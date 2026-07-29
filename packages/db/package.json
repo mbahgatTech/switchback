@@ -1,0 +1,32 @@
+{
+  "name": "@switchback/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "dotenv -e ../../.env -- prisma generate",
+    "push": "dotenv -e ../../.env -- prisma db push --skip-generate && npm run spatial",
+    "spatial": "dotenv -e ../../.env -- tsx scripts/apply-spatial.ts",
+    "migrate": "dotenv -e ../../.env -- prisma migrate dev",
+    "deploy": "prisma migrate deploy && tsx scripts/apply-spatial.ts",
+    "studio": "dotenv -e ../../.env -- prisma studio",
+    "seed": "dotenv -e ../../.env -- tsx scripts/seed.ts",
+    "seed:reviews": "dotenv -e ../../.env -- tsx scripts/seed-reviews.ts",
+    "seed:tracks": "dotenv -e ../../.env -- tsx scripts/seed-tracks.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.2.1",
+    "@switchback/core": "*"
+  },
+  "//devDependencies": "@switchback/geo is used only by scripts/seed.ts, for quadkey maths. The runtime db package does not depend on geo and must not — geo already imports core, and db importing geo at runtime is the first half of a cycle.",
+  "devDependencies": {
+    "@switchback/geo": "*",
+    "dotenv-cli": "^8.0.0",
+    "prisma": "^6.2.1"
+  }
+}

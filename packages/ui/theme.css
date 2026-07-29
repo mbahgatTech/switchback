@@ -1,0 +1,395 @@
+/*
+ * Tailwind v4 theme for Switchback.
+ *
+ * `src/tokens/*.ts` is the single source of truth. This file is hand-written rather than
+ * generated because packages in this repo have no build step, and a generated CSS file
+ * would need one. The safeguard is `test/tokens.test.ts`, which parses every custom
+ * property below and asserts it equals its TypeScript counterpart — including the px→rem
+ * conversion. Drift is a failing test, not a discovery six weeks later.
+ *
+ * Import it from the app's own stylesheet, after `@import 'tailwindcss'`.
+ */
+
+@theme {
+  /* ── Type ──────────────────────────────────────────────────────────────────────────
+   * Gothic plate headers, serif descriptive text — the field-guide inversion of the
+   * software default. Mono is scoped to coordinates, grid refs, and axis ticks.
+   * The `var()`s are next/font variables declared on <html> in apps/web/app/layout.tsx.
+   */
+  --font-display:
+    var(--font-archivo), ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-text: var(--font-source-serif), ui-serif, Georgia, 'Times New Roman', serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Graduated like an altimeter, not stepped by a modular ratio. */
+  --text-micro: 0.6875rem;
+  --text-micro--line-height: 1.4;
+  --text-micro--letter-spacing: 0.14em;
+  --text-caption: 0.8125rem;
+  --text-caption--line-height: 1.45;
+  --text-caption--letter-spacing: 0.01em;
+  --text-body: 1rem;
+  --text-body--line-height: 1.6;
+  --text-body--letter-spacing: 0em;
+  --text-body-lg: 1.125rem;
+  --text-body-lg--line-height: 1.6;
+  --text-body-lg--letter-spacing: 0em;
+  --text-title: 1.3125rem;
+  --text-title--line-height: 1.35;
+  --text-title--letter-spacing: -0.01em;
+  --text-h4: 1.625rem;
+  --text-h4--line-height: 1.25;
+  --text-h4--letter-spacing: -0.015em;
+  --text-h3: 2.0625rem;
+  --text-h3--line-height: 1.2;
+  --text-h3--letter-spacing: -0.02em;
+  --text-h2: 2.75rem;
+  --text-h2--line-height: 1.1;
+  --text-h2--letter-spacing: -0.025em;
+  --text-h1: 3.75rem;
+  --text-h1--line-height: 1.05;
+  --text-h1--letter-spacing: -0.03em;
+  --text-display: 5rem;
+  --text-display--line-height: 1;
+  --text-display--letter-spacing: -0.035em;
+
+  /* ── Space ─────────────────────────────────────────────────────────────────────────
+   * Graduated for the same reason a map scale bar reads 0-1-2-5-10.
+   */
+  --spacing-none: 0rem;
+  --spacing-hair: 0.125rem;
+  --spacing-xs: 0.25rem;
+  --spacing-sm: 0.5rem;
+  --spacing-md: 0.75rem;
+  --spacing-lg: 1rem;
+  --spacing-xl: 1.5rem;
+  --spacing-2xl: 2rem;
+  --spacing-3xl: 3rem;
+  --spacing-4xl: 4rem;
+  --spacing-5xl: 6rem;
+  --spacing-6xl: 8rem;
+  --spacing-7xl: 12rem;
+
+  --radius-none: 0rem;
+  --radius-hair: 0.125rem;
+  --radius-panel: 0.25rem;
+  --radius-pill: 999px;
+
+  /* ── Measure ───────────────────────────────────────────────────────────────────────
+   * Tailwind builds `max-w-*` out of `--container-*`, so these are `max-w-measure`,
+   * `max-w-measure-wide`, `max-w-rail` and `max-w-sheet`. Prose in `ch` so the measure
+   * survives being set at caption size; rails in px, because a rail is about the window.
+   */
+  --container-measure: 54ch;
+  --container-measure-wide: 62ch;
+  --container-rail: 1080px;
+  --container-sheet: 1180px;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+  /* Instrument motion: decisive, short, and only where it means something. `section` is
+   * the one long duration in the system — the profile plotting itself, once per trail. */
+  --duration-instant: 0ms;
+  --duration-quick: 120ms;
+  --duration-base: 200ms;
+  --duration-slow: 320ms;
+  --duration-section: 640ms;
+
+  /* ── Hypsometric ramp ──────────────────────────────────────────────────────────────
+   * Scheme-independent on purpose: a 2,400 m band is the same colour on paper, on the
+   * phone at night, and on the website. Fills only — text never sits on these.
+   */
+  --color-band-0: #3e5d3a;
+  --color-band-1: #61793f;
+  --color-band-2: #9a9350;
+  --color-band-3: #b08b50;
+  --color-band-4: #8e6242;
+  --color-band-5: #7c6a62;
+  --color-band-6: #d8d6cf;
+
+  /* Grade ramp. Hue and hatch density carry the same information twice, so slope survives
+   * any colour vision deficiency. Densities live in TS — SVG patterns need the number. */
+  --color-grade-0: #7fa36b;
+  --color-grade-1: #b5a55a;
+  --color-grade-2: #c98a47;
+  --color-grade-3: #b4603a;
+  --color-grade-4: #8e3a2e;
+
+  /* ── Five-plate, sheet scheme ──────────────────────────────────────────────────────
+   * The defaults. `sheet` is the reading surface, so it is what an unmarked page gets.
+   * Overridden below for `field`; utilities emit var() references, so they follow.
+   */
+  --color-canvas: #edf0ea;
+  --color-surface: #ffffff;
+  --color-bezel: #c9d0c4;
+  --color-ink: #161c1d;
+  --color-ink-muted: #5c6660;
+
+  --color-contour: #8a5524;
+  --color-contour-wash: #8a55241f;
+  --color-water: #1f6a8c;
+  --color-water-wash: #1f6a8c1f;
+  --color-woodland: #3f6b36;
+  --color-woodland-wash: #3f6b361f;
+  --color-survey: #b4322a;
+  --color-survey-wash: #b4322a1f;
+}
+
+/*
+ * ── The control ladder, for stylesheets ────────────────────────────────────────────────
+ *
+ * Outside `@theme` on purpose: these generate no utility and are not meant to. The website
+ * spells the ladder as Tailwind minimums in `apps/web/src/components/controls.ts`, because
+ * Tailwind finds classes by scanning text and `min-h-[34px]` therefore has to be written
+ * out longhand; the phone reads `CONTROL_HEIGHT` from TypeScript directly.
+ *
+ * What had no token at all was hand-written CSS — and the one place that needed it was the
+ * one place a control is not ours to write a class onto. MapLibre draws its zoom buttons at
+ * 29 px, which is not a rung, so on the explore sheet the map's own controls sat just below
+ * every control beside them. `apps/web/app/globals.css` reads `--control-panel` there.
+ *
+ * `test/tokens.test.ts` holds these to `CONTROL_HEIGHT`, the same as everything above.
+ */
+:root {
+  --control-panel: 34px;
+  --control-touch: 48px;
+  --control-field: 56px;
+}
+
+/*
+ * The two schemes as attributes.
+ *
+ * Both blocks restate every colour rather than one of them relying on the `@theme` defaults
+ * above, and that redundancy is load-bearing. Custom properties inherit, so a page that sets
+ * `data-scheme="sheet"` inside an `<html data-scheme="field">` is not choosing the defaults —
+ * it is sitting inside a subtree where the dark values have already been inherited, and a
+ * block that declares nothing overrides nothing. Writing `sheet` out is what makes the
+ * attribute an instruction instead of a hint.
+ *
+ * Both are unlayered, so they win over `@layer theme` regardless of specificity ties with
+ * `:root`, and neither is scoped to `html`: a dark instrument panel inside a light reading
+ * page — and a light card inside a dark one — are both real layouts here, and nesting works
+ * in either direction because an element's own declarations always beat inherited ones.
+ *
+ * `color-scheme` appears in all six palette blocks below, and it is not a duplicate of the
+ * colours it sits with. Those are ours; `color-scheme` is the half of the surface we do not
+ * draw — the scrollbar down the side of the filter panel, the popup a `.dial` opens, the
+ * caret and selection in a `.field`, the spinner on a number input. Set the ink and canvas
+ * dark without it and the browser keeps painting that furniture for a white page: a white
+ * scrollbar track on a black rail, a white dropdown over a dark map. It also declares what
+ * `light-dark()` resolves to, which is how the Microsoft sign-in button picks between the
+ * two variants Microsoft publishes without either of them being hard-coded to a mode.
+ */
+[data-scheme='sheet'] {
+  color-scheme: light;
+
+  --color-canvas: #edf0ea;
+  --color-surface: #ffffff;
+  --color-bezel: #c9d0c4;
+  --color-ink: #161c1d;
+  --color-ink-muted: #5c6660;
+
+  --color-contour: #8a5524;
+  --color-contour-wash: #8a55241f;
+  --color-water: #1f6a8c;
+  --color-water-wash: #1f6a8c1f;
+  --color-woodland: #3f6b36;
+  --color-woodland-wash: #3f6b361f;
+  --color-survey: #b4322a;
+  --color-survey-wash: #b4322a1f;
+}
+
+[data-scheme='field'] {
+  color-scheme: dark;
+
+  --color-canvas: #111819;
+  --color-surface: #222d2f;
+  --color-bezel: #2e3b3d;
+  --color-ink: #eaefe9;
+  --color-ink-muted: #8d9a93;
+
+  --color-contour: #d9975a;
+  --color-contour-wash: #d9975a1f;
+  --color-water: #63b8d6;
+  --color-water-wash: #63b8d61f;
+  --color-woodland: #8fbf7a;
+  --color-woodland-wash: #8fbf7a1f;
+  --color-survey: #f2695c;
+  --color-survey-wash: #f2695c1f;
+}
+
+/*
+ * Schemes are contextual, not a preference — a map screen is `field` whatever the OS
+ * says. But an unmarked page has no context to honour, so it honours the OS.
+ */
+@media (prefers-color-scheme: dark) {
+  html:not([data-scheme]) {
+    color-scheme: dark;
+
+    --color-canvas: #111819;
+    --color-surface: #222d2f;
+    --color-bezel: #2e3b3d;
+    --color-ink: #eaefe9;
+    --color-ink-muted: #8d9a93;
+
+    --color-contour: #d9975a;
+    --color-contour-wash: #d9975a1f;
+    --color-water: #63b8d6;
+    --color-water-wash: #63b8d61f;
+    --color-woodland: #8fbf7a;
+    --color-woodland-wash: #8fbf7a1f;
+    --color-survey: #f2695c;
+    --color-survey-wash: #f2695c1f;
+  }
+}
+
+/*
+ * ── Light and dark, as a second axis ────────────────────────────────────────────────────
+ *
+ * `data-scheme` says what a surface is *for*; `data-mode` says how bright the room is. The
+ * two blocks above are the pairing that has always shipped — dark instrument, light paper —
+ * so the two below are the other diagonal, and only the other diagonal. Nothing here
+ * restates a colour that was already correct.
+ *
+ * Each rule is written twice, as a descendant and as a compound, because `<html>` carries
+ * both attributes at once and a descendant combinator will not match an element against
+ * itself. Specificity is 0,2,0 either way, which clears the 0,1,0 scheme blocks above; the
+ * source order makes the tie moot regardless.
+ */
+[data-mode='light'] [data-scheme='field'],
+[data-mode='light'][data-scheme='field'] {
+  color-scheme: light;
+
+  --color-canvas: #e4e9e3;
+  --color-surface: #ffffff;
+  --color-bezel: #bfc7ba;
+  --color-ink: #131819;
+  --color-ink-muted: #545e58;
+
+  --color-contour: #8a5524;
+  --color-contour-wash: #8a55241f;
+  --color-water: #1f6a8c;
+  --color-water-wash: #1f6a8c1f;
+  --color-woodland: #3f6b36;
+  --color-woodland-wash: #3f6b361f;
+  --color-survey: #b4322a;
+  --color-survey-wash: #b4322a1f;
+}
+
+[data-mode='dark'] [data-scheme='sheet'],
+[data-mode='dark'][data-scheme='sheet'] {
+  color-scheme: dark;
+
+  --color-canvas: #1a2122;
+  --color-surface: #232b2d;
+  --color-bezel: #333e40;
+  --color-ink: #edf1eb;
+  --color-ink-muted: #96a29c;
+
+  --color-contour: #d9975a;
+  --color-contour-wash: #d9975a1f;
+  --color-water: #63b8d6;
+  --color-water-wash: #63b8d61f;
+  --color-woodland: #8fbf7a;
+  --color-woodland-wash: #8fbf7a1f;
+  --color-survey: #f2695c;
+  --color-survey-wash: #f2695c1f;
+}
+
+/*
+ * "Follow the system" is the default, and it costs no JavaScript.
+ *
+ * The server writes `data-mode` only when the reader has actually chosen a side. Left off,
+ * these two media blocks resolve it — which means the correct palette is in the very first
+ * paint of the very first response, with no blocking inline script and no flash of the
+ * wrong theme to fix afterwards. That is the entire reason the preference is an attribute
+ * the server can set rather than something read from `localStorage` on the client.
+ *
+ * `html:not([data-mode])` adds an element to the selector, so these sit at 0,2,1 and beat
+ * the explicit blocks above — harmless, because an explicit `data-mode` makes `:not()` fail
+ * and these stop matching entirely.
+ */
+@media (prefers-color-scheme: light) {
+  html:not([data-mode]) [data-scheme='field'],
+  html:not([data-mode])[data-scheme='field'] {
+    color-scheme: light;
+
+    --color-canvas: #e4e9e3;
+    --color-surface: #ffffff;
+    --color-bezel: #bfc7ba;
+    --color-ink: #131819;
+    --color-ink-muted: #545e58;
+
+    --color-contour: #8a5524;
+    --color-contour-wash: #8a55241f;
+    --color-water: #1f6a8c;
+    --color-water-wash: #1f6a8c1f;
+    --color-woodland: #3f6b36;
+    --color-woodland-wash: #3f6b361f;
+    --color-survey: #b4322a;
+    --color-survey-wash: #b4322a1f;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-mode]) [data-scheme='sheet'],
+  html:not([data-mode])[data-scheme='sheet'] {
+    color-scheme: dark;
+
+    --color-canvas: #1a2122;
+    --color-surface: #232b2d;
+    --color-bezel: #333e40;
+    --color-ink: #edf1eb;
+    --color-ink-muted: #96a29c;
+
+    --color-contour: #d9975a;
+    --color-contour-wash: #d9975a1f;
+    --color-water: #63b8d6;
+    --color-water-wash: #63b8d61f;
+    --color-woodland: #8fbf7a;
+    --color-woodland-wash: #8fbf7a1f;
+    --color-survey: #f2695c;
+    --color-survey-wash: #f2695c1f;
+  }
+}
+
+/*
+ * ── Paper is always light ───────────────────────────────────────────────────────────────
+ *
+ * The printed map sheet opts out of the mode axis entirely, and this is the one place in
+ * the system where that is correct. Every other surface is a screen, where "dark" means
+ * *emitting less light* and is a kindness. Paper emits none: dark mode on paper means
+ * spending a cartridge to lay down ink everywhere the map is empty, and handing somebody a
+ * sheet whose contour lines they cannot read by head-torch. The print stylesheet also sets
+ * `print-color-adjust: exact`, so the browser will faithfully do it if we ask.
+ *
+ * `!important` because the sheet element carries `data-print-sheet` and `data-scheme="sheet"`
+ * together, so `[data-print-sheet]` at 0,1,0 loses to `[data-mode='dark'][data-scheme='sheet']`
+ * at 0,2,0 — and adding attributes until it wins would still lose to the `html:not([data-mode])`
+ * fallbacks at 0,2,1. The surrounding print rules in `globals.css` are `!important` for the
+ * same reason; this is that convention, not an exception to it.
+ *
+ * Custom properties inherit, so declaring them here covers the whole sheet subtree — which
+ * is also the only subtree `globals.css` leaves visible on paper.
+ */
+@media print {
+  [data-print-sheet] {
+    color-scheme: light !important;
+
+    --color-canvas: #edf0ea !important;
+    --color-surface: #ffffff !important;
+    --color-bezel: #c9d0c4 !important;
+    --color-ink: #161c1d !important;
+    --color-ink-muted: #5c6660 !important;
+
+    --color-contour: #8a5524 !important;
+    --color-contour-wash: #8a55241f !important;
+    --color-water: #1f6a8c !important;
+    --color-water-wash: #1f6a8c1f !important;
+    --color-woodland: #3f6b36 !important;
+    --color-woodland-wash: #3f6b361f !important;
+    --color-survey: #b4322a !important;
+    --color-survey-wash: #b4322a1f !important;
+  }
+}

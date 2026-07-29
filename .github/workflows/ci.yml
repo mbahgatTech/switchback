@@ -1,0 +1,158 @@
+# The gates that can run on someone else's machine.
+#
+# Four of the five gates are hermetic — format:check, typecheck, lint and vitest touch
+# nothing outside the repo — so they run on every push and every pull request. The browser
+# suite is not, and the reason is worth stating rather than working around.
+#
+# `e2e/` opens a real browser against a real Postgres holding real OpenStreetMap data for
+# the Vesper Peak sheet. Nothing about it is mockable without defeating its purpose: it
+# exists because a component rendered twenty trails in its props and painted an empty map,
+# and a fixtured version would have passed. But `npm run db:seed` only *queues* the ingest
+# tiles; filling them means querying a public Overpass instance, and doing that on every
+# push would make this repository exactly the kind of automated client that gets a project
+# blocked — the same behaviour `packages/ingest/overpass.ts` is built to avoid. It would
+# also make CI red for weather timeouts rather than for defects.
+#
+# So the browser suite runs nightly and on demand: one z9 tile, once a day, which is well
+# inside any fair-use reading. Contributors run it locally, where the tile is already there.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # 04:11 UTC. Off the hour on purpose — every scheduled workflow on the platform fires at
+    # :00, and the queue at that minute is where a five-minute job waits twenty.
+    - cron: '11 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A local throwaway database and a throwaway secret. Neither is a credential to anything.
+  #
+  # There is no `.env` file here and none is written. Every db script runs under
+  # `dotenv -e ../../.env`, which is a no-op when the file is absent, and dotenv never
+  # overrides a variable that is already set — so these pass straight through. The vitest
+  # config reads the same way (`loadEnv` with an empty prefix merges `process.env` last).
+  DATABASE_URL: postgresql://switchback:switchback@localhost:5433/switchback
+  # Same endpoint. The two differ only on Neon, where DDL cannot go through PgBouncer;
+  # `prisma db push` reads `directUrl` and fails on a missing variable, not an equal one.
+  DIRECT_DATABASE_URL: postgresql://switchback:switchback@localhost:5433/switchback
+  AUTH_SECRET: ci-secret-not-used-for-anything-real-0123456789
+  # Overpass refuses a client that will not say who it is, and rightly. A CI run that ever
+  # reaches it should be identifiable and reachable.
+  OVERPASS_USER_AGENT: 'switchback-ci/0.1 (+https://github.com/${{ github.repository }})'
+
+jobs:
+  gates:
+    name: format · typecheck · lint · unit
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        # The same image infra/docker-compose.yml uses, and the same major versions Neon
+        # provides. A CI database on plain Postgres would pass every test that does not
+        # touch PostGIS and fail the ones that matter.
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: switchback
+          POSTGRES_PASSWORD: switchback
+          POSTGRES_DB: switchback
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U switchback -d switchback"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the engines floor in package.json, which is React Native 0.86's. With
+          # engine-strict=true in .npmrc, a mismatch fails the install rather than Metro.
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # First, because it needs nothing else — no database, no generated client, no build.
+      # A formatting failure that waits behind four minutes of Postgres and tsc is a
+      # four-minute wait to be told about a missing newline.
+      - run: npm run format:check
+
+      # Explicit rather than trusting @prisma/client's postinstall to find the schema from
+      # a hoisted workspace root. Everything downstream imports the generated types, so
+      # skipping this fails typecheck with an error about the wrong thing entirely.
+      - run: npm run db:generate
+
+      # `push` also applies packages/db/prisma/spatial.sql — the indexes and the check
+      # constraints Prisma cannot express live there, and half the db tests assert on them.
+      - run: npm run db:push
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+
+  browser:
+    name: browser suite
+    # Nightly and on demand only — see the note at the top of this file.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      db:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: switchback
+          POSTGRES_PASSWORD: switchback
+          POSTGRES_DB: switchback
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U switchback -d switchback"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run db:generate
+      - run: npm run db:push
+
+      # Creates the probe account the signed-in specs use, and queues the starter tiles.
+      - run: npm run db:seed
+
+      # The one Overpass query this workflow makes. Vesper Peak, because that is the sheet
+      # every spec opens on — the reader's original report was "I search Vesper peak and get
+      # nothing", and the suite was written to keep that fixed.
+      - name: Ingest the Vesper Peak tile
+        run: npm run ingest:tile -- --at 48.01213,-121.51188
+
+      # The full Chromium build, not the headless shell: playwright.config.ts sets
+      # `channel: 'chromium'` because MapLibre throws without a WebGL2 context and the shell
+      # cannot give it one even with SwiftShader.
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm run test:e2e
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14

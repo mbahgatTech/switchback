@@ -1,0 +1,68 @@
+{
+  "name": "switchback",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Trail discovery, planning, and navigation — web + iOS. Built on OpenStreetMap.",
+  "engines": {
+    "node": "^20.19.4 || ^22.13.0 || ^24.3.0 || >=25"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@switchback/web",
+    "build": "npm run build --workspace=@switchback/web",
+    "start": "npm run start --workspace=@switchback/web",
+    "mobile": "npm run start --workspace=@switchback/mobile",
+    "db:generate": "npm run generate --workspace=@switchback/db",
+    "db:push": "npm run push --workspace=@switchback/db",
+    "db:migrate": "npm run migrate --workspace=@switchback/db",
+    "db:studio": "npm run studio --workspace=@switchback/db",
+    "db:seed": "npm run seed --workspace=@switchback/db",
+    "db:seed:reviews": "npm run seed:reviews --workspace=@switchback/db",
+    "db:seed:tracks": "npm run seed:tracks --workspace=@switchback/db",
+    "db:up": "docker compose -f infra/docker-compose.yml up -d",
+    "db:down": "docker compose -f infra/docker-compose.yml down",
+    "ingest:drain": "tsx --env-file-if-exists=.env scripts/ingest.ts drain",
+    "ingest:tile": "tsx --env-file-if-exists=.env scripts/ingest.ts tile",
+    "ingest:route": "tsx --env-file-if-exists=.env scripts/ingest.ts route",
+    "ingest:requeue": "tsx --env-file-if-exists=.env scripts/requeue-jobs.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -p tsconfig.json && tsc -p e2e/tsconfig.json && npm run typecheck --workspace=@switchback/web && npm run typecheck --workspace=@switchback/mobile",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@eslint/js": "^9.17.0",
+    "@next/eslint-plugin-next": "^16.2.12",
+    "@playwright/test": "^1.62.0",
+    "@types/node": "^22.10.2",
+    "axe-core": "^4.12.1",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react-hooks": "^6.1.1",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^3.2.6"
+  },
+  "//audit": "npm audit reports GHSA-mh99-v99m-4gvg (brace-expansion DoS) with no fix available: the patch landed only in 5.0.8, and eslint reaches it through minimatch@3, which calls the v1 default export that v5 removed — overriding to ^5.0.8 clears the audit and breaks `npm run lint` with `expand is not a function`. Left unpinned deliberately. Exposure is dev-only: brace-expansion is reached from eslint's config globbing over patterns from eslint.config.mjs and argv, never from user input, and eslint ships in no bundle. Revisit when @eslint/config-array moves to a patched minimatch.",
+  "//audit-uuid": "uuid@7 (GHSA, bounds check in v3/v5/v6) reaches the tree through xcode@3 under @expo/config-plugins, and is the single root cause of every remaining advisory — the other nine entries npm lists are just the @expo/* packages that depend on it. Left alone: it is only executed by `expo prebuild`, against our own app.config.ts, and it appears in no shipped bundle — verified by exporting the iOS bundle and grepping it. Forcing uuid@11 there would swap the API out from under a package that has not been updated for it, trading a theoretical dev-time issue for a broken prebuild.",
+  "//overrides": "postcss is scoped to `next` because that is the only place a bad copy comes from — Next pins it at exactly 8.4.31, three advisories behind (worst: arbitrary .map file disclosure via sourceMappingURL, fixed in 8.5.18). sharp is global and deliberately so. Next declares it `optional`, and an override that narrows an optional dependency out of its declared range does not upgrade it — npm decides it is unsatisfiable and, because it is optional, silently installs nothing. `next/image` then falls back to unoptimised output with no error, which is worse than the CVE. So sharp is a real dependency of apps/web at the fixed version (0.35.0 closed four libvips CVEs) and the global override keeps any nested copy from reappearing under it. That code path matters here: it is what resizes user-uploaded photos from R2 in Phase 3. next@16.2.12 is already the latest, so no upgrade resolves either of these.",
+  "overrides": {
+    "next": {
+      "postcss": "^8.5.23"
+    },
+    "sharp": "^0.35.3",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "//overrides-react": "Both apps already pin 19.2.3, but pinning a dependency does not pin the tree: enough packages declare `react@^19.x` as a peer that npm hoists a newer patch alongside the pinned one, and a workspace ends up with two Reacts. React Native ships a renderer built against one exact React build and `expo-doctor` checks for that exact string, so the second copy is the one that breaks — at runtime, on the phone, with a confusing error. The override collapses the tree to one.",
+  "//engines": "The floor is React Native 0.86's, copied verbatim rather than rounded down — with engine-strict=true in .npmrc, a mismatch is a failed install with a clear message instead of a Metro crash three commands later. Node 20.17 is below it, and Node 20 left maintenance in April 2026; Node 22 LTS or 24 is the answer, not 20.19."
+}

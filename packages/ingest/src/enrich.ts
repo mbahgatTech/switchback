@@ -1,0 +1,520 @@
+/**
+ * Enrichment: the things around a trail that make it worth hiking.
+ *
+ * Two sources, both optional and both fail-soft. A trail with no waypoints and no photo is
+ * still a trail; a pipeline that aborts a whole tile because Wikimedia Commons was slow is
+ * not. Every function here catches its own failures and returns an empty result, and the
+ * caller records the failure without retrying the tile.
+ *
+ * The ordering is deliberate: enrichment runs *after* assembly has decided a trail is
+ * worth keeping, so we never pay a photo lookup for a 180 m fragment we are about to drop.
+ */
+
+import type { BBox, LngLat, WaypointKind } from '@switchback/core';
+import type { PlacedFeature, TerminusKinds } from '@switchback/geo';
+import { nearestPointOnLine, padBBox, terminusKinds } from '@switchback/geo';
+import type { OverpassElement } from './overpass';
+
+/**
+ * How far off the line a feature can be and still belong to this trail.
+ *
+ * 150 m for summits and viewpoints — the peak node sits at the true summit, which is
+ * routinely a few dozen metres off the path that circles it. Parking gets its own, larger
+ * radius: a trailhead car park is a car park, and it is often at the end of an access road
+ * the trail itself does not follow.
+ */
+export const WAYPOINT_BUFFER_M = 150;
+export const PARKING_BUFFER_M = 500;
+
+export interface EnrichedWaypoint {
+  kind: WaypointKind;
+  name: string | null;
+  lng: number;
+  lat: number;
+  /** Distance along the trail, or null for a feature that is near it but not on it. */
+  distM: number | null;
+  /** How far off the line the feature sits. Kept so the UI can say "200 m off-trail". */
+  offsetM: number;
+  osmType: 'node' | 'way';
+  osmId: number;
+  tags: Record<string, string>;
+}
+
+/**
+ * OSM tag → our waypoint vocabulary.
+ *
+ * Ordered, because tags overlap: a node tagged `natural=spring` + `amenity=drinking_water`
+ * is both, and "water" is the more useful label to a hiker who is thirsty. First match wins.
+ */
+const WAYPOINT_RULES: Array<{ kind: WaypointKind; match: (t: Record<string, string>) => boolean }> =
+  [
+    { kind: 'summit', match: (t) => t.natural === 'peak' },
+    { kind: 'viewpoint', match: (t) => t.tourism === 'viewpoint' },
+    { kind: 'waterfall', match: (t) => t.waterway === 'waterfall' },
+    { kind: 'lake', match: (t) => t.natural === 'water' && t.water !== 'river' },
+    { kind: 'water', match: (t) => t.natural === 'spring' || t.amenity === 'drinking_water' },
+    { kind: 'parking', match: (t) => t.amenity === 'parking' },
+    { kind: 'toilets', match: (t) => t.amenity === 'toilets' },
+    {
+      kind: 'shelter',
+      match: (t) =>
+        t.amenity === 'shelter' || t.tourism === 'alpine_hut' || t.tourism === 'wilderness_hut',
+    },
+    { kind: 'campsite', match: (t) => t.tourism === 'camp_site' },
+    { kind: 'ford', match: (t) => t.ford === 'yes' },
+    { kind: 'gate', match: (t) => t.barrier === 'gate' || t.barrier === 'stile' },
+    { kind: 'junction', match: (t) => t.information === 'guidepost' },
+    { kind: 'hazard', match: (t) => t.natural === 'cave_entrance' },
+  ];
+
+export function classifyWaypoint(tags: Record<string, string>): WaypointKind | null {
+  for (const rule of WAYPOINT_RULES) {
+    if (rule.match(tags)) return rule.kind;
+  }
+  return null;
+}
+
+/** `out center` gives ways a synthetic centre point; nodes have their own position. */
+function positionOf(element: OverpassElement): LngLat | null {
+  if (element.type === 'node') return [element.lon, element.lat];
+  if (element.type === 'way' && element.center) return [element.center.lon, element.center.lat];
+  return null;
+}
+
+/**
+ * Attach nearby OSM features to a trail line.
+ *
+ * `distM` is null for anything further off the line than `WAYPOINT_BUFFER_M`, because a
+ * car park 400 m away has no meaningful "distance along the trail" — it is not on it. The
+ * distinction matters downstream: the elevation chart plots waypoints by `distM`, and a
+ * parking pin at 0 m would sit on the chart as though you hiked through it.
+ */
+export function attachWaypoints(
+  coords: readonly LngLat[],
+  elements: readonly OverpassElement[],
+  options: { bufferM?: number; parkingBufferM?: number } = {},
+): EnrichedWaypoint[] {
+  const bufferM = options.bufferM ?? WAYPOINT_BUFFER_M;
+  const parkingBufferM = options.parkingBufferM ?? PARKING_BUFFER_M;
+  if (coords.length < 2) return [];
+
+  const out: EnrichedWaypoint[] = [];
+  const seen = new Set<string>();
+
+  for (const element of elements) {
+    if (element.type !== 'node' && element.type !== 'way') continue;
+    const tags = element.tags ?? {};
+    const kind = classifyWaypoint(tags);
+    if (!kind) continue;
+
+    const position = positionOf(element);
+    if (!position) continue;
+
+    const nearest = nearestPointOnLine(position, coords);
+    const limit = kind === 'parking' ? parkingBufferM : bufferM;
+    if (nearest.distM > limit) continue;
+
+    // A named summit tagged on both a node and its surrounding area appears twice.
+    const dedupeKey = `${kind}:${tags.name ?? ''}:${position[0].toFixed(4)},${position[1].toFixed(4)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    out.push({
+      kind,
+      name: tags.name ?? tags['name:en'] ?? null,
+      lng: position[0],
+      lat: position[1],
+      distM: nearest.distM <= bufferM ? nearest.alongM : null,
+      offsetM: Math.round(nearest.distM),
+      osmType: element.type,
+      osmId: element.id,
+      tags,
+    });
+  }
+
+  // Along the trail first, so the detail page reads as a hike rather than a tag dump.
+  out.sort((a, b) => (a.distM ?? Infinity) - (b.distM ?? Infinity));
+  return out;
+}
+
+/**
+ * What sits at each end of the line, for the route-type classifier.
+ *
+ * A separate pass from `attachWaypoints` rather than a filter over its output, because the
+ * two measure different things and the difference is the whole point. A waypoint's `distM`
+ * is measured *along* the trail, which puts a summit node 40 m off the last vertex at "5,640
+ * m" — the length of the line, telling you nothing about whether it is where the hike ends.
+ * `terminusKinds` measures straight-line distance from the endpoint, which is the question.
+ *
+ * Runs before `deriveTrail` and therefore on the stored, un-oriented geometry. That is safe:
+ * `hasImpliedReturnLeg` asks only whether *exactly one* end is a destination, which does not
+ * care which end is which, and `orientUphill` may still flip the line afterwards.
+ */
+export function terminusFeatures(
+  coords: readonly LngLat[],
+  elements: readonly OverpassElement[],
+): TerminusKinds {
+  const placed: PlacedFeature[] = [];
+
+  for (const element of elements) {
+    if (element.type !== 'node' && element.type !== 'way') continue;
+    const kind = classifyWaypoint(element.tags ?? {});
+    if (!kind) continue;
+    const at = positionOf(element);
+    if (at) placed.push({ at, kind });
+  }
+
+  return terminusKinds(coords, placed);
+}
+
+/**
+ * The trailhead.
+ *
+ * Synthesised rather than found, because OSM's `highway=trailhead` tag is rare outside
+ * North America. The start of the line is the trailhead by definition for a point-to-point
+ * or out-and-back; for a loop it is wherever the mapper started drawing, which is
+ * arbitrary but still the point every other distance is measured from — so labelling it is
+ * honest as long as we do not claim it is a car park.
+ */
+export function synthesiseTrailhead(coords: readonly LngLat[]): EnrichedWaypoint | null {
+  const start = coords[0];
+  if (!start) return null;
+  return {
+    kind: 'trailhead',
+    name: null,
+    lng: start[0],
+    lat: start[1],
+    distM: 0,
+    offsetM: 0,
+    osmType: 'node',
+    osmId: 0,
+    tags: {},
+  };
+}
+
+/**
+ * Total parking capacity near the trail.
+ *
+ * Feeds the busyness model in Phase 2: a trail with a 12-space gravel pull-off cannot be
+ * as crowded as one with a 400-space visitor centre, whatever the popularity numbers say.
+ * `capacity` is untagged more often than not, so this returns null rather than 0 when
+ * nothing is known — the model treats those differently.
+ */
+export function parkingCapacity(waypoints: readonly EnrichedWaypoint[]): number | null {
+  let total = 0;
+  let known = false;
+  for (const waypoint of waypoints) {
+    if (waypoint.kind !== 'parking') continue;
+    const capacity = Number(waypoint.tags.capacity);
+    if (Number.isFinite(capacity) && capacity > 0) {
+      total += capacity;
+      known = true;
+    }
+  }
+  return known ? total : null;
+}
+
+// ---------------------------------------------------------------------------
+// Photos
+// ---------------------------------------------------------------------------
+
+export interface SeedPhoto {
+  url: string;
+  thumbUrl: string;
+  width: number | null;
+  height: number | null;
+  lng: number | null;
+  lat: number | null;
+  /** Stored per photo, not per source: Commons carries a dozen different licences. */
+  license: string | null;
+  attribution: string | null;
+  sourceUrl: string;
+  source: 'wikimedia' | 'mapillary';
+  externalId: string;
+}
+
+export interface PhotoSourceOptions {
+  fetchImpl?: typeof fetch;
+  userAgent?: string;
+  limit?: number;
+  timeoutMs?: number;
+}
+
+interface CommonsPage {
+  pageid: number;
+  title: string;
+  imageinfo?: Array<{
+    url: string;
+    thumburl?: string;
+    width?: number;
+    height?: number;
+    descriptionurl?: string;
+    extmetadata?: Record<string, { value?: string } | undefined>;
+  }>;
+  coordinates?: Array<{ lat: number; lon: number }>;
+}
+
+/**
+ * Space agencies, matched case-sensitively and fenced by Unicode letter look-arounds.
+ *
+ * Both of those are load-bearing against a real name. `\b` is ASCII-only and three letters
+ * is a very small target, so a loose `/ESA/` finds Teresa, Mesa, Chiesa, Katormesa and
+ * jamesadney; the look-arounds fix that, including for the names that put a non-ASCII letter
+ * against the acronym, which an ASCII `\b` would still admit. Case is what stops the rest:
+ * `Esa` is a common Finnish given name — Esa-Pekka Salonen has photographs on Commons — and
+ * a hyphen is not a letter, so an `/i` flag here would delete them. The agencies write
+ * themselves in capitals every time; a lower-case `esa` is a person.
+ */
+const ORBITAL_AGENCY = /(?<![\p{L}\p{N}])(?:NASA|ESA|JAXA|MODIS)(?![\p{L}\p{N}])/u;
+
+/**
+ * Earth-observation programmes and the units that run them, which need no such care.
+ *
+ * Two entries carry a qualifier, for opposite reasons that come to the same one. Goddard is
+ * a surname a photographer may perfectly well have, so only `goddard space` counts; Aster is
+ * a genus of trailside wildflower with a great many pictures on Commons, so only `aster
+ * science` does. `sentinel-\d` earns its digit the same way — Sentinel Dome in Yosemite is
+ * one of the most photographed viewpoints in the corpus. What is left cannot be anything but
+ * a satellite.
+ *
+ * USGS is deliberately absent. It is a *ground* survey agency whose Commons corpus is very
+ * nearly a description of this product's subject, down to 1941 aerial plates of the Mima
+ * Mounds; the twenty-odd of their images that really were taken from orbit say Landsat on
+ * them and are caught by that instead.
+ */
+const ORBITAL_PROGRAMME =
+  /remote sensing|earth science|earth observatory|johnson space|goddard space|copernicus|landsat|sentinel-\d|aster science/i;
+
+/**
+ * Astronaut-photography frame designators, which is what these files are named after.
+ *
+ * `ISS042-E-107916`, `SL2-11-92`, `STS061A-101-005` — a mission, a magazine or camera, and a
+ * frame number, assigned by the Johnson Space Center catalogue and carried into the Commons
+ * filename verbatim. Being machine identifiers they collide with nothing, which is exactly
+ * what a mission *word* would not do: matching `sentinel` in a filename would delete every
+ * photograph taken from Sentinel Dome, and `aster` would take the wildflowers.
+ *
+ * Matched against the raw basename, which needs no percent-decoding — a designator is ASCII
+ * digits and hyphens and is never encoded, while `decodeURIComponent` throws outright on the
+ * malformed escapes that Commons filenames occasionally carry.
+ */
+const ORBITAL_FRAME = /^(?:iss\d+(?:-e-|e)\d+|sl\d+-\d+-\d+|sts\d+|as\d+-\d+-\d+)/i;
+
+/**
+ * Is this a picture of the Earth from space, rather than a picture of somewhere on it?
+ *
+ * Commons geosearch answers "which files are tagged with coordinates near here", and an
+ * astronaut's photograph of the Cascades taken from 400 km up is tagged with the coordinates
+ * of the Cascades. Nothing in the response distinguishes the two, so the top two credits in
+ * a seeded corpus of 127,000 photographs were one NASA remote sensing unit under two
+ * spellings — ahead of every real photographer on the site — and 3,669 trails led with a
+ * picture of cloud.
+ *
+ * Two independent tests, either sufficient. The credit catches Landsat and ASTER scenes,
+ * which carry ordinary descriptive filenames; the designator catches astronaut photography
+ * whose credit metadata is missing, unparsed, or simply says `NASA`.
+ */
+export function isOrbitalImagery(photo: { url: string; attribution?: string | null }): boolean {
+  const credit = photo.attribution ?? '';
+  if (ORBITAL_AGENCY.test(credit) || ORBITAL_PROGRAMME.test(credit)) return true;
+  return ORBITAL_FRAME.test(photo.url.split('/').pop() ?? '');
+}
+
+/**
+ * Wikimedia Commons geosearch.
+ *
+ * One request: `generator=geosearch` finds files near a point and `prop=imageinfo` returns
+ * their URLs and licence metadata in the same response, rather than a search followed by N
+ * detail lookups. `gsradius` caps at 10 km on the API side.
+ *
+ * Commons is the better seed source of the two because its images are curated and
+ * attributed. Mapillary has far more coverage but the images are street-level captures,
+ * which make poor hero photos.
+ */
+export async function fetchCommonsPhotos(
+  centroid: LngLat,
+  radiusM: number,
+  options: PhotoSourceOptions = {},
+): Promise<SeedPhoto[]> {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const limit = options.limit ?? 12;
+
+  const url = new URL('https://commons.wikimedia.org/w/api.php');
+  url.search = new URLSearchParams({
+    action: 'query',
+    format: 'json',
+    formatversion: '2',
+    origin: '*',
+    generator: 'geosearch',
+    ggscoord: `${centroid[1]}|${centroid[0]}`,
+    ggsradius: String(Math.min(Math.max(Math.round(radiusM), 10), 10_000)),
+    ggslimit: String(limit),
+    ggsnamespace: '6', // File:
+    prop: 'imageinfo|coordinates',
+    iiprop: 'url|size|extmetadata',
+    iiurlwidth: '1600',
+    iiextmetadatafilter: 'LicenseShortName|Artist|Credit|LicenseUrl',
+  }).toString();
+
+  const body = await getJson<{ query?: { pages?: CommonsPage[] } }>(
+    url.toString(),
+    options,
+    fetchImpl,
+  );
+  if (!body?.query?.pages) return [];
+
+  const photos: SeedPhoto[] = [];
+  for (const page of body.query.pages) {
+    const info = page.imageinfo?.[0];
+    if (!info?.url) continue;
+    // Commons hosts maps, diagrams, and scanned documents alongside photographs, and
+    // those are not what a trail card wants.
+    if (!/\.(jpe?g|png|webp)$/i.test(info.url)) continue;
+
+    const meta = info.extmetadata ?? {};
+    const attribution = stripHtml(meta.Artist?.value ?? meta.Credit?.value) ?? null;
+    // ...and it hosts a great deal of the Earth as seen from orbit, tagged with the
+    // coordinates of the ground it shows, which geosearch cannot tell from a photograph
+    // taken while standing on it.
+    if (isOrbitalImagery({ url: info.url, attribution })) continue;
+
+    const coordinate = page.coordinates?.[0];
+    photos.push({
+      url: info.url,
+      thumbUrl: info.thumburl ?? info.url,
+      width: info.width ?? null,
+      height: info.height ?? null,
+      lng: coordinate?.lon ?? null,
+      lat: coordinate?.lat ?? null,
+      license: stripHtml(meta.LicenseShortName?.value) ?? null,
+      attribution,
+      sourceUrl: info.descriptionurl ?? `https://commons.wikimedia.org/?curid=${page.pageid}`,
+      source: 'wikimedia',
+      externalId: String(page.pageid),
+    });
+  }
+  return photos;
+}
+
+/**
+ * Mapillary, as a fallback where Commons has nothing.
+ *
+ * Requires `MAPILLARY_TOKEN`; without one this returns empty rather than throwing, because
+ * a missing optional key should degrade the product, not break the pipeline. Mapillary
+ * images are CC-BY-SA 4.0 and the attribution is stored with each one.
+ */
+export async function fetchMapillaryPhotos(
+  bbox: BBox,
+  token: string | undefined,
+  options: PhotoSourceOptions = {},
+): Promise<SeedPhoto[]> {
+  if (!token) return [];
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const limit = options.limit ?? 8;
+  const [w, s, e, n] = bbox;
+
+  const url = new URL('https://graph.mapillary.com/images');
+  url.search = new URLSearchParams({
+    access_token: token,
+    bbox: `${w},${s},${e},${n}`,
+    fields: 'id,thumb_1024_url,thumb_2048_url,computed_geometry,captured_at',
+    limit: String(limit),
+  }).toString();
+
+  const body = await getJson<{
+    data?: Array<{
+      id: string;
+      thumb_1024_url?: string;
+      thumb_2048_url?: string;
+      computed_geometry?: { coordinates?: [number, number] };
+    }>;
+  }>(url.toString(), options, fetchImpl);
+
+  return (body?.data ?? [])
+    .filter((image) => Boolean(image.thumb_1024_url))
+    .map((image) => ({
+      url: image.thumb_2048_url ?? image.thumb_1024_url!,
+      thumbUrl: image.thumb_1024_url!,
+      width: null,
+      height: null,
+      lng: image.computed_geometry?.coordinates?.[0] ?? null,
+      lat: image.computed_geometry?.coordinates?.[1] ?? null,
+      license: 'CC BY-SA 4.0',
+      attribution: 'Mapillary contributors',
+      sourceUrl: `https://www.mapillary.com/app/?pKey=${image.id}`,
+      source: 'mapillary' as const,
+      externalId: image.id,
+    }));
+}
+
+/**
+ * Photos for one trail, Commons first.
+ *
+ * Mapillary only runs when Commons came back thin, because two mediocre street-level
+ * frames are worse than one good photograph — and because every avoided request is one we
+ * do not have to rate-limit.
+ */
+export async function fetchSeedPhotos(
+  input: { centroid: LngLat; bbox: BBox; lengthM: number },
+  options: PhotoSourceOptions & { mapillaryToken?: string } = {},
+): Promise<SeedPhoto[]> {
+  // Search radius scales with the trail: a 20 km route's photos are not all within 500 m
+  // of its midpoint. Capped at the API's own 10 km limit.
+  const radiusM = Math.min(Math.max(input.lengthM / 2, 500), 10_000);
+  const commons = await fetchCommonsPhotos(input.centroid, radiusM, options);
+  if (commons.length >= 3) return commons;
+
+  const mapillary = await fetchMapillaryPhotos(input.bbox, options.mapillaryToken, options);
+  return [...commons, ...mapillary];
+}
+
+/** The bbox to search for features around a trail, padded by the waypoint buffer. */
+export function featureSearchBBox(bbox: BBox): BBox {
+  return padBBox(bbox, PARKING_BUFFER_M);
+}
+
+/**
+ * Fetch JSON, and swallow everything.
+ *
+ * Enrichment is decoration. A Commons outage, a malformed response, a timeout — none of
+ * them should cost us a tile of trails that are otherwise complete and correct. The caller
+ * gets an empty array and the trail ships without a photo.
+ */
+async function getJson<T>(
+  url: string,
+  options: PhotoSourceOptions,
+  fetchImpl: typeof fetch,
+): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
+  try {
+    const response = await fetchImpl(url, {
+      headers: {
+        Accept: 'application/json',
+        ...(options.userAgent ? { 'User-Agent': options.userAgent } : {}),
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+}
+
+/** Commons `extmetadata` values are HTML fragments — an `<a>` around the author's name. */
+function stripHtml(value: string | undefined): string | null {
+  if (!value) return null;
+  const text = value
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return text || null;
+}

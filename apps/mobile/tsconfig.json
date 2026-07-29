@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    // Same trick as the root config: point straight at the shared sources rather than at
+    // the workspace symlinks, so `npm run typecheck` behaves identically before and after
+    // `npm install`, and matches what Metro resolves at runtime.
+    //
+    // `@switchback/db` and the value exports of `@switchback/api` are deliberately absent.
+    // Both reach Prisma and `node:crypto`, neither of which exists in Hermes. The app is
+    // allowed exactly one thing from the API package — `import type { AppRouter }` — and
+    // leaving the path off is what makes an accidental value import a compile error here
+    // rather than a red screen on the phone.
+    //
+    // No `baseUrl`: deprecated in TS 6, removed in 7. `paths` resolve relative to this file.
+    "paths": {
+      "@/*": ["./src/*"],
+      "@switchback/core": ["../../packages/core/src/index.ts"],
+      "@switchback/core/*": ["../../packages/core/src/*"],
+      "@switchback/geo": ["../../packages/geo/src/index.ts"],
+      "@switchback/geo/*": ["../../packages/geo/src/*"],
+      "@switchback/ui": ["../../packages/ui/src/index.ts"],
+      "@switchback/ui/*": ["../../packages/ui/src/*"],
+      "@switchback/api": ["../../packages/api/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx", ".expo/types/**/*.ts", "expo-env.d.ts"],
+  "exclude": ["node_modules", ".expo"]
+}

@@ -1,0 +1,24 @@
+services:
+  db:
+    # PostGIS 3.5 on Postgres 17 — matches what Neon provides in production.
+    image: postgis/postgis:17-3.5
+    container_name: switchback-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: switchback
+      POSTGRES_PASSWORD: switchback
+      POSTGRES_DB: switchback
+      # Trails are geometry-heavy; the default 128MB shared_buffers is stingy.
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    ports:
+      - '5433:5432'
+    volumes:
+      - switchback-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U switchback -d switchback']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  switchback-pgdata:

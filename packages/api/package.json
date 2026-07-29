@@ -1,0 +1,28 @@
+{
+  "name": "@switchback/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tokens": "./src/tokens.ts",
+    "./mobile-auth": "./src/mobile-auth.ts",
+    "./orphans": "./src/orphans.ts",
+    "./lifeline": "./src/lifeline.ts"
+  },
+  "//dependencies": "jose rather than jsonwebtoken: this code has to run on the Vercel edge runtime and in Expo's Hermes, neither of which has node:crypto in the shape jsonwebtoken expects. jose is WebCrypto-only.",
+  "dependencies": {
+    "@switchback/core": "*",
+    "@switchback/busyness": "*",
+    "@switchback/db": "*",
+    "@switchback/geo": "*",
+    "@switchback/ingest": "*",
+    "@switchback/weather": "*",
+    "@trpc/server": "^11.18.0",
+    "jose": "^6.2.4",
+    "superjson": "^2.2.6",
+    "zod": "^3.24.1"
+  }
+}

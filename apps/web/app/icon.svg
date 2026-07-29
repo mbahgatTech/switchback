@@ -1,0 +1,17 @@
+<!--
+  The double blaze, as a tab mark.
+
+  Inverted from the header — paper on woodland rather than woodland on paper — because a
+  favicon has no page around it. Green marks on a transparent ground would sit unbounded on
+  whatever the browser's tab strip happens to be, and at sixteen pixels an unbounded mark is
+  a smudge. The tile gives it an edge, and the edge is what makes it findable in a row of
+  twenty tabs.
+
+  Geometry matches `src/components/blaze.tsx`: a 2:3 rectangle, a second one below it, the
+  top one offset toward the turn.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" fill="#3F6B36" />
+  <rect x="11" y="4" width="7" height="11" fill="#EDF0EA" />
+  <rect x="14" y="17" width="7" height="11" fill="#EDF0EA" />
+</svg>

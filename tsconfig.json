@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // The workspace packages are source-only — no build step, no emitted .d.ts. Both
+    // bundlers resolve them through the npm-workspace symlinks, but pointing tsc straight
+    // at the sources keeps `npm run typecheck` working before `npm install` has linked
+    // anything, and keeps it identical to the aliases vitest.config.ts uses.
+    //
+    // No `baseUrl`: TypeScript 6 deprecates it and 7 removes it. Since 4.1 a `paths` entry
+    // resolves relative to the tsconfig that declares it, so every target below is already
+    // written that way and nothing here needed to change but the deletion.
+    "paths": {
+      "@switchback/core": ["./packages/core/src/index.ts"],
+      "@switchback/core/*": ["./packages/core/src/*"],
+      "@switchback/geo": ["./packages/geo/src/index.ts"],
+      "@switchback/geo/*": ["./packages/geo/src/*"],
+      "@switchback/db": ["./packages/db/src/index.ts"],
+      "@switchback/db/*": ["./packages/db/src/*"],
+      "@switchback/ingest": ["./packages/ingest/src/index.ts"],
+      "@switchback/ingest/*": ["./packages/ingest/src/*"],
+      "@switchback/api": ["./packages/api/src/index.ts"],
+      "@switchback/api/*": ["./packages/api/src/*"],
+      "@switchback/ui": ["./packages/ui/src/index.ts"],
+      "@switchback/ui/*": ["./packages/ui/src/*"],
+      "@switchback/weather": ["./packages/weather/src/index.ts"],
+      "@switchback/weather/*": ["./packages/weather/src/*"],
+      "@switchback/busyness": ["./packages/busyness/src/index.ts"],
+      "@switchback/busyness/*": ["./packages/busyness/src/*"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts",
+    "packages/*/scripts/**/*.ts",
+    "scripts/**/*.ts",
+    "vitest.config.ts",
+    "playwright.config.ts"
+  ],
+  // `e2e/` is deliberately absent: it is the one place in the repo that needs the DOM lib,
+  // because the bodies handed to `page.evaluate` are compiled as browser code. It has its
+  // own project at `e2e/tsconfig.json`, which the root `typecheck` script runs after this.
+  "exclude": ["node_modules", "dist", ".next", ".expo", "apps", "e2e"]
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+
+    // Declared here rather than left implicit. Up to TypeScript 5.7 an omitted `types` meant
+    // "every package under node_modules/@types", so this was free; on 6.0 the same configs
+    // stopped seeing `process`, `console`, and `import.meta.url` in packages/db, while the
+    // root and web configs — which already named `node` — kept working. Naming it is also
+    // the better default regardless: it makes the ambient surface a decision rather than a
+    // function of whatever happens to be installed.
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false,
+
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "exclude": ["node_modules", "dist", ".next", ".expo"]
+}

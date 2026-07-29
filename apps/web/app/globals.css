@@ -1,0 +1,477 @@
+@import 'tailwindcss';
+@import '@switchback/ui/theme.css';
+
+/*
+ * Base layer only. Every value below resolves to a token from `packages/ui` — if a hex or
+ * a px lands in this file, the system has a gap and the gap is what should be fixed.
+ */
+
+@layer base {
+  html {
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    /* Gothic plate headers, serif descriptive text — see docs/design.md. UI is the
+     * default because most of this product is labels and numbers, not paragraphs. */
+    font-family: var(--font-display);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    /* Every number in this product is a measurement sitting next to another measurement.
+     * Proportional figures make a column of distances look ragged. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Prose is the serif's job, and only prose. */
+  p,
+  blockquote {
+    font-family: var(--font-text);
+  }
+
+  /*
+   * Focus takes the structure plate, never the survey plate. Red means the user or their
+   * safety; a keyboard ring is neither, and borrowing it would blunt the one colour that
+   * has to still mean something on a ridge.
+   */
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+    border-radius: var(--radius-hair);
+  }
+
+  ::selection {
+    background-color: var(--color-contour-wash);
+  }
+
+  /* Off, not gentler. The section renders complete. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/*
+ * Registered so it interpolates. An unregistered custom property animates discretely — it
+ * would snap from 2rem to 0 halfway through the scroll instead of retracting — and the
+ * `0px` initial value is what a panel with nothing to scroll settles on.
+ */
+@property --sb-hint {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+@layer components {
+  /*
+   * The collar label — the marginalia voice of a map sheet. One treatment, defined once,
+   * because the discipline is that it appears only where a sheet would print collar text.
+   * Applied broadly it becomes wallpaper and the direction stops meaning anything.
+   */
+  .collar {
+    font-family: var(--font-display);
+    font-size: var(--text-micro);
+    line-height: var(--text-micro--line-height);
+    letter-spacing: var(--text-micro--letter-spacing);
+    font-stretch: 78%;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--color-ink-muted);
+  }
+
+  /* Hydrography convention: water features are italic on a topo sheet, so weather and
+   * conditions narrative is italic serif. Free, and correct to anyone who reads sheets. */
+  .hydrography {
+    font-family: var(--font-text);
+    font-style: italic;
+  }
+
+  /*
+   * A dial: a value in the running text of a label that the reader can change.
+   *
+   * The native select chrome is dropped and replaced with a dotted underline, which is the
+   * printed convention for a blank meant to be filled in — a form field on a permit, the
+   * date on a summit register. It reads as part of the sentence "Leaving Sat 27 Jul at
+   * 07:00" rather than as two dropped-in widgets, which is what the sentence is: one fact
+   * with two adjustable parts.
+   *
+   * The affordance rests on the underline and the pointer, so both are load-bearing: the
+   * decoration darkens to ink on hover, and focus falls through to the base layer's ring.
+   */
+  .dial {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0 var(--spacing-hair);
+    font: inherit;
+    color: var(--color-ink);
+    cursor: pointer;
+    text-decoration: underline dotted var(--color-bezel);
+    text-underline-offset: 4px;
+    transition: text-decoration-color var(--duration-quick) var(--ease-standard);
+  }
+
+  .dial:hover {
+    text-decoration-color: var(--color-ink);
+  }
+
+  .dial:disabled {
+    color: var(--color-ink-muted);
+    cursor: default;
+    text-decoration-color: transparent;
+  }
+
+  /* The list itself is native chrome, so it needs the page's own surface, not the OS's. */
+  .dial option {
+    background-color: var(--color-surface);
+    color: var(--color-ink);
+  }
+
+  /*
+   * A field on a form.
+   *
+   * The dial is a value inside a sentence; this is a box on a permit. Ruled on all four
+   * sides and filled with surface so it reads as an area meant to be written in rather than
+   * as a line the text happens to sit above — which is the distinction between a setting you
+   * are being asked to supply and a value you can nudge.
+   *
+   * Serif, at reading size. Everything typed into these boxes is prose somebody will read
+   * back on a profile, and setting it in the UI face while writing and the serif afterwards
+   * makes the same sentence two different lengths.
+   */
+  .field {
+    width: 100%;
+    border: 1px solid var(--color-bezel);
+    border-radius: var(--radius-hair);
+    background-color: var(--color-surface);
+    padding: var(--spacing-sm) var(--spacing-md);
+    font-family: var(--font-text);
+    font-size: var(--text-body);
+    line-height: var(--text-body--line-height);
+    color: var(--color-ink);
+    transition: border-color var(--duration-quick) var(--ease-standard);
+  }
+
+  .field::placeholder {
+    color: var(--color-ink-muted);
+    opacity: 0.65;
+  }
+
+  .field:hover {
+    border-color: var(--color-ink-muted);
+  }
+
+  /* Ruled in survey red only where the value is actually wrong — the plate means "you". */
+  .field[aria-invalid='true'] {
+    border-color: var(--color-survey);
+  }
+
+  /*
+   * Microsoft's sign-in button, to Microsoft's specification and nobody else's.
+   *
+   * Every value here is theirs: the 41px box, the 12px gutters, the 15px Segoe UI, the
+   * #8C8C8C rule that is the same grey in both variants, and the two pairs `light-dark()`
+   * picks between. It is the one control on the site deliberately not in the site's voice,
+   * because a reader recognises it from a dozen other sign-in pages and that recognition is
+   * the whole affordance. See `components/auth/microsoft-button.tsx`.
+   *
+   * It lives here rather than in a `style` attribute so that `light-dark()` goes through
+   * LightningCSS, which compiles it down to the `--lightningcss-light` / `--lightningcss-dark`
+   * pair keyed off `color-scheme`. Inline it would need native support, and a browser without
+   * it drops the declaration entirely — leaving a button with no background at all.
+   */
+  .ms-signin {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 41px;
+    padding: 0 12px;
+    border: 1px solid #8c8c8c;
+    font-family: 'Segoe UI', Segoe, system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1;
+    background-color: light-dark(#ffffff, #2f2f2f);
+    color: light-dark(#5e5e5e, #ffffff);
+  }
+
+  /* Microsoft publishes no focus state, and a control without a visible one is not
+   * shippable here. `currentColor` is legible in both variants without a third grey. */
+  .ms-signin:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+  }
+
+  /*
+   * Sign in with Apple, to Apple's Human Interface Guidelines.
+   *
+   * Same bargain as `.ms-signin` above and for the same reason, but Apple's rules are
+   * stricter and they are a condition of shipping the provider at all, not a courtesy. The
+   * ones that shape this block:
+   *
+   *   · Minimum height 30pt, minimum width 140pt. 41px matches the Microsoft button beside
+   *     it, so the row has one baseline rather than two.
+   *   · Title in the system font at **43% of the button height**, which is why every size
+   *     below is a ratio of `--apple-h` instead of a number somebody would later "tidy".
+   *   · At least 1/10 of the height as margin on all sides of the content.
+   *   · Black on light, white on dark — never a tinted variant, and never our ink.
+   *
+   * Apple's corner radius is free between 0 and half the height; this takes their own
+   * default proportion rather than our `rounded-hair`, because a reader recognises the
+   * shape as much as the mark, and recognition is the entire reason this control is not in
+   * our voice.
+   */
+  .apple-signin {
+    --apple-h: 41px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: calc(var(--apple-h) * 0.14);
+    height: var(--apple-h);
+    min-width: 140px;
+    padding: 0 calc(var(--apple-h) * 0.32);
+    border: 1px solid light-dark(#000000, #ffffff);
+    border-radius: calc(var(--apple-h) * 0.15);
+    /* Apple asks for the system font; on a Mac or an iPhone this resolves to SF Pro, which
+     * is the face their own button uses and the one we are not allowed to substitute. */
+    font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-size: calc(var(--apple-h) * 0.43);
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: -0.01em;
+    background-color: light-dark(#000000, #ffffff);
+    color: light-dark(#ffffff, #000000);
+  }
+
+  /* Apple publishes no focus state either. Drawn outside the box so it survives both
+   * variants without touching the fill, which is the part that is theirs. */
+  .apple-signin:focus-visible {
+    outline: 2px solid light-dark(#000000, #ffffff);
+    outline-offset: 3px;
+  }
+
+  /*
+   * A panel that admits it has more in it.
+   *
+   * The explore facets are capped so the results list keeps a usable share of the column,
+   * which on a short viewport cuts straight through a row of chips. A hard edge across half
+   * a chip does not read as "scroll me", it reads as broken — nothing tells the reader that
+   * Route and Activity are below the fold.
+   *
+   * So the last few pixels fade, and the fade retracts as the panel reaches its end:
+   * `scroll(self block)` drives the mask's stop from the element's own scroll offset, so the
+   * final chip is shown at full strength once there is nothing left to reveal. No listener,
+   * no ResizeObserver, nothing to keep in sync with the content's height.
+   *
+   * A panel whose content fits gets no fade at all, and that falls out for free — with
+   * nothing to scroll the timeline is inactive, the animation contributes nothing, and
+   * `--sb-hint` keeps the `0px` its `@property` registration gives it.
+   *
+   * Guarded, because the fallback must not be a permanent fade over the last chip. Without
+   * scroll-driven animation this is exactly the plain edge it was before.
+   */
+  @supports (animation-timeline: scroll()) {
+    .scroll-hint {
+      mask-image: linear-gradient(to bottom, #000 calc(100% - var(--sb-hint)), transparent);
+      animation: sb-scroll-hint linear both;
+      animation-timeline: scroll(self block);
+    }
+
+    /* Held flat until the end so the hint is not a gradient that drifts while you read. */
+    @keyframes sb-scroll-hint {
+      0%,
+      88% {
+        --sb-hint: 2rem;
+      }
+      100% {
+        --sb-hint: 0px;
+      }
+    }
+  }
+
+  /*
+   * MapLibre's chrome, in the house voice, once.
+   *
+   * Six map components carried the same nine-utility string in an arbitrary variant —
+   * `[&_.maplibregl-ctrl-group]:!border [&_.maplibregl-ctrl-group]:!border-bezel …` — two of
+   * them with the utilities in a different order, and one of the six styled the attribution
+   * while the other five left it in MapLibre's own grey-on-white. That is the copied-string
+   * failure `components/controls.ts` was written to stop, transposed into CSS: the map is one
+   * component of this product, and its buttons are not six independent decisions.
+   *
+   * **`!important`, and not as a shortcut.** `maplibre-gl.css` is imported from a module, so
+   * it arrives unlayered — and an unlayered normal declaration outranks every layered one,
+   * whatever the specificity. That is why the six copies were `!`-prefixed too. An important
+   * declaration inside a layer wins the cascade back, because important author declarations
+   * sort layers in reverse and put unlayered last.
+   *
+   * The zoom buttons are why this is a block rather than a token nobody reads. MapLibre draws
+   * them 29 px square, which is not a rung — on the explore sheet the map's own controls sat
+   * just under every control beside them, close enough to read as misalignment rather than as
+   * a decision. `--control-panel` is the same 34 as `HEIGHT.panel`.
+   */
+  .maplibregl-ctrl-group {
+    border: 1px solid var(--color-bezel) !important;
+    background-color: var(--color-surface) !important;
+    box-shadow: none !important;
+  }
+
+  .maplibregl-ctrl-group button {
+    width: var(--control-panel) !important;
+    height: var(--control-panel) !important;
+    color: var(--color-ink) !important;
+  }
+
+  /* The scale bar is lettering, so it takes the lettering the rest of the sheet's marginalia
+   * takes: mono, muted, on surface, ruled in bezel. */
+  .maplibregl-ctrl-scale {
+    border-color: var(--color-bezel) !important;
+    background-color: var(--color-surface) !important;
+    font-family: var(--font-mono) !important;
+    color: var(--color-ink-muted) !important;
+  }
+
+  /*
+   * Attribution is a licence condition, not decoration — ODbL requires it and it is never
+   * hidden. It is set quiet rather than small: muted ink on surface, with the links in the
+   * same ink so the strip reads as one line of credit instead of a row of blue.
+   */
+  .maplibregl-ctrl-attrib {
+    background-color: var(--color-surface) !important;
+    color: var(--color-ink-muted) !important;
+  }
+
+  .maplibregl-ctrl-attrib a {
+    color: var(--color-ink-muted) !important;
+  }
+
+  /*
+   * The section plotting itself. The one long duration in the system, and the only motion
+   * on the page — it happens once per trail, on first paint, and never on scroll.
+   *
+   * `prefers-reduced-motion` is handled by the base layer above, which drops every
+   * duration to 0.001ms. Both animations end on their natural final state, so the section
+   * simply renders complete rather than in a toned-down variant.
+   */
+  .sb-draw {
+    animation: sb-draw var(--duration-section) var(--ease-standard) both;
+  }
+
+  .sb-wipe {
+    transform-origin: left center;
+    animation: sb-wipe var(--duration-section) var(--ease-standard) both;
+  }
+
+  @keyframes sb-draw {
+    from {
+      stroke-dasharray: 1;
+      stroke-dashoffset: 1;
+    }
+    to {
+      stroke-dasharray: 1;
+      stroke-dashoffset: 0;
+    }
+  }
+
+  @keyframes sb-wipe {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+}
+
+/*
+ * Paper.
+ *
+ * One rule set, deliberately blunt: hide everything, unhide the sheet. The alternative —
+ * marking every wrapper, header and nav that should not print — needs a new rule for every
+ * layout the sheet is ever nested inside, and the day one is missed a hiker gets a blank
+ * first page and a map on the second.
+ *
+ * `visibility` rather than `display`, because visibility inherits and can be turned back on
+ * further down the tree, which is exactly the shape of "everything except this subtree".
+ * The cost is that a hidden ancestor still occupies its space — so the sheet is lifted out
+ * of the flow to the page origin, and its screen-fitting transform is dropped so that a
+ * millimetre in the layout is a millimetre on the paper.
+ */
+@media print {
+  html,
+  body {
+    background: #fff;
+    margin: 0;
+    padding: 0;
+  }
+
+  body * {
+    visibility: hidden;
+  }
+
+  [data-print-sheet],
+  [data-print-sheet] * {
+    visibility: visible;
+  }
+
+  [data-print-sheet] {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    transform: none !important;
+    box-shadow: none !important;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  /*
+   * No width or height here on purpose. The sheet is already laid out at the paper's size,
+   * from the same figure that sets `@page`, less the hair of bleed the component documents —
+   * restating it as `100%` would tie the printed sheet to whatever the containing block
+   * happens to be, which is the page area on paper but the window under a media emulator.
+   */
+
+  /*
+   * Everything above is `!important` because the sheet carries its own `position: relative`
+   * and `transform` inline — it has to, since both are computed from the paper the reader
+   * picked and the width of the window. An inline style outranks a stylesheet rule, so on
+   * paper these are the only declarations that can win.
+   */
+
+  /*
+   * The stage reserves the scaled height of the sheet so the screen page scrolls correctly.
+   * In print the sheet has left the flow, and a stage still holding its height is a second,
+   * blank page — which is the most common way a print stylesheet fails.
+   */
+  [data-print-stage] {
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  [data-print-root] {
+    min-height: 0 !important;
+  }
+
+  /* Controls, and anything else that exists to change the sheet rather than to be on it. */
+  [data-print-hide] {
+    display: none !important;
+  }
+
+  /*
+   * MapLibre draws into a canvas the print pipeline copies as-is; its overlay chrome is
+   * absolutely positioned over that canvas and would print on top of the mapped face.
+   */
+  .maplibregl-control-container,
+  .maplibregl-ctrl-attrib {
+    display: none !important;
+  }
+}

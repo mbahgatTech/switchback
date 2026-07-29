@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // The only project in the repo that needs both at once. Specs are Node — they read
+    // `process.env` and drive a browser over a socket — but the bodies passed to
+    // `page.evaluate` are compiled as browser code in the same file, so `navigator`,
+    // `caches`, and `document` have to be in scope for `tsc` to check them.
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"]
+}

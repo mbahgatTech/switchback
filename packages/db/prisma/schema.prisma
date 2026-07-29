@@ -1,0 +1,987 @@
+// Switchback data model.
+//
+// Two conventions run through this file and are worth reading before the models:
+//
+// 1. PostGIS geometry lives in `Unsupported(...)` columns. Prisma has no geometry type,
+//    and fields declared `Unsupported` are invisible to Prisma Client — they cannot be
+//    selected, written, or filtered. That is deliberate here rather than a limitation we
+//    work around: the geometry column exists for the GIST index and for spatial
+//    predicates (ST_Intersects, ST_DWithin, ST_Length), all of which run through the
+//    typed raw-SQL helpers in `src/spatial.ts`. Everything an ordinary read needs is
+//    denormalised into plain scalars alongside it, so cards, filters, and sorts are
+//    ordinary Prisma queries with no raw SQL at all.
+//
+//    Every `Unsupported` column is optional. It has to be: Prisma Client cannot supply a
+//    value on insert, so a NOT NULL geometry column would make `trail.create()` fail.
+//    Ingest writes the row, then fills the geometry in the same transaction.
+//
+// 2. Enum values match the string literals in `@switchback/core` exactly — lowercase,
+//    snake_case. `Difficulty.moderate` here is `'moderate'` there. No mapping layer, and
+//    a `zod` schema from core validates a database enum without translation.
+//
+// Indexes that Prisma cannot express (GIST on geometry, GIN on tsvector and trigram)
+// live in `prisma/spatial.sql`, applied by `npm run db:push`.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  // Neon pools connections through PgBouncer, which cannot run DDL. Migrations and
+  // `db push` need the unpooled endpoint; everything else uses the pooled one.
+  directUrl  = env("DIRECT_DATABASE_URL")
+  extensions = [postgis, pg_trgm]
+}
+
+// ---------------------------------------------------------------------------
+// Enums — mirrors of the const arrays in @switchback/core
+// ---------------------------------------------------------------------------
+
+enum Difficulty {
+  easy
+  moderate
+  hard
+}
+
+enum RouteType {
+  loop
+  out_and_back
+  point_to_point
+}
+
+enum ActivityType {
+  hiking
+  trail_running
+  backpacking
+  mountain_biking
+  road_biking
+  horseback_riding
+  snowshoeing
+  skiing
+  via_ferrata
+  scrambling
+}
+
+enum SacScale {
+  hiking
+  mountain_hiking
+  demanding_mountain_hiking
+  alpine_hiking
+  demanding_alpine_hiking
+  difficult_alpine_hiking
+}
+
+enum WaypointKind {
+  trailhead
+  summit
+  viewpoint
+  water
+  waterfall
+  lake
+  parking
+  toilets
+  shelter
+  campsite
+  junction
+  gate
+  ford
+  hazard
+}
+
+enum TrailCondition {
+  dry
+  muddy
+  snow
+  icy
+  flooded
+  overgrown
+  blowdown
+  washed_out
+  closed
+  bugs
+  crowded
+  well_marked
+  poorly_marked
+}
+
+/// Trails are only ever relations or ways. `node` exists for waypoints, which are almost
+/// always nodes — a summit, a spring, a gate.
+enum OsmElementType {
+  node
+  relation
+  way
+}
+
+/// Lifecycle of one z9 ingest tile. `empty` is distinct from `ready` with zero trails
+/// only in intent: both mean "do not re-fetch", but `empty` marks ocean and desert so
+/// the freshness sweep can skip them entirely rather than re-querying Overpass monthly.
+enum TileStatus {
+  pending
+  running
+  ready
+  empty
+  failed
+}
+
+enum JobKind {
+  ingest_tile
+  refresh_tile
+  ingest_route
+  enrich_trail
+  recompute_busyness
+  ingest_network
+}
+
+enum JobStatus {
+  queued
+  running
+  done
+  failed
+  dead
+}
+
+enum PhotoSource {
+  user
+  wikimedia
+  mapillary
+}
+
+enum ListKind {
+  custom
+  favorites
+  completed
+  want_to_do
+}
+
+enum Visibility {
+  private
+  followers
+  public
+}
+
+enum LifelineStatus {
+  active
+  completed
+  overdue
+  cancelled
+}
+
+enum UnitSystem {
+  metric
+  imperial
+}
+
+/// Light, dark, or follow the device. `system` is stored rather than resolved at write
+/// time: a reader who has never chosen should keep following their device when it flips at
+/// dusk, and collapsing the default to `light` on first save would freeze them there.
+enum ThemePreference {
+  system
+  light
+  dark
+}
+
+// ---------------------------------------------------------------------------
+// Auth — the four models Auth.js's Prisma adapter requires, plus our own columns
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  /// Display handle, used in profile URLs. Null until the user picks one.
+  username                  String?    @unique
+  bio                       String?
+  units                     UnitSystem @default(metric)
+  theme                     ThemePreference @default(system)
+  /// Plus-tier entitlement. Every Plus feature checks this one flag, so the billing
+  /// integration that eventually sets it has exactly one column to own.
+  isPlus                    Boolean    @default(false)
+  plusUntil                 DateTime?
+  /// Where "trails near me" defaults to before location permission is granted.
+  homeLng                   Float?
+  homeLat                   Float?
+  homeName                  String?
+  /// Default visibility applied to newly recorded activities.
+  defaultActivityVisibility Visibility @default(private)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts    Account[]
+  sessions    Session[]
+  reviews     Review[]
+  photos      Photo[]
+  activities  Activity[]
+  lists       TrailList[]
+  completions Completion[]
+  lifelines   LifelineSession[]
+  routes      PlannedRoute[]
+
+  @@index([createdAt])
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+/// Refresh tokens issued to the iOS app. The mobile client exchanges a provider identity
+/// token for one of these, then rotates it; `replacedBy` makes reuse of a rotated token
+/// detectable, which is the whole point of storing them rather than issuing stateless JWTs.
+model MobileRefreshToken {
+  id         String    @id @default(cuid())
+  userId     String
+  tokenHash  String    @unique
+  deviceName String?
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("mobile_refresh_tokens")
+}
+
+/// One in-flight browser-assisted sign-in from the iOS app.
+///
+/// The app cannot open Entra directly — Expo Go's redirect URI changes with the Wi-Fi and no
+/// provider will register it — so it opens *our* sign-in page in a system browser instead and
+/// this row is what survives the round trip. It carries the PKCE challenge the app kept the
+/// preimage of, the deep link the browser is allowed back to, and, once the browser has
+/// finished OIDC, the one-time code the app trades for a token pair.
+///
+/// Every field is single-use by design: `codeHash` is unique, `claimedAt` makes a replay
+/// visible, and `expiresAt` closes the window whether or not anyone came back.
+model MobileAuthRequest {
+  id String @id @default(cuid())
+
+  /// base64url SHA-256 of the verifier the app generated and never sent. Without the
+  /// preimage a stolen code is not redeemable, which is what makes the deep-link leg safe.
+  challenge   String
+  /// Where the browser is sent when OIDC finishes. Scheme allow-listed before this is stored.
+  redirectUri String
+  deviceName  String?
+
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  /// Set when the browser completes sign-in. Null means there is nothing to claim yet.
+  userId    String?
+  /// SHA-256 of the one-time code handed back over the deep link.
+  codeHash  String?   @unique
+  /// Set when the pair was issued. A second claim against the same row is a replay.
+  claimedAt DateTime?
+
+  @@index([expiresAt])
+  @@map("mobile_auth_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Trails
+// ---------------------------------------------------------------------------
+
+model Trail {
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+
+  description String?
+  regionName  String?
+  countryCode String? @db.Char(2)
+
+  // --- Source ---
+  osmType         OsmElementType?
+  osmId           BigInt?
+  /// When ingest last reconciled this trail against OSM. Drives the staleness sweep.
+  sourceUpdatedAt DateTime?
+  /// z9 tile this trail was ingested from. A trail spanning tiles is claimed by the tile
+  /// containing its first vertex, so two tiles never both create it.
+  quadkey         String?
+
+  // --- Geometry ---
+  /// Authoritative geometry. Written by ingest via raw SQL; see the header note.
+  geom         Unsupported("geometry(LineString, 4326)")?
+  centroid     Unsupported("geometry(Point, 4326)")?
+  /// The same line, simplified to a 5 m tolerance and stored as a GeoJSON LineString.
+  /// This is what every client actually renders — reading it costs no round trip through
+  /// ST_AsGeoJSON and no raw query, which matters because the map asks for hundreds at once.
+  geometryJson Json
+  centroidLng  Float
+  centroidLat  Float
+  bboxW        Float
+  bboxS        Float
+  bboxE        Float
+  bboxN        Float
+
+  // --- Derived stats ---
+  lengthM           Int
+  gainM             Int
+  lossM             Int
+  minEleM           Int
+  maxEleM           Int
+  /// Steepest grade sustained over 100 m, as a fraction. Null when the trail is shorter
+  /// than the measurement window.
+  maxSustainedGrade Float?
+  /// Tobler-derived moving time in seconds, before rest stops.
+  estimatedTimeS    Int
+  difficulty        Difficulty
+  /// Raw Shenandoah score, kept so trails can be ordered within a difficulty band.
+  difficultyScore   Float
+  routeType         RouteType
+  activityTypes     ActivityType[]
+
+  // --- OSM attributes ---
+  surface              String?
+  sacScale             SacScale?
+  dogsAllowed          Boolean?
+  wheelchairAccessible Boolean?
+  feeRequired          Boolean?
+  /// Trailhead parking spaces from a nearby `amenity=parking`, when tagged. An input to
+  /// the busyness prior, not a display field.
+  parkingCapacity      Int?
+
+  // --- Aggregates, denormalised so a card is one row ---
+  rating      Float?
+  reviewCount Int    @default(0)
+  photoCount  Int    @default(0)
+  /// Completions + recorded activities + reviews. Drives popularity sort and the
+  /// busyness prior's amplitude.
+  popularity  Int    @default(0)
+
+  primaryPhotoId String? @unique
+
+  /// tsvector over name, region, and description. Maintained at write time by ingest
+  /// rather than by a trigger or a generated column, both of which `prisma db push`
+  /// would fight with. GIN index in spatial.sql.
+  searchVector Unsupported("tsvector")?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  profile      ElevationProfile?
+  waypoints    Waypoint[]
+  reviews      Review[]
+  photos       Photo[]           @relation("TrailPhotos")
+  primaryPhoto Photo?            @relation("TrailPrimaryPhoto", fields: [primaryPhotoId], references: [id])
+  activities   Activity[]
+  listItems    TrailListItem[]
+  completions  Completion[]
+  busyness     BusynessBucket[]
+  lifelines    LifelineSession[]
+
+  @@unique([osmType, osmId])
+  @@index([quadkey])
+  @@index([difficulty])
+  @@index([lengthM])
+  @@index([gainM])
+  @@index([rating])
+  @@index([popularity])
+  @@index([sourceUpdatedAt])
+  @@map("trails")
+}
+
+/// Elevation samples, one row per trail. Split out because the profile is 100–2,000
+/// points and a search page loading 24 trail cards has no use for any of it.
+model ElevationProfile {
+  trailId        String @id
+  /// `ElevationPoint[]` from @switchback/core: { distM, eleM, lng, lat }.
+  points         Json
+  /// Resample interval the points were built at, in metres. Recorded so a future change
+  /// to the interval can be detected and the profile rebuilt rather than silently mixed.
+  spacingM       Int    @default(25)
+  /// Index into `points` of the high point — always a weather sample. Cached to avoid
+  /// scanning a 2,000-element array on every weather request.
+  highPointIndex Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trail Trail @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  @@map("elevation_profiles")
+}
+
+model Waypoint {
+  id      String       @id @default(cuid())
+  trailId String
+  kind    WaypointKind
+  name    String?
+  lng     Float
+  lat     Float
+  eleM    Float?
+  /// Distance along the trail. Null for off-route features like a parking lot 200 m
+  /// from the trailhead, which still belong to the trail but sit nowhere on its line.
+  distM   Float?
+
+  osmType OsmElementType?
+  osmId   BigInt?
+
+  point Unsupported("geometry(Point, 4326)")?
+
+  trail Trail @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  @@index([trailId, distM])
+  @@index([trailId, kind])
+  @@map("waypoints")
+}
+
+// ---------------------------------------------------------------------------
+// Lazy ingest
+// ---------------------------------------------------------------------------
+
+/// One z9 tile of the world, and what we know about it. This table is the whole
+/// on-demand design: a viewport is covered with quadkeys, ready tiles are served from
+/// Postgres immediately, and missing ones are queued.
+model IngestTile {
+  quadkey String     @id
+  z       Int
+  x       Int
+  y       Int
+  status  TileStatus @default(pending)
+
+  bboxW Float
+  bboxS Float
+  bboxE Float
+  bboxN Float
+
+  /// When Overpass was last queried for this tile. Freshness is judged from this, not
+  /// from `updatedAt`, which a failed attempt would also bump.
+  fetchedAt  DateTime?
+  trailCount Int       @default(0)
+  attempts   Int       @default(0)
+  lastError  String?
+  /// Overpass wall-clock for the last successful fetch. Useful for spotting a tile that
+  /// is expensive enough to need splitting.
+  fetchMs    Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, fetchedAt])
+  @@map("ingest_tiles")
+}
+
+/// The routing network's own tile ledger, deliberately separate from `IngestTile`.
+///
+/// Same idea, different grain and different query: z12 instead of z9, every foot-legal way
+/// instead of named trails only. Sharing one table would mean one `status` for two fetches
+/// that succeed and fail independently — a tile whose trails landed but whose network
+/// query timed out would read as READY and quietly plan nothing.
+model RoutingTile {
+  quadkey String     @id
+  z       Int
+  x       Int
+  y       Int
+  status  TileStatus @default(pending)
+
+  bboxW Float
+  bboxS Float
+  bboxE Float
+  bboxN Float
+
+  fetchedAt    DateTime?
+  segmentCount Int       @default(0)
+  /// Vertices across all segments. The number that predicts graph build time, and the one
+  /// worth watching when a city tile starts costing seconds instead of milliseconds.
+  nodeCount    Int       @default(0)
+  attempts     Int       @default(0)
+  lastError    String?
+  fetchMs      Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  segments PathSegmentRow[]
+
+  @@index([status, fetchedAt])
+  @@map("routing_tiles")
+}
+
+/// One contiguous run of one OSM way, as cached for routing.
+///
+/// A run rather than a way: a way clipped at the tile edge is split at the hole and stored
+/// as two rows, so `(quadkey, wayId)` is not unique and `run` disambiguates. Overlap
+/// between neighbouring tiles is expected and is not deduplicated here — `buildGraph`
+/// reconciles it, because both copies carry identical OSM node coordinates and therefore
+/// produce identical node pairs. Storing the redundancy is far cheaper than a merge step
+/// that has to be correct across tile boundaries.
+///
+/// Geometry is JSON rather than PostGIS: nothing queries these by shape. They are fetched
+/// by tile, shipped to the browser verbatim, and turned into a graph there.
+model PathSegmentRow {
+  id      String @id @default(cuid())
+  quadkey String
+  wayId   BigInt
+  /// Which run of this way within this tile, from 0.
+  run     Int    @default(0)
+
+  kind     String
+  name     String?
+  surface  String?
+  sacScale SacScale?
+
+  /// `[lng, lat, lng, lat, …]`, flattened — half the JSON of an array of pairs, and the
+  /// exact wire shape, so serving a tile is a column read with no transformation.
+  coords Json
+  /// Ground elevation in metres, one per coordinate pair.
+  eleM   Json
+
+  bboxW Float
+  bboxS Float
+  bboxE Float
+  bboxN Float
+
+  createdAt DateTime @default(now())
+
+  tile RoutingTile @relation(fields: [quadkey], references: [quadkey], onDelete: Cascade)
+
+  @@unique([quadkey, wayId, run])
+  @@index([quadkey])
+  @@map("path_segments")
+}
+
+/// A route somebody planned, as opposed to a trail somebody catalogued.
+///
+/// Named `PlannedRoute` because `Route` would sit one letter from the existing `RouteType`
+/// enum in every import list, and because "planned" is the distinction that matters: this
+/// is a line a user drew, not a line OSM asserts exists.
+///
+/// The anchors are kept alongside the geometry rather than derived from it. Geometry alone
+/// cannot be edited — reopening a route in the planner needs the points the user clicked,
+/// and which legs they chose to draw freehand — and re-deriving anchors from a line is
+/// guesswork that would silently rewrite somebody's route the first time they moved a
+/// waypoint.
+model PlannedRoute {
+  id     String @id @default(cuid())
+  userId String
+  slug   String
+
+  name        String
+  description String?
+
+  activityType ActivityType @default(hiking)
+  visibility   Visibility   @default(private)
+
+  /// Simplified to 5 m, the same treatment `Trail.geometryJson` gets, for the same reason:
+  /// this is what the map draws and the wire carries.
+  geometryJson Json
+  /// `[{ lng, lat, freehand }]`, in order. The editable source of the geometry above.
+  anchors      Json
+  /// `ElevationPoint[]` at 25 m spacing, matching `ElevationProfile.points`.
+  profile      Json
+
+  lengthM           Float
+  gainM             Float
+  lossM             Float
+  minEleM           Float
+  maxEleM           Float
+  maxSustainedGrade Float @default(0)
+  estimatedTimeS    Int   @default(0)
+
+  centroidLng Float
+  centroidLat Float
+  bboxW       Float
+  bboxS       Float
+  bboxE       Float
+  bboxN       Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, slug])
+  @@index([userId, updatedAt])
+  @@index([visibility, updatedAt])
+  @@map("planned_routes")
+}
+
+/// Durable work queue. `waitUntil` kicks work off immediately for latency; this table,
+/// drained by a cron every minute, is what makes it survive a deploy or a timeout.
+/// `lockedAt` + `lockedBy` give at-least-once delivery with a visibility timeout —
+/// every job handler is written to be idempotent, which is what makes that safe.
+model IngestJob {
+  id        String    @id @default(cuid())
+  kind      JobKind
+  /// Deduplication key, e.g. `ingest_tile:0213012`. A second request for a tile already
+  /// queued collides here instead of enqueuing duplicate work.
+  dedupeKey String    @unique
+  payload   Json
+  status    JobStatus @default(queued)
+
+  priority    Int       @default(0)
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  /// Earliest time this job may run. Backoff sets it forward rather than sleeping.
+  runAfter    DateTime  @default(now())
+  lockedAt    DateTime?
+  lockedBy    String?
+  lastError   String?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([status, runAfter, priority])
+  @@index([lockedAt])
+  @@map("ingest_jobs")
+}
+
+// ---------------------------------------------------------------------------
+// User-generated content
+// ---------------------------------------------------------------------------
+
+model Review {
+  id      String @id @default(cuid())
+  trailId String
+  userId  String
+
+  rating       Int
+  body         String?
+  /// The date they actually hiked it, which is often not the date they wrote this.
+  /// Conditions are only meaningful relative to this, not to `createdAt`.
+  hikedOn      DateTime?
+  conditions   TrailCondition[]
+  activityType ActivityType?
+  /// Their own recorded activity, when the review was written from one.
+  activityId   String?          @unique
+
+  helpfulCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trail    Trail     @relation(fields: [trailId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activity Activity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+  photos   Photo[]
+
+  /// One review per trail per person — the edit path updates, it does not append.
+  @@unique([trailId, userId])
+  @@index([trailId, createdAt])
+  @@index([userId, createdAt])
+  @@map("reviews")
+}
+
+model Photo {
+  id     String      @id @default(cuid())
+  source PhotoSource
+
+  trailId    String?
+  reviewId   String?
+  activityId String?
+  userId     String?
+
+  /// Key in R2 for user uploads; the upstream id for Commons and Mapillary. Unique per
+  /// source *and trail*, not per source alone: Commons geosearch is a radius query, so two
+  /// footpaths a few hundred metres apart legitimately return the same photograph. Keyed on
+  /// source alone, the second trail's upsert would move the row off the first — and `distM`
+  /// below proves the row was always per-trail anyway, since a distance along the trail
+  /// means nothing without knowing which trail.
+  sourceId String
+  url      String
+  thumbUrl String?
+  width    Int?
+  height   Int?
+  blurhash String?
+
+  /// SPDX-ish licence identifier and the attribution line to render. Required for
+  /// Commons and Mapillary, null for user uploads, which are covered by our terms.
+  license     String?
+  attribution String?
+  sourceUrl   String?
+
+  caption    String?
+  capturedAt DateTime?
+  lng        Float?
+  lat        Float?
+  /// Distance along the trail, so photos can be pinned to the elevation profile.
+  distM      Float?
+
+  createdAt DateTime @default(now())
+
+  trail     Trail?    @relation("TrailPhotos", fields: [trailId], references: [id], onDelete: Cascade)
+  primaryOf Trail?    @relation("TrailPrimaryPhoto")
+  review    Review?   @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  activity  Activity? @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  user      User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([source, sourceId, trailId])
+  @@index([trailId, createdAt])
+  @@index([reviewId])
+  @@index([activityId])
+  @@index([userId, createdAt])
+  @@map("photos")
+}
+
+// ---------------------------------------------------------------------------
+// Recorded activities
+// ---------------------------------------------------------------------------
+
+model Activity {
+  id      String  @id @default(cuid())
+  userId  String
+  /// Null for a free-form recording that matched no trail we hold.
+  trailId String?
+
+  name         String?
+  activityType ActivityType @default(hiking)
+  visibility   Visibility   @default(private)
+  notes        String?
+
+  startedAt    DateTime
+  endedAt      DateTime?
+  /// Moving time excludes pauses; elapsed time does not. Both are shown, because the
+  /// gap between them is the rest-stop time every pace estimate needs to be judged against.
+  movingTimeS  Int       @default(0)
+  elapsedTimeS Int       @default(0)
+  distanceM    Int       @default(0)
+  gainM        Int       @default(0)
+  lossM        Int       @default(0)
+  minEleM      Int?
+  maxEleM      Int?
+  avgSpeedMps  Float?
+  maxSpeedMps  Float?
+  avgHeartRate Int?
+  maxHeartRate Int?
+  calories     Int?
+
+  /// Simplified track as a GeoJSON LineString, for rendering. Full-fidelity samples
+  /// live in `samples`.
+  geometryJson Json?
+  geom         Unsupported("geometry(LineString, 4326)")?
+
+  /// Set once the client has uploaded every sample. An activity recorded offline and
+  /// synced later is incomplete until this flips, and is excluded from aggregates.
+  syncedAt DateTime?
+  device   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trail      Trail?           @relation(fields: [trailId], references: [id], onDelete: SetNull)
+  samples    ActivitySample[]
+  photos     Photo[]
+  review     Review?
+  completion Completion?
+  lifeline   LifelineSession?
+
+  @@index([userId, startedAt])
+  @@index([trailId, startedAt])
+  @@index([visibility, startedAt])
+  @@map("activities")
+}
+
+/// Full-fidelity track points. Recordings are downsampled before they are persisted —
+/// 1 Hz for six hours is ~21,600 fixes, and `simplifyLine` at a 2 m tolerance removes
+/// the great majority of them without moving any rendered pixel or changing any split.
+model ActivitySample {
+  id         String @id @default(cuid())
+  activityId String
+  /// Seconds since the activity started. Cheaper to store and to window than a timestamp,
+  /// and splits are computed against it directly.
+  t          Int
+  lng        Float
+  lat        Float
+  eleM       Float?
+  accuracyM  Float?
+  speedMps   Float?
+  heartRate  Int?
+  cadence    Int?
+
+  activity Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  /// Unique, not merely indexed, and that is what makes uploading a batch twice harmless.
+  /// A phone on a ridge retries; a retry that lands after the first attempt succeeded would
+  /// otherwise write every fix a second time — the totals would survive (`cleanFixes` drops
+  /// duplicate seconds) but the stored track would double, the GPX would stutter, and the
+  /// sample cap would arrive at half the hike. With the constraint here, `skipDuplicates`
+  /// on `createMany` means exactly what the recorder assumes it means.
+  @@unique([activityId, t])
+  @@map("activity_samples")
+}
+
+// ---------------------------------------------------------------------------
+// Lists, completions
+// ---------------------------------------------------------------------------
+
+model TrailList {
+  id          String   @id @default(cuid())
+  userId      String
+  kind        ListKind @default(custom)
+  name        String
+  description String?
+  slug        String
+  isPublic    Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items TrailListItem[]
+
+  @@unique([userId, slug])
+  /// Exactly one favourites list, one completed list, and one want-to-do list per user;
+  /// custom lists are unconstrained. Enforced in application code because Prisma cannot
+  /// express a partial unique index — see the partial index in spatial.sql, which does.
+  @@index([userId, kind])
+  @@map("trail_lists")
+}
+
+model TrailListItem {
+  id       String  @id @default(cuid())
+  listId   String
+  trailId  String
+  position Int     @default(0)
+  note     String?
+
+  addedAt DateTime @default(now())
+
+  list  TrailList @relation(fields: [listId], references: [id], onDelete: Cascade)
+  trail Trail     @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, trailId])
+  @@index([listId, position])
+  @@map("trail_list_items")
+}
+
+/// A trail marked done. Separate from an Activity because plenty of completions are
+/// logged after the fact with no recording, and one trail can be completed many times.
+model Completion {
+  id         String  @id @default(cuid())
+  userId     String
+  trailId    String
+  activityId String? @unique
+
+  completedAt DateTime
+  createdAt   DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trail    Trail     @relation(fields: [trailId], references: [id], onDelete: Cascade)
+  activity Activity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+
+  @@index([userId, completedAt])
+  @@index([trailId, completedAt])
+  @@map("completions")
+}
+
+// ---------------------------------------------------------------------------
+// Busyness
+// ---------------------------------------------------------------------------
+
+/// One (trail, weekday, hour) cell of the busy-times curve.
+///
+/// `modeled` is the parametric prior — archetype curve × popularity × parking capacity.
+/// `observed` is an EWMA over start times of activities our users actually recorded.
+/// The value shown blends the two by `sampleCount`, so a trail with four recorded visits
+/// is still mostly prior and says so, and one with four hundred is essentially measured.
+model BusynessBucket {
+  trailId   String
+  /// 0 = Sunday, matching `Date#getDay`.
+  dayOfWeek Int
+  hour      Int
+
+  modeled     Float @default(0)
+  observed    Float @default(0)
+  sampleCount Int   @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  trail Trail @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  @@id([trailId, dayOfWeek, hour])
+  @@map("busyness_buckets")
+}
+
+// ---------------------------------------------------------------------------
+// Lifeline
+// ---------------------------------------------------------------------------
+
+/// A safety session: someone knows where you are and when you are due back.
+///
+/// `token` is the unguessable share link. It is the only credential the contact needs,
+/// so it is generated with 256 bits of entropy and the session it unlocks is read-only
+/// and expires — a leaked link exposes one hike's position, not an account.
+model LifelineSession {
+  id         String  @id @default(cuid())
+  userId     String
+  activityId String? @unique
+  trailId    String?
+
+  token  String         @unique
+  status LifelineStatus @default(active)
+
+  contactName  String?
+  contactEmail String?
+  contactPhone String?
+  message      String?
+
+  startedAt         DateTime  @default(now())
+  expectedReturnAt  DateTime
+  endedAt           DateTime?
+  /// Last position ping. Written far more often than any other column here, which is why
+  /// position lives on this row rather than in a separate ping table nobody would read.
+  lastPingAt        DateTime?
+  lastLng           Float?
+  lastLat           Float?
+  lastEleM          Float?
+  lastBatteryPct    Int?
+  overdueNotifiedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activity Activity? @relation(fields: [activityId], references: [id], onDelete: SetNull)
+  trail    Trail?    @relation(fields: [trailId], references: [id], onDelete: SetNull)
+
+  @@index([userId, startedAt])
+  /// Drives the overdue sweep: find active sessions past their return time.
+  @@index([status, expectedReturnAt])
+  @@map("lifeline_sessions")
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "preserve",
+    "allowJs": true,
+    "incremental": true,
+    "types": ["node"],
+    "plugins": [{ "name": "next" }],
+    // Mirrors the root tsconfig: point at the package sources rather than the symlinks so
+    // typecheck behaves the same here, at the root, and in vitest. No `baseUrl` — TS 6
+    // deprecates it, and `paths` already resolve relative to this file.
+    "paths": {
+      "@/*": ["./src/*"],
+      "@switchback/core": ["../../packages/core/src/index.ts"],
+      "@switchback/core/*": ["../../packages/core/src/*"],
+      "@switchback/geo": ["../../packages/geo/src/index.ts"],
+      "@switchback/geo/*": ["../../packages/geo/src/*"],
+      "@switchback/db": ["../../packages/db/src/index.ts"],
+      "@switchback/db/*": ["../../packages/db/src/*"],
+      "@switchback/api": ["../../packages/api/src/index.ts"],
+      "@switchback/api/*": ["../../packages/api/src/*"],
+      "@switchback/ui": ["../../packages/ui/src/index.ts"],
+      "@switchback/ui/*": ["../../packages/ui/src/*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules", ".next"]
+}
