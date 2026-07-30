@@ -61,6 +61,12 @@
 # private on the free plan — so the rule would have been a note in a README that the next
 # person in a hurry ignores. Refusing to deploy is enforcement the free plan cannot switch
 # off: push straight to master and the gates still run, but nothing ships.
+#
+# That check needs `pull-requests: read` named explicitly on its job. This repository's
+# default token permission is "read", which reads like it grants read everywhere and does
+# not — it is GitHub's restricted default, `contents` and `packages` only. Asking for the
+# pull requests of a commit without the scope returns 403 "Resource not accessible by
+# integration", which is a sentence about permissions wearing the costume of a verdict.
 name: CI
 
 on:
@@ -278,6 +284,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # Naming any permission replaces the default set rather than adding to it, so `contents`
+    # is restated even though nothing here checks out — a later step that does would
+    # otherwise fail for a reason nobody would look for in this block.
+    permissions:
+      contents: read
+      pull-requests: read
+
     # Shows up as a deployment on the commit, with a link, and gives somewhere to hang a
     # required reviewer later without touching this file.
     environment:
@@ -291,8 +304,15 @@ jobs:
       # merge leaves a subject line indistinguishable from a direct commit — inferring it
       # from text would pass exactly the pushes it exists to catch. GitHub takes a moment to
       # index a freshly merged commit, so a single call would fail honest merges; hence the
-      # retry, and hence a failure meaning "there is no pull request" rather than "the API
-      # was not ready yet".
+      # retry.
+      #
+      # A failed *call* and an empty *answer* are kept apart, because the first version of
+      # this step ran them together and refused its own merge commit: the API was returning
+      # 403 for a missing scope and `|| echo 0` was reading that as "no pull request". A
+      # check that cannot tell "you skipped review" from "I could not ask" is not a check,
+      # so anything that is not a clean count now fails immediately and says which it was.
+      # The unreadable-count branch is the same guard one layer down — an absent or unhappy
+      # `jq` produces empty output, and empty compares as zero if you let it.
       - name: Refuse a commit that did not arrive through a pull request
         env:
           GH_TOKEN: ${{ github.token }}
@@ -300,14 +320,32 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           for attempt in 1 2 3 4 5 6; do
-            found=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq 'length' 2>/dev/null || echo 0)
-            if [ "${found:-0}" -gt 0 ]; then
-              gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[] | "From #\(.number): \(.title)"'
+            if ! body=$(gh api "repos/$REPO/commits/$SHA/pulls" 2>&1); then
+              echo "::error::Could not ask GitHub which pull request this commit came from."
+              echo "::error::This is not a verdict on the commit — the lookup itself failed:"
+              printf '%s\n' "$body"
+              exit 1
+            fi
+
+            count=$(printf '%s' "$body" | jq 'length' 2>&1)
+            case "$count" in
+              '' | *[!0-9]*)
+                echo "::error::Could not count the pull requests GitHub returned."
+                echo "::error::This is not a verdict on the commit — reading the reply failed:"
+                printf '%s\n' "$count"
+                exit 1
+                ;;
+            esac
+
+            if [ "$count" -gt 0 ]; then
+              printf '%s' "$body" | jq -r '.[] | "From #\(.number): \(.title)"'
               exit 0
             fi
+
             echo "attempt $attempt — GitHub reports no pull request for this commit yet"
             sleep 10
           done
+
           echo "::error::$SHA was pushed straight to master, so it will not be deployed."
           echo "::error::Branch it and open a pull request:"
           echo "::error::  git switch -c <branch> && git push -u origin <branch> && gh pr create"
