@@ -5,5 +5,10 @@
       "path": "/api/cron/drain",
       "schedule": "17 4 * * *"
     }
-  ]
+  ],
+  "git": {
+    "deploymentEnabled": {
+      "master": false
+    }
+  }
 }

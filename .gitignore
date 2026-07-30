@@ -71,4 +71,6 @@ npm-debug.log*
 yarn-error.log*
 
 # vercel
+# Holds project.json — the project and org ids the CLI links this checkout to. Not a
+# credential, but machine-local: a second clone gets its own on `vercel link`.
 .vercel

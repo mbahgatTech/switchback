@@ -1,4 +1,4 @@
-# The gates that can run on someone else's machine.
+# The gates that can run on someone else's machine — and the deploy they guard.
 #
 # Four of the five gates are hermetic — format:check, typecheck, lint and vitest touch
 # nothing outside the repo — so they run on every push and every pull request. The browser
@@ -15,6 +15,43 @@
 #
 # So the browser suite runs nightly and on demand: one z9 tile, once a day, which is well
 # inside any fair-use reading. Contributors run it locally, where the tile is already there.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **How production gets deployed, and why it looks like this.**
+#
+# The Vercel project is connected to this repository, so out of the box every push to
+# `master` deployed straight to production whether or not the gates passed. That is a
+# deployment mechanism, not a pipeline: the one thing a pipeline has to be able to do is
+# refuse. So `apps/web/vercel.json` sets `git.deploymentEnabled.master: false`, which turns
+# off the automatic production build, and the `deploy` job below triggers it instead — after
+# `gates` is green, and only then. Pull requests keep their automatic preview deployments,
+# because a preview is a throwaway URL nobody is relying on and having one to look at while
+# reviewing is worth more than the purity.
+#
+# The trigger is a **deploy hook** rather than `vercel deploy --prod`, and that is forced
+# rather than chosen. A CLI deploy needs a Vercel API token; Vercel refuses to mint one from
+# a CLI-issued credential ("Cannot create tokens for this app"), so the only token that could
+# go in `VERCEL_TOKEN` is one a human makes by hand in the dashboard. A deploy hook is a
+# project-scoped URL that can be created through the API, which means this pipeline could be
+# built end to end without leaving a manual step in the middle of it. The trade is that a
+# hook is fire-and-forget: it returns a job id and tells you nothing further.
+#
+# The two settings do not collide, which is worth writing down because it looks like they
+# should. `git.deploymentEnabled` gates deployments "upon commits" — the Git integration's
+# push path, and nothing else. The setting that stops a hook firing is the deprecated
+# `github.enabled: false`, which this project does not set and must not.
+#
+# A hook deploys the *tip of its branch* at the moment it is called, not the commit that
+# called it. Two pushes in quick succession would therefore have the first job polling for a
+# SHA the second one just replaced — which is why `cancel-in-progress` above is load-bearing
+# rather than a nicety: the superseded run is cancelled before it can wait twenty minutes to
+# fail at something that is not a defect.
+#
+# Hence `/api/version`. The job polls the production alias until it reports back the SHA that
+# was pushed. That is a better check than the deployment record it replaces — it proves the
+# build finished, the alias moved, *and* the app can serve a request, rather than proving a
+# row somewhere reads READY.
 name: CI
 
 on:
@@ -156,3 +193,150 @@ jobs:
           name: playwright-report
           path: playwright-report/
           retention-days: 14
+
+  # ---------------------------------------------------------------------------------------
+  # Production. Only ever reached from `master`, and only ever behind green gates.
+  # ---------------------------------------------------------------------------------------
+
+  migrate:
+    name: production schema
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Neon, from repository secrets. The pooled endpoint for queries and the direct one for
+      # DDL — `schema.prisma` names the second as `directUrl` because PgBouncer will not carry
+      # a `CREATE INDEX`. Nothing else in this workflow sees these; the two jobs above run
+      # against their own throwaway Postgres service.
+      #
+      # This runs here rather than from a developer's machine for a boring, concrete reason:
+      # a VPN that routes 5432 into a black hole is common enough, and the person who owns
+      # this repository is behind one. A runner is not.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # One commit of history, so the step below can ask what this push actually changed.
+          fetch-depth: 2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # There are no migration files in this repository — `db push` reconciles the database
+      # to `schema.prisma` — so there is no filename to key off and the question has to be
+      # asked of the diff. Anything unreadable counts as changed: `db push` against a matching
+      # schema is a few seconds and a no-op, and `spatial.sql` is written `IF NOT EXISTS`
+      # throughout, so the cost of a false positive is nil and the cost of a false negative is
+      # a deployment whose code expects a column that is not there.
+      - name: Did the schema change?
+        id: schema
+        run: |
+          if ! git rev-parse HEAD^ >/dev/null 2>&1; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No previous commit to compare against — running the push."
+            exit 0
+          fi
+          if git diff --name-only HEAD^ HEAD | grep -q '^packages/db/prisma/'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only HEAD^ HEAD | grep '^packages/db/prisma/' | sed 's/^/  /'
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change under packages/db/prisma — leaving production alone."
+          fi
+
+      - if: steps.schema.outputs.changed == 'true'
+        run: npm run db:generate
+
+      # No `--accept-data-loss`, deliberately. Prisma refuses a destructive reconciliation
+      # without it and cannot prompt in CI, so a change that would drop a column fails this
+      # job — and therefore blocks the deploy — instead of quietly executing against the one
+      # database with real data in it. Making that change is then a manual, deliberate act.
+      - if: steps.schema.outputs.changed == 'true'
+        run: npm run db:push
+
+  deploy:
+    name: deploy production
+    needs: [gates, migrate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Shows up as a deployment on the commit, with a link, and gives somewhere to hang a
+    # required reviewer later without touching this file.
+    environment:
+      name: production
+      url: https://switchback-three.vercel.app
+
+    steps:
+      # A hook is a URL and the URL is the credential, so it is passed through the environment
+      # rather than interpolated into the command line, where it would be visible to anything
+      # reading the process table on the runner. GitHub masks it in the log either way.
+      - name: Trigger the Vercel build
+        env:
+          DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::error::VERCEL_DEPLOY_HOOK is not set. See the note at the top of this file."
+            exit 1
+          fi
+          status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$DEPLOY_HOOK")
+          echo "Deploy hook returned $status"
+          [ "$status" = "201" ] || [ "$status" = "200" ]
+
+      # The hook returns a job id and nothing else, so liveness is confirmed from the outside:
+      # poll the production alias until it reports the commit that was just pushed. This is
+      # deliberately end-to-end — it clears only when the build has finished, the alias has
+      # moved, and the running app can answer a request.
+      - name: Wait for the alias to serve this commit
+        env:
+          SITE: https://switchback-three.vercel.app
+          SHA: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 90); do
+            body=$(curl -fsS --max-time 20 "$SITE/api/version" 2>/dev/null || true)
+            live=$(printf '%s' "$body" | jq -r '.commit // empty' 2>/dev/null || true)
+            where=$(printf '%s' "$body" | jq -r '.environment // empty' 2>/dev/null || true)
+
+            if [ "$live" = "$SHA" ] && [ "$where" = "production" ]; then
+              echo "Live: $SHA"
+              exit 0
+            fi
+
+            # Every tenth attempt, so a stuck deploy is diagnosable from the log without the
+            # log being ninety lines of the same sentence.
+            if [ $((attempt % 10)) -eq 1 ]; then
+              echo "attempt $attempt — serving ${live:-<nothing>} (${where:-unknown}), want $SHA"
+            fi
+            sleep 10
+          done
+
+          echo "::error::The production alias never reported $SHA. The build may have failed —"
+          echo "::error::check the Vercel dashboard for this project."
+          exit 1
+
+      # A smoke test, because "the alias moved" and "the site works" are different claims and
+      # only one of them has been proven so far. These five are the load-bearing routes: the
+      # landing page, the map, a trail read out of Postgres, the attribution ODbL requires,
+      # and the manifest without which none of it installs.
+      - name: Smoke-test the live site
+        env:
+          SITE: https://switchback-three.vercel.app
+        run: |
+          failed=0
+          for path in / /explore /trails/llanberis-path /attribution /manifest.webmanifest; do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$SITE$path" || echo 000)
+            printf '%s  %s\n' "$status" "$path"
+            [ "$status" = "200" ] || failed=1
+          done
+          [ "$failed" -eq 0 ] || {
+            echo "::error::A production route did not return 200."
+            exit 1
+          }
