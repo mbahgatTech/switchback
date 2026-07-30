@@ -52,6 +52,15 @@
 # was pushed. That is a better check than the deployment record it replaces — it proves the
 # build finished, the alias moved, *and* the app can serve a request, rather than proving a
 # row somewhere reads READY.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **Everything reaches master through a pull request**, and the `deploy` job is where that
+# is enforced rather than merely intended. The obvious place would be a branch ruleset, but
+# rulesets and branch protection need GitHub Pro on a private repository and this one is
+# private on the free plan — so the rule would have been a note in a README that the next
+# person in a hurry ignores. Refusing to deploy is enforcement the free plan cannot switch
+# off: push straight to master and the gates still run, but nothing ships.
 name: CI
 
 on:
@@ -276,6 +285,34 @@ jobs:
       url: https://switchback-three.vercel.app
 
     steps:
+      # The pull-request rule, enforced at the only point where enforcement is free.
+      #
+      # The association is queried rather than read off the commit message, because a squash
+      # merge leaves a subject line indistinguishable from a direct commit — inferring it
+      # from text would pass exactly the pushes it exists to catch. GitHub takes a moment to
+      # index a freshly merged commit, so a single call would fail honest merges; hence the
+      # retry, and hence a failure meaning "there is no pull request" rather than "the API
+      # was not ready yet".
+      - name: Refuse a commit that did not arrive through a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            found=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq 'length' 2>/dev/null || echo 0)
+            if [ "${found:-0}" -gt 0 ]; then
+              gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[] | "From #\(.number): \(.title)"'
+              exit 0
+            fi
+            echo "attempt $attempt — GitHub reports no pull request for this commit yet"
+            sleep 10
+          done
+          echo "::error::$SHA was pushed straight to master, so it will not be deployed."
+          echo "::error::Branch it and open a pull request:"
+          echo "::error::  git switch -c <branch> && git push -u origin <branch> && gh pr create"
+          exit 1
+
       # A hook is a URL and the URL is the credential, so it is passed through the environment
       # rather than interpolated into the command line, where it would be visible to anything
       # reading the process table on the runner. GitHub masks it in the log either way.
