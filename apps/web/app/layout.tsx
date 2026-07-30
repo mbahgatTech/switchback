@@ -46,14 +46,21 @@ export const metadata: Metadata = {
   description: BRAND.tagline,
   applicationName: BRAND.name,
   /*
-   * What iOS reads instead of the manifest.
+   * Launching from the home screen without the address bar, on two eras of iOS.
    *
-   * Safari has never implemented `display: standalone` from the web app manifest. Added to
-   * the home screen without these two tags, the site opens in a Safari tab with the address
-   * bar and the toolbar taking a third of a phone screen — which for a map is the difference
-   * between an app and a bookmark. `capable` is what iOS actually keys the standalone launch
-   * off; `title` is the home-screen label, and without it the launcher uses `<title>`, which
-   * on the start URL reads "Explore · Switchback" and gets truncated to "Explore".
+   * Since iOS 17 Safari reads the manifest's `display` member, and the `standalone` in
+   * `manifest.ts` is what actually does this on any current phone. Before 17 the manifest was
+   * ignored and the launch keyed off a meta tag instead — and added to the home screen
+   * without it, the site opens in a Safari tab with the address bar and toolbar taking a
+   * third of the screen, which for a map is the difference between an app and a bookmark.
+   *
+   * `capable: true` used to emit that tag. It now emits the standardised
+   * `mobile-web-app-capable`, which iOS 16 and earlier do not recognise, so the Apple-prefixed
+   * name is set by hand below. Neither line costs anything; the hand-written one is the only
+   * thing standing between an older phone and a bookmark.
+   *
+   * `title` is the label under the icon. Without it the launcher falls back to `<title>`,
+   * which on the start URL reads "Explore · Switchback" and gets truncated to "Explore".
    *
    * No `statusBarStyle`. The only value with an effect is `black-translucent`, which pulls
    * the page up under the clock and the battery — and this page's top edge is the neatline
@@ -61,6 +68,7 @@ export const metadata: Metadata = {
    * it does not require the status bar to be given away.
    */
   appleWebApp: { capable: true, title: BRAND.name },
+  other: { 'apple-mobile-web-app-capable': 'yes' },
 };
 
 /**
