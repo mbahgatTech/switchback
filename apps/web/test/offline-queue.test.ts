@@ -1,12 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ReviewWrite } from '@switchback/core';
 import {
+  adoptPendingReview,
   flushPendingReviews,
   getPendingReview,
+  holdReviewsFor,
   isUnreachable,
   listPendingReviews,
   pendingReview,
   putPendingReview,
+  releaseReviewsFor,
+  type FlushOptions,
+  type FlushResult,
 } from '../src/offline/queue';
 
 /**
@@ -37,8 +42,16 @@ interface FakeRequest<T> {
  * assigns its handlers *after* the call that will invoke them — a fake that fired
  * synchronously would call a handler that is still null and hang every promise.
  */
-function createFakeIndexedDB(): unknown {
+function createFakeIndexedDB(seed: Record<string, Array<Record<string, unknown>>> = {}): unknown {
   const stores = new Map<string, Map<string, unknown>>();
+  const keyPaths = new Map<string, string>();
+
+  // Rows the browser already held before the version this test is exercising. Seeded with the
+  // key they were stored under, because a store that predates the upgrade predates its key
+  // path too — which is exactly what the upgrade has to cope with.
+  for (const [name, rows] of Object.entries(seed)) {
+    stores.set(name, new Map(rows.map((row) => [String(row.trailId ?? row.key), row])));
+  }
 
   function transaction(_name: string, _mode: string) {
     const tx: {
@@ -73,9 +86,11 @@ function createFakeIndexedDB(): unknown {
       return {
         getAll: () => request(() => [...rows.values()]),
         get: (key: string) => request(() => rows.get(key)),
-        put: (row: { trailId: string }) =>
+        // The key path the store was created with, so a fake stays honest about a schema
+        // where the two queues and the ledger no longer key on the same field.
+        put: (row: Record<string, unknown>) =>
           request(() => {
-            rows.set(row.trailId, row);
+            rows.set(String(row[keyPaths.get(name) ?? 'key']), row);
             return undefined;
           }),
         delete: (key: string) =>
@@ -91,9 +106,14 @@ function createFakeIndexedDB(): unknown {
 
   const db = {
     objectStoreNames: { contains: (name: string) => stores.has(name) },
-    createObjectStore: (name: string) => {
+    createObjectStore: (name: string, options?: { keyPath?: string }) => {
       stores.set(name, new Map<string, unknown>());
+      if (options?.keyPath) keyPaths.set(name, options.keyPath);
       return {};
+    },
+    deleteObjectStore: (name: string) => {
+      stores.delete(name);
+      keyPaths.delete(name);
     },
     transaction,
     close: () => undefined,
@@ -101,12 +121,16 @@ function createFakeIndexedDB(): unknown {
 
   return {
     open: () => {
-      const request: FakeRequest<typeof db> = {
+      const request: FakeRequest<typeof db> & { transaction?: unknown } = {
         result: db,
         error: null,
         onsuccess: null,
         onerror: null,
         onupgradeneeded: null,
+        // The version-change transaction, which the upgrade uses to carry the old review
+        // queue into the new one. A real one spans the whole upgrade; this one is a plain
+        // transaction over the same stores, which is all `carryReviewsForward` asks of it.
+        transaction: transaction('upgrade', 'versionchange'),
       };
       queueMicrotask(() => {
         request.onupgradeneeded?.();
@@ -115,6 +139,17 @@ function createFakeIndexedDB(): unknown {
       return request;
     },
   };
+}
+
+/** The one hiker every case below runs as, unless it says otherwise. */
+const HIKER = 'hiker-a';
+
+/** `flushPendingReviews`, as that hiker. Ownership gets its own block at the end. */
+function flush(
+  post: (write: ReviewWrite) => Promise<unknown>,
+  options: Partial<FlushOptions> = {},
+): Promise<FlushResult> {
+  return flushPendingReviews(post, { readerId: HIKER, ...options });
 }
 
 const write = (trailId: string, rating: number): ReviewWrite => ({
@@ -126,7 +161,7 @@ const write = (trailId: string, rating: number): ReviewWrite => ({
 });
 
 /** Queue one row, at a chosen moment, so ordering can be asserted. */
-function queue(trailId: string, at: number): Promise<void> {
+function queue(trailId: string, at: number, userId: string | null = HIKER): Promise<void> {
   return putPendingReview(
     pendingReview({
       trailId,
@@ -134,6 +169,7 @@ function queue(trailId: string, at: number): Promise<void> {
       trailPath: `/trails/${trailId}`,
       write: write(trailId, 4),
       at,
+      userId,
     }),
   );
 }
@@ -193,7 +229,7 @@ describe('flushPendingReviews', () => {
     await queue('b', 2_000);
 
     const sentIds: string[] = [];
-    const result = await flushPendingReviews(async (payload) => {
+    const result = await flush(async (payload) => {
       sentIds.push(payload.trailId);
       return undefined;
     });
@@ -207,19 +243,19 @@ describe('flushPendingReviews', () => {
     await queue('a', 1_000);
     await queue('b', 2_000);
 
-    const result = await flushPendingReviews(async (payload) => {
+    const result = await flush(async (payload) => {
       if (payload.trailId === 'a') throw refusal('That trail no longer exists.');
       return undefined;
     });
 
     expect(result).toEqual({ sent: 1, kept: 1 });
-    const kept = await getPendingReview('a');
+    const kept = await getPendingReview(HIKER, 'a');
     expect(kept?.blocked).toBe(true);
     expect(kept?.attempts).toBe(1);
     expect(kept?.lastError).toBe('That trail no longer exists.');
     // The report itself is untouched — a refusal is not a reason to alter what was written.
     expect(kept?.write.body).toBe('The ford below the col is impassable.');
-    expect(await getPendingReview('b')).toBeNull();
+    expect(await getPendingReview(HIKER, 'b')).toBeNull();
   });
 
   it('stops at the first sign the connection is gone', async () => {
@@ -227,7 +263,7 @@ describe('flushPendingReviews', () => {
     await queue('b', 2_000);
 
     let calls = 0;
-    const result = await flushPendingReviews(async () => {
+    const result = await flush(async () => {
       calls += 1;
       throw unreachable();
     });
@@ -236,12 +272,12 @@ describe('flushPendingReviews', () => {
     expect(calls).toBe(1);
     expect(result).toEqual({ sent: 0, kept: 2 });
 
-    const first = await getPendingReview('a');
+    const first = await getPendingReview(HIKER, 'a');
     expect(first?.attempts).toBe(1);
     expect(first?.blocked).toBe(false);
     expect(first?.lastError).toBeNull();
     // Untouched, so it keeps its place in the queue rather than jumping it.
-    expect((await getPendingReview('b'))?.attempts).toBe(0);
+    expect((await getPendingReview(HIKER, 'b'))?.attempts).toBe(0);
   });
 
   it('does not refuse a report for good over a session that had expired', async () => {
@@ -250,34 +286,34 @@ describe('flushPendingReviews', () => {
     // Blocked rows are only ever retried by a person pressing a button on `/downloads`, so
     // treating "sign in to do that" as a refusal of the report loses it to a page the reader
     // has no reason to open. An auth failure waits for a session instead.
-    const refused = await flushPendingReviews(async () => {
+    const refused = await flush(async () => {
       throw unauthorised();
     });
     expect(refused).toEqual({ sent: 0, kept: 1 });
 
-    const waiting = await getPendingReview('a');
+    const waiting = await getPendingReview(HIKER, 'a');
     expect(waiting?.blocked).toBe(false);
     expect(waiting?.lastError).toBeNull();
 
     // An ordinary automatic flush after signing back in, with nothing pressed.
-    expect(await flushPendingReviews(async () => undefined)).toEqual({ sent: 1, kept: 0 });
+    expect(await flush(async () => undefined)).toEqual({ sent: 1, kept: 0 });
   });
 
   it('skips a refused report on an automatic run and retries it when asked', async () => {
     await queue('a', 1_000);
-    await flushPendingReviews(async () => {
+    await flush(async () => {
       throw refusal('That trail no longer exists.');
     });
 
     let calls = 0;
-    const automatic = await flushPendingReviews(async () => {
+    const automatic = await flush(async () => {
       calls += 1;
       return undefined;
     });
     expect(calls).toBe(0);
     expect(automatic).toEqual({ sent: 0, kept: 1 });
 
-    const asked = await flushPendingReviews(async () => undefined, { force: true });
+    const asked = await flush(async () => undefined, { force: true });
     expect(asked).toEqual({ sent: 1, kept: 0 });
   });
 
@@ -286,7 +322,7 @@ describe('flushPendingReviews', () => {
     await queue('b', 2_000);
 
     const sentIds: string[] = [];
-    const result = await flushPendingReviews(
+    const result = await flush(
       async (payload) => {
         sentIds.push(payload.trailId);
         return undefined;
@@ -308,11 +344,263 @@ describe('flushPendingReviews', () => {
         trailPath: '/trails/a',
         write: write('a', 2),
         at: 5_000,
+        userId: HIKER,
       }),
     );
 
     const rows = await listPendingReviews();
     expect(rows).toHaveLength(1);
     expect(rows[0]?.write.rating).toBe(2);
+  });
+});
+
+/**
+ * Whose report is whose.
+ *
+ * The case these exist for is one browser and two people: somebody writes a report on a ridge
+ * with no signal and closes the laptop, and the next person to sit down signs in. Before a row
+ * carried an author, the drain that runs on every page load posted the first person's words to
+ * the second person's account — under an upsert keyed on trail and user, so they published on
+ * a public trail page under a name that was not theirs, and the only copy was consumed on the
+ * way out.
+ */
+describe('a report belongs to whoever wrote it', () => {
+  const OTHER = 'hiker-b';
+
+  it('is not sent under a different account', async () => {
+    await queue('a', 1_000, HIKER);
+
+    const sent: string[] = [];
+    const result = await flushPendingReviews(
+      async (payload) => {
+        sent.push(payload.trailId);
+        return undefined;
+      },
+      { readerId: OTHER },
+    );
+
+    expect(sent).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 1 });
+    // Kept whole and still the first hiker's: not adopted, not marked as refused, not touched.
+    const kept = await getPendingReview(HIKER, 'a');
+    expect(kept?.userId).toBe(HIKER);
+    expect(kept?.attempts).toBe(0);
+    expect(kept?.write.body).toBe('The ford below the col is impassable.');
+  });
+
+  it('is not sent under a different account even when a person presses the button', async () => {
+    await queue('a', 1_000, HIKER);
+
+    // `force` is what a press on `/downloads` passes, and it overrides a refusal by the
+    // server. It does not override this: whose the report is was never in question.
+    const result = await flushPendingReviews(async () => undefined, {
+      readerId: OTHER,
+      force: true,
+      trailId: 'a',
+    });
+
+    expect(result).toEqual({ sent: 0, kept: 1 });
+    expect(await getPendingReview(HIKER, 'a')).not.toBeNull();
+  });
+
+  it('goes out the moment its own author is back', async () => {
+    await queue('a', 1_000, HIKER);
+    await flushPendingReviews(async () => undefined, { readerId: OTHER });
+    expect(await flush(async () => undefined)).toEqual({ sent: 1, kept: 0 });
+  });
+
+  it('does not displace another hiker report about the same trail', async () => {
+    await queue('a', 1_000, HIKER);
+    await queue('a', 2_000, OTHER);
+
+    // The store used to key on the trail alone, so the second of these silently replaced the
+    // first — one person's report destroyed by another person writing about the same hill.
+    expect(await listPendingReviews()).toHaveLength(2);
+    expect((await getPendingReview(HIKER, 'a'))?.userId).toBe(HIKER);
+    expect((await getPendingReview(OTHER, 'a'))?.userId).toBe(OTHER);
+
+    const sent: string[] = [];
+    await flush(async (payload) => {
+      sent.push(payload.trailId);
+      return undefined;
+    });
+    expect(sent).toEqual(['a']);
+    // Only the reader's own went. The other is untouched and still theirs.
+    expect(await getPendingReview(OTHER, 'a')).not.toBeNull();
+  });
+
+  it('is not sent at all while nobody is signed in', async () => {
+    await queue('a', 1_000, HIKER);
+    await queue('b', 2_000, null);
+
+    let calls = 0;
+    const result = await flushPendingReviews(
+      async () => {
+        calls += 1;
+        return undefined;
+      },
+      { readerId: null, force: true },
+    );
+
+    expect(calls).toBe(0);
+    expect(result).toEqual({ sent: 0, kept: 2 });
+  });
+});
+
+/**
+ * Reports the device cannot name an author for.
+ *
+ * Every row queued before authorship was recorded, plus anything written by a browser that had
+ * never been told who was signed in. The two tidy answers are both wrong — adopting them to
+ * whoever is here now is the defect itself, and discarding them destroys somebody's only copy
+ * — so nothing happens to one of these without a person saying so.
+ */
+describe('an unattributed report', () => {
+  it('is neither sent nor discarded on its own', async () => {
+    await queue('a', 1_000, null);
+
+    let calls = 0;
+    const automatic = await flush(async () => {
+      calls += 1;
+      return undefined;
+    });
+
+    expect(calls).toBe(0);
+    expect(automatic).toEqual({ sent: 0, kept: 1 });
+
+    // Nor by a person pressing "post it now" over their own queue, which passes `force`.
+    expect(await flush(async () => undefined, { force: true })).toEqual({ sent: 0, kept: 1 });
+
+    // Still there, still nobody's, still word for word what was written.
+    const kept = await getPendingReview(null, 'a');
+    expect(kept?.userId).toBeNull();
+    expect(kept?.write.body).toBe('The ford below the col is impassable.');
+  });
+
+  it('goes out once somebody claims it, under that person', async () => {
+    await queue('a', 1_000, null);
+    await adoptPendingReview('a', HIKER);
+
+    // Re-keyed, so the row is now findable as this reader's and not as nobody's.
+    expect(await getPendingReview(null, 'a')).toBeNull();
+    expect((await getPendingReview(HIKER, 'a'))?.userId).toBe(HIKER);
+
+    expect(await flush(async () => undefined)).toEqual({ sent: 1, kept: 0 });
+  });
+
+  it('is the only kind that can be claimed', async () => {
+    await queue('a', 1_000, HIKER);
+    await adoptPendingReview('a', 'hiker-b');
+
+    // Claiming looks the row up under the unattributed key and finds nothing, so the named
+    // row is untouched. A report with an author has one, and no press by anybody changes it.
+    expect((await getPendingReview(HIKER, 'a'))?.userId).toBe(HIKER);
+    expect(await listPendingReviews()).toHaveLength(1);
+  });
+});
+
+/**
+ * What happens when the browser changes hands.
+ *
+ * Mark, never delete. A queued report is the only copy of something a person wrote standing in
+ * the place they were writing about, and "somebody else has signed in" is not a reason to
+ * destroy it. It is a reason to set it aside and say so.
+ */
+describe('a change of account', () => {
+  const AT = 1_760_000_000_000;
+
+  it('marks a report rather than deleting it', async () => {
+    await queue('a', 1_000, HIKER);
+
+    await holdReviewsFor(HIKER, AT);
+
+    const held = await getPendingReview(HIKER, 'a');
+    expect(held).not.toBeNull();
+    expect(held?.heldAt).toBe(AT);
+    // The words are untouched, which is the whole point of marking instead.
+    expect(held?.write.body).toBe('The ford below the col is impassable.');
+  });
+
+  it('keeps the date the report was first set aside', async () => {
+    await queue('a', 1_000, HIKER);
+    await holdReviewsFor(HIKER, AT);
+    // Somebody else comes and goes again. The report was set aside once, not twice.
+    await holdReviewsFor(HIKER, AT + 100_000);
+
+    expect((await getPendingReview(HIKER, 'a'))?.heldAt).toBe(AT);
+  });
+
+  it('leaves rows belonging to anybody else alone', async () => {
+    await queue('a', 1_000, HIKER);
+    await queue('b', 2_000, 'hiker-b');
+    await queue('c', 3_000, null);
+
+    await holdReviewsFor(HIKER, AT);
+
+    expect((await getPendingReview('hiker-b', 'b'))?.heldAt).toBeNull();
+    expect((await getPendingReview(null, 'c'))?.heldAt).toBeNull();
+  });
+
+  it('releases the report when that person comes back', async () => {
+    await queue('a', 1_000, HIKER);
+    await holdReviewsFor(HIKER, AT);
+    await releaseReviewsFor(HIKER);
+
+    expect((await getPendingReview(HIKER, 'a'))?.heldAt).toBeNull();
+    // Being held was never a second gate in front of the drain — it is a thing to say on a
+    // screen. Ownership is the gate, and it has not changed.
+    expect(await flush(async () => undefined)).toEqual({ sent: 1, kept: 0 });
+  });
+});
+
+/**
+ * Reports already queued on real devices when this shipped.
+ *
+ * The migration is the part of this change that could actually lose something. A row written
+ * on a phone last week has no author on it, and the version bump has to decide what that
+ * means. Adopting it to whoever opens the app next is the defect the rest of this file is
+ * about; deleting it destroys the only copy of a report somebody wrote on a ridge. So it is
+ * carried across as nobody's, and stays on the device until a person says which.
+ */
+describe('the upgrade from the trail-keyed queue', () => {
+  it('carries an old row across as unattributed rather than adopting or dropping it', async () => {
+    vi.stubGlobal(
+      'indexedDB',
+      createFakeIndexedDB({
+        'pending-reviews': [
+          {
+            trailId: 'a',
+            trailName: 'Trail a',
+            trailPath: '/trails/a',
+            write: write('a', 4),
+            queuedAt: 1_000,
+            attempts: 2,
+            lastError: null,
+            blocked: false,
+          },
+        ],
+      }),
+    );
+
+    const rows = await listPendingReviews();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.userId).toBeNull();
+    expect(rows[0]?.heldAt).toBeNull();
+    expect(rows[0]?.key).toBe(':a');
+    // Everything else survives untouched, including how many times it has already been tried.
+    expect(rows[0]?.write.body).toBe('The ford below the col is impassable.');
+    expect(rows[0]?.attempts).toBe(2);
+
+    // And it is inert: no drain sends it, whoever is signed in and however hard they press.
+    let calls = 0;
+    await flush(
+      async () => {
+        calls += 1;
+        return undefined;
+      },
+      { force: true },
+    );
+    expect(calls).toBe(0);
+    expect(await listPendingReviews()).toHaveLength(1);
   });
 });

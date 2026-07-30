@@ -16,13 +16,45 @@
  * discarded and not retried forever; a report that could not be sent is retried on the next
  * reconnection. The one outcome this module will not produce is a hiker's words vanishing
  * with nobody told.
+ *
+ * **And nothing is ever sent under the wrong name.** Every row carries the account it was
+ * written under, and the drain sends only rows belonging to the reader the browser is
+ * currently acting as — see `ownedBy` in `identity.ts`. That is the second promise, and it is
+ * as strong as the first: on a shared computer a report written by the person who left is
+ * kept, marked, and shown to them when they come back, rather than published under the name
+ * of the person who arrived.
  */
 
 import type { ReviewWrite } from '@switchback/core';
-import { PENDING_REVIEWS_STORE, run } from './idb';
+import { ownedBy } from './identity';
+import { PENDING_REVIEWS_STORE, reviewKey, run } from './idb';
+
+export { reviewKey };
 
 export interface PendingReview {
-  /** The key. One report per trail, matching the constraint the server enforces. */
+  /** The key: `reviewKey(userId, trailId)`. One report per person per trail, as in Postgres. */
+  key: string;
+  /**
+   * Whose report this is, or null when the device cannot say.
+   *
+   * Stamped from `writingReader()` at the moment the row is written, which is the moment the
+   * post failed and not the moment it is finally sent — deliberately, because those can be
+   * days and a change of hands apart. Null on a row carried across from the trail-keyed store,
+   * and on one written by a browser that had never been told who was signed in. A null here is
+   * never resolved by guessing: see `identity.ts`.
+   */
+  userId: string | null;
+  /**
+   * Epoch ms when the reader who wrote this left the browser, or null.
+   *
+   * Set by `handover.ts` when the account changes, cleared when that reader comes back. It
+   * changes nothing about whether the row may be sent — `ownedBy` decides that on its own —
+   * and exists so the storage manager can say *when* a report was set aside rather than only
+   * that it was. Marking rather than deleting is the whole policy: the alternative throws
+   * away the one copy of something a hiker wrote, on the strength of somebody else signing in.
+   */
+  heldAt: number | null;
+  /** Which trail the report is about. */
   trailId: string;
   /** Enough to name the trail and link back to it with no server to ask. */
   trailName: string;
@@ -74,33 +106,112 @@ function announce(): void {
   for (const listener of listeners) listener();
 }
 
+/**
+ * A row as it comes back off the disk.
+ *
+ * Rows written by version 3 and earlier have no `userId` and no `heldAt`, and the version 4
+ * upgrade rewrites the ones it carries across — but a browser can also be reading a row it
+ * wrote seconds before an upgrade that has not run yet, so the defaults are applied on every
+ * read rather than trusted to have happened once. `undefined` becomes `null`, which is
+ * "unattributed", which is the only safe reading of a row that never said.
+ */
+function normalise(row: PendingReview): PendingReview {
+  return {
+    ...row,
+    userId: row.userId ?? null,
+    heldAt: row.heldAt ?? null,
+    key: row.key ?? reviewKey(row.userId ?? null, row.trailId),
+  };
+}
+
 export function listPendingReviews(): Promise<PendingReview[]> {
   return run<PendingReview[]>(
     PENDING_REVIEWS_STORE,
     'readonly',
     (store) => store.getAll() as IDBRequest<PendingReview[]>,
     // Oldest first: it is the order they were written in, and the order they should leave in.
-  ).then((rows) => rows.sort((a, b) => a.queuedAt - b.queuedAt));
+  ).then((rows) => rows.map(normalise).sort((a, b) => a.queuedAt - b.queuedAt));
 }
 
-export function getPendingReview(trailId: string): Promise<PendingReview | null> {
+/**
+ * One reader's draft for one trail.
+ *
+ * Takes the reader as well as the trail, because the key does. A caller that wants "the draft
+ * on this device for this trail, whoever wrote it" is asking the question this module refuses
+ * to answer — the report form used to ask it, and that is how a queued draft's full text came
+ * to be prefilled into the next person's form.
+ */
+export function getPendingReview(
+  userId: string | null,
+  trailId: string,
+): Promise<PendingReview | null> {
   return run<PendingReview | undefined>(
     PENDING_REVIEWS_STORE,
     'readonly',
-    (store) => store.get(trailId) as IDBRequest<PendingReview | undefined>,
-  ).then((row) => row ?? null);
+    (store) => store.get(reviewKey(userId, trailId)) as IDBRequest<PendingReview | undefined>,
+  ).then((row) => (row ? normalise(row) : null));
 }
 
 export function putPendingReview(row: PendingReview): Promise<void> {
-  return run(PENDING_REVIEWS_STORE, 'readwrite', (store) => store.put(row)).then(() => {
+  // The key is derived rather than taken on trust, so a caller cannot file a row under one
+  // person's key with another person's id on it.
+  const keyed: PendingReview = { ...row, key: reviewKey(row.userId, row.trailId) };
+  return run(PENDING_REVIEWS_STORE, 'readwrite', (store) => store.put(keyed)).then(() => {
     announce();
   });
 }
 
-export function deletePendingReview(trailId: string): Promise<void> {
-  return run(PENDING_REVIEWS_STORE, 'readwrite', (store) => store.delete(trailId)).then(() => {
+export function deletePendingReview(userId: string | null, trailId: string): Promise<void> {
+  return run(PENDING_REVIEWS_STORE, 'readwrite', (store) =>
+    store.delete(reviewKey(userId, trailId)),
+  ).then(() => {
     announce();
   });
+}
+
+/**
+ * Set aside every report belonging to a reader who has left, without losing one of them.
+ *
+ * Called from `handover.ts` on a change of account. Rows already held are left alone so the
+ * date stays the date they were first set aside, rather than creeping forward every time
+ * somebody else signs in and out.
+ */
+export async function holdReviewsFor(userId: string, at: number): Promise<void> {
+  const rows = await listPendingReviews();
+  for (const row of rows) {
+    if (row.userId === userId && row.heldAt === null) {
+      await putPendingReview({ ...row, heldAt: at });
+    }
+  }
+}
+
+/** The reader is back. Their reports are ordinary queued rows again. */
+export async function releaseReviewsFor(userId: string): Promise<void> {
+  const rows = await listPendingReviews();
+  for (const row of rows) {
+    if (row.userId === userId && row.heldAt !== null) {
+      await putPendingReview({ ...row, heldAt: null });
+    }
+  }
+}
+
+/**
+ * Claim an unattributed report as your own, on purpose.
+ *
+ * The only path by which a row's owner is ever written after the fact, and it exists only to
+ * be reachable from a button somebody presses on `/downloads` having read the sentence next to
+ * it. Refuses anything that already has an owner: a row belonging to a named account is that
+ * account's, and no press by anybody else changes that.
+ *
+ * Re-keyed rather than updated in place, because the owner is half the key — so the old row is
+ * removed and a new one written. Written first, deleted second: an interruption between the
+ * two leaves the report on the device twice, which is recoverable, rather than not at all.
+ */
+export async function adoptPendingReview(trailId: string, userId: string): Promise<void> {
+  const row = await getPendingReview(null, trailId);
+  if (!row) return;
+  await putPendingReview({ ...row, userId, heldAt: null, blocked: false, lastError: null });
+  await deletePendingReview(null, trailId);
 }
 
 /** A fresh row, for the moment a report is written and cannot be sent. */
@@ -110,8 +221,13 @@ export function pendingReview(fields: {
   trailPath: string;
   write: ReviewWrite;
   at: number;
+  /** Who is writing. Null is honest and has consequences; see `identity.ts`. */
+  userId: string | null;
 }): PendingReview {
   return {
+    key: reviewKey(fields.userId, fields.trailId),
+    userId: fields.userId,
+    heldAt: null,
     trailId: fields.trailId,
     trailName: fields.trailName,
     trailPath: fields.trailPath,
@@ -207,6 +323,19 @@ export interface FlushResult {
 }
 
 export interface FlushOptions {
+  /**
+   * Who the browser is acting as. Required, and there is no default.
+   *
+   * Nothing else in this module decides what may be sent. A drain running as `null` — a
+   * signed-out browser, or one that has never been told — sends nothing at all, which is the
+   * correct behaviour on a shared computer between one person leaving and the next arriving:
+   * that gap is exactly when `SyncQueuedWrites` used to post the last person's report under
+   * whatever session the browser happened to be holding.
+   *
+   * Not optional, so that adding a caller is a decision about identity rather than an
+   * omission that compiles.
+   */
+  readerId: string | null;
   /** Limit the run to one trail's report — what the "Post it now" button does. */
   trailId?: string;
   /** Include rows the server has already refused. Only ever set by a person retrying. */
@@ -227,7 +356,7 @@ export interface FlushOptions {
  */
 export async function flushPendingReviews(
   post: (write: ReviewWrite) => Promise<unknown>,
-  options: FlushOptions = {},
+  options: FlushOptions,
 ): Promise<FlushResult> {
   return serialise(reviewDrain, () => drainReviews(post, options));
 }
@@ -242,6 +371,9 @@ async function drainReviews(
   const all = await listPendingReviews();
   const queue = all.filter(
     (row) =>
+      // First and unconditionally. `force` overrides a refusal by the server; nothing
+      // overrides this, because it is not about the report — it is about whose it is.
+      ownedBy(row, options.readerId) &&
       (options.trailId === undefined || row.trailId === options.trailId) &&
       (options.force === true || !row.blocked),
   );
@@ -250,7 +382,7 @@ async function drainReviews(
   for (const row of queue) {
     try {
       await post(row.write);
-      await deletePendingReview(row.trailId);
+      await deletePendingReview(row.userId, row.trailId);
       sent += 1;
     } catch (error) {
       // Neither is a fault with the report, and neither is permanent. See `isUnauthorized`.

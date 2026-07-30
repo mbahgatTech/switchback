@@ -18,6 +18,7 @@ import {
   type OffRouteState,
 } from '@switchback/geo';
 import { isUnreachable } from '@/offline/queue';
+import { writingReader } from '@/offline/identity';
 import {
   CHUNK_FIXES,
   chunkKey,
@@ -138,6 +139,12 @@ function forgetLegacyJournal(): void {
  *
  * `serverStarted: true`, because the old flow could not mint an id — the only way that
  * journal exists is that `activities.start` already succeeded for it.
+ *
+ * `userId: null`, because nothing in that journal ever said whose hike it was. It becomes an
+ * unattributed row: never uploaded on its own, never resumed here, and surfaced on
+ * `/downloads` for a person to claim or discard. Stamping it with whoever is signed in now
+ * would be the exact guess this product no longer makes — the journal is on the device, and
+ * the device is not the hiker.
  */
 async function importLegacyJournal(): Promise<void> {
   const journal = readLegacyJournal();
@@ -151,6 +158,7 @@ async function importLegacyJournal(): Promise<void> {
         trailName: null,
         activityType: 'hiking',
         serverStarted: true,
+        userId: null,
       }),
       sent: Math.min(journal.sent, journal.fixes.length),
       count: journal.fixes.length,
@@ -468,7 +476,10 @@ export function useRecorder({
 
     const hydrate = async (): Promise<void> => {
       await importLegacyJournal().catch(() => undefined);
-      const restored = await readOpenActivity().catch(() => null);
+      // Only this reader's own unfinished hike is picked back up. Somebody else's is left
+      // where it is — resuming it would append this person's afternoon to that person's
+      // morning and publish the pair under one name. See `readOpenActivity`.
+      const restored = await readOpenActivity(writingReader()).catch(() => null);
       if (cancelled || !restored) return;
 
       const { header, fixes } = restored;
@@ -844,6 +855,10 @@ export function useRecorder({
         trailName: trailName ?? null,
         activityType,
         serverStarted: serverStarted ?? false,
+        // Whose day this is, decided at the press and not at the upload. A hike begun on a
+        // ridge can sit on the device for a week; by the time it drains the browser may be
+        // holding somebody else's session, and this is the field that stops it going there.
+        userId: writingReader(),
       });
       claimLive(id);
       persist();

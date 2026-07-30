@@ -33,6 +33,13 @@
  * treated as "try again after a sign-in" rather than as a refusal of the hike. Gating this on
  * a session would only move the decision, and a session that expires mid-drain would still
  * have to be handled where the refusal arrives.
+ *
+ * **What it will not do is flush somebody else's queue.** Both drains are handed the reader
+ * this browser is acting as, and both send only rows written under that account — see
+ * `ownedBy` in `identity.ts`. This component is the reason that guard has to exist at all: it
+ * runs in the layout, on every page, on mount and on every return to the foreground, so on a
+ * shared computer it is the first thing that happens after the next person signs in. It used
+ * to post whatever it found over whatever session the browser was holding.
  */
 
 import { useCallback, useEffect } from 'react';
@@ -40,32 +47,43 @@ import type { ReviewWrite } from '@switchback/core';
 import { useTRPCClient } from '../trpc/react';
 import { flushPendingActivities } from './activities';
 import { flushPendingReviews } from './queue';
+import { useReaderId } from './reader';
 
 export function SyncQueuedWrites() {
   const client = useTRPCClient();
+  const readerId = useReaderId();
 
   const flush = useCallback(() => {
     // No point spending a request to learn what `navigator.onLine` already said. It is a weak
     // signal in the other direction — online can mean a captive portal — but a false negative
     // here costs nothing: the next `online` event or the next page load tries again.
     if (!navigator.onLine) return;
+    // Nobody is signed in, so nothing on this device is sendable. Both drains would reach the
+    // same answer on their own; stopping here says why, and saves the two IndexedDB reads it
+    // would take them to reach it on every page load of every signed-out visit.
+    if (readerId === null) return;
 
     void (async () => {
       // Reports first, hikes second, and chained rather than run together. A report is one
       // small request and a hike is dozens; the connection that has just come back is one
       // bar, which is the same reason each drain is sequential inside itself.
-      await flushPendingReviews((write: ReviewWrite) => client.reviews.upsert.mutate(write));
-      await flushPendingActivities({
-        start: (input) => client.activities.start.mutate(input),
-        append: (input) => client.activities.append.mutate(input),
-        finish: (input) => client.activities.finish.mutate(input),
+      await flushPendingReviews((write: ReviewWrite) => client.reviews.upsert.mutate(write), {
+        readerId,
       });
+      await flushPendingActivities(
+        {
+          start: (input) => client.activities.start.mutate(input),
+          append: (input) => client.activities.append.mutate(input),
+          finish: (input) => client.activities.finish.mutate(input),
+        },
+        { readerId },
+      );
     })().catch(() => {
       // Every failure mode this can produce is already recorded on the row it belongs to,
       // and shown on the trail page and in the storage manager. There is nothing useful to
       // say here that is not said somewhere a person will actually look.
     });
-  }, [client]);
+  }, [client, readerId]);
 
   useEffect(() => {
     flush();

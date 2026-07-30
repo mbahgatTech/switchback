@@ -86,10 +86,13 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
  * there — `repairShell` retries on every successful navigation, and `refreshShell` puts the
  * real page in the first time that reader opens `/record` with a session.
  *
- * The residual leak, named rather than hidden: on a shared device the stored `/record` carries
- * the last signed-in reader's units, default visibility, and the name and start time of any
- * recording they left open. Same class as the opening coordinate accepted for `/` above, and
- * scoped to one browser profile.
+ * What used to be named here as a residual leak — on a shared device the stored `/record`
+ * carries the last signed-in reader's units, default visibility, and the name and start time of
+ * any recording they left open — is no longer residual and no longer a leak. `offline/
+ * handover.ts` deletes every cache whose name starts with `CACHE_PREFIX` the moment the account
+ * on the browser changes, so a stored page outlives its reader only until the next person signs
+ * in. The same argument covers `/` and its opening coordinate, and the downloaded trail pages,
+ * which carry the reader's own hikes on those trails.
  */
 export const SHELL_PAGES = [
   OFFLINE_FALLBACK_PATH,

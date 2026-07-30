@@ -3,6 +3,7 @@ import { Archivo, IBM_Plex_Mono, Source_Serif_4 } from 'next/font/google';
 import { BRAND } from '@switchback/core/brand';
 import { PALETTES } from '@switchback/ui';
 import { currentTheme, modeAttribute } from '@/lib/theme';
+import { ReaderIdentity } from '@/offline/reader';
 import { RegisterServiceWorker } from '@/offline/register';
 import { SyncQueuedWrites } from '@/offline/sync';
 import { UnitsProvider } from '@/components/units';
@@ -135,6 +136,14 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       className={`${archivo.variable} ${sourceSerif.variable} ${plexMono.variable}`}
     >
       <body>
+        {/*
+         * Before the provider and before the queue, because it is what tells the queue whose
+         * rows are whose. The session was already read for the nav and the units, so naming
+         * the reader here costs nothing; what it buys is that a browser which has changed
+         * hands says so — and sets aside the previous person's unsent hikes and reports —
+         * rather than posting them under whoever is signed in now. See `offline/handover.ts`.
+         */}
+        <ReaderIdentity readerId={viewer?.id ?? null} />
         <TRPCReactProvider>
           {/*
            * Mounted here rather than per page because a measurement can be rendered by any

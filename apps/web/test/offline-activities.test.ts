@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TrackFix } from '@switchback/core';
 import {
+  adoptPendingActivity,
   chunkKey,
   claimLive,
   deleteActivity,
   drainNotice,
   flushPendingActivities,
   getPendingActivity,
+  holdActivitiesFor,
   listPendingActivities,
   markFinished,
   newActivityId,
@@ -14,11 +16,14 @@ import {
   putActivityHeader,
   readFixes,
   readOpenActivity,
+  releaseActivitiesFor,
   releaseLive,
   setDrainNotice,
   writeChunk,
   type ActivityPosters,
   type FinishWrite,
+  type FlushActivitiesOptions,
+  type FlushActivitiesResult,
   type PendingActivity,
 } from '../src/offline/activities';
 
@@ -129,6 +134,24 @@ function createFakeIndexedDB(): unknown {
 
 const ID = '6f8b1c2a-3d4e-4f50-9a1b-2c3d4e5f6071';
 
+/**
+ * The hiker every case below belongs to, unless it says otherwise.
+ *
+ * A queued hike is now stamped with the account that recorded it, and the drain sends only
+ * rows belonging to the reader the browser is acting as. Nearly every test here is about the
+ * upload rules rather than about whose hike it is, so they all run as one person and the
+ * ownership rules get their own block at the end.
+ */
+const HIKER = 'hiker-a';
+
+/** `flushPendingActivities`, as the one hiker above. See `HIKER`. */
+function flush(
+  post: ActivityPosters,
+  options: Partial<FlushActivitiesOptions> = {},
+): Promise<FlushActivitiesResult> {
+  return flushPendingActivities(post, { readerId: HIKER, ...options });
+}
+
 function fix(t: number): TrackFix {
   return { t, lng: -121.5 + t / 100_000, lat: 48.0 + t / 100_000, eleM: 900 + t };
 }
@@ -165,6 +188,7 @@ async function queueHike(
       trailName: 'Vesper Peak',
       activityType: 'hiking',
       serverStarted: false,
+      userId: HIKER,
     }),
     count,
     ...overrides,
@@ -265,14 +289,14 @@ describe('the journal', () => {
   it('does not offer a finished hike back to the recorder as an open one', async () => {
     await queueHike(ID, 10);
     await markFinished(ID, finishWrite(ID));
-    expect(await readOpenActivity()).toBeNull();
+    expect(await readOpenActivity(HIKER)).toBeNull();
     // Still queued, though: it is a debt, not a deletion.
     expect(await listPendingActivities()).toHaveLength(1);
   });
 
   it('hands an unfinished hike back with its fixes', async () => {
     await queueHike(ID, 7, { sent: 3 });
-    const open = await readOpenActivity();
+    const open = await readOpenActivity(HIKER);
     expect(open?.header.sent).toBe(3);
     expect(open?.fixes).toHaveLength(7);
   });
@@ -291,7 +315,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities(posters);
+    const result = await flush(posters);
 
     expect(calls).toEqual([`start:${ID}`, 'append:0-499', 'append:500-599', `finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
@@ -306,7 +330,7 @@ describe('flushPendingActivities', () => {
     // Dies part-way through: the first batch lands, the second does not.
     let appends = 0;
     const first = recorder();
-    await flushPendingActivities({
+    await flush({
       ...first.posters,
       append: async (input) => {
         appends += 1;
@@ -325,7 +349,7 @@ describe('flushPendingActivities', () => {
     // Reconnected. The retry picks up at 500 and re-sends nothing already acknowledged —
     // and does not repeat `start`, because the server has that hike under this id already.
     const second = recorder();
-    const result = await flushPendingActivities(second.posters);
+    const result = await flush(second.posters);
     expect(second.calls).toEqual(['append:500-999', 'append:1000-1499', `finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
   });
@@ -336,7 +360,7 @@ describe('flushPendingActivities', () => {
 
     // The server took the start and the answer never came back.
     const lost = recorder();
-    await flushPendingActivities({
+    await flush({
       ...lost.posters,
       start: async (input) => {
         lost.calls.push(`start:${input.id}`);
@@ -346,7 +370,7 @@ describe('flushPendingActivities', () => {
     expect((await getPendingActivity(ID))?.serverStarted).toBe(false);
 
     const again = recorder();
-    await flushPendingActivities(again.posters);
+    await flush(again.posters);
     // The same id both times, which is what makes the replay land on the same row rather
     // than opening a second recording of the same day.
     expect(lost.calls).toEqual([`start:${ID}`]);
@@ -362,7 +386,7 @@ describe('flushPendingActivities', () => {
     await markFinished(other, finishWrite(other));
 
     let starts = 0;
-    const result = await flushPendingActivities({
+    const result = await flush({
       start: async () => {
         starts += 1;
         throw unreachable();
@@ -384,7 +408,7 @@ describe('flushPendingActivities', () => {
     await queueHike(other, 10, { queuedAt: 1_800_000_000_000 });
     await markFinished(other, finishWrite(other));
 
-    const result = await flushPendingActivities({
+    const result = await flush({
       start: async (input) => {
         if (input.id === ID) throw refusal('That recording is not yours.');
         return undefined;
@@ -403,7 +427,7 @@ describe('flushPendingActivities', () => {
   it('leaves a blocked hike alone automatically and sends it when a person asks', async () => {
     await queueHike(ID, 10);
     await markFinished(ID, finishWrite(ID));
-    await flushPendingActivities({
+    await flush({
       start: async () => {
         throw refusal('That recording is not yours.');
       },
@@ -412,7 +436,7 @@ describe('flushPendingActivities', () => {
     });
 
     const automatic = recorder();
-    expect(await flushPendingActivities(automatic.posters)).toEqual({
+    expect(await flush(automatic.posters)).toEqual({
       sent: 0,
       kept: 1,
       truncated: 0,
@@ -420,7 +444,7 @@ describe('flushPendingActivities', () => {
     expect(automatic.calls).toEqual([]);
 
     const asked = recorder();
-    expect(await flushPendingActivities(asked.posters, { force: true })).toEqual({
+    expect(await flush(asked.posters, { force: true })).toEqual({
       sent: 1,
       kept: 0,
       truncated: 0,
@@ -433,7 +457,7 @@ describe('flushPendingActivities', () => {
 
     // A signed-out visit, or a session that lapsed in a valley. `SyncQueuedWrites` is mounted
     // for everybody, so this drain runs whether or not anybody has signed in.
-    const refused = await flushPendingActivities({
+    const refused = await flush({
       start: async () => {
         throw unauthorised();
       },
@@ -451,7 +475,7 @@ describe('flushPendingActivities', () => {
 
     // Signing back in re-mounts the layout, which flushes. Nothing had to be pressed.
     const after = recorder();
-    expect(await flushPendingActivities(after.posters)).toEqual({
+    expect(await flush(after.posters)).toEqual({
       sent: 1,
       kept: 0,
       truncated: 0,
@@ -466,7 +490,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities(posters);
+    const result = await flush(posters);
 
     expect(calls).toEqual([`finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
@@ -481,7 +505,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async () => {
         calls.push('append:refused');
@@ -503,7 +527,7 @@ describe('flushPendingActivities', () => {
     await queueHike(ID, 10, { serverStarted: true });
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async () => {
         calls.push('append:refused');
@@ -525,7 +549,7 @@ describe('flushPendingActivities', () => {
 
     const { calls, posters } = recorder();
     let refusals = 0;
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async (input) => {
         refusals += 1;
@@ -547,7 +571,7 @@ describe('flushPendingActivities', () => {
 
     let appends = 0;
     const { posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async () => {
         appends += 1;
@@ -565,7 +589,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async (input) => {
         const answer = await posters.append(input);
@@ -591,10 +615,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const [first, second] = await Promise.all([
-      flushPendingActivities(posters),
-      flushPendingActivities(posters),
-    ]);
+    const [first, second] = await Promise.all([flush(posters), flush(posters)]);
 
     expect(calls).toEqual([`start:${ID}`, 'append:0-9', `finish:${ID}`]);
     expect(first).toEqual({ sent: 1, kept: 0, truncated: 0 });
@@ -606,7 +627,7 @@ describe('flushPendingActivities', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async () => {
         throw refusal(
@@ -624,7 +645,7 @@ describe('flushPendingActivities', () => {
     await queueHike(ID, 10, { serverStarted: true });
 
     const { posters } = recorder();
-    const result = await flushPendingActivities({
+    const result = await flush({
       ...posters,
       append: async () => {
         throw refusal(
@@ -644,13 +665,13 @@ describe('flushPendingActivities', () => {
     claimLive(ID);
 
     const { calls, posters } = recorder();
-    expect(await flushPendingActivities(posters)).toEqual({ sent: 0, kept: 1, truncated: 0 });
+    expect(await flush(posters)).toEqual({ sent: 0, kept: 1, truncated: 0 });
     // Both would otherwise write `sent` on the same row and the loser would re-send a batch.
     expect(calls).toEqual([]);
 
     releaseLive(ID);
     const after = recorder();
-    await flushPendingActivities(after.posters);
+    await flush(after.posters);
     expect(after.calls).toEqual([`start:${ID}`, 'append:0-9']);
   });
 
@@ -660,7 +681,7 @@ describe('flushPendingActivities', () => {
     await queueHike(ID, 10);
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities(posters);
+    const result = await flush(posters);
 
     expect(calls).toEqual([`start:${ID}`, 'append:0-9']);
     expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
@@ -675,10 +696,193 @@ describe('flushPendingActivities', () => {
     await markFinished(other, finishWrite(other));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities(posters, { activityId: other });
+    const result = await flush(posters, { activityId: other });
 
     expect(calls).toEqual([`start:${other}`, 'append:0-9', `finish:${other}`]);
     expect(result).toEqual({ sent: 1, kept: 1, truncated: 0 });
     expect((await listPendingActivities()).map((row) => row.activityId)).toEqual([ID]);
+  });
+});
+
+/**
+ * Whose hike is whose.
+ *
+ * A day's track is the strongest case in the product for getting this right. It is the only
+ * record of where somebody walked, no server has a copy until the drain runs, and the drain
+ * runs from the root layout on every page load — so on a shared computer the first thing that
+ * happened after the next person signed in was one person's hike being uploaded, finished, and
+ * logged as a completion against a trail, under the other person's name.
+ */
+describe('a hike belongs to whoever recorded it', () => {
+  const OTHER = 'hiker-b';
+
+  it('is not sent under a different account', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities(posters, { readerId: OTHER });
+
+    expect(calls).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
+    // Untouched: still the first hiker's, still unsent, still every fix it had.
+    const kept = await getPendingActivity(ID);
+    expect(kept?.userId).toBe(HIKER);
+    expect(kept?.attempts).toBe(0);
+    expect(await readFixes(ID)).toHaveLength(10);
+  });
+
+  it('is not sent under a different account even when a person presses the button', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+
+    const { calls } = recorder();
+    const result = await flushPendingActivities(recorder().posters, {
+      readerId: OTHER,
+      force: true,
+      activityId: ID,
+    });
+
+    expect(calls).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
+  });
+
+  it('goes out the moment its own author is back', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+    await flushPendingActivities(recorder().posters, { readerId: OTHER });
+
+    const { calls, posters } = recorder();
+    expect(await flush(posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
+    expect(calls).toEqual([`start:${ID}`, 'append:0-9', `finish:${ID}`]);
+  });
+
+  it('is not sent at all while nobody is signed in', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+
+    const { calls } = recorder();
+    const result = await flushPendingActivities(recorder().posters, {
+      readerId: null,
+      force: true,
+    });
+
+    expect(calls).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
+  });
+
+  it('is not resumed by the next person to open the recorder', async () => {
+    // Unfinished, so it is a live recording rather than a debt — the case where resuming it
+    // would append the second person's afternoon to the first person's morning.
+    await queueHike(ID, 10);
+
+    expect(await readOpenActivity(OTHER)).toBeNull();
+    expect(await readOpenActivity(null)).toBeNull();
+    expect((await readOpenActivity(HIKER))?.header.activityId).toBe(ID);
+  });
+});
+
+/**
+ * Hikes the device cannot name a walker for.
+ *
+ * Rows carried over from the pre-IndexedDB journal, which never recorded whose hike it was.
+ * Neither sending them nor deleting them is the device's decision to make.
+ */
+describe('an unattributed hike', () => {
+  it('is neither sent nor discarded on its own', async () => {
+    await queueHike(ID, 10, { userId: null });
+    await markFinished(ID, finishWrite(ID));
+
+    const { calls } = recorder();
+    expect(await flush(recorder().posters)).toEqual({ sent: 0, kept: 1, truncated: 0 });
+    // Nor by a person pressing "add them all", which passes `force`.
+    expect(await flush(recorder().posters, { force: true })).toEqual({
+      sent: 0,
+      kept: 1,
+      truncated: 0,
+    });
+
+    expect(calls).toEqual([]);
+    expect((await getPendingActivity(ID))?.userId).toBeNull();
+    expect(await readFixes(ID)).toHaveLength(10);
+  });
+
+  it('is not resumed into the recorder either', async () => {
+    await queueHike(ID, 10, { userId: null });
+    expect(await readOpenActivity(HIKER)).toBeNull();
+  });
+
+  it('goes out once somebody claims it, under that person', async () => {
+    await queueHike(ID, 10, { userId: null });
+    await markFinished(ID, finishWrite(ID));
+
+    await adoptPendingActivity(ID, HIKER);
+    expect((await getPendingActivity(ID))?.userId).toBe(HIKER);
+
+    const { calls, posters } = recorder();
+    expect(await flush(posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
+    expect(calls).toEqual([`start:${ID}`, 'append:0-9', `finish:${ID}`]);
+  });
+
+  it('is the only kind that can be claimed', async () => {
+    await queueHike(ID, 10);
+    await adoptPendingActivity(ID, 'hiker-b');
+    expect((await getPendingActivity(ID))?.userId).toBe(HIKER);
+  });
+});
+
+/**
+ * What happens when the browser changes hands.
+ *
+ * Mark, never delete — and for a hike the argument is at its plainest. The fixes are hours of
+ * somebody's day, recorded where there was no signal to send them over, and the alternative to
+ * marking is throwing them away because a different person signed in.
+ */
+describe('a change of account', () => {
+  const AT = 1_760_000_000_000;
+
+  it('marks a hike rather than deleting it', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+
+    await holdActivitiesFor(HIKER, AT);
+
+    const held = await getPendingActivity(ID);
+    expect(held).not.toBeNull();
+    expect(held?.heldAt).toBe(AT);
+    expect(held?.finish).not.toBeNull();
+    // Every fix is still on the device. Nothing about being set aside touches the track.
+    expect(await readFixes(ID)).toHaveLength(10);
+  });
+
+  it('keeps the date the hike was first set aside', async () => {
+    await queueHike(ID, 10);
+    await holdActivitiesFor(HIKER, AT);
+    await holdActivitiesFor(HIKER, AT + 100_000);
+
+    expect((await getPendingActivity(ID))?.heldAt).toBe(AT);
+  });
+
+  it('leaves rows belonging to anybody else alone', async () => {
+    const other = '11111111-2222-4333-8444-555555555555';
+    const nobodys = '22222222-3333-4444-8555-666666666666';
+    await queueHike(ID, 4);
+    await queueHike(other, 4, { userId: 'hiker-b', queuedAt: 1_800_000_000_000 });
+    await queueHike(nobodys, 4, { userId: null, queuedAt: 1_900_000_000_000 });
+
+    await holdActivitiesFor(HIKER, AT);
+
+    expect((await getPendingActivity(other))?.heldAt).toBeNull();
+    expect((await getPendingActivity(nobodys))?.heldAt).toBeNull();
+  });
+
+  it('releases the hike when that person comes back', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+    await holdActivitiesFor(HIKER, AT);
+    await releaseActivitiesFor(HIKER);
+
+    expect((await getPendingActivity(ID))?.heldAt).toBeNull();
+    expect(await flush(recorder().posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
   });
 });
