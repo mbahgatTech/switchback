@@ -35,7 +35,7 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
 /**
  * Pages kept from the moment the worker installs, before anything is downloaded.
  *
- * Four, and each earns it. `/` is the manifest's `start_url`, so it is what an installed app
+ * Five, and each earns it. `/` is the manifest's `start_url`, so it is what an installed app
  * opens on a cold launch — and an installed app is opened on a cold launch precisely when
  * there is no signal. Without it here the home-screen icon leads straight to the offline
  * fallback, which is the one screen the download was bought to avoid.
@@ -72,8 +72,32 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
  * `/offline` and `/downloads` take no server input at all, so one stored copy is right for
  * everybody; `/` and `/explore` are the two that are rendered per reader, which is the whole
  * of the paragraph above.
+ *
+ * `/record` is the fifth, and it is the one page here whose whole point is to work with no
+ * network at all — a hike is recorded on a ridge, not at a desk. It is auth-gated, so its
+ * stored copy is the signed-in reader's own; that is the same per-reader trade already argued
+ * for `/` two paragraphs up, and it holds for the same reason. The redirect is evaluated once,
+ * on the server, at the moment the copy is fetched — offline there is no server to run it, and
+ * the session cookie survives with no network, so what is served is the recorder as it was
+ * rendered for the reader who installed it. The copy is only ever stored when the response was
+ * *not* a redirect (see `precache` in `public/sw.js`): a signed-out install would otherwise
+ * follow the 307 to `/signin` and cache a sign-in form under the key `/record`, which is worse
+ * than a missing entry because it looks like it works. A missing entry is the correct outcome
+ * there — `repairShell` retries on every successful navigation, and `refreshShell` puts the
+ * real page in the first time that reader opens `/record` with a session.
+ *
+ * The residual leak, named rather than hidden: on a shared device the stored `/record` carries
+ * the last signed-in reader's units, default visibility, and the name and start time of any
+ * recording they left open. Same class as the opening coordinate accepted for `/` above, and
+ * scoped to one browser profile.
  */
-export const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'] as const;
+export const SHELL_PAGES = [
+  OFFLINE_FALLBACK_PATH,
+  '/downloads',
+  '/',
+  '/explore',
+  '/record',
+] as const;
 
 /**
  * Every build asset a page references, as it appears in that page's HTML.

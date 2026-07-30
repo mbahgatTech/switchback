@@ -140,7 +140,14 @@ function queue(trailId: string, at: number): Promise<void> {
 
 /** A tRPC client error the server did send: it has an envelope. */
 function refusal(message: string): Error & { data: { code: string } } {
-  return Object.assign(new Error(message), { data: { code: 'UNAUTHORIZED' } });
+  return Object.assign(new Error(message), { data: { code: 'BAD_REQUEST' } });
+}
+
+/** The server refused because nobody is signed in. Not a fault with the report. */
+function unauthorised(): Error & { data: { code: string; httpStatus: number } } {
+  return Object.assign(new Error('Sign in to do that.'), {
+    data: { code: 'UNAUTHORIZED', httpStatus: 401 },
+  });
 }
 
 /** A tRPC client error where nothing came back at all. */
@@ -201,7 +208,7 @@ describe('flushPendingReviews', () => {
     await queue('b', 2_000);
 
     const result = await flushPendingReviews(async (payload) => {
-      if (payload.trailId === 'a') throw refusal('Your session has expired.');
+      if (payload.trailId === 'a') throw refusal('That trail no longer exists.');
       return undefined;
     });
 
@@ -209,7 +216,7 @@ describe('flushPendingReviews', () => {
     const kept = await getPendingReview('a');
     expect(kept?.blocked).toBe(true);
     expect(kept?.attempts).toBe(1);
-    expect(kept?.lastError).toBe('Your session has expired.');
+    expect(kept?.lastError).toBe('That trail no longer exists.');
     // The report itself is untouched — a refusal is not a reason to alter what was written.
     expect(kept?.write.body).toBe('The ford below the col is impassable.');
     expect(await getPendingReview('b')).toBeNull();
@@ -237,10 +244,29 @@ describe('flushPendingReviews', () => {
     expect((await getPendingReview('b'))?.attempts).toBe(0);
   });
 
+  it('does not refuse a report for good over a session that had expired', async () => {
+    await queue('a', 1_000);
+
+    // Blocked rows are only ever retried by a person pressing a button on `/downloads`, so
+    // treating "sign in to do that" as a refusal of the report loses it to a page the reader
+    // has no reason to open. An auth failure waits for a session instead.
+    const refused = await flushPendingReviews(async () => {
+      throw unauthorised();
+    });
+    expect(refused).toEqual({ sent: 0, kept: 1 });
+
+    const waiting = await getPendingReview('a');
+    expect(waiting?.blocked).toBe(false);
+    expect(waiting?.lastError).toBeNull();
+
+    // An ordinary automatic flush after signing back in, with nothing pressed.
+    expect(await flushPendingReviews(async () => undefined)).toEqual({ sent: 1, kept: 0 });
+  });
+
   it('skips a refused report on an automatic run and retries it when asked', async () => {
     await queue('a', 1_000);
     await flushPendingReviews(async () => {
-      throw refusal('Your session has expired.');
+      throw refusal('That trail no longer exists.');
     });
 
     let calls = 0;

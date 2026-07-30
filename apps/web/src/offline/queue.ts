@@ -146,6 +146,52 @@ export function isUnreachable(error: unknown): boolean {
   return 'data' in error && error.data == null;
 }
 
+/**
+ * Did the server refuse this because nobody is signed in?
+ *
+ * A refusal, so `isUnreachable` says no — but not a fault with the write and not a permanent
+ * one either. The reader signs back in and the identical payload goes up untouched.
+ *
+ * It has to be told apart, because the row grammar below turns any refusal into `blocked`, and
+ * blocked rows are only ever retried by a person pressing a button on `/downloads`. A session
+ * that expired in a valley, or a signed-out visit on a shared browser, would otherwise refuse
+ * a hike for good on the one drain that ran before the reader signed in — and say so only on a
+ * page they have no reason to open. So an auth refusal is treated the way no signal is: the
+ * row is left alone, the drain stops, and the next one after a sign-in sends it.
+ */
+export function isUnauthorized(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const data = (error as { data?: { code?: string; httpStatus?: number } | null }).data;
+  return data?.code === 'UNAUTHORIZED' || data?.httpStatus === 401;
+}
+
+/**
+ * Run drains one at a time, however many callers ask at once.
+ *
+ * `SyncQueuedWrites` fires on mount, on `online`, and on every `visibilitychange` to visible,
+ * and the storage manager's buttons are a fourth caller. A phone unlocked as its radio
+ * reattaches hits two of those in the same tick, and without this both take the same snapshot
+ * of the queue and send every `start`, `append` and `finish` in it twice. The server absorbs
+ * the duplication — that is what the idempotency rules are for — but a six-hour hike is forty
+ * requests over one bar, and doubling exactly those is the opposite of what the sequential
+ * drain is for. Two concurrent `finish` calls also both read `endedAt === null`, which is the
+ * one server-side step that counts rather than sets.
+ *
+ * Serialised rather than coalesced: the second caller waits and then runs, and because a drain
+ * re-reads the store when it starts, it finds the work already done and returns immediately.
+ * That is the same answer coalescing would give, without having to reason about whether two
+ * callers asked for the same thing — one may have passed `force` and the other not.
+ */
+export function serialise<T>(tail: { current: Promise<void> }, work: () => Promise<T>): Promise<T> {
+  const result = tail.current.then(work);
+  // Never rejects, so one failed drain cannot poison every drain after it.
+  tail.current = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 /** What a message says when the error has none worth showing. */
 const UNSAID = 'The server would not take it.';
 
@@ -183,6 +229,16 @@ export async function flushPendingReviews(
   post: (write: ReviewWrite) => Promise<unknown>,
   options: FlushOptions = {},
 ): Promise<FlushResult> {
+  return serialise(reviewDrain, () => drainReviews(post, options));
+}
+
+/** The tail of the review drain. See `serialise`. */
+const reviewDrain = { current: Promise.resolve() };
+
+async function drainReviews(
+  post: (write: ReviewWrite) => Promise<unknown>,
+  options: FlushOptions,
+): Promise<FlushResult> {
   const all = await listPendingReviews();
   const queue = all.filter(
     (row) =>
@@ -197,17 +253,18 @@ export async function flushPendingReviews(
       await deletePendingReview(row.trailId);
       sent += 1;
     } catch (error) {
-      const unreachable = isUnreachable(error);
+      // Neither is a fault with the report, and neither is permanent. See `isUnauthorized`.
+      const wait = isUnreachable(error) || isUnauthorized(error);
       await putPendingReview({
         ...row,
         attempts: row.attempts + 1,
         // An unreachable server is not something to report as a fault with the report.
-        lastError: unreachable ? null : reason(error),
-        blocked: !unreachable,
+        lastError: wait ? null : reason(error),
+        blocked: !wait,
       });
-      // Still no signal. Everything after this would fail the same way, and each failure is
-      // a request the hiker's battery pays for.
-      if (unreachable) break;
+      // Still no signal, or still nobody signed in. Everything after this would fail the same
+      // way, and each failure is a request the hiker's battery pays for.
+      if (wait) break;
     }
   }
 

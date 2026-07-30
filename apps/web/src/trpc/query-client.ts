@@ -22,6 +22,27 @@ export function makeQueryClient(): QueryClient {
           return failureCount < 2;
         },
       },
+      mutations: {
+        /**
+         * Send it, and let it fail.
+         *
+         * TanStack Query's default is `'online'`, which *pauses* a mutation while
+         * `navigator.onLine` is false: `mutationFn` is never called and `mutateAsync` never
+         * settles. That is reasonable for a form that can wait, and wrong for everything this
+         * product queues. The whole offline design is built on a mutation rejecting with the
+         * `TypeError` that `fetch` throws when it cannot connect — `isUnreachable` in
+         * `offline/queue.ts` is written to recognise exactly that, and both the queued report
+         * and the finished-with-no-signal hike are written from the resulting `catch`. Under
+         * the default those `catch` blocks are unreachable code offline, which is the one
+         * moment they exist for: pressing Finish at a trailhead with no bars left the dialog
+         * on "Saving" for ever, the row with no `finish` payload, and the hike permanently
+         * unfinishable.
+         *
+         * Queries keep the default. A read that cannot be made has nothing to record and
+         * nothing to retry; pausing it is right.
+         */
+        networkMode: 'always',
+      },
       dehydrate: {
         serializeData: superjson.serialize,
         // Also ship queries that are still in flight, so the client picks up a pending

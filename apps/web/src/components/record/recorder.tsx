@@ -24,10 +24,12 @@ import {
   type Visibility,
 } from '@switchback/core';
 import { useTRPC } from '../../trpc/react';
+import { isMissing, markFinished, newActivityId, type FinishWrite } from '../../offline/activities';
+import { isUnreachable } from '../../offline/queue';
 import { BUTTON, DANGER, HEIGHT, PRIMARY, SECONDARY } from '../controls';
 import { LifelinePanel } from './lifeline-panel';
 import { RecordMap } from './record-map';
-import { useRecorder, type RecorderPhase } from './use-recorder';
+import { useRecorder, type RecorderOptions, type RecorderPhase } from './use-recorder';
 
 /**
  * The recorder.
@@ -48,6 +50,13 @@ import { useRecorder, type RecorderPhase } from './use-recorder';
  * confirmations that throw a hike away. Not on the record button, however much a record button
  * wants to be red — a control that shares a colour with a wrong-turn alert is a control that
  * makes the alert mean less.
+ *
+ * **Pressing start does not wait for the server.** The id is minted here, on the device, and
+ * `activities.start` is sent afterwards as a confirmation rather than as a precondition — it
+ * carries that same id, and the server adopts it. So a hike begins with no signal exactly as
+ * it begins with five bars, the GPS watch starts on the press rather than a round trip later,
+ * and the recording is already a queued row from its first second. `offline/activities.ts`
+ * holds the idempotency argument that makes that safe to retry.
  */
 
 export interface RecorderTrail {
@@ -76,6 +85,27 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   const [finishing, setFinishing] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedOffline, setSavedOffline] = useState(false);
+
+  /**
+   * The scrollport that holds the readout. Driven, not just read.
+   *
+   * Everything the phase changes into view is inserted at the *top* of this box — the
+   * off-route banner, the receipt for a hike saved with no connection — and the box keeps
+   * whatever scroll position the hiker left it at. At 320×568 that position is rarely zero:
+   * five of the fourteen things on the recording screen are below the fold, so reading your
+   * GPS accuracy or reaching the Lifeline means scrolling, and nothing scrolls back. Measured
+   * with the readout where a hiker leaves it, the wrong-turn alert renders 430px above the
+   * top of its own scrollport: none of it on the glass, and it is the only wrong-turn warning
+   * the product has.
+   *
+   * So the two effects below put the top of the readout back on screen whenever something
+   * lands there. `overflow-y-auto` is what made the column reachable at all; this is what
+   * keeps "reachable" from meaning "reachable if you happen to scroll".
+   */
+  const readout = useRef<HTMLDivElement | null>(null);
+  const wasIdle = useRef(true);
 
   const route = useMemo<readonly LngLat[] | null>(
     () => trail?.geometry.coordinates ?? null,
@@ -86,8 +116,19 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   const appendRef = useRef(append);
   appendRef.current = append;
 
+  /**
+   * Posts `activities.start`, for the recorder to call when the server has not heard of a
+   * hike it is about to upload. Assigned below, once the mutation exists.
+   */
+  const startServerRef = useRef<RecorderOptions['onStart']>(() =>
+    Promise.reject(new Error('The recorder is not ready.')),
+  );
+
   const recorder = useRecorder({
     onFlush: (id, fixes) => appendRef.current.mutateAsync({ id, fixes }),
+    // Announcing the recording is the upload path's job, not the button's — see the note on
+    // `RecorderOptions.onStart`. Held in a ref because `start` is declared below this call.
+    onStart: (input) => startServerRef.current(input),
     route,
     routeLengthM: trail?.lengthM ?? null,
   });
@@ -96,21 +137,48 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     trpc.activities.start.mutationOptions({
       onSuccess: (activity) => {
         setStartError(null);
-        recorder.begin({
-          id: activity.id,
-          startedAt: activity.startedAt,
-          trailId: activity.trail?.id ?? null,
-        });
+        // The recording is already running under this id; all the server has added is that
+        // it now knows about it. Nothing on screen changes.
+        recorder.noteServerStarted(activity.id);
       },
-      onError: (err) => setStartError(err.message),
+      onError: (err) => {
+        // No signal is not an error here. The hike is recording, the row is queued, and the
+        // next flush posts this same `start` when the connection comes back — so there is
+        // nothing to tell the hiker and nothing for them to do about it.
+        if (isUnreachable(err)) return;
+        setStartError(err.message);
+      },
     }),
   );
+  startServerRef.current = (input) =>
+    start.mutateAsync({
+      id: input.id,
+      activityType: input.activityType,
+      startedAt: input.startedAt,
+      ...(input.trailId ? { trailId: input.trailId } : {}),
+    });
 
   const finish = useMutation(trpc.activities.finish.mutationOptions());
   const remove = useMutation(trpc.activities.remove.mutationOptions());
 
   const running = recorder.phase === 'recording' || recorder.phase === 'locating';
   const live = running || recorder.phase === 'paused';
+
+  // Something has landed at the top of the readout. Put the top of the readout on screen.
+  useEffect(() => {
+    if (recorder.offRoute || recorder.alert !== null || savedOffline) {
+      readout.current?.scrollTo({ top: 0 });
+    }
+  }, [recorder.offRoute, recorder.alert, savedOffline]);
+
+  // And on the way into a hike. Choosing anything but Hiking means scrolling the chooser into
+  // view, and Start is on the ledge — so the press that begins a hike is routinely made from
+  // a scrolled column, and the first second of the recording would otherwise open with the
+  // distance gauge, which this file calls the signature, entirely off the glass.
+  useEffect(() => {
+    if (wasIdle.current && recorder.phase !== 'idle') readout.current?.scrollTo({ top: 0 });
+    wasIdle.current = recorder.phase === 'idle';
+  }, [recorder.phase]);
 
   // The elapsed clock ticks off the wall, not off the fixes, so it keeps moving through a
   // stretch with no signal. It is the same figure the server derives — `t` is measured from
@@ -157,6 +225,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   }): Promise<void> {
     const id = recorder.activityId;
     if (!id) return;
+    setSaveError(null);
     recorder.stop();
     // Everything still in the buffer goes up before the recording is closed, because
     // `finish` computes the hike from what is stored and nothing else.
@@ -166,29 +235,114 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       // Reported by the recorder already. Closing anyway is the right call: the alternative
       // is a hike that cannot be ended because the last minute will not upload.
     }
-    const saved = await finish.mutateAsync({
+
+    const write: FinishWrite = {
       id,
       name: input.name.trim() || null,
       notes: input.notes.trim() || null,
       visibility: input.visibility,
       trailId: recorder.trailId,
       logCompletion: input.logCompletion,
+    };
+
+    try {
+      const saved = await finish.mutateAsync(write);
+      recorder.forget();
+      setFinishing(false);
+      router.push(`/activities/${saved.id}`);
+    } catch (error) {
+      if (isUnreachable(error)) {
+        // The hike ends here as far as the hiker is concerned. The row keeps everything —
+        // the fixes and now this payload — and the drain replays start, append and finish
+        // when there is a connection. `handOff` rather than `forget`, which would delete the
+        // only copy of the day. No `router.push`: `/activities/:id` does not exist yet, and
+        // is not a page that can be rendered with no network.
+        //
+        // Awaited, and its failure is not swallowed. The receipt below says the hike is safe
+        // on this device, and `handOff` throws away the in-memory buffer that is otherwise
+        // the last copy of it — so on a device whose storage has been refusing writes all
+        // day (quota, private mode, a locked profile) the old order printed that sentence
+        // over a hike it had just destroyed. Nothing is cleared until the write is known to
+        // have happened.
+        try {
+          await markFinished(id, write);
+        } catch {
+          recorder.unstop();
+          setSaveError(
+            'This hike could not be saved on this device — its storage is full or blocked. ' +
+              'Keep this tab open and try again; the recording is still here.',
+          );
+          return;
+        }
+        recorder.handOff();
+        setFinishing(false);
+        // The hike this belonged to has gone. See `onDiscard`.
+        setStartError(null);
+        setSavedOffline(true);
+        return;
+      }
+      // The server refused it. Leave `saving` so the dialog's buttons work again and the
+      // hiker can read the reason, change something, and try — rather than being locked out
+      // of their own hike behind a modal that can neither be confirmed nor cancelled.
+      recorder.unstop();
+    }
+  }
+
+  /**
+   * The press.
+   *
+   * The id is minted here and the recording begins immediately; `start.mutate` carries that
+   * same id and is a confirmation, not a precondition. Lives on the Recorder rather than on
+   * the start panel because the button it belongs to now sits on the control ledge, which is
+   * a sibling of the panel rather than part of it.
+   */
+  function onStartPress(): void {
+    const id = newActivityId();
+    const startedAt = new Date();
+    setStartError(null);
+    setSaveError(null);
+    setSavedOffline(false);
+    recorder.begin({
+      id,
+      startedAt,
+      trailId: trail?.id ?? null,
+      trailName: trail?.name ?? null,
+      activityType,
+      serverStarted: false,
     });
-    recorder.forget();
-    setFinishing(false);
-    router.push(`/activities/${saved.id}`);
+    start.mutate({
+      id,
+      activityType,
+      startedAt,
+      ...(trail ? { trailId: trail.id } : {}),
+    });
   }
 
   async function onDiscard(): Promise<void> {
     const id = recorder.activityId;
-    if (id) await remove.mutateAsync({ id });
+    if (id) {
+      try {
+        await remove.mutateAsync({ id });
+      } catch (error) {
+        // Nothing there to delete, in either of the two ways that happens: no connection to
+        // ask over, or a hike begun with no signal that the server has never been told about.
+        // Refusing to discard would leave a hiker unable to throw away a false start until
+        // they found signal, which is the worse of the two.
+        if (!isUnreachable(error) && !isMissing(error)) throw error;
+      }
+    }
     recorder.forget();
     setConfirmDiscard(false);
+    // The hike that error was about has just been thrown away. Left set, it is re-rendered by
+    // the ledge's `!live` branch — a fresh `role="alert"` node, so it is announced again,
+    // assertively — above a Start button, describing a recording that no longer exists.
+    setStartError(null);
+    setSaveError(null);
   }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-      <div className="relative h-[46dvh] shrink-0 lg:h-auto lg:flex-1">
+      <div className="relative h-[40dvh] shrink-0 lg:h-auto lg:flex-1">
         <RecordMap
           className="absolute inset-0 h-full w-full"
           track={track}
@@ -209,76 +363,221 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
         ) : null}
       </div>
 
-      <div className="flex w-full flex-col gap-lg border-t border-bezel px-lg py-lg lg:w-[420px] lg:shrink-0 lg:border-l lg:border-t-0 lg:px-xl">
-        {recorder.offRoute ? (
-          <OffRouteBanner
-            distanceM={recorder.offRouteDistanceM}
+      {/*
+        The readout is two boxes, not one: a scrollport holding everything that is *read*, and
+        a ledge below it holding the one control the current phase exists for. The screen is
+        `h-dvh overflow-hidden` — the correct shell for an instrument, and the same one `/plan`
+        and `/` use — which means a column that overflows it is not scrollable by any gesture
+        at all. Before this it did: at 320×568 "Start recording" sat 177px past the bottom of
+        the phone with no way to reach it, and the Lifeline's setup form stranded seven more
+        controls at 1280×800. So the column has to bound itself.
+
+        The ledge is a sibling rather than something floating, because this product has no
+        z-axis: a `sticky` or absolutely-positioned bar would occlude the tail of whatever is
+        under it and need a hand-tuned padding to compensate. As a flow child it simply takes
+        its height out of the scrollport's, and Start / Pause / Finish land at a fixed place on
+        the glass that does not move when the off-route banner appears or the Lifeline opens.
+
+        `lg:flex-none` on the column, not `lg:shrink-0`: `flex-1` is `1 1 0%`, and overriding
+        only the shrink term leaves a grow of 1 with a basis of 0, which beats `w-[420px]` on
+        the row's main axis and splits the desktop half and half with the map.
+      */}
+      <div className="flex min-h-0 w-full flex-1 flex-col border-t border-bezel lg:w-[420px] lg:flex-none lg:border-l lg:border-t-0">
+        {/*
+          `lg:flex-initial` rather than `flex-1` on the desktop breakpoint so a column with
+          room to spare keeps its old shape — content, then the ledge directly beneath it —
+          and only starts scrolling when the Lifeline makes it taller than the window.
+        */}
+        <div
+          ref={readout}
+          className="flex min-h-0 flex-1 flex-col gap-lg overflow-y-auto overscroll-contain px-lg py-lg lg:flex-initial lg:px-xl"
+        >
+          {recorder.offRoute ? (
+            <OffRouteBanner
+              distanceM={recorder.offRouteDistanceM}
+              units={units}
+              trailName={trail?.name ?? 'the trail'}
+            />
+          ) : null}
+
+          {recorder.alert === 'returned' ? (
+            <p
+              className="rounded-hair border border-woodland px-md py-sm text-caption text-ink"
+              role="status"
+            >
+              Back on {trail?.name ?? 'the trail'}.
+            </p>
+          ) : null}
+
+          {/*
+            The receipt for a hike that ended with no connection. At the top of the scrollport
+            rather than inside the start panel, where it began: the start panel now sits below
+            a full-height instrument, so on a 320px phone the receipt would have opened below
+            the fold — and "where did my hike go?" is the one question this screen must answer
+            without being scrolled. Water, because it is a condition of the network and not a
+            fault of the hiker's.
+          */}
+          {savedOffline && !live ? (
+            <div className="rounded-hair border border-water px-md py-sm" role="status">
+              <p className="collar text-water">Saved on this device</p>
+              <p className="mt-hair text-caption text-ink">
+                It will be added to your account when you have a connection. You can start another
+                hike now.
+              </p>
+              <Link
+                href="/downloads"
+                className="mt-xs inline-block text-caption text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
+              >
+                See what is waiting
+              </Link>
+            </div>
+          ) : null}
+
+          <Instrument
             units={units}
-            trailName={trail?.name ?? 'the trail'}
+            distanceM={recorder.stats.distanceM}
+            elapsedS={elapsedS}
+            movingS={recorder.stats.movingTimeS}
+            gainM={recorder.stats.gainM}
+            avgSpeedMps={recorder.stats.avgSpeedMps}
+            remainingM={recorder.remainingM}
+            idle={!live}
           />
-        ) : null}
 
-        {recorder.alert === 'returned' ? (
-          <p
-            className="rounded-hair border border-woodland px-md py-sm text-caption text-ink"
-            role="status"
-          >
-            Back on {trail?.name ?? 'the trail'}.
-          </p>
-        ) : null}
+          {live ? (
+            <Status
+              phase={recorder.phase}
+              accuracyM={recorder.accuracyM}
+              weakSignal={recorder.weakSignal}
+              pending={recorder.pending}
+              syncing={recorder.syncing}
+              lastSyncAt={recorder.lastSyncAt}
+              geoError={recorder.geoError}
+              syncError={recorder.syncError}
+              syncOffline={recorder.syncOffline}
+              units={units}
+            />
+          ) : null}
 
-        <Instrument
-          units={units}
-          distanceM={recorder.stats.distanceM}
-          elapsedS={elapsedS}
-          movingS={recorder.stats.movingTimeS}
-          gainM={recorder.stats.gainM}
-          avgSpeedMps={recorder.stats.avgSpeedMps}
-          remainingM={recorder.remainingM}
-          idle={!live}
-        />
+          {/*
+            A start the server refused rather than failed to receive — an expired session, most
+            likely. Once the hike is live the ledge below carries the transport row instead of
+            the start button, so this is the only place the refusal can be read. The hike is
+            safe either way: it is on the device and queued.
+          */}
+          {live && startError ? (
+            <p className="text-caption text-survey" role="alert">
+              {startError} The hike is recording and saved on this device.
+            </p>
+          ) : null}
 
-        {live ? (
-          <Status
-            phase={recorder.phase}
-            accuracyM={recorder.accuracyM}
-            weakSignal={recorder.weakSignal}
-            pending={recorder.pending}
-            syncing={recorder.syncing}
-            lastSyncAt={recorder.lastSyncAt}
-            geoError={recorder.geoError}
-            syncError={recorder.syncError}
-            units={units}
+          {!live ? (
+            <StartPanel
+              openRecording={openRecording}
+              units={units}
+              activityType={activityType}
+              onActivityType={setActivityType}
+              onAdopt={(open) => {
+                setStartError(null);
+                setSavedOffline(false);
+                recorder.begin({
+                  id: open.id,
+                  startedAt: open.startedAt,
+                  trailId: open.trail?.id ?? null,
+                  trailName: open.trail?.name ?? null,
+                  activityType: open.activityType,
+                  resumed: true,
+                  serverStarted: true,
+                });
+              }}
+            />
+          ) : (
+            <div className="flex flex-col gap-sm">
+              {confirmDiscard ? (
+                <div className="flex flex-col gap-xs rounded-hair border border-survey px-md py-sm">
+                  <div className="flex items-center gap-sm">
+                    <p className="flex-1 text-caption text-ink">
+                      Throw this hike away? It cannot be recovered.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void onDiscard().catch(() => undefined)}
+                      disabled={remove.isPending}
+                      className={`${BUTTON} ${DANGER} ${HEIGHT.touch} px-md`}
+                    >
+                      {remove.isPending ? 'Discarding' : 'Discard'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDiscard(false)}
+                      className={`${BUTTON} ${SECONDARY} ${HEIGHT.touch} px-md`}
+                    >
+                      Keep
+                    </button>
+                  </div>
+                  {/*
+                    A refusal the server did send — the offline case never gets here, because
+                    `onDiscard` treats an unreachable server as nothing to delete. Without this
+                    the button would simply do nothing and the hiker would press it again.
+                  */}
+                  {remove.error ? (
+                    <p className="text-caption text-survey" role="alert">
+                      {remove.error.message} The hike is still here.
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDiscard(true)}
+                  className="self-start text-caption text-ink-muted underline decoration-bezel underline-offset-4 transition-colors duration-quick hover:text-survey hover:decoration-survey"
+                >
+                  Discard this recording
+                </button>
+              )}
+            </div>
+          )}
+
+          <LifelinePanel
+            activityId={recorder.activityId}
+            trailId={recorder.trailId ?? trail?.id ?? null}
+            trailName={trail?.name ?? null}
+            position={recorder.position}
+            eleM={lastEleM}
           />
-        ) : null}
 
-        {!live ? (
-          <StartPanel
-            trail={trail}
-            openRecording={openRecording}
-            units={units}
-            activityType={activityType}
-            onActivityType={setActivityType}
-            starting={start.isPending}
-            error={startError}
-            onStart={() =>
-              start.mutate({
-                activityType,
-                ...(trail ? { trailId: trail.id } : {}),
-              })
-            }
-            onAdopt={(open) => {
-              setStartError(null);
-              recorder.begin({
-                id: open.id,
-                startedAt: open.startedAt,
-                trailId: open.trail?.id ?? null,
-                resumed: true,
-              });
-            }}
-          />
-        ) : (
-          <div className="flex flex-col gap-sm">
+          {trail ? (
+            <p className="text-caption text-ink-muted">
+              Following{' '}
+              <Link
+                href={`/trails/${trail.slug}`}
+                className="text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
+              >
+                {trail.name}
+              </Link>
+              . Wrong-turn alerts are on.
+            </p>
+          ) : null}
+        </div>
+
+        {/*
+          The ledge. One row, one job: whatever the phase is for.
+
+          `clear-home-indicator` is margin rather than padding for the reason its own note
+          gives — margin lifts the whole box clear of the strip at the bottom of a modern
+          iPhone, and what shows through underneath is the shell's own canvas, so there is no
+          seam. `env()` is zero everywhere without an inset, which includes every desktop.
+
+          It is labelled because it is the last thing in the column now rather than the middle:
+          a reader arriving here by keyboard should be told what the group is, not just given
+          two buttons after a safety panel.
+        */}
+        <div
+          role="group"
+          aria-label="Recording controls"
+          className="clear-home-indicator flex shrink-0 flex-col gap-sm border-t border-bezel bg-canvas px-lg py-md lg:px-xl lg:py-lg"
+        >
+          {live ? (
             <div className="flex gap-sm">
               {running ? (
                 <button
@@ -305,60 +604,24 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 Finish
               </button>
             </div>
-
-            {confirmDiscard ? (
-              <div className="flex items-center gap-sm rounded-hair border border-survey px-md py-sm">
-                <p className="flex-1 text-caption text-ink">
-                  Throw this hike away? It cannot be recovered.
+          ) : (
+            <>
+              {startError ? (
+                <p className="text-caption text-survey" role="alert">
+                  {startError}
                 </p>
-                <button
-                  type="button"
-                  onClick={() => void onDiscard()}
-                  disabled={remove.isPending}
-                  className={`${BUTTON} ${DANGER} ${HEIGHT.touch} px-md`}
-                >
-                  {remove.isPending ? 'Discarding' : 'Discard'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmDiscard(false)}
-                  className={`${BUTTON} ${SECONDARY} ${HEIGHT.touch} px-md`}
-                >
-                  Keep
-                </button>
-              </div>
-            ) : (
+              ) : null}
               <button
                 type="button"
-                onClick={() => setConfirmDiscard(true)}
-                className="self-start text-caption text-ink-muted underline decoration-bezel underline-offset-4 transition-colors duration-quick hover:text-survey hover:decoration-survey"
+                onClick={onStartPress}
+                disabled={start.isPending}
+                className={`${BUTTON} ${PRIMARY} ${HEIGHT.field} w-full px-lg text-body-lg`}
               >
-                Discard this recording
+                {start.isPending ? 'Starting' : trail ? `Record ${trail.name}` : 'Start recording'}
               </button>
-            )}
-          </div>
-        )}
-
-        <LifelinePanel
-          activityId={recorder.activityId}
-          trailId={recorder.trailId ?? trail?.id ?? null}
-          trailName={trail?.name ?? null}
-          position={recorder.position}
-          eleM={lastEleM}
-        />
-
-        {trail ? (
-          <p className="text-caption text-ink-muted">
-            Following{' '}
-            <Link
-              href={`/trails/${trail.slug}`}
-              className="text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
-            >
-              {trail.name}
-            </Link>
-            . Wrong-turn alerts are on.
-          </p>
-        ) : null}
+            </>
+          )}
+        </div>
       </div>
 
       {finishing ? (
@@ -374,7 +637,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           distanceM={recorder.stats.distanceM}
           elapsedS={elapsedS}
           saving={finish.isPending || recorder.phase === 'saving'}
-          error={finish.error?.message ?? null}
+          error={saveError ?? finish.error?.message ?? null}
           onCancel={() => setFinishing(false)}
           onConfirm={onFinish}
         />
@@ -495,6 +758,7 @@ function Status({
   lastSyncAt,
   geoError,
   syncError,
+  syncOffline,
   units,
 }: {
   phase: RecorderPhase;
@@ -505,6 +769,8 @@ function Status({
   lastSyncAt: Date | null;
   geoError: string | null;
   syncError: string | null;
+  /** Whether the last upload failure was the connection rather than the server. */
+  syncOffline: boolean;
   units: UnitSystem;
 }) {
   const gps =
@@ -548,9 +814,19 @@ function Status({
           {geoError}
         </p>
       ) : null}
+      {/*
+        Two different things, and the trailing clause used to be glued to both. `syncError`
+        carries every refusal, not only a transport failure: an expired session, or a
+        recording at the 20,000-sample cap whose own message is "Finish it and start another".
+        Promising those will go up when the connection comes back is false, and in the second
+        case it contradicts the instruction it is appended to. A refusal prints the server's
+        sentence alone; only a connection that was not there gets the reassurance.
+      */}
       {syncError ? (
         <p className="text-caption text-ink-muted">
-          {syncError} Still recording — it will go up when the connection comes back.
+          {syncOffline
+            ? `${syncError} Still recording — it will go up when the connection comes back.`
+            : syncError}
         </p>
       ) : null}
     </div>
@@ -580,25 +856,25 @@ function OffRouteBanner({
 // Starting
 // ---------------------------------------------------------------------------
 
+/**
+ * What there is to decide before pressing start.
+ *
+ * The button itself is not here — it lives on the control ledge below the scrollport, so that
+ * it is on the glass at every viewport rather than at the end of however much this panel
+ * happens to be. What is left is the two things that change what the press does: a recording
+ * the server still has open, and what kind of outing this is.
+ */
 function StartPanel({
-  trail,
   openRecording,
   units,
   activityType,
   onActivityType,
-  starting,
-  error,
-  onStart,
   onAdopt,
 }: {
-  trail: RecorderTrail | null;
   openRecording: ActivitySummary | null;
   units: UnitSystem;
   activityType: ActivityType;
   onActivityType: (type: ActivityType) => void;
-  starting: boolean;
-  error: string | null;
-  onStart: () => void;
   onAdopt: (open: ActivitySummary) => void;
 }) {
   return (
@@ -650,21 +926,6 @@ function StartPanel({
           ))}
         </div>
       </fieldset>
-
-      <button
-        type="button"
-        onClick={onStart}
-        disabled={starting}
-        className={`${BUTTON} ${PRIMARY} ${HEIGHT.field} w-full px-lg text-body-lg`}
-      >
-        {starting ? 'Starting' : trail ? `Record ${trail.name}` : 'Start recording'}
-      </button>
-
-      {error ? (
-        <p className="text-caption text-survey" role="alert">
-          {error}
-        </p>
-      ) : null}
 
       <p className="text-caption text-ink-muted">
         Your position stays on this device until you finish. Keep this tab open — the screen can
@@ -734,7 +995,10 @@ function FinishDialog({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          void onConfirm({ name, notes, visibility, logCompletion });
+          // `onConfirm` handles every outcome it knows how to handle and leaves the phase
+          // recoverable for the rest. A bare `void` here would surface anything it did not
+          // as an unhandled rejection, which is noise rather than information.
+          void onConfirm({ name, notes, visibility, logCompletion }).catch(() => undefined);
         }}
         className="flex flex-col gap-md p-lg"
       >

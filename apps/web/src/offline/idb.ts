@@ -8,23 +8,24 @@
  * "their own" store at their own version would race. Whichever opened first would create its
  * store, and the other's would be missing until a version bump that never comes.
  *
- * So the schema is declared once, both stores are created together, and the modules above own
+ * So the schema is declared once, every store is created together, and the modules above own
  * only what goes in them.
  *
- * Hand-rolled rather than wrapped in a library. Two object stores, one key path, and no
+ * Hand-rolled rather than wrapped in a library. Four object stores, one key path each, and no
  * migrations beyond adding a store; the wrapper would be larger than the thing it wrapped.
  */
 
 const DB_NAME = 'switchback-offline';
 
 /**
- * Version 1 held downloads. Version 2 added the queue.
+ * Version 1 held downloads. Version 2 added the review queue. Version 3 added the recording
+ * journal and the hikes it owes the server.
  *
  * The upgrade creates whatever it does not find rather than switching on the version it came
- * from, so a browser arriving from 1, from nothing, or from a rolled-back deploy all end up
- * holding the same two stores.
+ * from, so a browser arriving from 1, from 2, from nothing, or from a rolled-back deploy all
+ * end up holding the same four stores.
  */
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 /** One row per downloaded trail. */
 export const TRAILS_STORE = 'trails';
@@ -38,10 +39,42 @@ export const TRAILS_STORE = 'trails';
  */
 export const PENDING_REVIEWS_STORE = 'pending-reviews';
 
-const STORES = [TRAILS_STORE, PENDING_REVIEWS_STORE] as const;
+/**
+ * One row per hike the device is holding on the server's behalf.
+ *
+ * Keyed by the activity's own id, which the device mints before the first fix — so this row
+ * and the server's row are the same hike under the same name from the moment the button is
+ * pressed. It is the header only: who, when, how far through the upload it is, and the
+ * `finish` payload once there is one.
+ */
+export const PENDING_ACTIVITIES_STORE = 'pending-activities';
 
-/** Both stores key on `trailId`, which is why one key path covers the whole schema. */
-const KEY_PATH = 'trailId';
+/**
+ * The fixes of those hikes, five hundred to a row.
+ *
+ * Chunked rather than held as one array on the header, because the header is rewritten on
+ * every fix and rewriting a growing array on every fix is quadratic — at 1 Hz a six-hour
+ * hike would end up serialising a 21,600-element array once a second. A chunk is bounded, so
+ * the per-fix cost is constant, and a chunk is exactly one upload batch so the drain never
+ * has to re-slice anything.
+ */
+export const ACTIVITY_FIXES_STORE = 'activity-fixes';
+
+/**
+ * What each store keys on.
+ *
+ * Was a single `trailId` while the schema was the downloads ledger and the review queue,
+ * which both key on a trail. A hike is keyed by itself and its chunks by a composite of
+ * activity and index, so the key path is now per store.
+ */
+const KEY_PATHS: Record<string, string> = {
+  [TRAILS_STORE]: 'trailId',
+  [PENDING_REVIEWS_STORE]: 'trailId',
+  [PENDING_ACTIVITIES_STORE]: 'activityId',
+  [ACTIVITY_FIXES_STORE]: 'key',
+};
+
+const STORES = Object.keys(KEY_PATHS);
 
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -50,7 +83,7 @@ function open(): Promise<IDBDatabase> {
       const db = request.result;
       for (const name of STORES) {
         if (!db.objectStoreNames.contains(name)) {
-          db.createObjectStore(name, { keyPath: KEY_PATH });
+          db.createObjectStore(name, { keyPath: KEY_PATHS[name] });
         }
       }
     };

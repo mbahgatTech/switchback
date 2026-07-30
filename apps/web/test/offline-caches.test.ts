@@ -125,6 +125,44 @@ describe('build assets referenced by a cached page', () => {
     expect(listed).toEqual([...SHELL_PAGES]);
   });
 
+  it('keeps the recorder in the shell', () => {
+    // Named separately from the equality above, which only says the two lists agree. Dropping
+    // `/record` from both would keep that test green and hand every hiker at a trailhead the
+    // offline fallback instead of the screen they came to use.
+    expect(SHELL_PAGES).toContain('/record');
+  });
+
+  it('never stores a redirect under a shell page', () => {
+    /*
+     * `/record` is auth-gated. A signed-out install follows its 307 to `/signin` and gets a
+     * 200, so without this guard the sign-in form would be cached under the key `/record` —
+     * which is worse than the entry being missing, because it looks like it works.
+     */
+    expect(SW).toMatch(/if \(response\.redirected\) return;/u);
+    expect(SW).toMatch(/redirectedShellPages\.add\(path\)/u);
+  });
+
+  it('stops asking for a shell page the reader is not allowed to see', () => {
+    /*
+     * `repairShell` runs on every successful navigation and fills any entry `cache.match`
+     * misses — and a signed-out `/record` misses for ever, because the guard above refuses
+     * to store it. Measured before this: three extra origin requests for `/record` and three
+     * for `/signin` on every page view, indefinitely, each one a server render. The refusal
+     * has to be remembered, and `refreshShell` clears it the moment a signed-in navigation
+     * proves the page is available after all.
+     */
+    expect(SW).toMatch(/if \(redirectedShellPages\.has\(path\)\) continue;/u);
+    expect(SW).toMatch(/redirectedShellPages\.delete\(url\.pathname\)/u);
+  });
+
+  it('matches a shell page by pathname when the query differs', () => {
+    // `cache.match` is query-sensitive, so `/record?trail=vesper-peak` — the link from every
+    // trail page — misses the stored `/record`. Same for `/?place=…` and `/explore?bbox=…`.
+    expect(SW).toMatch(
+      /SHELL_PAGES\.includes\(url\.pathname\)\) \{\s*const page = await shell\.match\(url\.pathname\)/u,
+    );
+  });
+
   it('finds scripts, stylesheets and fonts in real Next markup', () => {
     const html = `<!DOCTYPE html><html><head>
       <link rel="stylesheet" href="/_next/static/css/6c1a0f2b.css"/>
