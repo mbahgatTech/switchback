@@ -351,11 +351,19 @@ export function ReviewForm({
     // Narrowed to the report's own shape on the way in. The uploader speaks the gallery's
     // language — licence, attribution, distance along the route — and none of that belongs
     // to a picture credited by the name at the top of the report it sits under.
+    //
+    // A photograph the caller uploaded seconds ago cannot already have been moderated, so
+    // the nullable `url` a taken-down frame carries is unreachable here — but it is checked
+    // rather than asserted away, because a `!` would be a promise about somebody else's
+    // code and this is one `if`.
+    if (photo.url === null) return;
+    const url = photo.url;
+
     setAdded((current) => [
       ...current,
       {
         id: photo.id,
-        url: photo.url,
+        url,
         thumbUrl: photo.thumbUrl,
         width: photo.width,
         height: photo.height,

@@ -11,6 +11,7 @@ import {
   isReservedUsername,
   profileUpdateSchema,
   usernameSchema,
+  type ProfileUpdate,
   type SelfProfile,
   type HikerStats,
 } from '@switchback/core';
@@ -34,11 +35,56 @@ function toSelfProfile(user: User): SelfProfile {
     defaultActivityVisibility: user.defaultActivityVisibility,
     isPlus: user.isPlus,
     plusUntil: user.plusUntil,
+    /*
+     * Read from the row the context loaded, so the client can decide whether to draw a
+     * moderator's controls. It is not an authorisation — `moderatorProcedure` is, and it
+     * re-reads the same column server-side on every call.
+     */
+    role: user.role,
     home:
       user.homeLng !== null && user.homeLat !== null
         ? { at: [user.homeLng, user.homeLat], name: user.homeName }
         : null,
   };
+}
+
+/**
+ * The columns a profile edit is allowed to touch, and only those.
+ *
+ * **This is the allow-list that stops `me.update` being a privilege-escalation endpoint,
+ * and it is a named function so a test can hold it to that.** `User` carries a `role`
+ * column now; `data: { ...input }` here would let anybody who can POST a profile edit send
+ * `role: "admin"` and be one forgotten `.strict()` away from getting it. Zod already
+ * strips undeclared keys, so that would take two independent mistakes — and "two mistakes
+ * from total compromise" is not a margin worth keeping on the one table that decides who
+ * can delete other people's content.
+ *
+ * Built key by key rather than spread, which also solves the older problem it was written
+ * for: `undefined` and `null` mean different things across this boundary. Absent leaves the
+ * column alone; explicit null clears it. A spread turns "did not touch bio" into "erase
+ * bio".
+ *
+ * The rule for extending it: one named line per column, and if the field is an entitlement
+ * — `role`, `isPlus`, `plusUntil` — it does not belong in this procedure at all.
+ * `packages/api/test/moderation.test.ts` re-derives the key set from a deliberately
+ * polluted input and fails the build if any of those three ever appears.
+ */
+export function profileUpdateData(input: ProfileUpdate): Prisma.UserUpdateInput {
+  const data: Prisma.UserUpdateInput = {};
+  if (input.name !== undefined) data.name = input.name;
+  if (input.username !== undefined) data.username = input.username;
+  if (input.bio !== undefined) data.bio = input.bio;
+  if (input.units !== undefined) data.units = input.units;
+  if (input.theme !== undefined) data.theme = input.theme;
+  if (input.defaultActivityVisibility !== undefined) {
+    data.defaultActivityVisibility = input.defaultActivityVisibility;
+  }
+  if (input.home !== undefined) {
+    data.homeLng = input.home?.at[0] ?? null;
+    data.homeLat = input.home?.at[1] ?? null;
+    data.homeName = input.home?.name ?? null;
+  }
+  return data;
 }
 
 export const meRouter = router({
@@ -83,23 +129,7 @@ export const meRouter = router({
       throw new TRPCError({ code: 'CONFLICT', message: 'That username is reserved.' });
     }
 
-    // Built key by key because `undefined` and `null` mean different things across this
-    // boundary: absent leaves the column alone, explicit null clears it. Spreading the
-    // input wholesale would turn "did not touch bio" into "erase bio".
-    const data: Prisma.UserUpdateInput = {};
-    if (input.name !== undefined) data.name = input.name;
-    if (input.username !== undefined) data.username = input.username;
-    if (input.bio !== undefined) data.bio = input.bio;
-    if (input.units !== undefined) data.units = input.units;
-    if (input.theme !== undefined) data.theme = input.theme;
-    if (input.defaultActivityVisibility !== undefined) {
-      data.defaultActivityVisibility = input.defaultActivityVisibility;
-    }
-    if (input.home !== undefined) {
-      data.homeLng = input.home?.at[0] ?? null;
-      data.homeLat = input.home?.at[1] ?? null;
-      data.homeName = input.home?.name ?? null;
-    }
+    const data = profileUpdateData(input);
 
     try {
       const user = await ctx.db.user.update({ where: { id: ctx.user.id }, data });

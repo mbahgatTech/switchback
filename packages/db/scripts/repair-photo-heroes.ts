@@ -85,7 +85,10 @@ async function repairHeroes(apply: boolean): Promise<{ repairs: Repair[]; claime
     claimed.delete(trail.primaryPhotoId);
 
     const own = await prisma.photo.findMany({
-      where: { trailId: trail.id },
+      // A photograph a moderator took down is not a candidate for the hero slot. This
+      // script exists to repair heroes, and repairing one onto hidden content would be a
+      // maintenance pass quietly reversing a takedown.
+      where: { trailId: trail.id, hiddenAt: null },
       select: { id: true },
       // The order enrichment itself would have saved them in, so the repaired hero is the
       // one the trail would have had if the photos had never moved.

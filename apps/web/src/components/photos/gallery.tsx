@@ -22,13 +22,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
-import { MAX_CAPTION_LENGTH, blurhashAverageColor, formatDistance } from '@switchback/core';
-import type { UnitSystem } from '@switchback/core';
+import {
+  MAX_CAPTION_LENGTH,
+  blurhashAverageColor,
+  canModerate,
+  formatDistance,
+} from '@switchback/core';
+import type { UnitSystem, UserRole } from '@switchback/core';
 import type { TrailPhoto } from '@switchback/api/routers/photos';
 import { useTRPC } from '../../trpc/react';
 import { useUnitsOr } from '../units';
 import { PhotoUploader } from './uploader';
 import { Photograph, PhotographMissing, PhotographUnavailable } from './photograph';
+import { ModerateControl, ReportControl } from '../moderation/report-control';
 import { BUTTON_COLLAR, DANGER, HEIGHT, OUTLINE, SECONDARY } from '../controls';
 
 export interface PhotoGalleryProps {
@@ -38,6 +44,12 @@ export interface PhotoGalleryProps {
   trailPath: string;
   initial: TrailPhoto[];
   isViewerKnown: boolean;
+  /**
+   * Whether to draw a take-down control under a frame. `member` for everybody who is not an
+   * operator. It decides what is drawn and nothing about what is permitted —
+   * `moderatorProcedure` re-reads the column server-side on every call.
+   */
+  viewerRole?: UserRole;
   units?: UnitSystem;
 }
 
@@ -61,6 +73,7 @@ export function PhotoGallery({
   trailPath,
   initial,
   isViewerKnown,
+  viewerRole = 'member',
   units: given,
 }: PhotoGalleryProps) {
   const units = useUnitsOr(given);
@@ -310,6 +323,35 @@ export function PhotoGallery({
                   >
                     {remove.isPending ? 'Removing…' : 'Remove'}
                   </button>
+                ) : (
+                  /*
+                   * Reporting somebody else's frame, from the one place it is big enough to
+                   * judge. The strip's thumbnails deliberately carry no control of their
+                   * own: a report button on a 102px tile is a mis-tap waiting to happen,
+                   * and nobody should be filing a complaint about a picture they have not
+                   * actually looked at.
+                   */
+                  <ReportControl
+                    subject="photo"
+                    subjectId={open.id}
+                    isViewerKnown={isViewerKnown}
+                    what={`this photograph by ${creditOf(open)}`}
+                  />
+                )}
+
+                {canModerate(viewerRole) ? (
+                  <ModerateControl
+                    subject="photo"
+                    subjectId={open.id}
+                    hidden={open.hidden}
+                    onDone={() => {
+                      // The frame leaves the gallery entirely rather than becoming a grey
+                      // box — a tombstone in a contact strip communicates nothing. Closing
+                      // the lightbox first because the thing it was showing is now gone.
+                      setOpenIndex(null);
+                      router.refresh();
+                    }}
+                  />
                 ) : null}
 
                 <button

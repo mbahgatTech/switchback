@@ -9,6 +9,7 @@ export * from './weather';
 export * from './busyness';
 export * from './localtime';
 export * from './reviews';
+export * from './moderation';
 export * from './lists';
 export * from './activities';
 export * from './lifeline';

@@ -148,21 +148,38 @@ export const photoSelect = {
   userId: true,
   trailId: true,
   reviewId: true,
+  /* Read on every row so `toPhoto` can blank the URL rather than hand out a live object. */
+  hiddenAt: true,
   user: { select: { id: true, username: true, name: true, image: true } },
 } satisfies Prisma.PhotoSelect;
 
 type PhotoRow = Prisma.PhotoGetPayload<{ select: typeof photoSelect }>;
 
 export function toPhoto(row: PhotoRow, viewerId: string | null) {
+  /*
+   * **A hidden photograph leaves here with no URL.**
+   *
+   * Every public query already filters `hiddenAt: null`, so in practice the only caller
+   * that ever sees one is `mine` — where the uploader is shown that their photograph was
+   * removed rather than left to notice it is gone. Blanking the URL here anyway is the
+   * belt: hiding an image means the bytes must not reach a browser, and a shape that still
+   * carries a live object URL has not taken anything down, however carefully the `where`
+   * clauses are written today. A `where` can be forgotten in a query added next year;
+   * this cannot.
+   *
+   * The caption goes too. It is text the reporter may well have been complaining about.
+   */
+  const hidden = row.hiddenAt !== null;
+
   return {
     id: row.id,
     source: row.source,
-    url: row.url,
-    thumbUrl: row.thumbUrl,
+    url: hidden ? null : row.url,
+    thumbUrl: hidden ? null : row.thumbUrl,
     width: row.width,
     height: row.height,
-    blurhash: row.blurhash,
-    caption: row.caption,
+    blurhash: hidden ? null : row.blurhash,
+    caption: hidden ? null : row.caption,
     license: row.license,
     attribution: row.attribution,
     sourceUrl: row.sourceUrl,
@@ -177,6 +194,7 @@ export function toPhoto(row: PhotoRow, viewerId: string | null) {
       ? { id: row.user.id, username: row.user.username, name: row.user.name, image: row.user.image }
       : null,
     isMine: viewerId !== null && row.userId === viewerId,
+    hidden,
   };
 }
 
@@ -204,11 +222,18 @@ export type TrailPhoto = ReturnType<typeof toPhoto>;
  * stepped over rather than claimed; taking it would abort the whole update on a constraint
  * violation and lose the count alongside the hero.
  */
-async function refreshTrailPhotos(db: Prisma.TransactionClient, trailId: string): Promise<void> {
+export async function refreshTrailPhotos(
+  db: Prisma.TransactionClient,
+  trailId: string,
+): Promise<void> {
   const [count, candidates, trail] = await Promise.all([
-    db.photo.count({ where: { trailId } }),
+    // Both carry `hiddenAt: null`, and both have to. A count that includes a photograph the
+    // gallery will not show puts "14 photographs" over a strip of thirteen; a hero chosen
+    // from the hidden ones flies the taken-down image at the top of the trail page, which
+    // is the single most visible place it could possibly land.
+    db.photo.count({ where: { trailId, hiddenAt: null } }),
     db.photo.findMany({
-      where: { trailId },
+      where: { trailId, hiddenAt: null },
       // `source` ascending puts `user` first: the enum is declared user, wikimedia, mapillary,
       // and Postgres sorts an enum by declaration order, which is why that order was chosen.
       orderBy: [{ source: 'asc' }, { createdAt: 'asc' }],
@@ -297,7 +322,14 @@ async function locatePhoto(
   }
 }
 
-/** Both quota checks, run before we hand out a ticket and again before we write a row. */
+/**
+ * Both quota checks, run before we hand out a ticket and again before we write a row.
+ *
+ * **Neither filters `hiddenAt`, and that is deliberate.** A photograph a moderator removed
+ * still counts against the uploader's daily allowance and against their twelve on this
+ * trail. Discounting it would hand somebody whose upload was taken down a fresh slot to put
+ * it straight back in, which turns the per-trail cap from a limit into a refill.
+ */
 async function assertWithinQuota(
   db: Prisma.TransactionClient,
   userId: string,
@@ -509,8 +541,12 @@ export const photosRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
+      // `hiddenAt: null` in the predicate, not a separate check: re-captioning a photograph
+      // a moderator took down is a write to removed content, and the caption is often the
+      // part that was reported. A hidden row simply matches nothing and reads as "no such
+      // photograph", which is what the owner's gallery already says about it.
       const { count } = await ctx.db.photo.updateMany({
-        where: { id: input.photoId, userId: ctx.user.id },
+        where: { id: input.photoId, userId: ctx.user.id, hiddenAt: null },
         data: { caption: input.caption?.trim() ? input.caption.trim() : null },
       });
       if (count === 0) throw new TRPCError({ code: 'NOT_FOUND', message: 'No such photograph.' });
@@ -564,7 +600,14 @@ export const photosRouter = router({
       return { removed: true };
     }),
 
-  /** Everything the caller has contributed, newest first. The gallery on their own profile. */
+  /**
+   * Everything the caller has contributed, newest first. The gallery on their own profile.
+   *
+   * **Hidden photographs are included here and nowhere else.** Every public gallery filters
+   * them out; this one keeps them so the person who uploaded one is told it was removed
+   * rather than left to notice a gap. `toPhoto` has already blanked the URL, so the row
+   * carries the fact and not the image.
+   */
   mine: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(60).default(24) }))
     .query(async ({ ctx, input }): Promise<TrailPhoto[]> => {

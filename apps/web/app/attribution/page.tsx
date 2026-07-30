@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { ATTRIBUTION, ATTRIBUTION_CORRECTIONS, ATTRIBUTION_SOURCES, BRAND } from '@switchback/core';
+import { SiteFooter } from '@/components/site-footer';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
 
@@ -89,6 +90,8 @@ export default function AttributionPage() {
             </a>
           </p>
         </section>
+
+        <SiteFooter />
       </main>
     </div>
   );

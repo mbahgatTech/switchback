@@ -4,16 +4,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient, useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import type {
   RatingSummary,
+  UserRole,
   Review,
   ReviewPhoto,
   ReviewSort,
   TrailCondition,
 } from '@switchback/core';
 import {
+  REMOVED_NOTICE,
+  REMOVED_NOTICE_OWN,
   REVIEW_SORTS,
   REVIEW_SORT_LABEL,
   TRAIL_CONDITION_LABEL,
   blurhashAverageColor,
+  canModerate,
   formatDateLabel,
   plural,
 } from '@switchback/core';
@@ -21,6 +25,7 @@ import { CONDITION_PLATE } from '@switchback/ui';
 import { askAgain } from '../../lib/after-write';
 import { useTRPC } from '../../trpc/react';
 import { ReviewForm } from './review-form';
+import { ModerateControl, ReportControl } from '../moderation/report-control';
 import { Photograph, PhotographMissing, PhotographUnavailable } from '../photos/photograph';
 import { BUTTON_COLLAR, HEIGHT, SECONDARY } from '../controls';
 
@@ -61,6 +66,15 @@ export interface ReviewsProps {
   trailPath: string;
   /** Null when signed out — the only thing this section needs to know about the viewer. */
   viewerId: string | null;
+  /**
+   * What the viewer may do about somebody else's report. `member` for everybody who is not
+   * an operator, and for everybody signed out.
+   *
+   * It decides whether a take-down control is *drawn*. It does not decide whether one
+   * works: `moderatorProcedure` on the server does, and it re-reads the column on every
+   * call. A forged role here buys a button that returns FORBIDDEN.
+   */
+  viewerRole?: UserRole;
 }
 
 const PAGE_SIZE = 8;
@@ -109,7 +123,13 @@ interface PhotoView {
   author: string;
 }
 
-export function Reviews({ trailId, trailName, trailPath, viewerId }: ReviewsProps) {
+export function Reviews({
+  trailId,
+  trailName,
+  trailPath,
+  viewerId,
+  viewerRole = 'member',
+}: ReviewsProps) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
 
@@ -220,6 +240,9 @@ export function Reviews({ trailId, trailName, trailPath, viewerId }: ReviewsProp
               <ReviewRow
                 key={review.id}
                 review={review}
+                isViewerKnown={viewerId !== null}
+                canTakeDown={canModerate(viewerRole)}
+                onModerated={refetchAll}
                 onOpenPhotos={(index) =>
                   setViewing({ photos: review.photos, index, author: hikerName(review) })
                 }
@@ -395,9 +418,15 @@ export function ScaleBar({ value }: { value: number }) {
  */
 function ReviewRow({
   review,
+  isViewerKnown,
+  canTakeDown,
+  onModerated,
   onOpenPhotos,
 }: {
   review: Review;
+  isViewerKnown: boolean;
+  canTakeDown: boolean;
+  onModerated: () => void;
   onOpenPhotos: (index: number) => void;
 }) {
   const name = hikerName(review);
@@ -409,8 +438,18 @@ function ReviewRow({
     >
       <div className="flex flex-wrap items-baseline justify-between gap-x-md gap-y-xs">
         <div className="flex items-center gap-sm">
-          <ScaleBar value={review.rating} />
-          <span className="sr-only">{review.rating} out of 5.</span>
+          {/*
+           * The scale bar goes when the report does. A rating still drawn under a tombstone
+           * is a measurement the page is asserting on behalf of a report it has withdrawn —
+           * and it is not in the average above either, so drawing it would be the one number
+           * on this section that corresponds to nothing.
+           */}
+          {review.hidden ? null : (
+            <>
+              <ScaleBar value={review.rating} />
+              <span className="sr-only">{review.rating} out of 5.</span>
+            </>
+          )}
           <span className="text-caption text-ink">
             {name}
             {review.isMine ? <span className="collar ml-sm">You</span> : null}
@@ -421,9 +460,27 @@ function ReviewRow({
           {review.hikedOn !== null
             ? `Hiked ${formatDateLabel(review.hikedOn)}`
             : `Written ${formatDateLabel(review.createdAt.toISOString().slice(0, 10))}`}
-          {edited ? ' · edited' : ''}
+          {edited && !review.hidden ? ' · edited' : ''}
         </span>
       </div>
+
+      {/*
+       * The tombstone. It keeps the row rather than removing it, because a report that
+       * silently vanishes reads to its author as a bug in the site rather than as a decision
+       * somebody made — and the author is exactly the person who has to be able to argue.
+       *
+       * Dashed hairline and `ink-muted` prose: the same treatment as the section's other
+       * absences ("Reading the reports…", "Nobody has reported on this trail yet"), because
+       * that is what this is. No survey plate — survey is the reader's own position and
+       * safety, and somebody else's report being taken down is neither.
+       *
+       * Its author gets the longer sentence, with the address to write to.
+       */}
+      {review.hidden ? (
+        <p className="mt-sm max-w-measure rounded-hair border border-dashed border-bezel px-md py-sm text-caption text-ink-muted">
+          {review.isMine ? REMOVED_NOTICE_OWN : REMOVED_NOTICE}
+        </p>
+      ) : null}
 
       {review.body !== null ? (
         <p className="mt-sm max-w-measure-wide text-body leading-relaxed">{review.body}</p>
@@ -480,6 +537,35 @@ function ReviewRow({
           {review.activityType !== null && review.helpfulCount > 0 ? ' · ' : null}
           {review.helpfulCount > 0 ? `${review.helpfulCount} found this useful` : null}
         </p>
+      ) : null}
+
+      {/*
+       * The controls that are about the report rather than about the trail, kept apart from
+       * everything above by being right-aligned and last.
+       *
+       * You cannot report your own — the button would only ever mean "ask a stranger to read
+       * my own writing" — and there is nothing to report about a row that has already gone,
+       * which is also the only state where a moderator is offered "Put back" instead.
+       */}
+      {(canTakeDown || !review.isMine) && !(review.hidden && !canTakeDown) ? (
+        <div className="mt-xs flex flex-wrap items-center justify-end gap-xs">
+          {!review.isMine && !review.hidden ? (
+            <ReportControl
+              subject="review"
+              subjectId={review.id}
+              isViewerKnown={isViewerKnown}
+              what={`this report by ${name}`}
+            />
+          ) : null}
+          {canTakeDown ? (
+            <ModerateControl
+              subject="review"
+              subjectId={review.id}
+              hidden={review.hidden}
+              onDone={onModerated}
+            />
+          ) : null}
+        </div>
       ) : null}
     </li>
   );

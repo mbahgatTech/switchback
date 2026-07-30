@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { USER_ROLES } from './moderation';
 import { UNIT_SYSTEMS } from './units';
 import { lngLatSchema } from './types';
 
@@ -125,6 +126,17 @@ export const selfProfileSchema = publicProfileSchema.extend({
   defaultActivityVisibility: z.enum(VISIBILITIES),
   isPlus: z.boolean(),
   plusUntil: z.date().nullable(),
+  /**
+   * Whether this account can take content down.
+   *
+   * On the *self* profile and deliberately not on `publicProfileSchema`: it decides whether
+   * the client draws a moderator's controls, and who the moderators are is not something a
+   * trail page needs to publish. It is read-only in every direction — `profileUpdateSchema`
+   * has no such field, `me.update` never writes one, and the server ignores it on the way
+   * in. A client that lies about it draws itself some buttons and gets FORBIDDEN from
+   * `moderatorProcedure` the moment it presses one.
+   */
+  role: z.enum(USER_ROLES),
   home: z.object({ at: lngLatSchema, name: z.string().nullable() }).nullable(),
 });
 export type SelfProfile = z.infer<typeof selfProfileSchema>;

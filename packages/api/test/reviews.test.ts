@@ -31,6 +31,8 @@ const BASE = {
   helpfulCount: 3,
   createdAt: new Date('2026-03-15T09:04:00Z'),
   updatedAt: new Date('2026-03-15T09:04:00Z'),
+  /* Not hidden. The takedown path's own assertions live in `moderation.test.ts`. */
+  hiddenAt: null as Date | null,
   user: {
     id: 'usr_ivy',
     username: 'ivy' as string | null,

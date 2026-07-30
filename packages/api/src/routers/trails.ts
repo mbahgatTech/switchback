@@ -803,7 +803,10 @@ export const trailsRouter = router({
     .input(trailIdInput.extend({ limit: z.number().int().min(1).max(60).default(24) }))
     .query(async ({ ctx, input }): Promise<TrailPhoto[]> => {
       const rows = await ctx.db.photo.findMany({
-        where: { trailId: input.trailId },
+        // The public gallery, so a photograph a moderator took down is simply not in it.
+        // No tombstone: a grey box in a thumbnail strip tells the reader nothing and tells
+        // whoever reported it that we did not act. The uploader is told, on `photos.mine`.
+        where: { trailId: input.trailId, hiddenAt: null },
         orderBy: [{ source: 'asc' }, { createdAt: 'desc' }],
         take: input.limit,
         select: photoSelect,

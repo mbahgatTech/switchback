@@ -235,6 +235,17 @@ export const reviewSchema = z.object({
   photos: z.array(reviewPhotoSchema),
   /** True when the signed-in caller wrote this one. Always false when signed out. */
   isMine: z.boolean(),
+  /**
+   * A moderator took this down.
+   *
+   * The row is still returned and still occupies its place in the list — see
+   * `toReview` in `packages/api/src/routers/reviews.ts` for why a tombstone beats both a
+   * 404 and a silent disappearance. When this is true the server has already stripped
+   * `body`, `conditions`, `activityType` and `photos`, so a renderer that forgets to
+   * branch on it shows an empty report rather than the text somebody complained about.
+   * The rating is not in the trail's average either way.
+   */
+  hidden: z.boolean(),
 });
 export type Review = z.infer<typeof reviewSchema>;
 
