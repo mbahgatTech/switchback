@@ -25,6 +25,7 @@ import {
 } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
 import { admitIngest } from './backpressure';
+import type { IngestRefusal } from './backpressure';
 import { enqueue, tileJobKey } from './jobs';
 import { isTileFresh } from './pipeline';
 
@@ -54,6 +55,15 @@ export interface CoverageResult {
    * tell a fully cached viewport apart from one whose fetch was turned down.
    */
   busy: boolean;
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * Carried rather than collapsed into the boolean because the two refusals need different
+   * sentences: a deep queue clears on its own and "try again in a few minutes" is true of
+   * it; a full database does not, and telling somebody to wait for it is prescribing an
+   * action that cannot work.
+   */
+  busyReason: IngestRefusal | null;
   /** True when the bbox needed more tiles than we will cover in one request. */
   tooLarge: boolean;
   requiredTiles: number;
@@ -95,6 +105,7 @@ export async function ensureCoverage(
       refreshing: [],
       queued: [],
       busy: false,
+      busyReason: null,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
@@ -129,7 +140,8 @@ export async function ensureCoverage(
     }
   }
 
-  const queued = await queueTiles(db, needsWork, { urgent: options.urgent ?? true });
+  const enqueued = await queueTiles(db, needsWork, { urgent: options.urgent ?? true });
+  const queued = enqueued.queued;
 
   /*
    * Nothing queued despite work outstanding means backpressure refused it, and what the
@@ -144,6 +156,10 @@ export async function ensureCoverage(
    * So the tiles fall back to whatever we hold: `ready` keeps anything with data behind it,
    * the rest simply are not claimed to be coming, and `busy` carries the reason up so the
    * coverage note can say it in words instead of leaving a spinner to imply it.
+   *
+   * `busyReason` rides along because the two refusals are not the same sentence. "Try again
+   * in a few minutes" is true of a deep queue and false of a full database — waiting does
+   * not empty one, and the note must not prescribe an action that cannot work.
    */
   const busy = needsWork.length > 0 && queued.length === 0;
 
@@ -154,10 +170,19 @@ export async function ensureCoverage(
     refreshing,
     queued,
     busy,
+    busyReason: busy ? enqueued.refused : null,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,
   };
+}
+
+/** What an enqueue call did, and — when it did nothing — why. */
+export interface QueueOutcome {
+  /** The quadkeys now on the queue. Empty when admission refused. */
+  queued: string[];
+  /** The refusal, or `null` when nothing was refused. */
+  refused: IngestRefusal | null;
 }
 
 /**
@@ -168,17 +193,22 @@ export async function ensureCoverage(
  * request over the same area repairs, because a `pending` tile is never fresh. The reverse
  * order would leave a job pointing at a tile row that does not exist, and the handler
  * would have to invent one anyway.
+ *
+ * Returns the refusal rather than an empty array alone. The reason was already computed —
+ * `admitIngest` types it — and dropping it here is what made a full database and a deep
+ * queue arrive at the reader as the same sentence.
  */
 export async function queueTiles(
   db: PrismaClient,
   quadkeys: readonly string[],
   options: { urgent?: boolean; priority?: number } = {},
-): Promise<string[]> {
-  if (quadkeys.length === 0) return [];
+): Promise<QueueOutcome> {
+  if (quadkeys.length === 0) return { queued: [], refused: null };
 
   // The one place every trail-ingest path crosses, and so the place backpressure belongs.
   // See `backpressure.ts` for why it is not at the call sites any more.
-  if ((await admitIngest(db)) !== null) return [];
+  const refused = await admitIngest(db);
+  if (refused !== null) return { queued: [], refused };
 
   // Explicit priority wins; `urgent` is the two-value shorthand the viewport path uses.
   const priority = options.priority ?? (options.urgent === false ? 0 : VIEWPORT_PRIORITY);
@@ -203,7 +233,7 @@ export async function queueTiles(
     });
   }
 
-  return [...quadkeys];
+  return { queued: [...quadkeys], refused: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -333,8 +363,10 @@ export async function surveyArea(bbox: BBox, options: AreaOptions = {}): Promise
 export interface AreaRequest extends AreaCoverage {
   /** What this call put on the queue. What the caller should kick. */
   queued: string[];
-  /** True when the queue was already too deep to accept more, so nothing was queued. */
+  /** True when admission refused, so nothing was queued. */
   busy: boolean;
+  /** Which refusal, when `busy`. The two need different sentences on screen. */
+  busyReason: IngestRefusal | null;
 }
 
 /**
@@ -348,13 +380,21 @@ export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promis
   const db = options.db ?? prisma;
   const area = await surveyArea(bbox, options);
 
-  if (area.outstanding.length === 0) return { ...area, queued: [], busy: false };
+  if (area.outstanding.length === 0) {
+    return { ...area, queued: [], busy: false, busyReason: null };
+  }
 
   // No depth check here any more: `queueTiles` runs it, and running it in both places was
   // how the routing queue ended up unguarded — a check at one call site guards one call
-  // site. An empty return with work outstanding is the refusal.
-  const queued = await queueTiles(db, area.outstanding, { priority: AREA_PRIORITY });
-  if (queued.length === 0) return { ...area, queued: [], busy: true };
+  // site. An empty return with work outstanding is the refusal, and it now says which.
+  const { queued, refused } = await queueTiles(db, area.outstanding, { priority: AREA_PRIORITY });
+  if (queued.length === 0) return { ...area, queued: [], busy: true, busyReason: refused };
 
-  return { ...area, queued, working: [...new Set([...area.working, ...queued])], busy: false };
+  return {
+    ...area,
+    queued,
+    working: [...new Set([...area.working, ...queued])],
+    busy: false,
+    busyReason: null,
+  };
 }

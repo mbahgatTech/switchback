@@ -117,6 +117,18 @@ export const ROUTE_LEG_REASONS = [
   'no_path',
   /** The network for this ground has not finished downloading. Retrying will likely work. */
   'network_pending',
+  /**
+   * The server declined to fetch the network for this ground, so nothing is downloading.
+   *
+   * Distinct from `network_pending`, and the distinction is the whole point of the reason
+   * existing: waiting fixes a pending tile and does nothing for a refused one. Distinct from
+   * `off_network`/`no_path` for a much sharper reason — those two are claims about the
+   * terrain, and a leg over ground we chose not to fetch supports no claim about the terrain
+   * at all. Before this existed, backpressure made the planner tell people that stretches of
+   * their route had no path under them, as a safety warning, about ground it had never
+   * looked at.
+   */
+  'network_paused',
 ] as const;
 export type RouteLegReason = (typeof ROUTE_LEG_REASONS)[number];
 
@@ -157,6 +169,16 @@ export const routePlanSchema = z.object({
   legs: z.array(routeLegSchema),
   /** Routing tiles still downloading under these anchors. The planner says so rather than pretending. */
   pendingTiles: z.number().int().nonnegative(),
+  /**
+   * True when the server refused to fetch the network under these anchors.
+   *
+   * Separate from `pendingTiles` because zero pending means two opposite things: we hold
+   * everything, or we declined to go and get it. The planner needs to tell them apart —
+   * `pendingTiles` drives both the "fetching" line and the retry loop, and a refusal that
+   * arrives as a zero switches the retry off while the legs quietly turn into terrain
+   * claims. Defaulted, so a response from before this field existed still parses.
+   */
+  busy: z.boolean().default(false),
   /** True when the anchors span more ground than one plan may cover. */
   tooLarge: z.boolean(),
 });

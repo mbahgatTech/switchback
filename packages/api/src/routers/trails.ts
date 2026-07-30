@@ -355,6 +355,7 @@ function toCoverage(result: CoverageResult): TileCoverage {
     refreshingTiles: result.refreshing,
     tooLarge: result.tooLarge,
     busy: result.busy,
+    busyReason: result.busyReason,
     requiredTiles: result.requiredTiles,
     maxTiles: result.maxTiles,
   };
@@ -369,6 +370,7 @@ function noCoverage(): CoverageResult {
     refreshing: [],
     queued: [],
     busy: false,
+    busyReason: null,
     tooLarge: false,
     requiredTiles: 0,
     maxTiles: 0,
@@ -876,7 +878,14 @@ export const trailsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const area = await requestArea(input.bbox, { db: ctx.db });
       kickIngest(ctx, area.queued);
-      return { ...toArea(area), queued: area.queued.length, busy: area.busy };
+      // `busyReason` rides along with `busy`: the button's refusal copy has to tell a deep
+      // queue, which clears, apart from a full database, which does not.
+      return {
+        ...toArea(area),
+        queued: area.queued.length,
+        busy: area.busy,
+        busyReason: area.busyReason,
+      };
     }),
 });
 

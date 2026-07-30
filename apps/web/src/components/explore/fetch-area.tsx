@@ -59,6 +59,7 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
   const working = area.working;
   const done = area.fresh;
   const busy = fetchArea.data?.busy ?? false;
+  const busyReason = fetchArea.data?.busyReason ?? null;
 
   /*
    * Percentage of the *capped* set, which is the set this press can actually finish. Using
@@ -118,14 +119,17 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
       ) : null}
 
       {busy && working === 0 ? (
-        // The queue-depth guard tripped. Said plainly, because the alternative — a button
-        // that reports success and then never makes anything appear — is the failure mode
-        // this message exists to prevent.
+        // Admission refused. Said plainly, because the alternative — a button that reports
+        // success and then never makes anything appear — is the failure mode this message
+        // exists to prevent. Which refusal decides the sentence: a queue drains, and storage
+        // does not, so only one of them may end with "try again in a few minutes".
         <p
           role="status"
           className="max-w-[240px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted"
         >
-          The fetch queue is full right now. Try again in a few minutes.
+          {busyReason === 'storage'
+            ? 'There is no room left to store new ground. Trails already mapped still work.'
+            : 'The fetch queue is full right now. Try again in a few minutes.'}
         </p>
       ) : null}
 

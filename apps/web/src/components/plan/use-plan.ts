@@ -255,11 +255,18 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
    * a ref so a tile landing does not have to race the edit effect above for the same state.
    */
   const pending = plan?.pendingTiles ?? 0;
+  /*
+   * A refused fetch is not a slow one. `busy` means the server declined to queue the network
+   * under these anchors, so no tile is going to land and re-planning on a timer would be a
+   * poll loop against a server already saying it is under pressure. The chain resumes on the
+   * next edit, which is when the refusal is worth re-testing.
+   */
+  const busy = plan?.busy ?? false;
   const latest = useRef({ anchors, preferPaths });
   latest.current = { anchors, preferPaths };
 
   useEffect(() => {
-    if (pending === 0) return;
+    if (busy || pending === 0) return;
 
     let cancelled = false;
     const timer = setTimeout(() => {
@@ -284,7 +291,7 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [pending, plan, mutateAsync]);
+  }, [busy, pending, plan, mutateAsync]);
 
   return {
     anchors,

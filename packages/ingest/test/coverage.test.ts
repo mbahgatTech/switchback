@@ -34,7 +34,7 @@ interface Recorded {
 interface FakeOptions {
   /** Dedupe keys the fake should report as queued or running. */
   inFlight?: string[];
-  /** What `ingestJob.count` answers — the queue-depth guard's input. */
+  /** What the admission guard's grouped count answers — the queue-depth guard's input. */
   queueDepth?: number;
 }
 
@@ -68,7 +68,8 @@ function fakeDb(
             .filter((key) => where.dedupeKey.in.includes(key))
             .map((dedupeKey) => ({ dedupeKey })),
         ),
-      count: () => Promise.resolve(options.queueDepth ?? 0),
+      groupBy: () =>
+        Promise.resolve([{ kind: JobKind.ingest_tile, _count: { _all: options.queueDepth ?? 0 } }]),
       updateMany: () => Promise.resolve({ count: 0 }),
       upsert: (args: Record<string, unknown>) => {
         recorded.jobUpserts.push(args);

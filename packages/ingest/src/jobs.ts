@@ -358,3 +358,53 @@ export function networkJobKey(quadkey: string): string {
 export function routeIngestJobKey(osmId: number): string {
   return `${JobKind.ingest_route}:${osmId}`;
 }
+
+/**
+ * How long a finished job is kept before the drain collects it.
+ *
+ * A `done` row is pure history: `enqueue` revives a terminal row rather than reading it, so
+ * nothing in the system consults one, and deleting it simply means the next request for that
+ * quadkey creates the row fresh. A week is long enough to answer "did that tile ever run"
+ * from the table while looking at an incident.
+ *
+ * `failed` and `dead` are kept longer because they are the opposite: a `dead` row is the only
+ * record of five attempts against one tile, and `scripts/requeue-jobs.ts` reads them. A month
+ * outlives the investigation.
+ */
+export const DONE_JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const FAILED_JOB_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Delete terminal jobs past their window.
+ *
+ * Nothing pruned this table until now, which made it grow with lifetime job count rather
+ * than with queue depth — and admission control counts it on the hot path behind
+ * `trails.browse`, so every row ever recorded was work the guard did on every viewport that
+ * found new ground. The `@@index([kind, status])` added alongside this makes that count
+ * index-only, and this keeps the index from growing without bound underneath it.
+ *
+ * Bounded by `completedAt`, which every terminal transition sets. A row missing it — from
+ * before that column was written, or from a crash between the status flip and the stamp — is
+ * left alone rather than guessed at; there is no volume of them worth a heuristic.
+ */
+export async function pruneFinishedJobs(
+  db: Db,
+  now: Date = new Date(),
+): Promise<{ done: number; failed: number }> {
+  const [done, failed] = await Promise.all([
+    db.ingestJob.deleteMany({
+      where: {
+        status: JobStatus.done,
+        completedAt: { lt: new Date(now.getTime() - DONE_JOB_TTL_MS) },
+      },
+    }),
+    db.ingestJob.deleteMany({
+      where: {
+        status: { in: [JobStatus.failed, JobStatus.dead] },
+        completedAt: { lt: new Date(now.getTime() - FAILED_JOB_TTL_MS) },
+      },
+    }),
+  ]);
+
+  return { done: done.count, failed: failed.count };
+}

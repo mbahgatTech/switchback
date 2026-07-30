@@ -27,6 +27,7 @@ import {
 import { fillGaps } from './elevate';
 import { TerrainSource } from './elevate';
 import { admitIngest } from './backpressure';
+import type { QueueOutcome } from './coverage';
 import { enqueue, networkJobKey } from './jobs';
 import { OverpassUnavailableError } from './overpass';
 import type { OverpassElement, OverpassWay } from './overpass';
@@ -568,7 +569,14 @@ export interface NetworkCoverage {
   pending: string[];
   /** What this call put on the queue. */
   queued: string[];
-  /** True when ingest was refused, so the outstanding tiles are not on their way. */
+  /**
+   * True when ingest was refused, so the outstanding tiles are not on their way.
+   *
+   * Read by the route planner, which is the only consumer that can be *wrong* about it: a
+   * leg over ground we declined to fetch is not a leg with no path under it, and saying so
+   * on a hiking planner is a false claim about terrain dressed as a safety warning. See
+   * `planRoute` in the routes router.
+   */
   busy: boolean;
   tooLarge: boolean;
   requiredTiles: number;
@@ -634,19 +642,29 @@ export async function ensureNetworkCoverage(
     else pending.push(quadkey);
   }
 
-  const queued = options.queue === false ? [] : await queueNetworkTiles(db, needsWork);
+  const enqueued =
+    options.queue === false
+      ? { queued: [] as string[], refused: null }
+      : await queueNetworkTiles(db, needsWork);
+  const queued = enqueued.queued;
 
   /*
-   * Same reasoning as `ensureCoverage`: work outstanding with nothing queued means
-   * backpressure refused it, and the planner is told so rather than left showing a progress
-   * line for tiles that are not coming. `pending` drives that line, so it is cleared.
+   * Work outstanding with nothing queued means backpressure refused it.
+   *
+   * `pending` is left intact, unlike the trail side. There it is the field that makes the
+   * map poll, so clearing it is what stops a refusing database also taking a poll storm.
+   * Here its only consumers are `routes.coverage`, which reports a count nothing renders,
+   * and `planRoute` — and zeroing it there was a regression: `planRoute` used `pending` as
+   * the sole tiebreaker between "still downloading" and "no path exists", so a refusal
+   * silently relabelled every unsnappable leg as open country. `busy` is what those two read
+   * now, and the planner's retry gates on it rather than on the count.
    */
   const busy = options.queue !== false && needsWork.length > 0 && queued.length === 0;
 
   return {
     quadkeys: cover.quadkeys,
     ready,
-    pending: busy ? [] : pending,
+    pending,
     queued,
     busy,
     tooLarge: false,
@@ -660,13 +678,14 @@ export async function queueNetworkTiles(
   db: PrismaClient,
   quadkeys: readonly string[],
   priority = NETWORK_PRIORITY,
-): Promise<string[]> {
-  if (quadkeys.length === 0) return [];
+): Promise<QueueOutcome> {
+  if (quadkeys.length === 0) return { queued: [], refused: null };
 
   // The routing queue's share of the same ceiling. It used to have none: the depth guard
   // counted `ingest_tile` only, and this path enqueues `ingest_network`, so the whole
   // routing queue was invisible to the one thing watching. See `backpressure.ts`.
-  if ((await admitIngest(db)) !== null) return [];
+  const refused = await admitIngest(db);
+  if (refused !== null) return { queued: [], refused };
 
   for (const quadkey of quadkeys) {
     const { x, y, z } = quadkeyToTile(quadkey);
@@ -686,7 +705,7 @@ export async function queueNetworkTiles(
     });
   }
 
-  return [...quadkeys];
+  return { queued: [...quadkeys], refused: null };
 }
 
 /** True while any of these tiles still has a network fetch queued or running. */

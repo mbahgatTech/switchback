@@ -32,13 +32,14 @@ npm run mobile                  # Expo — scan the QR with Expo Go
 `AUTH_SECRET` needs 32+ characters; `openssl rand -base64 32` will do. Everything after
 those two variables degrades gracefully rather than failing:
 
-| Unset                       | What happens                                                                                                                                                                                          |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AUTH_MICROSOFT_ENTRA_ID_*` | Sign-in is unavailable; everything readable stays readable. Required in production — `env.ts` refuses to boot without it.                                                                             |
-| `R2_*`                      | Photo uploads go to local disk via a filesystem driver. **All five or none** — a half-configured bucket silently writes user photographs into a serverless container that is discarded minutes later. |
-| `NEXT_PUBLIC_PMTILES_URL`   | Falls through to keyless OpenFreeMap. The `.env.example` placeholder is rejected as firmly as an empty string.                                                                                        |
-| `MAPILLARY_TOKEN`           | Photo enrichment uses Wikimedia Commons alone.                                                                                                                                                        |
-| `AUTH_APPLE_ENABLED`        | Off. See [gated on an Apple account](#gated-on-an-apple-developer-account).                                                                                                                           |
+| Unset                       | What happens                                                                                                                                                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AUTH_MICROSOFT_ENTRA_ID_*` | Sign-in is unavailable; everything readable stays readable. Required in production — `env.ts` refuses to boot without it.                                                                                                      |
+| `R2_*`                      | Photo uploads go to local disk via a filesystem driver. **All five or none** — a half-configured bucket silently writes user photographs into a serverless container that is discarded minutes later.                          |
+| `NEXT_PUBLIC_PMTILES_URL`   | Falls through to keyless OpenFreeMap. The `.env.example` placeholder is rejected as firmly as an empty string.                                                                                                                 |
+| `MAPILLARY_TOKEN`           | Photo enrichment uses Wikimedia Commons alone.                                                                                                                                                                                 |
+| `DATABASE_SIZE_LIMIT_BYTES` | The ingest storage guard is off and only the queue-depth ceiling applies. Set it to the storage quota of the plan the database is on — nothing can measure that, so an unset guard fails open on purpose rather than guessing. |
+| `AUTH_APPLE_ENABLED`        | Off. See [gated on an Apple account](#gated-on-an-apple-developer-account).                                                                                                                                                    |
 
 `scripts/setup-entra.ps1` registers the Entra app and writes the credentials straight into
 `.env` without echoing the secret.
