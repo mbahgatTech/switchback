@@ -179,8 +179,16 @@ function Downloads() {
           waypoints and the map along the line, so the trail still opens where there is no signal to
           fetch it from.
         </p>
+        {/*
+         * `/nearby` rather than `/`, which is the second inbound link the nearby list has in
+         * the whole application — the first being "Near you" in the map's own neatline, folded
+         * behind the index at phone width. The list was `/` until the map took that address,
+         * and a reader who has nothing downloaded and is standing somewhere is better served by
+         * a short list of the hikes around them than by a sheet to pan. The map is still one
+         * tap away from here through the wordmark, which is not true in the other direction.
+         */}
         <Link
-          href="/explore"
+          href="/nearby"
           className={`${BUTTON_COLLAR} ${SECONDARY} ${HEIGHT.touch} mt-lg px-md`}
         >
           Find a trail

@@ -28,6 +28,7 @@ import { REPORT_TRAIL, VESPER } from './fixtures';
 const PAGES = [
   '/',
   '/explore',
+  '/nearby',
   '/plan',
   '/record',
   '/lists',

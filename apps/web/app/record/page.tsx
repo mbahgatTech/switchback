@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
-import { ATTRIBUTION, BRAND } from '@switchback/core';
+import { BRAND } from '@switchback/core';
+import { OsmCredit, OsmCreditBeside } from '@/components/map/osm-credit';
 import { Recorder, type RecorderTrail } from '@/components/record/recorder';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
@@ -72,20 +73,27 @@ export default async function RecordPage({
       <header className="flex h-3xl shrink-0 items-center justify-between gap-lg border-b border-bezel px-lg">
         <Wordmark />
 
-        <span className="collar flex items-center gap-md">
-          <SiteNav current="record" />
-          <a href={ATTRIBUTION.osm.href} className="hidden rounded-hair hover:text-ink sm:inline">
-            {ATTRIBUTION.osm.label}
-          </a>
-        </span>
+        {/*
+          `record-map.tsx` sets `attributionControl: false`, so this link is the whole ODbL
+          credit for the screen — which is why it goes through `beside` and not `extra`.
+          Folding it into the disclosure was argued as a strict improvement on the
+          `hidden … sm:inline` it replaced, since that class meant no credit at all below
+          640px. It was an improvement below 640 and a regression from 640 to 1279, where the
+          old class rendered the credit and the disclosure does not. `beside` shows it at
+          every width, long-form wherever it fits.
+        */}
+        <SiteNav current="record" beside={<OsmCreditBeside />} extra={<OsmCredit />} />
       </header>
 
-      <Recorder
-        units={viewer.units}
-        defaultVisibility={viewer.defaultActivityVisibility}
-        trail={trail}
-        openRecording={openRecording}
-      />
+      {/* The landmark, for the reason given in `components/explore/explore-shell.tsx`. */}
+      <main className="contents">
+        <Recorder
+          units={viewer.units}
+          defaultVisibility={viewer.defaultActivityVisibility}
+          trail={trail}
+          openRecording={openRecording}
+        />
+      </main>
     </div>
   );
 }

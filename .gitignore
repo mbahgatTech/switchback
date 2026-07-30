@@ -37,6 +37,8 @@ playwright-report/
 test-results/
 blob-report/
 .nyc_output/
+# The Playwright MCP server writes screenshots here when it drives the site.
+.playwright-mcp/
 
 # prisma
 packages/db/prisma/migrations/dev.db*

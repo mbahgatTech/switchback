@@ -138,7 +138,7 @@ export default async function SignInPage({
     <div data-scheme="sheet" className="min-h-dvh bg-canvas text-ink">
       <header className="mx-auto flex max-w-[640px] items-center justify-between px-xl py-lg">
         <Wordmark />
-        <Link href="/explore" className="collar rounded-hair hover:text-ink">
+        <Link href="/" className="collar rounded-hair hover:text-ink">
           Explore
         </Link>
       </header>

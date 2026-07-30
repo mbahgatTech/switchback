@@ -7,9 +7,13 @@ import { Wordmark } from '@/components/wordmark';
 /**
  * Downloads.
  *
- * Not in the four-destination nav — it is reached from a profile, from the offline screen,
- * and from the home-screen shortcut, which is where somebody looks for it. A fifth entry in
- * the collar would put a maintenance screen beside the three things this product is for.
+ * In the nav, sixth and last — after the four things the product is for, and after the account.
+ * The note that used to sit here argued the other way: that a maintenance screen has no place
+ * beside them, and that a profile, the offline screen and the home-screen shortcut are where
+ * somebody looks for it. It was right about the ordering and wrong about the conclusion. This
+ * is the page a hiker opens at a trailhead with no signal to check what came down with them,
+ * and it cannot be three taps behind `/settings`. Last in the row is where a maintenance screen
+ * belongs; absent from the row is not.
  *
  * No `caller`, no session check, nothing awaited: what is downloaded lives on the device, in
  * IndexedDB, and is nobody's business but this browser's. The page is a server shell around
@@ -26,7 +30,7 @@ export default function DownloadsPage() {
     <div data-scheme="sheet" className="min-h-dvh bg-canvas text-ink">
       <header className="mx-auto flex max-w-rail items-center justify-between px-xl py-lg">
         <Wordmark />
-        <SiteNav />
+        <SiteNav current="downloads" />
       </header>
 
       <main className="mx-auto max-w-rail px-xl pb-5xl">

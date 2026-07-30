@@ -17,9 +17,29 @@ export default function manifest(): MetadataRoute.Manifest {
     name: BRAND.name,
     short_name: BRAND.name,
     description: BRAND.tagline,
-    start_url: '/explore',
-    // Where a cold launch lands. `/explore` rather than `/`, because somebody who has put
-    // this on their home screen has already read the front page.
+    // Where a cold launch lands, and now the same path as `scope` — the front page is the
+    // map, so an installed app opens the instrument with no alias anywhere in the install
+    // path. That matters more than it sounds: the start URL is what the service worker
+    // precaches, and a shell keyed to a route that is only an alias is one rename from
+    // launching straight into the offline fallback.
+    start_url: '/',
+    /*
+     * The application's identity, and it is `/explore` on purpose.
+     *
+     * When `id` is absent the spec falls back to the resolved `start_url`, so every copy of
+     * this app installed before the front page moved recorded its identity as
+     * `https://<host>/explore`. Shipping `start_url: '/'` with no `id` would have handed the
+     * browser an identifier it had never seen: not an update to the installed app but a
+     * second, different one — the existing install frozen forever on the old start URL, no
+     * name or icon changes ever again, and an offer to install a duplicate beside it.
+     *
+     * So the identity stays where the field already put it, and the start URL moves under it.
+     * `id` resolves against the manifest's *origin* rather than against `start_url`, so this
+     * is `https://<host>/explore` and matches what is already recorded. It is now permanent:
+     * changing this string later orphans every install exactly as described above, whatever
+     * `start_url` says at the time.
+     */
+    id: '/explore',
     scope: '/',
     display: 'standalone',
     orientation: 'any',

@@ -1,79 +1,109 @@
-import Link from 'next/link';
+import type { ReactNode } from 'react';
 import { currentTheme } from '../lib/theme';
 import { caller } from '../trpc/server';
-import { ThemeChoice } from './theme-choice';
+import { type SiteSection, SiteNavMenu } from './site-nav-menu';
 
 /**
- * The five places this product goes.
+ * The public surface stays this module, even though the declaration moved next door. Nothing
+ * imports the type today; a caller that wants one should not have to know that the row is two
+ * files because half of it needs a browser.
+ */
+export type { SiteSection };
+
+/**
+ * The index of the sheet.
  *
- * Collar text in the margin of the sheet, not a navigation bar — the same eleven-pixel
- * condensed caps every other marginal label uses, because that is what these are. A product
- * with five destinations does not need chrome to hold them; it needs them written where a
- * sheet writes its index.
+ * Collar text in the margin, not a navigation bar — the same eleven-pixel condensed caps every
+ * other marginal label uses, because that is what these are. Above 1280px it is still exactly
+ * that: six words and a theme control, no box, no button, nothing that reads as chrome.
  *
- * Five is the ceiling. At six the row stops reading as a margin note and starts reading as a
- * menu, which is the point at which it would need chrome after all.
+ * Below 1280px it is a menu behind a labelled disclosure, and that is a real concession. The
+ * note that used to sit here said five was the ceiling — that at six the row stops reading as a
+ * margin note and starts reading as a menu, which is the point at which it would need chrome
+ * after all. That was right, and Downloads is the sixth. What follows is what it cost and why
+ * it was paid.
  *
- * The current page is named and not linked. A link to where you already are is a control
- * that does nothing, and removing it is also the clearest possible "you are here".
+ * **The arithmetic, and where the fold is.** One breakpoint for the whole product, sized off the
+ * densest header rather than tuned per page, because a fold that is right on the sparse screens
+ * and wrong on the dense one is the exact bug a breakpoint is supposed to prevent. The binding
+ * case is the map sheet's neatline: 48px tall, carrying the wordmark, the six words, the ODbL
+ * credit and the two other marginal links beside it, and the theme strip. Measured, that is
+ * about 1,117px of content — it clears 1280 and does not clear 1024. So `xl`, and see
+ * `site-nav-menu.tsx` for the measurement.
+ *
+ * **The cost.** Below 1280px this is chrome. A row of words became a button, and on a
+ * tablet-width window the six words would have fitted. The old note was right about what
+ * happens at six. It also became a control that needs JavaScript: open/closed is React state,
+ * so with scripting off, or in the window before hydration, the row below `xl` is an inert
+ * button. `site-nav-menu.tsx` gives the two CSS-first shapes that were weighed against it and
+ * why neither was taken. The one thing that must not ride behind it is the ODbL credit, which
+ * goes through `beside` instead.
+ *
+ * **Why it is worth it.** `/downloads` was already in the product — precached in the service
+ * worker's `SHELL_PAGES`, listed as a shortcut in the PWA manifest — and reachable only from
+ * `/settings`, `/offline` and a profile. A screen a hiker opens at a trailhead with no signal
+ * should not be three taps behind a settings page. One button on a phone buys that, and the
+ * phone is where the argument is won: the row it replaces did not fit on a phone either. It
+ * overflowed, silently, and had done since there were five words in it.
+ *
+ * The current page is named and not linked. A link to where you already are is a control that
+ * does nothing, and removing it is also the clearest possible "you are here".
  */
 
-export type SiteSection = 'explore' | 'plan' | 'record' | 'lists' | 'profile';
-
-const DESTINATIONS: ReadonlyArray<{ key: SiteSection; href: string; label: string }> = [
-  { key: 'explore', href: '/explore', label: 'Explore' },
-  // In the order the product is used: find a hike, draw one of your own, do it, keep it.
-  // Plan sits next to Explore because the two answer the same question — the first when
-  // somebody has already hiked the line you want, the second when nobody has.
-  { key: 'plan', href: '/plan', label: 'Plan' },
-  // Record sits third because it is the only entry that is ever urgent — somebody standing
-  // at a trailhead with a rucksack on should not have to read past three other words to
-  // find it, and three is where that stops being true.
-  { key: 'record', href: '/record', label: 'Record' },
-  { key: 'lists', href: '/lists', label: 'Lists' },
-  // `/profile` rather than `/u/<name>`, because it has to work before a username exists —
-  // an account created by clicking "Sign in with Microsoft" has no handle until somebody
-  // chooses one, and a nav entry that 404s for new accounts is worse than none.
-  { key: 'profile', href: '/profile', label: 'Profile' },
-];
-
 /**
- * The theme control rides here rather than becoming a sixth entry.
+ * The theme control rides here rather than becoming a seventh entry.
  *
  * It is not a destination and must not read as one — but it does have to be on every page,
  * because a preference you can only change in Settings is one a signed-out reader cannot
- * change at all. This row is already on every page, so it is where the control goes: outside
- * the `<nav>`, so the landmark still contains exactly the five places, and inside the same
- * collar so it reads as one more marginal note rather than as chrome.
+ * change at all. This row is already on every page, so it is where the control goes: inside the
+ * same collar, so it reads as one more marginal note rather than as chrome.
  *
- * `<span>` rather than `<div>` because two callers nest this inside a `<span>` of their own
- * alongside the licence line, and a block element inside phrasing content is a parse error
- * the browser fixes by moving the element somewhere you did not put it.
+ * It used to sit outside the `<nav>` as well, so the landmark held exactly the six places, and
+ * `extra` sat outside for the same reason — a licence credit is not a destination, and neither
+ * is "Sign in". Neither is true now, and the trade is written up in `site-nav-menu.tsx`: the
+ * landmark had to move out to wrap the trigger, because inside the panel it was inside a
+ * `display:none` subtree at every width below `xl`, and no page in the product exposed a
+ * navigation landmark on a phone at all.
+ *
+ * **What `extra` is for.** Four headers used to hand-roll their own collar span around this
+ * one — `<span className="collar flex items-center gap-md">` holding `<SiteNav>` and then an
+ * attribution link or a sign-in link of their own. That worked while the row was only ever a
+ * row: their links sat beside it and everything stayed on one line. It stops working the moment
+ * the row can fold, because a sibling of the disclosure does not fold with it — it overflows
+ * beside a tidy button. So anything riding next to the nav comes through this slot and lands
+ * inside the same panel.
+ *
+ * **What `beside` is for.** The exception, and there is exactly one class of it: something that
+ * has to be *displayed* rather than merely reachable. `extra` lands inside the panel, which is
+ * `display:none` below `xl` — fine for "Sign in", not fine for the ODbL notice, which the
+ * licence requires wherever the data is shown and which a control labelled "Index" does not
+ * show. So `beside` renders outside the fold and hides itself at `xl`, where the panel becomes
+ * the row again and carries the long-form credit. Nothing else belongs in it: a second thing
+ * here is the overflow this breakpoint exists to prevent.
+ *
+ * Still `async`, and still a server component. It awaits the session and the theme cookie, both
+ * of which are server-only — `trpc/server.ts` is `import 'server-only'` and `lib/theme.ts` reads
+ * `cookies()` — and asking the browser for the theme instead would put back the flash that file
+ * exists to prevent.
  */
-export async function SiteNav({ current }: { current?: SiteSection }) {
+export async function SiteNav({
+  current,
+  extra,
+  beside,
+}: {
+  current?: SiteSection;
+  extra?: ReactNode;
+  beside?: ReactNode;
+}) {
   const [viewer, theme] = await Promise.all([caller.me.get(), currentTheme()]);
 
   return (
-    <span className="collar flex items-center gap-lg">
-      <nav className="flex items-center gap-lg">
-        {DESTINATIONS.map((destination) =>
-          destination.key === current ? (
-            <span key={destination.key} className="text-ink">
-              {destination.label}
-            </span>
-          ) : (
-            <Link
-              key={destination.key}
-              href={destination.href}
-              className="rounded-hair hover:text-ink"
-            >
-              {destination.label}
-            </Link>
-          ),
-        )}
-      </nav>
-
-      <ThemeChoice value={theme} signedIn={viewer !== null} />
-    </span>
+    <SiteNavMenu
+      current={current}
+      theme={theme}
+      signedIn={viewer !== null}
+      extra={extra}
+      beside={beside}
+    />
   );
 }

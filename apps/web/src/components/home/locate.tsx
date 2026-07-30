@@ -7,9 +7,11 @@ import { forgetPlace, rememberPlace } from '@/lib/place-action';
 /**
  * Where the reader is — asked for on arrival, not waited for.
  *
- * The front page is a list of trails near you, so a page that opens on a question and a
+ * The nearby list is a list of trails near you, so a page that opens on a question and a
  * button is a page that has made the reader do the one thing it could have done itself.
- * It asks on mount.
+ * It asks on mount. This component renders on `/nearby` and nowhere else — it was the front
+ * page's until the map took that address, and the argument below is about this page rather
+ * than about whichever URL it happens to sit at.
  *
  * That is a reversal, and the argument it reverses was a real one: a denied permission is
  * denied for the whole origin and cannot be walked back, so a prompt fired before the reader

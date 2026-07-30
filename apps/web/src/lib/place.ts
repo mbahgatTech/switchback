@@ -19,7 +19,7 @@ import type { LngLat } from '@switchback/core';
  *    in request headers. City-accurate at best, occasionally the wrong side of a country
  *    on a VPN — but it costs nothing, it is already in the request, and it is enough to
  *    put real trails on the page in the first paint.
- * 3. **Nothing.** Rendered as a question rather than as a guess. See `app/page.tsx`.
+ * 3. **Nothing.** Rendered as a question rather than as a guess. See `app/nearby/page.tsx`.
  *
  * There is deliberately no reverse geocoder here. Naming a coordinate would mean a
  * Nominatim round trip on every landing-page render against a shared public gazetteer that
@@ -154,4 +154,90 @@ export const viewerPlace = cache(async (): Promise<ViewerPlace | null> => {
 export function placeLabel(place: ViewerPlace): string {
   if (place.source === 'browser') return 'your location';
   return place.name ?? 'here';
+}
+
+/**
+ * Where the map opens when the reader has told us nothing at all.
+ *
+ * Seattle, and the honest version of the reason is narrower than "that is where the trails
+ * are". `packages/db/scripts/seed.ts` seeds eight starter areas and **none of them is in
+ * Washington**; the Washington content this catalogue actually holds is Mountain-Loop-shaped
+ * — `seed-tracks.ts:66` is `[-121.75, 47.85, -121.25, 48.2]` and the whole e2e suite is built
+ * around Vesper Peak — which is 60 km north-east of here and outside any frame that could
+ * still be called Seattle. So this coordinate is the *city those hikes belong to*, not a
+ * coordinate with hikes on it, and a reader who lands here with nothing cached gets the
+ * ordinary on-demand ingest that any uncovered viewport gets.
+ *
+ * That is the premise worth re-checking before anyone defends this number: count the trails
+ * within ~30 km of it. If the count is low, the lever is this one constant — move it east to
+ * the I-90 corridor (Issaquah Alps, around `[-122.03, 47.53]`, still "Seattle" in plain
+ * speech and where Washington day hikes actually are). It could not be counted when this was
+ * written: the local Postgres was down and no other catalogue was reachable.
+ */
+export const FALLBACK_AT: LngLat = [-122.33, 47.61];
+
+/** A zoom that trusts the coordinate: a GPS fix, or a place the reader searched for. */
+const FIX_ZOOM = 11;
+
+/**
+ * A zoom that does not, used for both kinds of not-knowing.
+ *
+ * An IP lookup is city-accurate at best and the wrong side of a country on a VPN, so the
+ * sheet opens one step wider — far enough out that a guess wrong by twenty kilometres still
+ * has real trails on it, and wide enough to read as the hedge it is. `placeLabel` already
+ * refuses to say "your location" for anything but a browser fix; this is the same honesty
+ * spent on the camera, which is the only place the map has room to say it.
+ *
+ * The `null` case gets this zoom too, and that is not a hedge about the coordinate — it is
+ * that we know strictly *less* about a reader with no cookie and no edge headers than about
+ * one with an IP city, so handing the least-informed case the tighter frame is backwards. It
+ * also buys the fallback its margin: at z11 a sheet centred on Seattle is a third salt water
+ * and stops 10 km short of the nearest foothill, and at z10 the metro and the Issaquah Alps
+ * are both on screen.
+ *
+ * Not wider than 10, and here is the actual arithmetic rather than the sketch that used to sit
+ * here. `INGEST_ZOOM` is 9 and `MAX_TILES_PER_REQUEST` is 12 (`packages/geo/src/tiles.ts`), and
+ * `ensureCoverage` returns `tooLarge` with nothing queued above that budget — which surfaces as
+ * the coverage note and a "fetch this area" button instead of trails arriving on their own.
+ * Feeding the explore sheet's real viewport (window width less the 416px collar, height less
+ * the 48px neatline, centred on `FALLBACK_AT`) through `coverBBox` at z10 gives: 4 tiles at
+ * 1400×900, 4 at 1920×1080, **8** at 2560×1440, **12 — exactly the cap** at 3840×2160, and 24
+ * at 4800×2700. The note this replaces claimed "at most 3 tiles wide by 2 deep even on a
+ * 2560px monitor"; it is 4 by 2 there, and anyone re-deriving the headroom from the old
+ * sentence got half the real count.
+ *
+ * So the honest version: z10 is inside the budget on every mainstream desktop up to and
+ * including a 4K monitor at 1× scaling, and goes over it beyond roughly 4,400 CSS pixels of
+ * sheet — a 5K panel at dpr 1, or 4K with the browser zoomed out to 80%. There a first arrival
+ * renders whatever is already catalogued and offers the fetch button rather than queueing by
+ * itself. That is the designed degradation and not a broken page, but it is a degradation, and
+ * it is the case to look at first if arrivals on very wide windows ever look empty.
+ *
+ * It is not fixed by picking a different constant, which is why one is still here. No
+ * server-side number can be safe at an arbitrary viewport: the budget is spent by the *span*
+ * the sheet covers, and the server cannot see the window. z11 would clear the cap at every
+ * width — and cost every reader it applies to the frame this constant exists to give them. At
+ * z11 the fallback sheet is a third salt water and stops short of the nearest foothill, so the
+ * common case pays for the rare one. The levers, in order of how much they buy: move
+ * `FALLBACK_AT` east to the I-90 corridor as its own note describes, so the tighter frame has
+ * something in it; or derive the opening zoom from the sheet width on the client, which is the
+ * only place the width is known.
+ */
+const GUESS_ZOOM = 10;
+
+export interface PlaceCamera {
+  center: LngLat;
+  zoom: number;
+}
+
+/**
+ * Where a map should open, given what we know about the reader — and how well we know it.
+ *
+ * Pure, and deliberately separate from `viewerPlace()`: this module imports `next/headers` at
+ * module scope, so it can only be called on the server, and the answer has to cross into the
+ * map as a serialized prop rather than as a call inside the client tree.
+ */
+export function placeCamera(place: ViewerPlace | null): PlaceCamera {
+  if (place === null) return { center: FALLBACK_AT, zoom: GUESS_ZOOM };
+  return { center: place.at, zoom: place.source === 'network' ? GUESS_ZOOM : FIX_ZOOM };
 }

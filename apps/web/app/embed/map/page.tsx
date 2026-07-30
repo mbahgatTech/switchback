@@ -43,8 +43,12 @@ export default async function EmbedMapPage({
 
   return (
     <EmbedMapClient
-      // Snowdon, matching the website's own default — the phone overrides it with the last
-      // place the user was looking, and falls back to this on a first run.
+      // Snowdon, and this is now the last hard-coded opening view left on the website — kept
+      // deliberately. The website's own map derives its centre from the reader's cookie and
+      // edge headers (`lib/place.ts`), and this route has neither: it is a WebView with no
+      // session, driven entirely by the `lng`/`lat` the phone passes in. So this is not a
+      // stale copy of a default that moved; it is the floor for a first run where the phone
+      // has no last known fix to send, and the phone overrides it whenever it has one.
       initialCenter={lng !== null && lat !== null ? [lng, lat] : [-4.05, 53.07]}
       initialZoom={zoom !== null ? zoom : 11}
       initialBasemap={basemapId(params.basemap)}

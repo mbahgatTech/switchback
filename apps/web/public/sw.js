@@ -29,7 +29,7 @@ const MEDIA_CACHE = 'sb-media-v1';
 const SHELL_CACHE = 'sb-shell-v1';
 const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
-const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/explore'];
+const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];
 const STATIC_ASSET_PATTERN = String.raw`/_next/static/[A-Za-z0-9._@%/-]+\.[A-Za-z0-9]{2,5}\b`;
 const PRECACHE_ATTEMPTS = 3;
 const PRECACHE_BACKOFF_MS = 500;
@@ -180,6 +180,7 @@ async function handleNavigation(request) {
       // A working network, proven rather than assumed. If the shell is short a page, this is
       // the moment to put it back — see `repairShell`.
       void repairShell();
+      refreshShell(request, response);
 
       const cache = await caches.open(PAGE_CACHE);
       // Refresh a page that was explicitly downloaded, but do not silently download every
@@ -203,6 +204,47 @@ async function handleNavigation(request) {
       })
     );
   }
+}
+
+/**
+ * Replace a stored shell page with the copy the reader just successfully loaded.
+ *
+ * `repairShell` above only fills gaps — it asks whether an entry is *missing*. That was the
+ * whole story while the shell was viewer-independent. It is not any more: `/` and `/explore`
+ * are rendered with the reader's own opening coordinate, taken from the `sb-place` cookie and
+ * the edge geo headers, and `install` runs once per worker version. So a reader who installed
+ * the app and later corrected their place — searched somewhere on the map, or pressed "Use my
+ * location" on `/nearby` — had an offline cold launch pinned to whatever was true at install
+ * time, with no path back short of a new worker.
+ *
+ * A navigation that has just returned 2xx is that path: the bytes are already in hand and they
+ * are this reader's, so the store costs nothing but the write. Assets are not re-harvested —
+ * `/_next/static/*` is content-hashed and `handleStatic` is caching the live page's chunks as
+ * they are requested anyway.
+ *
+ * Synchronous down to the `clone()`, and that part is not style. A response body can only be
+ * read once; cloning after an `await` would race the page consuming the very response we are
+ * about to hand it, and the failure would be a navigation that renders nothing on a slow
+ * connection and everything on a fast one. So the cheap checks and the clone happen before
+ * anything yields, and only the cache write is deferred.
+ */
+function refreshShell(request, response) {
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return;
+  }
+
+  if (url.origin !== self.location.origin) return;
+  if (!SHELL_PAGES.includes(url.pathname)) return;
+
+  const copy = response.clone();
+  caches
+    .open(SHELL_CACHE)
+    .then((cache) => cache.put(url.pathname, copy))
+    // The stored copy stays as it was, which is the state this function improves on.
+    .catch(() => undefined);
 }
 
 /**

@@ -11,10 +11,29 @@ import {
 } from './place';
 
 /**
+ * Every route whose server render is a function of this cookie, so every route that has to be
+ * rebuilt for a new answer to appear anywhere.
+ *
+ * It was one path — `/` — written when `/` was the nearby list and was the only reader. Both
+ * halves of that stopped being true when the map became the front page. `/nearby` is now the
+ * page that is a function of this cookie and nothing else, and it is where "Use my location"
+ * lives, so leaving it off meant pressing the button wrote the cookie and left the list on
+ * screen unchanged. `/` and its alias `/explore` read it too, through `placeCamera(place)` in
+ * `components/explore/explore-shell.tsx` — the note that used to sit below said "the explore
+ * map reads its own viewport", which is true of a shared URL and false of a bare load. `/plan`
+ * reads it for the same camera. Nothing else does; `viewerPlace()` has exactly these callers.
+ */
+const PLACE_READERS = ['/nearby', '/', '/explore', '/plan'] as const;
+
+function rebuildPlaceReaders(): void {
+  for (const path of PLACE_READERS) revalidatePath(path);
+}
+
+/**
  * Remember where the reader is, so the next visit opens on their trails.
  *
  * Called two ways, and the distinction between them is the whole reason `source` is stored
- * rather than inferred: the front page's "Use my location" hands over a GPS fix, and the
+ * rather than inferred: the nearby list's "Use my location" hands over a GPS fix, and the
  * explore map hands over a place somebody searched for. Both are answers a person gave; the
  * first has no name and the second is nothing but a name.
  *
@@ -61,9 +80,7 @@ export async function rememberPlace(input: {
     httpOnly: false,
   });
 
-  // The front page is a function of this cookie and nothing else, so it has to be rebuilt
-  // for the answer to appear. Only that path: the explore map reads its own viewport.
-  revalidatePath('/');
+  rebuildPlaceReaders();
 }
 
 /**
@@ -71,10 +88,11 @@ export async function rememberPlace(input: {
  *
  * A location control that can only be switched on is a control that has taken something.
  * This is the same act as revoking the browser's permission, on our side of it, and it
- * returns the front page to the question it asks when it knows nothing.
+ * returns the nearby list to the question it asks when it knows nothing, and both maps to
+ * their fallback camera.
  */
 export async function forgetPlace(): Promise<void> {
   const jar = await cookies();
   jar.delete(PLACE_COOKIE);
-  revalidatePath('/');
+  rebuildPlaceReaders();
 }

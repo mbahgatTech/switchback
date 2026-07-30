@@ -35,20 +35,45 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
 /**
  * Pages kept from the moment the worker installs, before anything is downloaded.
  *
- * Three, and each earns it. `/explore` is the manifest's `start_url`, so it is what an
- * installed app opens on a cold launch — and an installed app is opened on a cold launch
- * precisely when there is no signal. Without it here the home-screen icon leads straight to
- * the offline fallback, which is the one screen the download was bought to avoid. It is a
- * pure server shell, chrome around a client component, so what is stored is the instrument
- * and not a stale list of somebody else's trails.
+ * Four, and each earns it. `/` is the manifest's `start_url`, so it is what an installed app
+ * opens on a cold launch — and an installed app is opened on a cold launch precisely when
+ * there is no signal. Without it here the home-screen icon leads straight to the offline
+ * fallback, which is the one screen the download was bought to avoid.
+ *
+ * `/explore` is the same argument aimed backwards. It was the `start_url` until the map moved
+ * to `/`, and an installed app keeps whatever start URL it captured: an iOS home-screen
+ * bookmark never re-reads the manifest at all, and a Chrome WebAPK update lags by up to a
+ * month. `app/manifest.ts` sets `id` so those installs at least *accept* the new manifest
+ * rather than being orphaned by it, but accepting it is not the same as having applied it, so
+ * for as long as the alias route exists the address they cold-launch has to be in this list.
+ * It is a cheap server shell and `precache` is guarded per path, so the cost is one fetch at
+ * install. Dropping it is a decision to write off pre-migration installs, and should be taken
+ * as one rather than as a tidy-up.
+ *
+ * `/` used to be viewer-independent, and this comment used to say that if it ever centred the
+ * map from `viewerPlace()` server-side the entry would have to go. It now does, and the entry
+ * stays — so here is the trade, rather than a condition quietly left broken. What is stored is
+ * still the instrument and not a stale list of somebody else's trails; what it now also carries
+ * is one opening coordinate. It is *that reader's* coordinate, because the worker precaches
+ * with `credentials: 'same-origin'` and each install fetches its own copy — not one reader's
+ * city shared out to everyone. And it only ever surfaces offline: `handleNavigation` is
+ * network-first, so anyone with signal gets a freshly derived centre and never reads this copy.
+ * The residual defect is any reader who corrects their place and then goes offline — searching
+ * a place on the map, or pressing "Use my location" on `/nearby`, writes the cookie that this
+ * copy was rendered without. `handleNavigation` re-puts a shell page whenever an online
+ * navigation to it succeeds, so the correction lands the next time they open that page with
+ * signal rather than at the next worker install; before that it was install-time only, which
+ * is to say never in practice.
  *
  * The fallback is where every unreachable navigation lands. The storage manager is where
  * that fallback sends you — and it reads its list from IndexedDB, so it is fully truthful
  * offline; without it here, "Manage downloads" leads back to the screen it was pressed
  * from, which is the kind of small dishonesty that makes a hiker stop trusting the rest.
- * None of the three takes a server, so all are static HTML plus their assets.
+ * `/offline` and `/downloads` take no server input at all, so one stored copy is right for
+ * everybody; `/` and `/explore` are the two that are rendered per reader, which is the whole
+ * of the paragraph above.
  */
-export const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/explore'] as const;
+export const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'] as const;
 
 /**
  * Every build asset a page references, as it appears in that page's HTML.
