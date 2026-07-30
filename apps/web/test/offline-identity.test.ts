@@ -23,10 +23,12 @@ import {
   heldForAnother,
   isUnattributed,
   ownedBy,
+  readerKeyChanged,
   rememberReader,
   rememberedReader,
   writingReader,
 } from '../src/offline/identity';
+import { READER_SHELL_PAGES, SHELL_CACHE, SHELL_PAGES } from '../src/offline/caches';
 import { clearReaderStorage, reconcileReader } from '../src/offline/handover';
 import {
   getPendingReview,
@@ -147,22 +149,40 @@ function createFakeStorage(): Storage {
   };
 }
 
-/** Cache Storage as a set of names. Nothing here reads a cached response, only the keys. */
-function createFakeCaches(names: readonly string[]): { store: Set<string>; api: CacheStorage } {
+/** Cache Storage as a set of names, plus the keys stored inside each one. */
+function createFakeCaches(names: readonly string[]): {
+  store: Set<string>;
+  entries: Map<string, Set<string>>;
+  api: CacheStorage;
+} {
   const store = new Set(names);
+  const entries = new Map<string, Set<string>>();
   const api = {
     keys: () => Promise.resolve([...store]),
     delete: (name: string) => Promise.resolve(store.delete(name)),
-    open: () =>
-      Promise.resolve({
-        delete: () => Promise.resolve(false),
+    open: (name: string) => {
+      const keys = entries.get(name) ?? new Set<string>();
+      entries.set(name, keys);
+      return Promise.resolve({
+        delete: (key: string) => Promise.resolve(keys.delete(key)),
         match: () => Promise.resolve(undefined),
         put: () => Promise.resolve(undefined),
-      }),
+      });
+    },
     has: (name: string) => Promise.resolve(store.has(name)),
     match: () => Promise.resolve(undefined),
   } as unknown as CacheStorage;
-  return { store, api };
+  return { store, entries, api };
+}
+
+/** A shell cache holding everything the worker precaches, so a sweep can be seen to be scoped. */
+function shellHolding(
+  entries: Map<string, Set<string>>,
+  paths: readonly string[] = [...SHELL_PAGES, '/_next/static/chunks/main-9f2c.js'],
+): Set<string> {
+  const keys = new Set(paths);
+  entries.set(SHELL_CACHE, keys);
+  return keys;
 }
 
 const A = 'hiker-a';
@@ -245,6 +265,31 @@ describe('the remembered reader', () => {
     forgetReader();
     expect(rememberedReader().known).toBe(false);
   });
+
+  it('notices the key another tab moved, and a wholesale clear', () => {
+    // `storage` fires on every document of this origin except the one that wrote, and it is
+    // the only notice an open tab gets that somebody signed in elsewhere. A null key means
+    // another document called `clear()`, which takes the reader with it.
+    expect(readerKeyChanged('sb-reader')).toBe(true);
+    expect(readerKeyChanged(null)).toBe(true);
+    expect(readerKeyChanged('sb-units')).toBe(false);
+  });
+});
+
+describe('the reader a write is stamped with', () => {
+  it('is read from storage at the moment of the write, not from a render', () => {
+    // The defect this closes needs no attacker: a second tab left open while somebody signs in
+    // on the first holds a render that says A, and its next request carries B's cookie. A
+    // drain that trusted the render would find `ownedBy(row, 'A')` true of A's report and post
+    // it as B. Reading here means the answer is whatever the browser says now.
+    rememberReader(A);
+    expect(writingReader()).toBe(A);
+
+    // What the other tab did.
+    rememberReader(B);
+    expect(writingReader()).toBe(B);
+    expect(ownedBy({ userId: A }, writingReader())).toBe(false);
+  });
 });
 
 describe('reconciling a change of reader', () => {
@@ -291,20 +336,53 @@ describe('reconciling a change of reader', () => {
 
   it('deletes the departing reader cached pages', async () => {
     rememberReader(A);
-    const { store, api } = createFakeCaches([
+    const { store, entries, api } = createFakeCaches([
       'sb-shell-v1',
       'sb-pages-v1',
       'sb-tiles-v1',
       'somebody-elses-cache',
     ]);
+    const shell = shellHolding(entries);
     vi.stubGlobal('caches', api);
 
     await reconcileReader(B);
 
-    // Everything under `sb-` was fetched with the first reader's cookie: the shell holds
-    // `/record` as it rendered for them, the pages hold their own hikes on those trails.
-    // A cache this product does not own is not ours to remove.
-    expect([...store]).toEqual(['somebody-elses-cache']);
+    // The trail pages and tiles were fetched with the first reader's cookie and go whole. The
+    // shell is not dropped by name: it also holds the offline fallback, the storage manager and
+    // the build assets every one of them needs to render, and nothing puts those back until a
+    // full-document navigation — so what goes is the three pages rendered for a person.
+    expect([...store]).toEqual(['sb-shell-v1', 'somebody-elses-cache']);
+    for (const path of READER_SHELL_PAGES) expect(shell.has(path)).toBe(false);
+    expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
+  });
+
+  it('keeps the downloads of somebody signing in for the first time', async () => {
+    // A download needs no account, so this is the ordinary order of events: acquire trails
+    // signed out, sign in afterwards. Nothing in those caches was fetched under a name, so
+    // deleting them protects nobody and costs the map for the hike being planned. The same
+    // branch fires on a thirty-day session lapse on a one-person phone.
+    rememberReader(null);
+    const { store, entries, api } = createFakeCaches(['sb-shell-v1', 'sb-tiles-v1']);
+    const shell = shellHolding(entries);
+    vi.stubGlobal('caches', api);
+
+    expect(await reconcileReader(A)).toBe(true);
+
+    expect([...store]).toEqual(['sb-shell-v1', 'sb-tiles-v1']);
+    expect([...shell]).toEqual([...SHELL_PAGES, '/_next/static/chunks/main-9f2c.js']);
+    expect(rememberedReader()).toEqual({ id: A, known: true });
+  });
+
+  it('clears on the way out, when a named reader signs out', async () => {
+    // Somebody to nobody is a person leaving a machine, and what they leave behind was fetched
+    // under their name.
+    rememberReader(A);
+    const { store, api } = createFakeCaches(['sb-tiles-v1']);
+    vi.stubGlobal('caches', api);
+
+    await reconcileReader(null);
+
+    expect([...store]).toEqual([]);
   });
 
   it('does nothing at all when the reader has not changed', async () => {
@@ -346,5 +424,29 @@ describe('clearReaderStorage', () => {
       'The ford below the col is impassable.',
     );
     expect(await getPendingReview(null, 'b')).not.toBeNull();
+  });
+
+  it('keeps the download caches when the ledger cannot be read', async () => {
+    const { store, entries, api } = createFakeCaches([
+      'sb-shell-v1',
+      'sb-tiles-v1',
+      'sb-pages-v1',
+      'sb-media-v1',
+    ]);
+    const shell = shellHolding(entries);
+    vi.stubGlobal('caches', api);
+    vi.stubGlobal('indexedDB', {
+      open: () => {
+        throw new Error('The profile is locked.');
+      },
+    });
+
+    await clearReaderStorage();
+
+    // The ledger rows survive an unreadable store; their bytes must survive with them, or
+    // `/downloads` lists a trail as available offline with a byte count and nothing behind it.
+    // The reader-specific pages still go — they are in no ledger and nothing lies about them.
+    expect([...store]).toEqual(['sb-shell-v1', 'sb-tiles-v1', 'sb-pages-v1', 'sb-media-v1']);
+    expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
   });
 });

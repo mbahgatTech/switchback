@@ -26,6 +26,18 @@
  * - **unattributed** — written before the queue recorded authorship. Shown, named, and left
  *   for a person to claim or discard, because those two are the only honest options and the
  *   device cannot choose between them. See `handover.ts`.
+ *
+ * ---
+ *
+ * **Drawing reads the subscription; acting reads `localStorage`.** `useReaderId()` gives these
+ * hooks the value to render — which list a row belongs in, whether to offer a claim button.
+ * Every callback that *sends, adopts or deletes* calls `writingReader()` instead, at the
+ * moment the button does its work. The two disagree exactly when it matters: a second tab
+ * signs in, or this document comes back from the back/forward cache, and the render that drew
+ * the button happened under an account that has since left while the request the button makes
+ * carries the cookie of the account that arrived. Acting on the drawn value posts one hiker's
+ * report under another's name; acting on the stored value posts nothing, which is correct.
+ * See the note on `writingReader` in `identity.ts`.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -44,7 +56,7 @@ import {
   type FlushActivitiesResult,
   type PendingActivity,
 } from './activities';
-import { heldForAnother, isUnattributed, ownedBy } from './identity';
+import { heldForAnother, isUnattributed, ownedBy, writingReader } from './identity';
 import {
   adoptPendingReview,
   deletePendingReview,
@@ -136,13 +148,17 @@ export function usePendingReviews(): PendingReviewsApi {
         // `force` because both entry points here are somebody pressing a button. An automatic
         // flush leaves refused rows alone; a person asking is a new fact about the world —
         // they may have signed back in since.
-        return await flushPendingReviews(send, { ...options, readerId, force: true });
+        return await flushPendingReviews(send, {
+          ...options,
+          readerId: writingReader(),
+          force: true,
+        });
       } finally {
         setBusy(false);
         await refresh();
       }
     },
-    [send, refresh, readerId],
+    [send, refresh],
   );
 
   return {
@@ -155,26 +171,29 @@ export function usePendingReviews(): PendingReviewsApi {
     post: useCallback((trailId: string) => run({ trailId }), [run]),
     discard: useCallback(
       async (trailId: string) => {
-        await deletePendingReview(readerId, trailId);
+        // The reader as stored, not as drawn: the key is half owner, so a stale value here
+        // deletes the report of the person who left rather than the one this list belongs to.
+        await deletePendingReview(writingReader(), trailId);
         await refresh();
       },
-      [refresh, readerId],
+      [refresh],
     ),
     adopt: useCallback(
       async (trailId: string) => {
         // Nobody is signed in, so there is no name to put on it. The control that calls this
         // is not rendered in that state; the guard is here so the answer cannot depend on it.
-        if (readerId === null) return;
+        const reader = writingReader();
+        if (reader === null) return;
         setBusy(true);
         try {
-          await adoptPendingReview(trailId, readerId);
-          await flushPendingReviews(send, { trailId, readerId, force: true });
+          await adoptPendingReview(trailId, reader);
+          await flushPendingReviews(send, { trailId, readerId: reader, force: true });
         } finally {
           setBusy(false);
           await refresh();
         }
       },
-      [send, refresh, readerId],
+      [send, refresh],
     ),
     discardUnattributed: useCallback(
       async (trailId: string) => {
@@ -232,16 +251,20 @@ export function usePendingReview(trailId: string): PendingReviewApi {
     post: useCallback(async () => {
       setBusy(true);
       try {
-        return await flushPendingReviews(send, { trailId, readerId, force: true });
+        return await flushPendingReviews(send, {
+          trailId,
+          readerId: writingReader(),
+          force: true,
+        });
       } finally {
         setBusy(false);
         await refresh();
       }
-    }, [send, trailId, refresh, readerId]),
+    }, [send, trailId, refresh]),
     discard: useCallback(async () => {
-      await deletePendingReview(readerId, trailId);
+      await deletePendingReview(writingReader(), trailId);
       await refresh();
-    }, [trailId, refresh, readerId]),
+    }, [trailId, refresh]),
   };
 }
 
@@ -330,7 +353,11 @@ export function usePendingActivities(): PendingActivitiesApi {
       try {
         // `force`, on the same reasoning written above for reports: an automatic flush leaves
         // refused rows alone, and a person pressing a button is a new fact about the world.
-        const result = await flushPendingActivities(post, { ...options, readerId, force: true });
+        const result = await flushPendingActivities(post, {
+          ...options,
+          readerId: writingReader(),
+          force: true,
+        });
         // Every terminal outcome is said, not only the one that lost something. A press that
         // empties the list takes the button, the row and the heading off the page with it, so
         // silence on success is indistinguishable from silence on failure — and to a reader
@@ -349,7 +376,7 @@ export function usePendingActivities(): PendingActivitiesApi {
         await refresh();
       }
     },
-    [post, refresh, readerId],
+    [post, refresh],
   );
 
   const throwAway = useCallback(
@@ -374,12 +401,12 @@ export function usePendingActivities(): PendingActivitiesApi {
       // server copy, if it has one, belongs to whoever recorded it — and `activities.remove`
       // is scoped to the caller, so asking would fail anyway. Discarding here means "take it
       // off this device", which is the only claim the person pressing it can make.
-      if (row?.serverStarted && ownedBy(row, readerId) && post.remove) {
+      if (row?.serverStarted && ownedBy(row, writingReader()) && post.remove) {
         await post.remove({ id: activityId }).catch(() => undefined);
       }
       await refresh();
     },
-    [post, refresh, readerId],
+    [post, refresh],
   );
 
   return {
@@ -394,17 +421,18 @@ export function usePendingActivities(): PendingActivitiesApi {
     discard: throwAway,
     adopt: useCallback(
       async (activityId: string) => {
-        if (readerId === null) return;
+        const reader = writingReader();
+        if (reader === null) return;
         setBusy(true);
         try {
-          await adoptPendingActivity(activityId, readerId);
-          await flushPendingActivities(post, { activityId, readerId, force: true });
+          await adoptPendingActivity(activityId, reader);
+          await flushPendingActivities(post, { activityId, readerId: reader, force: true });
         } finally {
           setBusy(false);
           await refresh();
         }
       },
-      [post, refresh, readerId],
+      [post, refresh],
     ),
   };
 }

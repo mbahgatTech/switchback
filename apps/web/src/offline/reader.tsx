@@ -23,11 +23,19 @@
  * `useSyncExternalStore` rather than `useState` plus an effect, so a component that renders
  * during the handover sees one value and not two. The server snapshot is `null`: on the server
  * there is no browser to have a memory, and a page that guessed would flash the wrong answer.
+ *
+ * **What this hook is for, and what it is not for.** It is for drawing: which queue to show,
+ * whether to offer a claim button. It is not for deciding what may be sent. A subscribed value
+ * is still a value from a render, and the two cases that matter — another tab signing in, and
+ * a document restored from the back/forward cache — are exactly the cases where the last
+ * render happened under one account and the next request will carry another's cookie. Anything
+ * that *acts* calls `writingReader()` in `identity.ts` at the moment it acts. See the note
+ * there.
  */
 
 import { useEffect, useSyncExternalStore } from 'react';
 import { reconcileReader } from './handover';
-import { rememberedReader } from './identity';
+import { readerKeyChanged, rememberedReader } from './identity';
 
 /**
  * Everyone rendering something that depends on who is here.
@@ -49,12 +57,44 @@ function subscribe(listener: () => void): () => void {
 }
 
 /**
+ * The same subscription, for something that is not a component.
+ *
+ * `SyncQueuedWrites` uses it to learn that this browser has finished deciding who is here —
+ * which is the moment its first drain is allowed to run, and the moment another tab's sign-in
+ * reaches this one. Returns an unsubscribe, like the hook's own.
+ */
+export function subscribeToReader(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
+/**
  * Cached because `useSyncExternalStore` compares snapshots by identity and calls this on every
  * render — a fresh read of `localStorage` each time would be a re-render loop rather than a
  * subscription. Invalidated by `announce`, which is the only thing that can change the answer.
  */
 let snapshot: string | null = null;
 let snapshotRead = false;
+
+/**
+ * Whether the handover for this document has run to an answer.
+ *
+ * False from the moment the module loads until `ReaderIdentity`'s effect has settled, whichever
+ * way it went. It matters because `reconcileReader` is asynchronous: on the page where the
+ * account changed, everything else in the layout mounts while `localStorage` still names the
+ * person who left, and a drain that read it then would be honest and wrong. `SyncQueuedWrites`
+ * asks this before its first run.
+ *
+ * Module state rather than a subscription value, and deliberately not reset by anything: it is
+ * a fact about this document, and a client navigation neither remounts `ReaderIdentity` nor
+ * changes who is here. A restore from the back/forward cache brings it back as true, which is
+ * correct — the handover did run, and what may have changed since is the reader, which is read
+ * fresh at the moment of every write.
+ */
+let settled = false;
+
+export function readerSettled(): boolean {
+  return settled;
+}
 
 function readerSnapshot(): string | null {
   if (!snapshotRead) {
@@ -66,6 +106,7 @@ function readerSnapshot(): string | null {
 
 function refreshReaderSnapshot(): void {
   snapshotRead = false;
+  settled = true;
   announce();
 }
 
@@ -100,14 +141,42 @@ export function ReaderIdentity({ readerId }: { readerId: string | null }) {
         // reader null, which owns nothing.
         refreshReaderSnapshot();
       });
-    // On mount and on a change of the rendered id, and deliberately on nothing else. There is
-    // no listener for another tab moving the remembered reader on: this document was rendered
-    // for `readerId`, and re-asserting that on a timer or a visibility change would let two
-    // tabs signed in as two people take it in turns to clear each other's storage. Every
-    // transition that matters is a full document load anyway — an OAuth callback and a
-    // sign-out redirect both are — and what stands between the transitions is not this effect
-    // but `ownedBy`, which refuses a row whatever the browser has remembered.
+    // On mount and on a change of the rendered id, and deliberately on nothing else. Nothing
+    // re-asserts the rendered id on a timer or a visibility change: two tabs signed in as two
+    // people would then take it in turns to clear each other's storage. The effect below
+    // listens for the other tab, but only ever *invalidates the snapshot* — it never runs
+    // `reconcileReader`, so there is nothing for the two tabs to fight over.
   }, [readerId]);
+
+  useEffect(() => {
+    /*
+     * What another tab did, and what the back button undid.
+     *
+     * `storage` fires on every document of this origin except the one that wrote — so it is
+     * the only notice a tab that is merely *open* gets that somebody signed in elsewhere.
+     * `pageshow` with `persisted` is the same fact arriving by the other route: a document
+     * restored from the back/forward cache keeps every module value it had, including this
+     * snapshot, and the browser it woke up in may have changed hands while it slept.
+     *
+     * Both do one thing: forget the cached answer so the next render reads `localStorage`
+     * again. Neither reconciles, neither deletes, and neither is what stops a queued row going
+     * to the wrong account — `writingReader()` at the moment of the write is. This keeps the
+     * *screen* honest, which is a smaller job and still worth doing: a claim button offered to
+     * somebody who signed out two tabs ago is a button that cannot work.
+     */
+    const onStorage = (event: StorageEvent): void => {
+      if (readerKeyChanged(event.key)) refreshReaderSnapshot();
+    };
+    const onPageShow = (event: PageTransitionEvent): void => {
+      if (event.persisted) refreshReaderSnapshot();
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('pageshow', onPageShow);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('pageshow', onPageShow);
+    };
+  }, []);
 
   return null;
 }

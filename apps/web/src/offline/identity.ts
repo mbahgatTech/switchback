@@ -78,15 +78,36 @@ export function rememberedReader(): RememberedReader {
 }
 
 /**
- * The id a write made right now should be stamped with.
+ * The id a write made right now should be stamped with, and the id a drain running right now
+ * may send.
  *
  * Null when the browser is acting as nobody, and null when it has never been told — both of
  * which mean the same thing to a row being written: **unattributed**. Such a row is never sent
  * automatically and never adopted silently; it is shown to a person and claimed or discarded
  * by hand. See `handover.ts`.
+ *
+ * **Read at the moment of the write, never from a render.** A React value is a snapshot of who
+ * was here when something last rendered, and the whole of this file exists because that is not
+ * the same as who is here now: another tab signs in, or a document comes back out of the
+ * back/forward cache, and the rendered answer is a person who left while the cookie on the
+ * request belongs to the person who arrived. Sending on the rendered answer is how a report
+ * written by one hiker is published under another — which is the defect, not a symptom of it.
+ * So `sync.tsx` and `use-queue.ts` call this function at the moment they act, and use the
+ * subscribed value from `reader.tsx` only to decide what to *draw*.
  */
 export function writingReader(): string | null {
   return rememberedReader().id;
+}
+
+/**
+ * Does this `storage` event move the remembered reader?
+ *
+ * `storage` fires on every *other* document of this origin, which is the only notice a tab
+ * gets that somebody signed in elsewhere. A null key means another document called `clear()`,
+ * which takes the reader with it, so that counts too.
+ */
+export function readerKeyChanged(key: string | null): boolean {
+  return key === null || key === READER_KEY;
 }
 
 export function rememberReader(id: string | null): void {

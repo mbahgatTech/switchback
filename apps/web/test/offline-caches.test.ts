@@ -7,6 +7,7 @@ import {
   OFFLINE_CACHES,
   OFFLINE_FALLBACK_PATH,
   PAGE_CACHE,
+  READER_SHELL_PAGES,
   SHELL_CACHE,
   SHELL_PAGES,
   STATIC_ASSET_PATTERN,
@@ -130,6 +131,19 @@ describe('build assets referenced by a cached page', () => {
     // `/record` from both would keep that test green and hand every hiker at a trailhead the
     // offline fallback instead of the screen they came to use.
     expect(SHELL_PAGES).toContain('/record');
+  });
+
+  it('names only per-reader pages as the ones a handover deletes', () => {
+    /*
+     * `handover.ts` used to delete `SHELL_CACHE` by name, which took the offline fallback, the
+     * storage manager and every harvested build chunk with it — and nothing puts those back
+     * until a full-document navigation, which App Router client routing never performs. So the
+     * sweep is scoped to these entries, and they have to be pages the shell actually holds.
+     */
+    for (const path of READER_SHELL_PAGES) expect(SHELL_PAGES).toContain(path);
+    // The two that take no server input are right for everybody and are not anybody's to lose.
+    expect(READER_SHELL_PAGES).not.toContain(OFFLINE_FALLBACK_PATH);
+    expect(READER_SHELL_PAGES).not.toContain('/downloads');
   });
 
   it('never stores a redirect under a shell page', () => {
