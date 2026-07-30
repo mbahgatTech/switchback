@@ -26,7 +26,25 @@ const CACHE_PREFIX = 'sb-';
 const TILE_CACHE = 'sb-tiles-v1';
 const PAGE_CACHE = 'sb-pages-v1';
 const MEDIA_CACHE = 'sb-media-v1';
-const SHELL_CACHE = 'sb-shell-v1';
+/**
+ * This build, out of the worker's own URL.
+ *
+ * `offline/register.tsx` registers `/sw.js?v=<build id>`, and `self.location` inside a worker
+ * is the script URL it was registered with — query string and all. That is the only channel
+ * into a file outside the module graph, and it does double duty: a changed query is a changed
+ * worker URL, so a deploy always installs a new worker rather than waiting on a revalidation.
+ *
+ * The fallback is for a worker registered by an older build, which had no `v` at all. It is a
+ * name like any other and the next activate collects it.
+ */
+const BUILD_ID = new URL(self.location.href).searchParams.get('v') || 'dev';
+/**
+ * The shell holds `/_next/static/*`, which is this build's own code, so it is scoped to the
+ * build and collected by `activate` when the next one takes over. The three above are the
+ * reader's downloads and are versioned by hand — a deploy must not delete the map somebody
+ * took onto a hill. `src/offline/caches.ts` has the full argument.
+ */
+const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
 const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
 const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];

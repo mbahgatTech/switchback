@@ -307,6 +307,19 @@ model MobileAuthRequest {
   redirectUri String
   deviceName  String?
 
+  /// SHA-256 of the secret `/start` put in a `__Host-` cookie on the browser that opened it.
+  ///
+  /// This is what ties the row to one browser. Without it, an attacker could call `/start`
+  /// themselves — so that they hold the PKCE verifier — and then navigate a victim's browser
+  /// to `/complete?request=<id>`; the victim's session cookie rides along on a top-level
+  /// cross-site GET, because that is exactly what `SameSite=Lax` is for, and the attacker
+  /// claims a token pair on the victim's account. The verifier defends the deep-link leg and
+  /// says nothing at all about *whose* session authorised the row.
+  ///
+  /// Nullable only because the column arrived after the table did. A null is treated as a
+  /// mismatch, not as "unchecked" — see `authorizeAuthRequest`.
+  browserHash String?
+
   createdAt DateTime @default(now())
   expiresAt DateTime
 

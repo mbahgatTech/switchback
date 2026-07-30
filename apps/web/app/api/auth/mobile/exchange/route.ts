@@ -67,16 +67,34 @@ export async function POST(request: Request): Promise<Response> {
 
     if (byEmail && !identity.emailVerified) {
       /**
-       * An account with this email exists and the provider will not vouch for the
-       * address. Linking here would let anyone who can get an unverified token for
-       * `you@example.com` take over that account, which is the classic account-linking
-       * hole. Refusing costs a legitimate user one extra step; allowing it costs someone
-       * their account.
+       * An account with this email exists and the provider will not vouch for the address.
+       * Linking here would let anyone who can get a token asserting `you@example.com` take
+       * over that account, which is the classic account-linking hole — and for Entra it is
+       * not theoretical: `email` is a tenant-mutable attribute, we sign against `/common`,
+       * and a free tenant costs nothing. `auth-native.ts` has the full reasoning.
+       *
+       * Refusing costs a legitimate user one extra step. Allowing it costs someone their
+       * account, along with every activity, photograph and list on it.
        */
-      return Response.json({ error: 'email_taken_unverified' }, { status: 409 });
+      return Response.json(
+        {
+          error: 'email_taken_unverified',
+          message:
+            'That email address already has a Switchback account. Sign in on the web first, then link this device from settings.',
+        },
+        { status: 409 },
+      );
     }
 
     if (byEmail) {
+      /*
+       * Reached only for Apple, which asserts `email_verified` itself. Entra never gets here
+       * now, and this branch is the one to delete once nobody is relying on it — see
+       * `scripts/report-email-linked-accounts.ts`, which counts who that is. It is left
+       * standing deliberately: removing it today would give anyone whose account was reached
+       * this way a fresh empty one on their next sign-in, which looks exactly like losing
+       * everything they had.
+       */
       userId = byEmail.id;
     } else {
       const created = await prisma.user.create({

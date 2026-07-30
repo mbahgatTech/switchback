@@ -108,12 +108,14 @@ Apple enrolment, when the scheme becomes stable and the `exp://` case can simply
  app                          our server                        provider
   │  verifier = random                                              │
   │  challenge = sha256(verifier)                                   │
-  ├─ GET /start?redirect=&challenge= ─►  row created, 302 ──►       │
+  ├─ GET /start?redirect=&challenge= ─►  row created, browser        │
+  │                                      cookie set, 302 ──►        │
   │                                      /signin?callbackUrl=…      │
   │                                            └─ normal OIDC ─────►│
   │                                      session cookie ◄───────────┘
-  │                                      GET /complete?request=
-  │  ◄── 302 exp://…/--/signin?code=&state= ─┘
+  │                                      GET  /complete?request=  → a question
+  │                                      POST /complete            ← the answer
+  │  ◄── 303 exp://…/--/signin?code=&state= ─┘
   ├─ POST /claim {request, code, verifier} ─►  code + verifier checked
   │  ◄── token pair ────────────────────────┘
 ```
@@ -130,11 +132,30 @@ provider's.
 | Device half — verifier, browser sheet, claim                 | `apps/mobile/src/auth/handshake.ts`                            |
 | The screen                                                   | `apps/mobile/app/signin.tsx`                                   |
 
-Three properties hold it together: the code is worthless without the verifier; everything is
+Four properties hold it together: the code is worthless without the verifier; everything is
 single-use (`codeHash` is unique and `claimedAt` is set inside the transaction that reads it);
-and the redirect is allow-listed **before** it is stored, because an endpoint that bounces a
+the redirect is allow-listed **before** it is stored, because an endpoint that bounces a
 browser to an arbitrary URL after a successful sign-in is a phishing primitive on our own
-domain even when the code riding along with it is unredeemable.
+domain even when the code riding along with it is unredeemable; and the request belongs to one
+browser.
+
+That last one is why `/complete` takes two requests. PKCE binds the row to the device that
+will _claim_ it and says nothing about the browser that _authorises_ it — so an attacker who
+ran `/start` themselves, and therefore holds the verifier, could navigate a victim's browser to
+`/complete?request=…` and end up with a token pair on the victim's account. `SameSite=Lax`
+sends the session cookie on a top-level cross-site GET; that is what Lax is for. So:
+
+- `/start` sets a `__Host-` cookie and stores its digest as `browserHash`. A row can only be
+  authorised by the browser that opened it.
+- `GET /complete` renders a question naming the device. It mints nothing.
+- `POST /complete` carries the Auth.js CSRF token and is the only thing that mints a code. A
+  cross-site form POST does not carry a Lax cookie, and a sibling subdomain cannot read the
+  token out of an `HttpOnly` cookie.
+- Both legs refuse a `Sec-Fetch-Site` that is neither `same-origin` nor `none`.
+
+The visible cost is that a sign-in **must finish in the browser it started in**. Starting in
+the app's in-app browser and finishing in Safari fails with `wrong_browser`, which says so and
+says to press sign in again in the app.
 
 Only `switchback://` is accepted in production. `exp://` and `http://localhost` are allowed
 where `AUTH_MOBILE_ALLOW_DEV_SCHEMES=true` or `NODE_ENV !== 'production'`, which is what makes
@@ -148,6 +169,34 @@ with `code`/`state` in its route params — and both end in the same claim.
 
 Expired request rows are swept by `apps/web/app/api/cron/drain/route.ts`, alongside expired
 refresh tokens.
+
+### The native exchange never trusts an Entra email
+
+`POST /api/auth/mobile/exchange` is the other way in: it takes a provider identity token
+straight from a native sheet, verifies it against the provider's JWKS, and mints a pair. When
+the `sub` is unknown but the email matches an existing account, it can either link the two or
+refuse — and which it does is decided by `emailVerified` in `apps/web/src/auth-native.ts`.
+
+For Entra that flag is now **always false**. Microsoft does not emit `email_verified`, and the
+`email` claim it does emit is a tenant-mutable directory attribute that Microsoft's own
+guidance says is unsuitable for identifying a user. We sign against `/common`, so the tenant is
+whichever one the caller belongs to — including a free one created for the purpose. It used to
+read `email !== null`, which was true whenever an email existed and made the 409
+`email_taken_unverified` guard unreachable for the only provider production has enabled. That
+is the nOAuth pattern, and the answer to it is that only Apple gets to assert a verified
+address.
+
+The email-linking branch itself is still there and deliberately so: an account reached through
+it would, on removal, stop resolving, and its owner's next sign-in would silently create a
+fresh empty account. `scripts/report-email-linked-accounts.ts` counts who that is —
+
+```
+npx tsx --env-file-if-exists=.env scripts/report-email-linked-accounts.ts
+```
+
+Run against production on 2026-07-30 it reported **zero**: no account there has ever been
+created by the native exchange route, so nothing is relying on the branch. Removing it is a
+follow-up, and re-running the script is the check that gates it.
 
 ---
 

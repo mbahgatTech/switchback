@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  BUILD_ID,
   CACHE_PREFIX,
   MEDIA_CACHE,
   OFFLINE_CACHES,
@@ -26,6 +27,17 @@ import {
  */
 const SW = readFileSync(fileURLToPath(new URL('../public/sw.js', import.meta.url)), 'utf8');
 
+/**
+ * The registration, read as text for the same reason.
+ *
+ * The build id reaches the worker through the URL it is registered with, so the two halves of
+ * that channel are in different files and neither can typecheck against the other.
+ */
+const REGISTER = readFileSync(
+  fileURLToPath(new URL('../src/offline/register.tsx', import.meta.url)),
+  'utf8',
+);
+
 /** Pull `const NAME = 'value';` out of the worker source. */
 function literal(name: string): string | null {
   const match = new RegExp(`const\\s+${name}\\s*=\\s*'([^']*)'`, 'u').exec(SW);
@@ -38,10 +50,33 @@ describe('service worker cache names', () => {
     ['TILE_CACHE', TILE_CACHE],
     ['PAGE_CACHE', PAGE_CACHE],
     ['MEDIA_CACHE', MEDIA_CACHE],
-    ['SHELL_CACHE', SHELL_CACHE],
     ['OFFLINE_FALLBACK_PATH', OFFLINE_FALLBACK_PATH],
   ])('%s matches the app', (name, expected) => {
     expect(literal(name)).toBe(expected);
+  });
+
+  /**
+   * The shell cache is the one name neither side can spell out, because it carries the build
+   * id: the app reads `NEXT_PUBLIC_BUILD_ID`, the worker reads `?v=` off its own URL, and the
+   * two only agree at runtime. So what is checked is the shape — same prefix, same
+   * interpolation — plus, below, that the worker really does take the value from its URL. A
+   * literal `sb-shell-v1` here would be the bug: the shell holds this build's `/_next/static`
+   * chunks, and on a fixed name `activate` never collects them, so a bad asset outlives the
+   * deploy that removed it.
+   */
+  it('scopes the shell cache to the build, in both copies', () => {
+    const inWorker = /const\s+SHELL_CACHE\s*=\s*`sb-shell-\$\{BUILD_ID\}`/u.test(SW);
+    expect(inWorker).toBe(true);
+    expect(SHELL_CACHE).toBe(`sb-shell-${BUILD_ID}`);
+    expect(SHELL_CACHE.startsWith(CACHE_PREFIX)).toBe(true);
+  });
+
+  it('takes the build id from the URL it was registered with', () => {
+    // `offline/register.tsx` appends `?v=<build id>`; `self.location` in a worker is the
+    // script URL it was registered with. That query string is the only channel into a file
+    // outside the module graph, and a changed one is also what forces the upgrade.
+    expect(SW).toMatch(/new URL\(self\.location\.href\)\.searchParams\.get\('v'\)/u);
+    expect(REGISTER).toMatch(/register\(`\/sw\.js\?v=\$\{encodeURIComponent\(BUILD_ID\)\}`/u);
   });
 
   it('lists every cache in OFFLINE_CACHES, so activate does not evict a live one', () => {
@@ -59,6 +94,14 @@ describe('service worker cache names', () => {
     // `activate` deletes caches starting with the prefix and not in the list. A cache named
     // outside the prefix would never be collected when its version is bumped.
     for (const name of OFFLINE_CACHES) expect(name.startsWith(CACHE_PREFIX)).toBe(true);
+  });
+
+  it('keeps the downloads a reader made off the build id', () => {
+    // Tiles, pages and photographs are somebody's deliberate download, quite possibly for a
+    // trip they are on. Versioning those off the build would empty them on every deploy.
+    for (const name of [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE]) {
+      expect(name).not.toContain(BUILD_ID);
+    }
   });
 });
 

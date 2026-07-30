@@ -371,9 +371,25 @@ function Home({ me }: { me: SelfProfile }) {
 
 function Devices() {
   const trpc = useTRPC();
+  const router = useRouter();
   const devices = useQuery(trpc.me.devices.queryOptions());
+  /*
+   * The success handler leaves the page rather than refreshing it. `signOutEverywhere` now
+   * deletes this browser's session row along with everybody else's, so a settings page that
+   * stayed put would look signed in while every request from it failed — the "discovered
+   * after the press" version of a behaviour that ought to be obvious before it. The counts
+   * ride along in the query string so the sign-in page can say what just happened.
+   */
   const signOut = useMutation(
-    trpc.me.signOutEverywhere.mutationOptions({ onSuccess: () => void devices.refetch() }),
+    trpc.me.signOutEverywhere.mutationOptions({
+      onSuccess: (result) => {
+        const params = new URLSearchParams({
+          signedOut: String(result.devicesSignedOut),
+          browsers: String(result.browsersSignedOut),
+        });
+        router.push(`/signin?${params.toString()}`);
+      },
+    }),
   );
 
   const list = devices.data ?? [];
@@ -381,7 +397,7 @@ function Devices() {
   return (
     <Section
       title="Signed in on"
-      note="Phones and tablets holding a long-lived token. This browser is signed out from the button in the header."
+      note="Phones and tablets holding a long-lived token. Sign out of this browser alone from the header."
     >
       {list.length === 0 ? (
         <p className="font-text text-body text-ink-muted">
@@ -403,29 +419,28 @@ function Devices() {
         </ul>
       )}
 
-      {list.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-md">
-          <button
-            type="button"
-            disabled={signOut.isPending}
-            onClick={() => signOut.mutate()}
-            className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
-          >
-            {signOut.isPending ? 'Signing out…' : 'Sign out everywhere'}
-          </button>
-          <span className="text-caption text-ink-muted">
-            Every app has to sign in again. Anything recorded but not yet synced stays on the
-            device.
-          </span>
-        </div>
-      ) : null}
-
-      {signOut.isSuccess ? (
-        <p role="status" className="text-caption text-ink-muted">
-          Signed out of {signOut.data.devicesSignedOut}{' '}
-          {signOut.data.devicesSignedOut === 1 ? 'device' : 'devices'}.
-        </p>
-      ) : null}
+      {/*
+       * Always offered, even with no apps in the list. It used to appear only when a device
+       * was signed in, which meant the one control for "somebody has my account" was hidden
+       * from exactly the reader whose browser was the thing taken — and browsers are what it
+       * now revokes. The button is the answer to a compromise, not a tidy-up of the list
+       * above it.
+       */}
+      <div className="flex flex-wrap items-center gap-md">
+        <button
+          type="button"
+          disabled={signOut.isPending}
+          onClick={() => signOut.mutate()}
+          className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
+        >
+          {signOut.isPending ? 'Signing out…' : 'Sign out everywhere'}
+        </button>
+        <span className="max-w-measure text-caption text-ink-muted">
+          Ends every session on the account — every app, every browser, and this one. You will land
+          on the sign-in page and have to sign in again here. Anything recorded but not yet synced
+          stays on the device.
+        </span>
+      </div>
     </Section>
   );
 }

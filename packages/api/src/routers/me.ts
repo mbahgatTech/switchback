@@ -115,16 +115,32 @@ export const meRouter = router({
   }),
 
   /**
-   * Ends every native session. The web session is a cookie Auth.js owns, so the caller
-   * still has to sign out there — the client does both, and this returns the count so it
-   * can say how many devices were affected rather than guessing.
+   * Ends every session this account has, everywhere: the native refresh tokens *and* the
+   * browser session rows.
+   *
+   * The browsers used to be left out, which made the name a lie. `auth.ts` picks database
+   * sessions over JWT with the argument that "a session row can be deleted, so 'this account
+   * was compromised' is one query" — and nothing ever deleted one, so a stolen browser cookie
+   * survived the one button in the product for revoking access, for the whole thirty days it
+   * was good for. Reaching for this is reaching for the compromise button; the phones are not
+   * the only place an attacker could be.
+   *
+   * **It signs out the caller's own browser too**, because that browser is one of the
+   * sessions and there is no way to tell it apart from the one being taken back. The client
+   * says so before the press and lands on the sign-in page after it — a page that still looks
+   * signed in while every request from it fails is worse than an extra sign-in.
+   *
+   * Both counts are read before the delete, so the numbers describe what was ended rather
+   * than what is left.
    */
   signOutEverywhere: protectedProcedure.mutation(async ({ ctx }) => {
-    const before = await ctx.db.mobileRefreshToken.count({
-      where: { userId: ctx.user.id, revokedAt: null },
-    });
+    const [devices, browsers] = await Promise.all([
+      ctx.db.mobileRefreshToken.count({ where: { userId: ctx.user.id, revokedAt: null } }),
+      ctx.db.session.count({ where: { userId: ctx.user.id } }),
+    ]);
     await revokeAllRefreshTokens(ctx.db, ctx.user.id);
-    return { devicesSignedOut: before };
+    await ctx.db.session.deleteMany({ where: { userId: ctx.user.id } });
+    return { devicesSignedOut: devices, browsersSignedOut: browsers };
   }),
 
   devices: protectedProcedure.query(({ ctx }) =>

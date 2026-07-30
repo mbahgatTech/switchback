@@ -5,6 +5,7 @@ import {
   startAuthRequest,
 } from '@switchback/api/mobile-auth';
 import { prisma } from '@switchback/db';
+import { bindingCookie } from '../_binding';
 import { notice } from '../_notice';
 
 /**
@@ -19,6 +20,10 @@ import { notice } from '../_notice';
  * not a fetch. It creates a row, which is the usual argument against — but the row is an
  * intent with no authority attached, and the endpoint is unauthenticated by necessity, so
  * there is nothing here for a forged request to accomplish beyond the cleanup job's problem.
+ *
+ * It also sets the cookie that marks *this* browser as the one allowed to finish the request.
+ * That is what stops an attacker starting their own request — so that they hold the verifier —
+ * and then walking a victim's browser through `/complete`. See `../_binding.ts`.
  */
 export const runtime = 'nodejs';
 
@@ -41,9 +46,9 @@ export async function GET(request: Request): Promise<Response> {
     );
   }
 
-  let id: string;
+  let started: { id: string; browserSecret: string };
   try {
-    id = await startAuthRequest(prisma, { redirectUri, challenge, deviceName });
+    started = await startAuthRequest(prisma, { redirectUri, challenge, deviceName });
   } catch (error) {
     if (error instanceof MobileAuthError) {
       return notice(
@@ -60,10 +65,18 @@ export async function GET(request: Request): Promise<Response> {
    * session already exists in this browser, that page redirects immediately and the whole
    * round trip is invisible — which is the right behaviour: somebody signed in on the phone's
    * browser is the same person, and asking them to prove it twice would be theatre.
+   *
+   * Built by hand rather than with `Response.redirect`, which returns a frozen response whose
+   * headers cannot be appended to — and the cookie has to ride this hop.
    */
-  const callbackUrl = `/api/auth/mobile/complete?request=${encodeURIComponent(id)}`;
-  return Response.redirect(
-    new URL(`/signin?callbackUrl=${encodeURIComponent(callbackUrl)}`, request.url),
-    302,
-  );
+  const callbackUrl = `/api/auth/mobile/complete?request=${encodeURIComponent(started.id)}`;
+  const target = new URL(`/signin?callbackUrl=${encodeURIComponent(callbackUrl)}`, request.url);
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: target.toString(),
+      'set-cookie': bindingCookie(request, started.browserSecret),
+    },
+  });
 }

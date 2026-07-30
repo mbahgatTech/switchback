@@ -6,10 +6,17 @@ import {
 } from '@switchback/api/mobile-auth';
 import { prisma } from '@switchback/db';
 import { auth } from '@/auth';
-import { notice } from '../_notice';
+import { csrfTokenFor, csrfTokenValid } from '@/auth-csrf';
+import {
+  clearBindingCookie,
+  fromOurOwnOrigin,
+  isSecureRequest,
+  readBindingSecret,
+} from '../_binding';
+import { confirmation, notice } from '../_notice';
 
 /**
- * GET /api/auth/mobile/complete
+ * /api/auth/mobile/complete
  *
  * The second leg. The browser has finished OIDC and carries a real session cookie, so this
  * mints the one-time code and bounces back into the app over its deep link.
@@ -17,6 +24,29 @@ import { notice } from '../_notice';
  * The app is what closes the browser: `WebBrowser.openAuthSessionAsync` watches for a
  * navigation to the return URL and dismisses the sheet itself. So there is nothing to render
  * on the success path — the redirect *is* the response.
+ *
+ * **It takes two requests now, and that is the fix.** The GET renders a question; the POST
+ * answers it. Minting the code on the GET meant any page anywhere could navigate a signed-in
+ * browser here and walk away with a fifteen-minute access token and a sixty-day refresh token,
+ * because `SameSite=Lax` sends the session cookie on a top-level cross-site GET — that is
+ * precisely what Lax is for. Three things now stand in the way, and each covers a case the
+ * others do not:
+ *
+ * - **The binding cookie.** The row is tied to the browser that ran `/start`, so an attacker
+ *   holding their own verifier cannot have a victim's browser authorise it.
+ * - **The POST, with the Auth.js CSRF token.** A cross-site form POST does not carry a
+ *   `SameSite=Lax` cookie at all, and a same-site page on a sibling subdomain cannot read the
+ *   token out of an `HttpOnly` cookie to put in the form.
+ * - **`Sec-Fetch-Site`.** Set by the browser, unforgeable from script, and refused unless it
+ *   says the request came from us or from nowhere.
+ *
+ * And a person has to press a button that names the device, which is the only one of the four
+ * that still helps if the reader is being played some way the other three do not cover.
+ *
+ * **Sign-ins already in flight when this deploys will fail**, with `wrong_browser`: their rows
+ * were written before there was a binding to write. They are engineered around rather than
+ * migrated because the window is fifteen minutes wide and the recovery is one button in the
+ * app — the copy below says exactly that.
  */
 export const runtime = 'nodejs';
 
@@ -41,6 +71,17 @@ const FAULTS: Record<string, { heading: string; body: string }> = {
     heading: 'That sign-in has already been used',
     body: 'Each attempt can only be completed once. If the app is not signed in, close this and start again from it.',
   },
+  /*
+   * The one new failure a legitimate reader can hit, so it is the one that has to say what to
+   * do rather than what went wrong. It happens when a sign-in finishes in a different browser
+   * from the one that started it — a link pasted from the app's in-app browser into Safari,
+   * or Chrome opened where the app opened Safari — and it is also what every request written
+   * before this code deployed will now get.
+   */
+  wrong_browser: {
+    heading: 'That sign-in started in a different browser',
+    body: 'A sign-in has to finish in the browser the app opened. Close this, open the app, and press sign in again — the new attempt will finish here.',
+  },
 };
 
 const GENERIC: { heading: string; body: string } = {
@@ -48,7 +89,14 @@ const GENERIC: { heading: string; body: string } = {
   body: 'Close this and start again from the app.',
 };
 
+const CROSS_SITE: { heading: string; body: string } = {
+  heading: 'That sign-in did not come from this site',
+  body: 'Another page sent your browser here, so nothing was signed in. Close this and start again from the app.',
+};
+
 export async function GET(request: Request): Promise<Response> {
+  if (!fromOurOwnOrigin(request)) return notice(403, CROSS_SITE.heading, CROSS_SITE.body);
+
   const requestId = new URL(request.url).searchParams.get('request') ?? '';
   if (!requestId) return notice(400, GENERIC.heading, GENERIC.body);
 
@@ -66,18 +114,117 @@ export async function GET(request: Request): Promise<Response> {
     );
   }
 
+  /*
+   * Read for two reasons: to fail before the reader presses anything rather than after, and
+   * to name the device in the question, which is what makes the question answerable. Nothing
+   * is minted here — a GET stays a read.
+   */
+  const stored = await prisma.mobileAuthRequest.findUnique({
+    where: { id: requestId },
+    select: { deviceName: true, browserHash: true, claimedAt: true, codeHash: true },
+  });
+  if (!stored) return await fail(request, requestId, new MobileAuthError('unknown_request'));
+  if (stored.claimedAt || stored.codeHash) {
+    return await fail(request, requestId, new MobileAuthError('already_claimed'));
+  }
+  if (!stored.browserHash || !readBindingSecret(request)) {
+    return await fail(request, requestId, new MobileAuthError('wrong_browser'));
+  }
+
+  const csrf = await csrfTokenFor(request, isSecureRequest(request));
+  return confirmation({
+    requestId,
+    csrfToken: csrf.token,
+    deviceName: stored.deviceName,
+    setCookies: csrf.setCookie ? [csrf.setCookie] : [],
+  });
+}
+
+export async function POST(request: Request): Promise<Response> {
+  if (!fromOurOwnOrigin(request)) return notice(403, CROSS_SITE.heading, CROSS_SITE.body);
+
+  const form = await request.formData().catch(() => null);
+  const requestId = field(form, 'request');
+  const posted = field(form, 'csrfToken');
+  if (!requestId) return notice(400, GENERIC.heading, GENERIC.body);
+
+  if (!(await csrfTokenValid(request, isSecureRequest(request), posted))) {
+    /*
+     * Either a forgery or a form that sat open long enough for the browser to be restarted,
+     * which drops the Auth.js CSRF cookie. The two are indistinguishable from here and the
+     * answer to both is the same, so the copy describes the recoverable one rather than
+     * accusing the reader of the other.
+     */
+    return notice(
+      403,
+      'That confirmation was no longer valid',
+      'The page had been open too long, or it did not come from this site. Close this and start again from the app.',
+    );
+  }
+
+  const session = await auth();
+  if (!session?.user?.id) {
+    return notice(
+      401,
+      'This browser is not signed in',
+      'The sign-in has to finish in a browser with a session. Close this and start again from the app.',
+    );
+  }
+
   try {
-    const target = await authorizeAuthRequest(prisma, requestId, session.user.id);
-    return Response.redirect(target, 302);
+    const target = await authorizeAuthRequest(
+      prisma,
+      requestId,
+      session.user.id,
+      readBindingSecret(request),
+    );
+    /*
+     * 303, not 302: this is the answer to a POST, and on a 302 it is left to the browser
+     * whether the redirected request keeps the method. A custom-scheme URL has no POST.
+     *
+     * The binding cookie is spent along with the row, so it is cleared on the same response.
+     */
+    return new Response(null, {
+      status: 303,
+      headers: { location: target, 'set-cookie': clearBindingCookie(request) },
+    });
   } catch (error) {
     if (!(error instanceof MobileAuthError)) throw error;
+    return await fail(request, requestId, error);
+  }
+}
 
-    /*
-     * Hand the failure to the app when we still can. The app has a screen, a back button and
-     * the context to say what happens next; this browser sheet has none of those. The
-     * redirect is re-checked against the allow-list rather than trusted from the row, so a
-     * stored value that predates a tightening of the rules cannot be used to bounce anywhere.
-     */
+/**
+ * One text field out of a posted form.
+ *
+ * `FormData.get` returns a `File` as readily as a string — a multipart body naming a field
+ * after ours is all it takes — so the type is narrowed rather than stringified. Anything that
+ * is not text reads as absent, which is the same thing as far as this endpoint is concerned.
+ */
+function field(form: FormData | null, name: string): string {
+  const value = form?.get(name);
+  return typeof value === 'string' ? value : '';
+}
+
+/**
+ * Hand the failure to the app when we still can.
+ *
+ * The app has a screen, a back button and the context to say what happens next; this browser
+ * sheet has none of those. The redirect is re-checked against the allow-list rather than
+ * trusted from the row, so a stored value that predates a tightening of the rules cannot be
+ * used to bounce anywhere.
+ *
+ * `wrong_browser` is the exception and is answered on this page instead. Bouncing it down the
+ * deep link would deliver the error to whichever copy of the app is in the foreground, which
+ * by definition is not the one that started this request — and the person who can act on the
+ * sentence is the one reading this browser.
+ */
+async function fail(
+  request: Request,
+  requestId: string,
+  error: MobileAuthError,
+): Promise<Response> {
+  if (error.code !== 'wrong_browser') {
     const stored = await prisma.mobileAuthRequest.findUnique({
       where: { id: requestId },
       select: { redirectUri: true },
@@ -86,10 +233,15 @@ export async function GET(request: Request): Promise<Response> {
       const target = new URL(stored.redirectUri);
       target.searchParams.set('error', error.code);
       target.searchParams.set('state', requestId);
-      return Response.redirect(target.toString(), 302);
+      return new Response(null, {
+        status: 303,
+        headers: { location: target.toString(), 'set-cookie': clearBindingCookie(request) },
+      });
     }
-
-    const fault = FAULTS[error.code] ?? GENERIC;
-    return notice(400, fault.heading, fault.body);
   }
+
+  const fault = FAULTS[error.code] ?? GENERIC;
+  const response = notice(400, fault.heading, fault.body);
+  response.headers.append('set-cookie', clearBindingCookie(request));
+  return response;
 }
