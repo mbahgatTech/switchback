@@ -202,7 +202,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           <button
             type="button"
             onClick={() => setFollow(true)}
-            className={`${BUTTON} absolute bottom-md left-1/2 ${HEIGHT.touch} -translate-x-1/2 border-ink bg-canvas px-md text-ink`}
+            className={`${BUTTON} clear-home-indicator absolute bottom-md left-1/2 ${HEIGHT.touch} -translate-x-1/2 border-ink bg-canvas px-md text-ink`}
           >
             Recentre
           </button>

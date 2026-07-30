@@ -474,7 +474,7 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
           // The attribution in particular is an ODbL condition, not a nicety.
           <div
             ref={cardRef}
-            className="pointer-events-none absolute bottom-xl left-lg right-lg flex md:right-auto"
+            className="clear-home-indicator pointer-events-none absolute bottom-xl left-lg right-lg flex md:right-auto"
           >
             <SelectedTrail trail={selected} onDismiss={() => setSelectedId(null)} />
           </div>

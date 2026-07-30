@@ -35,13 +35,20 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
 /**
  * Pages kept from the moment the worker installs, before anything is downloaded.
  *
- * Two, and both earn it. The fallback is where every unreachable navigation lands. The
- * storage manager is where that fallback sends you — and it reads its list from IndexedDB,
- * so it is fully truthful offline; without it here, "Manage downloads" leads back to the
- * screen it was pressed from, which is the kind of small dishonesty that makes a hiker stop
- * trusting the rest. Neither takes a server, so both are static HTML plus their assets.
+ * Three, and each earns it. `/explore` is the manifest's `start_url`, so it is what an
+ * installed app opens on a cold launch — and an installed app is opened on a cold launch
+ * precisely when there is no signal. Without it here the home-screen icon leads straight to
+ * the offline fallback, which is the one screen the download was bought to avoid. It is a
+ * pure server shell, chrome around a client component, so what is stored is the instrument
+ * and not a stale list of somebody else's trails.
+ *
+ * The fallback is where every unreachable navigation lands. The storage manager is where
+ * that fallback sends you — and it reads its list from IndexedDB, so it is fully truthful
+ * offline; without it here, "Manage downloads" leads back to the screen it was pressed
+ * from, which is the kind of small dishonesty that makes a hiker stop trusting the rest.
+ * None of the three takes a server, so all are static HTML plus their assets.
  */
-export const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads'] as const;
+export const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/explore'] as const;
 
 /**
  * Every build asset a page references, as it appears in that page's HTML.

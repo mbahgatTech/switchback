@@ -95,7 +95,7 @@ export function RouteView({ route, units }: RouteViewProps) {
           />
         </div>
         {hasProfile ? (
-          <div className="absolute bottom-md right-md z-10">
+          <div className="clear-home-indicator absolute bottom-md right-md z-10">
             <FlyoverControl
               plan={plan}
               playing={flying}

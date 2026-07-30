@@ -156,7 +156,7 @@ export function TrailView({ trail, forecast = null, units: given }: TrailViewPro
           />
         </div>
         {hasProfile ? (
-          <div className="absolute bottom-md right-md z-10">
+          <div className="clear-home-indicator absolute bottom-md right-md z-10">
             <FlyoverControl
               plan={plan}
               playing={flying}

@@ -353,6 +353,31 @@
   }
 
   /*
+   * Clearance for the home indicator.
+   *
+   * The layout viewport is declared `viewport-fit: cover` so the map reaches the physical
+   * edges of the phone, which is the whole reason to install this rather than bookmark it.
+   * The bill for that is the strip at the bottom of a modern iPhone: on the map itself it
+   * costs nothing — the map is meant to run under it — but anything *floating over* the map
+   * and anchored to its bottom edge lands underneath the indicator, where it is both dimmed
+   * by the system and one stray swipe from throwing the reader back to their home screen.
+   *
+   * Margin rather than padding, because every one of these is absolutely positioned against
+   * a `bottom-*` token. Padding grows the box downward into exactly the strip being avoided;
+   * margin-bottom enters the abs-pos height equation and lifts the whole thing clear, so the
+   * class composes with whatever offset the element already carries instead of replacing it.
+   *
+   * `env()` is zero on every device without an inset, and on the desktop viewports the e2e
+   * suite runs at, so this is inert everywhere it is not needed. Top has no equivalent here
+   * on purpose: without `apple-mobile-web-app-status-bar-style: black-translucent`, which
+   * `app/layout.tsx` deliberately does not set, iOS starts the web view below the clock and
+   * `safe-area-inset-top` is 0.
+   */
+  .clear-home-indicator {
+    margin-bottom: env(safe-area-inset-bottom);
+  }
+
+  /*
    * The section plotting itself. The one long duration in the system, and the only motion
    * on the page — it happens once per trail, on first paint, and never on scroll.
    *

@@ -45,6 +45,22 @@ export const metadata: Metadata = {
   title: { default: BRAND.name, template: `%s · ${BRAND.name}` },
   description: BRAND.tagline,
   applicationName: BRAND.name,
+  /*
+   * What iOS reads instead of the manifest.
+   *
+   * Safari has never implemented `display: standalone` from the web app manifest. Added to
+   * the home screen without these two tags, the site opens in a Safari tab with the address
+   * bar and the toolbar taking a third of a phone screen — which for a map is the difference
+   * between an app and a bookmark. `capable` is what iOS actually keys the standalone launch
+   * off; `title` is the home-screen label, and without it the launcher uses `<title>`, which
+   * on the start URL reads "Explore · Switchback" and gets truncated to "Explore".
+   *
+   * No `statusBarStyle`. The only value with an effect is `black-translucent`, which pulls
+   * the page up under the clock and the battery — and this page's top edge is the neatline
+   * and the wordmark, not the map. `viewportFit: 'cover'` below is what the map needs, and
+   * it does not require the status bar to be given away.
+   */
+  appleWebApp: { capable: true, title: BRAND.name },
 };
 
 /**
