@@ -2,9 +2,10 @@
 
 import { useState } from 'react';
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
-import { createTRPCClient, httpBatchLink } from '@trpc/client';
+import { createTRPCClient, httpBatchLink, httpLink, splitLink } from '@trpc/client';
 import { createTRPCContext } from '@trpc/tanstack-react-query';
 import superjson from 'superjson';
+import { isUnbatched } from '@switchback/core';
 import type { AppRouter } from '@switchback/api';
 import { makeQueryClient } from './query-client';
 
@@ -33,16 +34,20 @@ export function TRPCReactProvider({ children }: { children: React.ReactNode }) {
   const queryClient = getQueryClient();
   // useState, not useMemo: React may discard a memo, and a discarded tRPC client would
   // silently drop in-flight batches.
-  const [trpcClient] = useState(() =>
-    createTRPCClient<AppRouter>({
+  const [trpcClient] = useState(() => {
+    const options = { url: `${getBaseUrl()}/api/trpc`, transformer: superjson };
+    return createTRPCClient<AppRouter>({
       links: [
-        httpBatchLink({
-          url: `${getBaseUrl()}/api/trpc`,
-          transformer: superjson,
+        // Batch by default; the procedures that wait on somebody else's server go alone.
+        // `UNBATCHED_PROCEDURES` in @switchback/core says which, and why.
+        splitLink({
+          condition: (op) => isUnbatched(op.path),
+          true: httpLink(options),
+          false: httpBatchLink(options),
         }),
       ],
-    }),
-  );
+    });
+  });
 
   return (
     <QueryClientProvider client={queryClient}>

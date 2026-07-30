@@ -17,3 +17,4 @@ export * from './photos';
 export * from './heatmap';
 export * from './routing';
 export * from './map-bridge';
+export * from './transport';

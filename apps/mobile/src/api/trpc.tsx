@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { createTRPCClient, httpBatchLink } from '@trpc/client';
+import { createTRPCClient, httpBatchLink, httpLink, splitLink } from '@trpc/client';
 import { createTRPCContext } from '@trpc/tanstack-react-query';
 import superjson from 'superjson';
+import { isUnbatched } from '@switchback/core';
 import type { AppRouter } from '@switchback/api';
 import { getAccessToken } from '@/auth/session';
 import { trpcUrl } from '@/config';
@@ -40,25 +41,35 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
   // useState rather than useMemo: React is allowed to discard a memo, and a discarded
   // client would drop in-flight batches on the floor.
   const [queryClient] = useState(makeQueryClient);
-  const [trpcClient] = useState(() =>
-    createTRPCClient<AppRouter>({
+  const [trpcClient] = useState(() => {
+    const options = {
+      url: trpcUrl(),
+      transformer: superjson,
+      /**
+       * Resolved per request, not per client. The access token is replaced every 15
+       * minutes, so capturing one at construction would authenticate the first quarter
+       * hour of the app's life and nothing after it.
+       */
+      headers: async () => {
+        const token = await getAccessToken();
+        return token ? { authorization: `Bearer ${token}` } : {};
+      },
+    };
+    return createTRPCClient<AppRouter>({
       links: [
-        httpBatchLink({
-          url: trpcUrl(),
-          transformer: superjson,
-          /**
-           * Resolved per batch, not per client. The access token is replaced every 15
-           * minutes, so capturing one at construction would authenticate the first quarter
-           * hour of the app's life and nothing after it.
-           */
-          headers: async () => {
-            const token = await getAccessToken();
-            return token ? { authorization: `Bearer ${token}` } : {};
-          },
+        // Batch by default; the procedures that wait on somebody else's server go alone.
+        // `UNBATCHED_PROCEDURES` in @switchback/core says which, and why. This app has no
+        // geocoder typeahead yet, so it is the second half of that note that applies here:
+        // `trails.browse` fires on every pan and can sit on Overpass for half a minute, and
+        // anything unlucky enough to share its request waits too.
+        splitLink({
+          condition: (op) => isUnbatched(op.path),
+          true: httpLink(options),
+          false: httpBatchLink(options),
         }),
       ],
-    }),
-  );
+    });
+  });
 
   return (
     <QueryClientProvider client={queryClient}>
