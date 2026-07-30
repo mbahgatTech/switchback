@@ -1,8 +1,10 @@
 import type { Metadata } from 'next';
-import { ATTRIBUTION, BRAND, type RouteAnchor } from '@switchback/core';
+import { BRAND, type RouteAnchor } from '@switchback/core';
+import { OsmCredit, OsmCreditBeside } from '@/components/map/osm-credit';
 import { Planner } from '@/components/plan/planner';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
+import { placeCamera, viewerPlace } from '@/lib/place';
 import { viewerUnits } from '@/lib/units';
 import { caller } from '@/trpc/server';
 
@@ -34,15 +36,19 @@ export const metadata: Metadata = {
 };
 
 /**
- * Where the map opens when nothing else decides it.
+ * How close a reopened route sits.
  *
- * Snowdon, at the zoom where a valley fits — the same view Explore opens on, because a reader
- * moving between the two screens should not have the ground move underneath them. A planner
- * that opened on a world view would ask its first question ("click to drop a point") at a
- * scale where no click means anything.
+ * Only the saved-route branch below still needs a number of its own: a stored centroid is a
+ * known coordinate, as good as a fix, so it gets the zoom where a valley fits. The blank-sheet
+ * branch takes its whole camera from `lib/place.ts` instead — the reader's own place, or
+ * Seattle — because the alternative is a planner that opens on a different continent from the
+ * map the reader just came from. That invariant is the one this page has always claimed, and
+ * it used to be spelled as a copy of Explore's Snowdon constant; now it is spelled by both
+ * screens asking the same function. A planner that opened on a world view would ask its first
+ * question ("click to drop a point") at a scale where no click means anything, which is why
+ * there is a floor here at all.
  */
-const INITIAL_CENTER: readonly [number, number] = [-4.05, 53.07];
-const INITIAL_ZOOM = 11;
+const ROUTE_ZOOM = 11;
 
 export default async function PlanPage({
   searchParams,
@@ -51,13 +57,16 @@ export default async function PlanPage({
 }) {
   const { route: routeId } = await searchParams;
 
-  // Neither depends on the other, and a cold route fetch should not sit behind the session.
-  const [viewer, saved] = await Promise.all([
+  // None depends on the others, and a cold route fetch should not sit behind the session.
+  // `viewerPlace()` is a cookie-and-header read with no I/O, so it joins them for free.
+  const [viewer, saved, place] = await Promise.all([
     caller.me.get(),
     routeId ? caller.routes.detail({ id: routeId }).catch(() => null) : Promise.resolve(null),
+    viewerPlace(),
   ]);
 
   const units = await viewerUnits();
+  const opening = placeCamera(place);
   const anchors: readonly RouteAnchor[] = saved?.anchors ?? [];
 
   /*
@@ -86,24 +95,30 @@ export default async function PlanPage({
         {/*
           The route is drawn on OSM's ways and follows OSM's network. ODbL wants the credit
           on the screen that shows the data, and this screen shows more of it than any other.
+
+          `plan-map.tsx` sets `attributionControl: false`, so this link is the whole credit
+          here — which is why it goes through `beside` and not `extra`. Routing it into the
+          disclosure was argued at the time as a strict improvement on the `hidden … sm:inline`
+          it replaced, on the grounds that the old class meant no credit at all below 640px.
+          Half right: below 640px it was an improvement, and from 640 to 1279 — every tablet
+          and most laptop windows — it took a credit that was rendered and stopped rendering
+          it. `beside` shows it at every width, long-form wherever it fits.
         */}
-        <span className="collar flex items-center gap-md">
-          <SiteNav current="plan" />
-          <a href={ATTRIBUTION.osm.href} className="hidden rounded-hair hover:text-ink sm:inline">
-            {ATTRIBUTION.osm.label}
-          </a>
-        </span>
+        <SiteNav current="plan" beside={<OsmCreditBeside />} extra={<OsmCredit />} />
       </header>
 
-      <Planner
-        units={units}
-        defaultVisibility={viewer?.defaultActivityVisibility ?? 'private'}
-        viewerId={viewer?.id ?? null}
-        initialCenter={saved ? saved.centroid : INITIAL_CENTER}
-        initialZoom={INITIAL_ZOOM}
-        initialAnchors={anchors}
-        editing={editing}
-      />
+      {/* The landmark, for the reason given in `components/explore/explore-shell.tsx`. */}
+      <main className="contents">
+        <Planner
+          units={units}
+          defaultVisibility={viewer?.defaultActivityVisibility ?? 'private'}
+          viewerId={viewer?.id ?? null}
+          initialCenter={saved ? saved.centroid : opening.center}
+          initialZoom={saved ? ROUTE_ZOOM : opening.zoom}
+          initialAnchors={anchors}
+          editing={editing}
+        />
+      </main>
     </div>
   );
 }

@@ -108,12 +108,16 @@ async function settled(page: Page): Promise<void> {
  *
  * Not every page in the app — `/u/[username]`, `/lists/[key]`, `/activities/[id]` and
  * `/routes/[id]` are built from the same components as their index pages and would audit the
- * same markup twice. These thirteen are the distinct *shapes*: a marketing hero, a full-bleed
- * map, a dense data page, two live-instrument pages, four list pages, a form, a sign-in, and
- * two static documents.
+ * same markup twice. These eleven are the distinct *shapes*: a list of nearby trails, a dense
+ * data page, two live-instrument pages, four list pages, a form, and two static documents.
+ *
+ * `/` is deliberately not among them. It is the map now, and `settled()` is the wrong wait for
+ * it: the shell's `<h1>` is `sr-only`, which Playwright still counts as visible, so an audit
+ * would run against a sheet whose index is empty and report a clean page having read almost
+ * none of it. The map is audited by its own test below, on the state a hiker actually reads.
  */
 const ROUTES: { name: string; path: string }[] = [
-  { name: 'the home page', path: '/' },
+  { name: 'the nearby list', path: '/nearby' },
   { name: 'a trail', path: `/trails/${VESPER.slug}` },
   { name: 'the route planner', path: '/plan' },
   { name: 'the recorder', path: '/record' },
@@ -191,6 +195,83 @@ test.describe('Accessibility', () => {
     await expect(async () => {
       await page.getByRole('button', { name: /Report on this trail|Edit your report/u }).click();
       await expect(rating).toBeVisible({ timeout: 1_000 });
+    }).toPass({ timeout: 60_000 });
+
+    await audit(page, info);
+  });
+
+  /**
+   * The navigation, open, on the narrowest phone this product supports.
+   *
+   * Every audit above runs at the default viewport, where the nav is a plain row of links and
+   * the disclosure is `display:none` — which means axe has never seen the panel's markup. The
+   * failures this catches are the ones a disclosure actually ships with: a trigger with no
+   * accessible name, an `aria-controls` pointing at nothing, muted collar text on a panel it
+   * does not have the contrast for.
+   *
+   * The Escape and focus assertions are functional rather than axe's business, and they belong
+   * here anyway: this is the only spec in the suite that opens the menu, and a disclosure whose
+   * Escape handling is untested is a disclosure whose Escape handling regresses.
+   */
+  test('the navigation index has no WCAG A/AA violations at 320px', async ({
+    signedInPage: page,
+  }, info) => {
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.goto('/lists', { waitUntil: 'domcontentloaded' });
+    await settled(page);
+
+    const index = page.getByRole('button', { name: 'Index' });
+    const panel = page.locator('#site-nav-menu');
+    // Retried for the reason given on the report form above: first interaction on the page,
+    // server-rendered button, a click landing before hydration is swallowed in silence.
+    await expect(async () => {
+      await index.click();
+      await expect(panel.getByRole('link', { name: 'Downloads' })).toBeVisible({ timeout: 1_000 });
+    }).toPass({ timeout: 60_000 });
+
+    await expect(index).toHaveAttribute('aria-expanded', 'true');
+    await audit(page, info);
+
+    await page.keyboard.press('Escape');
+    await expect(index).toHaveAttribute('aria-expanded', 'false');
+    await expect(index).toBeFocused();
+  });
+
+  /**
+   * The same, on the neatline that has to carry the ODbL credit as well.
+   *
+   * The first assertion is the one worth stating plainly, because the suite previously
+   * documented the opposite: the map does **not** keep MapLibre's own attribution control.
+   * `map/trail-map.tsx` sets `attributionControl: false`, as do `plan-map.tsx` and
+   * `record-map.tsx`, so the link in the page is the entire credit for the screen. There is no
+   * second copy on the canvas to make hiding this one safe, which is why the credit rides the
+   * nav's `beside` slot — outside the fold — and why the check here is that it is on screen
+   * with the panel still shut.
+   *
+   * The panel-scoped locator that follows is scoped for a different reason than it used to be:
+   * outside the panel there is now a credit reading "© OSM" at this width, so an unscoped
+   * `/OpenStreetMap/` still matches one element but the intent is to assert the long form is
+   * the one behind the disclosure.
+   */
+  test('the map sheet navigation has no WCAG A/AA violations at 320px', async ({
+    signedInPage: page,
+  }, info) => {
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.goto(SHEET_AT_VESPER, { waitUntil: 'domcontentloaded' });
+    await expectTrailsLanded(sheetOf(page));
+
+    const index = page.getByRole('button', { name: 'Index' });
+    const panel = page.locator('#site-nav-menu');
+
+    // Before anything is opened. ODbL is a condition of showing the data, not a thing to be
+    // put one tap behind a control named for something else.
+    await expect(page.getByRole('link', { name: '© OSM' })).toBeVisible();
+
+    await expect(async () => {
+      await index.click();
+      await expect(panel.getByRole('link', { name: /OpenStreetMap/u })).toBeVisible({
+        timeout: 1_000,
+      });
     }).toPass({ timeout: 60_000 });
 
     await audit(page, info);

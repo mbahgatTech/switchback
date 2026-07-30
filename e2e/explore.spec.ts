@@ -134,7 +134,7 @@ test.describe('Explore', () => {
 
   test('a shared link opens on its trail', async ({ page, request }) => {
     const trail = await trailBySlug(request, VESPER.slug);
-    const sheet = await openSheet(page, `/explore?${VESPER.view}&trail=${trail.id}`);
+    const sheet = await openSheet(page, `/?${VESPER.view}&trail=${trail.id}`);
     await expectTrailsLanded(sheet);
 
     // No click anywhere. A link someone sent should arrive with the trail already picked.
@@ -145,8 +145,12 @@ test.describe('Explore', () => {
 
   test('searching a place moves the sheet to it', async ({ page }) => {
     // Deliberately from a long way off — this is the reader's own complaint, that searching
-    // "Vesper peak" got them nothing. Snowdon is the app's default view.
-    const sheet = await openSheet(page, '/explore?map=12/53.0685/-4.0763');
+    // "Vesper peak" got them nothing. The `map=` here is Snowdon, an explicit view rather than
+    // any default: the sheet is parked on another continent so the search has somewhere to
+    // travel from, and the assertion is that it arrives. Where a bare `/` opens is a separate
+    // question (the reader's own place, else Seattle — `apps/web/src/lib/place.ts`) and this
+    // test is insulated from it, since a URL view outranks everything.
+    const sheet = await openSheet(page, '/?map=12/53.0685/-4.0763');
 
     await page.getByPlaceholder('Search trails, or a place').fill('Vesper Peak');
 

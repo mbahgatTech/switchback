@@ -41,10 +41,6 @@ const TrailMap = dynamic(() => import('../map/trail-map').then((mod) => mod.Trai
   loading: () => <div className="absolute inset-0 bg-canvas" />,
 });
 
-/** Snowdon. Where the pipeline has ingested, and a good argument for shaded relief. */
-const INITIAL_CENTER: [number, number] = [-4.05, 53.07];
-const INITIAL_ZOOM = 11;
-
 /** How long the search box waits after the last keystroke. */
 const TYPING_MS = 300;
 
@@ -96,7 +92,20 @@ const AIR_QUALITY_STALE_MS = 30 * 60 * 1_000;
  */
 const HEATMAP_STALE_MS = 5 * 60 * 1_000;
 
-export function Explore({ viewerId }: { viewerId: string | null }) {
+export function Explore({
+  viewerId,
+  opening,
+}: {
+  viewerId: string | null;
+  /**
+   * Where the map opens when the URL does not say — the reader's own place, ranked by
+   * `lib/place.ts`, or Seattle. Resolved on the server and handed over as data, because
+   * `lib/place.ts` imports `next/headers` and cannot be called from this side of the
+   * boundary at all. Present on the very first client render, which is what makes the
+   * opening camera correct before the map exists rather than an `easeTo` afterwards.
+   */
+  opening: ExploreView;
+}) {
   const trpc = useTRPC();
 
   const [bbox, setBbox] = useState<BBox | null>(null);
@@ -122,8 +131,10 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
    * after that reconciliation, which costs one tick and is invisible here because the map
    * is `ssr: false` and does not exist until this resolves anyway.
    *
-   * `null` therefore means "not read yet", and the map waits for it. That wait is what
-   * makes a shared link land on the right mountain instead of flying there from Snowdon.
+   * `null` therefore means "not read yet", and the map waits for it. That wait is what makes
+   * a shared link land on the right mountain instead of on wherever the reader happens to be.
+   * Three steps, strongest first: the URL, then `opening` (the reader's own place, ranked by
+   * `lib/place.ts`), then Seattle. A link someone sent beats a cookie only they have.
    */
   const [initial, setInitial] = useState<ExploreUrlState | null>(null);
   useEffect(() => {
@@ -142,9 +153,27 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
    * navigation, re-runs the server component, and re-renders the tree — for a pan. The
    * existing `history.state` is passed through untouched because Next keeps its own routing
    * state in there, and dropping it breaks the back button for every earlier entry.
+   *
+   * The guard is what stops this effect from erasing the camera it was handed. `view` is only
+   * ever set by the map's own `onViewportChange`, which lands after MapLibre has loaded and
+   * settled — comfortably later than `URL_WRITE_MS` after `initial` resolves. So on a load of
+   * `/?map=13/48.012/-121.512` this effect would fire once with `view` still null,
+   * `exploreUrlSearch` would omit `map` because there is no view to write, and the shared
+   * camera would be wiped out of the address bar about six hundred milliseconds in. Measured:
+   * three writes per load, the middle one a bare `/`. Nothing on screen moved, because the map
+   * had already been built from `initial` — but anything that re-read `window.location.search`
+   * after that point, a reload most of all, parsed no `map`, fell through to `opening`, and
+   * landed the reader on their own place instead of on the link they were sent. The URL is
+   * supposed to beat the cookie; that only holds if the URL survives the first second.
+   *
+   * Written as "do not clear what the URL already had" rather than by seeding `view` from
+   * `initial.view ?? opening`, which would also close the gap: `view.zoom` is the heatmap
+   * query's cache key, and seeding it makes that query fire against a zoom the map has not
+   * confirmed it is at.
    */
   useEffect(() => {
     if (!initial) return;
+    if (view === null && initial.view !== null) return;
 
     const search = exploreUrlSearch({
       view,
@@ -181,10 +210,12 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
    * of what was asked for; the tiles under it are fetched by the viewport, as always.
    *
    * It is also the strongest statement of where somebody is interested in that we ever get,
-   * so it is written to the place cookie and becomes the front page's "near you" on the next
-   * visit. Named, unlike a GPS fix — this is the one source that arrives with a place name
-   * attached, which is why the front page can say "Hikes near Snowdonia" without ever
-   * reverse-geocoding anything.
+   * so it is written to the place cookie — which is this screen's own correction path. A bare
+   * `/` opens on whatever `lib/place.ts` ranks highest, and a searched place outranks the IP
+   * guess, so searching "Vesper Peak" once is also how a reader who keeps landing on the
+   * wrong city fixes it, with no permission prompt and nothing to configure. Named, unlike a
+   * GPS fix — this is the one source that arrives with a place name attached, which is why
+   * `/nearby` can say "Hikes near Snowdonia" without ever reverse-geocoding anything.
    */
   const onPlaceSelect = useCallback(
     (place: { bbox: BBox; name: string; lng: number; lat: number }) => {
@@ -295,7 +326,7 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
    */
   const heatmapQuery = useQuery(
     trpc.activities.heatmap.queryOptions(
-      { bbox: bbox ?? ([0, 0, 0, 0] as BBox), zoom: Math.round(view?.zoom ?? INITIAL_ZOOM) },
+      { bbox: bbox ?? ([0, 0, 0, 0] as BBox), zoom: Math.round(view?.zoom ?? opening.zoom) },
       {
         enabled: heatmap && bbox !== null,
         placeholderData: (previous) => previous,
@@ -318,9 +349,9 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
    * is the point. `scrollIntoView` does the same arithmetic and then applies it to *every*
    * scrolling box between the element and the viewport — which is what the specification
    * says it must do. One of those ancestors is the page shell, `overflow-hidden` on
-   * `app/explore/page.tsx`. Hidden is still a scrolling box: it can be scrolled
-   * programmatically, it just has no scrollbar to scroll it back. So picking a trail off
-   * the map shunted the whole page up by however far the filter rail overflowed, left the
+   * `src/components/explore/explore-shell.tsx`. Hidden is still a scrolling box: it can be
+   * scrolled programmatically, it just has no scrollbar to scroll it back. So picking a trail
+   * off the map shunted the whole page up by however far the filter rail overflowed, left the
    * header and the filters displaced with no way to undo it, and exposed a strip of the
    * results list where the map should have been.
    *
@@ -423,8 +454,8 @@ export function Explore({ viewerId }: { viewerId: string | null }) {
             slope={slope}
             airQuality={airQualityQuery.data ?? null}
             heatmap={heatmapQuery.data ?? null}
-            initialCenter={initial.view?.center ?? INITIAL_CENTER}
-            initialZoom={initial.view?.zoom ?? INITIAL_ZOOM}
+            initialCenter={initial.view?.center ?? opening.center}
+            initialZoom={initial.view?.zoom ?? opening.zoom}
             frame={frame}
           />
         ) : (

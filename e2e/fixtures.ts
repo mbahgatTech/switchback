@@ -65,7 +65,7 @@ export const REPORT_TRAIL = { slug: 'greider-lakes-trail' } as const;
  */
 export const LONG_TRAIL = { slug: 'appalachian-trail-dauphin-county' } as const;
 
-export const SHEET_AT_VESPER = `/explore?${VESPER.view}`;
+export const SHEET_AT_VESPER = `/?${VESPER.view}`;
 
 // ---------------------------------------------------------------------------
 // Fixtures

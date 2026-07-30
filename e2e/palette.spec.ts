@@ -33,7 +33,7 @@ const THEME_COOKIE = 'sb-theme';
  */
 const ROUTES = [
   '/',
-  '/explore',
+  '/nearby',
   `/trails/${VESPER.slug}`,
   '/plan',
   '/record',

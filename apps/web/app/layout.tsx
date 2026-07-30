@@ -59,8 +59,11 @@ export const metadata: Metadata = {
    * name is set by hand below. Neither line costs anything; the hand-written one is the only
    * thing standing between an older phone and a bookmark.
    *
-   * `title` is the label under the icon. Without it the launcher falls back to `<title>`,
-   * which on the start URL reads "Explore · Switchback" and gets truncated to "Explore".
+   * `title` is the label under the icon. Without it the launcher falls back to `<title>`, and
+   * relying on that is one metadata edit away from a truncated word: the start URL used to be
+   * `/explore`, whose title read "Explore · Switchback" and got cut to "Explore". It is `/`
+   * now, which sets its own title absolutely and reads correctly — so this line is currently
+   * belt to that page's braces, and it stays because the braces belong to a different file.
    *
    * No `statusBarStyle`. The only value with an effect is `black-translucent`, which pulls
    * the page up under the clock and the battery — and this page's top edge is the neatline

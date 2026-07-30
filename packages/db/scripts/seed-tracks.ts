@@ -55,10 +55,19 @@ const HIKERS: ReadonlyArray<readonly [username: string, name: string]> = [
  *
  * The heatmap is read one viewport at a time, so a corpus spread evenly over three
  * continents would put two or three recordings in every view and demonstrate nothing. These
- * are the two areas the ingest pipeline has actually filled: Snowdon, which is where
- * `/explore` opens, and the Mountain Loop, which is where the trails people search for by
- * name in this database happen to be. Seeding both means the layer is visible on arrival
- * *and* at the place a reader is most likely to navigate to next.
+ * are the two areas the ingest pipeline has actually filled: Snowdon, and the Mountain Loop,
+ * which is where the trails people search for by name in this database happen to be.
+ *
+ * Neither is where the map opens any more, and this note used to say Snowdon was. The sheet
+ * now opens on the reader's own place and falls back to Seattle (`apps/web/src/lib/place.ts`),
+ * whose arrival view — `[-122.668, 47.412, -121.992, 47.807]` at 1400×900 — is disjoint from
+ * both boxes below in longitude and in latitude. So "visible on arrival" is no longer a claim
+ * this script can make for anybody: a reader who switches the layer on from the front page
+ * gets an empty overlay unless they have already panned somewhere seeded. What it still buys
+ * is a layer that is dense and legible at the two places a reader navigates *to* by name,
+ * which is what the band ladder below is for. Closing the gap means seeding a third box inside
+ * the fallback view — the I-90 corridor that `FALLBACK_AT`'s own note names as the alternative
+ * lever — and that only works once the pipeline has filled it with trails to hang tracks on.
  *
  * The boxes are deliberately about one screen wide at the zoom the layer is useful at.
  */

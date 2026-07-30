@@ -81,7 +81,15 @@ const FLING = 140;
 /** Long enough that typing a word is one lookup. Nominatim allows one request a second. */
 const SEARCH_DEBOUNCE_MS = 320;
 
-/** Snowdon, matching the website's own opening view. Overridden by a last known fix. */
+/**
+ * Snowdon, overridden by a last known fix.
+ *
+ * It used to match the website's opening view; the website now derives its centre from the
+ * reader (cookie, then edge geo headers, then Seattle — `apps/web/src/lib/place.ts`), so this
+ * constant is a floor for a first run rather than a shared default. Left alone on purpose: a
+ * phone has a real GPS and a last known fix, so its right answer is `expo-location` and a
+ * persisted camera, which is a larger piece of work than copying a web coordinate across.
+ */
 const INITIAL_CENTER: readonly [number, number] = [-4.05, 53.07];
 const INITIAL_ZOOM = 11;
 

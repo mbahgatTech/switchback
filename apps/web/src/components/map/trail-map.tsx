@@ -66,7 +66,16 @@ export interface TrailMapProps {
    * place anyone looks for the privacy control.
    */
   heatmap?: Heatmap | null;
-  /** Where to open. Snowdonia, because that is what the pipeline has ingested. */
+  /**
+   * Where to open. Read exactly once, at construction, by the create-once effect below — so
+   * changing it later is inert, and adding it to that effect's dependencies would tear down
+   * and rebuild the whole MapLibre instance on every render. The lever for a move after mount
+   * is `frame`, with its nonce.
+   *
+   * The caller decides where "here" is, and the callers do not agree: explore and plan derive
+   * it from the reader (`lib/place.ts`), the embed takes it from query params handed over by
+   * the phone. This prop has no opinion.
+   */
   initialCenter: [number, number];
   initialZoom: number;
   /** An explicit "go here", from search. See `MapFrame` for why it carries a nonce. */

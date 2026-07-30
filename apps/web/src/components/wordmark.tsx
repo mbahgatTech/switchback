@@ -12,17 +12,19 @@ import { Blaze } from './blaze';
  * deliberate tightening that belongs to the wordmark specifically. Left inline it reads as a
  * stray magic number in twenty files; named here it is the one place the mark is specified.
  *
- * The front page is the exception the `large` prop exists for. It is the only screen where
- * the mark is not competing with a page heading directly beneath it, so it is set a step up.
+ * `large` is for a page that leads with the mark rather than with an instrument. `/nearby` is
+ * the only one: its heading sits a good distance below, so the mark is not competing with
+ * anything directly beneath it and is set a step up. On the map shell the header is a neatline
+ * one line tall, and a larger mark there just eats map.
  *
- * `home` is off only on the front page itself, where a link to the page you are already on is
- * an announced destination that goes nowhere.
+ * `home` is off wherever the mark would link to the page it is already on — today that is `/`,
+ * the map. A link to where you are is an announced destination that goes nowhere.
  */
 
 export interface WordmarkProps {
-  /** Front-page size — one step up, and only there. */
+  /** One step up, for a page that opens with the mark rather than an instrument. */
   large?: boolean;
-  /** Link to `/`. Off on the front page, which is already there. */
+  /** Link to `/`. Off on `/` itself, which is already there. */
   home?: boolean;
 }
 

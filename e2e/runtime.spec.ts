@@ -22,7 +22,7 @@ import { PROBE_SESSION_TOKEN, VESPER } from './fixtures';
  */
 
 /** Every route that constructs a MapLibre instance. */
-const MAP_ROUTES = ['/explore', `/trails/${VESPER.slug}`, '/plan', '/record'];
+const MAP_ROUTES = ['/', `/trails/${VESPER.slug}`, '/plan', '/record'];
 
 test('no uncaught errors on the routes that carry a map', async ({ browser, baseURL }) => {
   test.setTimeout(240_000);

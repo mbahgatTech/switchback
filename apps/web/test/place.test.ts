@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatPlaceCookie, parsePlaceCookie, placeLabel } from '../src/lib/place';
+import { formatPlaceCookie, parsePlaceCookie, placeCamera, placeLabel } from '../src/lib/place';
 
 /**
  * The front page is a function of this cookie, and the cookie is text a browser hands us.
@@ -75,5 +75,50 @@ describe('placeLabel', () => {
 
   it('falls back to a word that promises nothing when there is no name', () => {
     expect(placeLabel({ at: [0, 51], source: 'network' })).toBe('here');
+  });
+});
+
+/**
+ * The zoom table, written down where it cannot be tidied away.
+ *
+ * Three numbers with three different reasons, none of which is visible from the constants
+ * themselves — which is exactly the shape of thing somebody unifies into one `DEFAULT_ZOOM`
+ * on a quiet afternoon. The literals are asserted rather than the exported constants, so a
+ * change to a constant fails here instead of passing tautologically against itself.
+ */
+describe('placeCamera', () => {
+  it('opens on Seattle when the reader has told us nothing', () => {
+    expect(placeCamera(null)).toEqual({ center: [-122.33, 47.61], zoom: 10 });
+  });
+
+  it('trusts a browser fix', () => {
+    const at: [number, number] = [-121.51188, 48.01213];
+    expect(placeCamera({ at, source: 'browser' })).toEqual({ center: at, zoom: 11 });
+  });
+
+  it('trusts a searched place', () => {
+    const at: [number, number] = [-121.51188, 48.01213];
+    expect(placeCamera({ at, source: 'search', name: 'Vesper Peak' })).toEqual({
+      center: at,
+      zoom: 11,
+    });
+  });
+
+  it('opens wider on a guess than on a fix', () => {
+    // An IP lookup is city-accurate at best and the wrong side of a country on a VPN. One
+    // step out is where the map says so, since it has no room to say it in words.
+    const at: [number, number] = [-3.18, 51.48];
+    expect(placeCamera({ at, source: 'network', name: 'Cardiff' })).toEqual({
+      center: at,
+      zoom: 10,
+    });
+  });
+
+  it('is no more confident about nothing than about a guess', () => {
+    // Knowing neither a cookie nor an edge header is strictly less than knowing an IP city,
+    // so the fallback must never open tighter than the network case.
+    expect(placeCamera(null).zoom).toBeLessThanOrEqual(
+      placeCamera({ at: [-3.18, 51.48], source: 'network' }).zoom,
+    );
   });
 });

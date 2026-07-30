@@ -398,15 +398,20 @@ jobs:
           exit 1
 
       # A smoke test, because "the alias moved" and "the site works" are different claims and
-      # only one of them has been proven so far. These five are the load-bearing routes: the
-      # landing page, the map, a trail read out of Postgres, the attribution ODbL requires,
+      # only one of them has been proven so far. These six are the load-bearing routes: the
+      # map that is now the front page, the alias every shared link still carries, the list of
+      # trails near the reader, a trail read out of Postgres, the attribution ODbL requires,
       # and the manifest without which none of it installs.
+      #
+      # No `-L`, deliberately. `%{http_code}` reports the first response, so a redirect anywhere
+      # in this list fails the job — which is the point: `/explore` must serve the sheet itself
+      # rather than bounce a shared link through an extra round trip.
       - name: Smoke-test the live site
         env:
           SITE: https://switchback-three.vercel.app
         run: |
           failed=0
-          for path in / /explore /trails/llanberis-path /attribution /manifest.webmanifest; do
+          for path in / /explore /nearby /trails/llanberis-path /attribution /manifest.webmanifest; do
             status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$SITE$path" || echo 000)
             printf '%s  %s\n' "$status" "$path"
             [ "$status" = "200" ] || failed=1
