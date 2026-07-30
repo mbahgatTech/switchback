@@ -75,12 +75,18 @@ export async function POST(request: Request): Promise<Response> {
        *
        * Refusing costs a legitimate user one extra step. Allowing it costs someone their
        * account, along with every activity, photograph and list on it.
+       *
+       * The message names the only recovery that exists. An earlier draft said to "link this
+       * device from settings", and there is no such control — `me.ts` exposes no linking
+       * procedure and `settings-form.tsx` has no linking affordance, so the sentence sent the
+       * reader looking for a button nobody has written. Signing in with the provider the
+       * account was made with is a thing they can actually do, on this screen, now.
        */
       return Response.json(
         {
           error: 'email_taken_unverified',
           message:
-            'That email address already has a Switchback account. Sign in on the web first, then link this device from settings.',
+            'That email address already has a Switchback account. Sign in with the provider you first used, and this device will be added to it.',
         },
         { status: 409 },
       );

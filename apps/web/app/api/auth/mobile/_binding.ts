@@ -72,8 +72,21 @@ export function clearBindingCookie(request: Request): string {
  * `Sec-Fetch-Site` is set by the browser and cannot be forged from script. `none` is a typed
  * address or a bookmark, `same-origin` is our own form; anything else — `cross-site`,
  * `same-site` from a sibling subdomain — is refused. A request with no header at all is
- * allowed through, because that is what every non-browser client looks like and the two legs
- * this guards are also protected by the binding cookie and the CSRF token.
+ * allowed through, because that is what every non-browser client looks like and the leg this
+ * guards is also protected by the binding cookie and the CSRF token.
+ *
+ * **Only safe on a request the browser makes in one hop.** `Sec-Fetch-Site` is not a property
+ * of the page that started a navigation. The browser recomputes it at every hop of a redirect
+ * chain against the whole list of URLs in that chain, and it degrades permanently: one
+ * cross-site URL anywhere in the chain and every later hop reads `cross-site`, however
+ * same-origin the last two hops are. `none` is the exception — a browser-initiated navigation
+ * stays `none` through any number of redirects.
+ *
+ * So this must not be used on a redirect target. `POST /complete` is a form submission from a
+ * page we rendered, one hop, and is the only caller. `GET /complete` is where Entra's callback
+ * sends the browser, and calling this there refused every first-time sign-in with
+ * `cross-site` after the reader had already authenticated — the docblock on the cookie above
+ * concedes the same fact about the return leg and the guard did not listen to it.
  */
 export function fromOurOwnOrigin(request: Request): boolean {
   const site = request.headers.get('sec-fetch-site');

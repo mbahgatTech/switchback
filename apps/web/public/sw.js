@@ -27,6 +27,13 @@ const TILE_CACHE = 'sb-tiles-v1';
 const PAGE_CACHE = 'sb-pages-v1';
 const MEDIA_CACHE = 'sb-media-v1';
 /**
+ * The `/_next/static/*` a *downloaded page* names. Hand-versioned, like the three above and
+ * for the same reason — they are part of somebody's download, and a page served from
+ * `PAGE_CACHE` without its chunks renders "This page couldn't load". A deploy must not sweep
+ * them. `src/offline/caches.ts` has the full argument, including what it costs.
+ */
+const ASSET_CACHE = 'sb-assets-v1';
+/**
  * This build, out of the worker's own URL.
  *
  * `offline/register.tsx` registers `/sw.js?v=<build id>`, and `self.location` inside a worker
@@ -39,13 +46,13 @@ const MEDIA_CACHE = 'sb-media-v1';
  */
 const BUILD_ID = new URL(self.location.href).searchParams.get('v') || 'dev';
 /**
- * The shell holds `/_next/static/*`, which is this build's own code, so it is scoped to the
- * build and collected by `activate` when the next one takes over. The three above are the
- * reader's downloads and are versioned by hand — a deploy must not delete the map somebody
- * took onto a hill. `src/offline/caches.ts` has the full argument.
+ * The shell holds this build's own precache — `SHELL_PAGES` and the chunks those pages name —
+ * which the next build replaces wholesale, so it is scoped to the build and collected by
+ * `activate`. The four above are the reader's downloads and are versioned by hand: a deploy
+ * must not delete the map somebody took onto a hill, nor the code that draws it.
  */
 const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
-const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE];
+const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
 const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];
 const STATIC_ASSET_PATTERN = String.raw`/_next/static/[A-Za-z0-9._@%/-]+\.[A-Za-z0-9]{2,5}\b`;
@@ -272,11 +279,24 @@ function refreshShell(request, response) {
  * cache-first is exact rather than merely fast. This is what makes a downloaded page
  * *render* offline: the HTML is worth nothing without the JS and CSS it references, and
  * those are requested by the page rather than by us, so they cannot be listed in advance.
+ *
+ * Two caches, in this order and not the other. The shell holds the current build and is the
+ * common hit. `ASSET_CACHE` holds the chunks harvested for downloaded pages, which may belong
+ * to a build that shipped months ago — a page in `PAGE_CACHE` names hashed URLs no current
+ * build serves, so without this second look the download is present, matched, and replaced by
+ * React's error boundary the moment the reader is out of signal.
+ *
+ * A miss is written back to the shell. It is this build asking, by definition: the request
+ * came from a live page, not from the cache.
  */
 async function handleStatic(request) {
   const cache = await caches.open(SHELL_CACHE);
   const hit = await cache.match(request, { ignoreVary: true });
   if (hit) return hit;
+
+  const downloaded = await caches.open(ASSET_CACHE);
+  const kept = await downloaded.match(request, { ignoreVary: true });
+  if (kept) return kept;
 
   const response = await fetch(request);
   if (response.ok) cache.put(request, response.clone()).catch(() => undefined);

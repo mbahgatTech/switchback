@@ -151,7 +151,11 @@ sends the session cookie on a top-level cross-site GET; that is what Lax is for.
 - `POST /complete` carries the Auth.js CSRF token and is the only thing that mints a code. A
   cross-site form POST does not carry a Lax cookie, and a sibling subdomain cannot read the
   token out of an `HttpOnly` cookie.
-- Both legs refuse a `Sec-Fetch-Site` that is neither `same-origin` nor `none`.
+- `POST /complete` refuses a `Sec-Fetch-Site` that is neither `same-origin` nor `none`. The
+  `GET` does not, and must not: the browser recomputes that header at every hop of a redirect
+  chain and it stays `cross-site` once any URL in the chain is, which is precisely the shape of
+  the return leg from Entra. Checking it there refused every first-time sign-in after the
+  reader had already given Microsoft their password.
 
 The visible cost is that a sign-in **must finish in the browser it started in**. Starting in
 the app's in-app browser and finishing in Safari fails with `wrong_browser`, which says so and

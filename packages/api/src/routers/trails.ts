@@ -47,7 +47,7 @@ import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
 import { decodeCursor, encodeCursor } from '../cursor';
 import { readProfile } from '../profiles';
 import { summarySelect, toSummary } from '../trail-shape';
-import { publicProcedure, router } from '../trpc';
+import { deliberateServerError, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 import { photoSelect, toPhoto } from './photos';
 import type { TrailPhoto } from './photos';
@@ -187,11 +187,10 @@ function toDetail(row: DetailRow): TrailDetail {
   const geometry = readGeometry(row.geometryJson);
   if (!geometry) {
     // Ingest writes geometry and stats in one transaction, so this is a corrupted row
-    // rather than a trail that simply has not been enriched yet.
-    throw new TRPCError({
-      code: 'INTERNAL_SERVER_ERROR',
-      message: 'That trail has no usable geometry.',
-    });
+    // rather than a trail that simply has not been enriched yet. Marked so the message
+    // survives serialisation — it names the one thing that is wrong with this trail, and
+    // it stays a 500 because `NOT_FOUND` would be rendered as a 404 page instead.
+    throw deliberateServerError('That trail has no usable geometry.');
   }
 
   return {

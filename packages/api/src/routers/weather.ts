@@ -46,7 +46,7 @@ import {
 } from '@switchback/weather';
 import type { AirQualityDeps, AlongRouteDeps, AlongRouteInput } from '@switchback/weather';
 import { readProfile } from '../profiles';
-import { publicProcedure, router } from '../trpc';
+import { deliberateServerError, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
 /**
@@ -258,11 +258,7 @@ export function asTrpcError(error: unknown): TRPCError {
     });
   }
 
-  return new TRPCError({
-    code: 'INTERNAL_SERVER_ERROR',
-    message: 'Could not build a forecast for that trail.',
-    cause: error,
-  });
+  return deliberateServerError('Could not build a forecast for that trail.', error);
 }
 
 /**
@@ -271,13 +267,14 @@ export function asTrpcError(error: unknown): TRPCError {
  * Worth the four lines: an overlay that fails saying "could not build a forecast for that
  * trail" sends the reader looking for a broken trail that does not exist. The retryable
  * codes — which is the part the client acts on — are identical.
+ *
+ * Both messages are built by `deliberateServerError`, which is what keeps that true across
+ * the wire. Under a blanket scrub of every 500 the two came out identical and this helper did
+ * nothing at all — invisibly, because the test below asserts on the `TRPCError` and the
+ * replacement happened at serialisation.
  */
 export function asAirQualityError(error: unknown): TRPCError {
   const mapped = asTrpcError(error);
   if (mapped.code !== 'INTERNAL_SERVER_ERROR') return mapped;
-  return new TRPCError({
-    code: 'INTERNAL_SERVER_ERROR',
-    message: 'Could not read air quality for that area.',
-    cause: error,
-  });
+  return deliberateServerError('Could not read air quality for that area.', error);
 }

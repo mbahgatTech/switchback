@@ -37,8 +37,10 @@ import { confirmation, notice } from '../_notice';
  * - **The POST, with the Auth.js CSRF token.** A cross-site form POST does not carry a
  *   `SameSite=Lax` cookie at all, and a same-site page on a sibling subdomain cannot read the
  *   token out of an `HttpOnly` cookie to put in the form.
- * - **`Sec-Fetch-Site`.** Set by the browser, unforgeable from script, and refused unless it
- *   says the request came from us or from nowhere.
+ * - **`Sec-Fetch-Site`, on the POST only.** Set by the browser, unforgeable from script, and
+ *   refused on the POST unless it says the request came from us or from nowhere. It is *not*
+ *   checked on the GET, and that is a correction rather than an omission — see the note above
+ *   `GET` below, and `fromOurOwnOrigin` in `../_binding.ts`.
  *
  * And a person has to press a button that names the device, which is the only one of the four
  * that still helps if the reader is being played some way the other three do not cover.
@@ -89,14 +91,44 @@ const GENERIC: { heading: string; body: string } = {
   body: 'Close this and start again from the app.',
 };
 
+/**
+ * Shown when the POST arrives from somewhere that is not our own interstitial.
+ *
+ * Only the POST. The GET is a redirect target and its `Sec-Fetch-Site` describes a chain that
+ * legitimately runs through Microsoft; the POST is sent by a form on a page this route
+ * rendered, one hop, so `same-origin` there is a fact rather than a hope.
+ */
 const CROSS_SITE: { heading: string; body: string } = {
   heading: 'That sign-in did not come from this site',
   body: 'Another page sent your browser here, so nothing was signed in. Close this and start again from the app.',
 };
 
+/**
+ * The question. Reads, names the device, and mints nothing.
+ *
+ * **No `Sec-Fetch-Site` check here, on purpose.** There was one, and it broke every
+ * first-time sign-in on a new device. `Sec-Fetch-Site` is not a property of the page that
+ * started a navigation; the browser recomputes it at each hop of a redirect chain against
+ * every URL in that chain, and once any of them is cross-site it stays `cross-site` for the
+ * rest of the chain. That is exactly the shape of the ordinary return leg —
+ * `/signin` → `login.microsoftonline.com` → `/api/auth/callback/microsoft-entra-id` → 302 →
+ * here — so the guard refused the one request it most had to admit, after the reader had
+ * already given Microsoft their password and their second factor. They landed on a page
+ * accusing their own browser of not being this site, and `openAuthSessionAsync` never saw the
+ * return URL, so the sheet did not even close.
+ *
+ * The already-signed-in fast path hid it: `/start` opened by the browser arrives as `none`,
+ * `none` survives redirects where `same-origin` does not, and the whole chain stays `none`.
+ * That is the path a manual check exercises, and it is the only one that ever passed.
+ *
+ * Nothing is lost by dropping it, because this leg has nothing to steal. It mints no code,
+ * sets no credential and moves no state; it renders a form. Every guard that matters is on
+ * the POST, where `same-origin` is genuinely the truth because our own interstitial is what
+ * sends it: the binding cookie, the Lax-blocked cross-site form POST, and the double-submit
+ * CSRF token. The row is still read here so that a request that cannot succeed fails before
+ * the reader presses anything rather than after.
+ */
 export async function GET(request: Request): Promise<Response> {
-  if (!fromOurOwnOrigin(request)) return notice(403, CROSS_SITE.heading, CROSS_SITE.body);
-
   const requestId = new URL(request.url).searchParams.get('request') ?? '';
   if (!requestId) return notice(400, GENERIC.heading, GENERIC.body);
 

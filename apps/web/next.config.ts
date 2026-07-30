@@ -16,6 +16,54 @@ const BUILD_ID =
   randomUUID().slice(0, 12);
 
 /**
+ * The origin user-uploaded photographs are served from, if a deployment has a real one.
+ *
+ * Read from `R2_PUBLIC_URL`, which is the variable a deployment with R2 configured must have:
+ * `src/env.ts` validates it as a URL, its cross-field rule refuses a half-configured R2, and
+ * `packages/api/src/storage.ts` builds every photo URL out of it. `NEXT_PUBLIC_R2_PUBLIC_HOST`
+ * is a second, scheme-less spelling of the same host, kept as a fallback because
+ * `images.remotePatterns` below wants a hostname rather than a URL — but it is optional and
+ * unvalidated, so a deployment can be fully R2-configured with it unset. Reading only that
+ * one, which is what this file used to do, gave exactly those deployments a policy with no
+ * entry for the host every photograph comes from: harmless while the header is Report-Only,
+ * and a blank gallery on the day it is enforced.
+ *
+ * Placeholders are dropped for the same reason `pmtilesOrigin` drops them — `.env.example`
+ * ships `NEXT_PUBLIC_R2_PUBLIC_HOST="cdn.example.com"` verbatim, so a fresh clone would
+ * otherwise allow-list a host it will never talk to, and a CSP that allow-lists a placeholder
+ * has stopped describing the deployment it is on.
+ *
+ * `R2_PUBLIC_URL` is server-only, which is fine — this file runs on the server — but it is read
+ * at *build* time, so it has to be in the build environment and not only the runtime one. On
+ * Vercel that means the variable must be available to the Build step, not just to Functions.
+ */
+const PLACEHOLDER_HOSTS = ['cdn.example.com', 'example.com'];
+
+function r2Host(): string | null {
+  const url = process.env.R2_PUBLIC_URL?.trim();
+  const bare = process.env.NEXT_PUBLIC_R2_PUBLIC_HOST?.trim();
+
+  let hostname: string | undefined;
+  if (url) {
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      hostname = undefined;
+    }
+  }
+  hostname ??= bare || undefined;
+
+  if (!hostname || PLACEHOLDER_HOSTS.includes(hostname)) return null;
+  return hostname;
+}
+
+/** The same host as a CSP source, or nothing to add. */
+function r2Origin(): string[] {
+  const host = r2Host();
+  return host ? [`https://${host}`] : [];
+}
+
+/**
  * The PMTiles origin, if a deployment has a real one.
  *
  * `.env.example` ships `https://cdn.example.com/...` and a fresh clone copies it verbatim, so
@@ -29,7 +77,7 @@ function pmtilesOrigin(): string[] {
   if (!raw) return [];
   try {
     const { origin, hostname } = new URL(raw);
-    return ['cdn.example.com', 'example.com'].includes(hostname) ? [] : [origin];
+    return PLACEHOLDER_HOSTS.includes(hostname) ? [] : [origin];
   } catch {
     return [];
   }
@@ -88,9 +136,7 @@ const CSP = [
     'https://s3.amazonaws.com',
     'https://upload.wikimedia.org',
     'https://*.mapillary.com',
-    ...(process.env.NEXT_PUBLIC_R2_PUBLIC_HOST
-      ? [`https://${process.env.NEXT_PUBLIC_R2_PUBLIC_HOST}`]
-      : []),
+    ...r2Origin(),
   ].join(' '),
   /*
    * The same hosts as fetches rather than as images, because that is how MapLibre asks for
@@ -107,9 +153,7 @@ const CSP = [
     'https://upload.wikimedia.org',
     'https://*.mapillary.com',
     ...pmtilesOrigin(),
-    ...(process.env.NEXT_PUBLIC_R2_PUBLIC_HOST
-      ? [`https://${process.env.NEXT_PUBLIC_R2_PUBLIC_HOST}`]
-      : []),
+    ...r2Origin(),
   ].join(' '),
 ].join('; ');
 const config: NextConfig = {
@@ -146,10 +190,9 @@ const config: NextConfig = {
       // Wikimedia Commons and Mapillary, for photos seeded during ingest.
       { protocol: 'https', hostname: 'upload.wikimedia.org' },
       { protocol: 'https', hostname: '*.mapillary.com' },
-      // User uploads. R2's public bucket hostname is set per environment.
-      ...(process.env.NEXT_PUBLIC_R2_PUBLIC_HOST
-        ? [{ protocol: 'https' as const, hostname: process.env.NEXT_PUBLIC_R2_PUBLIC_HOST }]
-        : []),
+      // User uploads, from the same host the CSP allow-lists — derived from `R2_PUBLIC_URL`
+      // rather than read only from `NEXT_PUBLIC_R2_PUBLIC_HOST`, so the two cannot disagree.
+      ...(r2Host() ? [{ protocol: 'https' as const, hostname: r2Host() as string }] : []),
     ],
   },
 

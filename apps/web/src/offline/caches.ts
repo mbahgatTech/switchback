@@ -11,13 +11,12 @@
  * which the worker deletes on activate — the standard dance, and the only one that is safe
  * while an old worker is still serving pages from the cache you want to replace.
  *
- * **Two kinds of version, and the difference matters.** Three of these carry a hand-bumped
- * `-v1`, because what is in them belongs to the reader: tiles, pages and photographs are a
- * download somebody made on purpose, possibly for a trip they are on, and a deploy must not
- * throw them away. The shell is the opposite — it holds `/_next/static/*`, which is this
- * build's code, so it is versioned off the build id and collected automatically when a new
- * build takes over. Left on a fixed name it never was collected, which is how a compromised
- * script could have outlived the deploy that removed it.
+ * **Two kinds of version, and the difference matters.** Four of these carry a hand-bumped
+ * `-v1`, because what is in them belongs to the reader: tiles, pages, photographs and the
+ * build assets those pages name are a download somebody made on purpose, possibly for a trip
+ * they are on, and a deploy must not throw them away. Only the shell is versioned off the
+ * build id, because it holds this build's own precache and is replaced wholesale by the next
+ * one.
  */
 
 /**
@@ -43,12 +42,39 @@ export const PAGE_CACHE = 'sb-pages-v1';
 export const MEDIA_CACHE = 'sb-media-v1';
 
 /**
+ * The build assets a *downloaded page* names — its `/_next/static/*` chunks, stylesheets and
+ * fonts.
+ *
+ * Hand-versioned, and this is the one cache name that has already been got wrong once. It was
+ * folded into the shell, the shell was then scoped to the build id, and the two together meant
+ * every deploy deleted the chunks that pages already sitting in `PAGE_CACHE` refer to. The
+ * download survived; it just stopped rendering. A hiker's phone touches wifi, the new worker
+ * activates and sweeps `sb-shell-<old build>`, they walk out of signal, and the page they
+ * downloaded is served from cache and replaced by "This page couldn't load" — which is
+ * verbatim the failure the harvesting below exists to prevent.
+ *
+ * So the assets that belong to a download live with the download, on a hand-bumped name, and
+ * the shell keeps the build id. `download.ts`'s `storeShell` is the only writer.
+ *
+ * **What that costs, said plainly.** These entries are not collected on deploy, so a phone
+ * that has downloaded trails across several builds holds a chunk set per build. Two things
+ * bound it: the URLs are content-hashed, so re-downloading a trail on the same build stores
+ * nothing new, and `evict.ts` drops the whole cache once the last download is deleted. What is
+ * given up is the property the build-scoped name bought — that a bad asset cannot outlive the
+ * deploy that removed it. It cannot be had here: a downloaded page's markup names the exact
+ * hashed URLs it was built with, and serving that page offline means serving those bytes. The
+ * alternative on offer was deleting them, which is not a fix, it is the bug.
+ */
+export const ASSET_CACHE = 'sb-assets-v1';
+
+/**
  * The application shell: the offline page, and the hashed assets it needs to render.
  *
  * Named after the build, so every deploy starts a clean one and `activate` collects the last.
- * Content-hashed URLs make cache-first exact, which is what lets a downloaded page render
- * offline — and also what made a bad asset permanent, since a URL that resolves once was
- * never fetched again. Scoping the cache to the build is what puts a floor under that.
+ * What is in here is this build's own precache — `SHELL_PAGES` and the chunks those pages
+ * name — which the next build replaces wholesale, and which nothing that is not the current
+ * build ever asks for. That is what makes collecting it safe, and it is exactly the property
+ * `ASSET_CACHE` above does not have.
  *
  * The cost is one cold shell per deploy: the first navigation after an upgrade refetches the
  * chunks. They are on the network at that moment by definition — the reader is online, or
@@ -56,7 +82,13 @@ export const MEDIA_CACHE = 'sb-media-v1';
  */
 export const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
 
-export const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE] as const;
+export const OFFLINE_CACHES = [
+  TILE_CACHE,
+  PAGE_CACHE,
+  MEDIA_CACHE,
+  ASSET_CACHE,
+  SHELL_CACHE,
+] as const;
 
 /** Where the worker sends a navigation it cannot satisfy from either network or cache. */
 export const OFFLINE_FALLBACK_PATH = '/offline';
