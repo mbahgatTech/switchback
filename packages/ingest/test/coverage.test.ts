@@ -1,16 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { JobKind, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   AREA_PRIORITY,
   MAX_AREA_TILES,
-  MAX_TILE_QUEUE_DEPTH,
   VIEWPORT_PRIORITY,
   ensureCoverage,
   queueTiles,
   requestArea,
   surveyArea,
 } from '../src/coverage';
+import { MAX_TILE_QUEUE_DEPTH } from '../src/backpressure';
 import { TILE_TTL_MS } from '../src/pipeline';
 
 /** A bbox small enough to need exactly one z9 tile. */
@@ -331,6 +331,8 @@ describe('requestArea', () => {
   });
 
   it('refuses once the tile queue is already too deep, and says so', async () => {
+    // The guard logs its refusal for an operator; this suite is not the audience.
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db, recorded } = fakeDb([], { queueDepth: MAX_TILE_QUEUE_DEPTH });
     const result = await requestArea(HUGE, { db, now: NOW });
 

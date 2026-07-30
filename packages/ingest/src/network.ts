@@ -26,6 +26,7 @@ import {
 } from '@switchback/geo';
 import { fillGaps } from './elevate';
 import { TerrainSource } from './elevate';
+import { admitIngest } from './backpressure';
 import { enqueue, networkJobKey } from './jobs';
 import { OverpassUnavailableError } from './overpass';
 import type { OverpassElement, OverpassWay } from './overpass';
@@ -567,6 +568,8 @@ export interface NetworkCoverage {
   pending: string[];
   /** What this call put on the queue. */
   queued: string[];
+  /** True when ingest was refused, so the outstanding tiles are not on their way. */
+  busy: boolean;
   tooLarge: boolean;
   requiredTiles: number;
   maxTiles: number;
@@ -603,6 +606,7 @@ export async function ensureNetworkCoverage(
       ready: [],
       pending: [],
       queued: [],
+      busy: false,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
@@ -632,11 +636,19 @@ export async function ensureNetworkCoverage(
 
   const queued = options.queue === false ? [] : await queueNetworkTiles(db, needsWork);
 
+  /*
+   * Same reasoning as `ensureCoverage`: work outstanding with nothing queued means
+   * backpressure refused it, and the planner is told so rather than left showing a progress
+   * line for tiles that are not coming. `pending` drives that line, so it is cleared.
+   */
+  const busy = options.queue !== false && needsWork.length > 0 && queued.length === 0;
+
   return {
     quadkeys: cover.quadkeys,
     ready,
-    pending,
+    pending: busy ? [] : pending,
     queued,
+    busy,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,
@@ -649,6 +661,13 @@ export async function queueNetworkTiles(
   quadkeys: readonly string[],
   priority = NETWORK_PRIORITY,
 ): Promise<string[]> {
+  if (quadkeys.length === 0) return [];
+
+  // The routing queue's share of the same ceiling. It used to have none: the depth guard
+  // counted `ingest_tile` only, and this path enqueues `ingest_network`, so the whole
+  // routing queue was invisible to the one thing watching. See `backpressure.ts`.
+  if ((await admitIngest(db)) !== null) return [];
+
   for (const quadkey of quadkeys) {
     const { x, y, z } = quadkeyToTile(quadkey);
     const [bboxW, bboxS, bboxE, bboxN] = quadkeyToBBox(quadkey);

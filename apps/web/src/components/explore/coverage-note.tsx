@@ -90,6 +90,26 @@ function describe(
 
   if (loading && !coverage) return { text: 'Reading the sheet…', pending: true };
 
+  /*
+   * Ingest was refused — the queue is deep, or the database is close to full.
+   *
+   * Before the note said this, the same state showed as an ordinary pending count with a
+   * pulsing dot: tiles that were never queued, described as arriving, forever. Saying it
+   * plainly costs one line and is the difference between a map that is busy and a map that
+   * looks broken. No apology, because nothing went wrong that the reader should feel
+   * responsible for, and a time to come back, because "try again later" without one is a
+   * shrug.
+   */
+  if (coverage?.busy) {
+    return {
+      text:
+        shown > 0
+          ? `${count(shown, total)} · fetching new ground is paused. Try again in a few minutes.`
+          : 'Fetching new ground is paused while the queue clears. Try again in a few minutes.',
+      pending: false,
+    };
+  }
+
   const pending = coverage?.pendingTiles.length ?? 0;
   if (pending > 0) {
     return {

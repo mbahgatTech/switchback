@@ -24,6 +24,7 @@ import {
   quadkeyToTile,
 } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
+import { admitIngest } from './backpressure';
 import { enqueue, tileJobKey } from './jobs';
 import { isTileFresh } from './pipeline';
 
@@ -46,6 +47,13 @@ export interface CoverageResult {
   refreshing: string[];
   /** Tiles left with outstanding work by this call. What the caller should kick. */
   queued: string[];
+  /**
+   * True when ingest was refused, so the outstanding tiles are not on their way.
+   *
+   * Distinct from "nothing to do": `queued` is empty in both cases, and the client needs to
+   * tell a fully cached viewport apart from one whose fetch was turned down.
+   */
+  busy: boolean;
   /** True when the bbox needed more tiles than we will cover in one request. */
   tooLarge: boolean;
   requiredTiles: number;
@@ -86,6 +94,7 @@ export async function ensureCoverage(
       pending: [],
       refreshing: [],
       queued: [],
+      busy: false,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
@@ -122,12 +131,29 @@ export async function ensureCoverage(
 
   const queued = await queueTiles(db, needsWork, { urgent: options.urgent ?? true });
 
+  /*
+   * Nothing queued despite work outstanding means backpressure refused it, and what the
+   * client is told about that matters more than it looks.
+   *
+   * Reporting those tiles as `pending` would be truthful and much worse. `pending` is the
+   * client's "still loading" set, and it polls every few seconds for as long as it is
+   * non-empty — so a database under enough pressure to refuse ingest would get a poll storm
+   * from every open map, forever, over tiles that are never going to arrive. The same
+   * argument `coverageFor` makes in the trails router about a failed coverage read.
+   *
+   * So the tiles fall back to whatever we hold: `ready` keeps anything with data behind it,
+   * the rest simply are not claimed to be coming, and `busy` carries the reason up so the
+   * coverage note can say it in words instead of leaving a spinner to imply it.
+   */
+  const busy = needsWork.length > 0 && queued.length === 0;
+
   return {
     quadkeys: cover.quadkeys,
     ready,
-    pending,
+    pending: busy ? [] : pending,
     refreshing,
     queued,
+    busy,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,
@@ -148,6 +174,12 @@ export async function queueTiles(
   quadkeys: readonly string[],
   options: { urgent?: boolean; priority?: number } = {},
 ): Promise<string[]> {
+  if (quadkeys.length === 0) return [];
+
+  // The one place every trail-ingest path crosses, and so the place backpressure belongs.
+  // See `backpressure.ts` for why it is not at the call sites any more.
+  if ((await admitIngest(db)) !== null) return [];
+
   // Explicit priority wins; `urgent` is the two-value shorthand the viewport path uses.
   const priority = options.priority ?? (options.urgent === false ? 0 : VIEWPORT_PRIORITY);
 
@@ -198,21 +230,18 @@ export const MAX_AREA_TILES = 96;
  */
 export const AREA_PRIORITY = 2;
 
-/**
- * Refuse to accept new area requests past this many tile jobs already waiting.
+/*
+ * Backpressure lives in `backpressure.ts` now, and `MAX_TILE_QUEUE_DEPTH` with it.
  *
- * The one guard rail that is about strangers rather than about us. Everything else bounds a
- * single call — the tile cap, the freshness check that makes a repeat press free, the job
- * dedupe — but nothing stops somebody scripting a thousand presses across a thousand
- * different bounding boxes and filling the queue with ground nobody is looking at. That
- * would not cost us money or get us blocked (the Overpass client's own concurrency limit
- * sees to both), but it would put every live viewport behind hours of junk, which is the
- * same thing as breaking the map.
+ * It was here because this file held the only call site that checked it. That was the bug:
+ * `requestArea` is the path a person reaches by pressing a button, and the two paths that
+ * queue without anybody pressing anything — the viewport ingest above and the routing
+ * ingest in `network.ts` — went round it. The check now sits inside `queueTiles` and
+ * `queueNetworkTiles`, which every writing path crosses, and counts all three job kinds
+ * rather than `ingest_tile` alone.
  *
- * So depth is the backpressure, and it is reported rather than hidden: a caller who gets
- * `busy` is told the queue is deep and asked to try later, which is true.
+ * Re-exported nowhere: import it from `./backpressure`, which is the one place it lives.
  */
-export const MAX_TILE_QUEUE_DEPTH = 600;
 
 export interface AreaCoverage {
   /** Every tile this survey covers, nearest the centre of the box first. */
@@ -321,11 +350,11 @@ export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promis
 
   if (area.outstanding.length === 0) return { ...area, queued: [], busy: false };
 
-  const depth = await db.ingestJob.count({
-    where: { kind: JobKind.ingest_tile, status: { in: [JobStatus.queued, JobStatus.running] } },
-  });
-  if (depth >= MAX_TILE_QUEUE_DEPTH) return { ...area, queued: [], busy: true };
-
+  // No depth check here any more: `queueTiles` runs it, and running it in both places was
+  // how the routing queue ended up unguarded — a check at one call site guards one call
+  // site. An empty return with work outstanding is the refusal.
   const queued = await queueTiles(db, area.outstanding, { priority: AREA_PRIORITY });
+  if (queued.length === 0) return { ...area, queued: [], busy: true };
+
   return { ...area, queued, working: [...new Set([...area.working, ...queued])], busy: false };
 }

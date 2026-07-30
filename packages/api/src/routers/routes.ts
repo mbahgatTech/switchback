@@ -735,6 +735,9 @@ export const routesRouter = router({
     return {
       ready: coverage.ready.length,
       pending: coverage.pending.length,
+      // True when backpressure refused the fetch, so `pending` is zero for a reason other
+      // than "we hold it all". See `backpressure.ts` in @switchback/ingest.
+      busy: coverage.busy,
       tooLarge: coverage.tooLarge,
       requiredTiles: coverage.requiredTiles,
       maxTiles: coverage.maxTiles,

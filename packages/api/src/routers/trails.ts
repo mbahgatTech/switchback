@@ -354,6 +354,7 @@ function toCoverage(result: CoverageResult): TileCoverage {
     pendingTiles: result.pending,
     refreshingTiles: result.refreshing,
     tooLarge: result.tooLarge,
+    busy: result.busy,
     requiredTiles: result.requiredTiles,
     maxTiles: result.maxTiles,
   };
@@ -367,6 +368,7 @@ function noCoverage(): CoverageResult {
     pending: [],
     refreshing: [],
     queued: [],
+    busy: false,
     tooLarge: false,
     requiredTiles: 0,
     maxTiles: 0,

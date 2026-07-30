@@ -1,5 +1,6 @@
 import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
 import { after } from 'next/server';
+import { MAX_BATCH_SIZE } from '@switchback/core';
 import { appRouter, createContext } from '@switchback/api';
 import { auth } from '@/auth';
 
@@ -17,6 +18,12 @@ function handler(req: Request): Promise<Response> {
     endpoint: '/api/trpc',
     req,
     router: appRouter,
+    /**
+     * The ceiling on how many procedures one request may run. See `MAX_BATCH_SIZE` in
+     * `@switchback/core` for what it is sized against and why leaving it unset is not a
+     * default but an absence.
+     */
+    maxBatchSize: MAX_BATCH_SIZE,
     createContext: () =>
       createContext({
         headers: req.headers,
