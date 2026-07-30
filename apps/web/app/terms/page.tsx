@@ -100,9 +100,9 @@ export default function TermsPage() {
 
         <Clause title="Reporting something">
           <p>
-            Every report and every photograph has a <strong>Report</strong> control next to it. You
-            do not need an account to use it, and you do not have to leave an email address — though
-            we cannot answer you if you do not.
+            Every report and every photograph has a <strong>Report</strong> control next to it, on
+            the website and in the iPhone app. You do not need an account to use it, and you do not
+            have to leave an email address — though we cannot answer you if you do not.
           </p>
           <p>
             If you cannot reach the page, write to{' '}
@@ -139,7 +139,8 @@ export default function TermsPage() {
             It is hidden, not destroyed. A removed report leaves a line on the trail page saying it
             was removed — the page does not pretend it was never written — and its rating stops
             counting toward the trail&rsquo;s average. A removed photograph leaves the gallery, and
-            you will see it marked as removed in your own.
+            you will see it marked as removed on your own profile. Photographs filed with a report
+            come down with it.
           </p>
           <p>
             We keep the record of what was removed and why, because a takedown that cannot be shown
@@ -166,6 +167,12 @@ export default function TermsPage() {
           <p>
             You can delete your own reports and photographs at any time. Deleting a report removes
             it and takes its rating out of the trail&rsquo;s average.
+          </p>
+          <p>
+            The one exception is something we have already removed. While it is down you cannot edit
+            or delete it, because deleting the record of a takedown and posting the same thing again
+            is the same as never having had one. Write to us if you want it gone for good, or if you
+            think we got it wrong.
           </p>
           <p>
             We may suspend an account that keeps posting things that have to be removed. We will say

@@ -21,6 +21,7 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import {
+  MODERATION_CONTACT,
   MODERATION_NOTE_MAX,
   REPORT_SUBJECTS,
   USER_ROLES,
@@ -28,6 +29,7 @@ import {
 } from '@switchback/core';
 import type { ReportSubject } from '@switchback/core';
 import type { Prisma } from '@switchback/db';
+import { decodeCursor, encodeCursor } from '../cursor';
 import { adminProcedure, moderatorProcedure, publicProcedure, router } from '../trpc';
 import { refreshRatingAggregates } from './reviews';
 import { refreshTrailPhotos } from './photos';
@@ -38,11 +40,47 @@ import { refreshTrailPhotos } from './photos';
  * Not a rate limit — there is no rate limiter in this product yet, and pretending otherwise
  * would be worse than saying so. It is a cap on how much of the queue a single person can
  * occupy, which is the failure mode that actually stops the operator working: a hundred
- * reports from one account buries the one report from ninety-nine others. Anonymous reports
- * are not capped, because there is nothing to cap them by; the queue's defence there is
- * that an operator reading it can dismiss a run of them in one pass.
+ * reports from one account buries the one report from ninety-nine others.
  */
 const MAX_OPEN_REPORTS_PER_REPORTER = 20;
+
+/**
+ * How many open complaints one item may collect before the rest are absorbed.
+ *
+ * **This is the bound that does not depend on having an account**, and it is why the cap
+ * above is no longer defeated by signing out. Three open complaints about one photograph is
+ * already more than enough for an operator to act — the fourth adds no information and one
+ * more row to read — so the fourth is answered exactly as a duplicate is: `{ filed: true }`,
+ * with nothing written. An abuser with no session can no longer put a thousand rows against
+ * one review id, and the queue's `createdAt asc` ordering can no longer be stuffed.
+ *
+ * The cost is real and is worth stating: a genuine fourth reporter of a busy item is not
+ * heard individually. They are not losing anything an operator would have acted on — the
+ * item is already in the queue three times over — and the alternative is the flood.
+ */
+const MAX_OPEN_REPORTS_PER_SUBJECT = 3;
+
+/**
+ * How deep the anonymous half of the queue may get before it stops accepting more.
+ *
+ * The second identity-free bound, and the one that stops a flood spread thinly across many
+ * scraped subject ids from reaching the per-item cap on all of them at once. Signed-in
+ * reports are counted separately and are never refused by this, so a flood cannot displace
+ * the reports we can actually answer. The refusal names the email address, which is the
+ * route that still works when the box is full.
+ */
+const MAX_OPEN_ANONYMOUS_REPORTS = 500;
+
+/**
+ * Why a photograph is hidden when its trail report was the thing taken down.
+ *
+ * A sentinel rather than the moderator's note, and matched exactly on the way back: `unhide`
+ * clears only the photographs the cascade hid, so a frame that was taken down on its own
+ * merits — an unrelated complaint, a different decision, possibly a different moderator —
+ * stays down when the report it happened to be filed with is put back. The moderator's own
+ * note lives on the review row, which is where the decision was made.
+ */
+const CASCADED_FROM_REVIEW = 'Filed with a trail report that was taken down.';
 
 const subjectRef = z.object({
   subject: z.enum(REPORT_SUBJECTS),
@@ -113,21 +151,37 @@ export const moderationRouter = router({
    * from the session when there is one and is null when there is not; it is never accepted
    * from the input, which is why `reportSubmitSchema` has no field for it.
    *
-   * A second report of the same item by the same signed-in person updates nothing and
-   * returns as though it worked. Telling them "you already reported this" is information
-   * about a queue they cannot see, and the honest answer to "I reported this" is the same
-   * either way: we have it.
+   * **Every bound here holds without an account.** The per-reporter cap below was once the
+   * only one, which made it a cap on being polite enough to stay signed in: the same POST
+   * without a session cookie skipped it, and this is the only unauthenticated write in the
+   * product that keeps a row. So the two identity-free bounds run first and run for
+   * everybody — how many open complaints one item may hold, and how deep the anonymous half
+   * of the queue may get — in the same spirit as the four `trails.fetchArea` documents for
+   * the other public write.
+   *
+   * A submission absorbed by a cap returns as though it worked. Telling somebody "this has
+   * been reported three times already" is information about a queue they cannot see, and the
+   * honest answer to "I reported this" is the same either way: we have it.
    */
   report: publicProcedure.input(reportSubmitSchema).mutation(async ({ ctx, input }) => {
     const { trailId } = await locateSubject(ctx.db, input.subject, input.subjectId);
     const reporterId = ctx.user?.id ?? null;
+    const contactEmail = input.contactEmail?.trim() ? input.contactEmail.trim() : null;
+    const about = { subject: input.subject, subjectId: input.subjectId, status: 'open' } as const;
+
+    // First, and for everybody. Served by `@@index([subject, subjectId])`.
+    const onSubject = await ctx.db.contentReport.count({ where: about });
+    if (onSubject >= MAX_OPEN_REPORTS_PER_SUBJECT) return { filed: true };
 
     if (reporterId !== null) {
       const [already, open] = await Promise.all([
-        ctx.db.contentReport.findFirst({
-          where: { subject: input.subject, subjectId: input.subjectId, reporterId },
-          select: { id: true },
-        }),
+        /*
+         * Scoped to open reports, which is the only claim the dedupe can honestly make.
+         * Without the status filter one report of an item silences that reporter about it
+         * forever — including after the report was dismissed and the author edited the
+         * review into something worse, which is exactly when a second complaint matters.
+         */
+        ctx.db.contentReport.findFirst({ where: { ...about, reporterId }, select: { id: true } }),
         ctx.db.contentReport.count({ where: { reporterId, status: 'open' } }),
       ]);
 
@@ -136,6 +190,28 @@ export const moderationRouter = router({
         throw new TRPCError({
           code: 'TOO_MANY_REQUESTS',
           message: `You have ${open} reports waiting on a moderator. Give us a chance to read those first.`,
+        });
+      }
+    } else {
+      const [already, openAnonymous] = await Promise.all([
+        // The same dedupe, on the only handle an anonymous reporter leaves. Costs one
+        // indexed lookup and closes the easy duplicate — somebody pressing send twice.
+        contactEmail === null
+          ? Promise.resolve(null)
+          : ctx.db.contentReport.findFirst({
+              where: { ...about, contactEmail },
+              select: { id: true },
+            }),
+        ctx.db.contentReport.count({ where: { reporterId: null, status: 'open' } }),
+      ]);
+
+      if (already) return { filed: true };
+      if (openAnonymous >= MAX_OPEN_ANONYMOUS_REPORTS) {
+        throw new TRPCError({
+          code: 'TOO_MANY_REQUESTS',
+          // Says what happened and where to go instead. The address is read by a person and
+          // is not behind this cap.
+          message: `We have more reports waiting than a moderator can read. Write to ${MODERATION_CONTACT.email} and say what and where.`,
         });
       }
     }
@@ -148,7 +224,7 @@ export const moderationRouter = router({
         reason: input.reason,
         detail: input.detail?.trim() ? input.detail.trim() : null,
         reporterId,
-        contactEmail: input.contactEmail?.trim() ? input.contactEmail.trim() : null,
+        contactEmail,
       },
     });
 
@@ -168,20 +244,32 @@ export const moderationRouter = router({
    * id and a kind rather than a foreign key — see `ContentReport` in the schema for why
    * that is deliberate. A report whose content has since been deleted comes back with a
    * null `content`, which is correct: the complaint still happened.
+   *
+   * **Paged.** One hundred rows was the whole of the queue and there was no way past them,
+   * so a run of junk at the front made every genuine report behind it unreachable rather
+   * than merely late. Same offset cursor the review list uses.
    */
   queue: moderatorProcedure
     .input(
       z.object({
         status: z.enum(['open', 'upheld', 'dismissed']).default('open'),
+        cursor: z.string().optional(),
         limit: z.number().int().min(1).max(100).default(50),
       }),
     )
     .query(async ({ ctx, input }) => {
-      const reports = await ctx.db.contentReport.findMany({
-        where: { status: input.status },
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-        take: input.limit,
-      });
+      const offset = decodeCursor(input.cursor);
+      const where = { status: input.status };
+
+      const [reports, count] = await Promise.all([
+        ctx.db.contentReport.findMany({
+          where,
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          skip: offset,
+          take: input.limit,
+        }),
+        ctx.db.contentReport.count({ where }),
+      ]);
 
       const reviewIds = reports.filter((r) => r.subject === 'review').map((r) => r.subjectId);
       const photoIds = reports.filter((r) => r.subject === 'photo').map((r) => r.subjectId);
@@ -199,6 +287,18 @@ export const moderationRouter = router({
                 hiddenAt: true,
                 createdAt: true,
                 user: { select: { id: true, username: true, name: true } },
+                /*
+                 * The photographs filed with the report, because they are usually what the
+                 * complaint is actually about — "sexual", "personal information" and
+                 * "copyright" against a review are nearly always about an image attached to
+                 * it. An operator deciding without seeing them is deciding blind, and the
+                 * takedown now cascades onto exactly these rows, so this is also the list
+                 * of what the button will hide.
+                 */
+                photos: {
+                  select: { id: true, thumbUrl: true, hiddenAt: true },
+                  orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+                },
               },
             }),
         photoIds.length === 0
@@ -222,10 +322,15 @@ export const moderationRouter = router({
       for (const review of reviews) byId.set(`review:${review.id}`, review);
       for (const photo of photos) byId.set(`photo:${photo.id}`, photo);
 
-      return reports.map((report) => ({
-        ...report,
-        content: byId.get(`${report.subject}:${report.subjectId}`) ?? null,
-      }));
+      const consumed = offset + reports.length;
+      return {
+        reports: reports.map((report) => ({
+          ...report,
+          content: byId.get(`${report.subject}:${report.subjectId}`) ?? null,
+        })),
+        nextCursor: consumed < count ? encodeCursor(consumed) : null,
+        total: count,
+      };
     }),
 
   /**
@@ -240,6 +345,15 @@ export const moderationRouter = router({
    * because nothing else recomputes it until the next person writes a review. Same for a
    * photograph: the count on the card and the hero on the trail both have to settle onto the
    * photographs that are still visible.
+   *
+   * **Hiding a review hides the photographs filed with it.** A review's photographs are
+   * ordinary trail photographs — `commit` writes the `trailId` and `attach` only adds the
+   * `reviewId` afterwards — so they satisfy `trails.photos`'s `{ trailId, hiddenAt: null }`
+   * on their own. Without the cascade the reader got "Removed by a moderator after a report."
+   * in the reports list and the reported image itself two sections up the same page, still
+   * counted, still a candidate for the hero at the top and for the page's OG image. The
+   * complaint is very often *about* the photograph; taking down only the prose around it is
+   * not a takedown.
    *
    * Idempotent. Hiding something already hidden refreshes the timestamp and closes any
    * reports that arrived since, which is what a moderator working a queue of duplicates
@@ -261,7 +375,19 @@ export const moderationRouter = router({
           if (!review) throw new TRPCError({ code: 'NOT_FOUND', message: 'No such report.' });
 
           await tx.review.update({ where: { id: review.id }, data: hidden });
+          /*
+           * `hiddenAt: null` in the predicate so a photograph already down on its own merits
+           * keeps its own reason and is not relabelled as a casualty of this decision — which
+           * is what lets `unhide` leave it down.
+           */
+          await tx.photo.updateMany({
+            where: { reviewId: review.id, hiddenAt: null },
+            data: { ...hidden, hiddenReason: CASCADED_FROM_REVIEW },
+          });
           await refreshRatingAggregates(tx, review.trailId);
+          // Now that photographs may have left the gallery, the count and the hero have to
+          // settle — the same reason the photo branch below has always called this.
+          await refreshTrailPhotos(tx, review.trailId);
         } else {
           const photo = await tx.photo.findUnique({
             where: { id: input.subjectId },
@@ -295,6 +421,12 @@ export const moderationRouter = router({
    *
    * This does *not* reopen the reports that were upheld. They were answered; the answer has
    * since been changed, and `resolutionNote` is where that is written down.
+   *
+   * **The photograph cascade reverses asymmetrically, on purpose.** Putting a review back
+   * restores only the photographs `hide` took down with it — matched on the sentinel reason
+   * — and leaves alone any frame that was hidden by its own complaint. The alternative
+   * un-hides somebody's reported photograph as a side effect of an unrelated appeal
+   * succeeding, which is the sort of quiet re-publication a takedown process cannot afford.
    */
   unhide: moderatorProcedure
     .input(subjectRef.extend({ note: z.string().trim().max(MODERATION_NOTE_MAX).nullish() }))
@@ -310,7 +442,12 @@ export const moderationRouter = router({
           if (!review) throw new TRPCError({ code: 'NOT_FOUND', message: 'No such report.' });
 
           await tx.review.update({ where: { id: review.id }, data: cleared });
+          await tx.photo.updateMany({
+            where: { reviewId: review.id, hiddenReason: CASCADED_FROM_REVIEW },
+            data: cleared,
+          });
           await refreshRatingAggregates(tx, review.trailId);
+          await refreshTrailPhotos(tx, review.trailId);
         } else {
           const photo = await tx.photo.findUnique({
             where: { id: input.subjectId },

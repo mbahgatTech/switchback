@@ -830,7 +830,15 @@ model Photo {
   /// outright, and the API blanks its `url` on the way out. A tombstone in a thumbnail
   /// strip is noise, and — the point of hiding an image being that the image must not
   /// reach a browser — a row that still carries a live object URL has not been taken
-  /// down at all. The uploader still sees it, marked removed, on their own gallery.
+  /// down at all. The uploader still sees it, marked removed, on their own profile —
+  /// `photos.mine` is the one query that returns a hidden row, and the profile page is what
+  /// renders it. A moderator can also ask `trails.photos` for them, which is where the
+  /// control that puts one back lives.
+  ///
+  /// Set on this row directly when the photograph itself was reported, and set by cascade
+  /// when the trail report it was filed with was taken down — the cascade writes a sentinel
+  /// `hiddenReason` so that putting the report back does not also put back a photograph
+  /// that was hidden on its own merits. See `moderation.hide`.
   ///
   /// The bytes are deliberately left in the bucket. Hiding is reversible; deleting the
   /// object is not, and the two decisions belong to different moments.
@@ -849,7 +857,8 @@ model Photo {
   @@index([reviewId])
   @@index([activityId])
   @@index([userId, createdAt])
-  /// Every gallery query and the hero pass carry `hiddenAt: null`.
+  /// Every public gallery query and the hero pass carry `hiddenAt: null`; the moderator's
+  /// view of a trail's photographs is the one read that does not.
   @@index([trailId, hiddenAt])
   @@map("photos")
 }

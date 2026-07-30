@@ -211,15 +211,34 @@ export function Reviews({
       {summary.data ? <Reported summary={summary.data} /> : null}
       {summary.data && summary.data.count > 0 ? <Ratings summary={summary.data} /> : null}
 
-      <ReviewForm
-        trailId={trailId}
-        trailName={trailName}
-        trailPath={trailPath}
-        existing={mine.data ?? null}
-        isViewerKnown={viewerId !== null}
-        onSaved={refetchAll}
-      />
-
+      {mine.data?.hidden ? (
+        /*
+         * The author of a removed report is told before they type, not after.
+         *
+         * `reviews.mine` returns the hidden row with its rating intact and its body stripped,
+         * so handing it to `ReviewForm` as `existing` drew "Edit your report", opened a form
+         * showing their original stars above an empty box — reading as though the site had
+         * lost their writing — and threw the FORBIDDEN from `reviews.upsert` into the error
+         * strip only once they had retyped it and pressed save. The upsert guard is right;
+         * inviting the one action it exists to refuse is not. So the form is replaced by the
+         * notice and the address, which is the only move actually available to them.
+         *
+         * Survey plate and a hairline: this is about the reader's own standing, not about
+         * the trail.
+         */
+        <p className="mt-lg max-w-measure rounded-hair border border-survey px-md py-sm text-body leading-relaxed text-ink">
+          {REMOVED_NOTICE_OWN}
+        </p>
+      ) : (
+        <ReviewForm
+          trailId={trailId}
+          trailName={trailName}
+          trailPath={trailPath}
+          existing={mine.data ?? null}
+          isViewerKnown={viewerId !== null}
+          onSaved={refetchAll}
+        />
+      )}
       {list.isPending ? (
         <p className="mt-lg rounded-hair border border-dashed border-bezel px-md py-lg text-caption text-ink-muted">
           Reading the reports…

@@ -23,7 +23,13 @@
 
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-import { bboxSchema, lineStringSchema, lngLatSchema, trailSearchSchema } from '@switchback/core';
+import {
+  bboxSchema,
+  canModerate,
+  lineStringSchema,
+  lngLatSchema,
+  trailSearchSchema,
+} from '@switchback/core';
 import type {
   ActivityType,
   AreaSummary,
@@ -798,15 +804,31 @@ export const trailsRouter = router({
    * `license` and `attribution` travel with every row rather than being looked up per source:
    * Commons and Mapillary licences vary per image, and an unattributed CC-BY photo is a
    * licence breach, not a cosmetic gap.
+   *
+   * **`includeHidden` is honoured for operators and ignored for everybody else.** It is what
+   * makes a photograph takedown reversible from the product rather than from the database:
+   * the strip is where the only `unhide` control lives, and a hidden frame that is filtered
+   * out of the strip is one no moderator can put back — which the terms page promises we do
+   * when we got it wrong. The role is read from the session here, so a client that asks for
+   * it without being an operator gets the ordinary public list. `toPhoto` has already blanked
+   * the URL on a hidden row, so what comes back is the fact, not the image.
    */
   photos: publicProcedure
-    .input(trailIdInput.extend({ limit: z.number().int().min(1).max(60).default(24) }))
+    .input(
+      trailIdInput.extend({
+        limit: z.number().int().min(1).max(60).default(24),
+        includeHidden: z.boolean().default(false),
+      }),
+    )
     .query(async ({ ctx, input }): Promise<TrailPhoto[]> => {
+      const operator = input.includeHidden && canModerate(ctx.user?.role);
+
       const rows = await ctx.db.photo.findMany({
         // The public gallery, so a photograph a moderator took down is simply not in it.
-        // No tombstone: a grey box in a thumbnail strip tells the reader nothing and tells
-        // whoever reported it that we did not act. The uploader is told, on `photos.mine`.
-        where: { trailId: input.trailId, hiddenAt: null },
+        // No tombstone for the reader: a grey box in a thumbnail strip tells them nothing and
+        // tells whoever reported it that we did not act. The uploader is told, on
+        // `photos.mine`, which the profile page renders.
+        where: { trailId: input.trailId, ...(operator ? {} : { hiddenAt: null }) },
         orderBy: [{ source: 'asc' }, { createdAt: 'desc' }],
         take: input.limit,
         select: photoSelect,

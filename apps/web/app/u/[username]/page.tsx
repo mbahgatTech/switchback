@@ -6,6 +6,7 @@ import type { HikerProfile } from '@switchback/core';
 import { BRAND, formatDistance, plural } from '@switchback/core';
 import { ActivityRows } from '@/components/activity/activity-rows';
 import { Hiker } from '@/components/profile/hiker';
+import { YourPhotographs } from '@/components/profile/photographs';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
 import { viewerUnits } from '@/lib/units';
@@ -70,6 +71,14 @@ export default async function HikerPage({ params }: PageProps) {
   // the reader is the hiker, so this section shows what everyone else sees.
   const recordings = await caller.activities.byUser({ username, limit: 10 });
 
+  /*
+   * Your own frames, and only on your own page. `photos.mine` is the one query that returns
+   * a photograph a moderator took down, which is how the uploader is told rather than left
+   * to notice a gap — see `components/profile/photographs.tsx`. A stranger reading this page
+   * gets nothing extra: the fetch does not happen at all unless the page is yours.
+   */
+  const photographs = hiker.isMe ? await caller.photos.mine({ limit: 24 }) : [];
+
   return (
     <div data-scheme="sheet" className="min-h-dvh bg-canvas text-ink">
       <header className="mx-auto flex max-w-rail items-center justify-between px-xl py-lg">
@@ -79,6 +88,8 @@ export default async function HikerPage({ params }: PageProps) {
 
       <main className="mx-auto max-w-rail px-xl pb-5xl">
         <Hiker hiker={hiker} units={units} now={new Date()} />
+
+        <YourPhotographs photographs={photographs} />
 
         {recordings.items.length > 0 ? (
           <section className="mt-3xl">

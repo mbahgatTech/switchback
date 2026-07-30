@@ -391,9 +391,11 @@ export const reviewsRouter = router({
        * and, on the day somebody adds an "unhide" to a queue, restoring exactly the text
        * that was removed. Refusing the write is the only version of this that holds.
        *
-       * Deleting their own hidden review is still allowed. That is `remove` below, it is
-       * their own content, and the outcome — the text is gone — is the one the takedown
-       * was for.
+       * **`remove` refuses a hidden review for the same reason**, and it has to, or this
+       * guard is two calls from useless: delete the tombstone and the next upsert finds no
+       * row, passes this check, and republishes the removed prose under a fresh id — with
+       * the `hiddenAt`/`hiddenById`/`hiddenReason` audit gone and every report filed against
+       * the old id now pointing at nothing.
        */
       const existing = await ctx.db.review.findUnique({
         where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
@@ -435,14 +437,39 @@ export const reviewsRouter = router({
    *
    * Keyed by trail rather than by review id, which makes it structurally impossible to
    * delete someone else's: the unique index is `(trailId, userId)` and `userId` is the
-   * caller's, never an input. A count of zero means there was nothing of theirs to remove.
+   * caller's, never an input.
+   *
+   * **A removed review cannot be withdrawn**, and that is not pedantry about a row. Delete
+   * was the hole in the upsert guard above: deleting the tombstone frees the `(trailId,
+   * userId)` key, so the next upsert creates a fresh row with the same prose and no
+   * `hiddenAt` — the takedown undone in two calls by the person it was made against, the
+   * audit trail gone with it, and every `ContentReport` filed against the old id now
+   * pointing at a subject that no longer exists.
+   *
+   * The tombstone is not a punishment. What it publishes is one line saying a report here
+   * was removed; the prose, the photographs and the condition chips left the page the moment
+   * the moderator pressed the button, and the rating left the trail's average with them.
+   * Somebody who wants it gone entirely writes to the address in the notice.
    */
   remove: protectedProcedure.input(trailIdInput).mutation(async ({ ctx, input }) => {
     return ctx.db.$transaction(async (tx) => {
       const { count } = await tx.review.deleteMany({
-        where: { trailId: input.trailId, userId: ctx.user.id },
+        where: { trailId: input.trailId, userId: ctx.user.id, hiddenAt: null },
       });
       if (count === 0) {
+        // Two reasons the delete matched nothing, and they are owed different answers. The
+        // second read only happens on the failure path, so the ordinary delete is still one
+        // statement.
+        const existing = await tx.review.findUnique({
+          where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
+          select: { hiddenAt: true },
+        });
+        if (existing?.hiddenAt) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: `${REMOVED_NOTICE_OWN} You cannot delete it while it is removed.`,
+          });
+        }
         throw new TRPCError({ code: 'NOT_FOUND', message: 'You have not reviewed this trail.' });
       }
       await refreshRatingAggregates(tx, input.trailId);

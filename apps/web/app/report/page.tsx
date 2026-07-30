@@ -97,7 +97,7 @@ export default async function ReportPage({
                 <p>
                   Every trail report carries a <strong>Report</strong> control at the end of it.
                   Every photograph carries one in the viewer — open the picture from the gallery and
-                  it is beside Close.
+                  the control is there. Both are in the iPhone app too.
                 </p>
                 <p>
                   You will be asked what is wrong and, if you are not signed in, for an email

@@ -30,6 +30,7 @@ import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { apiBaseUrl } from '@/config';
 import { Photograph, PhotographMissing, PhotographUnavailable } from '@/components/photograph';
+import { ReportSheet } from '@/components/report-control';
 import { discard, preparePhoto } from '@/photos/prepare';
 import type { PreparedPhoto } from '@/photos/prepare';
 
@@ -462,6 +463,7 @@ function Viewer({
 }) {
   const trpc = useTRPC();
   const [draft, setDraft] = useState<string | null>(null);
+  const [reporting, setReporting] = useState(false);
 
   const saveCaption = useMutation(
     trpc.photos.caption.mutationOptions({
@@ -568,10 +570,32 @@ function Viewer({
                     {remove.isPending ? 'Removing…' : 'Remove this photograph'}
                   </Text>
                 </Pressable>
-              ) : null}
+              ) : (
+                /*
+                 * Somebody else's frame, and the one place it is big enough to judge — the
+                 * strip's thumbnails deliberately carry no control of their own. Reporting
+                 * is public, so this works signed out, which is the case that matters most:
+                 * the person who finds their own house in a photograph has no account.
+                 */
+                <Pressable
+                  onPress={() => setReporting(true)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Report this photograph by ${creditOf(photo)}`}
+                  style={styles.darkButton}
+                >
+                  <Text style={styles.darkButtonLabel}>Report</Text>
+                </Pressable>
+              )}
             </View>
           </ScrollView>
 
+          <ReportSheet
+            subject="photo"
+            subjectId={photo.id}
+            what={`this photograph by ${creditOf(photo)}`}
+            visible={reporting}
+            onClose={() => setReporting(false)}
+          />
           {/*
            * The controls sit over the image rather than under it, because the image is as
            * tall as it is and a bar below the fold is a bar nobody can reach.

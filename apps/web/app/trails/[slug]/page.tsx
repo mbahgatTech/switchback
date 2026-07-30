@@ -135,7 +135,10 @@ export default async function TrailPage({ params }: PageProps) {
   // render of the part that matters. Requested together rather than in sequence. `me.get`
   // costs nothing extra — the request context has already loaded the user for `ctx.user`.
   const [photos, nearby, viewer] = await Promise.all([
-    caller.trails.photos({ trailId: trail.id, limit: 12 }),
+    // `includeHidden` is asked for on every render and granted to nobody but an operator —
+    // `trails.photos` reads the role from the session. It is what puts a taken-down frame in
+    // front of the one control that can put it back.
+    caller.trails.photos({ trailId: trail.id, limit: 12, includeHidden: true }),
     caller.trails.nearby({ at: trail.centroid, radiusM: 30_000, limit: 7 }),
     caller.me.get(),
   ]);

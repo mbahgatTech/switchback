@@ -37,6 +37,7 @@ import {
   MAX_PHOTOS_PER_TRAIL_PER_USER,
   MAX_PHOTO_BYTES,
   MAX_THUMB_BYTES,
+  REMOVED_NOTICE_OWN,
   UPLOAD_TICKET_TTL_S,
   formatBytes,
   isBlurhash,
@@ -560,6 +561,14 @@ export const photosRouter = router({
    * orphaned bytes, which the sweeper collects; if it went the other way round and the row
    * delete failed we would have a gallery entry pointing at a 404, which nothing collects.
    * Given one of the two has to be able to fail, this is the one to leave failing.
+   *
+   * **A photograph a moderator took down cannot be deleted here**, for the same reason
+   * `caption` refuses to edit one — and for one more. Deleting the row frees the daily and
+   * per-trail quota slots that `assertWithinQuota` deliberately refuses to discount, so
+   * "delete, then upload the same frame again" would be a one-call refill of exactly the
+   * allowance the cap exists to spend. It also destroys the `hiddenAt`/`hiddenById`/
+   * `hiddenReason` record of the decision and orphans every report filed against the id,
+   * which is what a notice-and-takedown process is supposed to be able to show.
    */
   remove: protectedProcedure
     .input(z.object({ photoId: z.string().min(1).max(64) }))
@@ -573,10 +582,17 @@ export const photosRouter = router({
           url: true,
           thumbUrl: true,
           sourceId: true,
+          hiddenAt: true,
         },
       });
       if (!photo || photo.userId !== ctx.user.id) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'No such photograph.' });
+      }
+      if (photo.hiddenAt !== null) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: `${REMOVED_NOTICE_OWN} You cannot delete it while it is removed.`,
+        });
       }
 
       await ctx.db.$transaction(async (tx) => {
@@ -607,17 +623,28 @@ export const photosRouter = router({
    * them out; this one keeps them so the person who uploaded one is told it was removed
    * rather than left to notice a gap. `toPhoto` has already blanked the URL, so the row
    * carries the fact and not the image.
+   *
+   * Rendered by `components/profile/photographs.tsx` on `/profile` and on your own
+   * `/u/<name>`. That sentence is load-bearing: for a while this procedure had no caller at
+   * all, which made the tombstone a thing the code prepared and nobody ever saw, and made
+   * the terms page's promise that "you will see it marked as removed in your own" false.
+   *
+   * The trail travels with each row because the answer to "which one was that?" is a place,
+   * not an id, and the uploader needs somewhere to click.
    */
   mine: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(60).default(24) }))
-    .query(async ({ ctx, input }): Promise<TrailPhoto[]> => {
+    .query(async ({ ctx, input }) => {
       const rows = await ctx.db.photo.findMany({
         where: { userId: ctx.user.id },
         orderBy: [{ createdAt: 'desc' }],
         take: input.limit,
-        select: photoSelect,
+        select: { ...photoSelect, trail: { select: { name: true, slug: true } } },
       });
-      return rows.map((row) => toPhoto(row, ctx.user.id));
+      return rows.map((row) => ({
+        ...toPhoto(row, ctx.user.id),
+        trail: row.trail === null ? null : { name: row.trail.name, slug: row.trail.slug },
+      }));
     }),
 });
 

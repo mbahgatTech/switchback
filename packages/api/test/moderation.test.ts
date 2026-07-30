@@ -359,3 +359,148 @@ describe('reportSubmitSchema', () => {
     expect(REPORT_REASONS).toContain('other');
   });
 });
+
+// ---------------------------------------------------------------------------
+// A takedown survives its own author
+// ---------------------------------------------------------------------------
+
+/**
+ * A database that answers, rather than one that throws.
+ *
+ * The proxy above exists to prove role checks run before any query. These four cases are the
+ * opposite kind of assertion — they are about what the *resolver* does with what the database
+ * says — so they need a stub that returns rows. Still no Postgres: every path under test
+ * refuses before it writes anything, which is the property being tested.
+ *
+ * `$transaction` runs the callback against the same stub, which is what Prisma's interactive
+ * transaction does, so a guard that moved inside the transaction would still be caught here.
+ */
+function dbReturning(answers: Record<string, unknown>): Context['db'] {
+  const stub: Record<string, unknown> = {
+    $transaction: (work: (tx: unknown) => unknown) => work(stub),
+    ...answers,
+  };
+  return stub as unknown as Context['db'];
+}
+
+function callerWith(db: Context['db'], role: UserRole | null = 'member') {
+  return createCallerFactory(appRouter)({ ...contextFor(role), db });
+}
+
+describe('a moderated author cannot delete their way back to publishing', () => {
+  it('refuses to delete a hidden review, and says why', async () => {
+    /*
+     * The hole this closes. `upsert` refuses to edit a hidden review — but the row is keyed
+     * `(trailId, userId)`, so deleting the tombstone frees the key and the very next upsert
+     * creates a fresh row with the same prose, no `hiddenAt`, no `hiddenById`, and no reports
+     * pointing at it. Two calls, and the takedown is undone by the person it was made about.
+     */
+    const db = dbReturning({
+      review: {
+        // The delete carries `hiddenAt: null`, so a hidden row matches nothing.
+        deleteMany: () => Promise.resolve({ count: 0 }),
+        findUnique: () => Promise.resolve({ hiddenAt: new Date('2026-03-20T00:00:00Z') }),
+      },
+    });
+
+    expect(await codeOf(callerWith(db).reviews.remove({ trailId: 'trl_1' }))).toBe('FORBIDDEN');
+  });
+
+  it('still lets somebody withdraw a review nobody has touched', async () => {
+    // The guard must not cost the ordinary case. A visible review deletes, and the aggregate
+    // refresh runs on the way out exactly as it always did.
+    const db = dbReturning({
+      review: {
+        deleteMany: () => Promise.resolve({ count: 1 }),
+        groupBy: () => Promise.resolve([]),
+      },
+      trail: { update: () => Promise.resolve({}) },
+    });
+
+    await expect(callerWith(db).reviews.remove({ trailId: 'trl_1' })).resolves.toEqual({
+      removed: true,
+    });
+  });
+
+  it('refuses to delete a hidden photograph', async () => {
+    /*
+     * Same shape, and one more reason: `assertWithinQuota` deliberately counts hidden
+     * photographs against the uploader's daily and per-trail allowance, so a delete that went
+     * through would hand back the slot and make "upload the taken-down frame again" a single
+     * call. The refusal is what keeps the cap a limit rather than a refill.
+     */
+    const db = dbReturning({
+      photo: {
+        findUnique: () =>
+          Promise.resolve({
+            id: 'pho_1',
+            userId: 'usr_member',
+            trailId: 'trl_1',
+            url: 'https://photos.example.test/a.webp',
+            thumbUrl: null,
+            sourceId: 'abc',
+            hiddenAt: new Date('2026-03-20T00:00:00Z'),
+          }),
+      },
+    });
+
+    expect(await codeOf(callerWith(db).photos.remove({ photoId: 'pho_1' }))).toBe('FORBIDDEN');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The report box has bounds that do not depend on having an account
+// ---------------------------------------------------------------------------
+
+describe('moderation.report is bounded for a signed-out caller', () => {
+  const complaint = { subject: 'review' as const, subjectId: 'rev_1', reason: 'spam' as const };
+
+  function reportDb(openOnSubject: number, openAnonymous: number, created: string[]) {
+    return dbReturning({
+      review: { findUnique: () => Promise.resolve({ trailId: 'trl_1' }) },
+      contentReport: {
+        // First call counts the item's open complaints, second counts the anonymous queue.
+        count: ({ where }: { where: { reporterId?: null; subjectId?: string } }) =>
+          Promise.resolve(where.subjectId === undefined ? openAnonymous : openOnSubject),
+        findFirst: () => Promise.resolve(null),
+        create: ({ data }: { data: { subjectId: string } }) => {
+          created.push(data.subjectId);
+          return Promise.resolve({});
+        },
+      },
+    });
+  }
+
+  it('absorbs the fourth open complaint about one item, without writing a row', async () => {
+    /*
+     * The bound that replaces the one signing out used to skip. Three open complaints about a
+     * photograph is already more than an operator needs; the fourth adds a row to read and no
+     * information. It answers `{ filed: true }` rather than an error, because "this has been
+     * reported three times already" is information about a queue the reporter cannot see.
+     */
+    const written: string[] = [];
+    const anonymous = callerWith(reportDb(3, 0, written), null);
+
+    await expect(anonymous.moderation.report(complaint)).resolves.toEqual({ filed: true });
+    expect(written).toEqual([]);
+  });
+
+  it('accepts the first three', async () => {
+    const written: string[] = [];
+    const anonymous = callerWith(reportDb(2, 0, written), null);
+
+    await expect(anonymous.moderation.report(complaint)).resolves.toEqual({ filed: true });
+    expect(written).toEqual(['rev_1']);
+  });
+
+  it('stops accepting anonymous reports once the queue is deeper than a moderator can read', async () => {
+    // The second identity-free bound: a flood spread thinly across many scraped subject ids
+    // never reaches the per-item cap, so the anonymous half of the queue has a ceiling of its
+    // own. Signed-in reports are counted separately and are never refused by it.
+    const written: string[] = [];
+    const anonymous = callerWith(reportDb(0, 500, written), null);
+
+    expect(await codeOf(anonymous.moderation.report(complaint))).toBe('TOO_MANY_REQUESTS');
+    expect(written).toEqual([]);
+  });
+});

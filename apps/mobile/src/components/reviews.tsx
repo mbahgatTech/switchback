@@ -15,6 +15,7 @@ import { REVIEW_PAGE_SIZE } from '@/api/pages';
 import { useTRPC } from '@/api/trpc';
 import { Chip, ChipRail } from './chip';
 import { ConditionChip } from './condition-chip';
+import { ReportControl } from './report-control';
 import { ReportForm } from './report-form';
 
 /**
@@ -335,6 +336,15 @@ function Row({ review }: { review: Review }) {
             .join(' · ')}
         </Text>
       ) : null}
+
+      {/*
+       * Somebody else's report, so it carries the way to complain about it. Not on your own
+       * — reporting yourself is not a thing anybody needs — and not on a removed one, which
+       * has already been acted on and has nothing left on screen to object to.
+       */}
+      {review.isMine || review.hidden ? null : (
+        <ReportControl subject="review" subjectId={review.id} what={`this report by ${name}`} />
+      )}
     </View>
   );
 }
