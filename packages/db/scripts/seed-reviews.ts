@@ -158,7 +158,13 @@ function assertNotProduction(): void {
   }
   // This one *writes user rows*, which the trail seed does not. A stricter refusal than a
   // queue primer deserves: made-up accounts in a live users table are not a tidy mistake.
-  if (/neon\.tech|amazonaws\.com|supabase\.co/.test(url) && !process.env.SEED_ALLOW_REMOTE) {
+  //
+  // `postgres.database.azure.com` is production from the Neon→Azure migration onward; Neon
+  // stays in the list because it remains a live, populated rollback afterwards.
+  if (
+    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
+    !process.env.SEED_ALLOW_REMOTE
+  ) {
     throw new Error(
       `refusing to seed accounts into what looks like a hosted database (${url.replace(
         /:[^:@]*@/,

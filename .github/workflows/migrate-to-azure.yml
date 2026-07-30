@@ -1,0 +1,1047 @@
+# Move the production database from Neon to Azure — and prove it arrived.
+#
+# Manual only. This workflow copies every row of production data and, in `migrate` mode,
+# writes to a database. It is never triggered by a push, a pull request or a schedule, and it
+# must stay that way.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **Why this runs on a runner at all.**
+#
+# `az` and `gh` speak HTTPS and work fine from the machine that owns this repository. Postgres
+# speaks 5432 and does not — a VPN is the default route there and black-holes the port. So the
+# migration is split by protocol rather than by phase: every Azure control-plane action (the
+# Bicep deployment, server parameters, firewall rules) runs locally over 443, and everything
+# that opens a Postgres socket runs here. That split is also why this workflow holds no Azure
+# credentials and needs no OIDC federation — only connection strings, exactly like the
+# `migrate` job in ci.yml, which exists for the same reason and says so.
+#
+# **Why not Azure Cloud Shell, a container instance, or Database Migration Service.**
+# Cloud Shell is interactive, unreproducible, times out after twenty minutes idle, and ships
+# whatever `pg_dump` Microsoft last baked in. A container instance adds an image to trust and
+# a log stream that would then contain restore errors quoting row data, for no gain. Azure
+# Database Migration Service does not support this source at all: its documented list is RDS,
+# Aurora, Cloud SQL, on-premises and Azure VMs — Neon is on none of them.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **The modes.**
+#
+#   preflight  Read-only. Proves both endpoints are reachable, that the client is the right
+#              version, that PostGIS is allow-listed on the target, and that the collations
+#              agree. Costs nothing and changes nothing. Run this first, always.
+#
+#   migrate    The real thing: dump from Neon inside an exported snapshot, restore into
+#              Azure, converge the schema, ANALYZE, then verify. Refuses a target that
+#              already has tables unless `allow_overwrite` is ticked.
+#
+#   verify     Verification alone, against whatever is already in the target. Useful after a
+#              cutover, or to re-check without moving data. See the note on snapshot
+#              consistency below — this mode compares against a *live* source, so it is
+#              deliberately more forgiving about ingest-derived tables.
+#
+#   reset      Drops every table in the target's `public` schema, so a rehearsal can be
+#              wound back and the real run started from clean. Refuses any host that is not
+#              Azure, refuses a target that production is already served from, and requires
+#              `confirm_reset` to be `<database>-<today's UTC date>` — a value that is not
+#              written down anywhere in this repository and stops being correct at midnight.
+#
+#              Extension-owned tables are left alone: `spatial_ref_sys` belongs to postgis and
+#              cannot be dropped while the extension exists, so a loop that tried would abort
+#              atomically and drop nothing at all. Leaving postgis installed across a reset is
+#              correct anyway — the next `migrate` re-runs `CREATE EXTENSION IF NOT EXISTS`.
+#
+# A rehearsal is therefore: preflight → migrate → read the verification table → reset. Then
+# the real run is the same `migrate`, on a database that is empty again.
+#
+# **Snapshot consistency, and why it is the whole design.** Neon keeps taking writes while we
+# dump: `apps/web/app/api/trpc/[trpc]/route.ts` hands `waitUntil` into the tRPC context, so any
+# `trails.browse` over un-ingested ground writes trails, waypoints, photos and ingest rows
+# asynchronously. Comparing `count(*)` on both sides afterwards would therefore disagree for
+# entirely innocent reasons — which is worse than having no check, because it trains you to
+# wave off a mismatch. So `migrate` mode opens a REPEATABLE READ transaction on Neon, exports
+# its snapshot, computes the per-table checksums *inside* it, and hands the same snapshot id
+# to `pg_dump`. The checksums and the archive then describe the same instant, provably, and
+# every difference is a real difference.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **Secrets.** Five repository secrets, none of which is ever printed:
+#
+#   DATABASE_URL / DIRECT_DATABASE_URL              Neon. Already present — ci.yml uses them.
+#   AZURE_DATABASE_URL / AZURE_DIRECT_DATABASE_URL  The new server, as `sbadmin`. This is the
+#                                                   *migration and CI* credential: it can
+#                                                   execute DDL, which `prisma db push` needs.
+#   AZURE_APP_DATABASE_URL                          The new server, as `sbapp` — the
+#                                                   least-privilege role this workflow creates
+#                                                   and the only one Vercel is ever given.
+#
+# The Neon pair keeps pointing at Neon until the orchestrator's manual cutover. Nothing here
+# writes to Neon: every connection to it carries `default_transaction_read_only=on`, so that
+# is a guarantee the server enforces rather than an intention this file states.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **Why `secrets.DIRECT_DATABASE_URL` is what makes the destructive modes safe.**
+#
+# `reset` and `migrate --allow_overwrite` destroy data, and their obvious guards do not
+# survive the cutover this workflow exists to enable. "Is the host an Azure Flexible Server"
+# matches production *by construction* the moment production is Azure, and a confirmation
+# string written down in the repository is not a confirmation.
+#
+# So the guard here is temporal rather than topological, and it reads the one value that
+# actually changes at cutover: `secrets.DIRECT_DATABASE_URL` is what production points at. It
+# names Neon today; the orchestrator repoints it at Azure during the cutover. Comparing it to
+# the target host therefore answers the only question worth asking — *is production already
+# served by the database I am about to drop?* — and answers it correctly on both sides of the
+# cutover without anybody remembering to update a flag. `assert_target_is_not_live` below is
+# that check, and both destructive paths call it.
+#
+# It fails safe in the useful direction: before cutover the two hosts differ and the guard
+# admits, after cutover they are identical and it refuses. scripts/verify-migration.ts already
+# refuses the same coincidence from the other end, where two equal hosts would mean the
+# verifier was comparing a database to itself.
+#
+# `psql`, `pg_dump` and `pg_restore` are never given a connection string on the command line.
+# The step below splits each URL into the standard libpq environment variables and writes them
+# to a 0600 file under RUNNER_TEMP; every later step sources a helper that loads one set. That
+# keeps the credential out of argv, out of the process table, and out of every log line — and
+# it makes the "which database am I talking to" question a single word at the top of a step.
+#
+# **The dump is never uploaded.** It contains every user's email address, every recorded GPS
+# track and every session token. It lives in RUNNER_TEMP, is read once, and dies with the
+# runner. There is no `upload-artifact` step in this file and there must never be one.
+
+name: Migrate Neon → Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to do'
+        required: true
+        type: choice
+        default: preflight
+        options:
+          - preflight
+          - migrate
+          - verify
+          - reset
+      allow_overwrite:
+        description: 'migrate: proceed even if the target already has tables'
+        type: boolean
+        default: false
+      confirm_reset:
+        description: 'reset: type <database>-<UTC date>, e.g. switchback-2026-07-30'
+        type: string
+        default: ''
+
+# Never cancel a run in progress. `cancel-in-progress: true` is right for CI, where a
+# superseded run is waste; it is wrong here, where the thing being superseded might be halfway
+# through restoring a table.
+concurrency:
+  group: migrate-to-azure
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ inputs.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    # Not an approval gate on its own — at the time of writing this environment has no
+    # protection rules, so naming it buys deployment history and a single place to attach a
+    # required reviewer later without editing this file. Do that in the repository settings;
+    # note that `production` is also used by ci.yml's deploy job, so a required reviewer added
+    # there will start gating every production deploy too, which is a bigger change than it
+    # looks. The control that actually stops a post-cutover wipe is
+    # `assert_target_is_not_live`, which needs nobody to remember anything.
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # scripts/verify-migration.ts constructs two PrismaClients, so the generated client has
+      # to exist before it runs. Cheap, and needed in every mode that verifies.
+      - run: npm run db:generate
+
+      # -------------------------------------------------------------------------------
+      # The client version, asserted rather than assumed.
+      #
+      # The ubuntu-24.04 runner image ships PostgreSQL client 16. Neon and Azure are both 17,
+      # and pg_dump refuses to dump a server newer than itself:
+      #
+      #   pg_dump: error: server version: 17.x; pg_dump version: 16.x
+      #   pg_dump: error: aborting because of server version mismatch
+      #
+      # That is the first thing that goes wrong if nobody looks. It compounds: `--exclude-
+      # extension`, which the entire PostGIS strategy below rests on, was added in
+      # PostgreSQL 17 and does not exist in the 16 binary — so a silent fallback to
+      # /usr/bin/pg_dump would not merely fail a version check, it would remove the option
+      # this file depends on.
+      #
+      # Hence both halves: install 17 from PGDG, and invoke it through an absolute $PGBIN
+      # rather than trusting PATH order. The assertion is two seconds; the alternative is a
+      # confusing failure fifteen minutes into a dump.
+      # -------------------------------------------------------------------------------
+      - name: Install and assert PostgreSQL 17 client tools
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo "PGBIN=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/pg_dump --version | grep -qE ' 17\.' || {
+            echo "::error::pg_dump is not 17.x — refusing to dump a PostgreSQL 17 server with an older client."
+            exit 1
+          }
+
+      # -------------------------------------------------------------------------------
+      # Split both connection strings into libpq environment variables.
+      #
+      # Written as JSON with mode 0600 rather than as a shell file, deliberately: a sourced
+      # `export PGPASSWORD=...` line puts the password through another round of shell
+      # expansion, and a password containing `$` or a backtick would then be silently
+      # mangled — which surfaces as an authentication failure nobody can explain. Reading
+      # each field with `jq -r` into a variable assignment has no such round.
+      #
+      # Nothing is echoed. GitHub masks the *whole* secret string in logs, but a component of
+      # it — the password on its own — would not be masked, so the rule here is simply that
+      # no component is ever printed. There is no `::add-mask::` call for the same reason:
+      # that idiom works by writing the value to stdout.
+      # -------------------------------------------------------------------------------
+      - name: Prepare libpq credentials
+        env:
+          NEON_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+          AZURE_URL: ${{ secrets.AZURE_DIRECT_DATABASE_URL }}
+          AZURE_APP_URL: ${{ secrets.AZURE_APP_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            function write(name, raw, options, optional) {
+              if (!raw) {
+                if (optional) { console.log(name + ": not set, skipping."); return; }
+                console.error(name + ": the corresponding repository secret is empty.");
+                process.exit(1);
+              }
+              let u;
+              try { u = new URL(raw); } catch {
+                console.error(name + ": the connection string is not a valid URL.");
+                process.exit(1);
+              }
+              // verify-full, not require. `require` encrypts and then accepts whatever
+              // certificate it is handed — no root-CA check and no hostname check — which on
+              // an endpoint reachable from all of IPv4 is the wrong way round, because the
+              // threat this design carries is that the credential leaks. Defaulting to
+              // verify-full means a URL that forgot the parameter fails closed rather than
+              // silently downgrading. See the long note at the foot of infra/azure/
+              // postgres.bicep for why the URLs also carry Prisma`s `sslaccept=strict`.
+              const body = {
+                host: u.hostname,
+                port: u.port || "5432",
+                user: decodeURIComponent(u.username),
+                password: decodeURIComponent(u.password),
+                database: decodeURIComponent(u.pathname.replace(/^\//, "")),
+                sslmode: u.searchParams.get("sslmode") || "verify-full",
+                options,
+              };
+              const path = process.env.RUNNER_TEMP + "/" + name + ".json";
+              fs.writeFileSync(path, JSON.stringify(body), { mode: 0o600 });
+              console.log(name + ": parsed, database " + body.database + ", sslmode " + body.sslmode);
+            }
+            write("neon", process.env.NEON_URL, "-c default_transaction_read_only=on");
+            write("azure", process.env.AZURE_URL, "");
+            write("azureapp", process.env.AZURE_APP_URL, "", true);
+          '
+
+          # The helper every later step sources. Holds no secret itself — it reads them.
+          #
+          # PGSSLROOTCERT is why verify-full works here at all: libpq otherwise looks only in
+          # ~/.postgresql/root.crt, finds nothing, and fails closed on every connection. The
+          # runner's system bundle already contains DigiCert Global Root G2 and Microsoft RSA
+          # Root CA 2017, the two roots Flexible Server chains to.
+          cat > "$RUNNER_TEMP/pgenv.sh" <<'HELPER'
+          use() {
+            local f="$RUNNER_TEMP/$1.json"
+            PGHOST="$(jq -r .host "$f")";         export PGHOST
+            PGPORT="$(jq -r .port "$f")";         export PGPORT
+            PGUSER="$(jq -r .user "$f")";         export PGUSER
+            PGPASSWORD="$(jq -r .password "$f")"; export PGPASSWORD
+            PGDATABASE="$(jq -r .database "$f")"; export PGDATABASE
+            PGSSLMODE="$(jq -r .sslmode "$f")";   export PGSSLMODE
+            PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt; export PGSSLROOTCERT
+            PGCONNECT_TIMEOUT=30;                 export PGCONNECT_TIMEOUT
+            local o
+            o="$(jq -r '.options // ""' "$f")"
+            if [ -n "$o" ]; then PGOPTIONS="$o"; export PGOPTIONS; else unset PGOPTIONS; fi
+          }
+
+          # Refuse to destroy the database production is currently served from.
+          #
+          # `secrets.DIRECT_DATABASE_URL` — parsed into neon.json — is by definition what
+          # production points at. Before the cutover that is Neon and the two hosts differ;
+          # after it, it is this very server and they are identical. So host equality is a
+          # direct, self-maintaining answer to "has the cutover happened", and it needs no
+          # flag, no repository variable and nobody's memory. Both destructive paths call it.
+          assert_target_is_not_live() {
+            local what="$1"
+            local target live
+            target="$(jq -r .host "$RUNNER_TEMP/azure.json")"
+            live="$(jq -r .host "$RUNNER_TEMP/neon.json")"
+            if [ "$target" = "$live" ]; then
+              echo "::error::$what refused: the target is the database that"
+              echo "::error::secrets.DIRECT_DATABASE_URL currently names, which means production is"
+              echo "::error::already being served from it. This mode exists for a target nothing"
+              echo "::error::depends on yet. If you genuinely need to rebuild production, do it"
+              echo "::error::deliberately and by hand, not from a workflow button."
+              exit 1
+            fi
+            echo "$what: target is not the live production database"
+          }
+          HELPER
+          chmod 600 "$RUNNER_TEMP/pgenv.sh"
+
+      # -------------------------------------------------------------------------------
+      # Preflight. Everything that can be wrong before any data moves.
+      # -------------------------------------------------------------------------------
+      - name: Preflight
+        if: inputs.mode == 'preflight' || inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"
+
+          echo "--- source (Neon) ---"
+          use neon
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c "
+            SELECT current_setting('server_version')            AS server_version,
+                   current_setting('default_text_search_config') AS text_search,
+                   (SELECT datcollate FROM pg_database WHERE datname = current_database()) AS datcollate,
+                   (SELECT datctype   FROM pg_database WHERE datname = current_database()) AS datctype,
+                   current_setting('default_transaction_read_only') AS read_only;
+          "
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c \
+            "SELECT version, cipher, bits FROM pg_stat_ssl WHERE pid = pg_backend_pid();"
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c \
+            "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+          NEON_COLLATE="$("$PGBIN/psql" -X -A -t -q -c \
+            "SELECT datcollate || '/' || datctype FROM pg_database WHERE datname = current_database()")"
+
+          echo "--- target (Azure) ---"
+          use azure
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c "
+            SELECT current_setting('server_version')            AS server_version,
+                   current_setting('default_text_search_config') AS text_search,
+                   (SELECT datcollate FROM pg_database WHERE datname = current_database()) AS datcollate,
+                   (SELECT datctype   FROM pg_database WHERE datname = current_database()) AS datctype;
+          "
+          # The negotiated TLS version, printed because it is the one setting that can break
+          # connectivity silently. infra/azure/main.bicep ships ssl_min_protocol_version at
+          # TLSv1.2 on purpose; raise it to TLSv1.3 only once this line has said 1.3 from a
+          # runner, since the machine that owns this repo cannot reach 5432 to tell a TLS
+          # failure apart from a firewall one.
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c \
+            "SELECT version, cipher, bits FROM pg_stat_ssl WHERE pid = pg_backend_pid();"
+
+          # And the assertion the printed line does not make on its own. pg_stat_ssl reports
+          # that the session is encrypted; it cannot report whether this client checked who it
+          # is encrypted *to*. That distinction is the entire difference between `require` and
+          # `verify-full`, and on an endpoint reachable from all of IPv4 it is the control
+          # that protects the credential rather than the payload.
+          #
+          # The proof is structural rather than observational: the connection above either
+          # validated the chain and the hostname against PGSSLROOTCERT or it failed, so
+          # reaching this line with PGSSLMODE=verify-full *is* the verification. Asserting the
+          # mode therefore asserts the outcome — and catches the case that actually happens,
+          # which is a URL that quietly carries `sslmode=require` and downgrades everything
+          # after it.
+          if [ "${PGSSLMODE:-}" != "verify-full" ]; then
+            echo "::error::The target connection negotiated sslmode=${PGSSLMODE:-unset}, not verify-full."
+            echo "::error::That encrypts the session without authenticating the server, so anyone"
+            echo "::error::who can answer for this hostname can harvest the credential. Fix the"
+            echo "::error::sslmode parameter on AZURE_DIRECT_DATABASE_URL and re-run."
+            exit 1
+          fi
+          echo "target connection verified the server certificate (sslmode=verify-full)"
+
+          AZURE_COLLATE="$("$PGBIN/psql" -X -A -t -q -c \
+            "SELECT datcollate || '/' || datctype FROM pg_database WHERE datname = current_database()")"
+
+          if [ "$NEON_COLLATE" != "$AZURE_COLLATE" ]; then
+            echo "::error::Collation mismatch — source is $NEON_COLLATE, target is $AZURE_COLLATE."
+            echo "::error::A restore succeeds under either, which is what makes this dangerous:"
+            echo "::error::every ORDER BY name silently reorders and the partial unique index"
+            echo "::error::trail_lists_one_system_list_per_user is built under different rules."
+            echo "::error::Fix databaseCollation in infra/azure/main.bicepparam and redeploy."
+            exit 1
+          fi
+          echo "collation matches on both sides: $AZURE_COLLATE"
+
+          # Proves the azure.extensions allowlist actually took effect, without leaving
+          # anything behind: CREATE EXTENSION is transactional, so the ROLLBACK undoes it.
+          # This is the classic first failure of an Azure PostgreSQL migration — ARM records
+          # the parameter, the portal shows it, and CREATE EXTENSION still fails because
+          # `source: 'user-override'` was omitted and the engine kept its default.
+          echo "--- extension allowlist ---"
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN;
+          CREATE EXTENSION IF NOT EXISTS postgis;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          CREATE EXTENSION IF NOT EXISTS btree_gist;
+          ROLLBACK;
+          SQL
+          echo "postgis, pg_trgm and btree_gist are all allow-listed on the target."
+
+      # -------------------------------------------------------------------------------
+      # Refuse to restore over a populated database.
+      #
+      # Running `migrate` twice against a populated target duplicates rows and produces a
+      # checksum mismatch that looks exactly like data corruption. The `allow_overwrite`
+      # input exists so that deliberately re-running is possible; the default is that it is
+      # not.
+      # -------------------------------------------------------------------------------
+      - name: Refuse a non-empty target
+        if: inputs.mode == 'migrate'
+        # Through the environment rather than `${{ }}` inside the script. A workflow input is
+        # attacker-controlled in the same sense a pull-request title is — anyone who can run
+        # this workflow can put shell metacharacters in it — and `${{ }}` interpolation
+        # substitutes into the script text before bash ever sees it.
+        env:
+          ALLOW_OVERWRITE: ${{ inputs.allow_overwrite }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+
+          # Overwriting is destructive in exactly the way `reset` is — it restores a dump over
+          # rows that are already there — so it answers to the same guard. Without this,
+          # `allow_overwrite` would remain a one-click route to writing a stale Neon dump over
+          # live production the moment the cutover makes this server production.
+          if [ "$ALLOW_OVERWRITE" = "true" ]; then
+            assert_target_is_not_live "migrate with allow_overwrite"
+          fi
+
+          # Counted with the same predicate `reset` drops by, and for the same reason:
+          # `spatial_ref_sys` belongs to the postgis extension, so it is neither dropped by a
+          # reset nor restored by the dump. Counting it would leave a freshly reset target
+          # reading as "1 table" and refuse the very migrate the reset was performed to allow.
+          n="$("$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -c "
+            SELECT count(*) FROM pg_tables t
+             WHERE t.schemaname = 'public'
+               AND NOT EXISTS (
+                     SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_class'::regclass
+                        AND d.objid = format('%I.%I', t.schemaname, t.tablename)::regclass
+                        AND d.deptype = 'e')")"
+          echo "target public schema holds $n non-extension table(s)"
+          if [ "$n" != "0" ] && [ "$ALLOW_OVERWRITE" != "true" ]; then
+            echo "::error::The target already has $n table(s). Restoring over them would duplicate"
+            echo "::error::rows and make the checksum comparison meaningless."
+            echo "::error::Run this workflow in 'reset' mode first, or re-run with allow_overwrite."
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------------------
+      # Build the checksum script from the *source* catalog, so it cannot fall out of date.
+      #
+      # `md5(t::text)` hashes the whole row — every column, including the `Unsupported` ones
+      # Prisma cannot see. A geometry renders as hex EWKB and a tsvector as its lexeme list,
+      # so the row hash is itself the proof that geometry and search vectors arrived byte for
+      # byte. Nothing extra is needed for that claim.
+      #
+      # Sorting the per-row hashes makes the aggregate order-independent, because a parallel
+      # restore guarantees a different physical row order and that is not a difference.
+      # `COLLATE "C"` on the sort, because otherwise the ordering of hex strings is at the
+      # mercy of the two servers' collations — which is the very thing being tested.
+      #
+      # The header pins every GUC that `::text` output depends on. Without `extra_float_digits
+      # = 3` and a fixed DateStyle, two byte-identical databases can produce two different
+      # checksums; a check that fires when nothing is wrong gets ignored when something is.
+      #
+      # **Extension-owned tables are excluded, and `spatial_ref_sys` is why.** PostGIS installs
+      # into `public` — packages/db/prisma/spatial.sql line 19 is a bare `CREATE EXTENSION IF
+      # NOT EXISTS postgis` with no SCHEMA clause — and `spatial_ref_sys` is an ordinary table,
+      # so it appears in `pg_tables` and would be checksummed as a 24th entry. It is never
+      # migrated: `pg_dump --exclude-extension='*'` drops the extension and the table data it
+      # registers, and the target's copy is created instead by `CREATE EXTENSION` in the step
+      # below. The two sides are therefore populated by two independent PostGIS builds — Azure
+      # ships 3.6.1 and Neon does not — which regenerate it from their own bundled EPSG data,
+      # so the counts and the `srtext`/`proj4text` bytes legitimately differ. Comparing it
+      # would end a byte-perfect migration with a red row-count line whose only available
+      # response is to wave it off, which is the habit the header of this file argues is worse
+      # than having no check at all.
+      #
+      # Filtering on `pg_depend.deptype = 'e'` rather than naming the table keeps that true for
+      # whatever else an extension brings with it later. The count then lands on 23, which is a
+      # useful cross-check against EXPECTED_TABLES in scripts/verify-migration.ts.
+      # -------------------------------------------------------------------------------
+      - name: Build the checksum script
+        if: inputs.mode == 'migrate' || inputs.mode == 'verify'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use neon
+
+          cat > "$RUNNER_TEMP/gen-checksums.sql" <<'GEN'
+          SELECT format(
+            $f$SELECT %L || '|' || count(*) || '|'
+                   || coalesce(md5(string_agg(h, '' ORDER BY h COLLATE "C")), '-')
+                 FROM (SELECT md5(t::text) AS h FROM %I t) s;$f$,
+            t.tablename, t.tablename)
+            FROM pg_tables t
+           WHERE t.schemaname = 'public'
+             AND NOT EXISTS (
+                   SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_class'::regclass
+                      AND d.objid = format('%I.%I', t.schemaname, t.tablename)::regclass
+                      AND d.deptype = 'e')
+           ORDER BY t.tablename;
+          GEN
+
+          {
+            cat <<'HDR'
+          SET DateStyle = 'ISO, MDY';
+          SET IntervalStyle = 'postgres';
+          SET extra_float_digits = 3;
+          SET TimeZone = 'UTC';
+          SET bytea_output = 'hex';
+          SET client_encoding = 'UTF8';
+          SET search_path = public;
+          SET jit = off;
+          HDR
+            "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/gen-checksums.sql"
+          } > "$RUNNER_TEMP/checksums.sql"
+
+          echo "checksum script covers $(grep -c '^SELECT ' "$RUNNER_TEMP/checksums.sql") tables"
+          [ "$(grep -c '^SELECT ' "$RUNNER_TEMP/checksums.sql")" -gt 0 ] || {
+            echo "::error::The source has no tables in the public schema. Wrong database?"
+            exit 1
+          }
+
+      # -------------------------------------------------------------------------------
+      # Dump — from inside an exported snapshot, with the source-side checksums taken in the
+      # same transaction. See the note on snapshot consistency at the top of this file.
+      #
+      # `\!` runs a command in the psql *client* while the server-side transaction stays open,
+      # which is what holds the snapshot alive. The FIFO is how this step tells it to let go,
+      # and the trap guarantees that happens even when the dump fails — otherwise the session
+      # would sit there until the job's timeout.
+      #
+      # Dumped from the direct endpoint, never a pooler: a parallel dump needs several
+      # connections sharing one exported snapshot, and PgBouncer in transaction mode cannot
+      # honour `SET TRANSACTION SNAPSHOT`.
+      # -------------------------------------------------------------------------------
+      - name: Dump the source
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use neon
+
+          FIFO="$RUNNER_TEMP/hold.fifo"
+          rm -f "$FIFO" "$RUNNER_TEMP/snapshot.id" "$RUNNER_TEMP/neon-checksums.txt"
+          mkfifo "$FIFO"
+          release() { timeout 10 bash -c "echo go > '$FIFO'" >/dev/null 2>&1 || true; }
+          trap release EXIT
+
+          cat > "$RUNNER_TEMP/hold.sql" <<SQL
+          BEGIN ISOLATION LEVEL REPEATABLE READ;
+          \o $RUNNER_TEMP/snapshot.id
+          SELECT pg_export_snapshot();
+          \o $RUNNER_TEMP/neon-checksums.txt
+          \i $RUNNER_TEMP/checksums.sql
+          \o
+          \! timeout 5400 cat $FIFO > /dev/null
+          COMMIT;
+          SQL
+
+          "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/hold.sql" &
+          HOLD_PID=$!
+
+          for _ in $(seq 1 120); do
+            [ -s "$RUNNER_TEMP/snapshot.id" ] && break
+            kill -0 "$HOLD_PID" 2>/dev/null || {
+              echo "::error::The snapshot session exited before exporting a snapshot."
+              exit 1
+            }
+            sleep 1
+          done
+          SNAPSHOT_ID="$(tr -d ' \r\n' < "$RUNNER_TEMP/snapshot.id" || true)"
+          [ -n "$SNAPSHOT_ID" ] || {
+            echo "::error::pg_export_snapshot() produced nothing — cannot dump consistently."
+            exit 1
+          }
+          echo "dumping inside exported snapshot $SNAPSHOT_ID"
+
+          # --exclude-extension='*' drops every CREATE EXTENSION and its comment. The
+          # extensions are created on the target explicitly in the next step, so the geometry,
+          # tsvector and trigram columns restore into types that already exist. The glob is
+          # better than naming them: whatever else Neon happens to have installed is excluded
+          # too, rather than discovered as a restore failure.
+          #
+          # --no-owner/--no-privileges kill every reference to neondb_owner and neon_superuser,
+          # roles that do not exist on Azure and cannot be created. --no-comments kills
+          # COMMENT ON SCHEMA public, which fails there for the same reason.
+          "$PGBIN/pg_dump" \
+            --format=directory --jobs=4 --compress=0 \
+            --schema=public \
+            --exclude-extension='*' \
+            --no-owner --no-privileges --no-comments \
+            --no-tablespaces --no-publications --no-subscriptions --no-security-labels \
+            --snapshot="$SNAPSHOT_ID" \
+            --file "$RUNNER_TEMP/neon.dump"
+
+          release
+          trap - EXIT
+          wait "$HOLD_PID" || echo "::warning::the snapshot session exited non-zero after the dump"
+
+          [ -s "$RUNNER_TEMP/neon-checksums.txt" ] || {
+            echo "::error::The source-side checksums are empty. Verification would be vacuous."
+            exit 1
+          }
+          echo "dump: $(du -sh "$RUNNER_TEMP/neon.dump" | cut -f1)"
+          echo "source checksums: $(wc -l < "$RUNNER_TEMP/neon-checksums.txt") tables"
+
+      # -------------------------------------------------------------------------------
+      # Restore, in three sections.
+      #
+      # This is the shape rather than `prisma db push` followed by a `--data-only` restore,
+      # and the reason is concrete. A data-only load into a schema that already has every
+      # foreign key needs the constraints stood down, and pg_dump's own documentation says
+      # `--disable-triggers` "must be done as superuser" — the Azure admin is a member of
+      # azure_pg_admin and is *not* a superuser. The alternative, `session_replication_role`,
+      # is a PGC_SUSET GUC whose availability on Flexible Server is not something to discover
+      # halfway through a migration. Sectioning sidesteps the question entirely: `pre-data`
+      # creates tables with no indexes and no foreign keys, `data` bulk-loads into them, and
+      # `post-data` then adds the indexes, checks and keys over complete data — which is also
+      # the fast way round.
+      #
+      # And because `spatial.sql` has already run against Neon, all fourteen of its objects
+      # exist in Neon's catalog and come across inside `post-data` for free.
+      #
+      # **The error handling is deliberately lossy.** `pg_restore` quotes the offending row in
+      # its errors, and a row here can be a user's email address. So only lines matching
+      # `pg_restore: error:` are printed, anything from `DETAIL:` onward is stripped, and the
+      # result is truncated. The full log stays on the runner and is never uploaded.
+      # -------------------------------------------------------------------------------
+      - name: Create the extensions on the target
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS postgis;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          CREATE EXTENSION IF NOT EXISTS btree_gist;
+          SQL
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c \
+            "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+
+      - name: Restore into the target
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+
+          # `CREATE SCHEMA public` is the one error worth tolerating, and only in pre-data:
+          # whether pg_dump emits it depends on who owns the schema on the source, and the
+          # target already has one. Every other error is a defect.
+          BENIGN='schema "public" already exists'
+
+          restore_section() {
+            local section="$1"; shift
+            local log="$RUNNER_TEMP/restore-$section.log"
+            echo "--- $section ---"
+            local rc=0
+            "$PGBIN/pg_restore" \
+              --dbname="$PGDATABASE" \
+              --format=directory \
+              --section="$section" \
+              --no-owner --no-privileges --no-comments --no-tablespaces \
+              "$@" \
+              "$RUNNER_TEMP/neon.dump" 2> "$log" || rc=$?
+
+            local bad tolerated
+            bad="$(grep '^pg_restore: error:' "$log" | grep -v -F "$BENIGN" || true)"
+            if [ -n "$bad" ]; then
+              echo "::error::pg_restore reported errors in the $section section:"
+              printf '%s\n' "$bad" | sed 's/DETAIL:.*//' | cut -c1-200 | head -20
+              exit 1
+            fi
+            if [ "$rc" != "0" ] && [ "$section" != "pre-data" ]; then
+              echo "::error::pg_restore exited $rc in the $section section with no error lines."
+              exit 1
+            fi
+            tolerated="$(grep -c '^pg_restore: error:' "$log" || true)"
+            [ "$tolerated" = "0" ] || echo "($tolerated benign line(s) tolerated)"
+            echo "$section restored"
+          }
+
+          restore_section pre-data
+          restore_section data --jobs=4 --exit-on-error
+          restore_section post-data --exit-on-error
+
+      # -------------------------------------------------------------------------------
+      # The least-privilege application role.
+      #
+      # infra/azure/postgres.bicep justifies a firewall rule spanning all of IPv4 with a list
+      # of compensating controls, and this is the one ARM cannot deliver: there is no way to
+      # run SQL from a template. Without this step the list claims a privilege boundary that
+      # does not exist, and the credential every Vercel serverless function carries is
+      # `sbadmin` — a member of azure_pg_admin, DDL- and DROP-capable, against an endpoint
+      # reachable from any address on the internet.
+      #
+      # So `sbapp` gets exactly what a web request needs: connect, use the schema, and read
+      # and write rows. No CREATE, no DROP, no role management. `ALTER DEFAULT PRIVILEGES`
+      # matters as much as the grant itself — without it the next table `prisma db push`
+      # creates would be invisible to the app until somebody remembered to re-grant, which
+      # surfaces as a permission error in production long after this workflow is forgotten.
+      #
+      # The password never reaches argv. It is already in AZURE_APP_DATABASE_URL, so node
+      # reads it from the parsed 0600 JSON and writes a SQL file that psql runs with `-f`;
+      # `quote_literal`-style escaping is done by doubling single quotes. The file is shredded
+      # with everything else. Re-runnable: the role is ALTERed if it already exists, so a
+      # second migrate resets the password to whatever the secret currently says rather than
+      # failing on a duplicate.
+      # -------------------------------------------------------------------------------
+      - name: Create the least-privilege application role
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"
+
+          if [ ! -f "$RUNNER_TEMP/azureapp.json" ]; then
+            echo "::error::AZURE_APP_DATABASE_URL is not set, so the least-privilege role this"
+            echo "::error::migration is supposed to hand Vercel cannot be created. Production"
+            echo "::error::would have to connect as sbadmin, which infra/azure/postgres.bicep"
+            echo "::error::explicitly says it does not. Set the secret and re-run."
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const app = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/azureapp.json", "utf8"));
+            const role = app.user;
+            const db = app.database;
+            const pw = app.password;
+            // The role and database names are interpolated into the script text, so they are
+            // held to a plain-identifier shape rather than trusted. The password is not
+            // interpolated anywhere — it is handed to the server as a dollar-quoted literal
+            // and escaped by `format(%L)` there, which is the one escaper guaranteed to agree
+            // with the parser that will read it.
+            for (const [what, value] of [["login", role], ["database", db]]) {
+              if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+                console.error("The application " + what + " is not a plain identifier; refusing to build SQL around it.");
+                process.exit(1);
+              }
+            }
+            if (!pw || pw.includes("$pw$")) {
+              console.error("The application password is empty or contains the dollar-quote tag; refusing.");
+              process.exit(1);
+            }
+            fs.writeFileSync(
+              process.env.RUNNER_TEMP + "/role.sql",
+              [
+                "DO $do$",
+                "BEGIN",
+                "  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = " + JSON.stringify(role).replace(/"/g, "\x27") + ") THEN",
+                "    EXECUTE format(\x27ALTER ROLE %I LOGIN PASSWORD %L\x27,  \x27" + role + "\x27, $pw$" + pw + "$pw$);",
+                "  ELSE",
+                "    EXECUTE format(\x27CREATE ROLE %I LOGIN PASSWORD %L\x27, \x27" + role + "\x27, $pw$" + pw + "$pw$);",
+                "  END IF;",
+                "END",
+                "$do$;",
+                "",
+                "REVOKE ALL ON SCHEMA public FROM \"" + role + "\";",
+                "GRANT CONNECT ON DATABASE \"" + db + "\" TO \"" + role + "\";",
+                "GRANT USAGE ON SCHEMA public TO \"" + role + "\";",
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO \"" + role + "\";",
+                "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO \"" + role + "\";",
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public",
+                "  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO \"" + role + "\";",
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public",
+                "  GRANT USAGE, SELECT ON SEQUENCES TO \"" + role + "\";",
+                "",
+              ].join("\n"),
+              { mode: 0o600 },
+            );
+            console.log("built the role script for " + role);
+          '
+
+          use azure
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/role.sql"
+          rm -f "$RUNNER_TEMP/role.sql"
+
+          # Printed as the record that the boundary exists. `is_pg_admin` false is the claim
+          # infra/azure/postgres.bicep makes; scripts/verify-migration.ts asserts it again
+          # from the application credential itself, by trying to create a table and requiring
+          # the attempt to be refused.
+          APP_ROLE="$(jq -r .user "$RUNNER_TEMP/azureapp.json")"
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -v role="$APP_ROLE" -c "
+            SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls,
+                   pg_has_role(rolname, 'azure_pg_admin', 'member') AS is_pg_admin
+              FROM pg_roles WHERE rolname = :'role';"
+
+      # -------------------------------------------------------------------------------
+      # Checksum the target — before anything is allowed to change its schema.
+      #
+      # `md5(t::text)` hashes the row as a record literal, so adding, dropping or retyping a
+      # single column changes the hash of every row in that table. `prisma db push` in the next
+      # step reconciles the restored schema to schema.prisma, and if Neon has drifted from that
+      # file in any non-destructive way the push applies the difference here — turning data
+      # that arrived byte for byte into `N rows on both sides but the content hash differs`.
+      # Taking the reading first means the comparison describes what the restore produced,
+      # which is the thing being verified.
+      # -------------------------------------------------------------------------------
+      - name: Checksum the target
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+          "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 \
+            -f "$RUNNER_TEMP/checksums.sql" > "$RUNNER_TEMP/azure-checksums.txt"
+          echo "target checksums: $(wc -l < "$RUNNER_TEMP/azure-checksums.txt") tables"
+
+      # -------------------------------------------------------------------------------
+      # Converge the schema, as an assertion rather than as a build step.
+      #
+      # Everything the app needs is already there — the restore brought the tables, the
+      # indexes and the constraints. This runs `db push` so that the target is checked against
+      # `schema.prisma` rather than against whatever Neon had drifted into. The expected
+      # outcome is "already in sync".
+      #
+      # Anything else is a stop, not a warning. A push that changes the schema means the source
+      # this migration just copied does not match the schema file, and that is a fact about
+      # production worth interrupting a migration for — the alternative is to continue and let
+      # it resurface as row-hash failures whose stated cause ("the content hash differs") is
+      # not the actual cause. The target checksum above was taken before this step precisely so
+      # the two cannot be confused; this step is then free to be a plain assertion.
+      #
+      # `npm run db:push` also applies `spatial.sql`, whose fourteen statements are all
+      # IF NOT EXISTS. That costs nothing and proves the file applies cleanly on Azure's
+      # PostGIS 3.6.1 rather than only on Neon's.
+      # -------------------------------------------------------------------------------
+      - name: Converge the schema and assert it was already in sync
+        if: inputs.mode == 'migrate'
+        env:
+          DATABASE_URL: ${{ secrets.AZURE_DATABASE_URL }}
+          DIRECT_DATABASE_URL: ${{ secrets.AZURE_DIRECT_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          npm run db:push 2>&1 | tee "$RUNNER_TEMP/push.log"
+          if grep -q 'already in sync' "$RUNNER_TEMP/push.log"; then
+            echo "schema matches schema.prisma exactly"
+          else
+            echo "::error::db push changed the schema, which means Neon has drifted from"
+            echo "::error::packages/db/prisma/schema.prisma. The data restored above is a copy of"
+            echo "::error::the drifted source, so the target now holds those rows under a schema"
+            echo "::error::that has just been altered underneath them. Reconcile the drift on Neon"
+            echo "::error::first — this is a reason to stop, not to carry on and read the row"
+            echo "::error::hashes as corruption."
+            exit 1
+          fi
+
+      # Planner statistics, and the visibility map. Without this the EXPLAIN assertion in the
+      # verification below can legitimately fail: a freshly restored table has no statistics,
+      # so the planner may prefer a sequential scan over an index that is present and correct.
+      - name: VACUUM ANALYZE
+        if: inputs.mode == 'migrate'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 -c "VACUUM (ANALYZE);"
+
+      # -------------------------------------------------------------------------------
+      # Checksums for `verify` mode, then the verification itself.
+      #
+      # In `verify` mode both readings are taken now rather than from the dump's snapshot, so
+      # the source is a moving target. That is recorded in CHECKSUM_SNAPSHOT_CONSISTENT and the
+      # verifier reads it: differences in ingest-derived tables become warnings, everything
+      # else stays a failure. In `migrate` mode nothing is forgiven, and the target reading was
+      # already taken above — immediately after the restore, before `db push` could touch the
+      # schema the row hashes are computed over.
+      #
+      # The two readings are taken back to back, source first, to keep the window in which
+      # Neon can move between them as small as it can be without a snapshot.
+      # -------------------------------------------------------------------------------
+      - name: Checksum both sides (verify mode only)
+        if: inputs.mode == 'verify'
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"
+
+          use neon
+          "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 \
+            -f "$RUNNER_TEMP/checksums.sql" > "$RUNNER_TEMP/neon-checksums.txt"
+          echo "source checksums: $(wc -l < "$RUNNER_TEMP/neon-checksums.txt") tables"
+
+          use azure
+          "$PGBIN/psql" -X -A -t -q -v ON_ERROR_STOP=1 \
+            -f "$RUNNER_TEMP/checksums.sql" > "$RUNNER_TEMP/azure-checksums.txt"
+          echo "target checksums: $(wc -l < "$RUNNER_TEMP/azure-checksums.txt") tables"
+
+      - name: Verify
+        if: inputs.mode == 'migrate' || inputs.mode == 'verify'
+        env:
+          # The direct endpoint for the source, and the *pooled* one for the target — the
+          # target reads go through the exact path Vercel will, which on General Purpose
+          # means PgBouncer. That makes this the only step in the migration that would
+          # surface `prepared statement "s0" already exists` before a user does.
+          NEON_VERIFY_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+          AZURE_VERIFY_URL: ${{ secrets.AZURE_DATABASE_URL }}
+          # The application credential, so the privilege boundary can be asserted from the
+          # side that matters: not "the catalog says sbapp lacks DDL" but "sbapp tried to
+          # create a table and was refused".
+          AZURE_APP_VERIFY_URL: ${{ secrets.AZURE_APP_DATABASE_URL }}
+          CHECKSUM_SNAPSHOT_CONSISTENT: ${{ inputs.mode == 'migrate' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          NEON_CHECKSUMS="$RUNNER_TEMP/neon-checksums.txt" \
+          AZURE_CHECKSUMS="$RUNNER_TEMP/azure-checksums.txt" \
+            npm run verify:migration
+
+      # -------------------------------------------------------------------------------
+      # Reset — for winding a rehearsal back.
+      #
+      # Drops every table in the target's public schema rather than the database itself:
+      # DROP DATABASE cannot run against the database you are connected to, and the ownership
+      # of `public` on a managed server is not something to bet a destructive command on.
+      #
+      # Three guards, because this is the one step here that destroys data, and because the
+      # obvious two do not survive the cutover this workflow exists to perform:
+      #
+      #   1. The host must be an Azure Flexible Server. Weak on its own — after the cutover
+      #      production *is* one, so this admits rather than blocks — but it still stops a
+      #      copy-pasted Neon string from reaching the code below.
+      #   2. The target must not be the database `secrets.DIRECT_DATABASE_URL` names. This is
+      #      the guard that actually holds, and it is the one that changes meaning at exactly
+      #      the right moment. See the note at the top of this file.
+      #   3. `confirm_reset` must be `<database>-<today's UTC date>`. The old form was the
+      #      database name alone, which is printed in main.bicepparam, in the README, and in
+      #      this file — a confirmation token written down in the repository is not a
+      #      confirmation. The date is not written down anywhere, has to be constructed at the
+      #      moment of use, and a stale value stops working at midnight UTC.
+      # -------------------------------------------------------------------------------
+      - name: Reset the target
+        if: inputs.mode == 'reset'
+        env:
+          CONFIRM_RESET: ${{ inputs.confirm_reset }}
+        run: |
+          set -euo pipefail
+          . "$RUNNER_TEMP/pgenv.sh"; use azure
+
+          case "$PGHOST" in
+            *.postgres.database.azure.com) ;;
+            *)
+              echo "::error::The target host is not an Azure Flexible Server. Refusing to drop"
+              echo "::error::anything — check AZURE_DIRECT_DATABASE_URL."
+              exit 1
+              ;;
+          esac
+
+          assert_target_is_not_live "reset"
+
+          EXPECTED="$PGDATABASE-$(date -u +%Y-%m-%d)"
+          if [ "$CONFIRM_RESET" != "$EXPECTED" ]; then
+            echo "::error::confirm_reset must be the target database name and today's UTC date,"
+            echo "::error::joined by a hyphen — <database>-YYYY-MM-DD. It is deliberately not"
+            echo "::error::written down anywhere in this repository, and it expires at midnight"
+            echo "::error::UTC so a value copied from an old run cannot be replayed."
+            exit 1
+          fi
+
+          # Extension-owned objects are skipped, and `spatial_ref_sys` is the one that matters:
+          # it belongs to postgis, and PostgreSQL refuses `DROP TABLE spatial_ref_sys` with
+          # "cannot drop table spatial_ref_sys because extension postgis requires it". CASCADE
+          # does not help — it follows dependent objects, not extension membership. Because the
+          # loop is a single DO block, that error would abort the whole statement atomically
+          # and drop *nothing*, leaving the operator with a target that reports a full table
+          # set after a "successful" wind-back. Measured on a populated target: 24 tables
+          # before, 24 after.
+          #
+          # The enum types are dropped for a reason found the same way — by running this.
+          # `pre-data` creates 16 enums (`ActivityType`, `Difficulty`, `JobKind`, …) and a
+          # tables-only reset leaves every one of them behind, so the *next* `migrate` fails
+          # 16 times over with `type "ActivityType" already exists` before it has loaded a
+          # single row. A wind-back that cannot be followed by a run forward is not a
+          # wind-back. Domains go with them for the same reason; both filtered on the same
+          # `pg_depend` predicate, because postgis brings its own types and those must stay.
+          #
+          # Leaving postgis installed across a reset is correct anyway: the next `migrate`
+          # re-runs CREATE EXTENSION IF NOT EXISTS, and the non-empty check above counts with
+          # this same predicate so a reset target still reads as empty.
+          "$PGBIN/psql" -X -q -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE r record;
+          BEGIN
+            FOR r IN
+              SELECT t.tablename FROM pg_tables t
+               WHERE t.schemaname = 'public'
+                 AND NOT EXISTS (
+                       SELECT 1 FROM pg_depend d
+                        WHERE d.classid = 'pg_class'::regclass
+                          AND d.objid = format('%I.%I', t.schemaname, t.tablename)::regclass
+                          AND d.deptype = 'e')
+            LOOP
+              EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename);
+            END LOOP;
+
+            FOR r IN
+              SELECT t.typname FROM pg_type t
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+               WHERE n.nspname = 'public'
+                 AND t.typtype IN ('e', 'd')
+                 AND NOT EXISTS (
+                       SELECT 1 FROM pg_depend d
+                        WHERE d.classid = 'pg_type'::regclass
+                          AND d.objid = t.oid
+                          AND d.deptype = 'e')
+            LOOP
+              EXECUTE format('DROP TYPE IF EXISTS public.%I CASCADE', r.typname);
+            END LOOP;
+          END
+          $$;
+          SQL
+          "$PGBIN/psql" -X -A -t -q -c "
+            SELECT count(*) || ' non-extension table(s) left in public'
+              FROM pg_tables t
+             WHERE t.schemaname = 'public'
+               AND NOT EXISTS (
+                     SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_class'::regclass
+                        AND d.objid = format('%I.%I', t.schemaname, t.tablename)::regclass
+                        AND d.deptype = 'e')"
+
+      # Belt and braces. The runner is ephemeral and its disk goes with it, but the dump holds
+      # every user's email address and every recorded GPS track, so it is removed explicitly
+      # rather than left to the platform. Runs even when an earlier step failed.
+      #
+      # The restore logs are on this list because the step that writes them says, in as many
+      # words, that `pg_restore` quotes the offending row in its errors and that a row here can
+      # be a user's email address. Leaving them behind while shredding the dump they came from
+      # would make this step a control that does not do what it claims. Globbed rather than
+      # enumerated so a fourth section or a renamed log cannot fall off the end of the list.
+      - name: Shred the working files
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/neon.dump" \
+                 "$RUNNER_TEMP/neon.json" "$RUNNER_TEMP/azure.json" \
+                 "$RUNNER_TEMP/azureapp.json" "$RUNNER_TEMP/role.sql" \
+                 "$RUNNER_TEMP"/restore-*.log "$RUNNER_TEMP/push.log" \
+                 "$RUNNER_TEMP"/*-checksums.txt \
+                 "$RUNNER_TEMP/checksums.sql" "$RUNNER_TEMP/gen-checksums.sql" \
+                 "$RUNNER_TEMP/hold.sql" "$RUNNER_TEMP/hold.fifo" \
+                 "$RUNNER_TEMP/snapshot.id" || true

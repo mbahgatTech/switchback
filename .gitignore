@@ -31,6 +31,18 @@ apps/mobile/android/
 *.mobileprovision
 *.p12
 
+# Azure deployment parameters, belt and braces.
+#
+# `infra/azure/main.bicepparam` holds only non-secret values and is committed; the admin
+# password reaches the deployment through the environment instead. But the shapes below are
+# what someone reaches for when they are in a hurry — a hand-written ARM parameters file or a
+# "just for me" bicepparam — and either one would carry the password that is the *only* thing
+# between the open internet and every user's email and GPS history. Ignored in advance, so
+# the mistake is uncommittable rather than merely discouraged.
+infra/azure/*.local.bicepparam
+infra/azure/*.parameters.json
+infra/azure/*.params.json
+
 # test output
 coverage/
 playwright-report/
