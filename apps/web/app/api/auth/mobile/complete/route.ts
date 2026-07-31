@@ -4,6 +4,7 @@ import {
   developmentSchemesAllowed,
   isAllowedRedirect,
 } from '@switchback/api/mobile-auth';
+import { hashToken } from '@switchback/api/tokens';
 import { prisma } from '@switchback/db';
 import { auth } from '@/auth';
 import { csrfTokenFor, csrfTokenValid } from '@/auth-csrf';
@@ -29,21 +30,27 @@ import { confirmation, notice } from '../_notice';
  * answers it. Minting the code on the GET meant any page anywhere could navigate a signed-in
  * browser here and walk away with a fifteen-minute access token and a sixty-day refresh token,
  * because `SameSite=Lax` sends the session cookie on a top-level cross-site GET — that is
- * precisely what Lax is for. Three things now stand in the way, and each covers a case the
+ * precisely what Lax is for. Four things now stand in the way, and each covers a case the
  * others do not:
  *
+ * - **`Sec-Fetch-Site` on `GET /start`.** The one that makes the other three independent
+ *   rather than jointly satisfiable. Without it an attacker page navigates the victim's own
+ *   browser to `/start` with a challenge the attacker chose: the row is theirs, the binding
+ *   cookie lands in the victim's browser and *matches*, the session is real, and the POST is
+ *   honestly same-origin with an honest CSRF token. Every check below then passes, and only
+ *   the consent click is left. `/start` is a first hop, so the header means what it says.
  * - **The binding cookie.** The row is tied to the browser that ran `/start`, so an attacker
  *   holding their own verifier cannot have a victim's browser authorise it.
  * - **The POST, with the Auth.js CSRF token.** A cross-site form POST does not carry a
  *   `SameSite=Lax` cookie at all, and a same-site page on a sibling subdomain cannot read the
  *   token out of an `HttpOnly` cookie to put in the form.
- * - **`Sec-Fetch-Site`, on the POST only.** Set by the browser, unforgeable from script, and
- *   refused on the POST unless it says the request came from us or from nowhere. It is *not*
- *   checked on the GET, and that is a correction rather than an omission — see the note above
- *   `GET` below, and `fromOurOwnOrigin` in `../_binding.ts`.
+ * - **`Sec-Fetch-Site`, on the POST too.** Set by the browser, unforgeable from script, and
+ *   refused unless the request came from us or from nowhere. It is *not* checked on the GET,
+ *   and that is a correction rather than an omission — see the note above `GET` below, and
+ *   `fromOurOwnOrigin` in `../_binding.ts`.
  *
- * And a person has to press a button that names the device, which is the only one of the four
- * that still helps if the reader is being played some way the other three do not cover.
+ * And a person has to press a button that names the device, which is the only one of the five
+ * that still helps if the reader is being played some way the other four do not cover.
  *
  * **Sign-ins already in flight when this deploys will fail**, with `wrong_browser`: their rows
  * were written before there was a binding to write. They are engineered around rather than
@@ -150,6 +157,14 @@ export async function GET(request: Request): Promise<Response> {
    * Read for two reasons: to fail before the reader presses anything rather than after, and
    * to name the device in the question, which is what makes the question answerable. Nothing
    * is minted here — a GET stays a read.
+   *
+   * The binding is *compared*, not merely counted. Testing `readBindingSecret` for presence
+   * let the one failure this whole change exists to produce — a cookie that does not match —
+   * through to the confirmation, so the reader pressed a button on a request that could never
+   * succeed and got `wrong_browser` from the POST. It also meant an attacker-chosen device
+   * string was rendered under "Sign in to Switchback on …?" on our own origin for a request
+   * with no path to a token. Same expression as `authorizeAuthRequest`, deliberately: two
+   * spellings of one rule is how they come apart.
    */
   const stored = await prisma.mobileAuthRequest.findUnique({
     where: { id: requestId },
@@ -159,7 +174,7 @@ export async function GET(request: Request): Promise<Response> {
   if (stored.claimedAt || stored.codeHash) {
     return await fail(request, requestId, new MobileAuthError('already_claimed'));
   }
-  if (!stored.browserHash || !readBindingSecret(request)) {
+  if (!stored.browserHash || stored.browserHash !== (await hashToken(readBindingSecret(request)))) {
     return await fail(request, requestId, new MobileAuthError('wrong_browser'));
   }
 

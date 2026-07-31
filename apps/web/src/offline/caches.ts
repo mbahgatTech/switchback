@@ -56,6 +56,10 @@ export const MEDIA_CACHE = 'sb-media-v1';
  * So the assets that belong to a download live with the download, on a hand-bumped name, and
  * the shell keeps the build id. `download.ts`'s `storeShell` is the only writer.
  *
+ * That fixes it going forward and not backwards: chunks harvested by a build that shipped
+ * before the split are sitting in `LEGACY_SHELL_CACHE` below, which the split itself makes
+ * sweepable. `adoptLegacyShell` in the worker moves them here first.
+ *
  * **What that costs, said plainly.** These entries are not collected on deploy, so a phone
  * that has downloaded trails across several builds holds a chunk set per build. Two things
  * bound it: the URLs are content-hashed, so re-downloading a trail on the same build stores
@@ -81,6 +85,23 @@ export const ASSET_CACHE = 'sb-assets-v1';
  * they would still be on the old worker.
  */
 export const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
+
+/**
+ * The shell name every build before the split used. Not a cache anything writes — a name the
+ * worker has to empty once, on the way to deleting it.
+ *
+ * `ASSET_CACHE` above describes the bug as a thing that was caught. It was caught late: the
+ * flat `sb-shell-v1` shipped, and `storeShell` wrote downloaded pages' chunks into it, so every
+ * phone holding a download made on the live build has those chunks under this name. Introducing
+ * the build-scoped shell drops it out of `OFFLINE_CACHES`, and `activate` collects anything
+ * under the prefix that is not in that list — which would delete exactly the entries this whole
+ * split exists to protect, on the first upgrade, for the readers who had already paid for them.
+ *
+ * So the worker's `adoptLegacyShell` copies the `/_next/static/*` across before the sweep. It is
+ * declared here for the same reason as everything else in this file: `test/offline-caches.test.ts`
+ * reads the worker as text and fails the build if the two spellings drift.
+ */
+export const LEGACY_SHELL_CACHE = 'sb-shell-v1';
 
 export const OFFLINE_CACHES = [
   TILE_CACHE,

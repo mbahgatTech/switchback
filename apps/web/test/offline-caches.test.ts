@@ -5,6 +5,7 @@ import {
   ASSET_CACHE,
   BUILD_ID,
   CACHE_PREFIX,
+  LEGACY_SHELL_CACHE,
   MEDIA_CACHE,
   OFFLINE_CACHES,
   OFFLINE_FALLBACK_PATH,
@@ -98,6 +99,31 @@ describe('service worker cache names', () => {
     // And the worker has to look there, or the entries are stored and never served: a
     // downloaded page names hashed URLs that no current build serves.
     expect(SW).toMatch(/async function handleStatic[\s\S]*?caches\.open\(ASSET_CACHE\)/u);
+  });
+
+  /**
+   * The half of that regression that had already shipped.
+   *
+   * The test above stops a *future* deploy sweeping a download's chunks. It does nothing for
+   * the downloads already on phones: those were harvested into the flat `sb-shell-v1`, which
+   * scoping the shell to the build drops out of `OFFLINE_CACHES` — so the first activate after
+   * the split deletes them, and `storeShell` runs only inside `downloadTrail`, so nothing puts
+   * them back. The download stays in `PAGE_CACHE` and stops rendering, offline, permanently.
+   *
+   * So the worker has to empty the old name before it collects it, and it must copy into the
+   * cache that is *not* swept.
+   */
+  it('carries a pre-split download’s chunks out of the old shell before sweeping it', () => {
+    expect(literal('LEGACY_SHELL_CACHE')).toBe(LEGACY_SHELL_CACHE);
+    // Not adopted into the keep-list: it is emptied and then collected, not retained.
+    expect(OFFLINE_CACHES).not.toContain(LEGACY_SHELL_CACHE);
+    expect(SW).toMatch(
+      /async function adoptLegacyShell[\s\S]*?caches\.open\(LEGACY_SHELL_CACHE\)[\s\S]*?caches\.open\(ASSET_CACHE\)/u,
+    );
+    // Only the build assets. Shell markup for an older build is refetched on first navigation.
+    expect(SW).toMatch(/adoptLegacyShell[\s\S]*?startsWith\('\/_next\/static\/'\)/u);
+    // And before the delete pass, or the copy reads a cache that is already gone.
+    expect(SW).toMatch(/adoptLegacyShell\(\)[\s\S]*?caches\.delete\(name\)/u);
   });
 
   it('takes the build id from the URL it was registered with', () => {

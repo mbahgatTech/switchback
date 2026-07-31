@@ -52,6 +52,24 @@ const BUILD_ID = new URL(self.location.href).searchParams.get('v') || 'dev';
  * must not delete the map somebody took onto a hill, nor the code that draws it.
  */
 const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
+/**
+ * The shell name every build before this one used, kept only long enough to empty it.
+ *
+ * It is not in `OFFLINE_CACHES`, so `activate` collects it — and that is the whole problem.
+ * Until this deploy the shell was the flat `sb-shell-v1` and `download.ts`'s `storeShell`
+ * harvested a *downloaded page's* chunks into it. So every phone that has downloaded a trail
+ * on the live build is holding that trail's `/_next/static/*` in a cache this worker is about
+ * to delete, with nothing to put them back: `storeShell` runs only inside `downloadTrail`, and
+ * `refreshShell` re-puts SHELL_PAGES rather than trail pages. The download would survive in
+ * `PAGE_CACHE` and stop rendering — "This page couldn't load", offline, which is verbatim the
+ * failure `ASSET_CACHE` exists to prevent.
+ *
+ * So `adoptLegacyShell` moves the build assets across before the sweep runs. One release of
+ * that is enough — nothing writes this name any more — but it costs a `caches.keys()` on an
+ * activate that already calls one, so it stays until somebody can show every install has
+ * upgraded, and removing it before then is silent and unrecoverable.
+ */
+const LEGACY_SHELL_CACHE = 'sb-shell-v1';
 const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
 const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];
@@ -160,10 +178,59 @@ self.addEventListener('install', (event) => {
   );
 });
 
+/**
+ * Rescue a pre-existing download's build assets out of the old flat shell.
+ *
+ * Before this build, `SHELL_CACHE` was the constant `sb-shell-v1` and it held two unrelated
+ * things: this build's precache, and the `/_next/static/*` that `storeShell` harvested for
+ * every trail somebody downloaded. Splitting them — a build-scoped shell, a hand-versioned
+ * `ASSET_CACHE` — is the right shape, but the split alone strands everything already stored:
+ * the old name stops being in `OFFLINE_CACHES` and the sweep below deletes it, chunks and all.
+ *
+ * Only `/_next/static/*` is carried over. The shell *pages* in there are this-build markup for
+ * an older build and are refetched on the first navigation; the chunks cannot be refetched at
+ * all, because a downloaded page names content-hashed URLs no current build serves.
+ *
+ * Everything is guarded and nothing is fatal. A failure here costs one download its offline
+ * rendering, which is the status quo it is trying to improve on; throwing would cost the
+ * activate, and with it `clients.claim()` and the sweep.
+ */
+async function adoptLegacyShell() {
+  const names = await caches.keys();
+  if (!names.includes(LEGACY_SHELL_CACHE) || OFFLINE_CACHES.includes(LEGACY_SHELL_CACHE)) return;
+
+  const old = await caches.open(LEGACY_SHELL_CACHE);
+  const assets = await caches.open(ASSET_CACHE);
+
+  for (const request of await old.keys()) {
+    let pathname;
+    try {
+      const url = new URL(request.url);
+      if (url.origin !== self.location.origin) continue;
+      pathname = url.pathname;
+    } catch {
+      continue;
+    }
+    if (!pathname.startsWith('/_next/static/')) continue;
+
+    try {
+      // Content-hashed, so an entry already held is the same bytes. Skipping it keeps a
+      // second activate cheap rather than rewriting the whole set.
+      if (await assets.match(request, { ignoreVary: true })) continue;
+      const response = await old.match(request);
+      if (response) await assets.put(request, response);
+    } catch {
+      // One asset lost, not the pass. The rest of the page's chunks are still worth moving.
+    }
+  }
+}
+
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches
-      .keys()
+    // Before the sweep, and sequentially: the cache it reads is the one the sweep deletes.
+    adoptLegacyShell()
+      .catch(() => undefined)
+      .then(() => caches.keys())
       .then((names) =>
         Promise.all(
           names

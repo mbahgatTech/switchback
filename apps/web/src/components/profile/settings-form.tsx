@@ -436,9 +436,10 @@ function Devices() {
           {signOut.isPending ? 'Signing out…' : 'Sign out everywhere'}
         </button>
         <span className="max-w-measure text-caption text-ink-muted">
-          Ends every session on the account — every app, every browser, and this one. You will land
-          on the sign-in page and have to sign in again here. Anything recorded but not yet synced
-          stays on the device.
+          Ends every session on the account — every app, every browser, and this one. An app that is
+          already open stops working on its next request rather than in fifteen minutes. You will
+          land on the sign-in page and have to sign in again here. Anything recorded but not yet
+          synced stays on the device.
         </span>
       </div>
     </Section>

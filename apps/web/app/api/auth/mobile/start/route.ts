@@ -5,7 +5,7 @@ import {
   startAuthRequest,
 } from '@switchback/api/mobile-auth';
 import { prisma } from '@switchback/db';
-import { bindingCookie } from '../_binding';
+import { bindingCookie, fromOurOwnOrigin } from '../_binding';
 import { notice } from '../_notice';
 
 /**
@@ -27,7 +27,45 @@ import { notice } from '../_notice';
  */
 export const runtime = 'nodejs';
 
+/**
+ * Shown when something other than the app or our own pages opened this.
+ *
+ * The reader is on a page they did not ask for, in a browser sheet with no navigation, so the
+ * sentence has to end somewhere they can act: the app.
+ */
+const CROSS_SITE = {
+  heading: 'That sign-in did not come from this site',
+  body: 'Another page sent your browser here, so nothing was started. Close this and start again from the app.',
+};
+
 export async function GET(request: Request): Promise<Response> {
+  /*
+   * **The binding is only a binding if the attacker cannot choose which browser gets it.**
+   *
+   * The three guards on `/complete` were reasoned about as independent, and they are not,
+   * because all three can be satisfied at once by running the whole chain inside the victim's
+   * browser — which an attacker page can do from here, with one `location =`. The row is
+   * created with a `challenge` they chose, so they hold the verifier; the 302's `Set-Cookie`
+   * is accepted because a `SameSite=Lax` cookie set on a top-level navigation response is;
+   * `safeCallback` preserves the query, so a signed-in visitor is carried straight through
+   * `/signin` into `GET /complete`; and by then the binding cookie *matches*, the session is
+   * real, and the POST is genuinely same-origin with a genuine CSRF token. Everything after
+   * this point passes. The only thing left standing between the victim and a sixty-day token
+   * on their account is whether they read the confirmation button before pressing it.
+   *
+   * `Sec-Fetch-Site` closes it here and cannot close it anywhere later. This is the first hop
+   * — the browser is opened at this URL, or follows a link from one of our pages — so the
+   * header describes the thing that actually started the navigation. The redirect-chain
+   * degradation documented on `fromOurOwnOrigin` and on `GET /complete` is a property of being
+   * a redirect *target*, which this is not: `/complete` reads `cross-site` because the honest
+   * chain runs through Microsoft, and nothing legitimate reaches `/start` through anybody.
+   *
+   * Measured: the app opening the system browser arrives as `none`, a link from our own pages
+   * as `same-origin`, an attacker's `location =` as `cross-site`. `fromOurOwnOrigin` admits
+   * the first two and a header-less non-browser client, and refuses the third.
+   */
+  if (!fromOurOwnOrigin(request)) return notice(403, CROSS_SITE.heading, CROSS_SITE.body);
+
   const params = new URL(request.url).searchParams;
   const redirectUri = params.get('redirect') ?? '';
   const challenge = params.get('challenge') ?? '';

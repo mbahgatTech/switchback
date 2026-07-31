@@ -36,6 +36,12 @@ const ROUTE = readFileSync(
   'utf8',
 ).replace(/\r\n/gu, '\n');
 
+/** The first leg, read the same way and normalised for the same reason. */
+const START = readFileSync(
+  fileURLToPath(new URL('../app/api/auth/mobile/start/route.ts', import.meta.url)),
+  'utf8',
+).replace(/\r\n/gu, '\n');
+
 /** The source of one exported handler, from its `export` to the next top-level `}`. */
 function handler(name: 'GET' | 'POST'): string {
   const start = ROUTE.indexOf(`export async function ${name}(`);
@@ -64,8 +70,56 @@ describe('the origin guard on /api/auth/mobile/complete', () => {
   it('mints nothing on the GET', () => {
     // The whole reason dropping the header check costs nothing: this leg has no credential
     // to hand out. `authorizeAuthRequest` is the thing that mints, and it is POST-only.
-    expect(handler('GET')).not.toMatch(/authorizeAuthRequest/u);
-    expect(handler('POST')).toMatch(/authorizeAuthRequest/u);
+    //
+    // The call, not the name: the GET's own comments cite the function to explain that its
+    // binding check is spelled the same way, and a bare word match reads that as a call.
+    expect(handler('GET')).not.toMatch(/authorizeAuthRequest\(/u);
+    expect(handler('POST')).toMatch(/authorizeAuthRequest\(/u);
+  });
+
+  it('compares the binding on the GET rather than testing it for presence', () => {
+    /*
+     * `!readBindingSecret(request)` asks only whether a cookie is there. That let the one
+     * failure the binding exists to produce — a cookie belonging to a different row — reach
+     * the confirmation page: the reader pressed the button and got `wrong_browser` from the
+     * POST, and an attacker-chosen device name was rendered on our own origin for a request
+     * that could never mint anything. Same expression as `authorizeAuthRequest`, so the two
+     * legs cannot come apart.
+     */
+    expect(handler('GET')).toMatch(
+      /stored\.browserHash !== \(await hashToken\(readBindingSecret\(request\)\)\)/u,
+    );
+  });
+});
+
+/**
+ * The guard that makes the ones above independent of each other.
+ *
+ * Every check on `/complete` can be satisfied at once if the attacker gets to choose which
+ * browser runs `/start`: the row carries a challenge they picked, so they hold the verifier;
+ * the 302's `Set-Cookie` is accepted by the victim's browser because a `SameSite=Lax` cookie
+ * set on a top-level navigation response is; `safeCallback` preserves the `request` id through
+ * `/signin`; and the confirmation POST is then honestly same-origin, with an honest CSRF token
+ * and a binding cookie that genuinely matches. Three guards, all green, one consent click from
+ * a sixty-day refresh token on somebody else's account.
+ *
+ * `/start` is the first hop of that chain — the app opens the browser at it (`none`) or one of
+ * our pages links to it (`same-origin`) — so `Sec-Fetch-Site` describes the thing that really
+ * started the navigation, and the redirect-chain degradation that forced the guard off
+ * `GET /complete` does not apply.
+ */
+describe('the origin guard on /api/auth/mobile/start', () => {
+  it('gates the GET, which is the first hop and not a redirect target', () => {
+    expect(START).toMatch(/if \(!fromOurOwnOrigin\(request\)\)/u);
+  });
+
+  it('refuses before it writes a row', () => {
+    // The point is that the attacker never gets a row bound to the victim's browser. A guard
+    // after `startAuthRequest` would still create one and still set the cookie.
+    const guard = START.indexOf('fromOurOwnOrigin(request)');
+    const create = START.indexOf('startAuthRequest(');
+    expect(guard).toBeGreaterThan(-1);
+    expect(create).toBeGreaterThan(guard);
   });
 });
 

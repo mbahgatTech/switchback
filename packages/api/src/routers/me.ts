@@ -115,8 +115,8 @@ export const meRouter = router({
   }),
 
   /**
-   * Ends every session this account has, everywhere: the native refresh tokens *and* the
-   * browser session rows.
+   * Ends every session this account has, everywhere: the native refresh tokens, the browser
+   * session rows, and the access tokens already handed out.
    *
    * The browsers used to be left out, which made the name a lie. `auth.ts` picks database
    * sessions over JWT with the argument that "a session row can be deleted, so 'this account
@@ -125,19 +125,43 @@ export const meRouter = router({
    * was good for. Reaching for this is reaching for the compromise button; the phones are not
    * the only place an attacker could be.
    *
+   * **The access tokens were the other half of the same lie.** They are JWTs and nothing
+   * stores them, so deleting rows could not touch one already in a client's memory: the copy
+   * on a stolen phone kept working for up to `ACCESS_TOKEN_TTL_S` — fifteen minutes of reading
+   * Lifeline positions and deleting activities — while the screen said every session had
+   * ended. `User.sessionsRevokedAt` is the stamp that closes it, and `createContext` refuses
+   * any bearer token issued at or before it. It is set *first*, so there is no instant in
+   * which the tokens are still honoured and the rows are already gone.
+   *
    * **It signs out the caller's own browser too**, because that browser is one of the
    * sessions and there is no way to tell it apart from the one being taken back. The client
    * says so before the press and lands on the sign-in page after it — a page that still looks
    * signed in while every request from it fails is worse than an extra sign-in.
    *
-   * Both counts are read before the delete, so the numbers describe what was ended rather
-   * than what is left.
+   * **Both counts are of things that were live**, not of rows that happened to exist. They are
+   * read before the delete, and they carry the same expiry filters as `devices` below, because
+   * they are read out on the receipt the person lands on: an expired-but-unpruned refresh token
+   * and a session row from a browser last used in March are not sessions that were ended, and
+   * counting them made the receipt claim a bigger number than the device list on the screen the
+   * reader had just left. Nothing prunes either kind — the drain cron takes refresh tokens and
+   * auth requests, and @auth/core only deletes an expired session when that browser comes back
+   * with its cookie, which a browser that never comes back never does. The deletes stay
+   * unfiltered: clearing dead rows is free and it is the honest thing to do with them.
    */
   signOutEverywhere: protectedProcedure.mutation(async ({ ctx }) => {
+    const now = new Date();
     const [devices, browsers] = await Promise.all([
-      ctx.db.mobileRefreshToken.count({ where: { userId: ctx.user.id, revokedAt: null } }),
-      ctx.db.session.count({ where: { userId: ctx.user.id } }),
+      ctx.db.mobileRefreshToken.count({
+        where: { userId: ctx.user.id, revokedAt: null, expiresAt: { gt: now } },
+      }),
+      ctx.db.session.count({ where: { userId: ctx.user.id, expires: { gt: now } } }),
     ]);
+    // Stamped after the counts rather than with the same clock reading. It only ever moves
+    // later, and later rejects strictly more tokens — the safe direction for this button.
+    await ctx.db.user.update({
+      where: { id: ctx.user.id },
+      data: { sessionsRevokedAt: new Date() },
+    });
     await revokeAllRefreshTokens(ctx.db, ctx.user.id);
     await ctx.db.session.deleteMany({ where: { userId: ctx.user.id } });
     return { devicesSignedOut: devices, browsersSignedOut: browsers };

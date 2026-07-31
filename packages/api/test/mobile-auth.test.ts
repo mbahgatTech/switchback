@@ -179,7 +179,7 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
       deviceName: 'iPhone 15',
     });
 
-    await expect(verifyAccessToken(pair.accessToken)).resolves.toBe(userId);
+    await expect(verifyAccessToken(pair.accessToken)).resolves.toMatchObject({ userId });
     const tokens = await prisma.mobileRefreshToken.findMany({ where: { userId } });
     expect(tokens.some((row) => row.deviceName === 'iPhone 15')).toBe(true);
   });

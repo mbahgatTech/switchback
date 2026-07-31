@@ -486,11 +486,17 @@ function Home({ me }: { me: SelfProfile }) {
 /**
  * Everything holding a credential, including the phone reading this.
  *
- * The website words the same control as "every app has to sign in again" and leaves the
- * browser alone, because a browser session is a cookie the server cannot revoke from here.
- * On the phone the honest wording is the opposite: this device is on the list, so the button
- * signs it out too, and it says so before it is pressed rather than dumping somebody on the
- * sign-in screen a moment after they thought they were tidying up other people's access.
+ * The list is `me.devices`, which is refresh tokens — phones and tablets. The button is
+ * `me.signOutEverywhere`, which is not: it revokes the refresh tokens, deletes the browser
+ * session rows, and stamps the account so access tokens already issued stop being accepted.
+ * The two have to be described separately or the sheet lies by omission. It used to say "this
+ * phone is the only one signed in, so this signs you out here" to somebody with a signed-in
+ * laptop, and take the laptop down too, unannounced and uncounted — the same "discovered after
+ * the press" failure the website's copy was rewritten to stop making.
+ *
+ * The count in the sentence is of phones, because the list is of phones and that is the number
+ * the reader can check. Browsers are named without a number: nothing on this screen knows how
+ * many there are before the press, and inventing one would be worse than saying "any browser".
  */
 function Devices() {
   const trpc = useTRPC();
@@ -540,46 +546,52 @@ function Devices() {
         </View>
       )}
 
-      {list.length > 0 ? (
-        confirming ? (
-          <View style={styles.danger}>
-            <Text style={styles.dangerProse}>
-              {list.length === 1
-                ? 'This phone is the only one signed in, so this signs you out here.'
-                : `All ${list.length} sign out, this phone included.`}{' '}
-              Anything recorded but not yet uploaded stays on the device it was recorded on.
-            </Text>
-            <View style={styles.dangerActions}>
-              <Pressable
-                onPress={() => revoke.mutate()}
-                disabled={revoke.isPending}
-                accessibilityRole="button"
-                style={({ pressed }) => [styles.destructive, pressed ? styles.actionDim : null]}
-              >
-                <Text style={styles.destructiveLabel}>
-                  {revoke.isPending ? 'Signing out…' : 'Sign out everywhere'}
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={() => setConfirming(false)}
-                disabled={revoke.isPending}
-                accessibilityRole="button"
-                style={styles.quiet}
-              >
-                <Text style={styles.quietLabel}>Stay signed in</Text>
-              </Pressable>
-            </View>
+      {confirming ? (
+        <View style={styles.danger}>
+          <Text style={styles.dangerProse}>
+            {list.length === 1
+              ? 'This phone signs out, and so does any browser signed in to this account.'
+              : list.length > 1
+                ? `All ${list.length} phones sign out, this one included, and so does any browser signed in to this account.`
+                : 'Any browser signed in to this account signs out, and this phone with it.'}{' '}
+            Anything recorded but not yet uploaded stays on the device it was recorded on.
+          </Text>
+          <View style={styles.dangerActions}>
+            <Pressable
+              onPress={() => revoke.mutate()}
+              disabled={revoke.isPending}
+              accessibilityRole="button"
+              style={({ pressed }) => [styles.destructive, pressed ? styles.actionDim : null]}
+            >
+              <Text style={styles.destructiveLabel}>
+                {revoke.isPending ? 'Signing out…' : 'Sign out everywhere'}
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setConfirming(false)}
+              disabled={revoke.isPending}
+              accessibilityRole="button"
+              style={styles.quiet}
+            >
+              <Text style={styles.quietLabel}>Stay signed in</Text>
+            </Pressable>
           </View>
-        ) : (
-          <Pressable
-            onPress={() => setConfirming(true)}
-            accessibilityRole="button"
-            style={styles.quiet}
-          >
-            <Text style={styles.quietLabel}>Sign out everywhere</Text>
-          </Pressable>
-        )
-      ) : null}
+        </View>
+      ) : (
+        /*
+         * Offered even with an empty list, which it was not before. The list is phones; the
+         * button now also revokes browsers and live access tokens, so gating it on "a phone is
+         * signed in" hid the compromise control from exactly the reader whose browser is the
+         * thing that was taken. Same reasoning as the web settings form.
+         */
+        <Pressable
+          onPress={() => setConfirming(true)}
+          accessibilityRole="button"
+          style={styles.quiet}
+        >
+          <Text style={styles.quietLabel}>Sign out everywhere</Text>
+        </Pressable>
+      )}
 
       {revoke.isError ? <Text style={styles.error}>{revoke.error.message}</Text> : null}
     </Section>

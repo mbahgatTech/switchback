@@ -213,6 +213,20 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// When "sign out everywhere" was last pressed on this account.
+  ///
+  /// The refresh tokens and the session rows can be deleted; the access JWT cannot, because
+  /// verifying it is a signature check with no database round trip and that is the whole
+  /// reason it is cheap enough to put on every request. So it lived for up to its full fifteen
+  /// minutes after the press — on the one path this button exists for, a stolen phone, the
+  /// thief kept full read/write API access while the owner read "every session on the account
+  /// has ended".
+  ///
+  /// This closes it without giving up the property: `createContext` already loads the user row
+  /// to authenticate a bearer caller, so rejecting a token issued at or before this costs no
+  /// extra query. Null means never pressed, which is almost every row.
+  sessionsRevokedAt DateTime?
+
   accounts    Account[]
   sessions    Session[]
   reviews     Review[]

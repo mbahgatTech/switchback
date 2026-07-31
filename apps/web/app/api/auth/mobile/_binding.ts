@@ -82,9 +82,17 @@ export function clearBindingCookie(request: Request): string {
  * same-origin the last two hops are. `none` is the exception — a browser-initiated navigation
  * stays `none` through any number of redirects.
  *
- * So this must not be used on a redirect target. `POST /complete` is a form submission from a
- * page we rendered, one hop, and is the only caller. `GET /complete` is where Entra's callback
- * sends the browser, and calling this there refused every first-time sign-in with
+ * So this must not be used on a redirect target. It has two callers, and both are first hops:
+ *
+ * - `POST /complete`, a form submission from a page we rendered.
+ * - `GET /start`, which the app opens the system browser at (`none`) or which is reached from
+ *   one of our own pages (`same-origin`). Nothing legitimate arrives there via a redirect. It
+ *   is the hop that makes the guards on `/complete` independent of each other rather than
+ *   jointly satisfiable — without it an attacker page can create the row *and* have the
+ *   victim's browser bound to it, and every later check passes. See the note there.
+ *
+ * `GET /complete` is the counter-example and is deliberately not guarded: it is where Entra's
+ * callback sends the browser, and checking this there refused every first-time sign-in with
  * `cross-site` after the reader had already authenticated — the docblock on the cookie above
  * concedes the same fact about the return leg and the guard did not listen to it.
  */

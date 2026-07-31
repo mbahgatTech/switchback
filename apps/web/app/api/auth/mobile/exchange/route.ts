@@ -95,11 +95,16 @@ export async function POST(request: Request): Promise<Response> {
     if (byEmail) {
       /*
        * Reached only for Apple, which asserts `email_verified` itself. Entra never gets here
-       * now, and this branch is the one to delete once nobody is relying on it — see
-       * `scripts/report-email-linked-accounts.ts`, which counts who that is. It is left
-       * standing deliberately: removing it today would give anyone whose account was reached
-       * this way a fresh empty one on their next sign-in, which looks exactly like losing
-       * everything they had.
+       * now, and this branch is the one to delete once the forward-looking cost is understood
+       * — see `scripts/report-email-linked-accounts.ts`.
+       *
+       * Note what removal does *not* cost, because an earlier comment here had it wrong: the
+       * `account.create` below runs on this path as well as the create path, so anybody linked
+       * this way already has a row keyed on (provider, providerAccountId) and resolves through
+       * the `existing` lookup above on every later sign-in. Deleting these two lines cannot
+       * strand them. What it changes is which future unknown-`sub` sign-ins may link at all —
+       * an Entra user whose browser account has a different `sub` is then permanently 409ed by
+       * the branch above, on a message that promises the device will be added.
        */
       userId = byEmail.id;
     } else {

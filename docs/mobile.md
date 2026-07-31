@@ -89,6 +89,29 @@ Two related rules in the same file:
   this product; being signed out for hiking into a valley is not.
 - Only an HTTP 401 clears it, because only the server can say a token is dead.
 
+### Sign out everywhere really is everywhere
+
+`me.signOutEverywhere` revokes the refresh tokens, deletes the browser `Session` rows, and
+stamps `User.sessionsRevokedAt`. That third one is what makes the sentence on the button true.
+An access token is a JWT that nothing stores — verifying it is a signature check with no
+database round trip, which is the whole reason it is cheap enough to put on every request — so
+deleting rows could not touch a copy already in a client's memory. On the path the button
+exists for, a phone somebody else is now holding, that left the thief up to fifteen minutes of
+authenticated reads and writes after the owner had been told every session had ended.
+
+`createContext` now refuses a bearer token whose `iat` is at or before that stamp. It costs no
+extra query: that request already loads the user row to authenticate the caller.
+
+The reported counts are of things that were **live** — both carry the same expiry filters as
+the `me.devices` list, because they are read back to the person on the sign-in page and a
+number larger than the device list they just looked at is a number that teaches them not to
+trust the screen. Nothing prunes expired `Session` rows (`@auth/core` deletes one only when
+that browser returns with its cookie), so counting rows rather than sessions would have
+inflated it. The deletes stay unfiltered; clearing dead rows is free.
+
+**This needs `npm run db:push` before the deploy**, alongside `MobileAuthRequest.browserHash`.
+A missing column here fails every authenticated request, not just the button.
+
 ### Signing in goes through a browser, on purpose
 
 The obvious approach — `expo-auth-session` opening Entra directly from the app — needs a
@@ -145,9 +168,20 @@ ran `/start` themselves, and therefore holds the verifier, could navigate a vict
 `/complete?request=…` and end up with a token pair on the victim's account. `SameSite=Lax`
 sends the session cookie on a top-level cross-site GET; that is what Lax is for. So:
 
+- `GET /start` refuses a `Sec-Fetch-Site` of `cross-site`. This is the guard that makes the
+  three below independent rather than jointly satisfiable: without it an attacker page sends
+  the victim's own browser to `/start` with a challenge the attacker chose, and then the row is
+  the attacker's, the binding cookie lands in the victim's browser and _matches_, the session
+  is real, and the confirmation POST is honestly same-origin with an honest CSRF token. Every
+  later check passes and only the consent click is left. `/start` is a first hop — the app
+  opens the browser at it (`none`), or one of our pages links to it (`same-origin`) — so the
+  header describes what really started the navigation, and the redirect-chain problem noted
+  below does not apply.
 - `/start` sets a `__Host-` cookie and stores its digest as `browserHash`. A row can only be
   authorised by the browser that opened it.
-- `GET /complete` renders a question naming the device. It mints nothing.
+- `GET /complete` renders a question naming the device. It mints nothing, and it compares the
+  binding cookie against `browserHash` rather than merely checking that one is present — a
+  mismatch has to fail before the button, not after it.
 - `POST /complete` carries the Auth.js CSRF token and is the only thing that mints a code. A
   cross-site form POST does not carry a Lax cookie, and a sibling subdomain cannot read the
   token out of an `HttpOnly` cookie.
@@ -190,17 +224,34 @@ read `email !== null`, which was true whenever an email existed and made the 409
 is the nOAuth pattern, and the answer to it is that only Apple gets to assert a verified
 address.
 
-The email-linking branch itself is still there and deliberately so: an account reached through
-it would, on removal, stop resolving, and its owner's next sign-in would silently create a
-fresh empty account. `scripts/report-email-linked-accounts.ts` counts who that is —
+The email-linking branch itself is still there, but not for the reason this document first
+gave. It said an account reached through the branch would stop resolving on removal and its
+owner's next sign-in would silently create a fresh empty account. That is not what the route
+does: `prisma.account.create` sits outside the inner if/else, so it runs on the link path too,
+and every identity ever linked by email already has its own `Account` row. The next sign-in
+resolves on `(provider, providerAccountId)` and never reaches the email branch again. Removal
+strands nobody.
+
+What removal actually changes is which **future** unknown-`sub` sign-ins may link. The cost is
+forward-looking: an Entra user whose browser account carries a different `sub` gets a permanent
+409 with a message promising "this device will be added to it", and nothing adds it.
+
+`scripts/report-email-linked-accounts.ts` lists the links that were already made, split by
+provider —
 
 ```
 npx tsx --env-file-if-exists=.env scripts/report-email-linked-accounts.ts
 ```
 
+An `apple` row rested on a claim Apple asserts and controls: ordinary linking, no action. A
+`microsoft-entra-id` row rested on the forgeable claim, from the provider the attack was
+written against — each one is a **suspected takeover**, to be reviewed with the account holder
+and reversed (delete the `Account` row, revoke that user's refresh tokens), never "migrated".
+
 Run against production on 2026-07-30 it reported **zero**: no account there has ever been
-created by the native exchange route, so nothing is relying on the branch. Removing it is a
-follow-up, and re-running the script is the check that gates it.
+created by the native exchange route, so there is nothing to review and nothing linked. Removing
+the branch is a follow-up, and what should gate it is a count of the forward-looking 409 case
+above, which this script does not measure.
 
 ---
 
