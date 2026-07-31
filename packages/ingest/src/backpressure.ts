@@ -47,14 +47,21 @@
  * - **Queue depth** is about *time*. A deep queue is not dangerous, it is slow, and the
  *   damage is that every live viewport sits behind hours of ground nobody is looking at.
  * - **Database size** is about *space*, and that one is terminal. Six hundred jobs times
- *   `MAX_TILE_BYTES` is 7.2 GB of fetched OSM against a half-gigabyte Postgres, nothing
- *   reclaims a row, and a full database does not degrade — it stops accepting writes, which
- *   takes sign-in and activity recording down with the map.
+ *   `MAX_TILE_BYTES` is 7.2 GB of fetched OSM, nothing reclaims a row, and a full database
+ *   does not degrade — it stops accepting writes, which takes sign-in and activity recording
+ *   down with the map.
  *
- * The failure mode both produce is the same and is chosen deliberately: **the map stops
- * filling, and says so.** Reads keep working, everything already ingested still draws, and
- * the reader gets a sentence explaining why nothing new is arriving. That is a bad
- * afternoon. A database at 100% is a bad week.
+ * And one number that is deliberately *not* a limit: the derived backlog. It is counted and
+ * logged, never refused on. `DERIVED_QUEUE_WARN_DEPTH` carries the argument, and it is the
+ * one worth reading before adding a third ceiling here — **a ceiling is only honest on a
+ * queue this deploy can drain**, and that is a claim about the drain, not about the size of
+ * the fan-out. Both blockers this module has shipped were the same mistake in different
+ * clothes: a limit whose real denominator was never measured.
+ *
+ * The failure mode both real limits produce is the same and is chosen deliberately: **the
+ * map stops filling, and says so.** Reads keep working, everything already ingested still
+ * draws, and the reader gets a sentence explaining why nothing new is arriving. That is a
+ * bad afternoon. A database at 100% is a bad week.
  */
 
 import { JobKind, JobStatus } from '@switchback/db';
@@ -89,20 +96,18 @@ export const REQUEST_JOB_KINDS = [
 ] as const;
 
 /**
- * The kinds the *drain* produces while running the kinds above. Counted separately.
+ * The kinds the *drain* produces while running the kinds above. Counted, never gated.
  *
  * `enrich_trail` is enqueued once per committed trail by `pipeline.ts`, and `ingest_route`
  * once per superroute — the most expensive job in the package. Neither can be requested;
- * both are fan-out from a tile that was already admitted. Leaving them out of the guard
- * entirely was the same bug the `ingest_network` fix was written to close: production is
- * carrying 5,310 queued `enrich_trail` and 7 queued `ingest_route` against 74 counted
- * request jobs, so the guard was watching 1.4% of its own queue while the other 98.6%
- * wrote photos and metadata into the database the storage half is meant to protect.
+ * both are fan-out from a tile that was already admitted. Leaving them uncounted was the
+ * same bug the `ingest_network` fix was written to close: production is carrying 5,310
+ * queued `enrich_trail` and 7 queued `ingest_route` against 74 counted request jobs, so the
+ * guard was watching 1.4% of its own queue while the other 98.6% wrote photos and metadata
+ * into the database the storage half is meant to protect.
  *
- * They get their own ceiling rather than sharing the six hundred, because sharing it would
- * have refused every ingest in production the moment it deployed — the same shape of
- * blocker the storage half shipped with, and for the same reason: a limit whose real
- * denominator was never measured.
+ * Counting them is right. **Refusing on them was not, and the version of this file that did
+ * so was a shipping blocker** — see `DERIVED_QUEUE_WARN_DEPTH` for the whole argument.
  */
 export const DERIVED_JOB_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as const;
 
@@ -110,20 +115,45 @@ export const DERIVED_JOB_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as
 export const INGEST_JOB_KINDS = [...REQUEST_JOB_KINDS, ...DERIVED_JOB_KINDS] as const;
 
 /**
- * Refuse to queue new ground past this much *fan-out* already waiting.
+ * Say so, once, when the derived backlog is this deep. **This does not refuse anything.**
  *
- * Twenty thousand, anchored on the table it fans out from: production holds 19,157 trails,
- * so this is roughly "every trail we have ever ingested is waiting to be enriched" — the
- * point at which the fan-out has stopped draining rather than merely being deep. Measured
- * fan-out is about 339 trails per z9 tile, so it is also around sixty tiles' worth, which
- * is well past a working backlog and far short of the two hundred thousand a full 600-tile
- * request queue would eventually produce.
+ * It used to, as `MAX_DERIVED_QUEUE_DEPTH = 20_000`, and that was a one-way latch — a
+ * ceiling on a queue this deploy cannot drain. Review caught it; the mechanism is worth
+ * writing down, because the mistake is easy to make again and every individual step of it
+ * looks reasonable.
  *
- * Refusing *requests* on a derived backlog is the intended coupling: that backlog is the
- * write amplification already committed to, and the only lever that reduces it is not
- * adding more ground on top.
+ * Derived jobs are enqueued at `priority: -10` (`pipeline.ts`), the lowest value anything
+ * uses, and `claimJobs` orders `priority DESC, "runAfter" ASC`. So while a single request
+ * job is runnable, a derived job is never claimed at all. The only unscoped drainer in
+ * production is the Vercel cron, which claims `BATCH` jobs on `17 4 * * *` — once a day.
+ * Both inline kicks are `dedupeKeys`-scoped to the tiles they just queued and so cannot
+ * reach a derived job by construction. Net drain rate: a theoretical few jobs a day, a
+ * practical zero whenever request work exists.
+ *
+ * Against that, the arithmetic of the old ceiling: production sat at 5,317 derived jobs of
+ * 20,000, measured fan-out is ~339 `enrich_trail` per z9 tile, and one unauthenticated
+ * `trails.fetchArea` may queue `MAX_AREA_TILES` = 96 tiles. That is ~32,500 derived jobs
+ * from one POST against 14,683 of headroom — 2.2x over, in a single call. Past the ceiling,
+ * `admitIngest` refused *every* enqueue on *every* path, and nothing in the tree could bring
+ * the count back down: a queued job leaves only by running (starved) or by exhausting five
+ * attempts (five cron claims each), and `pruneFinishedJobs` deletes only terminal rows. One
+ * stranger, one request, ingest off product-wide, permanently. The copy made it worse — the
+ * refusal arrived as `'queue-depth'`, so the reader was told to try again in a few minutes
+ * about a backlog that clears in years.
+ *
+ * Two things changed and both were needed. The gate is gone, which is this constant. And
+ * the starvation is fixed: every drain now claims a guaranteed share of derived work
+ * regardless of priority (`drainJobs`' `derivedLimit`, wired into the cron and both inline
+ * kicks), so the backlog moves at the rate the traffic that creates it moves. Write
+ * amplification is the storage half's job — that is the lever with a real denominator now
+ * that production is on Azure with a known quota. See `.env.example`.
+ *
+ * Twenty thousand is kept as the number worth *saying*, on the same anchor it always had:
+ * production holds 19,157 trails, so it is roughly "every trail we have ever ingested is
+ * waiting to be enriched", which is a backlog that has stopped draining rather than one that
+ * is merely deep. A log line is the right response to that. A refusal was not.
  */
-export const MAX_DERIVED_QUEUE_DEPTH = 20_000;
+export const DERIVED_QUEUE_WARN_DEPTH = 20_000;
 
 /**
  * How full the database may get before new ingest is refused.
@@ -137,6 +167,9 @@ export const MAX_STORAGE_FRACTION = 0.85;
 /** How long a database-size reading is trusted. */
 export const STORAGE_CACHE_MS = 60_000;
 
+/** How often the derived backlog may be mentioned in the log. */
+export const DERIVED_WARN_INTERVAL_MS = 10 * 60_000;
+
 /** Why ingest was refused, or `null` when it was not. */
 export type IngestRefusal = 'queue-depth' | 'storage';
 
@@ -148,15 +181,36 @@ interface StorageReading {
 
 let cached: StorageReading | null = null;
 let warnedUnconfigured = false;
+let warnedProbeFailed = false;
+let derivedWarnedAt = Number.NEGATIVE_INFINITY;
 
-/** Test seam: forget the cached database size and the once-only "not configured" warning. */
+/** Test seam: forget the cached database size and the once-only warnings. */
 export function resetStorageCache(): void {
   cached = null;
   warnedUnconfigured = false;
+  warnedProbeFailed = false;
+  derivedWarnedAt = Number.NEGATIVE_INFINITY;
 }
 
 /**
- * The database's size ceiling in bytes, or `null` when nobody has said what it is.
+ * What `DATABASE_SIZE_LIMIT_BYTES` says, as one of three answers rather than two.
+ *
+ * `null` for "unset" and `null` for "unparseable" is the shape this had, and it made the one
+ * log line the storage guard owns actively misdirect the person switching it on: set
+ * `DATABASE_SIZE_LIMIT_BYTES=64GiB`, redeploy, grep the log, read *is unset*, and go looking
+ * for a variable that arrived perfectly intact. `.env.example` presents the ceiling in prose
+ * — "(0.5 GB)", "(10 GB)", "(64 GiB)" beside the raw integers — so a unit suffix is the most
+ * likely thing an operator types, and it is exactly the input that produced the wrong line.
+ *
+ * `Number()` accepts a bare integer and nothing else useful here: `32GB`, `64GiB`, `32 GB`,
+ * `34,359,738,368` and `10_737_418_240` are all `NaN`, and `0` and `-1` are non-positive.
+ * All of them are now `invalid`, and `invalid` says so with the value in the message.
+ */
+type LimitReading =
+  { kind: 'ok'; bytes: number } | { kind: 'unset' } | { kind: 'invalid'; raw: string };
+
+/**
+ * The database's size ceiling in bytes, or why there isn't one.
  *
  * A plan property rather than something Postgres will tell us — `pg_database_size` reports
  * what is used, and nothing reports what is allowed — so it has to be written down, and
@@ -175,12 +229,14 @@ export function resetStorageCache(): void {
  * instrument nobody calibrated is not evidence of a full disk. Set it to the real quota of
  * the plan the database is on and the space half starts working. See `.env.example`.
  */
-function databaseLimitBytes(): number | null {
+function databaseLimitBytes(): LimitReading {
   const raw = process.env.DATABASE_SIZE_LIMIT_BYTES;
-  if (raw === undefined || raw.trim() === '') return null;
+  if (raw === undefined || raw.trim() === '') return { kind: 'unset' };
 
   const configured = Number(raw);
-  return Number.isFinite(configured) && configured > 0 ? configured : null;
+  return Number.isFinite(configured) && configured > 0
+    ? { kind: 'ok', bytes: configured }
+    : { kind: 'invalid', raw };
 }
 
 /**
@@ -194,20 +250,32 @@ function databaseLimitBytes(): number | null {
  * Returns `null` when it cannot tell, and the caller treats that as permission. A size probe
  * that fails is a broken instrument, not a full disk, and an instrument failure must not be
  * able to stop the map filling — the depth guard above is the one that has to hold.
+ *
+ * Three states produce `null`, and the log distinguishes all three, because they need three
+ * different actions from whoever is reading it: set the variable, fix the value, or go and
+ * find out why the database will not answer `pg_database_size`. They used to produce one
+ * wrong line and one silence between them.
  */
 async function storageFraction(db: PrismaClient, now: number): Promise<number | null> {
-  const limit = databaseLimitBytes();
-  if (limit === null) {
+  const reading = databaseLimitBytes();
+
+  if (reading.kind !== 'ok') {
     if (!warnedUnconfigured) {
       warnedUnconfigured = true;
       // Once per process, because this runs behind every viewport. An operator who wants the
-      // space guard has to be told it is switched off; one line is enough to say so.
+      // space guard has to be told it is switched off, and told which of the two reasons it
+      // is off for — "unset" printed at a variable that was set is how a five-minute fix
+      // becomes an afternoon in the deployment settings.
       console.warn(
-        'ingest storage guard is off: DATABASE_SIZE_LIMIT_BYTES is unset, so only the queue-depth ceiling applies',
+        reading.kind === 'unset'
+          ? 'ingest storage guard is off: DATABASE_SIZE_LIMIT_BYTES is unset, so only the queue-depth ceiling applies'
+          : `ingest storage guard is off: DATABASE_SIZE_LIMIT_BYTES="${reading.raw}" is not a positive integer of bytes (no units, no separators), so only the queue-depth ceiling applies`,
       );
     }
     return null;
   }
+
+  const limit = reading.bytes;
 
   if (cached && cached.limit === limit && now - cached.readAt < STORAGE_CACHE_MS) {
     return cached.bytes / cached.limit;
@@ -225,11 +293,19 @@ async function storageFraction(db: PrismaClient, now: number): Promise<number | 
 
     cached = { bytes, limit, readAt: now };
     return cached.bytes / cached.limit;
-  } catch {
-    // Deliberately quiet. This runs behind every viewport, and a database refusing the probe
-    // is a database already logging the underlying failure from somewhere far more useful.
-    // A stand-in client without `$queryRaw` lands here too, which is the behaviour we want:
-    // no reading, no opinion.
+  } catch (error) {
+    // Once per process, and only reachable with the variable *set*: somebody asked for this
+    // guard and it is not running. The silent version of this catch meant "configured and
+    // working" and "configured and the probe throws" looked identical from outside — no
+    // line either way — which is the state an operator is least able to diagnose and most
+    // likely to be in, since a stand-in client without `$queryRaw` lands here too.
+    if (!warnedProbeFailed) {
+      warnedProbeFailed = true;
+      console.warn(
+        'ingest storage guard is off: pg_database_size could not be read, so only the queue-depth ceiling applies',
+        error,
+      );
+    }
     return null;
   }
 }
@@ -277,12 +353,16 @@ export async function admitIngest(
     return 'queue-depth';
   }
 
+  // Reported, never refused on. See `DERIVED_QUEUE_WARN_DEPTH` for why gating on this queue
+  // was a latch nothing could unlatch. Rate-limited rather than once-per-process, because a
+  // backlog that crosses the mark at 03:00 and is still over it at noon is worth saying
+  // twice, and this runs behind every viewport.
   const derived = depthOf(DERIVED_JOB_KINDS);
-  if (derived >= MAX_DERIVED_QUEUE_DEPTH) {
+  if (derived >= DERIVED_QUEUE_WARN_DEPTH && now - derivedWarnedAt >= DERIVED_WARN_INTERVAL_MS) {
+    derivedWarnedAt = now;
     console.warn(
-      `ingest refused: ${derived} derived jobs outstanding, at or past the ${MAX_DERIVED_QUEUE_DEPTH} ceiling`,
+      `ingest backlog: ${derived} derived jobs outstanding, at or past the ${DERIVED_QUEUE_WARN_DEPTH} mark — enrichment is not keeping up with ingest`,
     );
-    return 'queue-depth';
   }
 
   const fraction = await storageFraction(db, now);

@@ -228,13 +228,15 @@ export const tileCoverageSchema = z.object({
   /** True when the viewport is too large to cover; the client should zoom in. */
   tooLarge: z.boolean(),
   /**
-   * True when ingest was refused, so the tiles this view is missing are not being fetched.
+   * True when ingest was refused, so the *new* ground this view is missing is not coming.
    *
-   * Not the same as "nothing outstanding". `pendingTiles` is empty in both cases, because a
-   * non-empty `pendingTiles` makes the client poll and there is nothing to poll for — but
-   * the reader is owed the difference between a view we hold entirely and one whose fetch
-   * was turned down, so the note says which. Defaulted, so a cached response from before
-   * this field existed still parses.
+   * Not the same as "nothing outstanding". The refused tiles are kept out of `pendingTiles`,
+   * because a non-empty `pendingTiles` makes the client poll and there would be nothing to
+   * poll for — but the reader is owed the difference between a view we hold entirely and one
+   * whose fetch was turned down, so the note says which. Tiles this viewport already had a
+   * job for are unaffected: they stay in `pendingTiles`, they are still coming, and the poll
+   * that watches them keeps running. Defaulted, so a cached response from before this field
+   * existed still parses.
    */
   busy: z.boolean().default(false),
   /**

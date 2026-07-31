@@ -19,7 +19,7 @@ import { JobKind, JobStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   DERIVED_JOB_KINDS,
-  MAX_DERIVED_QUEUE_DEPTH,
+  DERIVED_QUEUE_WARN_DEPTH,
   MAX_STORAGE_FRACTION,
   MAX_TILE_QUEUE_DEPTH,
   REQUEST_JOB_KINDS,
@@ -31,6 +31,9 @@ import { ensureNetworkCoverage, queueNetworkTiles } from '../src/network';
 
 /** A bbox small enough to need exactly one tile at either zoom. */
 const ONE_TILE: [number, number, number, number] = [-4.08, 53.06, -4.07, 53.07];
+
+/** The single z9 quadkey `ONE_TILE` covers. */
+const ONE_TILE_KEY = '031311230';
 
 /** A ceiling to measure fractions against, since there is no default any more. */
 const LIMIT = 512 * 1024 * 1024;
@@ -54,6 +57,8 @@ interface FakeOptions {
   derived?: number;
   /** Bytes `pg_database_size` reports. Omit for a client that has no `$queryRaw` at all. */
   databaseBytes?: number;
+  /** Quadkeys whose `ingest_tile` job is already queued or running. */
+  inFlight?: readonly string[];
 }
 
 function fakeDb(options: FakeOptions = {}): { db: PrismaClient; recorded: Recorded } {
@@ -75,7 +80,14 @@ function fakeDb(options: FakeOptions = {}): { db: PrismaClient; recorded: Record
       },
     },
     ingestJob: {
-      findMany: () => Promise.resolve([]),
+      // What `ensureCoverage` and `surveyArea` read to tell "nobody has asked for this tile"
+      // apart from "somebody asked and it is coming".
+      findMany: () =>
+        Promise.resolve(
+          (options.inFlight ?? []).map((quadkey) => ({
+            dedupeKey: `${JobKind.ingest_tile}:${quadkey}`,
+          })),
+        ),
       groupBy: ({ where }: { where: GroupByCall }) => {
         recorded.groupBys.push(where);
         return Promise.resolve([
@@ -163,11 +175,42 @@ describe('queue depth', () => {
     expect(kinds).toContain(JobKind.ingest_route);
   });
 
-  it('refuses on the derived ceiling with the request queue empty', async () => {
+  it('never refuses on the derived backlog, however deep it gets', async () => {
+    /*
+     * The blocker this replaced. `MAX_DERIVED_QUEUE_DEPTH` refused every enqueue on every
+     * path once the fan-out passed 20,000 — and nothing in the deploy could bring it back
+     * under, because derived jobs sit at `priority: -10` under a `priority DESC` claim, the
+     * only unscoped drainer is a once-a-day cron, and both inline kicks are dedupe-scoped to
+     * tile keys. One unauthenticated `fetchArea` over dense ground crossed it in a single
+     * call and ingest was off product-wide, permanently.
+     *
+     * A hundred times the mark, and it still admits. If somebody re-adds a derived ceiling
+     * this fails, which is the point: the next one has to come with a drain that can empty
+     * it. See `DERIVED_QUEUE_WARN_DEPTH`.
+     */
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const { db } = fakeDb({ depth: 0, derived: MAX_DERIVED_QUEUE_DEPTH });
+    const { db, recorded } = fakeDb({ depth: 0, derived: DERIVED_QUEUE_WARN_DEPTH * 100 });
 
-    expect(await admitIngest(db)).toBe('queue-depth');
+    expect(await admitIngest(db)).toBeNull();
+    expect((await queueTiles(db, ['0213012'])).queued).toEqual(['0213012']);
+    expect(recorded.jobUpserts).toBe(1);
+  });
+
+  it('says the derived backlog out loud without calling it a refusal', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { db } = fakeDb({ depth: 0, derived: DERIVED_QUEUE_WARN_DEPTH + 11 });
+
+    await admitIngest(db);
+
+    // Named number, like every other line this module logs. And not the word "refused",
+    // because nothing was: an operator grepping for refusals must not find this. Found by
+    // content rather than by position — the storage guard logs its own "switched off" line
+    // from the same call, and which lands last is not this test's subject.
+    const line = String(
+      warn.mock.calls.find((call) => String(call[0]).includes('derived jobs'))?.[0],
+    );
+    expect(line).toContain(String(DERIVED_QUEUE_WARN_DEPTH + 11));
+    expect(line).not.toContain('refused');
   });
 
   it('does not judge a derived backlog against the request ceiling', async () => {
@@ -255,6 +298,53 @@ describe('storage headroom', () => {
     expect(offLines).toHaveLength(1);
   });
 
+  /**
+   * The line an operator reads on the one day they touch this variable.
+   *
+   * `.env.example` prints the ceiling in prose — "(0.5 GB)", "(64 GiB)" — beside the raw
+   * integers, so a unit suffix is the likeliest thing anyone types, and `Number()` rejects
+   * every one of them. Reporting a set-but-rejected value as "unset" sends the reader to the
+   * deployment settings to look for a variable that arrived perfectly intact.
+   */
+  it.each(['64GiB', '32 GB', '34,359,738,368', '10_737_418_240', '0', '-1'])(
+    'calls %s invalid rather than unset',
+    async (raw) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      process.env.DATABASE_SIZE_LIMIT_BYTES = raw;
+      const { db } = fakeDb({ databaseBytes: LIMIT });
+
+      // Still admits: a value nobody can parse is not evidence of a full disk, so the guard
+      // fails open exactly as it does when unset. Only the sentence differs.
+      expect(await admitIngest(db)).toBeNull();
+
+      const line = String(
+        warn.mock.calls.find((call) => String(call[0]).includes('DATABASE_SIZE_LIMIT_BYTES'))?.[0],
+      );
+      expect(line).toContain(raw);
+      expect(line).not.toContain('unset');
+    },
+  );
+
+  it('says so when the size probe itself fails', async () => {
+    /*
+     * Configured and broken used to look exactly like configured and working — no line
+     * either way — which is the state an operator is least able to diagnose. Failing open
+     * is right; failing open in silence is not.
+     */
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    process.env.DATABASE_SIZE_LIMIT_BYTES = String(LIMIT);
+    const { db } = fakeDb();
+
+    expect(await admitIngest(db)).toBeNull();
+    expect(await admitIngest(db)).toBeNull();
+
+    const probeLines = warn.mock.calls.filter((call) =>
+      String(call[0]).includes('pg_database_size'),
+    );
+    // Said, and said once — this runs behind every viewport.
+    expect(probeLines).toHaveLength(1);
+  });
+
   it('refuses new ingest above the headroom ceiling once configured', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     process.env.DATABASE_SIZE_LIMIT_BYTES = String(LIMIT);
@@ -319,6 +409,42 @@ describe('what the reader is told', () => {
      * from every open map, for tiles that are never going to arrive.
      */
     expect(coverage.pending).toEqual([]);
+  });
+
+  /**
+   * The other half of that, and the regression it caused.
+   *
+   * Every non-fresh tile went into one bucket, so a tile whose job an earlier admitted
+   * request had already queued was handed to admission along with genuinely new ground. Past
+   * the ceiling the whole set was refused, `pending` was cleared, and the client stopped
+   * polling — for tiles that were in flight and about to land. Under master, with no guard at
+   * all, that reader kept polling and watched the trails appear.
+   *
+   * Refusing them bought nothing either way: `enqueue` upserts on `dedupeKey`, so
+   * re-enqueueing a queued quadkey writes no row.
+   */
+  it('keeps polling for tiles that are already on their way', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH, inFlight: [ONE_TILE_KEY] });
+
+    const coverage = await ensureCoverage(ONE_TILE, { db });
+
+    // The one tile this bbox covers is already queued, so there is no new ground to refuse
+    // and nothing for the ceiling to have an opinion about.
+    expect(coverage.busy).toBe(false);
+    expect(coverage.pending).toEqual([ONE_TILE_KEY]);
+  });
+
+  it('still admits new ground beside tiles that are already coming', async () => {
+    // Below the ceiling the in-flight tile is enqueued anyway — it costs no row and it is
+    // what raises a background refresh's priority when somebody starts looking at it.
+    const { db, recorded } = fakeDb({ inFlight: [ONE_TILE_KEY] });
+
+    const coverage = await ensureCoverage(ONE_TILE, { db });
+
+    expect(coverage.busy).toBe(false);
+    expect(coverage.queued).toEqual([ONE_TILE_KEY]);
+    expect(recorded.jobUpserts).toBe(1);
   });
 
   it('carries which refusal it was, not just that there was one', async () => {

@@ -179,6 +179,17 @@ export const routePlanSchema = z.object({
    * claims. Defaulted, so a response from before this field existed still parses.
    */
   busy: z.boolean().default(false),
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * The trail side has carried this from the start and `/plan` did not, so both refusals
+   * arrived here as one sentence ending "Try the route again later." That is right for a
+   * deep queue and wrong for a full database: nobody can wait out a database that needs an
+   * operator to delete something, and prescribing an action that cannot work is the one
+   * thing this project's error copy is not allowed to do. Defaulted, so a response from
+   * before this field existed still parses.
+   */
+  busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
   /** True when the anchors span more ground than one plan may cover. */
   tooLarge: z.boolean(),
 });

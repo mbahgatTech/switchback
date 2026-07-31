@@ -144,10 +144,19 @@ export function PlanReadout({
          * below — a claim that stretches of the route have no path under them, on ground the
          * server had never looked at. Say what happened instead, and say nothing about the
          * terrain, because nothing about the terrain is known.
+         *
+         * The closing clause splits on the reason, the same way the trail side's coverage
+         * note does. "Try the route again later" is a real instruction for a deep queue and
+         * a false one for a full database — that does not drain on its own, an operator has
+         * to decide what to delete, and telling somebody to wait for it prescribes an action
+         * that cannot work. This branch used to give both refusals the queue's sentence.
          */
         <p className="rounded-hair border border-survey px-md py-sm text-caption text-ink">
           Fetching paths for this ground is paused, so the straight stretches below are not claims
-          about the terrain — they are ground we have not looked at. Try the route again later.
+          about the terrain — they are ground we have not looked at.{' '}
+          {plan.busyReason === 'storage'
+            ? 'There is no room left to store new ground. Paths already mapped still work.'
+            : 'Try the route again later.'}
         </p>
       ) : null}
 

@@ -42,6 +42,22 @@ export const runtime = 'nodejs';
  */
 const BATCH = 4;
 
+/**
+ * Derived jobs claimed alongside, which `BATCH` would never reach on its own.
+ *
+ * `claimJobs` orders by `priority DESC` and `enrich_trail`/`ingest_route` are enqueued at
+ * `-10`, so a plain batch takes one only when the rest of the table is empty. This is a
+ * separate, kind-scoped claim — see `drainJobs` — and six is what fits: an enrichment is a
+ * lookup and an image fetch rather than an Overpass query, so it costs a second or two
+ * against the twenty-odd seconds `BATCH` leaves spare.
+ *
+ * Six a day is not the drain rate and is not meant to be. On a schedule Hobby caps at daily,
+ * the rate that matters comes from the inline `waitUntil` kicks, which take their own share
+ * on every map request that finds new ground — the backlog falls with traffic, which is what
+ * it rises with. This is the backstop for a deploy nobody is looking at.
+ */
+const DERIVED_BATCH = 6;
+
 /** Vercel's cron scheduler will not wait longer than this, and neither should we. */
 export const maxDuration = 60;
 
@@ -167,7 +183,7 @@ export async function GET(req: Request): Promise<Response> {
 
   const started = Date.now();
   const [result, swept, orphans, lifelines, jobs] = await Promise.all([
-    drainIngest({ limit: BATCH, workerId: 'cron' }),
+    drainIngest({ limit: BATCH, derivedLimit: DERIVED_BATCH, workerId: 'cron' }),
     sweepCredentials(),
     sweepOrphans(),
     sweepLifelines(),

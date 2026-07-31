@@ -133,6 +133,11 @@ export interface ClaimedJob {
  * falls through to `runAfter` and the oldest wins. Without this, panning to a new valley
  * starts four tiles from a viewport somebody left an hour ago and the one being watched
  * waits behind them — the work is not lost, it is merely never the work you are waiting on.
+ *
+ * `kinds` narrows it the other way, and exists for one reason: `ORDER BY priority DESC` is
+ * a starvation order, not a fairness order. Derived work is enqueued at `-10`, so while any
+ * request job is runnable a derived job is never claimed at all — see `drainJobs`, which
+ * uses this to reserve a share for them.
  */
 export async function claimJobs(
   db: Db,
@@ -140,6 +145,7 @@ export async function claimJobs(
   limit = 4,
   now = new Date(),
   dedupeKeys?: readonly string[],
+  kinds?: readonly JobKind[],
 ): Promise<ClaimedJob[]> {
   const lockCutoff = new Date(now.getTime() - LOCK_TIMEOUT_MS);
   // An empty array is a caller with nothing to ask for, not a caller asking for anything —
@@ -150,6 +156,14 @@ export async function claimJobs(
       : dedupeKeys.length === 0
         ? Prisma.sql`AND false`
         : Prisma.sql`AND "dedupeKey" IN (${Prisma.join([...dedupeKeys])})`;
+
+  // Same rule for the kind filter, for the same reason.
+  const kindScope =
+    kinds === undefined
+      ? Prisma.empty
+      : kinds.length === 0
+        ? Prisma.sql`AND false`
+        : Prisma.sql`AND kind::text IN (${Prisma.join(kinds.map(String))})`;
 
   const rows = await db.$queryRaw<
     Array<{
@@ -171,6 +185,7 @@ export async function claimJobs(
        WHERE ((status = 'queued'  AND "runAfter" <= ${now})
            OR (status = 'running' AND "lockedAt" < ${lockCutoff}))
        ${scope}
+       ${kindScope}
        ORDER BY priority DESC, "runAfter" ASC
        LIMIT ${limit}
        FOR UPDATE SKIP LOCKED
@@ -268,7 +283,20 @@ export interface DrainResult {
   failed: number;
   /** Claimed but handed back untried — a kind this build has no handler for. */
   deferred: number;
+  /** How many of `claimed` came from the reserved derived share. */
+  derived: number;
 }
+
+/**
+ * The kinds `drainJobs` will reserve a share for.
+ *
+ * Duplicated from `backpressure.ts` rather than imported, and the duplication is the point:
+ * that module is about admission and this one is about execution, and making execution
+ * depend on the guard's list would be a cycle (`backpressure` → `coverage` → `jobs`). They
+ * are the same two kinds for the same reason — both are fan-out enqueued at `-10` — and if a
+ * third derived kind is ever added it belongs in both lists.
+ */
+const DERIVED_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as const;
 
 /**
  * Claim and run a batch of jobs.
@@ -282,6 +310,17 @@ export interface DrainResult {
  * than one drain can be running: the ceiling that matters is `commitGate` in `pipeline.ts`,
  * and the pool all of it draws from is `backgroundPrisma`, which is not the pool serving
  * requests. See `packages/db/src/client.ts` for why those are two pools and not one.
+ *
+ * **`derivedLimit` is a fairness reservation, and without it derived work never runs.**
+ * `claimJobs` orders by `priority DESC`, `pipeline.ts` enqueues `enrich_trail` and
+ * `ingest_route` at `-10`, and every requestable kind is at 0 or above — so a plain claim
+ * takes a derived job only in the moment the whole rest of the table is empty, which on a
+ * live deploy is never. The inline kicks made it stricter still: both scope their claim to
+ * the tile keys they just queued, so they cannot reach a derived job at all. Measured on
+ * this branch, the derived backlog drained at four jobs a day in theory and zero in
+ * practice, while fan-out added ~339 per tile. A second, kind-scoped claim is what turns
+ * that around: it costs one more indexed statement, it runs the same handlers through the
+ * same claim, and it means the backlog now falls at the rate of the traffic that creates it.
  */
 export async function drainJobs(
   handlers: Partial<Record<JobKind, JobHandler>>,
@@ -292,13 +331,26 @@ export async function drainJobs(
     now?: () => Date;
     /** Claim only these units of work. Omitted means "whatever is most important". */
     dedupeKeys?: readonly string[];
+    /** Additionally claim up to this many derived jobs, which priority would never reach. */
+    derivedLimit?: number;
   } = {},
 ): Promise<DrainResult> {
   const db = options.db ?? backgroundPrisma;
   const now = options.now ?? (() => new Date());
   const workerId = options.workerId ?? `drain-${now().toISOString()}`;
 
-  const jobs = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
+  const primary = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
+
+  // Unscoped by `dedupeKey` on purpose: the whole point is to reach work nobody asked for by
+  // name. Claimed after the primary batch so a caller waiting on specific tiles still gets
+  // those first.
+  const derivedLimit = options.derivedLimit ?? 0;
+  const derived =
+    derivedLimit > 0
+      ? await claimJobs(db, workerId, derivedLimit, now(), undefined, DERIVED_KINDS)
+      : [];
+
+  const jobs = [...primary, ...derived];
   let succeeded = 0;
   let failed = 0;
   let deferred = 0;
@@ -323,7 +375,7 @@ export async function drainJobs(
     }
   }
 
-  return { claimed: jobs.length, succeeded, failed, deferred };
+  return { claimed: jobs.length, succeeded, failed, deferred, derived: derived.length };
 }
 
 /** The dedupe key for a tile ingest. Exported so the router can enqueue without importing the pipeline. */

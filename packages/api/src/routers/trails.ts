@@ -482,6 +482,14 @@ let inlineDrain: Promise<unknown> | null = null;
  * takes the *oldest* pending tiles — which are, by construction, the ones nobody is looking
  * at any more. The work all gets done eventually either way; the difference is whether the
  * person waiting is the one it gets done for.
+ *
+ * That scoping is also why `drainIngest` reserves a derived share on top. `dedupeKeys` is a
+ * tile-key list, so this claim cannot reach an `enrich_trail` row by construction; combined
+ * with derived work sitting at `priority: -10` under every requestable kind, the fan-out
+ * these very tiles produce had no drainer in the request path at all. The share is small and
+ * it is a rate, not a rescue — enrichment is not made to keep up with a fan-out of a few
+ * hundred trails per tile, it is made to move at all. See `drainJobs` and
+ * `DERIVED_QUEUE_WARN_DEPTH`.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
   if (!ctx.waitUntil || queued.length === 0 || inlineDrain) return;

@@ -27,6 +27,7 @@ import {
 import { fillGaps } from './elevate';
 import { TerrainSource } from './elevate';
 import { admitIngest } from './backpressure';
+import type { IngestRefusal } from './backpressure';
 import type { QueueOutcome } from './coverage';
 import { enqueue, networkJobKey } from './jobs';
 import { OverpassUnavailableError } from './overpass';
@@ -578,6 +579,17 @@ export interface NetworkCoverage {
    * `planRoute` in the routes router.
    */
   busy: boolean;
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * Carried for the same reason the trail side carries it, and it was dropped here while the
+   * trail side kept it — `queueNetworkTiles` computed the reason, `ensureNetworkCoverage`
+   * read `enqueued.queued` and discarded `enqueued.refused`, and `/plan` ended up with one
+   * sentence for both refusals: "Try the route again later." That is the right instruction
+   * for a deep queue and the wrong one for a full database, which does not drain and which
+   * nobody can wait out. The reason was already computed one frame upstream.
+   */
+  busyReason: IngestRefusal | null;
   tooLarge: boolean;
   requiredTiles: number;
   maxTiles: number;
@@ -615,6 +627,7 @@ export async function ensureNetworkCoverage(
       pending: [],
       queued: [],
       busy: false,
+      busyReason: null,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
@@ -667,6 +680,7 @@ export async function ensureNetworkCoverage(
     pending,
     queued,
     busy,
+    busyReason: busy ? enqueued.refused : null,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,

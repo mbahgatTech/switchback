@@ -75,6 +75,7 @@ import {
   loadNetworkSegments,
   networkJobKey,
 } from '@switchback/ingest';
+import type { IngestRefusal } from '@switchback/ingest';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
@@ -231,7 +232,12 @@ interface PlanOutcome {
   coords: LngLat[];
 }
 
-function emptyPlan(tooLarge: boolean, pendingTiles: number, busy = false): PlanOutcome {
+function emptyPlan(
+  tooLarge: boolean,
+  pendingTiles: number,
+  busy = false,
+  busyReason: IngestRefusal | null = null,
+): PlanOutcome {
   return {
     plan: {
       geometry: null,
@@ -240,6 +246,7 @@ function emptyPlan(tooLarge: boolean, pendingTiles: number, busy = false): PlanO
       legs: [],
       pendingTiles,
       busy,
+      busyReason,
       tooLarge,
     },
     coords: [],
@@ -366,6 +373,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
    * point 3": a claim about the ground, on a screen whose job is to be honest about ground.
    */
   let networkPaused = false;
+  let pausedReason: IngestRefusal | null = null;
 
   if (needsNetwork) {
     const coverage = await ensureNetworkCoverage(padBBox(bboxOf(raw), PLAN_PAD_M), { db: ctx.db });
@@ -373,6 +381,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     kickNetwork(ctx, coverage.queued);
     pendingTiles = coverage.pending.length;
     networkPaused = coverage.busy;
+    pausedReason = coverage.busyReason;
     graph = await graphFor(ctx.db, coverage.ready);
   }
 
@@ -482,7 +491,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     });
   }
 
-  if (coords.length < 2) return emptyPlan(false, pendingTiles, networkPaused);
+  if (coords.length < 2) return emptyPlan(false, pendingTiles, networkPaused, pausedReason);
 
   const lengthM = lineLengthM(coords);
   const dense = buildProfile(coords, ele);
@@ -497,6 +506,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
       legs,
       pendingTiles,
       busy: networkPaused,
+      busyReason: pausedReason,
       tooLarge: false,
     },
     coords,
@@ -756,6 +766,7 @@ export const routesRouter = router({
       // planner actually reads it — this procedure exists to warm tiles and its result is
       // deliberately not rendered. See `backpressure.ts` in @switchback/ingest.
       busy: coverage.busy,
+      busyReason: coverage.busyReason,
       tooLarge: coverage.tooLarge,
       requiredTiles: coverage.requiredTiles,
       maxTiles: coverage.maxTiles,

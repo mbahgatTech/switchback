@@ -107,6 +107,15 @@ function describe(
      * thing to do. A full database does not drain — somebody has to decide what to delete —
      * so telling the reader to wait for it would be prescribing an action that cannot work,
      * which is the one thing an error message must never do.
+     *
+     * Review flagged a third case: `'queue-depth'` also covered the 20,000-job derived
+     * backlog, which is hours-to-days of drain rather than minutes, so this branch was
+     * promising a timescale nobody could hold to. Right, and fixed one layer down instead of
+     * here — the derived ceiling no longer refuses anything at all, because nothing in this
+     * deploy could drain it and a ceiling on an undrainable queue is a latch. See
+     * `DERIVED_QUEUE_WARN_DEPTH` in `backpressure.ts`. So `'queue-depth'` now means only the
+     * 600-job request queue, which does drain in minutes, and the sentence below is true of
+     * every refusal that can reach it. A new reason here needs a new sentence, not this one.
      */
     const why =
       coverage.busyReason === 'storage'
