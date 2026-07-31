@@ -64,6 +64,7 @@ import {
   getPendingReview,
   listPendingReviews,
   subscribeToQueue,
+  type AdoptOutcome,
   type FlushResult,
   type PendingReview,
 } from './queue';
@@ -114,7 +115,7 @@ export interface PendingReviewsApi {
   /** Throw one of yours away. The only path that loses a report, and always a person's choice. */
   discard: (trailId: string) => Promise<void>;
   /** Claim an unattributed report and send it as yourself. */
-  adopt: (trailId: string) => Promise<void>;
+  adopt: (trailId: string, options?: { replace?: boolean }) => Promise<AdoptOutcome>;
   /** Throw an unattributed report away, having decided it is not yours to send. */
   discardUnattributed: (trailId: string) => Promise<void>;
 }
@@ -151,6 +152,7 @@ export function usePendingReviews(): PendingReviewsApi {
         return await flushPendingReviews(send, {
           ...options,
           readerId: writingReader(),
+          stillReader: writingReader,
           force: true,
         });
       } finally {
@@ -179,15 +181,34 @@ export function usePendingReviews(): PendingReviewsApi {
       [refresh],
     ),
     adopt: useCallback(
-      async (trailId: string) => {
+      async (trailId: string, adoptOptions: { replace?: boolean } = {}) => {
         // Nobody is signed in, so there is no name to put on it. The control that calls this
         // is not rendered in that state; the guard is here so the answer cannot depend on it.
         const reader = writingReader();
-        if (reader === null) return;
+        if (reader === null) return 'nothing-to-claim';
         setBusy(true);
         try {
-          await adoptPendingReview(trailId, reader);
-          await flushPendingReviews(send, { trailId, readerId: reader, force: true });
+          const outcome = await adoptPendingReview(trailId, reader, adoptOptions);
+          // The claimer already has a report queued for this trail. Nothing has been written
+          // and nothing may be, until they say which of the two to keep — the caller draws
+          // that question. See `adoptPendingReview`.
+          if (outcome !== 'adopted') return outcome;
+          const result = await flushPendingReviews(send, {
+            trailId,
+            readerId: reader,
+            stillReader: writingReader,
+            force: true,
+          });
+          // Said out loud, on the same reasoning as the hikes below: settling the last
+          // unattributed row takes the button, the row and the whole section off the page, so
+          // silence on success and silence on failure look identical — and to somebody who
+          // cannot see the list disappear, both look like nothing happened.
+          setDrainNotice(
+            result.sent > 0
+              ? 'Posted under your account.'
+              : 'It could not be posted. It is still on this device, now under your account.',
+          );
+          return outcome;
         } finally {
           setBusy(false);
           await refresh();
@@ -254,6 +275,7 @@ export function usePendingReview(trailId: string): PendingReviewApi {
         return await flushPendingReviews(send, {
           trailId,
           readerId: writingReader(),
+          stillReader: writingReader,
           force: true,
         });
       } finally {
@@ -356,6 +378,7 @@ export function usePendingActivities(): PendingActivitiesApi {
         const result = await flushPendingActivities(post, {
           ...options,
           readerId: writingReader(),
+          stillReader: writingReader,
           force: true,
         });
         // Every terminal outcome is said, not only the one that lost something. A press that
@@ -426,7 +449,24 @@ export function usePendingActivities(): PendingActivitiesApi {
         setBusy(true);
         try {
           await adoptPendingActivity(activityId, reader);
-          await flushPendingActivities(post, { activityId, readerId: reader, force: true });
+          const result = await flushPendingActivities(post, {
+            activityId,
+            readerId: reader,
+            stillReader: writingReader,
+            force: true,
+          });
+          // Claiming the last unattributed row removes the button, then the row, then the
+          // whole section — so without this the page answers a press by going quiet and
+          // shorter, which is what a failure looks like too. Same argument as `run` above,
+          // and it carries further here: this screen is about rows whose author is in doubt,
+          // and a claim that could not be sent re-lists the hike elsewhere on the page.
+          if (result.truncated === 0) {
+            setDrainNotice(
+              result.sent > 0
+                ? 'Added to your account.'
+                : 'It could not be added. It is still on this device, now under your account.',
+            );
+          }
         } finally {
           setBusy(false);
           await refresh();

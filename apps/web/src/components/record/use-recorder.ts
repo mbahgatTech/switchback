@@ -19,6 +19,7 @@ import {
 } from '@switchback/geo';
 import { isUnreachable } from '@/offline/queue';
 import { writingReader } from '@/offline/identity';
+import { readerSettled, subscribeToReader } from '@/offline/reader';
 import {
   CHUNK_FIXES,
   chunkKey,
@@ -470,9 +471,27 @@ export function useRecorder({
    * Asynchronous now, so it carries a cancelled flag: the store read can outlive the mount on
    * a fast navigation, and setting state after that is a warning at best and a resurrection of
    * a hike the reader has left at worst.
+   *
+   * **And it waits for the browser to have decided who is here**, the same gate
+   * `SyncQueuedWrites` uses and for the same reason, which bites harder here. `reconcileReader`
+   * is asynchronous and `rememberReader` is its last statement, so on the page where the
+   * account changed `writingReader()` still names the person who left — while this effect,
+   * whose only `await` before reading it is `importLegacyJournal` (which returns at the first
+   * microtask when there is no legacy journal), gets there first every time. That is
+   * deterministic rather than racy, and `/record` is exactly where it lands: a session-less
+   * visitor is sent to `/signin?callbackUrl=/record` and comes straight back, so the first page
+   * a returning hiker sees is this one, with `localStorage` still holding the empty string from
+   * the earlier lapse. `readOpenActivity(null)` matches nothing by design, so a purely-offline
+   * recording would not be restored, Start would mint a fresh id, and the old row would be left
+   * permanently unfinishable on `/downloads`. In the other direction it is worse: the departing
+   * reader's live hike would be resumed into the arriving reader's recorder and claimed.
+   *
+   * Both, rather than either — if the handover has already settled (every ordinary navigation
+   * to `/record`) it runs immediately; otherwise the first announcement runs it.
    */
   useEffect(() => {
     let cancelled = false;
+    let stopWatchingReader: (() => void) | null = null;
 
     const hydrate = async (): Promise<void> => {
       await importLegacyJournal().catch(() => undefined);
@@ -522,9 +541,20 @@ export function useRecorder({
       }
     };
 
-    void hydrate();
+    if (readerSettled()) {
+      void hydrate();
+    } else {
+      stopWatchingReader = subscribeToReader(() => {
+        if (cancelled) return;
+        stopWatchingReader?.();
+        stopWatchingReader = null;
+        void hydrate();
+      });
+    }
+
     return () => {
       cancelled = true;
+      stopWatchingReader?.();
     };
   }, []);
 

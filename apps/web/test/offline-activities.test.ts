@@ -144,12 +144,21 @@ const ID = '6f8b1c2a-3d4e-4f50-9a1b-2c3d4e5f6071';
  */
 const HIKER = 'hiker-a';
 
-/** `flushPendingActivities`, as the one hiker above. See `HIKER`. */
+/**
+ * `flushPendingActivities`, as the one hiker above. See `HIKER`.
+ *
+ * `stillReader` defaults to "the same person all the way through", which is every case except
+ * the ones that deliberately change it mid-drain.
+ */
 function flush(
   post: ActivityPosters,
   options: Partial<FlushActivitiesOptions> = {},
 ): Promise<FlushActivitiesResult> {
-  return flushPendingActivities(post, { readerId: HIKER, ...options });
+  return flushPendingActivities(post, {
+    readerId: HIKER,
+    stillReader: () => HIKER,
+    ...options,
+  });
 }
 
 function fix(t: number): TrackFix {
@@ -721,7 +730,10 @@ describe('a hike belongs to whoever recorded it', () => {
     await markFinished(ID, finishWrite(ID));
 
     const { calls, posters } = recorder();
-    const result = await flushPendingActivities(posters, { readerId: OTHER });
+    const result = await flushPendingActivities(posters, {
+      readerId: OTHER,
+      stillReader: () => OTHER,
+    });
 
     expect(calls).toEqual([]);
     expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
@@ -739,6 +751,7 @@ describe('a hike belongs to whoever recorded it', () => {
     const { calls } = recorder();
     const result = await flushPendingActivities(recorder().posters, {
       readerId: OTHER,
+      stillReader: () => OTHER,
       force: true,
       activityId: ID,
     });
@@ -750,7 +763,10 @@ describe('a hike belongs to whoever recorded it', () => {
   it('goes out the moment its own author is back', async () => {
     await queueHike(ID, 10);
     await markFinished(ID, finishWrite(ID));
-    await flushPendingActivities(recorder().posters, { readerId: OTHER });
+    await flushPendingActivities(recorder().posters, {
+      readerId: OTHER,
+      stillReader: () => OTHER,
+    });
 
     const { calls, posters } = recorder();
     expect(await flush(posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
@@ -764,6 +780,7 @@ describe('a hike belongs to whoever recorded it', () => {
     const { calls } = recorder();
     const result = await flushPendingActivities(recorder().posters, {
       readerId: null,
+      stillReader: () => null,
       force: true,
     });
 
@@ -779,6 +796,81 @@ describe('a hike belongs to whoever recorded it', () => {
     expect(await readOpenActivity(OTHER)).toBeNull();
     expect(await readOpenActivity(null)).toBeNull();
     expect((await readOpenActivity(HIKER))?.header.activityId).toBe(ID);
+  });
+
+  it('stops appending the moment somebody else signs in mid-upload', async () => {
+    // A six-hour hike is forty-odd requests over the one bar at the trailhead: minutes, not an
+    // instant. Pinning the reader when the drain starts leaves every request after the first
+    // carrying whichever session the browser has picked up since.
+    await queueHike(ID, 1_500);
+    await markFinished(ID, finishWrite(ID));
+
+    let here: string | null = HIKER;
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities(
+      {
+        ...posters,
+        append: async (input) => {
+          const outcome = await posters.append(input);
+          here = OTHER;
+          return outcome;
+        },
+      },
+      { readerId: HIKER, stillReader: () => here },
+    );
+
+    // Start and one batch, and then nothing: no second append, and above all no `finish`,
+    // which is the call that publishes the day and logs a completion against the trail.
+    expect(calls).toEqual([`start:${ID}`, 'append:0-499']);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
+
+    // The hike is whole and still the first hiker's, with its progress written so the next
+    // drain run as that person resumes at exactly the batch this one stopped at.
+    const kept = await getPendingActivity(ID);
+    expect(kept?.userId).toBe(HIKER);
+    expect(kept?.sent).toBe(500);
+    expect(kept?.blocked).toBe(false);
+    expect(await readFixes(ID)).toHaveLength(1_500);
+  });
+
+  it('does not finish a hike whose account changed after the last batch landed', async () => {
+    // The narrowest and most expensive window: everything is uploaded and only `finish` is
+    // left, which is the request that adds the day to an account.
+    await queueHike(ID, 400);
+    await markFinished(ID, finishWrite(ID));
+
+    let here: string | null = HIKER;
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities(
+      {
+        ...posters,
+        append: async (input) => {
+          const outcome = await posters.append(input);
+          here = OTHER;
+          return outcome;
+        },
+      },
+      { readerId: HIKER, stillReader: () => here },
+    );
+
+    expect(calls).toEqual([`start:${ID}`, 'append:0-399']);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
+    expect((await getPendingActivity(ID))?.userId).toBe(HIKER);
+  });
+
+  it('does not even announce a hike when the reader changed before the drain reached it', async () => {
+    await queueHike(ID, 10);
+    await markFinished(ID, finishWrite(ID));
+
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities(posters, {
+      readerId: HIKER,
+      stillReader: () => OTHER,
+      force: true,
+    });
+
+    expect(calls).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
   });
 });
 

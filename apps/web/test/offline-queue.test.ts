@@ -144,12 +144,21 @@ function createFakeIndexedDB(seed: Record<string, Array<Record<string, unknown>>
 /** The one hiker every case below runs as, unless it says otherwise. */
 const HIKER = 'hiker-a';
 
-/** `flushPendingReviews`, as that hiker. Ownership gets its own block at the end. */
+/**
+ * `flushPendingReviews`, as that hiker. Ownership gets its own block at the end.
+ *
+ * `stillReader` defaults to "the same person all the way through", which is every case except
+ * the ones that deliberately change it mid-drain.
+ */
 function flush(
   post: (write: ReviewWrite) => Promise<unknown>,
   options: Partial<FlushOptions> = {},
 ): Promise<FlushResult> {
-  return flushPendingReviews(post, { readerId: HIKER, ...options });
+  return flushPendingReviews(post, {
+    readerId: HIKER,
+    stillReader: () => HIKER,
+    ...options,
+  });
 }
 
 const write = (trailId: string, rating: number): ReviewWrite => ({
@@ -376,7 +385,7 @@ describe('a report belongs to whoever wrote it', () => {
         sent.push(payload.trailId);
         return undefined;
       },
-      { readerId: OTHER },
+      { readerId: OTHER, stillReader: () => OTHER },
     );
 
     expect(sent).toEqual([]);
@@ -395,6 +404,7 @@ describe('a report belongs to whoever wrote it', () => {
     // server. It does not override this: whose the report is was never in question.
     const result = await flushPendingReviews(async () => undefined, {
       readerId: OTHER,
+      stillReader: () => OTHER,
       force: true,
       trailId: 'a',
     });
@@ -405,7 +415,10 @@ describe('a report belongs to whoever wrote it', () => {
 
   it('goes out the moment its own author is back', async () => {
     await queue('a', 1_000, HIKER);
-    await flushPendingReviews(async () => undefined, { readerId: OTHER });
+    await flushPendingReviews(async () => undefined, {
+      readerId: OTHER,
+      stillReader: () => OTHER,
+    });
     expect(await flush(async () => undefined)).toEqual({ sent: 1, kept: 0 });
   });
 
@@ -439,11 +452,60 @@ describe('a report belongs to whoever wrote it', () => {
         calls += 1;
         return undefined;
       },
-      { readerId: null, force: true },
+      { readerId: null, stillReader: () => null, force: true },
     );
 
     expect(calls).toBe(0);
     expect(result).toEqual({ sent: 0, kept: 2 });
+  });
+
+  it('stops the moment somebody else signs in part-way through a drain', async () => {
+    // A shared laptop. The first hiker left a tab open with three reports queued; the second
+    // signs in on another tab while the drain is running. From that instant the cookie the
+    // browser attaches is the second person's, and every remaining post would publish the
+    // first person's words under the second person's name.
+    await queue('a', 1_000, HIKER);
+    await queue('b', 2_000, HIKER);
+    await queue('c', 3_000, HIKER);
+
+    let here: string | null = HIKER;
+    const sent: string[] = [];
+    const result = await flushPendingReviews(
+      async (payload) => {
+        sent.push(payload.trailId);
+        if (payload.trailId === 'a') here = 'hiker-b';
+        return undefined;
+      },
+      { readerId: HIKER, stillReader: () => here },
+    );
+
+    // The one in flight when it changed is allowed to land; nothing after it is attempted.
+    expect(sent).toEqual(['a']);
+    expect(result).toEqual({ sent: 1, kept: 2 });
+    // And the two left behind are untouched — no attempt counted, nothing blocked, still the
+    // first hiker's. They go out on the next drain that runs as that person.
+    for (const trailId of ['b', 'c']) {
+      const kept = await getPendingReview(HIKER, trailId);
+      expect(kept?.userId).toBe(HIKER);
+      expect(kept?.attempts).toBe(0);
+      expect(kept?.blocked).toBe(false);
+    }
+  });
+
+  it('sends nothing when the reader changed before the first request', async () => {
+    await queue('a', 1_000, HIKER);
+
+    let calls = 0;
+    const result = await flushPendingReviews(
+      async () => {
+        calls += 1;
+        return undefined;
+      },
+      { readerId: HIKER, stillReader: () => 'hiker-b', force: true },
+    );
+
+    expect(calls).toBe(0);
+    expect(result).toEqual({ sent: 0, kept: 1 });
   });
 });
 
@@ -496,6 +558,43 @@ describe('an unattributed report', () => {
     // row is untouched. A report with an author has one, and no press by anybody changes it.
     expect((await getPendingReview(HIKER, 'a'))?.userId).toBe(HIKER);
     expect(await listPendingReviews()).toHaveLength(1);
+  });
+
+  it('will not be claimed over a report of the claimer own about the same trail', async () => {
+    // Reachable straight out of the v4 upgrade. The migrated draft is unattributed, so the
+    // trail page form — which asks for `getPendingReview(readerId, trailId)` — cannot see it,
+    // and the ordinary thing to do is write the report again. Both rows are then on
+    // `/downloads` at once, in two different sections, about the same hill.
+    await queue('si', 1_000, null);
+    await queue('si', 2_000, HIKER);
+    const mine = await getPendingReview(HIKER, 'si');
+
+    const outcome = await adoptPendingReview('si', HIKER);
+
+    // Owner is half the key, so the claim's destination is exactly where the reader's own row
+    // sits, and an IndexedDB `put` replaces on collision. Refused instead: the newer text is
+    // still there, the older one is still unattributed, and nothing was sent.
+    expect(outcome).toBe('would-replace-your-own');
+    expect(await listPendingReviews()).toHaveLength(2);
+    expect(await getPendingReview(HIKER, 'si')).toEqual(mine);
+    expect((await getPendingReview(null, 'si'))?.userId).toBeNull();
+  });
+
+  it('replaces the claimer own report only when they say to', async () => {
+    await queue('si', 1_000, null);
+    await queue('si', 2_000, HIKER);
+
+    expect(await adoptPendingReview('si', HIKER, { replace: true })).toBe('adopted');
+
+    // One row, the claimed one, under the claimer. This is the destructive answer, and it is
+    // reachable only from a second press with both reports named on screen.
+    expect(await listPendingReviews()).toHaveLength(1);
+    expect((await getPendingReview(HIKER, 'si'))?.queuedAt).toBe(1_000);
+    expect(await getPendingReview(null, 'si')).toBeNull();
+  });
+
+  it('says so when there is nothing left to claim', async () => {
+    expect(await adoptPendingReview('si', HIKER)).toBe('nothing-to-claim');
   });
 });
 

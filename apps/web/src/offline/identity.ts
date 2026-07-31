@@ -10,7 +10,7 @@
  * Two facts are kept here and nowhere else.
  *
  * **The remembered reader.** One string in `localStorage`, written only by `ReaderIdentity` in
- * the root layout and only from a page the network actually served. That last clause is the
+ * the root layout and only for an id the origin has just confirmed. That last clause is the
  * load-bearing one: a page served from Cache Storage is the *previous* reader's HTML, so
  * trusting the id in it would let a stale copy re-assert an account that has since gone. What
  * makes reading it safe at all is that `handover.ts` deletes those copies the moment the
@@ -143,6 +143,31 @@ export function forgetReader(): void {
  */
 export function ownedBy(row: { userId: string | null }, readerId: string | null): boolean {
   return row.userId !== null && row.userId === readerId;
+}
+
+/**
+ * Is the browser still acting as the reader a drain started under?
+ *
+ * `ownedBy` answers "may this row go" once. This answers "may it still go" — and the two are
+ * different questions because a drain is not an instant. A six-hour hike is forty-odd requests
+ * over one bar, tens of seconds to minutes of wall clock, and the account the browser is
+ * holding can change in the middle of that: a second tab signs somebody in, or a `storage`
+ * event announces that another document did. The cookie the origin sends is then the new
+ * person's while the drain's own `readerId` is still the old one, so `ownedBy(row, 'A')` stays
+ * true of A's report and it goes up over B's session.
+ *
+ * Pinning the reader once per flush shrinks that window to the length of one drain rather than
+ * closing it. So both drains ask this immediately before every request they make, and stop —
+ * without marking, without blocking, without deleting — the moment the answer is no. Whatever
+ * is left is still on the device, still owned by whoever wrote it, and goes out on the next
+ * drain that runs as that person.
+ *
+ * `ask` is passed in rather than being `writingReader` directly, for the same reason `post` is:
+ * `queue.ts` and `activities.ts` stay plain functions over a store, testable with no
+ * `localStorage` in the environment.
+ */
+export function stillActingAs(readerId: string | null, ask: () => string | null): boolean {
+  return ask() === readerId;
 }
 
 /** A row nobody can be named for: the migration case, and the only one a person is asked about. */

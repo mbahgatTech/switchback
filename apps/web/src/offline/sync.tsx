@@ -41,7 +41,7 @@
  * computer it is the first thing that happens after the next person signs in. It used to post
  * whatever it found over whatever session the browser was holding.
  *
- * **Which reader that is, is read here and not in a render.** Twice over.
+ * **Which reader that is, is read here and not in a render.** Three times over.
  *
  * The value is taken from `localStorage` inside `flush`, so it is the answer at the instant of
  * the request rather than at the last paint. A rendered answer goes stale in two ordinary ways
@@ -50,6 +50,12 @@
  * fires `visibilitychange` on the way back. Both leave a tab whose last render said A while
  * the cookie on its next request says B — and `ownedBy(row, 'A')` is then true of A's report,
  * which goes out over B's session and is deleted from the device on the way.
+ *
+ * And it is handed on, as `stillReader`, so the drains can ask it again themselves. Reading it
+ * once here is only the answer for the *first* request of the flush: draining a six-hour hike
+ * is dozens of requests over minutes, and a sign-in in another tab lands in the middle of that
+ * as easily as before it. The drains re-ask before every request and stop when the answer
+ * changes; see `stillActingAs` in `identity.ts`.
  *
  * And the *first* drain waits for `reader.tsx` to say the browser has settled. `reconcileReader`
  * is asynchronous, so on the page where the account changed, this component mounts while
@@ -93,6 +99,7 @@ export function SyncQueuedWrites() {
       // bar, which is the same reason each drain is sequential inside itself.
       await flushPendingReviews((write: ReviewWrite) => client.reviews.upsert.mutate(write), {
         readerId,
+        stillReader: writingReader,
       });
       await flushPendingActivities(
         {
@@ -100,7 +107,7 @@ export function SyncQueuedWrites() {
           append: (input) => client.activities.append.mutate(input),
           finish: (input) => client.activities.finish.mutate(input),
         },
-        { readerId },
+        { readerId, stillReader: writingReader },
       );
     })().catch(() => {
       // Every failure mode this can produce is already recorded on the row it belongs to,

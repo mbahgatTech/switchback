@@ -22,11 +22,13 @@
  * currently acting as — see `ownedBy` in `identity.ts`. That is the second promise, and it is
  * as strong as the first: on a shared computer a report written by the person who left is
  * kept, marked, and shown to them when they come back, rather than published under the name
- * of the person who arrived.
+ * of the person who arrived. "Currently" is meant literally: who the browser is acting as is
+ * asked again before every single request, not once when the drain starts. See `stillReader`
+ * on `FlushOptions`.
  */
 
 import type { ReviewWrite } from '@switchback/core';
-import { ownedBy } from './identity';
+import { ownedBy, stillActingAs } from './identity';
 import { PENDING_REVIEWS_STORE, reviewKey, run } from './idb';
 
 export { reviewKey };
@@ -196,6 +198,23 @@ export async function releaseReviewsFor(userId: string): Promise<void> {
 }
 
 /**
+ * What claiming an unattributed report did.
+ *
+ * A result rather than `void`, because one of the three outcomes needs a sentence on screen.
+ * See `adoptPendingReview`.
+ */
+export type AdoptOutcome =
+  /** The row now belongs to the claimer and will go out as theirs. */
+  | 'adopted'
+  /** There was no unattributed row for that trail — already claimed, or already discarded. */
+  | 'nothing-to-claim'
+  /**
+   * The claimer already has a queued report for the same trail, and taking this one would
+   * destroy it. Nothing was written; the caller asks the reader which of the two to keep.
+   */
+  | 'would-replace-your-own';
+
+/**
  * Claim an unattributed report as your own, on purpose.
  *
  * The only path by which a row's owner is ever written after the fact, and it exists only to
@@ -206,12 +225,34 @@ export async function releaseReviewsFor(userId: string): Promise<void> {
  * Re-keyed rather than updated in place, because the owner is half the key — so the old row is
  * removed and a new one written. Written first, deleted second: an interruption between the
  * two leaves the report on the device twice, which is recoverable, rather than not at all.
+ *
+ * **And it refuses to write over a report of the claimer's own.** The owner is half the key, so
+ * the destination `reviewKey(userId, trailId)` is exactly where this reader's own queued report
+ * for the same trail already sits — and IndexedDB `put` replaces on a key collision. That state
+ * is not exotic: after the v4 upgrade a migrated draft is unattributed, so the trail page's form
+ * (which asks `getPendingReview(readerId, trailId)`) cannot see it, and the ordinary thing for a
+ * hiker to do is write the report again. Both rows are then on `/downloads` at once — theirs
+ * under "Waiting to post", the migrated one under "We cannot tell whose these are" — and one
+ * press used to delete the newer text and publish the older one in its place, silently. That is
+ * the single outcome this module says at the top it will not produce.
+ *
+ * So the destination is read first and an occupied one is reported back rather than overwritten.
+ * `replace` is the reader's own answer to the question that raises, taken on a second press with
+ * both reports named — never a default, and never inferred.
  */
-export async function adoptPendingReview(trailId: string, userId: string): Promise<void> {
+export async function adoptPendingReview(
+  trailId: string,
+  userId: string,
+  options: { replace?: boolean } = {},
+): Promise<AdoptOutcome> {
   const row = await getPendingReview(null, trailId);
-  if (!row) return;
+  if (!row) return 'nothing-to-claim';
+  if (options.replace !== true && (await getPendingReview(userId, trailId))) {
+    return 'would-replace-your-own';
+  }
   await putPendingReview({ ...row, userId, heldAt: null, blocked: false, lastError: null });
   await deletePendingReview(null, trailId);
+  return 'adopted';
 }
 
 /** A fresh row, for the moment a report is written and cannot be sent. */
@@ -336,6 +377,21 @@ export interface FlushOptions {
    * omission that compiles.
    */
   readerId: string | null;
+  /**
+   * Who the browser is acting as *now*, asked again before every request.
+   *
+   * `readerId` above is pinned when the flush starts. A flush is not an instant — it is one
+   * request per queued row, sequential, over the single bar a hiker has just come back into —
+   * and the account the browser holds can change part-way through it. Then every remaining
+   * `post` carries the new person's cookie while `ownedBy(row, readerId)` is still true of the
+   * old person's report, which is the original defect with a shorter fuse rather than a fixed
+   * one. See `stillActingAs` in `identity.ts` for the sequence in full.
+   *
+   * Required, and required separately from `readerId`, on the same reasoning as `readerId`
+   * itself: a caller that has to supply it has to think about it. Production passes
+   * `writingReader`; a test passes a function returning whatever it is asserting on.
+   */
+  stillReader: () => string | null;
   /** Limit the run to one trail's report — what the "Post it now" button does. */
   trailId?: string;
   /** Include rows the server has already refused. Only ever set by a person retrying. */
@@ -380,6 +436,12 @@ async function drainReviews(
 
   let sent = 0;
   for (const row of queue) {
+    // Asked again for every row, immediately before the request that would send it. The
+    // browser can change hands part-way through a drain, and after that this row's owner and
+    // the cookie the origin will attach are two different people. Break rather than mark: the
+    // report is not at fault, nothing is owed a `blocked`, and it goes out untouched on the
+    // next drain that runs as whoever wrote it. See `stillActingAs` in `identity.ts`.
+    if (!stillActingAs(options.readerId, options.stillReader)) break;
     try {
       await post(row.write);
       await deletePendingReview(row.userId, row.trailId);

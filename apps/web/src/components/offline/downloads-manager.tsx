@@ -169,6 +169,20 @@ export function DownloadsManager() {
   const readerId = useReaderId();
   const status = useRef<HTMLParagraphElement | null>(null);
 
+  /**
+   * The pressed control is about to be destroyed — disabling it has already taken the focus to
+   * `<body>`, and the section it lives in disappears when its queue empties. Focus lands where
+   * the outcome is written instead.
+   *
+   * Given to the unattributed section as well as the queued-hikes one. That section is the
+   * shorter-lived of the two and the argument is stronger there: it appears once per device,
+   * is about rows whose author is in doubt, and settling the last of them removes a button, a
+   * row and a whole heading in one press.
+   */
+  const moveFocusToOutcome = (): void => {
+    status.current?.focus();
+  };
+
   return (
     <>
       {/*
@@ -191,17 +205,14 @@ export function DownloadsManager() {
         {hikes.notice}
       </p>
 
-      <QueuedHikes
-        api={hikes}
-        onSettled={() => {
-          // The pressed control is about to be destroyed — disabling it has already taken the
-          // focus to `<body>`, and the section it lives in disappears when the queue empties.
-          // Focus lands where the outcome is written instead.
-          status.current?.focus();
-        }}
-      />
+      <QueuedHikes api={hikes} onSettled={moveFocusToOutcome} />
       <QueuedReports api={reports} />
-      <Unclaimed hikes={hikes} reports={reports} readerId={readerId} />
+      <Unclaimed
+        hikes={hikes}
+        reports={reports}
+        readerId={readerId}
+        onSettled={moveFocusToOutcome}
+      />
       <HeldForAnother count={hikes.held + reports.held} />
       <Downloads />
     </>
@@ -260,13 +271,25 @@ function Unclaimed({
   hikes,
   reports,
   readerId,
+  onSettled,
 }: {
   hikes: PendingActivitiesApi;
   reports: PendingReviewsApi;
   readerId: string | null;
+  /** Called when a claim or a discard finishes, so focus leaves a control that is about to go. */
+  onSettled: () => void;
 }) {
   const units = useUnits();
   const [confirming, setConfirming] = useState<string | null>(null);
+  /**
+   * The trail whose claim would destroy a report of the reader's own.
+   *
+   * Claiming re-keys the row to `reviewKey(you, trail)`, which is the same key your own queued
+   * report for that trail already occupies — so one of the two has to go, and the device may
+   * not pick. `adopt` refuses and says which case it hit; this holds that answer until the
+   * reader settles it, in the same two-tap grammar the Discard controls use.
+   */
+  const [colliding, setColliding] = useState<string | null>(null);
   const total = hikes.unattributed.length + reports.unattributed.length;
 
   if (total === 0) return null;
@@ -312,7 +335,7 @@ function Unclaimed({
                   type="button"
                   disabled={hikes.busy}
                   onClick={() => {
-                    void hikes.adopt(row.activityId);
+                    void hikes.adopt(row.activityId).finally(onSettled);
                   }}
                   className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
                 >
@@ -325,7 +348,10 @@ function Unclaimed({
                   <button
                     type="button"
                     onClick={() => {
-                      void hikes.discard(row.activityId).finally(() => setConfirming(null));
+                      void hikes.discard(row.activityId).finally(() => {
+                        setConfirming(null);
+                        onSettled();
+                      });
                     }}
                     className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
                   >
@@ -362,12 +388,48 @@ function Unclaimed({
             </Link>
             <span className="collar">A report, written {taken(row.queuedAt)}</span>
             <span className="ml-auto flex flex-wrap items-baseline gap-lg">
-              {readerId === null ? null : (
+              {/*
+               * You already have a report queued for this trail, and the two cannot both be
+               * kept: a report is keyed by trail and author, so claiming this one writes over
+               * yours. Named rather than resolved — the device knows there is a conflict and
+               * cannot know which text the hiker meant.
+               */}
+              {colliding === row.trailId ? (
+                <>
+                  <span className="max-w-measure text-caption text-ink">
+                    You already have a report waiting for this trail. Keep yours, or replace it with
+                    this one.
+                  </span>
+                  <button
+                    type="button"
+                    disabled={reports.busy}
+                    onClick={() => {
+                      void reports.adopt(row.trailId, { replace: true }).finally(() => {
+                        setColliding(null);
+                        onSettled();
+                      });
+                    }}
+                    className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
+                  >
+                    Replace mine
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setColliding(null)}
+                    className={`${BUTTON_COLLAR} ${GHOST} ${HEIGHT.panel} px-sm`}
+                  >
+                    Keep mine
+                  </button>
+                </>
+              ) : readerId === null ? null : (
                 <button
                   type="button"
                   disabled={reports.busy}
                   onClick={() => {
-                    void reports.adopt(row.trailId);
+                    void reports.adopt(row.trailId).then((outcome) => {
+                      if (outcome === 'would-replace-your-own') setColliding(row.trailId);
+                      else onSettled();
+                    });
                   }}
                   className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
                 >
@@ -380,9 +442,10 @@ function Unclaimed({
                   <button
                     type="button"
                     onClick={() => {
-                      void reports
-                        .discardUnattributed(row.trailId)
-                        .finally(() => setConfirming(null));
+                      void reports.discardUnattributed(row.trailId).finally(() => {
+                        setConfirming(null);
+                        onSettled();
+                      });
                     }}
                     className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
                   >
