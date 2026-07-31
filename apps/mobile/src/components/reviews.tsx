@@ -4,7 +4,6 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-nati
 import type { RatingSummary, Review, ReviewSort } from '@switchback/core';
 import {
   REMOVED_NOTICE,
-  REMOVED_NOTICE_OWN,
   REVIEW_SORTS,
   REVIEW_SORT_LABEL,
   formatDateLabel,
@@ -291,8 +290,11 @@ function Row({ review }: { review: Review }) {
          * of the trail's average, so drawing the bar would put the one measurement on this
          * screen that corresponds to nothing — and it would be a rating the page is
          * asserting on behalf of a report it has just withdrawn.
+         *
+         * Keyed off `rating === null`, which is what the server sends on a removed row,
+         * rather than off `hidden`: one value decides, so the two cannot disagree.
          */}
-        {review.hidden ? null : <ScaleBar value={review.rating} />}
+        {review.rating === null ? null : <ScaleBar value={review.rating} />}
         <Text style={styles.rowName} numberOfLines={1}>
           {name}
         </Text>
@@ -310,11 +312,16 @@ function Row({ review }: { review: Review }) {
        * The tombstone, matching the website's. The row stays rather than disappearing,
        * because a report that silently vanishes reads to whoever wrote it as a bug in the
        * app rather than as a decision somebody made — and they are exactly the person who
-       * has to be able to argue with it, which is why their own copy carries the address.
+       * has to be able to argue with it.
+       *
+       * The short notice on every row, including your own. The longer sentence with the
+       * address lives once per screen, in the form slot `ReportForm` renders above this
+       * list, which is where the author arrives to type and where the refusal has to be
+       * explained before they try. Printing it in both places put the identical sentence on
+       * screen twice within one scroll, styled two different ways, which reads as two
+       * decisions about one takedown.
        */}
-      {review.hidden ? (
-        <Text style={styles.rowRemoved}>{review.isMine ? REMOVED_NOTICE_OWN : REMOVED_NOTICE}</Text>
-      ) : null}
+      {review.hidden ? <Text style={styles.rowRemoved}>{REMOVED_NOTICE}</Text> : null}
 
       {review.body === null ? null : <Text style={styles.rowBody}>{review.body}</Text>}
 

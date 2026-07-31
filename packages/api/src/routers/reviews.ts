@@ -137,7 +137,6 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
   return {
     id: row.id,
     trailId: row.trailId,
-    rating: row.rating,
     /*
      * **A hidden report is a tombstone, not a 404 and not a deletion.**
      *
@@ -149,12 +148,25 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
      * replies loses its subject with no explanation.
      *
      * What is stripped is everything the moderator objected to — the prose, the
-     * photographs, the condition chips. What survives is that somebody rated this trail
-     * and when. The rating is *not* counted in the average: `ratingCounts` filters
-     * `hiddenAt: null`, so the number under the histogram already excludes this row. It
-     * stays on the shape only so the tombstone can keep the row's shape without the list
-     * jumping, and nothing renders it.
+     * photographs, the condition chips — and, since a review of this PR, every *number*
+     * the row carried as well. The rule the first pass got wrong is that a value which no
+     * renderer draws is still published: it ships in the JSON, and it can be read off the
+     * row's position in a sorted list even by somebody who never opens the network tab.
+     *
+     * `rating` used to survive here on the reasoning that both renderers decline to draw
+     * it. But `rating_desc` and `rating_asc` order on the database column, so a tombstone
+     * standing first under "Highest rated" and last under "Lowest rated" announced the
+     * withdrawn number without printing it — while `ratingCounts` excluded that same row
+     * from the average, so the page both refused the rating and leaked it. `helpfulCount`
+     * was worse than leaked, it was *drawn*: with `activityType` nulled the footer's
+     * condition collapsed to the count alone, and a removed report printed "3 found this
+     * useful" directly beneath its own tombstone — the page endorsing the report it had
+     * just withdrawn. Roughly eight in nine seeded reviews carry a non-zero count, so that
+     * was the ordinary case rather than an edge.
+     *
+     * What survives is that somebody reported on this trail and when. Nothing numeric.
      */
+    rating: hidden ? null : row.rating,
     body: hidden ? null : row.body,
     hikedOn: toDateString(row.hikedOn),
     // Re-normalised on the way out as well as in. Rows predating this router, or written by
@@ -162,7 +174,7 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
     // reshuffle between two reviews saying the same thing.
     conditions: hidden ? [] : normaliseConditions(row.conditions),
     activityType: hidden ? null : row.activityType,
-    helpfulCount: row.helpfulCount,
+    helpfulCount: hidden ? 0 : row.helpfulCount,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     author: {
@@ -178,6 +190,26 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
 }
 
 /**
+ * Tombstones last, as a block, in every sort whose key a tombstone no longer carries.
+ *
+ * `nulls: 'first'` puts the visible rows (`hiddenAt IS NULL`) ahead of the removed ones, and
+ * the removed ones then fall newest-takedown-first among themselves.
+ *
+ * This is the half of the leak that stripping the shape does not close. `toReview` runs after
+ * Postgres has already sorted, so nulling `rating` on the way out changes what the row *says*
+ * and nothing about where it *stands* — and under `rating_desc` a tombstone in position one
+ * says "five stars" to anybody who can count, as loudly as printing it would. The fix has to
+ * be in the query. Ordering the tombstones into one block at the end means their position
+ * asserts only that they were removed, which is the one thing the page is already saying out
+ * loud.
+ *
+ * Deliberately **not** applied to `recent`. That sort keys on `createdAt`, which the tombstone
+ * still prints on its own face ("Written 15 March"), so there is nothing to leak — and holding
+ * a removed report in its chronological place is the whole point of keeping the row at all.
+ */
+const TOMBSTONES_LAST = { hiddenAt: { sort: 'desc', nulls: 'first' } } as const;
+
+/**
  * Sort orders, each with a full tiebreak chain.
  *
  * The trailing `id` is not decoration. These pages are offset-based, and Postgres is free to
@@ -187,9 +219,9 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
  */
 export const ORDER_BY: Readonly<Record<ReviewSort, Prisma.ReviewOrderByWithRelationInput[]>> = {
   recent: [{ createdAt: 'desc' }, { id: 'desc' }],
-  rating_desc: [{ rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
-  rating_asc: [{ rating: 'asc' }, { createdAt: 'desc' }, { id: 'desc' }],
-  helpful: [{ helpfulCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  rating_desc: [TOMBSTONES_LAST, { rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  rating_asc: [TOMBSTONES_LAST, { rating: 'asc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  helpful: [TOMBSTONES_LAST, { helpfulCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
 };
 
 // ---------------------------------------------------------------------------

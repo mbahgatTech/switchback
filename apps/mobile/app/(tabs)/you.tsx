@@ -4,6 +4,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { ListSummary, UnitSystem, HikeRecord, HikeRegion } from '@switchback/core';
 import {
+  REMOVED_NOTICE_OWN,
   formatBytes,
   formatDateLabel,
   formatDistance,
@@ -55,6 +56,19 @@ export default function YouScreen() {
    * can say how many there are instead of saying "Routes" and making the tap the question.
    */
   const routes = useQuery({ ...trpc.routes.mine.queryOptions(), enabled: signedIn });
+
+  /*
+   * Your own photographs, asked for here only so a takedown has somewhere to appear.
+   *
+   * `photos.mine` is the one query in the product that returns a hidden photograph, and
+   * until this call it had no iOS caller at all — the website rendered the tombstone on
+   * `/profile` and the phone rendered nothing. A removed frame therefore left the trail
+   * gallery and silently took one off the contributed count below (this PR changed
+   * `hikerStats` to exclude hidden rows), with no notice anywhere on the device. That is
+   * exactly the silent disappearance the review tombstone exists to prevent, and half of it
+   * shipped to iOS while this half did not.
+   */
+  const photos = useQuery({ ...trpc.photos.mine.queryOptions({}), enabled: signedIn });
 
   // Downloads belong to the phone, not to the account — they are readable, and removable,
   // whether or not anybody is signed in. Hence a store read rather than a query.
@@ -134,6 +148,9 @@ export default function YouScreen() {
 
   const profile = me.data;
   const record = stats.data;
+  // Hidden ones only. `photos.mine` returns everything you uploaded, and the rest of your
+  // gallery is not this tab's business — the trail screens already show it.
+  const removed = (photos.data ?? []).filter((photo) => photo.hidden);
   const units: UnitSystem = profile.units;
   const name = profile.name ?? (profile.username ? `@${profile.username}` : 'A hiker');
   const since = new Date(profile.createdAt).toLocaleDateString('en-GB', {
@@ -307,6 +324,33 @@ export default function YouScreen() {
           <Text style={styles.actionLabel}>Units, name and who sees your hikes →</Text>
         </Pressable>
       </Block>
+
+      {removed.length > 0 ? (
+        /*
+         * Only the removed frames, and only when there are some.
+         *
+         * The website's `/profile` prints your whole gallery with the taken-down tiles marked
+         * in place. This tab has never had a photo grid — it is the record and the settings —
+         * and inventing one here to carry a notice would be a new feature wearing a
+         * moderation fix as a hat. What the notice actually needs is that the owner is told,
+         * with the address to write to and enough to know which frame it was, which is a
+         * place name. So: the tombstones, named by trail, and nothing when nobody has had
+         * anything removed.
+         *
+         * Survey plate. This is the reader's own standing on the site, which is the one thing
+         * survey is for. The frames are already blank — `toPhoto` stripped url, thumbUrl,
+         * blurhash and caption server-side — so there is no image to draw and nothing here
+         * could print one if it tried.
+         */
+        <Block title="Removed">
+          {removed.map((photo) => (
+            <View key={photo.id} style={styles.removed}>
+              <Text style={styles.removedWhere}>{photo.trail?.name ?? 'A trail'}</Text>
+              <Text style={styles.removedProse}>{REMOVED_NOTICE_OWN}</Text>
+            </View>
+          ))}
+        </Block>
+      ) : null}
 
       {record.reviews > 0 || record.photos > 0 ? (
         <Text style={styles.contributed}>
@@ -575,6 +619,19 @@ const styles = StyleSheet.create({
 
   block: { gap: theme.space.md, marginTop: theme.space.xl },
   blockBody: { gap: theme.space.sm },
+
+  // A hairline in the survey plate around each notice. No fill and no shadow: the border is
+  // what says something is missing here on purpose, and the sentence says who removed it.
+  removed: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.color.survey,
+    borderRadius: theme.radius.hair,
+    paddingHorizontal: theme.space.md,
+    paddingVertical: theme.space.sm,
+    gap: theme.space.xs,
+  },
+  removedWhere: { ...theme.collarLabel, color: theme.color.survey },
+  removedProse: { ...theme.text('caption', { family: 'text' }), color: theme.color.ink },
 
   record: {
     flexDirection: 'row',

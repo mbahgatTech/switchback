@@ -631,13 +631,23 @@ export const photosRouter = router({
    *
    * The trail travels with each row because the answer to "which one was that?" is a place,
    * not an id, and the uploader needs somewhere to click.
+   *
+   * **Removed frames sort first, ahead of the newest visible one.** Hiding does not touch
+   * `createdAt`, so under a plain newest-first order a takedown kept whatever place it always
+   * had — and both callers ask for 24. The quotas make passing 24 ordinary (twelve per trail,
+   * a hundred a day: three trails is enough), so a contributor with thirty photographs whose
+   * twenty-sixth-newest was taken down got a page with no notice anywhere on it, while
+   * `/terms` promises they "will see it marked as removed" on their own profile. A promise
+   * that holds only for recent uploads is not one. `nulls: 'last'` is what does it: the
+   * non-null `hiddenAt` rows come first, newest takedown at the top, and everything still
+   * visible follows in the order it always had.
    */
   mine: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(60).default(24) }))
     .query(async ({ ctx, input }) => {
       const rows = await ctx.db.photo.findMany({
         where: { userId: ctx.user.id },
-        orderBy: [{ createdAt: 'desc' }],
+        orderBy: [{ hiddenAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
         take: input.limit,
         select: { ...photoSelect, trail: { select: { name: true, slug: true } } },
       });

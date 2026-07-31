@@ -12,7 +12,7 @@ import {
 } from '@switchback/core';
 import type { User } from '@switchback/db';
 import { profileUpdateData } from '../src/routers/me';
-import { toReview } from '../src/routers/reviews';
+import { ORDER_BY, toReview } from '../src/routers/reviews';
 import { appRouter } from '../src/root';
 import { createCallerFactory } from '../src/trpc';
 import type { Context } from '../src/context';
@@ -257,7 +257,7 @@ const REVIEW_ROW = {
   hikedOn: new Date('2026-03-14T00:00:00Z') as Date | null,
   conditions: ['muddy'] as TrailCondition[],
   activityType: 'hiking' as ActivityType | null,
-  helpfulCount: 0,
+  helpfulCount: 3,
   createdAt: new Date('2026-03-15T09:04:00Z'),
   updatedAt: new Date('2026-03-15T09:04:00Z'),
   hiddenAt: null as Date | null,
@@ -299,12 +299,53 @@ describe('a hidden review is a tombstone', () => {
     expect(JSON.stringify(shape)).not.toContain('libellous');
   });
 
+  it('carries none of its numbers either', () => {
+    /*
+     * The half the first pass missed, and the reason the fixture above now has a non-zero
+     * `helpfulCount` — pinned at 0 it asserted nothing, and roughly eight in nine seeded
+     * reviews carry a real one.
+     *
+     * `helpfulCount` was not merely published, it was *drawn*: with `activityType` nulled,
+     * the footer's `activityType !== null || helpfulCount > 0` condition collapses to the
+     * count alone, so a removed report printed "3 found this useful" directly under its own
+     * tombstone — the page endorsing the report it had just withdrawn.
+     *
+     * `rating` was published without being drawn, which is not better. Both renderers
+     * declined to draw it, and it still shipped in every `reviews.list` response and still
+     * ordered the list, so a tombstone standing first under "Highest rated" announced the
+     * withdrawn number to anybody who can count — while `ratingCounts` excluded that same
+     * row from the average.
+     */
+    const shape = toReview({ ...REVIEW_ROW, hiddenAt: new Date() }, null);
+    expect(shape.rating).toBeNull();
+    expect(shape.helpfulCount).toBe(0);
+  });
+
   it('leaves a visible review completely alone', () => {
     const shape = toReview(REVIEW_ROW, null);
     expect(shape.hidden).toBe(false);
     expect(shape.body).toBe('The libellous bit.');
     expect(shape.photos).toHaveLength(1);
     expect(shape.conditions).toEqual(['muddy']);
+    expect(shape.rating).toBe(1);
+    expect(shape.helpfulCount).toBe(3);
+  });
+
+  it('does not let a sort key rank a tombstone by a number it no longer carries', () => {
+    /*
+     * Stripping the shape closes half the leak. `toReview` runs after Postgres has sorted,
+     * so nulling `rating` changes what the row says and nothing about where it stands — and
+     * position is readable without opening the network tab. The three sorts that key on a
+     * withdrawn column therefore have to push the tombstones into one block first.
+     *
+     * `recent` is deliberately exempt: it keys on `createdAt`, which the tombstone prints on
+     * its own face, and holding a removed report in its chronological place is the entire
+     * point of keeping the row.
+     */
+    for (const sort of ['rating_desc', 'rating_asc', 'helpful'] as const) {
+      expect(Object.keys(ORDER_BY[sort][0]!)).toEqual(['hiddenAt']);
+    }
+    expect(Object.keys(ORDER_BY.recent[0]!)).toEqual(['createdAt']);
   });
 });
 
@@ -445,6 +486,82 @@ describe('a moderated author cannot delete their way back to publishing', () => 
     });
 
     expect(await codeOf(callerWith(db).photos.remove({ photoId: 'pho_1' }))).toBe('FORBIDDEN');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The one role check on the read path
+// ---------------------------------------------------------------------------
+
+/**
+ * `includeHidden` is a request, not a permission.
+ *
+ * Every other role check in this file guards a *write* and throws when it fails, which makes
+ * it loud. This one guards a read, defaults quietly to the public answer, and is the sole
+ * expression separating an operator from the public on every trail page render — because
+ * `apps/web/app/trails/[slug]/page.tsx` sends `includeHidden: true` on every render for every
+ * visitor, signed in or not, and lets the server decide what that means.
+ *
+ * A review of this PR mutation-tested the branch and found this the only guard the suite did
+ * not kill: replacing `input.includeHidden && canModerate(ctx.user?.role)` with
+ * `input.includeHidden` left all 1,444 tests green. If that conjunct were ever dropped, every
+ * anonymous visitor would get a "Removed" tile per hidden photograph on every trail page,
+ * carrying the author's name and username, the coordinates, the distance along the route and
+ * the capture date — the fields `toPhoto` does not blank. Repeating the accusation is half of
+ * publishing it, which is the whole reason the takedown exists.
+ *
+ * So the assertion is on the `where` clause rather than on the rows: what matters is that the
+ * filter was asked for, and a stub that returns nothing cannot accidentally satisfy it.
+ */
+describe('includeHidden is honoured for operators and ignored for everybody else', () => {
+  function spyingDb(): { seen: Record<string, unknown>[]; db: Context['db'] } {
+    const seen: Record<string, unknown>[] = [];
+    const db = dbReturning({
+      photo: {
+        findMany: (args: Record<string, unknown>) => {
+          seen.push(args);
+          return Promise.resolve([]);
+        },
+      },
+    });
+    return { seen, db };
+  }
+
+  async function whereFor(role: UserRole | null): Promise<Record<string, unknown>> {
+    const { seen, db } = spyingDb();
+    await callerWith(db, role).trails.photos({ trailId: 'trl_1', includeHidden: true });
+    return (seen.at(-1)?.where ?? {}) as Record<string, unknown>;
+  }
+
+  it('filters hidden photographs out for a signed-out caller who asks for them', async () => {
+    expect(await whereFor(null)).toMatchObject({ trailId: 'trl_1', hiddenAt: null });
+  });
+
+  it('filters them out for an ordinary member who asks for them', async () => {
+    // The interesting caller: authenticated, a real row, a real session — and still the
+    // public answer. Nothing about being signed in is permission to see a takedown.
+    expect(await whereFor('member')).toMatchObject({ trailId: 'trl_1', hiddenAt: null });
+  });
+
+  it('lets a moderator through, because unhide lives in that strip', async () => {
+    // The other direction, and it is not optional: the photograph strip is where the only
+    // `unhide` control is, so a moderator who cannot see a hidden frame cannot put it back —
+    // which is the thing /terms promises we do when we got it wrong.
+    const where = await whereFor('moderator');
+    expect(where).toMatchObject({ trailId: 'trl_1' });
+    expect(where).not.toHaveProperty('hiddenAt');
+  });
+
+  it('gives an admin the same reach as a moderator', async () => {
+    expect(await whereFor('admin')).not.toHaveProperty('hiddenAt');
+  });
+
+  it('still filters for a moderator who did not ask', async () => {
+    // The flag has to be doing work in both directions. A moderator reading an ordinary
+    // trail page gets the ordinary gallery; the hidden rows arrive only where the queue is.
+    const { seen, db } = spyingDb();
+    await callerWith(db, 'moderator').trails.photos({ trailId: 'trl_1' });
+    expect(seen.at(-1)?.where).toMatchObject({ hiddenAt: null });
   });
 });
 

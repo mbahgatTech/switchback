@@ -202,9 +202,16 @@ export default function TermsPage() {
           </p>
         </Clause>
 
+        {/*
+         * "A complaint", not "a report". Nine clauses above this line use "report" to mean a
+         * trail report, starting with the lead paragraph, and a trail report's limit is
+         * REVIEW_BODY_MAX = 5,000. REPORT_DETAIL_MAX is the abuse-complaint box. The tail of
+         * the sentence made that clear and the noun did not, so the page stated a wrong
+         * number about the one thing it had spent the whole document defining.
+         */}
         <p className="mt-3xl max-w-measure text-caption text-ink-muted">
-          A report may be up to {REPORT_DETAIL_MAX.toLocaleString()} characters, which is more than
-          anybody needs to explain what is wrong with a photograph.
+          A complaint may be up to {REPORT_DETAIL_MAX.toLocaleString()} characters, which is more
+          than anybody needs to explain what is wrong with a photograph.
         </p>
 
         <SiteFooter />

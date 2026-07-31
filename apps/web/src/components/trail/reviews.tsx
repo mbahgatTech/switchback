@@ -224,7 +224,10 @@ export function Reviews({
          * notice and the address, which is the only move actually available to them.
          *
          * Survey plate and a hairline: this is about the reader's own standing, not about
-         * the trail.
+         * the trail. This is also the *only* place the long notice appears. The author's own
+         * row in the list below prints the short `REMOVED_NOTICE` on the section's ordinary
+         * dashed-bezel absence treatment, so the address is stated once, here, where somebody
+         * who came to write is already looking.
          */
         <p className="mt-lg max-w-measure rounded-hair border border-survey px-md py-sm text-body leading-relaxed text-ink">
           {REMOVED_NOTICE_OWN}
@@ -462,8 +465,13 @@ function ReviewRow({
            * is a measurement the page is asserting on behalf of a report it has withdrawn —
            * and it is not in the average above either, so drawing it would be the one number
            * on this section that corresponds to nothing.
+           *
+           * Branching on `rating === null` rather than on `hidden` is deliberate. The server
+           * nulls the rating on a removed row, so this reads the value it is about to draw
+           * instead of a second flag that has to agree with it — the two cannot drift, and a
+           * row that somehow arrives hidden with a rating still on it draws nothing.
            */}
-          {review.hidden ? null : (
+          {review.rating === null ? null : (
             <>
               <ScaleBar value={review.rating} />
               <span className="sr-only">{review.rating} out of 5.</span>
@@ -493,11 +501,17 @@ function ReviewRow({
        * that is what this is. No survey plate — survey is the reader's own position and
        * safety, and somebody else's report being taken down is neither.
        *
-       * Its author gets the longer sentence, with the address to write to.
+       * **The short notice even on your own row.** The longer sentence, the one carrying the
+       * address to write to, belongs in the form slot above: that slot is where the author
+       * arrives to type, and it is the one that has to answer "why can I not edit this?"
+       * before they try. Printing the same sentence again here put it on screen twice within
+       * one scroll, in two different plates — survey up there, dashed bezel down here — which
+       * reads as two separate decisions about one takedown rather than one. Said once, in the
+       * place the reader is already looking.
        */}
       {review.hidden ? (
         <p className="mt-sm max-w-measure rounded-hair border border-dashed border-bezel px-md py-sm text-caption text-ink-muted">
-          {review.isMine ? REMOVED_NOTICE_OWN : REMOVED_NOTICE}
+          {REMOVED_NOTICE}
         </p>
       ) : null}
 
