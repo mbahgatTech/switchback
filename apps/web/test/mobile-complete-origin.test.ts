@@ -21,10 +21,20 @@ import { fromOurOwnOrigin } from '../app/api/auth/mobile/_binding';
  * POST, which is one hop from a form on a page this route rendered, and not on the GET — and
  * the predicate's own semantics, which nothing else covers.
  */
+/*
+ * Normalised to LF at read time, because the search below is for a literal `\n}\n`.
+ *
+ * The repository has no `.gitattributes` and Windows checkouts run `core.autocrlf=true`, so
+ * this file arrives with 279 CRLF line endings and not one bare LF. `indexOf('\n}\n')` then
+ * returns -1, `end` never exceeds `start`, and all four handler-based tests fail — on a branch
+ * where the security property they pin is actually satisfied. Green on Linux CI, red on every
+ * Windows clone, which is the worst way for a security test to fail: it teaches the person who
+ * sees it that this file is unreliable rather than that the code is wrong.
+ */
 const ROUTE = readFileSync(
   fileURLToPath(new URL('../app/api/auth/mobile/complete/route.ts', import.meta.url)),
   'utf8',
-);
+).replace(/\r\n/gu, '\n');
 
 /** The source of one exported handler, from its `export` to the next top-level `}`. */
 function handler(name: 'GET' | 'POST'): string {
