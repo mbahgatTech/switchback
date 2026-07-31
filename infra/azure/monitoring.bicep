@@ -19,9 +19,11 @@
 // watching the number. The first notice of the cliff would have been the site being down,
 // with a recovery that is either "wait for the next billing month" or "remove the spending
 // limit, converting the subscription to pay-as-you-go". Neither is five minutes. The credit
-// is also not dedicated: the same subscription already carries `rg-mazenbahgat-8881` with a
-// WAF policy in it, and a WAF policy exists to be attached to something that bills by the
-// hour.
+// is also not dedicated, and by a wide margin: measured for July 2026, `rg-mazenbahgat-8881`
+// alone billed 179.85 USD of a 191.39 USD subscription total, against a 150 USD credit. That
+// is why there are two budgets — the cliff at subscription scope in main.bicep, and this
+// file's `switchback-database` at resource-group scope, which is the only one whose number is
+// about Postgres.
 //
 // The second is the connection ceiling. Production connects to Neon's *pooled* endpoint
 // today; on Burstable there is no PgBouncer, so after cutover every client connection lands
@@ -49,6 +51,15 @@ action group with no receiver is a rule that fires into nothing, which is worse 
 because the portal shows it as configured.
 ''')
 param alertEmailAddress string
+
+@description('Budget for this resource group alone, in USD. See main.bicep.')
+param workloadBudgetUsd int
+
+@description('First day of the budget window, UTC, as `yyyy-MM-01`. Fixed, not `utcNow()`.')
+param budgetStartDate string
+
+@description('Last day of the budget window, UTC.')
+param budgetEndDate string
 
 // ---------------------------------------------------------------------------------------
 
@@ -84,7 +95,8 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
 
 @description('''
 The single destination for every alert in this deployment — the two metric alerts on the
-server and the three thresholds on the consumption budget.
+server, the three thresholds on this file's resource-group budget, and the two on the
+subscription budget in main.bicep.
 
 One group rather than one per alert, so that changing where alerts go is one edit. The short
 name is limited to 12 characters by Azure and appears in the SMS/email subject line.
@@ -109,3 +121,73 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
 
 output workspaceId string = workspace.id
 output actionGroupId string = actionGroup.id
+
+@description('''
+The budget for **this workload**, evaluated against this resource group only.
+
+`main.bicep` also declares a subscription-scoped budget pegged to the monthly credit, and the
+two are not redundant — they answer different questions, and until this revision only the
+subscription one existed, which meant neither question was answered.
+
+The subscription is the thing that gets *disabled*: exceed the credit with the spending limit
+on and every resource in it is deallocated, including this server, regardless of whose spend
+did it. So the cliff has to be watched at subscription scope.
+
+But that scope cannot tell you anything about Postgres. Measured for July 2026, subscription
+spend was 191.39 USD, of which 179.85 came from `rg-mazenbahgat-8881` and 0.00 from this
+resource group. A 150 USD subscription budget is therefore at 128% before this database bills
+a cent, and graded thresholds on it fire from birth on somebody else's Front Door.
+
+This one is scoped to `rg-switchback-prod-northcentralus`, so its number is the database and
+nothing else. Steady state ~57 USD against 150 is ~38%, which puts every threshold below the
+line with room, and each threshold names a real event rather than a fraction:
+
+  50%  (75 USD)  — an autogrow step, or Microsoft Defender for open-source relational
+                   databases being switched on. Both are legitimate; both should be a message
+                   rather than a discovery on next month's bill.
+  75%  (112 USD) — approaching the General Purpose escalation's ~137 USD. If nobody
+                   deliberately escalated the tier, this is the signal something is wrong.
+  90%  (135 USD) — this workload alone is about to consume the whole credit, which means the
+                   spending limit deallocates it and the site goes down.
+
+`Actual` rather than `Forecasted` throughout, for the same reason as the subscription budget:
+a forecast over a nearly flat line is noise, and a false alarm trains a shrug.
+''')
+resource workloadBudget 'Microsoft.Consumption/budgets@2023-05-01' = {
+  name: 'switchback-database'
+  properties: {
+    category: 'Cost'
+    timeGrain: 'Monthly'
+    amount: workloadBudgetUsd
+    timePeriod: {
+      startDate: budgetStartDate
+      endDate: budgetEndDate
+    }
+    notifications: {
+      half: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 50
+        thresholdType: 'Actual'
+        contactEmails: [alertEmailAddress]
+        contactGroups: [actionGroup.id]
+      }
+      threeQuarters: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 75
+        thresholdType: 'Actual'
+        contactEmails: [alertEmailAddress]
+        contactGroups: [actionGroup.id]
+      }
+      nearlyOut: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 90
+        thresholdType: 'Actual'
+        contactEmails: [alertEmailAddress]
+        contactGroups: [actionGroup.id]
+      }
+    }
+  }
+}

@@ -3,9 +3,9 @@
  *
  *   npm run verify:migration
  *
- * Run from a GitHub Actions runner by `.github/workflows/migrate-to-azure.yml`, because both
- * credentials have to be in scope at once and because the machine that owns this repository is
- * not a dependable path to 5432 — a VPN sits in front of it. It is not always a *closed* path:
+ * Both credentials have to be in scope at once, so this runs wherever both are to hand. It
+ * was run from the machine that owns this repository, which is not a dependable path to
+ * 5432 — a VPN sits in front of it. It is not always a *closed* path:
  * measured during the first real migration, both endpoints answered and a 549 MB dump came
  * down from Neon intact, but sustained `COPY` toward Azure corrupted TLS records
  * (`sslv3 alert bad record mac`) often enough to kill a whole-database restore twice. Reads of
@@ -35,16 +35,16 @@
  *
  * **The checksums are computed elsewhere, on purpose.** `packages/db/prisma/schema.prisma`
  * declares the geometry and tsvector columns `Unsupported`, which makes them invisible to
- * Prisma Client — it cannot select them, so it cannot hash them. The workflow computes
- * `md5(row::text)` in SQL instead, on the Neon side from *inside the snapshot pg_dump used*,
- * and hands this script the two files to compare. Hashing the whole row means the geometry
+ * Prisma Client — it cannot select them, so it cannot hash them. The `md5(row::text)` is
+ * computed in SQL instead, on the Neon side from *inside the snapshot pg_dump used*, and this
+ * script is handed the two files to compare (`NEON_CHECKSUMS`, `AZURE_CHECKSUMS`). Hashing the whole row means the geometry
  * (rendered as hex EWKB) and the search vector (rendered as its lexeme list) are covered by
  * the same hash as everything else, so the row checksum is itself the proof that they
  * arrived byte for byte.
  *
  * **Nothing here prints a connection string, a password, or a row of user data.** Failures
  * report table names, counts and hashes. The corpus contains every user's email address and
- * every recorded GPS track; a workflow log is not the place for any of it.
+ * every recorded GPS track; a terminal scrollback or a CI log is not the place for any of it.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { PrismaClient } from '@prisma/client';
@@ -236,7 +236,7 @@ function num(rows: Row[], column: string): number {
 }
 
 // ---------------------------------------------------------------------------------------
-// Checksums, computed by the workflow and read from disk here.
+// Checksums, computed alongside the dump and read from disk here.
 // ---------------------------------------------------------------------------------------
 
 interface TableChecksum {
@@ -538,7 +538,7 @@ async function checkPrivileges(azure: PrismaClient, appUrl: string): Promise<voi
     );
     return;
   }
-  record(`privilege · ${appRole} exists`, 'pass', 'created by the migration workflow');
+  record(`privilege · ${appRole} exists`, 'pass', 'created by the runbook role step');
 
   for (const [label, column] of [
     ['not a superuser', 'is_super'],
@@ -943,7 +943,7 @@ async function main(): Promise<void> {
 main().catch((error: unknown) => {
   // `.message` rather than the error object, and never the object's `stack` or its Prisma
   // `clientVersion`/meta bag: a driver-level failure can carry the datasource it was
-  // constructed with, and this log is public to anyone who can read a workflow run.
+  // constructed with, and this output is read by whoever can see the terminal or the log.
   console.error('verification could not complete:', error instanceof Error ? error.message : error);
   process.exitCode = 1;
 });

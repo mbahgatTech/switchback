@@ -39,9 +39,23 @@ apps/mobile/android/
 # "just for me" bicepparam — and either one would carry the password that is the *only* thing
 # between the open internet and every user's email and GPS history. Ignored in advance, so
 # the mistake is uncommittable rather than merely discouraged.
-infra/azure/*.local.bicepparam
+#
+# The bicepparam half is written as ignore-everything-then-allow-one rather than as a list of
+# guessed names, because a deny-list here was measurably too narrow: an earlier revision
+# ignored only `*.local.bicepparam`, while Bicep's own convention is `<name>.bicepparam`
+# beside the template — so `prod.bicepparam`, `dev.bicepparam` and `secrets.bicepparam`, which
+# are the *likelier* names once `main.bicepparam` is taken, were all committable. The negation
+# inverts the burden: a new parameter file is ignored until someone deliberately adds it here.
+#
+# `parameters.json` and `params.json` are named in full as well as by suffix. `*.parameters.json`
+# does not match a bare `parameters.json` — the pattern needs a literal `.` before `parameters`,
+# and `*` matching the empty string leaves nothing to supply it.
+infra/azure/*.bicepparam
+!infra/azure/main.bicepparam
 infra/azure/*.parameters.json
 infra/azure/*.params.json
+infra/azure/parameters.json
+infra/azure/params.json
 
 # test output
 coverage/

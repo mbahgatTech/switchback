@@ -13,14 +13,51 @@
 //
 // Re-running this template is a no-op, not a second server. Every name here is either fixed
 // or a pure function of the resource group id (`uniqueString`), so a redeploy reconciles the
-// existing server rather than provisioning beside it. The one exception is
-// `administratorLoginPassword`: ARM has no way to read the current password, so whatever is
-// passed is written. Pass the *same* value every time — a redeploy with a freshly generated
-// password silently rotates the admin credential and every connection string that carries it
-// stops working. See infra/azure/README.md, "Redeploying".
+// existing server rather than provisioning beside it.
 //
-//   openssl rand -hex 32 > "$TEMP/pgpw"
-//   export PGADMIN_PASSWORD="$(cat "$TEMP/pgpw")"
+// **"No-op" is a claim someone will check, so here is what checking it actually shows.**
+// Measured with `az deployment sub what-if` against the live deployment: 18 changes, 11
+// `NoChange`, and a residue that never converges no matter how many times it is applied. All
+// of it is either a value ARM will not read back or a value ARM rewrites on read. Nothing in
+// the list changes behaviour, and the list is written down so nobody spends an afternoon on it
+// a second time.
+//
+// 1. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
+//    is passed is written. Pass the *same* value every time — a redeploy with a freshly
+//    generated password silently rotates the admin credential and every connection string
+//    that carries it stops working. See infra/azure/README.md, "Redeploying", which also says
+//    where that value has to live for this to be possible at all. This is the one item on the
+//    list with teeth.
+//
+// 2. Three server parameters report as changed on every run and never converge:
+//    `log_connections`, `log_disconnections` and `ssl_min_protocol_version`. The template
+//    declares `source: 'user-override'`; Azure collapses `source` back to `system-default`
+//    whenever the value equals the engine default, which all three do, so what-if reports
+//
+//      Modify properties.source: "system-default" -> "user-override"
+//
+//    on each of them, forever. The *values* are correct and are what postgres.bicep intends —
+//    verified with `az postgres flexible-server parameter show`.
+//
+// 3. The server resource reports the deletion of five properties the template does not
+//    declare, because they are provider-assigned and only exist on read:
+//    `dataEncryption` (SystemManaged), `replica`, `replicationRole`, `storage.iops` (240, a
+//    function of the size) and `storage.type` (Premium_LRS). Plus `createMode: "Default"`,
+//    which is a write-only property that does not read back. Declaring them would mean
+//    hard-coding derived values — `storage.iops` in particular moves on its own when autogrow
+//    fires, which is exactly the value main.bicepparam warns against pinning.
+//
+// 4. The diagnostic setting reports `logAnalyticsDestinationType` being removed and its `logs`
+//    and `metrics` arrays as changed. Same cause: `AzureDiagnostics` is the provider's default
+//    fill-in, and what-if compares arrays it cannot match by identity.
+//
+// The budget window used to be item 5, because `budgetStartDate` defaulted to `utcNow()`. It
+// is now a fixed timestamp passed from main.bicepparam with an explicit `endDate`, in the
+// exact form ARM stores (`2026-07-01T00:00:00Z`, not `2026-07-01` — the short form deploys
+// identically and then diffs forever), and it converges.
+//
+//   openssl rand -hex 32 > "$TMP/pgpw"
+//   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
 //   az deployment sub create \
 //     --name switchback-db \
 //     --location northcentralus \
@@ -30,7 +67,7 @@
 // The password reaches the deployment through the environment, read by
 // `readEnvironmentVariable` in main.bicepparam, so it never appears in argv, in the process
 // table, in shell history, or in a committed file. README.md has the full recipe including
-// what to do with the $TEMP file afterwards.
+// where the value is kept afterwards.
 
 targetScope = 'subscription'
 
@@ -150,11 +187,12 @@ Login for the least-privilege application role — the credential Vercel carries
 
 This role is **not** created by this template. ARM cannot run SQL, so a Bicep file can name
 the role but cannot bring it into existence, and a security control that only exists in a
-comment is worse than a shorter honest list. It is created by the `Create the least-privilege
-application role` step of `.github/workflows/migrate-to-azure.yml`, which runs from a GitHub
-Actions runner (the only place in this design that can reach 5432), and `scripts/verify-
-migration.ts` then asserts that it exists, that it is not a member of `azure_pg_admin`, and
-that it cannot create a table.
+comment is worse than a shorter honest list. It is created by hand, by the
+`Create the least-privilege application role` step of the runbook in infra/azure/README.md,
+which carries the exact SQL; `scripts/verify-migration.ts` then asserts that it exists, that
+it is not a member of `azure_pg_admin`, and that it cannot create a table. That assertion is
+what makes this comment a claim rather than an intention, and it has been run: 72 checks,
+72 passed.
 
 The point of it: with a firewall spanning the whole internet the perimeter is a credential,
 and the credential handed to every Vercel serverless function should be able to read and
@@ -223,10 +261,27 @@ Address that receives budget and metric alerts. See `monitoring.bicep`.
 param alertEmailAddress string = 'mazenbahgat@outlook.com'
 
 @description('''
-Monthly credit on the subscription, in USD. The budget below is expressed as a fraction of
-this rather than as absolute dollars, so changing the credit changes every threshold.
+Monthly credit on the subscription, in USD. The **subscription**-scoped budget below is
+expressed as a fraction of this, so changing the credit changes both of its thresholds.
+
+This is a fact about the offer (`MSDN_2014-09-01`), not a target: it is what the spending
+limit deallocates the server for exceeding. Measured subscription spend for July 2026 was
+191.39 USD, i.e. already past it, almost entirely from a resource group unrelated to this
+workload — which is why the question "is this database getting more expensive" is answered by
+a separate resource-group budget rather than by this number.
 ''')
 param monthlyCreditUsd int = 150
+
+@description('''
+Budget for this workload alone, in USD, evaluated against `rg-switchback-prod-northcentralus`
+only. See `monitoring.bicep`.
+
+Set to the credit rather than to the bill on purpose. Steady state is ~57 USD, so the server
+sits at ~38% and the 50 / 75 / 90% thresholds are quiet — while each one still names a real
+event: 50% is an autogrow step or Defender being enabled, 75%/90% is the General Purpose
+escalation (~137 USD) about to consume the whole credit on its own.
+''')
+param workloadBudgetUsd int = 150
 
 // ---------------------------------------------------------------------------------------
 // Tags
@@ -265,6 +320,9 @@ module monitoring 'monitoring.bicep' = {
     location: location
     tags: tags
     alertEmailAddress: alertEmailAddress
+    workloadBudgetUsd: workloadBudgetUsd
+    budgetStartDate: budgetStartDate
+    budgetEndDate: budgetEndDate
   }
 }
 
@@ -299,38 +357,90 @@ module postgres 'postgres.bicep' = {
 //
 // **The single most consequential resource in this file, measured by what its absence costs.**
 //
-// Everything above is sized around one fact: this subscription's `spendingLimit` is `On`
-// (verified live — `az account show --query subscriptionPolicies`), which means that when the
-// monthly credit is consumed the subscription is *disabled* and every resource in it is
-// deallocated. postgres.bicep chooses Burstable over General Purpose explicitly to stay at
-// ~38% of the credit rather than ~91%, and README.md argues the same. And until this
-// revision, nothing measured it: `az consumption budget list` returned `[]`. The first notice
-// of the cliff would have been the site being down — with a recovery of either "wait for the
-// next billing month" or "remove the spending limit", which converts the subscription to
-// pay-as-you-go and starts charging a card. Neither is a five-minute fix, and the symptom
-// table in README.md now carries a row for it.
+// Everything above is sized around one fact: this subscription's `spendingLimit` is `On`,
+// which means that when the monthly credit is consumed the subscription is *disabled* and
+// every resource in it is deallocated. postgres.bicep chooses Burstable over General Purpose
+// explicitly to stay at ~38% of the credit rather than ~91%, and README.md argues the same.
+// And until this revision, nothing measured it: `az consumption budget list` returned `[]`.
+// The first notice of the cliff would have been the site being down — with a recovery of
+// either "wait for the next billing month" or "remove the spending limit", which converts the
+// subscription to pay-as-you-go and starts charging a card. Neither is a five-minute fix, and
+// the symptom table in README.md now carries a row for it.
 //
-// The credit is not dedicated to this workload. The same subscription already holds
-// `rg-mazenbahgat-8881` — a virtual network, three NSGs, a private-link DNS zone and a WAF
-// policy. Those are near-free standing alone, but a WAF policy exists to be attached to an
-// Application Gateway or a Front Door, either of which would consume $150 in days. So the
-// budget is scoped to the *subscription*, not to this resource group: the thing that can
-// take this database offline is total spend, wherever it comes from.
+// A note on verifying that claim, because the obvious command no longer shows it: current
+// `az` returns `subscriptionPolicies.spendingLimit` as `null` from `az account show`. The
+// value is still there on the ARM representation —
 //
-// Three thresholds rather than one, at 50 / 75 / 90% — $75, $110, $135 against $150. The
-// expected steady state is ~$57, so 50% is already "something changed"; 90% is "act today".
-// All are `Actual` rather than `Forecasted`: a forecast on a subscription whose spend is
-// nearly a flat line is noise, and a false alarm here trains the same shrug this design has
-// spent so much effort avoiding elsewhere.
+//   az rest --method get --url "https://management.azure.com/subscriptions/<id>?api-version=2022-12-01"
+//     → subscriptionPolicies: { quotaId: "MSDN_2014-09-01", spendingLimit: "On" }
 //
-// `startDate` must be the first of a month and, for a monthly budget, not in the past.
-// `utcNow()` is evaluated at deployment time, which makes this template's output depend on
-// when it is run — normally a smell, here unavoidable and harmless, because ARM reconciles a
-// budget by name and a redeploy in a later month simply moves the window forward.
+// **Two budgets, because one budget was answering two questions and getting both wrong.**
+//
+// The credit is not dedicated to this workload, and the gap is not small. Measured against
+// the live subscription for July 2026 (`Microsoft.CostManagement/query`, ActualCost, grouped
+// by ResourceGroupName):
+//
+//   rg-mazenbahgat-8881                              179.85 USD
+//   me_plant-environment_plant_together_centralus     11.52 USD
+//   plant_together                                     0.02 USD
+//   rg-switchback-prod-northcentralus                  0.00 USD   (created 2026-07-30)
+//   ------------------------------------------------------------
+//   subscription total                               191.39 USD
+//
+// So a *subscription*-scoped budget of 150 is at 128% before this database has billed a
+// single cent, and the 50 / 75 / 90% thresholds an earlier revision put on it were all
+// breached on the day they were created. Three alerts that fire from birth, on spend from a
+// resource group nobody here touches, train exactly the shrug this design spends its length
+// trying to avoid — and they cannot answer the question they were written to answer, which is
+// "is *the database* about to cost more than it should".
+//
+// The split:
+//
+//   `switchback-monthly-credit` (here, subscription scope) is the *cliff*. Total spend is what
+//   disables the subscription, wherever it comes from, so this one has to stay at subscription
+//   scope and has to stay pegged to the credit. Two notifications rather than a graded ramp,
+//   because a ramp implies headroom that does not exist: 90% is "the credit is nearly gone"
+//   and 100% is "it is gone, and the spending limit will deallocate the database". Both are
+//   true *today*, and they will alert on the next evaluation. That is not noise — the
+//   subscription really is over its credit, and the reason the server is still running is
+//   worth someone establishing from the billing page rather than inferring from this file.
+//   What was noise was reading those alerts as a statement about Postgres.
+//
+//   `switchback-database` (monitoring.bicep, resource-group scope) is *this workload*. It sits
+//   at 0.00 USD today and at ~38% of its amount in steady state, so its 50 / 75 / 90%
+//   thresholds are all quiet and every one of them means something specific: an autogrow step,
+//   Defender being switched on, or the General Purpose escalation.
+//
+// All thresholds are `Actual` rather than `Forecasted`: a forecast on spend that is nearly a
+// flat line is noise, and a false alarm trains the same shrug.
+//
+// `startDate` must be the first of a month and, for a monthly budget, not in the past at
+// creation. It is passed in from main.bicepparam as a fixed date rather than computed with
+// `utcNow()`, so this template's output does not depend on the day it is run — see the note
+// on the parameter itself.
 // ---------------------------------------------------------------------------------------
 
-@description('First day of the current month, UTC. See the note above on why this is dynamic.')
-param budgetStartDate string = utcNow('yyyy-MM-01')
+@description('''
+First day of the budget window, UTC, as `yyyy-MM-01`. Fixed, not `utcNow()`.
+
+An earlier revision defaulted this to `utcNow('yyyy-MM-01')`. That made it the one value in
+this template that is neither fixed nor a function of the resource group id, which falsified
+the "re-running this template is a no-op" claim at the top of this file in a directly
+measurable way: `az deployment sub what-if` reported the budget as `Modify` on every run, with
+
+  startDate  "2026-07-01T00:00:00Z" -> "[utcNow('yyyy-MM-01')]"
+  endDate    "2036-07-01T00:00:00Z" -> null
+
+— and in a later month the PUT would also move the live budget window forward, on the same
+redeploy the header calls "the only documented way to reapply the same admin password". A
+budget window that moves because of *when* someone reapplied a password is a surprise nobody
+asked for. `endDate` is likewise stated rather than left to the provider, so the deployed
+window and the declared window are the same window.
+''')
+param budgetStartDate string = '2026-07-01'
+
+@description('Last day of the budget window, UTC. Matches what Azure assigns by default.')
+param budgetEndDate string = '2036-07-01'
 
 resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
   name: 'switchback-monthly-credit'
@@ -340,28 +450,21 @@ resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
     amount: monthlyCreditUsd
     timePeriod: {
       startDate: budgetStartDate
+      endDate: budgetEndDate
     }
     notifications: {
-      half: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: 50
-        thresholdType: 'Actual'
-        contactEmails: [alertEmailAddress]
-        contactGroups: [monitoring.outputs.actionGroupId]
-      }
-      threeQuarters: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: 75
-        thresholdType: 'Actual'
-        contactEmails: [alertEmailAddress]
-        contactGroups: [monitoring.outputs.actionGroupId]
-      }
       nearlyOut: {
         enabled: true
         operator: 'GreaterThan'
         threshold: 90
+        thresholdType: 'Actual'
+        contactEmails: [alertEmailAddress]
+        contactGroups: [monitoring.outputs.actionGroupId]
+      }
+      overCredit: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 100
         thresholdType: 'Actual'
         contactEmails: [alertEmailAddress]
         contactGroups: [monitoring.outputs.actionGroupId]

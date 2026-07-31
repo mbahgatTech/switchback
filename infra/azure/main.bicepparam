@@ -5,8 +5,8 @@
 // every required parameter — so it is read from the environment instead, which is the one
 // place that is neither this file, nor argv, nor a log line:
 //
-//   openssl rand -hex 32 > "$TEMP/pgpw"
-//   export PGADMIN_PASSWORD="$(cat "$TEMP/pgpw")"
+//   openssl rand -hex 32 > "$TMP/pgpw"
+//   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
 //   az deployment sub create \
 //     --name switchback-db --location northcentralus \
 //     --template-file infra/azure/main.bicep \
@@ -14,8 +14,9 @@
 //   unset PGADMIN_PASSWORD
 //
 // A `$( )` substitution never reaches the process table, and what lands in shell history is
-// the variable name rather than its value. Keep the $TEMP file until the connection strings
-// have been set as GitHub and Vercel secrets, then `rm -f` it. See README.md, "Deploying".
+// the variable name rather than its value. **Put the password in a password manager before
+// deleting the file** — it cannot be read back out of ARM, out of a GitHub secret, or out of
+// Vercel, and a redeploy has to pass the same value. See README.md, "Deploying".
 //
 // Note `az` will not accept a `.bicepparam` alongside any other `--parameters` argument, so
 // there is no second file to merge in. Everything non-secret lives here; the secret lives in
@@ -57,9 +58,9 @@ param skuName = 'Standard_B2s'
 // the size-implied performance tier moves with the size: 65536 MB is P6/240 IOPS, 131072 MB
 // is P10/500 IOPS. After one autogrow these two values describe a smaller disk on a tier that
 // is no longer valid for the actual size, and the redeploy README.md calls a no-op fails —
-// which matters because that redeploy is also the only documented way to reapply the *same*
-// admin password. The `storage_percent` alert exists so an autogrow is a message rather than
-// a discovery.
+// which matters because a redeploy is also how the *same* admin password gets reapplied, so a
+// stale value here turns a routine reapply into a failed deployment. The `storage_percent`
+// alert exists so an autogrow is a message rather than a discovery.
 //
 //   az postgres flexible-server show \
 //     -g rg-switchback-prod-northcentralus -n <server> \
@@ -72,8 +73,8 @@ param postgresVersion = '17'
 
 param databaseName = 'switchback'
 
-// Must equal Neon's `datcollate`/`datctype`. The migration workflow checks and refuses to
-// proceed on a mismatch rather than silently reordering every `ORDER BY name` in the app.
+// Must equal Neon's `datcollate`/`datctype`. The migration preflight checked this and refused
+// to proceed on a mismatch rather than silently reordering every `ORDER BY name` in the app.
 //
 // **`C.UTF-8`, not `en_US.utf8`.** Measured on the live source rather than assumed — Neon
 // reports `C.UTF-8` for both `datcollate` and `datctype`, while Azure's server-default (and
@@ -93,10 +94,10 @@ param databaseCollation = 'C.UTF-8'
 
 param administratorLogin = 'sbadmin'
 
-// The least-privilege role Vercel connects as. Created by the migration workflow, not by the
-// template — ARM cannot run SQL — and asserted by scripts/verify-migration.ts. `sbadmin`
-// above can DROP TABLE and manage roles and stays in the GitHub secrets that CI and the
-// migration use; `sbapp` can only read and write rows, and is the credential that sits on an
+// The least-privilege role Vercel connects as. Created by hand from the runbook in README.md,
+// not by the template — ARM cannot run SQL — and asserted by scripts/verify-migration.ts.
+// `sbadmin` above can DROP TABLE and manage roles and stays in the GitHub secrets that CI
+// uses; `sbapp` can only read and write rows, and is the credential that sits on an
 // internet-reachable endpoint being used by every web request.
 param applicationLogin = 'sbapp'
 
@@ -104,16 +105,39 @@ param applicationLogin = 'sbapp'
 // is a rule that fires into nothing while the portal shows it as configured.
 param alertEmailAddress = 'mazenbahgat@outlook.com'
 
-// The subscription's monthly credit, in USD. Every budget threshold in main.bicep is a
-// percentage of this, so changing the credit changes all three. The spending limit on this
-// subscription is *On*: exceeding the credit disables the subscription and deallocates the
-// server, which is why a budget exists at all.
+// The subscription's monthly credit, in USD. The subscription-scoped budget in main.bicep is
+// pegged to this. The spending limit on this subscription is *On*: exceeding the credit
+// disables the subscription and deallocates the server, which is why a budget exists at all.
+//
+// Note what this number is not: it is not a statement about what this database costs. Measured
+// July 2026, subscription spend was 191.39 USD — already over the credit — of which 179.85 came
+// from `rg-mazenbahgat-8881` and 0.00 from this workload's resource group. The two budgets are
+// split for that reason; see the block above the budget in main.bicep.
 param monthlyCreditUsd = 150
 
-// TLSv1.2 is Azure's default and what Neon serves today. Raise to 'TLSv1.3' only after the
-// migration workflow's preflight has printed a negotiated TLS 1.3 session from a runner —
-// the machine that owns this repository cannot reach 5432 to tell a TLS failure apart from a
-// firewall one. See the parameter description in main.bicep.
+// Budget for this resource group alone, in USD, evaluated by the resource-group-scoped budget
+// in monitoring.bicep. Same figure as the credit, so ~57 USD steady state reads as ~38% and
+// every threshold stays quiet until something actually changes.
+param workloadBudgetUsd = 150
+
+// Fixed budget window. **Not `utcNow()`** — an earlier revision computed the start date at
+// deployment time, which made `az deployment sub what-if` report the budget as modified on
+// every single run and would have silently moved the live window forward on any redeploy made
+// in a later month. A start date in the past is fine for an existing budget; it only has to be
+// the first of a month and not in the past at the moment of *creation*.
+//
+// Written as full ISO-8601 with the `T00:00:00Z`, which is the shape ARM stores and reads back.
+// A bare `'2026-07-01'` deploys identically and then reports
+// `Modify properties.timePeriod.startDate "2026-07-01T00:00:00Z" -> "2026-07-01"` on every
+// what-if afterwards — the same permanent-diff problem in a different costume. Measured, not
+// guessed.
+param budgetStartDate = '2026-07-01T00:00:00Z'
+param budgetEndDate = '2036-07-01T00:00:00Z'
+
+// TLSv1.2 is Azure's default and what Neon serves today. Raise to 'TLSv1.3' only after a
+// negotiated TLS 1.3 session has actually been observed against this server from the machine
+// that will hold the connection — the migration preflight printed the negotiated version for
+// exactly this reason. See the parameter description in main.bicep.
 param minTlsVersion = 'TLSv1.2'
 
 // Optional Microsoft Entra administrator, so a human can connect without the application's

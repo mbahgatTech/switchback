@@ -197,10 +197,9 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     //   - connection_throttle.enable, which backs off repeated failed logins per source.
     //   - A least-privilege application role (`applicationLogin`, `sbapp` by default). This
     //     one is *not* created by this template — ARM has no way to run SQL — so it would be
-    //     easy for this list to claim a boundary that does not exist. It is created by the
-    //     `Create the least-privilege application role` step of
-    //     .github/workflows/migrate-to-azure.yml, which runs in `migrate` mode from a runner
-    //     that can reach 5432, and the verification step asserts afterwards that the role
+    //     easy for this list to claim a boundary that does not exist. It is created by hand,
+    //     by the `Create the least-privilege application role` step of the runbook in
+    //     infra/azure/README.md, and the verification step asserts afterwards that the role
     //     exists and that it cannot execute DDL. The credential Vercel carries is that role;
     //     `administratorLogin` never leaves the GitHub repository secrets.
     //   - Full certificate verification on every client (`sslmode=verify-full` for libpq,
@@ -603,10 +602,11 @@ output pooledPort int = pooledPort
 // The two parameters are here because the two clients that read these strings honour
 // different ones, and each ignores the other's:
 //
-//   `sslmode=verify-full`  is what **libpq** understands — psql, pg_dump and pg_restore in
-//                          .github/workflows/migrate-to-azure.yml, which also sets
-//                          PGSSLROOTCERT to the runner's system CA bundle, because libpq
-//                          otherwise looks only in ~/.postgresql/root.crt and fails closed.
+//   `sslmode=verify-full`  is what **libpq** understands — psql, pg_dump and pg_restore, which
+//                          must also be given PGSSLROOTCERT pointing at a CA bundle holding
+//                          DigiCert Global Root G2 and Microsoft RSA Root CA 2017, because
+//                          libpq otherwise looks only in ~/.postgresql/root.crt and fails
+//                          closed.
 //
 //   `sslaccept=strict`     is what **Prisma** understands, and it is the load-bearing half on
 //                          Vercel. Measured on Prisma 6.19.3 rather than assumed: a client
@@ -650,8 +650,8 @@ output directDatabaseUrlTemplate string = 'postgresql://${administratorLogin}:<P
 // so the web app has no use for a DDL-capable credential and should not carry one.
 //
 // The role behind it does not exist yet at deployment time — ARM cannot run SQL. It is
-// created by the `Create the least-privilege application role` step of
-// .github/workflows/migrate-to-azure.yml, from the `AZURE_APP_DATABASE_URL` repository secret
-// built out of this template, and the verification step then asserts that the role exists,
-// that it is not a member of azure_pg_admin, and that it cannot create a table.
+// created by hand, by the `Create the least-privilege application role` step of the runbook
+// in infra/azure/README.md, from the connection string built out of this template, and the
+// verification step then asserts that the role exists, that it is not a member of
+// azure_pg_admin, and that it cannot create a table.
 output applicationDatabaseUrlTemplate string = 'postgresql://${applicationLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:${pooledPort}/${databaseName}?${sslArgs}${pgBouncerEnabled ? '&pgbouncer=true' : ''}'

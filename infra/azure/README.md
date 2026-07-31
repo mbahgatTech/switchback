@@ -6,24 +6,84 @@ resource group, described entirely in Bicep.
 
 It replaces **Neon**, and nothing else. The app stays on Vercel, photographs stay in
 Cloudflare R2, CI stays on GitHub Actions. This is a database migration, not a platform
-migration.
+migration. **It is done** — production has been serving from Azure since 2026-07-30.
 
 **Neon stays alive.** It is the rollback, it is not deleted, and it costs nothing while idle.
 See [Rolling back](#rolling-back-to-neon) — that section is the reason several of the choices
-below look under-engineered, and it is deliberate.
+below look under-engineered, and it is deliberate. It is also the section with the largest gap
+between what an earlier revision of this file claimed and what was actually in place; read
+[Status](#status-as-of-the-last-run) before relying on any of it.
 
 ---
 
 ## Status, as of the last run
 
-The server exists and **the data has been migrated and verified.** All 23 tables were copied
-from a `REPEATABLE READ` exported snapshot; the source and target checksum files are byte
-identical, and `scripts/verify-migration.ts` reports **72 checks, 72 passed, 0 warnings,
-0 failed** — including the geometry totals, both vertex-for-vertex spot checks, the 192-trail
-`/nearby` id set, and the privilege assertions on `sbapp`.
+**Production is on Azure.** The cutover happened on **2026-07-30 at about 20:09 UTC**, which is
+the timestamp on the `DATABASE_URL` and `DIRECT_DATABASE_URL` repository secrets
+(`gh secret list`) and matches the rewrite of the same two variables in Vercel's Production
+environment. `https://switchback-three.vercel.app` serves from
+`psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com`.
 
-Production has **not** been cut over. `DATABASE_URL` and `DIRECT_DATABASE_URL` still point at
-Neon in both Vercel and the repository secrets; the cutover below is a deliberate manual step.
+An earlier revision of this section said the opposite — "production has **not** been cut over,
+`DATABASE_URL` and `DIRECT_DATABASE_URL` still point at Neon" — for several hours after it had.
+That is the worst sentence this file could get wrong: it is the first thing a responder reads at
+2am, it would have sent them to the wrong database, and it presents the whole of "Cutting over"
+below as still-to-do when steps 3 and 8 re-run against a live system are destructive. The fix is
+not just the correction; it is that this section now names **which steps ran and which did not**,
+because "the cutover happened" and "the cutover finished" are different claims.
+
+The data was migrated and verified before any of that. All 23 tables were copied from a
+`REPEATABLE READ` exported snapshot; the source and target checksum files are byte identical, and
+`scripts/verify-migration.ts` reports **72 checks, 72 passed, 0 warnings, 0 failed** — including
+the geometry totals, both vertex-for-vertex spot checks, the 192-trail `/nearby` id set, and the
+privilege assertions on `sbapp`.
+
+### Which cutover steps actually ran
+
+| Step                                      | State                                                       |
+| ----------------------------------------- | ----------------------------------------------------------- |
+| 1 Record `T0`                             | done                                                        |
+| 2 Save the way back                       | **not done** — and the step as written was wrong. See below |
+| 3 Repoint Vercel                          | done, 2026-07-30 ~20:0x UTC                                 |
+| 4 Redeploy                                | done                                                        |
+| 5 Wait for the alias                      | done                                                        |
+| 6 Smoke-test the six routes               | done                                                        |
+| 7 Prove it is on Azure                    | done                                                        |
+| 8 Update the repository secrets           | done, 20:09:31Z / 20:09:32Z                                 |
+| 9 Keep Neon schema-current                | **not done, and not going to be.** See "Rollback expiry"    |
+| 10 Delete the `AZURE_*` migration secrets | **not done — outstanding.** See below                       |
+
+**Step 2 was not skipped by accident; it was incoherent.** It said to copy the Neon connection
+strings into `NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL` as GitHub repository secrets, and
+then rollback step 1 said to read them back out. GitHub Actions secrets cannot be read back —
+`gh api repos/mbahgatTech/switchback/actions/secrets/AZURE_DATABASE_URL` returns `name`,
+`created_at` and `updated_at`, and no value field, by design. A rollback copy in a write-only
+store is not a copy. "Rolling back to Neon" now sources the value from somewhere a human can
+actually read at 2am.
+
+**Step 10 is outstanding, and the order matters.** The three `AZURE_*` secrets are still present
+(`gh secret list`), two of them carrying `sbadmin`, which is a member of `azure_pg_admin` and can
+execute DDL against production. Nothing reads them any more: their only consumer was the
+migration workflow, which this change deletes, and `ci.yml`'s `migrate` job reads `DATABASE_URL` /
+`DIRECT_DATABASE_URL`. So they should go. They have not gone yet because **they are also the last
+remaining copy of the admin password**, and deleting them before that password exists somewhere
+readable converts "an unreadable copy exists" into "no copy exists at all". Do these two in this
+order:
+
+```bash
+# 1. Give the admin password a home that can be read from. Rotating is the honest move here,
+#    because the current value cannot be recovered to write down — see "Redeploying".
+az postgres flexible-server update \
+  --resource-group rg-switchback-prod-northcentralus \
+  --name psql-switchback-prod-37ywppu5p7fri \
+  --admin-password "$(openssl rand -hex 32)"
+# …store it in the password manager, then rebuild and reset any secret carrying it.
+
+# 2. Then, and only then, remove the migration credentials.
+gh secret delete AZURE_DATABASE_URL        --repo mbahgatTech/switchback
+gh secret delete AZURE_DIRECT_DATABASE_URL --repo mbahgatTech/switchback
+gh secret delete AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback
+```
 
 Two things the preflight caught before any data moved, both of which had been wrong in these
 files and are now fixed:
@@ -35,33 +95,50 @@ files and are now fixed:
   `pg_catalog.english`. No current query consults it (every `to_tsvector`/`websearch_to_tsquery`
   in the codebase names `'english'` explicitly), but it is now matched to the source.
 
-**How it was run, and why that matters.** The migration was executed with the PostgreSQL 17
-client from the machine that owns this repository, not from a GitHub Actions runner, because
-`migrate-to-azure.yml` is `workflow_dispatch`-only and cannot be dispatched until it exists on
-the default branch. The workflow remains the documented mechanism and every step below was run
-in its order, with its SQL — but it has still never been executed _as a workflow_, and that is
-the one claim in this directory nobody should treat as tested. Run `preflight`, then `verify`,
-from a runner once it lands on `master`.
+**How it was run.** The migration was executed with the PostgreSQL 17 client from the machine
+that owns this repository. There was a `migrate-to-azure.yml` workflow in this repository that
+described the same procedure as four dispatchable modes; it has been **deleted**. It was never
+run as a workflow — it could not be, being `workflow_dispatch`-only and never on the default
+branch — so it was 1,047 lines of untested automation for a job that is finished. Every step it
+would have taken is written out below, in order, with its SQL, which is the form that was
+actually executed. Keeping an untested destructive `reset` mode reachable from a button, wired to
+five credentials, to document a migration that is over, was the wrong trade.
 
 Note also that this path is **not reliable for bulk transfer**: the local route to Azure
 corrupts TLS records under sustained `COPY` (`SSL error: sslv3 alert bad record mac`), which
 killed both a 4-way parallel restore and a single-stream one part way through. The data was
-loaded table by table with retries, and the largest table in 13 chunks. A runner does not have
-this problem, and it is the reason the workflow exists.
+loaded table by table with retries, and the largest table in 13 chunks. If this ever has to be
+done again over the same path, plan for that; a runner does not have the problem.
 
 ---
 
 ## Contents
 
-| File              | What it is                                                                                    |
-| ----------------- | --------------------------------------------------------------------------------------------- |
-| `main.bicep`      | Subscription-scoped. Creates the resource group, then calls the module. Outputs the hostname. |
-| `postgres.bicep`  | The server: compute, storage, backups, firewall, server parameters, the database.             |
-| `main.bicepparam` | Every non-secret parameter. Committed. The password is **not** here and never may be.         |
-| `README.md`       | This file.                                                                                    |
+| File               | What it is                                                                                     |
+| ------------------ | ---------------------------------------------------------------------------------------------- |
+| `main.bicep`       | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname. |
+| `postgres.bicep`   | The server: compute, storage, backups, firewall, server parameters, the database.              |
+| `monitoring.bicep` | Log Analytics workspace, the alert action group, and the workload budget.                      |
+| `main.bicepparam`  | Every non-secret parameter. Committed. The password is **not** here and never may be.          |
+| `README.md`        | This file.                                                                                     |
 
-The migration itself lives in `.github/workflows/migrate-to-azure.yml` and
-`scripts/verify-migration.ts`, one directory up.
+Verification lives in `scripts/verify-migration.ts`, two directories up, and is run with
+`npm run verify:migration`. There is no migration workflow: there was one, it was never
+executed, and it has been deleted — see "Status" above and "Verifying" below.
+
+### A note on `$TMP`
+
+Every shell block below writes intermediate files under `$TMP`. Define it once, before the
+first block, and use one shell for the whole procedure:
+
+```bash
+TMP="${TMPDIR:-/tmp}"
+```
+
+An earlier revision used `$TEMP`, which is a Windows environment variable that Git Bash happens
+to inherit. It is unset on Linux, on macOS and in a container, where `"$TEMP/pgpw"` expands to
+`/pgpw` — a write at the filesystem root that either fails or, running as root, succeeds
+somewhere nobody will think to shred. The admin password is the file in question.
 
 ---
 
@@ -93,10 +170,34 @@ The migration itself lives in `.github/workflows/migrate-to-azure.yml` and
 
 Pay-as-you-go list prices for North Central US, verified against the retail API — they are
 identical to the East US 2 prices this table originally quoted, so the region change cost
-nothing. The subscription paying for this carries a $150
-monthly credit, so this leaves roughly $93 of headroom — enough to absorb an autogrow step,
-Microsoft Defender for open-source relational databases (~$15), and a diagnostic setting,
-without approaching the ceiling.
+nothing.
+
+**Headroom, honestly.** An earlier revision of this paragraph said the subscription's $150
+monthly credit "leaves roughly $93 of headroom". That arithmetic assumed the credit was
+dedicated to this workload, and it is not. Measured for July 2026 with
+`Microsoft.CostManagement/query`:
+
+| Resource group                                  | USD        |
+| ----------------------------------------------- | ---------- |
+| `rg-mazenbahgat-8881`                           | 179.85     |
+| `me_plant-environment_plant_together_centralus` | 11.52      |
+| `plant_together`                                | 0.02       |
+| `rg-switchback-prod-northcentralus`             | 0.00       |
+| **Subscription total**                          | **191.39** |
+
+So the subscription is already over its $150 credit before this database has billed anything,
+and the real headroom for adding to it is **negative**. The spending limit is still `On`
+(`subscriptionPolicies.spendingLimit` on the ARM representation of the subscription — current
+`az account show` reports it as `null`, which is a CLI regression, not a change of state), and
+the subscription is still `Enabled`, which those two facts together do not explain. Establish
+that from the billing page rather than from this file before treating the credit as a real
+ceiling; it is the one number here that nothing in this repository can verify.
+
+What that changes about the design: nothing, because the design was already sized to the
+Burstable tier for exactly this reason. What it changes about the _alerting_ is the whole
+budget section of `main.bicep` — a subscription-scoped budget cannot tell you anything about
+this database when 94% of the subscription's spend is somebody else's, which is why
+`monitoring.bicep` now carries a second, resource-group-scoped budget.
 
 ---
 
@@ -158,25 +259,95 @@ high-entropy and SCRAM-only, `connection_throttle.enable` backs off repeated fai
 record, and — the one that bounds the blast radius — **the credential Vercel carries is `sbapp`,
 not `sbadmin`**: it can read and write rows and is refused `CREATE TABLE`, which
 `scripts/verify-migration.ts` asserts by connecting as it and trying.
-The residual risk is therefore _leakage_ rather than brute force — which makes one operational
-rule more important than any setting in these files:
+The residual risk is therefore _leakage_ rather than brute force — which makes the credential
+inventory more important than any setting in these files. An inventory is only worth writing
+down if it is **counted rather than asserted**, so this one is counted, and the count is not
+the flattering one.
 
-> The connection strings live in exactly two places — GitHub Actions repository secrets and
-> Vercel production environment variables — and nowhere else. Not in `.env`, not in a parameter
-> file, not in a runbook, not in a commit.
+#### The sanctioned stores
 
-That rule has exactly one exception, and naming it here is the point — an unwritten exception
-is how a rule stops being auditable. **The rollback copies of the Neon strings stay in the
-GitHub repository secrets, where they already are.** `DATABASE_URL` and `DIRECT_DATABASE_URL`
-hold Neon today; at cutover they are repointed at Azure, and the Neon values move to
-`NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL` **as repository secrets only**. They are not
-pre-staged into Vercel: an environment variable sitting unused in a production project is
-another place the credential can be read, screenshotted or exported by anyone with project
-access, and the rollback does not need it there — step 1 of the rollback pastes the value in by
-hand, from the secret, at the moment it is needed.
+Two stores are sanctioned for the connection strings the application and CI depend on: GitHub
+Actions repository secrets, and Vercel environment variables. Not `.env`, not a parameter file,
+not a commit. Everything below is what is actually in them — including the part that predates
+this work and that an earlier revision of this section did not know about.
 
-So the auditable count is: two live strings (GitHub + Vercel), plus two rollback strings in
-GitHub. Four values, all in one of the two sanctioned stores, and none anywhere else.
+| Store             | Value                                 | Notes                                            |
+| ----------------- | ------------------------------------- | ------------------------------------------------ |
+| GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                 |
+| GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin` |
+| GitHub secret     | `AZURE_DATABASE_URL`                  | `sbadmin`. No consumer left — delete, see Status |
+| GitHub secret     | `AZURE_DIRECT_DATABASE_URL`           | `sbadmin`. Ditto                                 |
+| GitHub secret     | `AZURE_APP_DATABASE_URL`              | `sbapp`. Ditto                                   |
+| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`    |
+| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | separate entries, set 2026-07-31                 |
+
+The values themselves cannot be read back out of GitHub, so that column is the design intent
+plus what each consumer demonstrably requires, not a readback. If you need to know what a
+secret actually contains, the only honest answer is to set it again from a source you trust.
+
+#### The seventeen this file used to pretend were not there
+
+An earlier revision of this section stated, as a rule, that the strings live "in exactly two
+places… and nowhere else", named one exception, and closed with "the auditable count is: two
+live strings (GitHub + Vercel), plus two rollback strings in GitHub. Four values… none anywhere
+else."
+
+That was false, and measurably so. `npx vercel env ls` against
+`mbahgattechs-projects/switchback` lists **seventeen** further variables, every one of them
+scoped to _Production **and Preview**_, put there by the Vercel↔Neon marketplace integration
+when the project was first linked:
+
+```
+POSTGRES_URL   POSTGRES_URL_NO_SSL   POSTGRES_PRISMA_URL   POSTGRES_URL_NON_POOLING
+DATABASE_URL_UNPOOLED   POSTGRES_PASSWORD   PGPASSWORD   POSTGRES_USER   PGUSER
+POSTGRES_HOST   PGHOST   PGHOST_UNPOOLED   POSTGRES_DATABASE   PGDATABASE
+NEON_PROJECT_ID   NEON_AUTH_BASE_URL   VITE_NEON_AUTH_URL
+```
+
+Five of those are complete Neon connection strings and two are the bare password. So the real
+number of live-credential copies was never four; it was four plus at least seven, and the seven
+sat in exactly the location the rule argued against two paragraphs later. The reviewer who
+found this was right, and the specific way this file was wrong is worth naming: it audited what
+the author had put there, not what was there. An inventory that only counts your own additions
+is not an inventory.
+
+Three things follow, and none of them is comfortable.
+
+- **`POSTGRES_URL_NO_SSL` is a connection string with TLS switched off**, in a directory whose
+  central security argument (`postgres.bicep`, the note at the foot) is that `sslmode=require`
+  is already insufficient because an unauthenticated handshake is a way for the credential to
+  leak. A no-SSL string is a strictly worse version of the thing this design refuses.
+- **The Preview scope means every preview deployment, from any branch or pull request, is
+  handed a working credential** for the database that is the documented rollback and still
+  holds every user's email address and GPS history.
+- **The migration did not remove any of them,** so cutover changed nothing about this.
+
+They are not this change's fault — Vercel reports them as predating the branch — but they are
+this change's problem, because this is the file that publishes the inventory.
+
+**They are also, awkwardly, the thing that makes the rollback executable.** See "Rolling back":
+`POSTGRES_URL_NON_POOLING` is a readable Neon connection string, and the rollback needs exactly
+one of those. Which is the honest reason they are still there and not deleted in this change:
+removing them is a live-production edit to a project whose Preview variables were being changed
+by hand while this was written, they are integration-managed and get re-synced if forced (the
+integration has to be disconnected first), and until the rollback is retired one of them is
+load-bearing.
+
+**So this is a second declared exception, not an omission.** Removing them is the last step of
+retiring Neon, alongside deleting the Neon project itself:
+
+```bash
+# When Neon is retired — not before, the rollback reads POSTGRES_URL_NON_POOLING.
+# Disconnect the Neon storage integration from the Vercel project first, or these come back.
+npx vercel env rm POSTGRES_URL_NO_SSL production
+npx vercel env rm POSTGRES_URL_NO_SSL preview
+# …and the remaining sixteen.
+```
+
+If that is not being done today, `POSTGRES_URL_NO_SSL` should still go today: nothing in this
+repository reads it (`apps/web/src/env.ts` reads `DATABASE_URL` and `DIRECT_DATABASE_URL`;
+`git grep` finds no `POSTGRES_*` or `PG*` reference outside comments), and it is the only one of
+the seventeen that is worse than the credential it carries.
 
 Worth stating plainly: this is not a regression. Neon's endpoints are public and
 credential-only today, with precisely the same exposure model.
@@ -208,7 +379,7 @@ az provider register --namespace Microsoft.DBforPostgreSQL --wait
 ### Deploy
 
 The admin password never reaches `argv`, a committed file, or a log line. It is generated into
-a file under `$TEMP`, exported into the environment, and read from there by
+a file under `$TMP`, exported into the environment, and read from there by
 `readEnvironmentVariable` in `main.bicepparam`.
 
 `openssl rand -hex 32` rather than `-base64`, and that is not a style preference: three places
@@ -218,8 +389,8 @@ about half the time — does **not** throw. It terminates the authority, the hos
 becomes something else, and the failure names nothing useful. Hex has no such characters.
 
 ```bash
-openssl rand -hex 32 > "$TEMP/pgpw"
-export PGADMIN_PASSWORD="$(cat "$TEMP/pgpw")"
+openssl rand -hex 32 > "$TMP/pgpw"
+export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
 
 az deployment sub create \
   --name switchback-db \
@@ -227,6 +398,14 @@ az deployment sub create \
   --template-file infra/azure/main.bicep \
   --parameters infra/azure/main.bicepparam
 ```
+
+**Put that password in a password manager now, before going any further.** This is the only
+moment it is readable. It cannot be recovered from ARM (`administratorLoginPassword` is
+`@secure()` and is never returned), it cannot be recovered from a GitHub Actions secret (those
+are write-only), and it cannot be recovered from Vercel, which is never given it. A redeploy
+has to pass the _same_ value, so a password that exists only inside a connection string nobody
+can read is a password that has already been lost — the recovery is a rotation, which is a
+different and more disruptive procedure. See "Redeploying".
 
 Read the outputs — hostname, ports, and the two connection-string templates, none of which
 contains the password:
@@ -247,23 +426,27 @@ az deployment sub what-if \
 ### Set the three new repository secrets
 
 Build each URL from `databaseUrlTemplate` / `directDatabaseUrlTemplate` /
-`applicationDatabaseUrlTemplate` with the password substituted, write it to a `$TEMP` file, and
+`applicationDatabaseUrlTemplate` with the password substituted, write it to a `$TMP` file, and
 pipe it in over stdin. Never `--body`, which puts the value in `argv` and in shell history.
 
 ```bash
-gh secret set AZURE_DATABASE_URL        --repo mbahgatTech/switchback < "$TEMP/azure-pooled"
-gh secret set AZURE_DIRECT_DATABASE_URL --repo mbahgatTech/switchback < "$TEMP/azure-direct"
-gh secret set AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback < "$TEMP/azure-app"
-rm -f "$TEMP/azure-pooled" "$TEMP/azure-direct" "$TEMP/azure-app" "$TEMP/pgpw"
+gh secret set AZURE_DATABASE_URL        --repo mbahgatTech/switchback < "$TMP/azure-pooled"
+gh secret set AZURE_DIRECT_DATABASE_URL --repo mbahgatTech/switchback < "$TMP/azure-direct"
+gh secret set AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback < "$TMP/azure-app"
+rm -f "$TMP/azure-pooled" "$TMP/azure-direct" "$TMP/azure-app" "$TMP/pgpw"
 unset PGADMIN_PASSWORD
 ```
+
+The `rm` is a shred of scratch files, **not** an archival step. Nothing here is a backup of the
+password: see the note under "Deploy" about the password manager, and "Redeploying" about what
+it costs to skip it.
 
 The first two are `sbadmin` — the migration and CI credential, which can execute DDL because
 `prisma db push` needs it. The third is `sbapp`, the least-privilege role, and it is the only
 one Vercel is ever given; pick a _different_ password for it, since the whole point is that a
 leak of the web credential is not a leak of the admin one. The role does not exist yet at this
-stage: `migrate` mode creates it from this secret, and `scripts/verify-migration.ts` then
-connects as it and asserts that `CREATE TABLE` is refused.
+stage — it is created by the role step below, and `scripts/verify-migration.ts` then connects as
+it and asserts that `CREATE TABLE` is refused.
 
 The existing `DATABASE_URL` and `DIRECT_DATABASE_URL` secrets keep pointing at Neon. They are
 changed at cutover, not before.
@@ -284,9 +467,9 @@ Prisma half, and each client ignores the other's parameter.
 
 One consequence worth knowing before it surprises you: libpq looks for a root store in
 `~/.postgresql/root.crt` and fails closed when it is absent, so anything running `psql`,
-`pg_dump` or `pg_restore` against these URLs must also set `PGSSLROOTCERT`. The migration
-workflow points it at the runner's system bundle, which already contains DigiCert Global
-Root G2 and Microsoft RSA Root CA 2017.
+`pg_dump` or `pg_restore` against these URLs must also set `PGSSLROOTCERT` to a bundle
+containing DigiCert Global Root G2 and Microsoft RSA Root CA 2017. On Debian and Ubuntu that is
+`/etc/ssl/certs/ca-certificates.crt`; both roots are already in it.
 
 The first two are identical, and that is correct rather than redundant — `schema.prisma`
 requires `directUrl` to exist, and keeping the split means the eventual General Purpose
@@ -305,10 +488,43 @@ connections is a pool timeout on every drain.
 Re-running the template is a no-op, not a second server: every name is either fixed or a pure
 function of the resource group id, so ARM reconciles the existing server.
 
-**With one exception.** ARM cannot read the current password, so whatever is passed is written.
-Pass the _same_ value every time. A redeploy with a freshly generated password silently rotates
-the admin credential and every connection string carrying it stops working — including the ones
-Vercel is using to serve the site.
+"No-op" has a precise meaning here, and the header of `main.bicep` carries the measured version
+— `az deployment sub what-if` reports a handful of properties that never converge, because they
+are provider-assigned (`storage.iops`, `dataEncryption`, `replicationRole`) or because Azure
+rewrites them on read (`source: user-override` collapsing to `system-default` on three server
+parameters whose values happen to equal the engine default). None of them changes behaviour.
+Read that list before concluding the template has drifted.
+
+**The exception with teeth is the password.** ARM cannot read the current password, so whatever
+is passed is written. Pass the _same_ value every time. A redeploy with a freshly generated
+password silently rotates the admin credential and every connection string carrying it stops
+working — including the ones Vercel is using to serve the site.
+
+Which means the password has to exist somewhere a human can read at the moment of the redeploy.
+There is exactly one such place and this file has to name it, because an earlier revision did
+not and the omission made its own instructions impossible to follow: **a password-manager
+entry.** Not the `$TMP` file, which the deploy procedure deletes three steps after creating it.
+Not a GitHub Actions secret — those cannot be read back, only overwritten. Not Vercel, which is
+deliberately never given the admin credential at all. If the value is not in a password manager
+then it is not anywhere, and the sentence "pass the same value every time" is an instruction
+nobody can carry out.
+
+**If it has already been lost, rotate rather than guess.** This is a real procedure with real
+consequences, not a footnote:
+
+```bash
+NEWPW="$(openssl rand -hex 32)"          # …and paste it into the password manager first
+az postgres flexible-server update \
+  --resource-group rg-switchback-prod-northcentralus \
+  --name psql-switchback-prod-37ywppu5p7fri \
+  --admin-password "$NEWPW"
+```
+
+Every connection string carrying `sbadmin` stops working the instant that returns — so rebuild
+and re-set `DIRECT_DATABASE_URL` (and any surviving `AZURE_*` secret) in the same sitting. The
+site itself is unaffected: Vercel carries `sbapp`, whose password is separate and is not touched
+by this. That separation is the whole reason for the two-role design, and this is the day it
+pays for itself.
 
 Add a delete lock once you are happy with it. Deleting a Flexible Server deletes all of its
 backups, irrecoverably:
@@ -320,90 +536,90 @@ az lock create --name no-delete --lock-type CanNotDelete \
 
 ---
 
-## Running the migration
+## Creating the least-privilege application role
 
-Everything that opens a Postgres socket runs on a GitHub Actions runner, because the machine
-that owns this repository cannot reach port 5432 — a VPN is the default route there and
-black-holes it. Everything that talks to Azure's control plane (`az`) runs locally over 443.
-That split is why the workflow needs no Azure credentials at all.
+`sbapp` is the credential Vercel carries. ARM cannot run SQL, so `postgres.bicep` names the
+role but cannot create it; this is the step that does, and `scripts/verify-migration.ts` is what
+turns it from an intention into a checked claim.
 
-The workflow is **`Migrate Neon → Azure`** in the Actions tab, or:
+It has been run. It is written out here because it is the only remaining record of it, and
+because it has to be run again against any rebuilt server.
+
+Connect as `sbadmin` with `psql`, then:
+
+```sql
+-- Substitute the sbapp password by hand. Deliberately a plain top-level statement rather than
+-- a DO $$ … $$ block: a statement executed through PL/pgSQL `EXECUTE format(…%L…)` is quoted
+-- back verbatim in PostgreSQL's `CONTEXT:` line when it raises, which means a failure prints
+-- the password in cleartext to whatever is reading stderr. A top-level statement's error does
+-- not quote its own text. If you do wrap this in a DO block, pass `-v VERBOSITY=terse` to psql,
+-- which suppresses DETAIL/HINT/CONTEXT.
+CREATE ROLE sbapp LOGIN PASSWORD '…';
+-- …or, if it already exists:
+-- ALTER ROLE sbapp LOGIN PASSWORD '…';
+
+REVOKE ALL ON SCHEMA public FROM sbapp;
+GRANT CONNECT ON DATABASE switchback TO sbapp;
+GRANT USAGE ON SCHEMA public TO sbapp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sbapp;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO sbapp;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sbapp;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO sbapp;
+```
+
+The two `ALTER DEFAULT PRIVILEGES` statements are the ones people leave out. Without them the
+grants cover the tables that exist right now, and the next `prisma db push` that adds a table
+produces a `permission denied` on a table the app has never seen — at runtime, in production,
+on whichever page reads it first.
+
+Then confirm the boundary rather than assuming it:
+
+```sql
+SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls,
+       pg_has_role(rolname, 'azure_pg_admin', 'member') AS is_pg_admin
+FROM pg_roles WHERE rolname = 'sbapp';
+```
+
+All six should be false. `verify:migration` asserts the same thing from the other side, by
+connecting _as_ `sbapp` and requiring `CREATE TABLE` to be refused, which is the version that
+cannot be fooled by a misread catalogue.
+
+---
+
+## Verifying
+
+`scripts/verify-migration.ts` compares a source and a target and prints a table of pass/fail.
+It is the thing that proves a migration rather than assuming it, and it is worth re-running
+after any restore, any rebuild, and any cutover.
 
 ```bash
-gh workflow run migrate-to-azure.yml --repo mbahgatTech/switchback -f mode=preflight
+export NEON_VERIFY_URL='postgresql://…@…neon.tech/switchback?sslmode=verify-full'
+export AZURE_VERIFY_URL='postgresql://sbadmin:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
+export AZURE_APP_VERIFY_URL='postgresql://sbapp:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
+npm run verify:migration
 ```
 
-It has four modes.
+| Variable                       | Required | What it does                                                       |
+| ------------------------------ | -------- | ------------------------------------------------------------------ |
+| `NEON_VERIFY_URL`              | yes      | The source. Read-only; nothing writes to it                        |
+| `AZURE_VERIFY_URL`             | yes      | The target, as `sbadmin`                                           |
+| `AZURE_APP_VERIFY_URL`         | no       | The target as `sbapp`. Omitting it skips the privilege assertions  |
+| `NEON_CHECKSUMS`               | no       | Path to source per-table `md5` file                                |
+| `AZURE_CHECKSUMS`              | no       | Path to target per-table `md5` file                                |
+| `CHECKSUM_SNAPSHOT_CONSISTENT` | no       | `1` when the source checksums came from inside the dump's snapshot |
 
-### 1. `preflight` — read-only, changes nothing
+Without `CHECKSUM_SNAPSHOT_CONSISTENT=1` the ingest-derived tables (trails, waypoints, tiles,
+jobs, sessions) are compared against a _live_ Neon that keeps taking writes, so a difference in
+those is reported as a warning rather than a failure. A difference anywhere else is still a
+failure. `photos` is deliberately not on the forgiving list: it holds user uploads as well as
+ingest-derived hero images, and treating somebody's lost photograph as expected churn is the
+wrong default.
 
-Run this first, always. It proves:
-
-- the runner has PostgreSQL **17** client tools (the image ships 16, and `pg_dump` refuses to
-  dump a newer server — this is the first thing that goes wrong if nobody looks);
-- both endpoints are reachable and what version they are;
-- the negotiated TLS version on each side;
-- the two databases have the **same collation** — a mismatch restores fine and then silently
-  reorders every `ORDER BY name` and rebuilds the partial unique index on `trail_lists` under
-  different rules, so preflight refuses to continue;
-- `postgis`, `pg_trgm` and `btree_gist` can actually be created on the target. This is the
-  classic first failure of an Azure PostgreSQL migration: ARM records `azure.extensions`, the
-  portal shows the value, and `CREATE EXTENSION` still fails because the engine kept its
-  default. Preflight creates them inside a transaction and rolls back, so it proves the
-  allowlist without leaving anything behind.
-
-### 2. `migrate` — the real thing
-
-Dump from Neon, restore into Azure, converge the schema, `VACUUM ANALYZE`, verify. Refuses a
-target that already has tables unless `allow_overwrite` is ticked.
-
-Neon is never written to: every connection to it carries
-`default_transaction_read_only=on`, so that is a guarantee the server enforces rather than an
-intention. The dump never leaves the runner — no artifact upload, ever. It contains every
-user's email address, every recorded GPS track and every session token.
-
-Expect roughly 20–40 minutes end to end for the ~382 MB corpus.
-
-### 3. `verify` — verification alone
-
-Re-checks whatever is already in the target. Useful after a cutover. Because it compares
-against a _live_ Neon rather than a frozen snapshot, differences in ingest-derived tables
-(trails, waypoints, tiles, jobs, sessions) are reported as warnings rather than failures.
-Everything else is still a failure.
-
-### 4. `reset` — wind a rehearsal back
-
-Drops every non-extension table **and every non-extension enum type** in the target's `public`
-schema. Three guards, all of which must pass:
-
-1. The host must be `*.postgres.database.azure.com`.
-2. The target must not be the host `secrets.DIRECT_DATABASE_URL` currently names — i.e. it
-   refuses the moment production is served from it. This is the guard that survives the
-   cutover; the first one does not, because after cutover production _is_ an Azure Flexible
-   Server.
-3. `confirm_reset` must be `<database>-<today's UTC date>`, e.g. `switchback-2026-07-30`. The
-   old form was the database name alone, which is printed in `main.bicepparam`, in this file
-   and in the workflow — a confirmation token written down in the repository is not a
-   confirmation. This one has to be constructed at the moment of use and stops working at
-   midnight UTC.
-
-Extension-owned objects are skipped deliberately. `spatial_ref_sys` belongs to postgis and
-cannot be dropped while the extension exists; a loop that tried would abort atomically and drop
-_nothing_ — measured on a populated target, 24 tables before and 24 after. The enum types are
-dropped because `pre-data` creates 16 of them and leaving them behind makes the _next_ migrate
-fail 16 times with `type "ActivityType" already exists` before loading a row.
-
-### A rehearsal
-
-Do this days before the real run, not on the day:
-
-```
-preflight  →  migrate  →  read the verification table  →  reset
-```
-
-It measures the real dump and restore times, so the cutover window is a number rather than a
-guess, and it surfaces every ordering problem while nothing is at stake. Then the real run is
-the same `migrate` against a database that is empty again.
+The first check, before any query, is that the two URLs name different hosts. A verification
+run comparing a database to itself passes everything else in the file perfectly, and it is one
+copy-paste away.
 
 ### What verification actually proves
 
@@ -442,27 +658,35 @@ string and no row of user data.
 
 ## Cutting over
 
-Preconditions: verification green, a rehearsal done, and a low-traffic hour. Avoid 04:17 UTC —
+**This has already been done** — see "Status" at the top for what ran and what did not. What
+follows is the procedure as executed, kept because the same steps apply to any rebuild, and
+because two of them are still outstanding.
+
+Preconditions: verification green, and a low-traffic hour. Avoid 04:17 UTC —
 `apps/web/vercel.json` runs the ingest drain cron then.
 
 1. **Record the moment.** Note `T0` in UTC. Anything written to Neon after this exists only
    there.
 
-2. **Save the way back first — in the repository secrets, not in Vercel.** Copy the _current_
-   Neon values into `NEON_DATABASE_URL` and `NEON_DIRECT_DATABASE_URL` as GitHub repository
-   secrets, over stdin, the same way every other secret here is set:
+2. **Save the way back — somewhere you can read it from.** This step used to say to copy the
+   Neon strings into `NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL` as GitHub repository
+   secrets. **That was wrong and the instruction has been removed rather than repaired.**
 
-   ```bash
-   gh secret set NEON_DATABASE_URL        --repo mbahgatTech/switchback < "$TEMP/neon-pooled"
-   gh secret set NEON_DIRECT_DATABASE_URL --repo mbahgatTech/switchback < "$TEMP/neon-direct"
-   rm -f "$TEMP/neon-pooled" "$TEMP/neon-direct"
-   ```
+   GitHub Actions secrets are write-only. `gh api repos/mbahgatTech/switchback/actions/secrets/
+AZURE_DATABASE_URL` returns `name`, `created_at` and `updated_at` and no value field; there
+   is no API, CLI flag or UI affordance that returns the contents. A rollback copy in a store
+   that cannot be read is not a copy, and rollback step 1 — which said to read them back —
+   could never have worked. The step was also never performed, so the mistake stayed
+   theoretical, which is the only good thing about it.
 
-   Deliberately **not** as Vercel environment variables. An unused variable sitting in a
-   production project is one more place a live credential can be read or exported, and the
-   rollback gains nothing from it being there — rollback step 1 pastes the value into Vercel by
-   hand at the moment it is needed, which is the same number of keystrokes. See the rule and
-   its single named exception near the top of this file.
+   A GitHub secret is still the right home for a value a _workflow_ consumes, because a
+   workflow does not need to read it, only to be handed it. It is the wrong home for a value a
+   _human_ has to type at 2am. Those are different requirements and this file used to conflate
+   them.
+
+   So: put the Neon pooled and direct strings in **the password-manager entry that already
+   holds the database credentials**, next to the Azure admin password. Then see "Rolling back",
+   which now names two sources that can actually be read.
 
 3. **Repoint production.** Change `DATABASE_URL` and `DIRECT_DATABASE_URL` to the Azure values.
    Note that `DATABASE_URL` currently spans **Production and Preview** as a single entry —
@@ -500,11 +724,14 @@ Preconditions: verification green, a rehearsal done, and a low-traffic hour. Avo
 8. **Update the repository secrets** `DATABASE_URL` and `DIRECT_DATABASE_URL` to the Azure
    values, so `ci.yml`'s `migrate` job pushes schema to the live database.
 
-9. **Keep Neon schema-current while it is the rollback.** Add a second `db push` against the
-   `NEON_DIRECT_DATABASE_URL` secret saved in step 2 to `ci.yml`'s `migrate` job. Without it,
-   the first schema change shipped after cutover silently expires the rollback: the env var
-   flips to Azure, Neon's schema freezes at the cutover commit, and a rollback three weeks
-   later lands the app on a database missing a column. Remove the step when Neon is retired.
+9. **Keep Neon schema-current while it is the rollback — or accept that it is not.** The
+   original instruction here was to add a second `db push` against a `NEON_DIRECT_DATABASE_URL`
+   secret to `ci.yml`'s `migrate` job. **That was not done, and it is not being done.** The
+   reasoning is in "Rollback expiry" below; the short version is that a second `db push` to a
+   database nothing serves is a schema migration running unwatched against the one copy of the
+   data that exists if Azure is broken, and the failure mode of _that_ going wrong is worse than
+   the failure mode it prevents. What replaces it is stating the consequence out loud rather
+   than leaving an unticked instruction that a reader assumes was followed.
 
 10. **Delete the migration secrets.** Once `DATABASE_URL` / `DIRECT_DATABASE_URL` point at
     Azure, the `AZURE_*` trio has done its job and should not outlive it:
@@ -515,13 +742,21 @@ Preconditions: verification green, a rehearsal done, and a low-traffic hour. Avo
     gh secret delete AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback
     ```
 
-    This is defence in depth rather than the primary control. `migrate-to-azure.yml` is
-    `workflow_dispatch`-only and must live on the default branch to be dispatchable at all, so
-    it stays visible in the Actions tab forever; its `reset` and `allow_overwrite` paths are
-    already refused after cutover by `assert_target_is_not_live`, which compares the target
-    against the host in `secrets.DIRECT_DATABASE_URL` and so flips from "permit" to "refuse" at
-    the exact moment this step is taken. Deleting the secrets removes the input those paths
-    read, so the guard and the absence of a credential fail in the same direction.
+    **Outstanding** — see "Status" for why the admin password has to be rotated into a password
+    manager first, and why deleting these before that would destroy the last copy of it.
+
+    Two of the three carry `sbadmin`, which is a member of `azure_pg_admin` and can execute DDL
+    against production. Before cutover they addressed a database nothing depended on; they now
+    address the live one. The whole blast-radius argument of this design is that the credential
+    reachable from CI and from Vercel is `sbapp` — leaving a DDL-capable production credential
+    in repository secrets, readable by any workflow anyone adds later, is that argument being
+    quietly given up.
+
+    An earlier revision justified keeping them by pointing at `assert_target_is_not_live` inside
+    `migrate-to-azure.yml`, which refused destructive modes once the target host matched the
+    live one. That guard was real and it did work. It is also gone, along with the workflow, so
+    the argument it supported no longer stands and these secrets have no compensating control
+    and no consumer. Delete them.
 
 ### What can be lost, honestly
 
@@ -554,11 +789,10 @@ would cover **inserts only** — updates and deletes made in the window are not 
 way.
 
 Say plainly what that costs, because an earlier draft of this file described the replay as
-though it were a step someone could take: `migrate-to-azure.yml` has no mode that does it.
-`migrate` refuses a non-empty target, `verify` only reads, `reset` only destroys, and no
-`reconcile` script exists. Nor is one easy to add in the direction that matters most — the
-workflow's standing guarantee is that it _never writes to Neon_ (every connection to it carries
-`default_transaction_read_only=on`), and the rollback direction would have to break it.
+though it were a step someone could take: no script in this repository does it. `verify:migration`
+only reads, and no `reconcile` script exists. Nor is one trivial in the direction that matters
+most: everything here that touches Neon does so read-only, deliberately, and a reconcile in the
+rollback direction would have to be the first thing that writes to it.
 
 So plan the cutover on the assumption that **writes in the window are not automatically
 recovered**. That is tolerable because of what the window contains, not because the recovery
@@ -574,39 +808,90 @@ deliberately, by someone with both credentials in front of them.
 
 Neon is retained, populated and reachable. Rolling back is a Vercel change and a redeploy.
 
-1. Vercel → Production environment variables: set `DATABASE_URL` and `DIRECT_DATABASE_URL` back
-   to the Neon values, read from the `NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL`
-   repository secrets saved in step 2 of the cutover. They are in GitHub rather than pre-staged
-   in Vercel on purpose — see the rule and its named exception near the top of this file.
+1. **Get the Neon connection strings.** Two sources, both readable, in preference order:
+
+   - **The Vercel project already holds them.** The Neon marketplace integration put
+     `POSTGRES_URL_NON_POOLING` and `POSTGRES_URL` into this project, scoped to Production and
+     Preview, and cutover did not remove them. Read either from the Vercel dashboard, or:
+
+     ```bash
+     npx vercel env pull /tmp/neon.env --environment=production
+     grep -E '^POSTGRES_URL(_NON_POOLING)?=' /tmp/neon.env
+     # …and shred it: rm -f /tmp/neon.env
+     ```
+
+     `POSTGRES_URL_NON_POOLING` is the direct endpoint, `POSTGRES_URL` the pooled one. There is
+     an irony here worth naming rather than hiding: the seventeen variables the security section
+     above criticises are the reason this step has an input at all.
+
+   - **The Neon console**, connection-string panel for the project's branch and role. If the
+     password is no longer displayed, reset the role password there and rebuild the URL. This is
+     the source that survives the integration being disconnected.
+
+   **Not** from a GitHub Actions secret. `NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL` were
+   never created, and had they been they would not be readable — Actions secrets are write-only.
+   An earlier revision of this step said to read them from there, which could not have worked on
+   the night it mattered.
+
+   Then set `DATABASE_URL` and `DIRECT_DATABASE_URL` in Vercel → Production back to those values.
+
 2. Redeploy. Poll `/api/version`. Run the six smoke routes.
    **Time to restore service: about 3–5 minutes**, nearly all of it the redeploy.
-3. Revert the repository secrets `DATABASE_URL` / `DIRECT_DATABASE_URL` to the Neon values.
-4. Reconcile in reverse: rows written to Azure since cutover exist only there. As above, this
-   is manual — no mode of `migrate-to-azure.yml` performs it, and the workflow cannot be the
-   vehicle in this direction because it is built never to write to Neon. Leave Azure intact and
-   replay by hand if the set turns out to matter.
-5. **Leave Azure running and intact** until the cause is understood. Do not delete the evidence.
+3. **Push the schema to Neon before trusting it.** Neon's schema is frozen at the cutover commit
+   — see "Rollback expiry". If anything has shipped since, reconcile it by hand:
 
-**Rollback expiry.** The rollback is clean only while both hold: no schema change has shipped
-since cutover _unless_ step 9 of the cutover kept Neon in sync, and the Azure-only write set is
-still small enough to replay. **Keep Neon for at least 30 days.** Neon suspends idle compute
-automatically and retains the data, so a warm rollback costs nothing.
+   ```bash
+   DATABASE_URL='<neon-pooled>' DIRECT_DATABASE_URL='<neon-direct>' npm run db:push
+   ```
+
+   Read the diff Prisma proposes before accepting it. Note that `db:push` loads `.env` through
+   `dotenv-cli`, which does not override variables already present in the environment — so the
+   two above win, but check the host it prints before answering any prompt.
+
+4. Revert the repository secrets `DATABASE_URL` / `DIRECT_DATABASE_URL` to the Neon values.
+5. Reconcile in reverse: rows written to Azure since cutover exist only there. As above, this is
+   manual — no script here performs it. Leave Azure intact and replay by hand if the set turns
+   out to matter.
+6. **Leave Azure running and intact** until the cause is understood. Do not delete the evidence.
+
+**Rollback expiry.** Two things bound it, and the first one is already running.
+
+**Neon's schema is frozen at the cutover commit, and nothing keeps it current.** Cutover step 9
+proposed a second `db push` against Neon from `ci.yml`; it was never added and is not going to
+be. So the honest statement is: the first schema change shipped after 2026-07-30 20:09 UTC makes
+a rollback a two-step operation rather than one — repoint, then `db push` against Neon by hand,
+as step 3 above says — and the further past the cutover, the larger the diff that `db push` will
+propose against a database holding the only copy of anything Azure has lost. That is survivable
+while it is a column or two. It stops being survivable quietly, which is why it is written here
+rather than left implied by an unticked checkbox.
+
+**And the Azure-only write set has to stay small enough to replay by hand.** It grows every day.
+
+**Keep Neon for at least 30 days,** and treat the rollback as expiring rather than permanent.
+Neon suspends idle compute automatically and retains the data, so a warm rollback costs nothing
+while it lasts.
 
 ### Signals that the cutover went wrong
 
 A 500 on its own tells you nothing. These do:
 
-| Symptom                                                             | Cause                                                            |
-| ------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `/api/version` fine, `/nearby` and `/trails/*` 500                  | Prisma cannot reach Azure — firewall, TLS, or wrong port         |
-| `prepared statement "s0" already exists`                            | Pooled URL missing `pgbouncer=true` (General Purpose only)       |
-| `SSL connection required`                                           | `sslmode=verify-full` missing from a URL                         |
-| `function st_dwithin(geography, geography, numeric) does not exist` | PostGIS not created, or not on `search_path`                     |
-| `/nearby` correct but slower than 3 s                               | `trails_geom_geography_gist` missing or unused — sequential scan |
-| Search returns nothing for a trail you know exists                  | `trails_search_vector_gin` or `trails_name_trgm` missing         |
-| Everyone signed out                                                 | `sessions` rows lost in the window. Expected, self-healing       |
-| Every page 1–2 s slower                                             | Wrong region. Not fixable in place                               |
-| Azure active connections pinned at the ceiling                      | Pool sizing — check `BACKGROUND_POOL_SIZE` against the tier      |
+| Symptom                                                             | Cause                                                               |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `/api/version` fine, `/nearby` and `/trails/*` 500                  | Prisma cannot reach Azure — firewall, TLS, or wrong port            |
+| `prepared statement "s0" already exists`                            | Pooled URL missing `pgbouncer=true` (General Purpose only)          |
+| `SSL connection required`                                           | `sslmode=verify-full` missing from a URL                            |
+| `function st_dwithin(geography, geography, numeric) does not exist` | PostGIS not created, or not on `search_path`                        |
+| `/nearby` correct but slower than 3 s                               | `trails_geom_geography_gist` missing or unused — sequential scan    |
+| Search returns nothing for a trail you know exists                  | `trails_search_vector_gin` or `trails_name_trgm` missing            |
+| Everyone signed out                                                 | `sessions` rows lost in the window. Expected, self-healing          |
+| Every page 1–2 s slower                                             | Wrong region. Not fixable in place                                  |
+| Azure active connections pinned at the ceiling                      | Pool sizing — check `BACKGROUND_POOL_SIZE` against the tier         |
+| Every route 500, and the server is gone from the portal             | The credit ran out and the spending limit deallocated it. See below |
+
+That last row is the one with no five-minute fix. The recovery is either to wait for the next
+billing month or to remove the spending limit, which converts the subscription to
+pay-as-you-go and starts charging a card. Roll back to Neon while deciding, and read the budget
+section of `main.bicep`.
 
 Watch for an hour after cutover: Vercel function error rate, Azure active connections and CPU,
 and the p95 of `/nearby`. If any of the first four appear and are not fixable in five minutes,
@@ -617,8 +902,10 @@ redeploy.
 
 ## Known follow-ups, deliberately not done here
 
-Three small changes belong to the application rather than to the infrastructure, and are left
-for a separate reviewable commit:
+Operational steps that are outstanding are in [Status](#status-as-of-the-last-run), not here —
+rotating the admin password into a password manager, deleting the three `AZURE_*` secrets, and
+removing the Neon integration's seventeen Vercel variables when Neon is retired. This section is
+for code that belongs to the application rather than to the infrastructure.
 
 - ~~**`packages/db/scripts/seed.ts`, `seed-reviews.ts`, `seed-tracks.ts`**~~ — **done in this
   change, not left for later.** All three gated on `/neon\.tech|amazonaws\.com|supabase\.co/`,
