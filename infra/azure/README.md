@@ -85,6 +85,20 @@ gh secret delete AZURE_DIRECT_DATABASE_URL --repo mbahgatTech/switchback
 gh secret delete AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback
 ```
 
+Neither command is a change to this repository, so **merging this branch does not close step
+10** and no review of it can. Both act on live state — one on the running server, one on the
+repository's secret store — and the first needs a password manager that only a person has. The
+step is recorded here as outstanding rather than dropped so that it survives the merge, and the
+table above will keep saying `not done` until someone runs the two commands and edits the row.
+To check where it stands without reading anything else:
+
+```bash
+gh secret list --repo mbahgatTech/switchback | grep AZURE_
+```
+
+Three lines means step 10 is still open. No output means it is done, and this section and the
+row in the table above should both be updated to say so.
+
 Two things the preflight caught before any data moved, both of which had been wrong in these
 files and are now fixed:
 
@@ -424,6 +438,18 @@ az deployment sub what-if \
 ```
 
 ### Set the three new repository secrets
+
+**These three are migration-scoped, and on a rebuild today you can skip this section
+entirely.** Their only consumer was the deleted `migrate-to-azure.yml`; nothing in the
+repository reads `AZURE_DATABASE_URL`, `AZURE_DIRECT_DATABASE_URL` or `AZURE_APP_DATABASE_URL`
+now (`git grep -ln 'AZURE_.*DATABASE_URL'` returns this file and nothing else — `ci.yml`'s
+`migrate` job reads `DATABASE_URL` / `DIRECT_DATABASE_URL`, and `scripts/verify-migration.ts`
+takes `*_VERIFY_URL` from the environment of whoever runs it). A migration executed from a
+workstation, which is how this one was executed, needs the three URLs in `$TMP` files and in
+that shell — not in a write-only store no step reads back. The step is kept because it is what
+was done, and because it is where the still-live secrets came from; if you do run it, **step 10
+of "Cutting over" deletes them again**, and the gap between the two is the whole of the exposure
+described under "Step 10 is outstanding".
 
 Build each URL from `databaseUrlTemplate` / `directDatabaseUrlTemplate` /
 `applicationDatabaseUrlTemplate` with the password substituted, write it to a `$TMP` file, and

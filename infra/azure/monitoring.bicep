@@ -55,10 +55,13 @@ param alertEmailAddress string
 @description('Budget for this resource group alone, in USD. See main.bicep.')
 param workloadBudgetUsd int
 
-@description('First day of the budget window, UTC, as `yyyy-MM-01`. Fixed, not `utcNow()`.')
+@description('''
+First day of the budget window, UTC, as full ISO-8601 — `yyyy-MM-01T00:00:00Z`, the form ARM
+stores and reads back. Fixed, not `utcNow()`. See main.bicep.
+''')
 param budgetStartDate string
 
-@description('Last day of the budget window, UTC.')
+@description('Last day of the budget window, UTC, same form as `budgetStartDate`.')
 param budgetEndDate string
 
 // ---------------------------------------------------------------------------------------

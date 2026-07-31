@@ -421,7 +421,8 @@ module postgres 'postgres.bicep' = {
 // ---------------------------------------------------------------------------------------
 
 @description('''
-First day of the budget window, UTC, as `yyyy-MM-01`. Fixed, not `utcNow()`.
+First day of the budget window, UTC, as full ISO-8601 — `yyyy-MM-01T00:00:00Z`. Fixed, not
+`utcNow()`.
 
 An earlier revision defaulted this to `utcNow('yyyy-MM-01')`. That made it the one value in
 this template that is neither fixed nor a function of the resource group id, which falsified
@@ -436,11 +437,24 @@ redeploy the header calls "the only documented way to reapply the same admin pas
 budget window that moves because of *when* someone reapplied a password is a surprise nobody
 asked for. `endDate` is likewise stated rather than left to the provider, so the deployed
 window and the declared window are the same window.
-''')
-param budgetStartDate string = '2026-07-01'
 
-@description('Last day of the budget window, UTC. Matches what Azure assigns by default.')
-param budgetEndDate string = '2036-07-01'
+The default carries the `T00:00:00Z` for the same reason main.bicepparam does. A bare
+`'2026-07-01'` deploys identically and then reports
+`Modify properties.timePeriod.startDate "2026-07-01T00:00:00Z" -> "2026-07-01"` on every
+what-if afterwards, because ARM stores and reads back the full form. This default previously
+used the bare form, which meant the file documenting that trap shipped it: anyone deploying
+main.bicep without main.bicepparam — the what-if in the header runs both together, but a
+`--parameters budgetStartDate=` override or a bare template deploy does not — inherited the
+permanent diff the paragraph above exists to prevent. Default and parameter file now agree
+character for character, so the two cannot disagree.
+''')
+param budgetStartDate string = '2026-07-01T00:00:00Z'
+
+@description('''
+Last day of the budget window, UTC, in the same full ISO-8601 form as `budgetStartDate`.
+Matches what Azure assigns by default.
+''')
+param budgetEndDate string = '2036-07-01T00:00:00Z'
 
 resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
   name: 'switchback-monthly-credit'
