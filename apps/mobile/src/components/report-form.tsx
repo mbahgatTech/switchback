@@ -208,12 +208,14 @@ export function ReportForm({ trailId }: { trailId: string }) {
     /*
      * The author of a removed report is told before they type, not after.
      *
-     * `reviews.mine` returns the hidden row with its rating intact and its body stripped, so
-     * opening the form on it would show the original stars over an empty box — reading as
-     * though the app had lost their writing — and both buttons on that screen are refused
-     * server-side: `reviews.upsert` will not edit a hidden row and `reviews.remove` will not
-     * delete one. Offering the screen at all invites the two actions that cannot succeed.
-     * The notice carries the address, which is the move that is actually available.
+     * `reviews.mine` returns the hidden row, but `toReview` empties it on the way out:
+     * rating and body come back null, conditions empty, activity null, helpful count zero.
+     * Only the dates and the author survive. So opening the form on it would show a blank
+     * screen where their report was — reading as though the app had lost it rather than
+     * removed it — and both buttons on that screen are refused server-side: `reviews.upsert`
+     * will not edit a hidden row and `reviews.remove` will not delete one. Offering the
+     * screen at all invites the two actions that cannot succeed. The notice carries the
+     * address, which is the move that is actually available.
      */
     return (
       <View style={styles.removed}>

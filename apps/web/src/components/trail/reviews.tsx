@@ -215,13 +215,17 @@ export function Reviews({
         /*
          * The author of a removed report is told before they type, not after.
          *
-         * `reviews.mine` returns the hidden row with its rating intact and its body stripped,
-         * so handing it to `ReviewForm` as `existing` drew "Edit your report", opened a form
-         * showing their original stars above an empty box — reading as though the site had
-         * lost their writing — and threw the FORBIDDEN from `reviews.upsert` into the error
-         * strip only once they had retyped it and pressed save. The upsert guard is right;
-         * inviting the one action it exists to refuse is not. So the form is replaced by the
-         * notice and the address, which is the only move actually available to them.
+         * `reviews.mine` returns the hidden row, but `toReview` empties it on the way out:
+         * rating and body come back null, conditions empty, activity null, helpful count
+         * zero. Only the dates and the author survive. So handing it to `ReviewForm` as
+         * `existing` drew "Edit your report" over a form with nothing in it — reading as
+         * though the site had lost the whole report rather than removed it — and the two
+         * buttons that heading implies are both refused server-side: `reviews.upsert`
+         * throws FORBIDDEN on a hidden row, and `reviews.remove` will not delete the
+         * tombstone either. The save error is the worse of the two, because it reaches the
+         * error strip only after they have retyped the whole report. Those guards are right;
+         * drawing the two actions they exist to refuse is not. So the form is replaced by
+         * the notice and the address, which is the only move actually available to them.
          *
          * Survey plate and a hairline: this is about the reader's own standing, not about
          * the trail. This is also the *only* place the long notice appears. The author's own
