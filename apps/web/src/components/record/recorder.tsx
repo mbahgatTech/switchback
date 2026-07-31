@@ -76,6 +76,19 @@ export interface RecorderProps {
   openRecording: ActivitySummary | null;
 }
 
+/**
+ * What the screen has to say about the hike that just ended, when it does not navigate away.
+ *
+ * Two endings need one: a hike closed with no connection, which is safe on the device and is
+ * now the drain's business; and a hike the server closed before this device had sent all of
+ * it, whose tail no longer has anywhere to go. Both are the answer to "where did my hike go?",
+ * so both are written into the same region at the top of the readout.
+ */
+type Receipt =
+  | { kind: 'offline' }
+  /** `activityId` is the saved hike, `lost` the fixes the server would not take. */
+  | { kind: 'truncated'; activityId: string; lost: number };
+
 export function Recorder({ units, defaultVisibility, trail, openRecording }: RecorderProps) {
   const trpc = useTRPC();
   const router = useRouter();
@@ -86,8 +99,20 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [savedOffline, setSavedOffline] = useState(false);
-
+  const [receipt, setReceipt] = useState<Receipt | null>(null);
+  /**
+   * The permanent live region the receipt is written into, and where focus goes with it.
+   *
+   * Two things this element is doing, both of them because it is the answer to "where did my
+   * hike go?". It is mounted whether or not there is anything in it: assistive technology
+   * misses a `role="status"` region that arrives in the DOM together with its text, so the
+   * container is constant and only the sentence is swapped — the same rule, and the same
+   * mistake corrected, as the notice on `/downloads` (`downloads-manager.tsx`). And it is
+   * focusable, because the offline finish is the one ending that does not navigate: closing
+   * the dialog unmounts it while the control that opened it is being replaced on the ledge,
+   * which measurably drops focus to `<body>`. Focus lands where the outcome is written.
+   */
+  const receiptRef = useRef<HTMLDivElement | null>(null);
   /**
    * The scrollport that holds the readout. Driven, not just read.
    *
@@ -166,10 +191,18 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
 
   // Something has landed at the top of the readout. Put the top of the readout on screen.
   useEffect(() => {
-    if (recorder.offRoute || recorder.alert !== null || savedOffline) {
+    if (recorder.offRoute || recorder.alert !== null || receipt !== null) {
       readout.current?.scrollTo({ top: 0 });
     }
-  }, [recorder.offRoute, recorder.alert, savedOffline]);
+  }, [recorder.offRoute, recorder.alert, receipt]);
+
+  // And the receipt takes focus with it. The offline finish is the only ending that stays on
+  // this screen, and the dialog it closes is unmounted while the button that opened it is
+  // being replaced — which drops focus to `<body>` and leaves a keyboard reader at the top of
+  // the document with no idea the hike was saved.
+  useEffect(() => {
+    if (receipt) receiptRef.current?.focus();
+  }, [receipt]);
 
   // And on the way into a hike. Choosing anything but Hiking means scrolling the chooser into
   // view, and Start is on the ledge — so the press that begins a hike is routinely made from
@@ -228,13 +261,19 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     setSaveError(null);
     recorder.stop();
     // Everything still in the buffer goes up before the recording is closed, because
-    // `finish` computes the hike from what is stored and nothing else.
+    // `finish` computes the hike from what is stored and nothing else. `flush` joins a drain
+    // that is already running rather than returning past it — see its note in `use-recorder`;
+    // returning early here is what used to let `finish` land in the middle of a backlog and
+    // close the recording under the loop still uploading it.
     try {
       await recorder.flush();
     } catch {
       // Reported by the recorder already. Closing anyway is the right call: the alternative
-      // is a hike that cannot be ended because the last minute will not upload.
+      // is a hike that cannot be ended because the last minute will not upload. What it costs
+      // is counted below rather than swallowed.
     }
+    // Read after the await, not off the render this closure was made in.
+    const lost = recorder.outstanding();
 
     const write: FinishWrite = {
       id,
@@ -249,6 +288,24 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       const saved = await finish.mutateAsync(write);
       recorder.forget();
       setFinishing(false);
+      /*
+       * Fixes that were still outstanding when the hike closed are gone, and saying so is
+       * this path's job.
+       *
+       * `finish` has just set `endedAt` and `syncedAt` on the server, and `append` refuses a
+       * row carrying both, permanently — so there is no later run of the drain that could
+       * land them, and `forget()` is right to delete chunks nothing will ever take. What was
+       * wrong was doing it in silence. The drain says exactly this sentence when it hits the
+       * same wall (`flushPendingActivities`, `truncated`), and it could never say it for this
+       * path because the row was deleted here before any drain saw it.
+       *
+       * Reported on this screen rather than navigated past: the hike is open in the account
+       * and one link away, and a notice on `/downloads` is a notice on a page nobody opens.
+       */
+      if (lost > 0) {
+        setReceipt({ kind: 'truncated', activityId: saved.id, lost });
+        return;
+      }
       router.push(`/activities/${saved.id}`);
     } catch (error) {
       if (isUnreachable(error)) {
@@ -258,12 +315,15 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
         // only copy of the day. No `router.push`: `/activities/:id` does not exist yet, and
         // is not a page that can be rendered with no network.
         //
+        // Nothing is truncated on this branch however much is outstanding: the row still
+        // holds every fix and the drain sends them all before it replays this payload.
+        //
         // Awaited, and its failure is not swallowed. The receipt below says the hike is safe
         // on this device, and `handOff` throws away the in-memory buffer that is otherwise
         // the last copy of it — so on a device whose storage has been refusing writes all
         // day (quota, private mode, a locked profile) the old order printed that sentence
         // over a hike it had just destroyed. Nothing is cleared until the write is known to
-        // have happened.
+        // have happened, which since `idb.run` resolves on commit is now what that means.
         try {
           await markFinished(id, write);
         } catch {
@@ -278,7 +338,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
         setFinishing(false);
         // The hike this belonged to has gone. See `onDiscard`.
         setStartError(null);
-        setSavedOffline(true);
+        setReceipt({ kind: 'offline' });
         return;
       }
       // The server refused it. Leave `saving` so the dialog's buttons work again and the
@@ -301,7 +361,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     const startedAt = new Date();
     setStartError(null);
     setSaveError(null);
-    setSavedOffline(false);
+    setReceipt(null);
     recorder.begin({
       id,
       startedAt,
@@ -410,28 +470,38 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           ) : null}
 
           {/*
-            The receipt for a hike that ended with no connection. At the top of the scrollport
-            rather than inside the start panel, where it began: the start panel now sits below
-            a full-height instrument, so on a 320px phone the receipt would have opened below
+            The receipt for a hike that has just ended. At the top of the scrollport rather
+            than inside the start panel, where it began: the start panel now sits below a
+            full-height instrument, so on a 320px phone the receipt would have opened below
             the fold — and "where did my hike go?" is the one question this screen must answer
-            without being scrolled. Water, because it is a condition of the network and not a
-            fault of the hiker's.
+            without being scrolled.
+
+            The container is mounted whether or not it has anything to say, and only its
+            contents are swapped. A `role="status"` region that arrives in the DOM at the same
+            moment as its text is missed by assistive technology — the note on the equivalent
+            region in `downloads-manager.tsx` sets out the same rule, and this element was
+            built the way that note says does not work.
+
+            `sr-only` while it is empty rather than a bare zero-height box: the scrollport is a
+            `gap-lg` column, and an empty flex item still takes a gap on both sides of itself,
+            which would open 24px of nothing above the instrument on every idle screen.
+            `sr-only` is absolutely positioned, so it leaves the flow without leaving the
+            accessibility tree — which is the whole point of keeping it mounted.
           */}
-          {savedOffline && !live ? (
-            <div className="rounded-hair border border-water px-md py-sm" role="status">
-              <p className="collar text-water">Saved on this device</p>
-              <p className="mt-hair text-caption text-ink">
-                It will be added to your account when you have a connection. You can start another
-                hike now.
-              </p>
-              <Link
-                href="/downloads"
-                className="mt-xs inline-block text-caption text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
-              >
-                See what is waiting
-              </Link>
-            </div>
-          ) : null}
+          <div
+            ref={receiptRef}
+            role="status"
+            tabIndex={-1}
+            className={
+              receipt && !live
+                ? `rounded-hair border px-md py-sm ${
+                    receipt.kind === 'offline' ? 'border-water' : 'border-bezel'
+                  }`
+                : 'sr-only'
+            }
+          >
+            {receipt && !live ? <ReceiptBody receipt={receipt} /> : null}
+          </div>
 
           <Instrument
             units={units}
@@ -479,7 +549,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
               onActivityType={setActivityType}
               onAdopt={(open) => {
                 setStartError(null);
-                setSavedOffline(false);
+                setReceipt(null);
                 recorder.begin({
                   id: open.id,
                   startedAt: open.startedAt,
@@ -530,7 +600,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 <button
                   type="button"
                   onClick={() => setConfirmDiscard(true)}
-                  className="self-start text-caption text-ink-muted underline decoration-bezel underline-offset-4 transition-colors duration-quick hover:text-survey hover:decoration-survey"
+                  className={`${HEIGHT.touch} inline-flex items-center self-start text-caption text-ink-muted underline decoration-bezel underline-offset-4 transition-colors duration-quick hover:text-survey hover:decoration-survey`}
                 >
                   Discard this recording
                 </button>
@@ -833,6 +903,58 @@ function Status({
   );
 }
 
+/**
+ * What the receipt says, once there is something to say.
+ *
+ * Split out only so the container above it can be permanent — the region has to exist before
+ * it has any text, and that is easier to read when the text is somewhere else.
+ */
+function ReceiptBody({ receipt }: { receipt: Receipt }) {
+  if (receipt.kind === 'offline') {
+    // Water, because it is a condition of the network and not a fault of the hiker's.
+    return (
+      <>
+        <p className="collar text-water">Saved on this device</p>
+        <p className="mt-hair text-caption text-ink">
+          It will be added to your account when you have a connection. You can start another hike
+          now.
+        </p>
+        <Link
+          href="/downloads"
+          className={`${HEIGHT.touch} mt-xs inline-flex items-center text-caption text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink`}
+        >
+          See what is waiting
+        </Link>
+      </>
+    );
+  }
+
+  /*
+   * The tail the server would not take.
+   *
+   * Ink rather than survey: nothing here is about where the hiker is or whether they are safe,
+   * which is the only thing that plate means on this screen. The sentence is the one the drain
+   * prints for the same wall (`flushPendingActivities`), so a hiker who meets it in both places
+   * meets it in the same words. No apology and no instruction, because there is nothing to do —
+   * `append` refuses a finished recording permanently, so those fixes have nowhere left to go.
+   */
+  return (
+    <>
+      <p className="collar text-ink">Part of this hike was not sent</p>
+      <p className="mt-hair text-caption text-ink">
+        This hike was closed before all of it had been sent. What reached the server was kept; the
+        last {receipt.lost === 1 ? 'fix' : `${receipt.lost} fixes`} could not be added.
+      </p>
+      <Link
+        href={`/activities/${receipt.activityId}`}
+        className={`${HEIGHT.touch} mt-xs inline-flex items-center text-caption text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink`}
+      >
+        Open the hike
+      </Link>
+    </>
+  );
+}
+
 function OffRouteBanner({
   distanceM,
   units,
@@ -842,9 +964,23 @@ function OffRouteBanner({
   units: UnitSystem;
   trailName: string;
 }) {
+  /*
+   * The label is `text-ink`, not `text-survey`, and that is a contrast fix rather than a
+   * change of plate.
+   *
+   * `SchemeColors` in `packages/ui` states the rule this broke: a plate's own wash is a fill,
+   * not a text background. Measured in light mode, survey `#B4322A` on this banner's composited
+   * background `#DFD7D0` is **4.30:1** at 11px bold — under the 4.5:1 that non-large text
+   * needs, and axe agrees (`color-contrast[serious]`, 4.3). On bare canvas the same ink is
+   * 4.97:1; it is the wash underneath it that costs the 0.7. Dark mode was never affected.
+   *
+   * The plate assignment is untouched — the 2px survey border and the survey wash still carry
+   * it, which is what those are for. This is the one alert on the screen whose entire job is to
+   * interrupt somebody, so it is the last place to be relying on a ratio that does not hold.
+   */
   return (
     <div role="alert" className="rounded-hair border-2 border-survey bg-survey/10 px-md py-sm">
-      <p className="collar text-survey">Off route</p>
+      <p className="collar text-ink">Off route</p>
       <p className="mt-hair font-mono text-title text-ink">
         {distanceM != null ? formatDistance(distanceM, units) : '—'} from {trailName}
       </p>

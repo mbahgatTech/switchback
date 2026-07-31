@@ -161,6 +161,9 @@ async function primaryOnScreen(page: Page, name: string): Promise<void> {
  * The distinction is the whole point. `overflow-y-auto` clips its children, so an element can
  * be inside the viewport and painted nowhere — which is exactly how an alert inserted at the
  * top of a scrolled readout fails. A viewport-only check passes on all of them.
+ *
+ * Callers assert a *floor*, not presence. `> 0` passes on an alert clipped to one per cent,
+ * which is a regression a reader would experience as the alert being gone.
  */
 async function onGlass(page: Page, selector: string, text: string): Promise<number> {
   return page.evaluate(
@@ -177,6 +180,45 @@ async function onGlass(page: Page, selector: string, text: string): Promise<numb
     },
     { selector, text },
   );
+}
+
+/**
+ * Leave the readout where a hiker who has looked below the fold leaves it.
+ *
+ * Not a contrived state: at 320px, five of the fourteen targets in the recording phase are
+ * below the fold, so reading your GPS accuracy or reaching the Lifeline means scrolling, and
+ * nothing scrolls back on its own. Returns the scroll offset, so a caller can fail loudly if
+ * the column did not overflow and the measurement that follows would prove nothing.
+ */
+async function scrollReadoutToBottom(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const port = document.querySelector('main .overflow-y-auto');
+    if (!(port instanceof HTMLElement)) return -1;
+    port.scrollTop = port.scrollHeight;
+    return port.scrollTop;
+  });
+}
+
+/**
+ * Press start, and wait for the first fix good enough to turn `locating` into `recording`.
+ *
+ * The nudge is not optional: a watch that has already delivered its one mocked position will
+ * not deliver another, so the position has to move for a fix to arrive at all.
+ */
+async function beginRecording(
+  page: Page,
+  at: { latitude: number; longitude: number },
+): Promise<void> {
+  await page.getByRole('button', { name: /^(Start recording|Record )/ }).click();
+  await expect(async () => {
+    await page.context().setGeolocation({
+      latitude: at.latitude + Math.random() / 10_000,
+      longitude: at.longitude + Math.random() / 10_000,
+    });
+    await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible({
+      timeout: 1_000,
+    });
+  }).toPass({ timeout: 60_000 });
 }
 
 /**
@@ -477,7 +519,10 @@ test.describe('Accessibility', () => {
     await primaryOnScreen(page, 'Pause');
     await primaryOnScreen(page, 'Finish');
     const distance = await onGlass(page, '.collar', 'Distance');
-    expect(distance, 'the distance gauge is not on screen when a hike begins').toBeGreaterThan(0);
+    expect(
+      distance,
+      'the distance gauge is not fully on screen when a hike begins',
+    ).toBeGreaterThan(80);
 
     const recording = await survey(page);
     expect(recording.stranded, 'controls stranded while recording').toEqual([]);
@@ -489,5 +534,97 @@ test.describe('Accessibility', () => {
     await primaryOnScreen(page, 'Resume');
     const paused = await survey(page);
     expect(paused.stranded, 'controls stranded while paused').toEqual([]);
+  });
+
+  /**
+   * The two states the fix above was actually built for.
+   *
+   * The recording test drives idle → recording → paused and measures the distance gauge, which
+   * is the *least* likely thing to be clipped: it is the first item in the column. The two
+   * things that were rendering at zero percent visible are the off-route banner and the finish
+   * receipt, and neither of them is entered anywhere in this suite — so the fix shipped
+   * unguarded, and a later change that moved either back off the glass, or a scroll-to-top
+   * effect that lost a dependency, would go unnoticed.
+   *
+   * Both take the same shape: leave the readout where a hiker leaves it — scrolled — put the
+   * thing on screen, and measure it against its own scrollport rather than the window.
+   */
+  test('the wrong-turn alert is on the glass from a scrolled readout', async ({
+    signedInPage: page,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.context().grantPermissions(['geolocation']);
+    await page.context().setGeolocation(TRAILHEAD);
+    // With the trail, because the watchdog needs a route to be off.
+    await page.goto(`/record?trail=${VESPER.slug}`, { waitUntil: 'domcontentloaded' });
+    await settled(page);
+
+    await beginRecording(page, TRAILHEAD);
+    expect(
+      await scrollReadoutToBottom(page),
+      'the readout does not scroll at 320px, so this proves nothing',
+    ).toBeGreaterThan(0);
+
+    /*
+     * About a kilometre off the line, and held there.
+     *
+     * `DEFAULT_OFF_ROUTE_CONFIG` wants three consecutive fixes over at least forty-five
+     * seconds before it will say so, which is deliberate — an alert that fires on one bad fix
+     * is one nobody trusts — so this nudges the position until the banner arrives rather than
+     * sleeping for a fixed time. Each nudge is a fix, because a watch that has already
+     * delivered its one mocked position will not deliver another.
+     */
+    const banner = page.getByRole('alert').filter({ hasText: 'Off route' });
+    await expect(async () => {
+      await page.context().setGeolocation({
+        latitude: TRAILHEAD.latitude + 0.01 + Math.random() / 100_000,
+        longitude: TRAILHEAD.longitude + 0.01 + Math.random() / 100_000,
+      });
+      await expect(banner).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 150_000 });
+
+    // Present is not the claim. Painted is: measured before the fix, the alert rendered 430px
+    // above the top of its own scrollport with the readout left exactly here.
+    const visible = await onGlass(page, '[role="alert"]', 'Off route');
+    expect(visible, 'the wrong-turn alert is clipped by its own scrollport').toBeGreaterThan(80);
+  });
+
+  test('the receipt for a hike finished with no connection is on the glass, and takes focus', async ({
+    signedInPage: page,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.context().grantPermissions(['geolocation']);
+    await page.context().setGeolocation(TRAILHEAD);
+    await page.goto('/record', { waitUntil: 'domcontentloaded' });
+    await settled(page);
+
+    await beginRecording(page, TRAILHEAD);
+    expect(
+      await scrollReadoutToBottom(page),
+      'the readout does not scroll at 320px, so this proves nothing',
+    ).toBeGreaterThan(0);
+
+    // The car park at the end of the day, still with no bars. `finish` cannot reach the
+    // server, so the hike is written to the device and the receipt is the only thing that
+    // says where it went.
+    await page.context().setOffline(true);
+    try {
+      await page.getByRole('button', { name: 'Finish', exact: true }).click();
+      await page.getByRole('button', { name: 'Save hike' }).click();
+
+      await expect(page.getByText('Saved on this device')).toBeVisible({ timeout: 60_000 });
+      const visible = await onGlass(page, '[role="status"]', 'Saved on this device');
+      expect(visible, 'the finish receipt is clipped by its own scrollport').toBeGreaterThan(80);
+
+      // And focus went with it. This is the one ending that does not navigate: the dialog is
+      // unmounted while the button that opened it is replaced on the ledge, which otherwise
+      // drops the caret to `<body>` with nothing said.
+      const landed = await page.evaluate(
+        () => document.activeElement?.getAttribute('role') ?? document.activeElement?.tagName ?? '',
+      );
+      expect(landed, 'focus was dropped when the hike was saved').toBe('status');
+    } finally {
+      await page.context().setOffline(false);
+    }
   });
 });

@@ -239,6 +239,14 @@ export interface RecorderApi {
   resume: () => void;
   /** Flush anything outstanding. Resolves when the server has it, or throws. */
   flush: () => Promise<void>;
+  /**
+   * Fixes the server has not acknowledged, read live.
+   *
+   * `pending` is the same number off the last render, which is the right one to draw. This is
+   * the one to ask *after* an await — `onFinish` closes over the render it was created in, and
+   * needs to know what a flush actually left behind rather than what the buffer held before it.
+   */
+  outstanding: () => number;
   stop: () => void;
   /**
    * Leave `saving` and go back to being a paused recording.
@@ -255,6 +263,15 @@ export interface RecorderApi {
    *
    * What a hike finished with no signal does: it is no longer this screen's business, and it
    * is now the drain's. `forget` would delete the only copy of the day.
+   *
+   * The header reference is dropped *first*, and that is what protects the `finish` payload
+   * `onFinish` has just written. `writeJournal` reads `headerRef.current` when it executes and
+   * returns if it is null, so every write still queued on the chain becomes a no-op rather
+   * than landing `{...header, finish: null}` on top of the finish and silently un-finishing
+   * the hike. Settling here instead would be the wrong move — it would *run* those writes
+   * rather than neuter them. The one write already past that check and awaiting its chunk is
+   * closed further upstream: `flush` settles the journal on every exit, and `onFinish` awaits
+   * it before `markFinished`, so the chain is empty by the time the payload is written.
    */
   handOff: () => void;
 }
@@ -322,7 +339,15 @@ export function useRecorder({
   startedAtRef.current = startedAt;
   const trailIdRef = useRef<string | null>(null);
   trailIdRef.current = trailId;
-  const flushingRef = useRef(false);
+  /**
+   * The drain that is running, if one is.
+   *
+   * Held rather than reduced to a boolean because a second caller has to be able to *wait* for
+   * it. A flag can only answer "is one running", which leaves the second caller nothing to do
+   * but return — and returning from `flush` without draining is a lie told to whoever awaited
+   * it. See the note on `flush`.
+   */
+  const inFlightRef = useRef<Promise<void> | null>(null);
   /**
    * `flush`, reachable from the hydrate effect above it.
    *
@@ -699,19 +724,22 @@ export function useRecorder({
   // Uploading
   // -------------------------------------------------------------------------
 
-  const flush = useCallback(async (): Promise<void> => {
+  /** Fixes the server has not acknowledged, read live rather than off the last render. */
+  const outstanding = useCallback((): number => fixesRef.current.length - sentRef.current, []);
+
+  /** Whether the server has been told this recording exists. */
+  const announced = useCallback((): boolean => headerRef.current?.serverStarted !== false, []);
+
+  const drain = useCallback(async (): Promise<void> => {
     const id = activityIdRef.current;
-    if (!id || flushingRef.current) return;
-    const outstanding = fixesRef.current.length - sentRef.current;
-    const announced = headerRef.current?.serverStarted !== false;
+    if (!id) return;
     // Nothing to upload and the server already knows about the recording — but a caller that
     // awaits this is entitled to a settled journal when it returns, and `onFinish` is one.
-    if (outstanding <= 0 && announced) {
+    if (outstanding() <= 0 && announced()) {
       await settle();
       return;
     }
 
-    flushingRef.current = true;
     setSyncing(true);
     try {
       /*
@@ -739,10 +767,12 @@ export function useRecorder({
         }
       }
 
-      // One batch per call, largest first. Draining the whole backlog in a loop would turn
-      // a reconnection after an hour of no signal into sixty simultaneous requests.
+      // The whole backlog, one batch at a time and strictly in order. Sequential rather than
+      // parallel for the reason the drain gives: a connection that has just come back is one
+      // bar, and a six-hour hike is forty-odd requests. The loop re-reads the live buffer on
+      // every turn, so fixes that arrive while it runs are carried by this same call.
       let reannounced = false;
-      while (fixesRef.current.length - sentRef.current > 0) {
+      while (outstanding() > 0) {
         const from = sentRef.current;
         const batch = fixesRef.current.slice(from, from + SAMPLE_BATCH);
         try {
@@ -796,11 +826,47 @@ export function useRecorder({
       );
       throw err;
     } finally {
-      flushingRef.current = false;
       setSyncing(false);
       await settle();
     }
-  }, [persist, settle]);
+  }, [announced, outstanding, persist, settle]);
+
+  /**
+   * Upload everything outstanding, and do not return until it is up or has failed.
+   *
+   * **A second caller joins the drain that is running; it does not skip past it.** This used
+   * to be `if (flushingRef.current) return;`, which resolved immediately and without draining
+   * — and the state it guarded against is not rare. One `drain` empties the *whole* backlog in
+   * a loop, and the effect below re-fires on every fix while a batch is outstanding, so a hike
+   * that spent eight minutes in a valley and climbed back into signal is flushing continuously
+   * for tens of seconds over one bar. The Save button is live throughout. So the sequence was:
+   * `onFinish` awaits `flush`, gets an instant resolve, posts `finish`, the server sets
+   * `endedAt` and `syncedAt`, the still-running loop's next batch is refused with "already
+   * finished", the refusal is swallowed by the void-catch on the interval, and `forget()`
+   * deletes the chunks holding fixes that had never been transmitted. Nothing on the server
+   * will take them afterwards, and nothing was said. The drain's `truncated` accounting exists
+   * to announce exactly that loss, and it never saw it because the row was gone.
+   *
+   * A joiner inherits the failure of the drain it joined rather than starting a second attempt
+   * — a hiker with no signal must not pay for one request per fix — and re-checks the buffer
+   * afterwards, because a fix that landed after the loop's last look is still outstanding and
+   * a caller about to close the hike needs the difference.
+   */
+  const flush = useCallback(async (): Promise<void> => {
+    for (let joined = inFlightRef.current; joined; joined = inFlightRef.current) {
+      await joined;
+      if (outstanding() <= 0 && announced()) {
+        await settle();
+        return;
+      }
+    }
+
+    const run: Promise<void> = drain().finally(() => {
+      if (inFlightRef.current === run) inFlightRef.current = null;
+    });
+    inFlightRef.current = run;
+    return run;
+  }, [announced, drain, outstanding, settle]);
   flushRef.current = flush;
 
   useEffect(() => {
@@ -1020,6 +1086,7 @@ export function useRecorder({
     pause,
     resume,
     flush,
+    outstanding,
     stop,
     unstop,
     forget,

@@ -160,9 +160,22 @@ function open(): Promise<IDBDatabase> {
 /**
  * One request, in its own transaction, on a connection that is closed afterwards.
  *
- * The connection is closed on the transaction rather than after the request, so a write is
- * durable before the handle goes away. Holding one open across the tab's life would be
- * faster and would also block the next version upgrade until every tab was shut.
+ * **It resolves on the transaction's commit, not on the request's success**, and that
+ * distinction is what two callers above this file are built on. A `put` reports success as
+ * soon as the object store has accepted it, which is some way short of "the write happened":
+ * the transaction can still abort afterwards — eviction under storage pressure, a tab torn
+ * down mid-commit, a quota error raised at commit time — and the value goes with it. This
+ * used to resolve on `request.onsuccess`, so `markFinished` returning meant "accepted", while
+ * the caller reading it — the offline branch of `onFinish` — treats it as "known to have
+ * happened": on the strength of it `handOff()` throws away the in-memory buffer, which that
+ * code calls the last copy of the day, and the screen prints "Saved on this device". Same for
+ * `writeChunk`, which `writeJournal` awaits before writing a header whose `count` describes
+ * those fixes. So the result is captured on success and handed back on commit, and an abort
+ * rejects rather than resolving into silence.
+ *
+ * The connection is closed on the transaction rather than after the request for the same
+ * reason. Holding one open across the tab's life would be faster and would also block the
+ * next version upgrade until every tab was shut.
  */
 export function run<T>(
   storeName: string,
@@ -174,10 +187,21 @@ export function run<T>(
       new Promise<T>((resolve, reject) => {
         const tx = db.transaction(storeName, mode);
         const request = work(tx.objectStore(storeName));
-        request.onsuccess = () => resolve(request.result);
+        // Definite-assignment: `oncomplete` cannot fire without the request having succeeded
+        // first — a transaction whose only request failed aborts instead of committing.
+        let result!: T;
+        request.onsuccess = () => {
+          result = request.result;
+        };
         request.onerror = () => reject(request.error ?? new Error('Offline store write failed.'));
-        tx.oncomplete = () => db.close();
-        tx.onabort = () => db.close();
+        tx.oncomplete = () => {
+          db.close();
+          resolve(result);
+        };
+        tx.onabort = () => {
+          db.close();
+          reject(tx.error ?? new Error('Offline store write failed.'));
+        };
       }),
   );
 }

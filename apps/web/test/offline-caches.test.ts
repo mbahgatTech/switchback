@@ -151,9 +151,26 @@ describe('build assets referenced by a cached page', () => {
      * `/record` is auth-gated. A signed-out install follows its 307 to `/signin` and gets a
      * 200, so without this guard the sign-in form would be cached under the key `/record` —
      * which is worse than the entry being missing, because it looks like it works.
+     *
+     * Both guards are pinned by *shape and position*, not by a substring. This used to assert
+     * `/if \(response\.redirected\) return;/`, which only ever matched the `refreshShell` copy
+     * below — `precache`'s is a block, so the assertion that was supposed to protect the new
+     * `/record` entry matched a different function entirely. Two mutations proved it: making
+     * `precache`'s condition unreachable, and hoisting the `cache.put` above it so the redirect
+     * is stored and only then recorded, each left all 22 tests in this file green while a
+     * signed-out install cached the sign-in form under `/record`.
+     *
+     * Text rather than an importable predicate, for the reason at the top of this file: the
+     * worker cannot import, so a `shouldStoreShellPage()` in `caches.ts` would be a second
+     * copy of the decision rather than the one the worker runs — and the text assertion that
+     * kept the two in step would be back here anyway, weaker for being a level removed.
      */
-    expect(SW).toMatch(/if \(response\.redirected\) return;/u);
-    expect(SW).toMatch(/redirectedShellPages\.add\(path\)/u);
+    expect(SW).toMatch(
+      /if \(response\.redirected\) \{\s*redirectedShellPages\.add\(path\);\s*return;\s*\}[\s\S]*?await cache\.put\(path, response\);/u,
+    );
+    // And `refreshShell`'s, which stores the reader's own navigation: it returns before the
+    // `caches.open` that would put it.
+    expect(SW).toMatch(/if \(response\.redirected\) return;[\s\S]*?caches\s*$/mu);
   });
 
   it('stops asking for a shell page the reader is not allowed to see', () => {
