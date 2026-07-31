@@ -35,6 +35,9 @@ const ONE_TILE: [number, number, number, number] = [-4.08, 53.06, -4.07, 53.07];
 /** The single z9 quadkey `ONE_TILE` covers. */
 const ONE_TILE_KEY = '031311230';
 
+/** The z12 quadkeys `ONE_TILE` covers — routing tiles are finer, so there are two. */
+const ROUTING_KEYS = ['031311230201', '031311230203'];
+
 /** A ceiling to measure fractions against, since there is no default any more. */
 const LIMIT = 512 * 1024 * 1024;
 
@@ -59,6 +62,8 @@ interface FakeOptions {
   databaseBytes?: number;
   /** Quadkeys whose `ingest_tile` job is already queued or running. */
   inFlight?: readonly string[];
+  /** Quadkeys whose `ingest_network` job is already queued or running. */
+  networkInFlight?: readonly string[];
 }
 
 function fakeDb(options: FakeOptions = {}): { db: PrismaClient; recorded: Recorded } {
@@ -80,14 +85,19 @@ function fakeDb(options: FakeOptions = {}): { db: PrismaClient; recorded: Record
       },
     },
     ingestJob: {
-      // What `ensureCoverage` and `surveyArea` read to tell "nobody has asked for this tile"
-      // apart from "somebody asked and it is coming".
+      // What `ensureCoverage`, `surveyArea` and `networkTilesInFlight` read to tell "nobody
+      // has asked for this tile" apart from "somebody asked and it is coming". Both kinds
+      // come back from the one stub because each caller filters on its own key prefix, so
+      // the extra rows are invisible to whichever one is asking.
       findMany: () =>
-        Promise.resolve(
-          (options.inFlight ?? []).map((quadkey) => ({
+        Promise.resolve([
+          ...(options.inFlight ?? []).map((quadkey) => ({
             dedupeKey: `${JobKind.ingest_tile}:${quadkey}`,
           })),
-        ),
+          ...(options.networkInFlight ?? []).map((quadkey) => ({
+            dedupeKey: `${JobKind.ingest_network}:${quadkey}`,
+          })),
+        ]),
       groupBy: ({ where }: { where: GroupByCall }) => {
         recorded.groupBys.push(where);
         return Promise.resolve([
@@ -474,6 +484,51 @@ describe('what the reader is told', () => {
      * now, and this pins that `pending` is no longer laundered through.
      */
     expect(coverage.pending).not.toEqual([]);
+  });
+
+  it('does not refuse routing tiles that are already on their way', async () => {
+    /*
+     * The half the in-flight fix missed. It landed on the trail path and stopped, so a
+     * planning viewport whose tiles were all mid-fetch still ran admission over them, was
+     * refused by the depth its own jobs were making, and reported `busy`.
+     *
+     * That reaches the reader as a frozen planner: `routes.plan` turns `busy` into
+     * `networkPaused`, every unsnappable leg is labelled `network_paused`, and `use-plan.ts`
+     * reads `busy` as "no tile is going to land" and stops the retry chain — so the tiles
+     * arrive and nothing re-plans on them until an anchor moves. All for ground that was
+     * already coming.
+     */
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { db, recorded } = fakeDb({
+      depth: MAX_TILE_QUEUE_DEPTH,
+      networkInFlight: ROUTING_KEYS,
+    });
+
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { db });
+
+    expect(coverage.busy).toBe(false);
+    expect(coverage.busyReason).toBeNull();
+    expect(coverage.queued).toEqual(ROUTING_KEYS);
+    // Enqueued over all of them, not just the new ground: the upsert writes no row for a job
+    // that already exists but does raise its priority, which is how a tile a background sweep
+    // queued at 0 jumps the line the moment somebody plans across it.
+    expect(recorded.jobUpserts).toBe(ROUTING_KEYS.length);
+  });
+
+  it('still refuses the routing tiles nothing is coming for', async () => {
+    // The other side of the same split: one tile in flight must not admit the other.
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { db, recorded } = fakeDb({
+      depth: MAX_TILE_QUEUE_DEPTH,
+      networkInFlight: [ROUTING_KEYS[0]!],
+    });
+
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { db });
+
+    expect(coverage.busy).toBe(true);
+    expect(coverage.busyReason).toBe('queue-depth');
+    expect(coverage.queued).toEqual([]);
+    expect(recorded.jobUpserts).toBe(0);
   });
 
   it('is not busy when there was simply nothing to do', async () => {

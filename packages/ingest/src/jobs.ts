@@ -159,11 +159,26 @@ export async function claimJobs(
 
   // Same rule for the kind filter, for the same reason.
   //
-  // The cast is on the *parameter*, never on the column. `kind::text IN (…)` would read
+  // The cast is on the *parameter*, never on the column. `kind::text = ANY(…)` would read
   // identically and quietly throw away `@@index([kind, status])` — a cast column is not the
-  // indexed expression, so the planner falls back to the sequential scan that index was
-  // added to remove. Binding a text array and casting it to the enum type leaves `kind` bare
-  // on the left, where the index can still be used.
+  // indexed expression, so the predicate demotes from something the index can seek on to
+  // something applied to every entry it returns. Binding a text array and casting it to the
+  // enum type leaves `kind` bare on the left, where the index condition can still use it.
+  //
+  // Measured, rather than reasoned about, because this statement had never run against
+  // Postgres at all — `jobs.test.ts` stubs `$queryRaw`, so nothing had ever asked the server
+  // to parse the cast. Against a local copy of the job table (164k rows, `ANALYZE`d):
+  //
+  //   kind = ANY($1::"JobKind"[])   Index Cond: (kind = ANY(…)) AND (status = 'done')
+  //                                 Index Only Scan, cost 2595
+  //   kind::text = ANY($1::text[])  Index Cond: (status = 'done')
+  //                                 Filter:     (kind)::text = ANY(…)
+  //                                 Index Only Scan, cost 4127
+  //
+  // The cast form parses, executes, and keeps `kind` in the index condition; the column form
+  // reads the whole `status = 'done'` range and filters it. Both the cast and the empty-list
+  // branch are exercised end to end by `npm run ingest:drain`, which claims its derived share
+  // through this path on every tick.
   const kindScope =
     kinds === undefined
       ? Prisma.empty
@@ -347,14 +362,35 @@ export async function drainJobs(
 
   const primary = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
 
-  // Unscoped by `dedupeKey` on purpose: the whole point is to reach work nobody asked for by
-  // name. Claimed after the primary batch so a caller waiting on specific tiles still gets
-  // those first.
+  /*
+   * Unscoped by `dedupeKey` on purpose: the whole point is to reach work nobody asked for by
+   * name. Claimed after the primary batch so a caller waiting on specific tiles still gets
+   * those first.
+   *
+   * Its own try/catch, and the ordering is why. `claimJobs` is a claim, not a read — the
+   * primary statement above has already flipped its batch to `running` and stamped a lock by
+   * the time this line runs. If the derived claim threw, that rejection would propagate out
+   * of `drainJobs` past every handler, and the primary batch — claimed, locked, untouched —
+   * would sit at `running` until `LOCK_TIMEOUT_MS` expired ten minutes later. One failing
+   * fairness reservation would cost the queue ten minutes of every drain.
+   *
+   * The derived claim is also the only statement here carrying hand-written SQL the primary
+   * path never exercises: the `kind = ANY($1::"JobKind"[])` cast in `claimJobs` is reached
+   * solely through this call, and the unit suite stubs `$queryRaw`, so it had never been put
+   * to a server. It has now — `npm run ingest:drain -- --limit 0` claims and runs a derived batch
+   * through this line against Postgres — and the plans either side of the cast are recorded in
+   * `claimJobs`. A fairness optimisation is still not worth a batch of real work, so a failure
+   * degrades to "no derived work this tick" and the drain carries on with what it holds.
+   */
   const derivedLimit = options.derivedLimit ?? 0;
-  const derived =
-    derivedLimit > 0
-      ? await claimJobs(db, workerId, derivedLimit, now(), undefined, DERIVED_KINDS)
-      : [];
+  let derived: ClaimedJob[] = [];
+  if (derivedLimit > 0) {
+    try {
+      derived = await claimJobs(db, workerId, derivedLimit, now(), undefined, DERIVED_KINDS);
+    } catch (error) {
+      console.error('[ingest] derived claim failed; draining primary batch only', error);
+    }
+  }
 
   const jobs = [...primary, ...derived];
   let succeeded = 0;

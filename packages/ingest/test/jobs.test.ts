@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
 import {
   LOCK_TIMEOUT_MS,
@@ -348,6 +348,48 @@ describe('the derived share', () => {
     // pins that the count reports the second claim's haul and not the batch's.
     expect(result.derived).toBe(0);
     expect(result.claimed).toBe(1);
+  });
+
+  it('drains the primary batch even when the derived claim fails', async () => {
+    /*
+     * Ordering is the whole argument. `claimJobs` is a claim, not a read: by the time the
+     * derived pass runs, the primary batch is already `running` with a lock stamped on it.
+     * Letting that rejection out of `drainJobs` would strand those rows until the lock
+     * expired ten minutes later — one failing fairness reservation costing the queue the
+     * work it had just taken, on every tick.
+     *
+     * The thrown message is the shape a bad `kind = ANY($1::"JobKind"[])` would actually
+     * take, which is the failure this guard was written for.
+     */
+    const { db, recorded } = fakeDb([job()]);
+    const raw = (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> })
+      .$queryRaw;
+    let calls = 0;
+    (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> }).$queryRaw = async (
+      ...args: unknown[]
+    ) => {
+      calls += 1;
+      if (calls === 2) throw new Error('operator does not exist: "JobKind" = text');
+      return raw(...args);
+    };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const ran: string[] = [];
+    const result = await drainJobs(
+      {
+        [JobKind.ingest_tile]: async (claimed: ClaimedJob) => {
+          ran.push(claimed.id);
+        },
+      },
+      { db, derivedLimit: 2 },
+    );
+
+    expect(ran).toEqual(['job-1']);
+    expect(result).toEqual({ claimed: 1, succeeded: 1, failed: 0, deferred: 0, derived: 0 });
+    // Completed, not left at `running` for the lock timeout to pick up.
+    expect(recorded.updates.at(-1)?.data.status).toBe(JobStatus.done);
+    // And loudly: a share that has silently stopped running is a backlog nobody is watching.
+    expect(errors).toHaveBeenCalled();
   });
 });
 
