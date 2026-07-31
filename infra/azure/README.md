@@ -598,24 +598,40 @@ after any restore, any rebuild, and any cutover.
 export NEON_VERIFY_URL='postgresql://…@…neon.tech/switchback?sslmode=verify-full'
 export AZURE_VERIFY_URL='postgresql://sbadmin:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
 export AZURE_APP_VERIFY_URL='postgresql://sbapp:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
+export NEON_CHECKSUMS="$TMP/neon-checksums.txt"
+export AZURE_CHECKSUMS="$TMP/azure-checksums.txt"
 npm run verify:migration
 ```
 
-| Variable                       | Required | What it does                                                       |
-| ------------------------------ | -------- | ------------------------------------------------------------------ |
-| `NEON_VERIFY_URL`              | yes      | The source. Read-only; nothing writes to it                        |
-| `AZURE_VERIFY_URL`             | yes      | The target, as `sbadmin`                                           |
-| `AZURE_APP_VERIFY_URL`         | no       | The target as `sbapp`. Omitting it skips the privilege assertions  |
-| `NEON_CHECKSUMS`               | no       | Path to source per-table `md5` file                                |
-| `AZURE_CHECKSUMS`              | no       | Path to target per-table `md5` file                                |
-| `CHECKSUM_SNAPSHOT_CONSISTENT` | no       | `1` when the source checksums came from inside the dump's snapshot |
+| Variable                       | If omitted                                                              |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| `NEON_VERIFY_URL`              | The script prints a usage error and exits 1 before connecting           |
+| `AZURE_VERIFY_URL`             | Same                                                                    |
+| `AZURE_APP_VERIFY_URL`         | Recorded as a **failure**, not a skip — see below                       |
+| `NEON_CHECKSUMS`               | Recorded as a **failure** (`checksums · source file not found at`)      |
+| `AZURE_CHECKSUMS`              | Same, for the target                                                    |
+| `CHECKSUM_SNAPSHOT_CONSISTENT` | Treated as not `1`, which loosens the ingest-derived tables to warnings |
 
-Without `CHECKSUM_SNAPSHOT_CONSISTENT=1` the ingest-derived tables (trails, waypoints, tiles,
-jobs, sessions) are compared against a _live_ Neon that keeps taking writes, so a difference in
-those is reported as a warning rather than a failure. A difference anywhere else is still a
-failure. `photos` is deliberately not on the forgiving list: it holds user uploads as well as
-ingest-derived hero images, and treating somebody's lost photograph as expected churn is the
-wrong default.
+**None of the first five is optional, and that is deliberate rather than an oversight.** All
+five are required inputs; omitting one produces a red run, not a shorter one. The privilege
+check says why in its own failure text: the least-privilege role is listed by `postgres.bicep`
+as a compensating control for a firewall spanning the whole internet, and a control that was
+not checked is exactly what such a list must not contain. Silently skipping it would turn a
+missing environment variable into a clean bill of health.
+
+So a green run means every check ran. If you genuinely want a structure-only pass — no
+checksums, no privilege assertion — read the red lines and decide they are acceptable, rather
+than expecting the script to make that decision for you.
+
+Checksum files are `table|rows|md5` per line, computed in SQL on each side. On the source they
+must be taken from _inside the transaction snapshot `pg_dump` used_, and
+`CHECKSUM_SNAPSHOT_CONSISTENT=1` is the assertion that they were.
+
+Without that flag the ingest-derived tables (trails, waypoints, tiles, jobs, sessions) are
+compared against a _live_ Neon that keeps taking writes, so a difference in those is reported as
+a warning rather than a failure. A difference anywhere else is still a failure. `photos` is
+deliberately not on the forgiving list: it holds user uploads as well as ingest-derived hero
+images, and treating somebody's lost photograph as expected churn is the wrong default.
 
 The first check, before any query, is that the two URLs name different hosts. A verification
 run comparing a database to itself passes everything else in the file perfectly, and it is one
