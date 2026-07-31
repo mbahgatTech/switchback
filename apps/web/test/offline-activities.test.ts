@@ -21,6 +21,7 @@ import {
   type FinishWrite,
   type PendingActivity,
 } from '../src/offline/activities';
+import { ACTIVITY_FIXES_STORE, PENDING_ACTIVITIES_STORE } from '../src/offline/idb';
 
 /**
  * A hike recorded with no signal exists in exactly one place until it drains.
@@ -45,9 +46,25 @@ interface FakeRequest<T> {
   onupgradeneeded?: (() => void) | null;
 }
 
-function createFakeIndexedDB(): unknown {
+function createFakeIndexedDB(): {
+  /** What goes on `globalThis.indexedDB`. */
+  idb: unknown;
+  /**
+   * Take a row out from under the code's feet, synchronously.
+   *
+   * Paired with `onceOnRead`. `sendOne` has exactly one window between checking that a hike is
+   * still wanted and posting `finish` for it — the `readFixes` round trip — and no member of
+   * `ActivityPosters` is called during it, so a discard staged from a poster can only ever
+   * reach the earlier checks. Staging it here reaches the later one, and it is the level the
+   * race actually lives at: two store operations interleaving, not two server calls.
+   */
+  drop: (store: string, key: string) => void;
+  /** Run `fn` once, from inside the next read of `store`. */
+  onceOnRead: (store: string, fn: () => void) => void;
+} {
   const stores = new Map<string, Map<string, unknown>>();
   const keyPaths = new Map<string, string>();
+  const onRead = new Map<string, () => void>();
 
   function transaction(_name: string, _mode: string) {
     const tx: {
@@ -79,7 +96,15 @@ function createFakeIndexedDB(): unknown {
       const rows = stores.get(name) ?? new Map<string, unknown>();
       stores.set(name, rows);
       return {
-        getAll: () => request(() => [...rows.values()]),
+        getAll: () =>
+          request(() => {
+            const hook = onRead.get(name);
+            if (hook) {
+              onRead.delete(name);
+              hook();
+            }
+            return [...rows.values()];
+          }),
         get: (key: string) => request(() => rows.get(key)),
         put: (row: Record<string, unknown>) =>
           request(() => {
@@ -110,19 +135,27 @@ function createFakeIndexedDB(): unknown {
   };
 
   return {
-    open: () => {
-      const request: FakeRequest<typeof db> = {
-        result: db,
-        error: null,
-        onsuccess: null,
-        onerror: null,
-        onupgradeneeded: null,
-      };
-      queueMicrotask(() => {
-        request.onupgradeneeded?.();
-        request.onsuccess?.();
-      });
-      return request;
+    idb: {
+      open: () => {
+        const request: FakeRequest<typeof db> = {
+          result: db,
+          error: null,
+          onsuccess: null,
+          onerror: null,
+          onupgradeneeded: null,
+        };
+        queueMicrotask(() => {
+          request.onupgradeneeded?.();
+          request.onsuccess?.();
+        });
+        return request;
+      },
+    },
+    drop: (store, key) => {
+      stores.get(store)?.delete(key);
+    },
+    onceOnRead: (store, fn) => {
+      onRead.set(store, fn);
     },
   };
 }
@@ -171,7 +204,16 @@ async function queueHike(
   });
 }
 
-/** Records what the server was asked to do, in order. */
+/**
+ * Records what the server was asked to do, in order.
+ *
+ * An append is labelled with **how many** fixes it carried as well as which seconds, and the
+ * count is not decoration. Labelled by first and last `t` alone, a batch carrying somebody
+ * else's track was indistinguishable from a correct one: dropping the ownership filter in
+ * `listChunks` made `readFixes` return both hikes in the multi-hike tests, but both start at
+ * t=0 and end at t=9 and 20 fixes still fit in one `SAMPLE_BATCH`, so every assertion in this
+ * file stayed green while every upload carried a different hike's day.
+ */
 function recorder(): { calls: string[]; posters: ActivityPosters } {
   const calls: string[] = [];
   return {
@@ -182,7 +224,8 @@ function recorder(): { calls: string[]; posters: ActivityPosters } {
         return undefined;
       },
       append: async (input) => {
-        calls.push(`append:${input.fixes[0]?.t}-${input.fixes[input.fixes.length - 1]?.t}`);
+        const { fixes } = input;
+        calls.push(`append:${fixes.length}:${fixes[0]?.t}-${fixes[fixes.length - 1]?.t}`);
         return undefined;
       },
       finish: async (input) => {
@@ -215,8 +258,11 @@ function unreachable(): Error & { data: null } {
   return Object.assign(new Error('Failed to fetch'), { data: null });
 }
 
+let fake: ReturnType<typeof createFakeIndexedDB>;
+
 beforeEach(() => {
-  vi.stubGlobal('indexedDB', createFakeIndexedDB());
+  fake = createFakeIndexedDB();
+  vi.stubGlobal('indexedDB', fake.idb);
   releaseLive();
   // Module-level, and it outlives a store that is stood up fresh for every test.
   setDrainNotice(null);
@@ -270,6 +316,39 @@ describe('the journal', () => {
     expect(await listPendingActivities()).toHaveLength(1);
   });
 
+  it('refuses to finish a hike this device is not holding', async () => {
+    // The throw is the whole of what makes the offline receipt honest: `onFinish` reads a
+    // quiet return as success, clears the in-memory buffer and prints "Saved on this device"
+    // — which on a device whose writes have been failing all day is printed over a hike that
+    // has just been thrown away. A silent `return` here leaves every other test green.
+    await expect(markFinished(ID, finishWrite(ID))).rejects.toThrow(
+      'This hike is not stored on this device.',
+    );
+  });
+
+  it('unblocks a hike that is finished after an earlier drain refused it', async () => {
+    // Reachable: a hike whose tab was closed mid-recording can be blocked by the background
+    // drain, handed back by `readOpenActivity` — which does not filter on `blocked` — resumed
+    // on `/record` and finished. Without the clear it is skipped by every automatic flush for
+    // ever and can only be sent from a button on `/downloads`, which is the failure this
+    // queue's session-expiry handling exists to avoid.
+    await queueHike(ID, 10, {
+      serverStarted: true,
+      blocked: true,
+      lastError: 'That recording is not yours.',
+    });
+    await markFinished(ID, finishWrite(ID));
+
+    const row = await getPendingActivity(ID);
+    expect(row?.blocked).toBe(false);
+    expect(row?.lastError).toBeNull();
+
+    // And an ordinary automatic flush — no `force` — now takes it.
+    const { calls, posters } = recorder();
+    expect(await flushPendingActivities(posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
+    expect(calls).toEqual(['append:10:0-9', `finish:${ID}`]);
+  });
+
   it('hands an unfinished hike back with its fixes', async () => {
     await queueHike(ID, 7, { sent: 3 });
     const open = await readOpenActivity();
@@ -293,7 +372,12 @@ describe('flushPendingActivities', () => {
     const { calls, posters } = recorder();
     const result = await flushPendingActivities(posters);
 
-    expect(calls).toEqual([`start:${ID}`, 'append:0-499', 'append:500-599', `finish:${ID}`]);
+    expect(calls).toEqual([
+      `start:${ID}`,
+      'append:500:0-499',
+      'append:100:500-599',
+      `finish:${ID}`,
+    ]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
     expect(await listPendingActivities()).toEqual([]);
     expect(await readFixes(ID)).toEqual([]);
@@ -326,7 +410,7 @@ describe('flushPendingActivities', () => {
     // and does not repeat `start`, because the server has that hike under this id already.
     const second = recorder();
     const result = await flushPendingActivities(second.posters);
-    expect(second.calls).toEqual(['append:500-999', 'append:1000-1499', `finish:${ID}`]);
+    expect(second.calls).toEqual(['append:500:500-999', 'append:500:1000-1499', `finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
   });
 
@@ -456,7 +540,7 @@ describe('flushPendingActivities', () => {
       kept: 0,
       truncated: 0,
     });
-    expect(after.calls).toEqual([`start:${ID}`, 'append:0-9', `finish:${ID}`]);
+    expect(after.calls).toEqual([`start:${ID}`, 'append:10:0-9', `finish:${ID}`]);
   });
 
   it('finishes a replayed hike whose delete failed, and reports no loss', async () => {
@@ -537,7 +621,7 @@ describe('flushPendingActivities', () => {
       },
     });
 
-    expect(calls).toEqual(['append:missing', `start:${ID}`, 'append:0-9', `finish:${ID}`]);
+    expect(calls).toEqual(['append:missing', `start:${ID}`, 'append:10:0-9', `finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
   });
 
@@ -579,9 +663,54 @@ describe('flushPendingActivities', () => {
     // their account, and finishing it would also log a completion and a point of popularity
     // against the trail. The row must not come back either — writing progress onto a deleted
     // key re-creates it.
-    expect(calls).toEqual(['append:0-499']);
+    expect(calls).toEqual(['append:500:0-499']);
     expect(result).toEqual({ sent: 0, kept: 0, truncated: 0 });
     expect(await listPendingActivities()).toEqual([]);
+  });
+
+  it('makes no server call at all for a hike discarded before its turn came round', async () => {
+    // The queue is listed once, up front, so a row can be thrown away between the listing and
+    // its own turn. This pins the check on the way *in* to `sendOne`, which the test above
+    // never reaches: that one returns from the progress write half-way through the first
+    // hike's appends and never starts a second.
+    await queueHike(ID, 10, { serverStarted: true });
+    await markFinished(ID, finishWrite(ID));
+    const other = '11111111-2222-4333-8444-555555555555';
+    await queueHike(other, 10, { queuedAt: 1_800_000_000_000 });
+    await markFinished(other, finishWrite(other));
+
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities({
+      ...posters,
+      append: async (input) => {
+        const answer = await posters.append(input);
+        await deleteActivity(other);
+        return answer;
+      },
+    });
+
+    // Without the check, `other` would be announced to the server — a recording created in
+    // the account for a hike its owner had already thrown away.
+    expect(calls).toEqual(['append:10:0-9', `finish:${ID}`]);
+    expect(result).toEqual({ sent: 1, kept: 0, truncated: 0 });
+  });
+
+  it('does not publish a hike discarded while its fixes were being read back', async () => {
+    // Everything acknowledged, `finish` payload written, only the delete outstanding — so the
+    // append loop has nothing to do and the one await between "is this row still wanted?" and
+    // `post.finish` is the `readFixes` round trip. No poster is called during it, which is why
+    // the discard is staged in the store itself; see `drop` on the fake above.
+    await queueHike(ID, 10, { serverStarted: true, sent: 10 });
+    await markFinished(ID, finishWrite(ID));
+    fake.onceOnRead(ACTIVITY_FIXES_STORE, () => fake.drop(PENDING_ACTIVITIES_STORE, ID));
+
+    const { calls, posters } = recorder();
+    const result = await flushPendingActivities(posters);
+
+    // A `finish` here would publish somebody's discarded day and log a completion and a point
+    // of popularity against the trail.
+    expect(calls).toEqual([]);
+    expect(result).toEqual({ sent: 0, kept: 0, truncated: 0 });
   });
 
   it('runs one drain at a time when two callers ask at once', async () => {
@@ -596,7 +725,7 @@ describe('flushPendingActivities', () => {
       flushPendingActivities(posters),
     ]);
 
-    expect(calls).toEqual([`start:${ID}`, 'append:0-9', `finish:${ID}`]);
+    expect(calls).toEqual([`start:${ID}`, 'append:10:0-9', `finish:${ID}`]);
     expect(first).toEqual({ sent: 1, kept: 0, truncated: 0 });
     expect(second).toEqual({ sent: 0, kept: 0, truncated: 0 });
   });
@@ -651,7 +780,7 @@ describe('flushPendingActivities', () => {
     releaseLive(ID);
     const after = recorder();
     await flushPendingActivities(after.posters);
-    expect(after.calls).toEqual([`start:${ID}`, 'append:0-9']);
+    expect(after.calls).toEqual([`start:${ID}`, 'append:10:0-9']);
   });
 
   it('catches an unfinished hike up without deleting it', async () => {
@@ -662,7 +791,7 @@ describe('flushPendingActivities', () => {
     const { calls, posters } = recorder();
     const result = await flushPendingActivities(posters);
 
-    expect(calls).toEqual([`start:${ID}`, 'append:0-9']);
+    expect(calls).toEqual([`start:${ID}`, 'append:10:0-9']);
     expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
     expect((await getPendingActivity(ID))?.sent).toBe(10);
   });
@@ -677,7 +806,7 @@ describe('flushPendingActivities', () => {
     const { calls, posters } = recorder();
     const result = await flushPendingActivities(posters, { activityId: other });
 
-    expect(calls).toEqual([`start:${other}`, 'append:0-9', `finish:${other}`]);
+    expect(calls).toEqual([`start:${other}`, 'append:10:0-9', `finish:${other}`]);
     expect(result).toEqual({ sent: 1, kept: 1, truncated: 0 });
     expect((await listPendingActivities()).map((row) => row.activityId)).toEqual([ID]);
   });

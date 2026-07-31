@@ -4,6 +4,7 @@ import {
   flushPendingReviews,
   getPendingReview,
   isUnreachable,
+  isUnauthorized,
   listPendingReviews,
   pendingReview,
   putPendingReview,
@@ -184,6 +185,31 @@ describe('isUnreachable', () => {
     expect(isUnreachable('offline')).toBe(false);
     expect(isUnreachable(null)).toBe(false);
     expect(isUnreachable(undefined)).toBe(false);
+  });
+});
+
+describe('isUnauthorized', () => {
+  /*
+   * Two branches, and each is here for a shape the other does not cover: a tRPC envelope that
+   * carries `httpStatus`, and a shape-only error that crossed a module boundary carrying just
+   * the code. Every drain test builds an error satisfying both at once, so either half could
+   * be deleted with the whole suite green — which is half of the predicate this queue's
+   * session handling rests on going unexercised.
+   */
+  it.each([
+    ['a full tRPC envelope', { code: 'UNAUTHORIZED', httpStatus: 401 }],
+    ['the code alone', { code: 'UNAUTHORIZED' }],
+    ['the status alone', { httpStatus: 401 }],
+  ])('recognises %s', (_shape, data) => {
+    expect(isUnauthorized(Object.assign(new Error('Sign in to do that.'), { data }))).toBe(true);
+  });
+
+  it('does not mistake another refusal, a dead connection, or a non-object for one', () => {
+    expect(isUnauthorized(refusal('That trail no longer exists.'))).toBe(false);
+    expect(isUnauthorized({ data: { code: 'FORBIDDEN', httpStatus: 403 } })).toBe(false);
+    expect(isUnauthorized(unreachable())).toBe(false);
+    expect(isUnauthorized(null)).toBe(false);
+    expect(isUnauthorized('unauthorized')).toBe(false);
   });
 });
 

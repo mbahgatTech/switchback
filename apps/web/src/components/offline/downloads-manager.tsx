@@ -108,7 +108,7 @@ function QueuedReports() {
                 onClick={() => {
                   void post(row.trailId);
                 }}
-                className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
+                className={`${BUTTON_COLLAR} ${GHOST} ${HEIGHT.panel} px-sm`}
               >
                 Post it now
               </button>
@@ -141,7 +141,7 @@ function QueuedReports() {
                 <button
                   type="button"
                   onClick={() => setConfirming(row.trailId)}
-                  className="collar rounded-hair px-sm text-ink-muted hover:text-survey"
+                  className={`collar ${HEIGHT.panel} inline-flex items-center rounded-hair px-sm text-ink-muted hover:text-survey`}
                 >
                   Discard
                 </button>
@@ -279,7 +279,7 @@ function QueuedHikes({
                 onClick={() => {
                   void send(row.activityId).finally(onSettled);
                 }}
-                className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
+                className={`${BUTTON_COLLAR} ${GHOST} ${HEIGHT.panel} px-sm`}
               >
                 Add it now
               </button>
@@ -312,7 +312,7 @@ function QueuedHikes({
                 <button
                   type="button"
                   onClick={() => setConfirming(row.activityId)}
-                  className="collar rounded-hair px-sm text-ink-muted hover:text-survey"
+                  className={`collar ${HEIGHT.panel} inline-flex items-center rounded-hair px-sm text-ink-muted hover:text-survey`}
                 >
                   Discard
                 </button>
