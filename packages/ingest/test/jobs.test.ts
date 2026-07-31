@@ -271,10 +271,13 @@ describe('claimJobs', () => {
     ]);
 
     const sql = allScopeSql(recorded.rawValues);
-    expect(sql).toContain('kind::text IN');
+    expect(sql).toContain('kind = ANY(');
+    // The cast belongs on the parameter. On the column it would silently drop
+    // `@@index([kind, status])`, which is the index this queue's hot path depends on.
+    expect(sql).toContain('::"JobKind"[]');
+    expect(sql).not.toContain('kind::text');
     expect(recorded.rawValues.flatMap(fragmentValues)).toEqual([
-      JobKind.enrich_trail,
-      JobKind.ingest_route,
+      [JobKind.enrich_trail, JobKind.ingest_route],
     ]);
   });
 
@@ -284,7 +287,7 @@ describe('claimJobs', () => {
     await claimJobs(db, 'cron', 2, new Date(), undefined, []);
 
     expect(allScopeSql(recorded.rawValues)).toContain('false');
-    expect(allScopeSql(recorded.rawValues)).not.toContain('kind::text IN');
+    expect(allScopeSql(recorded.rawValues)).not.toContain('kind = ANY(');
   });
 });
 
@@ -309,10 +312,10 @@ describe('the derived share', () => {
     expect(recorded.rawCalls).toHaveLength(2);
     // The first claim is the caller's own work, scoped by key and unrestricted by kind.
     expect(allScopeSql(recorded.rawCalls[0]!)).toContain('"dedupeKey" IN');
-    expect(allScopeSql(recorded.rawCalls[0]!)).not.toContain('kind::text IN');
+    expect(allScopeSql(recorded.rawCalls[0]!)).not.toContain('kind = ANY(');
     // The second is the reservation: kind-scoped, and deliberately *not* key-scoped, because
     // reaching work nobody asked for by name is the entire point.
-    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind::text IN');
+    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind = ANY(');
     expect(allScopeSql(recorded.rawCalls[1]!)).not.toContain('"dedupeKey" IN');
     expect(recorded.rawCalls[1]!).toContain(2);
   });
@@ -325,7 +328,7 @@ describe('the derived share', () => {
     await drainJobs({}, { db, dedupeKeys: [], derivedLimit: 2 });
 
     expect(recorded.rawCalls).toHaveLength(2);
-    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind::text IN');
+    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind = ANY(');
   });
 
   it('asks for nothing extra when the share is zero', async () => {

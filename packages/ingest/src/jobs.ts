@@ -158,12 +158,18 @@ export async function claimJobs(
         : Prisma.sql`AND "dedupeKey" IN (${Prisma.join([...dedupeKeys])})`;
 
   // Same rule for the kind filter, for the same reason.
+  //
+  // The cast is on the *parameter*, never on the column. `kind::text IN (…)` would read
+  // identically and quietly throw away `@@index([kind, status])` — a cast column is not the
+  // indexed expression, so the planner falls back to the sequential scan that index was
+  // added to remove. Binding a text array and casting it to the enum type leaves `kind` bare
+  // on the left, where the index can still be used.
   const kindScope =
     kinds === undefined
       ? Prisma.empty
       : kinds.length === 0
         ? Prisma.sql`AND false`
-        : Prisma.sql`AND kind::text IN (${Prisma.join(kinds.map(String))})`;
+        : Prisma.sql`AND kind = ANY(${kinds.map(String)}::"JobKind"[])`;
 
   const rows = await db.$queryRaw<
     Array<{
