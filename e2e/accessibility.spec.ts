@@ -595,8 +595,11 @@ test.describe('Accessibility', () => {
    * elsewhere in this file describe. `beginRecording` retries it now, and asserts the fix it
    * always claimed to wait for.
    *
+   * Run 30625128989, against 5e3c80c, carries both green — the wrong-turn spec in 58.5s, which
+   * is the watchdog's forty-five second dwell plus the drive to it.
+   *
    * Three specs outside this file — the two in `photographs.spec.ts` and the section collar in
-   * `trail.spec.ts` — fail in that workflow and did so before this change. They open
+   * `trail.spec.ts` — fail in both of those runs, and failed before this change. They open
    * `boston-basin-trail` and `appalachian-trail-dauphin-county`, and the job ingests one tile
    * over Vesper Peak and seeds no photographs, so neither trail is in the database it built.
    * That is a gap in what CI stands up, not a regression, and it is not this pull request's.
