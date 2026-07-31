@@ -202,6 +202,22 @@ async function scrollReadoutToBottom(page: Page): Promise<number> {
 /**
  * Press start, and wait for the first fix good enough to turn `locating` into `recording`.
  *
+ * Two waits, because they are two claims, and the first version of this made neither of them.
+ *
+ * **The press is retried**, for the reason this file gives on every other first interaction:
+ * the button is server-rendered, and a press that lands before React attaches its handler is
+ * swallowed in silence. That is not a precaution here, it is what run 30623733133 hit — see
+ * the note above the wrong-turn spec. `begin` sets the phase to `locating` synchronously and
+ * the ledge carries Pause for every live phase, so Pause arriving *is* the press being
+ * received, with no satellite involved. The press is only re-made while the start button is
+ * still on the ledge, so a press that did land cannot be made twice.
+ *
+ * **Then the fix.** `locating` becomes `recording` on the first reading good enough to trust,
+ * which is what takes "Finding you" off the signal readout — and that readout only exists
+ * once the recording is live, so its absence is read after the ledge has already swapped and
+ * cannot be the absence of a page that never started. Waiting on Pause for this, as this used
+ * to, proved nothing: Pause is on screen throughout `locating`.
+ *
  * The nudge is not optional: a watch that has already delivered its one mocked position will
  * not deliver another, so the position has to move for a fix to arrive at all.
  */
@@ -209,15 +225,20 @@ async function beginRecording(
   page: Page,
   at: { latitude: number; longitude: number },
 ): Promise<void> {
-  await page.getByRole('button', { name: /^(Start recording|Record )/ }).click();
+  const startButton = page.getByRole('button', { name: /^(Start recording|Record )/ });
+  await expect(async () => {
+    if (await startButton.isVisible()) await startButton.click();
+    await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible({
+      timeout: 1_000,
+    });
+  }).toPass({ timeout: 60_000 });
+
   await expect(async () => {
     await page.context().setGeolocation({
       latitude: at.latitude + Math.random() / 10_000,
       longitude: at.longitude + Math.random() / 10_000,
     });
-    await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible({
-      timeout: 1_000,
-    });
+    await expect(page.getByText('Finding you')).toBeHidden({ timeout: 1_000 });
   }).toPass({ timeout: 60_000 });
 }
 
@@ -548,10 +569,44 @@ test.describe('Accessibility', () => {
    *
    * Both take the same shape: leave the readout where a hiker leaves it — scrolled — put the
    * thing on screen, and measure it against its own scrollport rather than the window.
+   *
+   * ---------------------------------------------------------------------------------------
+   *
+   * **Both have been run, and the first run failed.**
+   *
+   * They arrived with the commit that fixed the defect, and a pull request does not run the
+   * browser suite — it is nightly and on demand only, for the reason given at the top of
+   * `.github/workflows/ci.yml` — so for a day these were guards nobody had executed. A local
+   * run needs a database (`npm run db:up && npm run db:push && npm run db:seed`, then
+   * `npm run ingest:tile -- --at 48.01213,-121.51188`); without one the fixture's cookie names
+   * no session, `/record` serves the signed-out page, and both fail on the start button, which
+   * is legible but is not a verdict on the fix. Dispatching the workflow builds all of that
+   * from nothing:
+   *
+   *     gh workflow run ci.yml --ref offline-recording
+   *
+   * Run 30623733133, against 9029b1b: the receipt spec passed. The wrong-turn spec failed, and
+   * the guard was the thing that was wrong rather than the screen. Its press of Start was the
+   * only first interaction in this file that was not retried; `/record?trail=…` is the one
+   * page `warm.setup.ts` never asks for, and it is heavier than `/record` because it
+   * server-renders the trail as well; and the page snapshot taken at the failure showed the
+   * start button still on the ledge, holding focus, with the readout at zero. The press had
+   * landed before React attached its handler and had been swallowed exactly as the comments
+   * elsewhere in this file describe. `beginRecording` retries it now, and asserts the fix it
+   * always claimed to wait for.
+   *
+   * Three specs outside this file — the two in `photographs.spec.ts` and the section collar in
+   * `trail.spec.ts` — fail in that workflow and did so before this change. They open
+   * `boston-basin-trail` and `appalachian-trail-dauphin-county`, and the job ingests one tile
+   * over Vesper Peak and seeds no photographs, so neither trail is in the database it built.
+   * That is a gap in what CI stands up, not a regression, and it is not this pull request's.
    */
   test('the wrong-turn alert is on the glass from a scrolled readout', async ({
     signedInPage: page,
   }) => {
+    // The wait below is allowed 150 s, and every test gets 120 s from `playwright.config.ts` —
+    // so without this the budget the watchdog actually needs can never be spent.
+    test.setTimeout(240_000);
     await page.setViewportSize({ width: 320, height: 568 });
     await page.context().grantPermissions(['geolocation']);
     await page.context().setGeolocation(TRAILHEAD);
