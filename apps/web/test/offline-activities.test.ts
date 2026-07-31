@@ -1001,6 +1001,47 @@ describe('a hike belongs to whoever recorded it', () => {
     expect(calls).toEqual([]);
     expect(result).toEqual({ sent: 0, kept: 1, truncated: 0 });
   });
+
+  it('is picked up mid-upload where the recorder stopped, and finished by its own author', async () => {
+    /*
+     * What `useRecorder`'s own uploader hands over when somebody signs in during a hike.
+     *
+     * The recorder does not go through this drain while it is recording — `claimLive` keeps
+     * the drain off the row and the hook posts `start` and every `append` itself — so its
+     * ownership guard is the one on that path, and its promise is this one: it stops before a
+     * request rather than after it, writes nothing, blocks nothing, deletes nothing, and
+     * leaves `sent` at the last batch the server acknowledged. What that is worth depends
+     * entirely on the drain then picking the row up unchanged and re-sending nothing, which
+     * is what this pins.
+     *
+     * Set up as the recorder leaves it: one batch acknowledged, the hike announced, the
+     * finish payload written by the screen, and `releaseLive` because the tab has let go.
+     * The hook itself cannot be driven here — `apps/web/test` runs in the node environment
+     * with no DOM, so there is no way to render a React hook in this suite.
+     */
+    await queueHike(ID, 1_500, { serverStarted: true, sent: 500 });
+    await markFinished(ID, finishWrite(ID));
+    releaseLive(ID);
+
+    // The arriving reader gets nothing, and nothing of the hike moves under them.
+    const arriving = recorder();
+    expect(
+      await flushPendingActivities(arriving.posters, {
+        readerId: OTHER,
+        stillReader: () => OTHER,
+        force: true,
+      }),
+    ).toEqual({ sent: 0, kept: 1, truncated: 0 });
+    expect(arriving.calls).toEqual([]);
+    expect((await getPendingActivity(ID))?.sent).toBe(500);
+
+    // The hiker who walked it signs back in. No second `start` for a hike the server already
+    // has, no re-send of the batch it acknowledged, and the day lands whole.
+    const back = recorder();
+    expect(await flush(back.posters)).toEqual({ sent: 1, kept: 0, truncated: 0 });
+    expect(back.calls).toEqual(['append:500:500-999', 'append:500:1000-1499', `finish:${ID}`]);
+    expect(await getPendingActivity(ID)).toBeNull();
+  });
 });
 
 /**

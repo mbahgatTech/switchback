@@ -188,11 +188,35 @@ export function usePendingReviews(): PendingReviewsApi {
         if (reader === null) return 'nothing-to-claim';
         setBusy(true);
         try {
-          const outcome = await adoptPendingReview(trailId, reader, adoptOptions);
+          const outcome = await adoptPendingReview(trailId, reader, adoptOptions).catch(
+            (error: unknown) => {
+              // The claim itself would not write — a device whose storage is full, blocked or
+              // locked. Nothing has moved, and the press must not pass in silence: the button
+              // is disabled while `busy` is true, so focus has already left it and the reader
+              // has no other way to learn that nothing happened.
+              setDrainNotice('That report could not be claimed. It is still on this device.');
+              throw error;
+            },
+          );
           // The claimer already has a report queued for this trail. Nothing has been written
           // and nothing may be, until they say which of the two to keep — the caller draws
           // that question. See `adoptPendingReview`.
-          if (outcome !== 'adopted') return outcome;
+          //
+          // Said in the page's one live region as well as beside the button, because this is
+          // an *answer to a press* rather than a confirmation the reader opened. The press
+          // replaces the control that made it, which takes focus to `<body>`; the caller moves
+          // focus here instead, and a sentence that lives only in a `<span>` further down the
+          // row is announced to nobody when it arrives. Word for word the same as the visible
+          // sentence, on the rule the recorder's receipts follow: one wall, one wording,
+          // wherever a reader meets it.
+          if (outcome !== 'adopted') {
+            setDrainNotice(
+              outcome === 'would-replace-your-own'
+                ? 'You already have a report waiting for this trail. Keep yours, or replace it with this one.'
+                : 'That report is no longer on this device. It has already been claimed or discarded.',
+            );
+            return outcome;
+          }
           const result = await flushPendingReviews(send, {
             trailId,
             readerId: reader,
@@ -448,7 +472,13 @@ export function usePendingActivities(): PendingActivitiesApi {
         if (reader === null) return;
         setBusy(true);
         try {
-          await adoptPendingActivity(activityId, reader);
+          await adoptPendingActivity(activityId, reader).catch((error: unknown) => {
+            // As on the report claim beside it: the write itself was refused, the button that
+            // asked for it is disabled and has lost focus, and nothing else on the page will
+            // change to show it.
+            setDrainNotice('That hike could not be claimed. It is still on this device.');
+            throw error;
+          });
           const result = await flushPendingActivities(post, {
             activityId,
             readerId: reader,

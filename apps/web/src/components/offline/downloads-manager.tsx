@@ -335,7 +335,13 @@ function Unclaimed({
                   type="button"
                   disabled={hikes.busy}
                   onClick={() => {
-                    void hikes.adopt(row.activityId).finally(onSettled);
+                    // `catch` before `finally` for the reason written on the report claim
+                    // below: a store that refuses the write must not reject into `void` and
+                    // leave the press unanswered. The sentence comes from `adopt`.
+                    void hikes
+                      .adopt(row.activityId)
+                      .catch(() => undefined)
+                      .finally(onSettled);
                   }}
                   className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
                 >
@@ -393,6 +399,11 @@ function Unclaimed({
                * kept: a report is keyed by trail and author, so claiming this one writes over
                * yours. Named rather than resolved — the device knows there is a conflict and
                * cannot know which text the hiker meant.
+               *
+               * The same sentence is in the page's live region, put there by `adopt`. Not a
+               * duplicate by accident: this copy is the one a sighted reader needs beside the
+               * two buttons it is asking about, and that copy is the one anybody who cannot
+               * see the row appear is told. One wall, one wording.
                */}
               {colliding === row.trailId ? (
                 <>
@@ -404,10 +415,13 @@ function Unclaimed({
                     type="button"
                     disabled={reports.busy}
                     onClick={() => {
-                      void reports.adopt(row.trailId, { replace: true }).finally(() => {
-                        setColliding(null);
-                        onSettled();
-                      });
+                      void reports
+                        .adopt(row.trailId, { replace: true })
+                        .catch(() => undefined)
+                        .finally(() => {
+                          setColliding(null);
+                          onSettled();
+                        });
                     }}
                     className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
                   >
@@ -426,10 +440,29 @@ function Unclaimed({
                   type="button"
                   disabled={reports.busy}
                   onClick={() => {
-                    void reports.adopt(row.trailId).then((outcome) => {
-                      if (outcome === 'would-replace-your-own') setColliding(row.trailId);
-                      else onSettled();
-                    });
+                    void reports
+                      .adopt(row.trailId)
+                      .then((outcome) => {
+                        if (outcome === 'would-replace-your-own') setColliding(row.trailId);
+                      })
+                      /*
+                       * Every outcome answers the press, including the two that used to pass
+                       * in silence.
+                       *
+                       * `onSettled` was on the success branch alone, so a collision — the one
+                       * outcome that asks the reader a question — replaced the button that had
+                       * just been pressed, dropped focus to `<body>`, and put its explanation
+                       * in a plain `<span>` that no live region was watching. That is the same
+                       * failure this page's permanent `role="status"` paragraph was added to
+                       * fix, arriving again by a different route. `adopt` now writes the
+                       * sentence into that paragraph and focus lands on it here.
+                       *
+                       * The `catch` is not decoration either: without it a store that refuses
+                       * the claim rejected into `void`, leaving the reader looking at a button
+                       * that flickered from disabled back to enabled and said nothing.
+                       */
+                      .catch(() => undefined)
+                      .finally(onSettled);
                   }}
                   className="collar rounded-hair px-sm hover:text-ink disabled:opacity-40"
                 >

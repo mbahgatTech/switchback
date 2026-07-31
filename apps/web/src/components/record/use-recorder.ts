@@ -18,7 +18,7 @@ import {
   type OffRouteState,
 } from '@switchback/geo';
 import { isUnreachable } from '@/offline/queue';
-import { writingReader } from '@/offline/identity';
+import { stillActingAs, writingReader } from '@/offline/identity';
 import { readerSettled, subscribeToReader } from '@/offline/reader';
 import {
   CHUNK_FIXES,
@@ -216,7 +216,13 @@ export interface RecorderApi {
   syncing: boolean;
   /** A geolocation problem, in the words the reader needs. */
   geoError: string | null;
-  /** An upload problem. Recording continues; this is informational. */
+  /**
+   * An upload problem. Recording continues; this is informational.
+   *
+   * Also carries the one non-problem written here: the browser is now acting as somebody else,
+   * so the uploader has stopped. Nothing failed and nothing is lost, which is why it is a
+   * sync state rather than an error — see `stillMine`.
+   */
   syncError: string | null;
   /** Whether the last upload failure was the connection rather than the server's answer. */
   syncOffline: boolean;
@@ -247,6 +253,16 @@ export interface RecorderApi {
    * needs to know what a flush actually left behind rather than what the buffer held before it.
    */
   outstanding: () => number;
+  /**
+   * Is the browser still acting as the account that pressed start? Read live.
+   *
+   * For the one call this hook does not make itself. `finish` is posted by the screen, and it
+   * is the request that publishes a day, adds it to an account and logs a completion against
+   * the trail — the most expensive one on this page to send under the wrong name, and the
+   * furthest in time from the press that decided the name. The uploader asks the same question
+   * before every batch it sends; this is how the screen asks it before the last one.
+   */
+  stillMine: () => boolean;
   stop: () => void;
   /**
    * Leave `saving` and go back to being a paused recording.
@@ -730,6 +746,36 @@ export function useRecorder({
   /** Whether the server has been told this recording exists. */
   const announced = useCallback((): boolean => headerRef.current?.serverStarted !== false, []);
 
+  /**
+   * Is the browser still acting as the account that pressed start?
+   *
+   * The recorder is the one uploader on the device that does *not* go through
+   * `flushPendingActivities`: it holds the live hike, `claimLive` keeps the drain off it, and
+   * it posts `start` and every `append` itself. So the ownership rule the drain was given had
+   * no effect at all on the path that runs during a hike — the one path that is guaranteed to
+   * be running when somebody signs in on a shared laptop. A tab left open on `/record` at the
+   * trailhead kept recording, and every batch after the new sign-in carried the arriving
+   * person's cookie: an unannounced hike was *created* in their account by `start`, and the
+   * whole day appended to it.
+   *
+   * Read live, never off a render, for the reason `writingReader` gives: the rendered answer
+   * is who was here when something last painted, and a recording screen can go a long time
+   * without painting anything that depends on the reader.
+   *
+   * Both `null`s match, deliberately, and this is where it differs from the drain's `ownedBy`.
+   * A hike begun on a browser that could not name a session — private mode, a locked profile,
+   * `localStorage` refused — is stamped `userId: null`, and `writingReader()` keeps returning
+   * null for as long as that is true. Refusing that pair would stop such a browser recording
+   * at all, which is a worse answer than the one it protects against; and the moment anybody
+   * *does* sign in, the answer becomes their id, the two disagree, and the hike stops. The
+   * unattributed row is then the drain's problem rather than this hook's, and `/downloads`
+   * asks a person whose it was.
+   */
+  const stillMine = useCallback(
+    (): boolean => stillActingAs(headerRef.current?.userId ?? null, writingReader),
+    [],
+  );
+
   const drain = useCallback(async (): Promise<void> => {
     const id = activityIdRef.current;
     if (!id) return;
@@ -739,6 +785,40 @@ export function useRecorder({
       await settle();
       return;
     }
+
+    /*
+     * Whose hike this is, pinned for the length of this flush and asked again before every
+     * request the flush makes.
+     *
+     * Pinned rather than re-read from the header, so that a `begin()` landing mid-drain
+     * cannot quietly re-point the question at a different hike's owner while this loop is
+     * still uploading the old id. Asked *per request* rather than once, because a flush is
+     * not an instant: one call empties the whole backlog, and a hike that spent an hour in a
+     * valley is forty-odd requests over one bar — tens of seconds to minutes, all of it after
+     * the answer was taken. That is the same window `sendOne` closes in `activities.ts`, and
+     * it is closed here in the same way and with the same consequence: stop, mark nothing,
+     * delete nothing, leave `sent` where it stands. Everything unsent is still on the device
+     * under the name of whoever walked it, and goes out on the next flush that runs as them —
+     * this one if they sign back in, the drain otherwise.
+     */
+    const owner = headerRef.current?.userId ?? null;
+    const stillTheirs = (): boolean => stillActingAs(owner, writingReader);
+
+    /**
+     * Somebody else is here. Say so where the recorder says everything else about uploading.
+     *
+     * A sync state rather than a thrown error, matching `syncOffline`: nothing has gone
+     * wrong, the recording carries on, and the sentence is the answer to "why does this still
+     * say fixes to save?". Thrown, it would reach `onFinish`'s catch, be read as a refusal,
+     * and put the hiker in front of a dialog about a failure that did not happen.
+     */
+    const noteHeldForAnother = (): void => {
+      setSyncOffline(false);
+      setSyncError(
+        'Somebody else is signed in. This hike waits on this device until the hiker who ' +
+          'recorded it signs back in.',
+      );
+    };
 
     setSyncing(true);
     try {
@@ -750,9 +830,18 @@ export function useRecorder({
        * refused with "No such recording", so this has to come first, and it has to come from
        * here rather than from the screen — after a reload the press is gone and the journal
        * is all that remembers. Safe to replay: the id is the server's idempotency key.
+       *
+       * And it is the most expensive call here to get wrong. `start` does not append to
+       * something that exists; it *creates* a hike, so an announcement made under the wrong
+       * session puts a row that nobody walked into that person's account and leaves it there
+       * whether or not a single fix follows it.
        */
       const before = headerRef.current;
       if (before && !before.serverStarted) {
+        if (!stillTheirs()) {
+          noteHeldForAnother();
+          return;
+        }
         await onStartRef.current({
           id,
           activityType: before.activityType,
@@ -773,6 +862,13 @@ export function useRecorder({
       // every turn, so fixes that arrive while it runs are carried by this same call.
       let reannounced = false;
       while (outstanding() > 0) {
+        // Before each batch, not once before the loop. `sent` is already written for
+        // everything the server acknowledged, so stopping here costs nothing and re-sends
+        // nothing: the next run picks up at exactly this batch.
+        if (!stillTheirs()) {
+          noteHeldForAnother();
+          return;
+        }
         const from = sentRef.current;
         const batch = fixesRef.current.slice(from, from + SAMPLE_BATCH);
         try {
@@ -791,6 +887,12 @@ export function useRecorder({
            */
           const header = headerRef.current;
           if (!isMissing(error) || reannounced || !header) throw error;
+          // The re-announcement is a `start` like any other, and creates a hike like any
+          // other. It gets the same gate as the first one.
+          if (!stillTheirs()) {
+            noteHeldForAnother();
+            return;
+          }
           reannounced = true;
           headerRef.current = { ...header, serverStarted: false };
           await onStartRef.current({
@@ -1087,6 +1189,7 @@ export function useRecorder({
     resume,
     flush,
     outstanding,
+    stillMine,
     stop,
     unstop,
     forget,
