@@ -279,7 +279,7 @@ this work and that an earlier revision of this section did not know about.
 | GitHub secret     | `AZURE_DIRECT_DATABASE_URL`           | `sbadmin`. Ditto                                 |
 | GitHub secret     | `AZURE_APP_DATABASE_URL`              | `sbapp`. Ditto                                   |
 | Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`    |
-| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | separate entries, set 2026-07-31                 |
+| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | separate entries, added after the cutover        |
 
 The values themselves cannot be read back out of GitHub, so that column is the design intent
 plus what each consumer demonstrably requires, not a readback. If you need to know what a
