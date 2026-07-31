@@ -42,6 +42,12 @@ const START = readFileSync(
   'utf8',
 ).replace(/\r\n/gu, '\n');
 
+/** The predicate's own file, for the one claim below that lives in prose rather than code. */
+const BINDING = readFileSync(
+  fileURLToPath(new URL('../app/api/auth/mobile/_binding.ts', import.meta.url)),
+  'utf8',
+).replace(/\r\n/gu, '\n');
+
 /** The source of one exported handler, from its `export` to the next top-level `}`. */
 function handler(name: 'GET' | 'POST'): string {
   const start = ROUTE.indexOf(`export async function ${name}(`);
@@ -135,8 +141,28 @@ describe('fromOurOwnOrigin', () => {
     expect(fromOurOwnOrigin(withHeader('none'))).toBe(true);
   });
 
-  it('admits a request with no header, which is every non-browser client', () => {
+  it('admits a request with no header, which is not only a non-browser client', () => {
+    /*
+     * The admission is deliberate and it is a concession rather than a covered case. Three
+     * things arrive without `Sec-Fetch-Site`: a non-browser client, a browser on an origin
+     * that is not potentially trustworthy — Fetch Metadata is only attached to secure
+     * origins, so every plain-HTTP development build sends nothing — and a browser older
+     * than Safari 16.4, which is every supported iOS from 15.1 up. Refusing it on `/start`
+     * was proposed and refused: it 403s the first hop of sign-in on those devices and in
+     * development, from a browser sheet with no navigation in it. See `fromOurOwnOrigin`.
+     */
     expect(fromOurOwnOrigin(withHeader(null))).toBe(true);
+  });
+
+  it('keeps the reason for that admission written down', () => {
+    /*
+     * The wording this replaces justified `null` once for both callers — non-browser client,
+     * plus the binding cookie and the CSRF token — and that argument only holds on
+     * `POST /complete`. `GET /start` is where the cookie is minted and carries no CSRF token.
+     * Pinned so the honest version cannot be quietly compressed back into the wrong one.
+     */
+    expect(BINDING).toMatch(/Safari 16\.4/u);
+    expect(BINDING).toMatch(/not potentially trustworthy/u);
   });
 
   it('refuses cross-site and a sibling subdomain', () => {

@@ -69,11 +69,43 @@ export function clearBindingCookie(request: Request): string {
 /**
  * Whether this request came from our own pages rather than from somebody else's.
  *
- * `Sec-Fetch-Site` is set by the browser and cannot be forged from script. `none` is a typed
- * address or a bookmark, `same-origin` is our own form; anything else — `cross-site`,
- * `same-site` from a sibling subdomain — is refused. A request with no header at all is
- * allowed through, because that is what every non-browser client looks like and the leg this
- * guards is also protected by the binding cookie and the CSRF token.
+ * `Sec-Fetch-Site` is set by the browser and cannot be forged or stripped from script. `none`
+ * is a typed address, a bookmark, or an app opening the browser at a URL; `same-origin` is our
+ * own form; anything else — `cross-site`, `same-site` from a sibling subdomain — is refused.
+ *
+ * **A request with no header at all is admitted, and that is a concession, not a proof.** The
+ * older wording here justified it once for both callers — "every non-browser client, and this
+ * leg has the binding cookie and the CSRF token as well" — and that sentence is only true of
+ * `POST /complete`. `GET /start` is where the binding cookie is minted and carries no CSRF
+ * token, so it has neither of the two things that argument leans on. Three kinds of request
+ * arrive header-less, and they land differently on the two callers:
+ *
+ * - **A non-browser client** — curl, a health check, an uptime probe. On `POST /complete` it
+ *   still has to present the binding secret and a valid CSRF token, so it gets nowhere. On
+ *   `GET /start` it can create a row, which the docblock on that route already concedes is an
+ *   intent with no authority attached and nobody's browser bound to it.
+ * - **A browser on an origin that is not potentially trustworthy.** Fetch Metadata is only
+ *   attached to secure origins, so plain HTTP on a LAN address gets no `Sec-Fetch-*` at all.
+ *   That is development exactly: `apiBaseUrl()` in the app derives `http://<metro host>:3000`,
+ *   the same origin the `__Host-` note above already calls untrustworthy. Measured against the
+ *   dev server, a browser opened at `http://127.0.0.1:3000/api/auth/mobile/start` sends `none`
+ *   and one opened at `http://10.0.0.93:3000/…` sends nothing — and a cross-site `location =`
+ *   to that same LAN URL sends nothing either. On plain HTTP the guard is inert in both
+ *   directions; it is load-bearing on HTTPS, which is where the account is.
+ * - **A browser too old to send it.** WebKit shipped Fetch Metadata in Safari 16.4, and the
+ *   minimum iOS this app supports is 15.1 (`min_ios_version_supported`, React Native 0.86).
+ *   Every supported device from 15.1 to 16.3 opens the sign-in sheet without the header, over
+ *   HTTPS, in production. On those devices the first hop is genuinely unguarded and the checks
+ *   on `/complete` are jointly satisfiable again, with the consent button the last thing left.
+ *
+ * Requiring `none || same-origin` on `/start` was proposed as the alternative and is not done.
+ * It reads as free only if the app-opened browser always sends the header, and it does not:
+ * the third case above turns into a 403 on the first hop of sign-in for every iOS 15.1–16.3
+ * device, and the second turns into the same 403 for every development build — both of them in
+ * a browser sheet with no navigation in it, so there is nothing the reader can do but give up.
+ * That is a certain break of working sign-ins to close a hole that still needs the victim to
+ * read a device name off a button and press it. The concession stays; what was wrong was
+ * claiming it cost nothing.
  *
  * **Only safe on a request the browser makes in one hop.** `Sec-Fetch-Site` is not a property
  * of the page that started a navigation. The browser recomputes it at every hop of a redirect
@@ -85,8 +117,9 @@ export function clearBindingCookie(request: Request): string {
  * So this must not be used on a redirect target. It has two callers, and both are first hops:
  *
  * - `POST /complete`, a form submission from a page we rendered.
- * - `GET /start`, which the app opens the system browser at (`none`) or which is reached from
- *   one of our own pages (`same-origin`). Nothing legitimate arrives there via a redirect. It
+ * - `GET /start`, which the app opens the system browser at (`none`, or nothing at all on the
+ *   two header-less paths above) or which is reached from one of our own pages
+ *   (`same-origin`). Nothing legitimate arrives there via a redirect. It
  *   is the hop that makes the guards on `/complete` independent of each other rather than
  *   jointly satisfiable — without it an attacker page can create the row *and* have the
  *   victim's browser bound to it, and every later check passes. See the note there.
@@ -98,6 +131,8 @@ export function clearBindingCookie(request: Request): string {
  */
 export function fromOurOwnOrigin(request: Request): boolean {
   const site = request.headers.get('sec-fetch-site');
+  // `null` is admitted knowingly, and what it costs differs per caller — see above. Do not
+  // drop it without reading the third bullet: iOS 15.1 to 16.3 sends no header over HTTPS.
   return site === null || site === 'same-origin' || site === 'none';
 }
 

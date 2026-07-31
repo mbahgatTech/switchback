@@ -62,7 +62,14 @@ export async function GET(request: Request): Promise<Response> {
    *
    * Measured: the app opening the system browser arrives as `none`, a link from our own pages
    * as `same-origin`, an attacker's `location =` as `cross-site`. `fromOurOwnOrigin` admits
-   * the first two and a header-less non-browser client, and refuses the third.
+   * the first two and refuses the third.
+   *
+   * It also admits a request with no `Sec-Fetch-Site` at all, and on this leg that is a
+   * concession rather than a covered case: there is no binding cookie yet and no CSRF token,
+   * so nothing else here catches it. Two legitimate things arrive header-less — a browser on
+   * a plain-HTTP origin, which is every development build, and a browser older than Safari
+   * 16.4, which is every supported iOS below 16.4 — and refusing them would 403 the first hop
+   * of sign-in with no way back. The reasoning and the measurements are on `fromOurOwnOrigin`.
    */
   if (!fromOurOwnOrigin(request)) return notice(403, CROSS_SITE.heading, CROSS_SITE.body);
 
