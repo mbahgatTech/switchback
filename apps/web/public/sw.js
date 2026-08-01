@@ -29,10 +29,29 @@ const MEDIA_CACHE = 'sb-media-v1';
 const SHELL_CACHE = 'sb-shell-v1';
 const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
-const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];
+const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore', '/record'];
 const STATIC_ASSET_PATTERN = String.raw`/_next/static/[A-Za-z0-9._@%/-]+\.[A-Za-z0-9]{2,5}\b`;
 const PRECACHE_ATTEMPTS = 3;
 const PRECACHE_BACKOFF_MS = 500;
+
+/**
+ * Shell pages that answered with a redirect, and are therefore not cacheable for whoever is
+ * using this browser right now.
+ *
+ * `/record` is auth-gated. For a signed-out reader every fetch of it lands on `/signin`, the
+ * `response.redirected` guard below correctly refuses to store it, and the entry stays
+ * missing — which `repairShell` reads as "try again", on every single navigation, for ever.
+ * Measured on a signed-out session: install cost three hits on `/record` and three on
+ * `/signin`, and five further navigations cost fifteen more of each. In the real app each of
+ * those is a server-rendered request.
+ *
+ * So the refusal is remembered. Per worker instance rather than persisted, which is the right
+ * lifetime: a browser that has terminated an idle worker and started a fresh one is exactly
+ * the moment it is worth asking again, and a sign-in in the meantime is picked up either by
+ * that or by `refreshShell`, which stores the real page from the reader's own navigation and
+ * clears the entry below.
+ */
+const redirectedShellPages = new Set();
 
 /**
  * Cache a page *and the build assets it names*, which is not the same thing.
@@ -60,6 +79,24 @@ async function precache(cache, path) {
 
     const response = await fetch(new Request(path, { cache: 'reload' })).catch(() => null);
     if (!response || !response.ok) continue;
+    /*
+     * A redirect is not this page.
+     *
+     * `/record` is auth-gated. A signed-out install fetches it, `fetch` follows the 307 to
+     * `/signin?callbackUrl=/record`, and hands back a 200 — so without this the sign-in form
+     * would be stored under the key `/record` and served from cache to a hiker at a trailhead.
+     * A missing entry is the honest outcome: `refreshShell` stores the real page the first
+     * time this reader opens it with a session. (A redirected response also fails a navigation
+     * outright in Chromium, whose redirect mode is `manual`, so this closes that too.)
+     *
+     * Returned rather than retried. Three attempts exist to survive one bad response from a
+     * server mid-deploy; a redirect is not a bad response, it is a settled answer about who is
+     * signed in, and asking twice more only costs the origin two more renders.
+     */
+    if (response.redirected) {
+      redirectedShellPages.add(path);
+      return;
+    }
 
     const html = await response.clone().text();
     await cache.put(path, response);
@@ -83,6 +120,9 @@ async function precache(cache, path) {
  * The in-flight flag stops a run of navigations from stacking repairs on top of each other.
  * It is cleared either way, so a repair that fails is retried by the next navigation rather
  * than written off — the same refusal to decide permanently that `precache` makes above.
+ *
+ * A page that answered with a redirect is skipped, not retried: it is not missing by accident,
+ * and no number of attempts will sign this reader in. See `redirectedShellPages`.
  */
 let repairing = false;
 
@@ -92,6 +132,7 @@ async function repairShell() {
   try {
     const cache = await caches.open(SHELL_CACHE);
     for (const path of SHELL_PAGES) {
+      if (redirectedShellPages.has(path)) continue;
       if (!(await cache.match(path))) await precache(cache, path);
     }
   } catch {
@@ -170,8 +211,16 @@ async function fromOurCaches(request) {
  * planning at home should see today's. Cache second, which is the download doing its job.
  * The offline page last — a real screen that says what is available rather than the
  * browser's dinosaur.
+ *
+ * The shell is matched twice on the way down, and the second match is the one that matters
+ * offline. `cache.match` is query-sensitive, so the stored `/record` entry is a miss for
+ * `/record?trail=vesper-peak` — which is the link from every trail page — and the hiker gets
+ * the offline fallback while the recorder sits in the cache. The same gap is there for
+ * `/?place=…` and `/explore?bbox=…`. Serving the plain shell for a query it was not rendered
+ * with is honest degradation: on `/record` you can still record, you simply do not get the
+ * wrong-turn watchdog, because the trail line came from the server.
  */
-async function handleNavigation(request) {
+async function handleNavigation(request, url) {
   try {
     const response = await fetch(request);
     // Only 2xx is worth keeping: caching a 500 would pin the error until the cache is
@@ -195,6 +244,11 @@ async function handleNavigation(request) {
     if (cached) return cached;
 
     const shell = await caches.open(SHELL_CACHE);
+    if (SHELL_PAGES.includes(url.pathname)) {
+      const page = await shell.match(url.pathname);
+      if (page) return page;
+    }
+
     const fallback = await shell.match(OFFLINE_FALLBACK_PATH);
     return (
       fallback ??
@@ -238,8 +292,13 @@ function refreshShell(request, response) {
 
   if (url.origin !== self.location.origin) return;
   if (!SHELL_PAGES.includes(url.pathname)) return;
+  // Same guard as `precache`: a navigation that ended somewhere else is not this page, and
+  // storing it here would hand a signed-out reader's sign-in form to a signed-in one offline.
+  if (response.redirected) return;
 
   const copy = response.clone();
+  // This reader can see the page after all, so the earlier refusal no longer holds.
+  redirectedShellPages.delete(url.pathname);
   caches
     .open(SHELL_CACHE)
     .then((cache) => cache.put(url.pathname, copy))
@@ -291,7 +350,7 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (request.mode === 'navigate') {
-    event.respondWith(handleNavigation(request));
+    event.respondWith(handleNavigation(request, url));
     return;
   }
 

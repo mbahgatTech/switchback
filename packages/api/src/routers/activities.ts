@@ -299,10 +299,23 @@ export const activitiesRouter = router({
    * button, not when the request arrived — those differ by however long the phone spent
    * looking for signal, which on a trailhead can be minutes. It is clamped to the present:
    * a clock set to 2031 would otherwise put the recording at the top of every list forever.
+   *
+   * **`id` comes from the client too, and that is what makes a hike startable offline.** The
+   * device mints a v4 UUID before the first fix and the recording begins on the press rather
+   * than on this response; this call is the confirmation. Passing the id in makes it the
+   * idempotency key, which is what the retry policy on the other end rests on: a drain that
+   * posted a start and lost the answer replays it and gets the same hike back rather than a
+   * second one. So the id is looked up before anything is created, and a `P2002` from the
+   * create — the same thing arriving twice at once — resolves the same way.
+   *
+   * A v4 UUID makes collision with a stranger's id cryptographically absent, and the `uuid`
+   * check stops anyone squatting a short guessable one; an id that does exist and belongs to
+   * somebody else is a conflict rather than an adoption.
    */
   start: protectedProcedure
     .input(
       z.object({
+        id: z.string().uuid().optional(),
         activityType: z.enum(ACTIVITY_TYPES).default('hiking'),
         trailId: z.string().min(1).max(64).nullish(),
         name: z.string().trim().min(1).max(ACTIVITY_NAME_MAX).nullish(),
@@ -315,6 +328,26 @@ export const activitiesRouter = router({
       const startedAt =
         input.startedAt && input.startedAt.getTime() <= now.getTime() ? input.startedAt : now;
 
+      /** A replay: hand back the row that already exists, or refuse if it is not theirs. */
+      const adopt = async (id: string): Promise<ActivitySummary | null> => {
+        const existing = await ctx.db.activity.findUnique({
+          where: { id },
+          select: activitySelect,
+        });
+        if (!existing) return null;
+        if (existing.userId !== ctx.user.id) {
+          throw new TRPCError({ code: 'CONFLICT', message: 'That recording is not yours.' });
+        }
+        return toSummary(existing, ctx.user.id);
+      };
+
+      // Before the stale sweep, deliberately. A replay must change nothing at all — running
+      // the sweep for it would close the very recording it is asking about.
+      if (input.id) {
+        const replayed = await adopt(input.id);
+        if (replayed) return replayed;
+      }
+
       // Close anything left open — a force-quit, a dead battery, a tab shut mid-hike. Closed
       // rather than deleted: whatever fixes it holds are a real hike, just an unfinished one.
       const stale = await ctx.db.activity.findMany({
@@ -322,7 +355,10 @@ export const activitiesRouter = router({
         orderBy: { startedAt: 'desc' },
         select: { id: true, startedAt: true },
       });
-      for (const row of stale.slice(MAX_OPEN - 1)) {
+      // Only recordings that began no later than this one. A hike recorded offline yesterday
+      // and backfilled today would otherwise close the hike being recorded right now, because
+      // the sweep keeps the most recent `MAX_OPEN` by start time and the backfill is older.
+      for (const row of stale.filter((r) => r.startedAt <= startedAt).slice(MAX_OPEN - 1)) {
         await closeStale(ctx.db, row.id);
       }
 
@@ -330,22 +366,36 @@ export const activitiesRouter = router({
         ? await ctx.db.trail.findUnique({ where: { id: input.trailId }, select: { name: true } })
         : null;
 
-      const row = await ctx.db.activity.create({
-        data: {
-          userId: ctx.user.id,
-          activityType: input.activityType,
-          trailId: trail ? input.trailId : null,
-          name: input.name ?? defaultActivityName(input.activityType, startedAt, trail?.name),
-          device: input.device ?? null,
-          visibility: ctx.user.defaultActivityVisibility,
-          startedAt,
-          distanceM: 0,
-          gainM: 0,
-          lossM: 0,
-        },
-        select: activitySelect,
-      });
-      return toSummary(row, ctx.user.id);
+      const data = {
+        userId: ctx.user.id,
+        activityType: input.activityType,
+        trailId: trail ? input.trailId : null,
+        name: input.name ?? defaultActivityName(input.activityType, startedAt, trail?.name),
+        device: input.device ?? null,
+        visibility: ctx.user.defaultActivityVisibility,
+        startedAt,
+        distanceM: 0,
+        gainM: 0,
+        lossM: 0,
+      };
+
+      try {
+        const row = await ctx.db.activity.create({
+          data: { ...data, ...(input.id ? { id: input.id } : {}) },
+          select: activitySelect,
+        });
+        return toSummary(row, ctx.user.id);
+      } catch (error) {
+        // Two copies of the same start in flight at once — a drain and a reconnecting tab,
+        // say. The lookup above missed because neither had committed yet; the constraint is
+        // what actually settles it, and the loser adopts the winner's row.
+        const clash =
+          error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+        if (!clash || !input.id) throw error;
+        const replayed = await adopt(input.id);
+        if (replayed) return replayed;
+        throw error;
+      }
     }),
 
   /**
@@ -376,6 +426,10 @@ export const activitiesRouter = router({
    * because its response was lost lands exactly once. That property is what lets the client
    * retry blindly, which is the only retry policy that works on a phone that is going in and
    * out of signal.
+   *
+   * `start` is now idempotent by id in service of the same policy, and `finish` is replayable,
+   * so a hike recorded with no signal can be drained by posting all three blindly and in order
+   * however many times it takes. See the note on `start` above.
    */
   append: protectedProcedure
     .input(
@@ -387,16 +441,33 @@ export const activitiesRouter = router({
     .mutation(async ({ ctx, input }) => {
       const row = await ctx.db.activity.findUnique({
         where: { id: input.id },
-        select: { id: true, userId: true, endedAt: true },
+        select: { id: true, userId: true, endedAt: true, syncedAt: true },
       });
       if (!row || row.userId !== ctx.user.id) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'No such recording.' });
       }
-      if (row.endedAt) {
+      if (row.endedAt && row.syncedAt) {
         throw new TRPCError({
           code: 'BAD_REQUEST',
           message: 'That recording is already finished.',
         });
+      }
+      /*
+       * Closed by the sweep, not by a person. Reopen it and take the fixes.
+       *
+       * `syncedAt` is what "the hiker finished this" means — `finish` is the only thing that
+       * sets it, and `closeStale` deliberately leaves it null. Everything else that ends a
+       * recording is housekeeping: `start` closes every earlier open recording, and `open`
+       * closes anything past `MAX_RECORDING_MS`. Refusing an append after that turned a
+       * guess about abandonment into permanent data loss, and the loss was silent — a hiker
+       * who recorded three hours with no signal, finished at the car, and started a second
+       * hike before the first had drained had the sweep close hike one mid-drain, so its
+       * remaining fixes could never be appended and its queue row was removed as though it
+       * had landed whole. A device still uploading is proof that the recording was not
+       * abandoned, and it is proof that arrives at exactly the right moment.
+       */
+      if (row.endedAt) {
+        await ctx.db.activity.update({ where: { id: row.id }, data: { endedAt: null } });
       }
 
       const stored = await ctx.db.activitySample.count({ where: { activityId: row.id } });
@@ -440,6 +511,12 @@ export const activitiesRouter = router({
    * The one place the elevation correction and the completion both happen, and the only
    * place `syncedAt` is set — which is what the interface reads to know a hike is finished
    * and its numbers are final.
+   *
+   * Replayable, on purpose: a hike drained from the offline queue may post this more than
+   * once if a response is lost. Ending an already-ended recording is allowed, the statistics
+   * recompute from the stored samples to the same answer, and the completion is guarded by a
+   * unique on `activityId`. The one step that counts rather than sets is the busyness
+   * observation, which is why it is gated on the row not already having ended.
    */
   finish: protectedProcedure
     .input(
@@ -461,6 +538,9 @@ export const activitiesRouter = router({
       if (!row || row.userId !== ctx.user.id) {
         throw new TRPCError({ code: 'NOT_FOUND', message: 'No such recording.' });
       }
+      // Captured before the update below sets it. A replayed finish must not observe the
+      // start a second time — see the note above.
+      const alreadyFinished = row.endedAt !== null;
 
       const trailId = input.trailId === undefined ? row.trailId : input.trailId;
       const stored = await loadFixes(ctx.db, row.id);
@@ -516,8 +596,9 @@ export const activitiesRouter = router({
           select: { centroidLng: true },
         });
         // Swallowed: a busyness bucket that did not get written costs the model one sample
-        // out of thousands, and must not be able to fail the request that ends a hike.
-        if (trail) {
+        // out of thousands, and must not be able to fail the request that ends a hike. Only
+        // on the first finish: the bucket is a counter, and a replayed drain would inflate it.
+        if (trail && !alreadyFinished) {
           await observeStart(ctx.db, trailId, row.startedAt, trail.centroidLng).catch(
             () => undefined,
           );
@@ -965,6 +1046,14 @@ async function closeStale(db: PrismaClient, activityId: string): Promise<void> {
  * which is the design decision documented at the top of `routers/lists.ts` and the reason
  * a hike recorded here shows up in the completed tab without either file knowing about
  * the other.
+ *
+ * The read is an optimisation, not the guard. `finish` is replayable by design and the client
+ * drains are triggered by four independent events, so two finishes for one activity can be in
+ * flight at once: both read no completion, both enter the transaction, and the loser hits
+ * `Completion.activityId @unique` with a P2002 that would otherwise leave the mutation
+ * returning a raw Prisma exception as a 500 — for a hike that is, by then, correctly in the
+ * account. The unique constraint is the real answer, and swallowing its violation is what
+ * makes it an answer rather than an error.
  */
 async function logCompletion(
   db: PrismaClient,
@@ -982,10 +1071,17 @@ async function logCompletion(
   const day = new Date(
     Date.UTC(completedAt.getUTCFullYear(), completedAt.getUTCMonth(), completedAt.getUTCDate()),
   );
-  await db.$transaction(async (tx) => {
-    await tx.completion.create({ data: { userId, trailId, activityId, completedAt: day } });
-    await tx.trail.update({ where: { id: trailId }, data: { popularity: { increment: 1 } } });
-  });
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.completion.create({ data: { userId, trailId, activityId, completedAt: day } });
+      await tx.trail.update({ where: { id: trailId }, data: { popularity: { increment: 1 } } });
+    });
+  } catch (error) {
+    // Somebody else logged it between the read above and the create. That is the outcome this
+    // function wanted; the transaction rolled back, so the popularity increment went with it.
+    const clash = error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+    if (!clash) throw error;
+  }
 }
 
 /** A filename someone can find again, out of a name someone typed. */
