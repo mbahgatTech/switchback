@@ -55,12 +55,32 @@ export function ingestHandlers(deps?: Partial<PipelineDeps>): Partial<Record<Job
 }
 
 /**
+ * How many derived jobs a drain claims on top of its batch, unless told otherwise.
+ *
+ * Two, and the number is chosen against the two places this runs rather than against the
+ * backlog. A cron tick has a 60 s budget mostly spent on tile fetches; an inline kick is
+ * `waitUntil` work hanging off a map request, where the cost is a background function
+ * holding a connection a little longer. `enrichTrailPhotos` is the cheap end of the job
+ * table — a lookup and an image fetch, not an Overpass query — so two of them fit in the
+ * slack of either caller.
+ *
+ * It is a rate, not a target: two per drain times every viewport that finds new ground is
+ * what makes the backlog fall with traffic, which is the same thing it rises with. The
+ * alternative — one big periodic sweep — needs a scheduler this deploy does not have.
+ */
+export const DEFAULT_DERIVED_SHARE = 2;
+
+/**
  * Drain a batch of ingest work. This is the cron route's entire body.
  *
  * `limit` is small on purpose. A Vercel cron invocation has a wall-clock budget and a tile
  * can take a minute; claiming twenty would mean nineteen locks expiring unhelpfully. Four
  * per minute, with the immediate `waitUntil` path handling anything a user is watching, is
  * the right shape.
+ *
+ * `derivedLimit` is separate from `limit` and defaults to a share rather than to zero,
+ * because derived work is enqueued below every requestable kind and `claimJobs` orders by
+ * priority — a batch that does not reserve room for it never runs any. See `drainJobs`.
  */
 export async function drainIngest(
   options: {
@@ -69,11 +89,14 @@ export async function drainIngest(
     deps?: Partial<PipelineDeps>;
     /** Claim only these units of work — see `claimJobs`. */
     dedupeKeys?: readonly string[];
+    /** Derived jobs to claim alongside — see `drainJobs`. Pass 0 to take none. */
+    derivedLimit?: number;
   } = {},
 ): Promise<DrainResult> {
   return drainJobs(ingestHandlers(options.deps), {
     limit: options.limit ?? 4,
     workerId: options.workerId,
+    derivedLimit: options.derivedLimit ?? DEFAULT_DERIVED_SHARE,
     ...(options.dedupeKeys ? { dedupeKeys: options.dedupeKeys } : {}),
   });
 }

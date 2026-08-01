@@ -26,13 +26,75 @@ const CACHE_PREFIX = 'sb-';
 const TILE_CACHE = 'sb-tiles-v1';
 const PAGE_CACHE = 'sb-pages-v1';
 const MEDIA_CACHE = 'sb-media-v1';
-const SHELL_CACHE = 'sb-shell-v1';
-const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE];
+/**
+ * The `/_next/static/*` a *downloaded page* names. Hand-versioned, like the three above and
+ * for the same reason — they are part of somebody's download, and a page served from
+ * `PAGE_CACHE` without its chunks renders "This page couldn't load". A deploy must not sweep
+ * them. `src/offline/caches.ts` has the full argument, including what it costs.
+ */
+const ASSET_CACHE = 'sb-assets-v1';
+/**
+ * This build, out of the worker's own URL.
+ *
+ * `offline/register.tsx` registers `/sw.js?v=<build id>`, and `self.location` inside a worker
+ * is the script URL it was registered with — query string and all. That is the only channel
+ * into a file outside the module graph, and it does double duty: a changed query is a changed
+ * worker URL, so a deploy always installs a new worker rather than waiting on a revalidation.
+ *
+ * The fallback is for a worker registered by an older build, which had no `v` at all. It is a
+ * name like any other and the next activate collects it.
+ */
+const BUILD_ID = new URL(self.location.href).searchParams.get('v') || 'dev';
+/**
+ * The shell holds this build's own precache — `SHELL_PAGES` and the chunks those pages name —
+ * which the next build replaces wholesale, so it is scoped to the build and collected by
+ * `activate`. The four above are the reader's downloads and are versioned by hand: a deploy
+ * must not delete the map somebody took onto a hill, nor the code that draws it.
+ */
+const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
+/**
+ * The shell name every build before this one used, kept only long enough to empty it.
+ *
+ * It is not in `OFFLINE_CACHES`, so `activate` collects it — and that is the whole problem.
+ * Until this deploy the shell was the flat `sb-shell-v1` and `download.ts`'s `storeShell`
+ * harvested a *downloaded page's* chunks into it. So every phone that has downloaded a trail
+ * on the live build is holding that trail's `/_next/static/*` in a cache this worker is about
+ * to delete, with nothing to put them back: `storeShell` runs only inside `downloadTrail`, and
+ * `refreshShell` re-puts SHELL_PAGES rather than trail pages. The download would survive in
+ * `PAGE_CACHE` and stop rendering — "This page couldn't load", offline, which is verbatim the
+ * failure `ASSET_CACHE` exists to prevent.
+ *
+ * So `adoptLegacyShell` moves the build assets across before the sweep runs. One release of
+ * that is enough — nothing writes this name any more — but it costs a `caches.keys()` on an
+ * activate that already calls one, so it stays until somebody can show every install has
+ * upgraded, and removing it before then is silent and unrecoverable.
+ */
+const LEGACY_SHELL_CACHE = 'sb-shell-v1';
+const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE, SHELL_CACHE];
 const OFFLINE_FALLBACK_PATH = '/offline';
-const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore'];
+const SHELL_PAGES = [OFFLINE_FALLBACK_PATH, '/downloads', '/', '/explore', '/record'];
 const STATIC_ASSET_PATTERN = String.raw`/_next/static/[A-Za-z0-9._@%/-]+\.[A-Za-z0-9]{2,5}\b`;
 const PRECACHE_ATTEMPTS = 3;
 const PRECACHE_BACKOFF_MS = 500;
+
+/**
+ * Shell pages that answered with a redirect, and are therefore not cacheable for whoever is
+ * using this browser right now.
+ *
+ * `/record` is auth-gated. For a signed-out reader every fetch of it lands on `/signin`, the
+ * `response.redirected` guard below correctly refuses to store it, and the entry stays
+ * missing — which `repairShell` reads as "try again", on every single navigation, for ever.
+ * Measured on a signed-out session: install cost three hits on `/record` and three on
+ * `/signin`, and five further navigations cost fifteen more of each. In the real app each of
+ * those is a server-rendered request.
+ *
+ * So the refusal is remembered. Per worker instance rather than persisted, which is the right
+ * lifetime: a browser that has terminated an idle worker and started a fresh one is exactly
+ * the moment it is worth asking again, and a sign-in in the meantime is picked up either by
+ * that or by `refreshShell`, which stores the real page from the reader's own navigation and
+ * clears the entry below.
+ */
+const redirectedShellPages = new Set();
 
 /**
  * Cache a page *and the build assets it names*, which is not the same thing.
@@ -60,6 +122,24 @@ async function precache(cache, path) {
 
     const response = await fetch(new Request(path, { cache: 'reload' })).catch(() => null);
     if (!response || !response.ok) continue;
+    /*
+     * A redirect is not this page.
+     *
+     * `/record` is auth-gated. A signed-out install fetches it, `fetch` follows the 307 to
+     * `/signin?callbackUrl=/record`, and hands back a 200 — so without this the sign-in form
+     * would be stored under the key `/record` and served from cache to a hiker at a trailhead.
+     * A missing entry is the honest outcome: `refreshShell` stores the real page the first
+     * time this reader opens it with a session. (A redirected response also fails a navigation
+     * outright in Chromium, whose redirect mode is `manual`, so this closes that too.)
+     *
+     * Returned rather than retried. Three attempts exist to survive one bad response from a
+     * server mid-deploy; a redirect is not a bad response, it is a settled answer about who is
+     * signed in, and asking twice more only costs the origin two more renders.
+     */
+    if (response.redirected) {
+      redirectedShellPages.add(path);
+      return;
+    }
 
     const html = await response.clone().text();
     await cache.put(path, response);
@@ -83,6 +163,9 @@ async function precache(cache, path) {
  * The in-flight flag stops a run of navigations from stacking repairs on top of each other.
  * It is cleared either way, so a repair that fails is retried by the next navigation rather
  * than written off — the same refusal to decide permanently that `precache` makes above.
+ *
+ * A page that answered with a redirect is skipped, not retried: it is not missing by accident,
+ * and no number of attempts will sign this reader in. See `redirectedShellPages`.
  */
 let repairing = false;
 
@@ -92,6 +175,7 @@ async function repairShell() {
   try {
     const cache = await caches.open(SHELL_CACHE);
     for (const path of SHELL_PAGES) {
+      if (redirectedShellPages.has(path)) continue;
       if (!(await cache.match(path))) await precache(cache, path);
     }
   } catch {
@@ -135,10 +219,59 @@ self.addEventListener('install', (event) => {
   );
 });
 
+/**
+ * Rescue a pre-existing download's build assets out of the old flat shell.
+ *
+ * Before this build, `SHELL_CACHE` was the constant `sb-shell-v1` and it held two unrelated
+ * things: this build's precache, and the `/_next/static/*` that `storeShell` harvested for
+ * every trail somebody downloaded. Splitting them — a build-scoped shell, a hand-versioned
+ * `ASSET_CACHE` — is the right shape, but the split alone strands everything already stored:
+ * the old name stops being in `OFFLINE_CACHES` and the sweep below deletes it, chunks and all.
+ *
+ * Only `/_next/static/*` is carried over. The shell *pages* in there are this-build markup for
+ * an older build and are refetched on the first navigation; the chunks cannot be refetched at
+ * all, because a downloaded page names content-hashed URLs no current build serves.
+ *
+ * Everything is guarded and nothing is fatal. A failure here costs one download its offline
+ * rendering, which is the status quo it is trying to improve on; throwing would cost the
+ * activate, and with it `clients.claim()` and the sweep.
+ */
+async function adoptLegacyShell() {
+  const names = await caches.keys();
+  if (!names.includes(LEGACY_SHELL_CACHE) || OFFLINE_CACHES.includes(LEGACY_SHELL_CACHE)) return;
+
+  const old = await caches.open(LEGACY_SHELL_CACHE);
+  const assets = await caches.open(ASSET_CACHE);
+
+  for (const request of await old.keys()) {
+    let pathname;
+    try {
+      const url = new URL(request.url);
+      if (url.origin !== self.location.origin) continue;
+      pathname = url.pathname;
+    } catch {
+      continue;
+    }
+    if (!pathname.startsWith('/_next/static/')) continue;
+
+    try {
+      // Content-hashed, so an entry already held is the same bytes. Skipping it keeps a
+      // second activate cheap rather than rewriting the whole set.
+      if (await assets.match(request, { ignoreVary: true })) continue;
+      const response = await old.match(request);
+      if (response) await assets.put(request, response);
+    } catch {
+      // One asset lost, not the pass. The rest of the page's chunks are still worth moving.
+    }
+  }
+}
+
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches
-      .keys()
+    // Before the sweep, and sequentially: the cache it reads is the one the sweep deletes.
+    adoptLegacyShell()
+      .catch(() => undefined)
+      .then(() => caches.keys())
       .then((names) =>
         Promise.all(
           names
@@ -170,8 +303,16 @@ async function fromOurCaches(request) {
  * planning at home should see today's. Cache second, which is the download doing its job.
  * The offline page last — a real screen that says what is available rather than the
  * browser's dinosaur.
+ *
+ * The shell is matched twice on the way down, and the second match is the one that matters
+ * offline. `cache.match` is query-sensitive, so the stored `/record` entry is a miss for
+ * `/record?trail=vesper-peak` — which is the link from every trail page — and the hiker gets
+ * the offline fallback while the recorder sits in the cache. The same gap is there for
+ * `/?place=…` and `/explore?bbox=…`. Serving the plain shell for a query it was not rendered
+ * with is honest degradation: on `/record` you can still record, you simply do not get the
+ * wrong-turn watchdog, because the trail line came from the server.
  */
-async function handleNavigation(request) {
+async function handleNavigation(request, url) {
   try {
     const response = await fetch(request);
     // Only 2xx is worth keeping: caching a 500 would pin the error until the cache is
@@ -195,6 +336,11 @@ async function handleNavigation(request) {
     if (cached) return cached;
 
     const shell = await caches.open(SHELL_CACHE);
+    if (SHELL_PAGES.includes(url.pathname)) {
+      const page = await shell.match(url.pathname);
+      if (page) return page;
+    }
+
     const fallback = await shell.match(OFFLINE_FALLBACK_PATH);
     return (
       fallback ??
@@ -238,8 +384,13 @@ function refreshShell(request, response) {
 
   if (url.origin !== self.location.origin) return;
   if (!SHELL_PAGES.includes(url.pathname)) return;
+  // Same guard as `precache`: a navigation that ended somewhere else is not this page, and
+  // storing it here would hand a signed-out reader's sign-in form to a signed-in one offline.
+  if (response.redirected) return;
 
   const copy = response.clone();
+  // This reader can see the page after all, so the earlier refusal no longer holds.
+  redirectedShellPages.delete(url.pathname);
   caches
     .open(SHELL_CACHE)
     .then((cache) => cache.put(url.pathname, copy))
@@ -254,11 +405,24 @@ function refreshShell(request, response) {
  * cache-first is exact rather than merely fast. This is what makes a downloaded page
  * *render* offline: the HTML is worth nothing without the JS and CSS it references, and
  * those are requested by the page rather than by us, so they cannot be listed in advance.
+ *
+ * Two caches, in this order and not the other. The shell holds the current build and is the
+ * common hit. `ASSET_CACHE` holds the chunks harvested for downloaded pages, which may belong
+ * to a build that shipped months ago — a page in `PAGE_CACHE` names hashed URLs no current
+ * build serves, so without this second look the download is present, matched, and replaced by
+ * React's error boundary the moment the reader is out of signal.
+ *
+ * A miss is written back to the shell. It is this build asking, by definition: the request
+ * came from a live page, not from the cache.
  */
 async function handleStatic(request) {
   const cache = await caches.open(SHELL_CACHE);
   const hit = await cache.match(request, { ignoreVary: true });
   if (hit) return hit;
+
+  const downloaded = await caches.open(ASSET_CACHE);
+  const kept = await downloaded.match(request, { ignoreVary: true });
+  if (kept) return kept;
 
   const response = await fetch(request);
   if (response.ok) cache.put(request, response.clone()).catch(() => undefined);
@@ -291,7 +455,7 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (request.mode === 'navigate') {
-    event.respondWith(handleNavigation(request));
+    event.respondWith(handleNavigation(request, url));
     return;
   }
 

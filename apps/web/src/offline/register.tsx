@@ -14,6 +14,7 @@
  */
 
 import { useEffect } from 'react';
+import { BUILD_ID } from './caches';
 
 export function RegisterServiceWorker() {
   useEffect(() => {
@@ -23,11 +24,20 @@ export function RegisterServiceWorker() {
     // After load, not during: registration competes with the page's own requests for the
     // connection, and the page is what the user is waiting for.
     const register = () => {
-      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch((error: unknown) => {
-        // Worth surfacing to a developer console and nowhere else — the site works without
-        // it, minus the offline half, and there is nothing the reader can do about it.
-        console.error('Service worker registration failed', error);
-      });
+      /*
+       * The build id rides in the query string, and it is the only way to tell a file outside
+       * the module graph which build it belongs to — `sw.js` reads it back off
+       * `self.location`. It also guarantees an upgrade: a changed URL is a different worker
+       * as far as the browser is concerned, so a deploy installs rather than waiting on a
+       * byte comparison of a file that may not have changed.
+       */
+      navigator.serviceWorker
+        .register(`/sw.js?v=${encodeURIComponent(BUILD_ID)}`, { scope: '/' })
+        .catch((error: unknown) => {
+          // Worth surfacing to a developer console and nowhere else — the site works without
+          // it, minus the offline half, and there is nothing the reader can do about it.
+          console.error('Service worker registration failed', error);
+        });
     };
 
     if (document.readyState === 'complete') {

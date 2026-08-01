@@ -45,7 +45,14 @@ function assertNotProduction(): void {
   }
   // A seed run against the live database would enqueue work, not destroy data — but the
   // point of a guard is to stop the run before you find out which kind of script it was.
-  if (/neon\.tech|amazonaws\.com|supabase\.co/.test(url) && !process.env.SEED_ALLOW_REMOTE) {
+  //
+  // `postgres.database.azure.com` is production from the Neon→Azure migration onward, and
+  // `neon.tech` stays in the list for as long as Neon is the rollback: both have to be
+  // refused, because for a while both are real databases holding real users.
+  if (
+    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
+    !process.env.SEED_ALLOW_REMOTE
+  ) {
     throw new Error(
       `refusing to seed what looks like a hosted database (${url.replace(/:[^:@]*@/, ':***@')}). ` +
         'Set SEED_ALLOW_REMOTE=1 if you really mean it.',

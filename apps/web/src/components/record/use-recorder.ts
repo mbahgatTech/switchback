@@ -5,6 +5,7 @@ import {
   MAX_FIX_ACCURACY_M,
   SAMPLE_BATCH,
   type ActivityStats,
+  type ActivityType,
   type LngLat,
   type TrackFix,
 } from '@switchback/core';
@@ -16,6 +17,23 @@ import {
   updateOffRoute,
   type OffRouteState,
 } from '@switchback/geo';
+import { isUnreachable } from '@/offline/queue';
+import { stillActingAs, writingReader } from '@/offline/identity';
+import { readerSettled, subscribeToReader } from '@/offline/reader';
+import {
+  CHUNK_FIXES,
+  chunkKey,
+  claimLive,
+  deleteActivity,
+  isMissing,
+  pendingActivity,
+  putActivityHeader,
+  readOpenActivity,
+  releaseLive,
+  writeChunk,
+  type ActivityChunk,
+  type PendingActivity,
+} from '@/offline/activities';
 
 /**
  * The recording engine: a phone's geolocation stream turned into a hike.
@@ -24,7 +42,7 @@ import {
  * a position watch, an upload loop, an off-route watchdog and a crash-recovery journal —
  * and none of them are about layout. The screen reads this hook and draws what it says.
  *
- * **Three rules hold the whole design together.**
+ * **Four rules hold the whole design together.**
  *
  * 1. **The buffer in memory is the truth while hiking; the server is the truth after.**
  *    Fixes accumulate locally, are flushed in batches, and are never removed from the local
@@ -33,11 +51,24 @@ import {
  *    the number you watch tick over is the number you get at the end.
  * 2. **Nothing waits for the end.** A batch goes up roughly every minute. Close the tab on
  *    the summit and what is stored is a shorter hike, not a lost one.
- * 3. **The journal survives a refresh.** `localStorage` holds the activity id, the start
- *    time, and every fix. A reload mid-hike picks the recording back up rather than
- *    orphaning it — and the recording comes back *paused*, because the honest thing to say
- *    after an interruption is "you were recording; carry on?" rather than pretending the
+ * 3. **The journal survives a refresh.** IndexedDB holds the activity id, the start time, and
+ *    every fix, five hundred to a chunk. A reload mid-hike picks the recording back up rather
+ *    than orphaning it — and the recording comes back *paused*, because the honest thing to
+ *    say after an interruption is "you were recording; carry on?" rather than pretending the
  *    gap did not happen.
+ * 4. **The journal is also the queue row.** It is written through `offline/activities.ts`,
+ *    which is the same store the background drain reads, so a hike that ends with no signal is
+ *    already a debt the app owes rather than something that has to be handed over at the end.
+ *    That is also why the id is minted on the device and passed to `activities.start`: there
+ *    is one id from the first second, and nothing to reconcile when the connection returns.
+ *
+ * The journal was `localStorage` until this queue existed, and could not stay there. The cap
+ * is about 5 MB of UTF-16, which is roughly six hours at 1 Hz — the middle of exactly the hike
+ * this feature is for — and it fails silently, because a `QuotaExceededError` cannot be shown
+ * to somebody who is walking. Worse, it re-serialised the whole buffer on every fix, which is
+ * quadratic: about 22 GB of string building across an eighteen-thousand-fix day, ending at one
+ * synchronous 2.5 MB write a second. Chunking is what makes the per-fix cost constant;
+ * IndexedDB is what makes the budget hundreds of megabytes and the write asynchronous.
  */
 
 export type RecorderPhase =
@@ -64,23 +95,28 @@ const JOURNAL_VERSION = 1;
  */
 export const FLUSH_INTERVAL_MS = 60_000;
 
-interface Journal {
+/**
+ * The journal as it was before it moved to IndexedDB.
+ *
+ * Kept only to read one. A hiker who is mid-hike across the deploy that ships this has their
+ * whole day in `localStorage` under the old key, and dropping it on upgrade would be losing a
+ * hike to a release — which is the one thing this feature exists to stop happening.
+ */
+interface LegacyJournal {
   v: number;
   id: string;
-  /** Epoch milliseconds. Every fix's `t` is seconds after this. */
   startedAt: number;
   trailId: string | null;
   fixes: TrackFix[];
-  /** How many of `fixes`, from the front, the server has acknowledged. */
   sent: number;
 }
 
-function readJournal(): Journal | null {
+function readLegacyJournal(): LegacyJournal | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = window.localStorage.getItem(JOURNAL_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Journal;
+    const parsed = JSON.parse(raw) as LegacyJournal;
     if (parsed.v !== JOURNAL_VERSION || typeof parsed.id !== 'string') return null;
     if (!Array.isArray(parsed.fixes)) return null;
     return parsed;
@@ -91,7 +127,7 @@ function readJournal(): Journal | null {
   }
 }
 
-function clearJournal(): void {
+function forgetLegacyJournal(): void {
   try {
     window.localStorage.removeItem(JOURNAL_KEY);
   } catch {
@@ -99,12 +135,68 @@ function clearJournal(): void {
   }
 }
 
+/**
+ * Move a pre-IndexedDB hike into the new store, once, before anything reads it.
+ *
+ * `serverStarted: true`, because the old flow could not mint an id — the only way that
+ * journal exists is that `activities.start` already succeeded for it.
+ *
+ * `userId: null`, because nothing in that journal ever said whose hike it was. It becomes an
+ * unattributed row: never uploaded on its own, never resumed here, and surfaced on
+ * `/downloads` for a person to claim or discard. Stamping it with whoever is signed in now
+ * would be the exact guess this product no longer makes — the journal is on the device, and
+ * the device is not the hiker.
+ */
+async function importLegacyJournal(): Promise<void> {
+  const journal = readLegacyJournal();
+  if (!journal) return;
+  try {
+    const header: PendingActivity = {
+      ...pendingActivity({
+        activityId: journal.id,
+        startedAt: journal.startedAt,
+        trailId: journal.trailId,
+        trailName: null,
+        activityType: 'hiking',
+        serverStarted: true,
+        userId: null,
+      }),
+      sent: Math.min(journal.sent, journal.fixes.length),
+      count: journal.fixes.length,
+    };
+    for (let index = 0; index * CHUNK_FIXES < journal.fixes.length; index += 1) {
+      await writeChunk({
+        key: chunkKey(journal.id, index),
+        activityId: journal.id,
+        index,
+        fixes: journal.fixes.slice(index * CHUNK_FIXES, (index + 1) * CHUNK_FIXES),
+      });
+    }
+    await putActivityHeader(header);
+  } catch {
+    // The old copy is left in place if this fails, so the next load tries again.
+    return;
+  }
+  forgetLegacyJournal();
+}
+
 export interface StartArgs {
+  /** Minted on the device. This is also the id the server stores the hike under. */
   id: string;
   startedAt: Date;
   trailId: string | null;
+  /** For naming the hike on the storage manager with no server to ask. */
+  trailName?: string | null;
+  activityType: ActivityType;
   /** Fixes already on the server, when adopting a recording started elsewhere. */
   resumed?: boolean;
+  /**
+   * Whether `activities.start` has already been acknowledged for this id.
+   *
+   * False for a hike begun with no signal — the first flush that reaches the server posts
+   * `start` for it. True when adopting a recording the server already knows about.
+   */
+  serverStarted?: boolean;
 }
 
 export interface RecorderApi {
@@ -124,8 +216,16 @@ export interface RecorderApi {
   syncing: boolean;
   /** A geolocation problem, in the words the reader needs. */
   geoError: string | null;
-  /** An upload problem. Recording continues; this is informational. */
+  /**
+   * An upload problem. Recording continues; this is informational.
+   *
+   * Also carries the one non-problem written here: the browser is now acting as somebody else,
+   * so the uploader has stopped. Nothing failed and nothing is lost, which is why it is a
+   * sync state rather than an error — see `stillMine`.
+   */
   syncError: string | null;
+  /** Whether the last upload failure was the connection rather than the server's answer. */
+  syncOffline: boolean;
   offRoute: boolean;
   /** Metres from the route line, when a route is being followed. */
   offRouteDistanceM: number | null;
@@ -139,25 +239,90 @@ export interface RecorderApi {
   trailId: string | null;
 
   begin: (args: StartArgs) => void;
+  /** Record that `activities.start` has been acknowledged for this id. */
+  noteServerStarted: (id: string) => void;
   pause: () => void;
   resume: () => void;
   /** Flush anything outstanding. Resolves when the server has it, or throws. */
   flush: () => Promise<void>;
+  /**
+   * Fixes the server has not acknowledged, read live.
+   *
+   * `pending` is the same number off the last render, which is the right one to draw. This is
+   * the one to ask *after* an await — `onFinish` closes over the render it was created in, and
+   * needs to know what a flush actually left behind rather than what the buffer held before it.
+   */
+  outstanding: () => number;
+  /**
+   * Is the browser still acting as the account that pressed start? Read live.
+   *
+   * For the one call this hook does not make itself. `finish` is posted by the screen, and it
+   * is the request that publishes a day, adds it to an account and logs a completion against
+   * the trail — the most expensive one on this page to send under the wrong name, and the
+   * furthest in time from the press that decided the name. The uploader asks the same question
+   * before every batch it sends; this is how the screen asks it before the last one.
+   */
+  stillMine: () => boolean;
   stop: () => void;
-  /** Wipe the local journal without touching the server. */
+  /**
+   * Leave `saving` and go back to being a paused recording.
+   *
+   * The way out of a `finish` the server refused. Without it the phase is stuck at `saving`,
+   * which is neither running nor paused, so the screen shows the start panel behind a finish
+   * dialog whose buttons are permanently disabled — the day's hike locked behind a dead modal.
+   */
+  unstop: () => void;
+  /** Wipe the local journal and the queued row. Nothing on the server is touched. */
   forget: () => void;
+  /**
+   * Clear the screen but leave the queued row where it is.
+   *
+   * What a hike finished with no signal does: it is no longer this screen's business, and it
+   * is now the drain's. `forget` would delete the only copy of the day.
+   *
+   * The header reference is dropped *first*, and that is what protects the `finish` payload
+   * `onFinish` has just written. `writeJournal` reads `headerRef.current` when it executes and
+   * returns if it is null, so every write still queued on the chain becomes a no-op rather
+   * than landing `{...header, finish: null}` on top of the finish and silently un-finishing
+   * the hike. Settling here instead would be the wrong move — it would *run* those writes
+   * rather than neuter them. The one write already past that check and awaiting its chunk is
+   * closed further upstream: `flush` settles the journal on every exit, and `onFinish` awaits
+   * it before `markFinished`, so the chain is empty by the time the payload is written.
+   */
+  handOff: () => void;
 }
 
 export interface RecorderOptions {
   /** Uploads a batch. Resolves with what the server kept. */
   onFlush: (id: string, fixes: TrackFix[]) => Promise<unknown>;
+  /**
+   * Tells the server the recording exists. Called before the first upload of a hike it has
+   * not acknowledged, and must be idempotent by `id` — it is replayed until it lands.
+   *
+   * Nothing can be appended to a recording the server has never heard of: `append` answers
+   * "No such recording". A hike begun with no signal is exactly that, so the announcement is
+   * carried by the upload path rather than by the button press, and the first flush after
+   * signal returns makes it. Which is also why it must survive a reload: after one, the press
+   * and everything it closed over are gone, and only the journal remembers.
+   */
+  onStart: (input: {
+    id: string;
+    activityType: ActivityType;
+    trailId: string | null;
+    startedAt: Date;
+  }) => Promise<unknown>;
   /** The route being followed, if any. Enables the off-route watchdog. */
   route: readonly LngLat[] | null;
   /** Total route length, for the distance-to-finish readout. */
   routeLengthM: number | null;
 }
 
-export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): RecorderApi {
+export function useRecorder({
+  onFlush,
+  onStart,
+  route,
+  routeLengthM,
+}: RecorderOptions): RecorderApi {
   const [phase, setPhase] = useState<RecorderPhase>('idle');
   const [activityId, setActivityId] = useState<string | null>(null);
   const [startedAt, setStartedAt] = useState<Date | null>(null);
@@ -167,6 +332,7 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   const [weakSignal, setWeakSignal] = useState(false);
   const [geoError, setGeoError] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [syncOffline, setSyncOffline] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
   const [offRoute, setOffRoute] = useState(false);
@@ -189,9 +355,27 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   startedAtRef.current = startedAt;
   const trailIdRef = useRef<string | null>(null);
   trailIdRef.current = trailId;
-  const flushingRef = useRef(false);
+  /**
+   * The drain that is running, if one is.
+   *
+   * Held rather than reduced to a boolean because a second caller has to be able to *wait* for
+   * it. A flag can only answer "is one running", which leaves the second caller nothing to do
+   * but return — and returning from `flush` without draining is a lie told to whoever awaited
+   * it. See the note on `flush`.
+   */
+  const inFlightRef = useRef<Promise<void> | null>(null);
+  /**
+   * `flush`, reachable from the hydrate effect above it.
+   *
+   * Assigned once `flush` exists, further down. A ref rather than a dependency because the
+   * hydrate effect must run exactly once — putting `flush` in its deps would re-adopt the
+   * journal every time the callback's identity changed.
+   */
+  const flushRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const onFlushRef = useRef(onFlush);
   onFlushRef.current = onFlush;
+  const onStartRef = useRef(onStart);
+  onStartRef.current = onStart;
   const routeRef = useRef<readonly LngLat[] | null>(route);
   routeRef.current = route;
   const offRouteRef = useRef<OffRouteState>(initialOffRouteState());
@@ -200,41 +384,237 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   // Journal
   // -------------------------------------------------------------------------
 
-  const persist = useCallback(() => {
-    const id = activityIdRef.current;
-    const start = startedAtRef.current;
-    if (!id || !start) return;
-    try {
-      const journal: Journal = {
-        v: JOURNAL_VERSION,
-        id,
-        startedAt: start.getTime(),
-        trailId: trailIdRef.current,
-        fixes: fixesRef.current,
-        sent: sentRef.current,
-      };
-      window.localStorage.setItem(JOURNAL_KEY, JSON.stringify(journal));
-    } catch {
-      // Quota, most likely, on a very long hike in a browser with a small budget. The
-      // recording is unaffected — only its ability to survive a refresh is.
+  /**
+   * The queue row as it stands, and the chunk currently being filled.
+   *
+   * The header is held whole rather than rebuilt from the other refs so that fields the drain
+   * owns — `attempts`, `blocked` — survive a hydrate and are not clobbered by a write from
+   * here. Only one chunk is ever open, and it is the only one this hook rewrites.
+   */
+  const headerRef = useRef<PendingActivity | null>(null);
+  const chunkRef = useRef<{ index: number; fixes: TrackFix[] } | null>(null);
+  /** Metres so far, for the storage manager. Mirrored out of the stats memo below. */
+  const distanceRef = useRef(0);
+
+  /**
+   * One write at a time, and never more than one queued.
+   *
+   * The store is asynchronous now, and the geolocation handler is not: a fix can land, be
+   * buffered, and have its chunk write still in flight when the next one arrives. Two
+   * overlapping `put`s of the same chunk key would interleave and lose fixes, which is
+   * precisely the failure the journal exists to prevent — so writes are chained rather than
+   * fired in parallel.
+   *
+   * `queued` collapses the run: a write already scheduled will read the refs when it executes
+   * and therefore already covers every fix that arrived in the meantime, so a second one is
+   * not worth scheduling. That turns a burst of fixes into one write rather than a queue of
+   * them, and it is what keeps the per-fix cost constant.
+   */
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  const queuedRef = useRef(false);
+
+  const writeJournal = useCallback(async (): Promise<void> => {
+    const header = headerRef.current;
+    const chunk = chunkRef.current;
+    if (!header) return;
+    if (chunk) {
+      await writeChunk({
+        key: chunkKey(header.activityId, chunk.index),
+        activityId: header.activityId,
+        index: chunk.index,
+        // A copy, because the live array keeps growing and the write is asynchronous.
+        fixes: chunk.fixes.slice(),
+      });
     }
+    const next: PendingActivity = {
+      ...header,
+      sent: sentRef.current,
+      count: fixesRef.current.length,
+      distanceM: distanceRef.current,
+    };
+    headerRef.current = next;
+    await putActivityHeader(next);
   }, []);
 
-  /** Adopt whatever the last session left behind. Runs once, before anything else can. */
+  const persist = useCallback(() => {
+    if (!headerRef.current || queuedRef.current) return;
+    queuedRef.current = true;
+    writeChainRef.current = writeChainRef.current
+      .then(() => {
+        // Cleared before the write, not after: a fix arriving while it runs schedules the
+        // next one rather than being folded into a write that has already read the refs.
+        queuedRef.current = false;
+        return writeJournal();
+      })
+      .catch(() => {
+        // Storage refused. The recording carries on — only its ability to survive a refresh
+        // is affected, and the next fix schedules another attempt.
+        queuedRef.current = false;
+      });
+  }, [writeJournal]);
+
+  /**
+   * Wait for the journal to catch up with the buffer.
+   *
+   * The write is asynchronous and the callers that end a hike are not: `onFinish` writes the
+   * `finish` payload onto the same row this hook has been writing all day, and a write of ours
+   * still in flight would land on top of it and silently un-finish the hike — caught up on the
+   * server and never closed. So anything that hands the row over settles first.
+   */
+  const settle = useCallback((): Promise<void> => writeChainRef.current.catch(() => undefined), []);
+
+  /** Add a fix to the open chunk, rolling over to a new one when it is full. */
+  const journalFix = useCallback(
+    (fix: TrackFix) => {
+      const chunk = chunkRef.current;
+      if (!chunk || chunk.fixes.length >= CHUNK_FIXES) {
+        /*
+         * The chunk that just filled is final, and it is written here rather than left to
+         * `persist`.
+         *
+         * `persist` collapses a burst into one write on the reasoning that a write already
+         * scheduled will read the refs when it runs and therefore covers everything that
+         * arrived in the meantime. That holds only while `chunkRef` still points at the same
+         * chunk. A write scheduled before this line and executed after it stores the *new*
+         * chunk, and the completed one keeps whatever length it had when it was last
+         * written — short by however many fixes arrived while that write was in flight.
+         * Replayed against a synthetic store at four times the fix interval, 1,200 fixes
+         * came back as 1,197, missing exactly the chunk-boundary tails.
+         *
+         * Pushed onto the same chain as every other write, so it lands in order, before the
+         * next `writeJournal` opens the new chunk.
+         */
+        const header = headerRef.current;
+        if (chunk && header) {
+          const key = chunkKey(header.activityId, chunk.index);
+          const closed: ActivityChunk = {
+            key,
+            activityId: header.activityId,
+            index: chunk.index,
+            fixes: chunk.fixes.slice(),
+          };
+          writeChainRef.current = writeChainRef.current
+            .then(() => writeChunk(closed))
+            .catch(() => undefined);
+        }
+        chunkRef.current = { index: chunk ? chunk.index + 1 : 0, fixes: [fix] };
+      } else {
+        chunk.fixes.push(fix);
+      }
+      persist();
+    },
+    [persist],
+  );
+
+  /**
+   * Adopt whatever the last session left behind. Runs once, before anything else can.
+   *
+   * Asynchronous now, so it carries a cancelled flag: the store read can outlive the mount on
+   * a fast navigation, and setting state after that is a warning at best and a resurrection of
+   * a hike the reader has left at worst.
+   *
+   * **And it waits for the browser to have decided who is here**, the same gate
+   * `SyncQueuedWrites` uses and for the same reason, which bites harder here. `reconcileReader`
+   * is asynchronous and `rememberReader` is its last statement, so on the page where the
+   * account changed `writingReader()` still names the person who left — while this effect,
+   * whose only `await` before reading it is `importLegacyJournal` (which returns at the first
+   * microtask when there is no legacy journal), gets there first every time. That is
+   * deterministic rather than racy, and `/record` is exactly where it lands: a session-less
+   * visitor is sent to `/signin?callbackUrl=/record` and comes straight back, so the first page
+   * a returning hiker sees is this one, with `localStorage` still holding the empty string from
+   * the earlier lapse. `readOpenActivity(null)` matches nothing by design, so a purely-offline
+   * recording would not be restored, Start would mint a fresh id, and the old row would be left
+   * permanently unfinishable on `/downloads`. In the other direction it is worse: the departing
+   * reader's live hike would be resumed into the arriving reader's recorder and claimed.
+   *
+   * Both, rather than either — if the handover has already settled (every ordinary navigation
+   * to `/record`) it runs immediately; otherwise the first announcement runs it.
+   */
   useEffect(() => {
-    const journal = readJournal();
-    if (!journal) return;
-    fixesRef.current = journal.fixes;
-    sentRef.current = Math.min(journal.sent, journal.fixes.length);
-    setActivityId(journal.id);
-    setStartedAt(new Date(journal.startedAt));
-    setTrailId(journal.trailId);
-    setVersion((n) => n + 1);
-    // Paused, not recording: see the note at the top of the file.
-    setPhase('paused');
-    const last = journal.fixes[journal.fixes.length - 1];
-    if (last) setPosition([last.lng, last.lat]);
+    let cancelled = false;
+    let stopWatchingReader: (() => void) | null = null;
+
+    const hydrate = async (): Promise<void> => {
+      await importLegacyJournal().catch(() => undefined);
+      // Only this reader's own unfinished hike is picked back up. Somebody else's is left
+      // where it is — resuming it would append this person's afternoon to that person's
+      // morning and publish the pair under one name. See `readOpenActivity`.
+      const restored = await readOpenActivity(writingReader()).catch(() => null);
+      if (cancelled || !restored) return;
+
+      const { header, fixes } = restored;
+      fixesRef.current = fixes;
+      sentRef.current = Math.min(header.sent, fixes.length);
+      headerRef.current = header;
+      // The open chunk is the tail: whatever is left after the full ones.
+      const index = Math.max(0, Math.ceil(fixes.length / CHUNK_FIXES) - 1);
+      chunkRef.current = { index, fixes: fixes.slice(index * CHUNK_FIXES) };
+      distanceRef.current = header.distanceM;
+      claimLive(header.activityId);
+      // Set here as well as through state, because the flush below runs before React has
+      // re-rendered and `flush` reads the ref rather than the value.
+      activityIdRef.current = header.activityId;
+      startedAtRef.current = new Date(header.startedAt);
+      trailIdRef.current = header.trailId;
+
+      setActivityId(header.activityId);
+      setStartedAt(new Date(header.startedAt));
+      setTrailId(header.trailId);
+      setVersion((n) => n + 1);
+      // Paused, not recording: see the note at the top of the file.
+      setPhase('paused');
+      const last = fixes[fixes.length - 1];
+      if (last) setPosition([last.lng, last.lat]);
+
+      /*
+       * One upload, now, if there is a connection.
+       *
+       * Claiming the row tells the background drain to leave it alone, on the grounds that
+       * the recorder is uploading it "on its own timer and its own online listener". For a
+       * restored recording neither is true: the interval only runs while the phase is
+       * `recording`, and this one comes back paused, and `online` fires on a transition that
+       * has already happened. Measured as-shipped, a hike left unfinished offline and
+       * reopened with the network back sat at "0 of 4 fixes sent" indefinitely with the
+       * recorder on screen. This is the flush the listener would have made.
+       */
+      if (typeof navigator !== 'undefined' && navigator.onLine) {
+        await flushRef.current().catch(() => undefined);
+      }
+    };
+
+    if (readerSettled()) {
+      void hydrate();
+    } else {
+      stopWatchingReader = subscribeToReader(() => {
+        if (cancelled) return;
+        stopWatchingReader?.();
+        stopWatchingReader = null;
+        void hydrate();
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      stopWatchingReader?.();
+    };
   }, []);
+
+  /*
+   * Hand the row back to the drain when this screen goes away.
+   *
+   * The claim exists so the recorder and the background drain do not both write `sent` on the
+   * same header. It is module-level, so without this it would outlive the screen that took it:
+   * a hiker who finishes at the car with no signal and navigates to `/downloads` would be
+   * looking at a row nothing will ever send, because the drain is still being told the
+   * recorder owns it. Unmounting is the moment that stops being true.
+   */
+  useEffect(
+    () => () => {
+      const id = activityIdRef.current;
+      if (id) releaseLive(id);
+    },
+    [],
+  );
 
   // -------------------------------------------------------------------------
   // The position watch
@@ -274,7 +654,7 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
       };
       buffer.push(fix);
       setVersion((n) => n + 1);
-      persist();
+      journalFix(fix);
 
       const line = routeRef.current;
       if (line && line.length >= 2) {
@@ -300,7 +680,7 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
         }
       }
     },
-    [persist],
+    [journalFix],
   );
 
   useEffect(() => {
@@ -360,36 +740,236 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   // Uploading
   // -------------------------------------------------------------------------
 
-  const flush = useCallback(async (): Promise<void> => {
-    const id = activityIdRef.current;
-    if (!id || flushingRef.current) return;
-    const outstanding = fixesRef.current.length - sentRef.current;
-    if (outstanding <= 0) return;
+  /** Fixes the server has not acknowledged, read live rather than off the last render. */
+  const outstanding = useCallback((): number => fixesRef.current.length - sentRef.current, []);
 
-    flushingRef.current = true;
+  /** Whether the server has been told this recording exists. */
+  const announced = useCallback((): boolean => headerRef.current?.serverStarted !== false, []);
+
+  /**
+   * Is the browser still acting as the account that pressed start?
+   *
+   * The recorder is the one uploader on the device that does *not* go through
+   * `flushPendingActivities`: it holds the live hike, `claimLive` keeps the drain off it, and
+   * it posts `start` and every `append` itself. So the ownership rule the drain was given had
+   * no effect at all on the path that runs during a hike — the one path that is guaranteed to
+   * be running when somebody signs in on a shared laptop. A tab left open on `/record` at the
+   * trailhead kept recording, and every batch after the new sign-in carried the arriving
+   * person's cookie: an unannounced hike was *created* in their account by `start`, and the
+   * whole day appended to it.
+   *
+   * Read live, never off a render, for the reason `writingReader` gives: the rendered answer
+   * is who was here when something last painted, and a recording screen can go a long time
+   * without painting anything that depends on the reader.
+   *
+   * Both `null`s match, deliberately, and this is where it differs from the drain's `ownedBy`.
+   * A hike begun on a browser that could not name a session — private mode, a locked profile,
+   * `localStorage` refused — is stamped `userId: null`, and `writingReader()` keeps returning
+   * null for as long as that is true. Refusing that pair would stop such a browser recording
+   * at all, which is a worse answer than the one it protects against; and the moment anybody
+   * *does* sign in, the answer becomes their id, the two disagree, and the hike stops. The
+   * unattributed row is then the drain's problem rather than this hook's, and `/downloads`
+   * asks a person whose it was.
+   */
+  const stillMine = useCallback(
+    (): boolean => stillActingAs(headerRef.current?.userId ?? null, writingReader),
+    [],
+  );
+
+  const drain = useCallback(async (): Promise<void> => {
+    const id = activityIdRef.current;
+    if (!id) return;
+    // Nothing to upload and the server already knows about the recording — but a caller that
+    // awaits this is entitled to a settled journal when it returns, and `onFinish` is one.
+    if (outstanding() <= 0 && announced()) {
+      await settle();
+      return;
+    }
+
+    /*
+     * Whose hike this is, pinned for the length of this flush and asked again before every
+     * request the flush makes.
+     *
+     * Pinned rather than re-read from the header, so that a `begin()` landing mid-drain
+     * cannot quietly re-point the question at a different hike's owner while this loop is
+     * still uploading the old id. Asked *per request* rather than once, because a flush is
+     * not an instant: one call empties the whole backlog, and a hike that spent an hour in a
+     * valley is forty-odd requests over one bar — tens of seconds to minutes, all of it after
+     * the answer was taken. That is the same window `sendOne` closes in `activities.ts`, and
+     * it is closed here in the same way and with the same consequence: stop, mark nothing,
+     * delete nothing, leave `sent` where it stands. Everything unsent is still on the device
+     * under the name of whoever walked it, and goes out on the next flush that runs as them —
+     * this one if they sign back in, the drain otherwise.
+     */
+    const owner = headerRef.current?.userId ?? null;
+    const stillTheirs = (): boolean => stillActingAs(owner, writingReader);
+
+    /**
+     * Somebody else is here. Say so where the recorder says everything else about uploading.
+     *
+     * A sync state rather than a thrown error, matching `syncOffline`: nothing has gone
+     * wrong, the recording carries on, and the sentence is the answer to "why does this still
+     * say fixes to save?". Thrown, it would reach `onFinish`'s catch, be read as a refusal,
+     * and put the hiker in front of a dialog about a failure that did not happen.
+     */
+    const noteHeldForAnother = (): void => {
+      setSyncOffline(false);
+      setSyncError(
+        'Somebody else is signed in. This hike waits on this device until the hiker who ' +
+          'recorded it signs back in.',
+      );
+    };
+
     setSyncing(true);
     try {
-      // One batch per call, largest first. Draining the whole backlog in a loop would turn
-      // a reconnection after an hour of no signal into sixty simultaneous requests.
-      while (fixesRef.current.length - sentRef.current > 0) {
+      /*
+       * Tell the server the recording exists, if it does not know yet.
+       *
+       * A hike begun with no signal was never announced: `activities.start` failed at the
+       * press and nothing since has been able to retry it. Every `append` for it would be
+       * refused with "No such recording", so this has to come first, and it has to come from
+       * here rather than from the screen — after a reload the press is gone and the journal
+       * is all that remembers. Safe to replay: the id is the server's idempotency key.
+       *
+       * And it is the most expensive call here to get wrong. `start` does not append to
+       * something that exists; it *creates* a hike, so an announcement made under the wrong
+       * session puts a row that nobody walked into that person's account and leaves it there
+       * whether or not a single fix follows it.
+       */
+      const before = headerRef.current;
+      if (before && !before.serverStarted) {
+        if (!stillTheirs()) {
+          noteHeldForAnother();
+          return;
+        }
+        await onStartRef.current({
+          id,
+          activityType: before.activityType,
+          trailId: before.trailId,
+          startedAt: new Date(before.startedAt),
+        });
+        // Re-read: the await above is long enough for the hike to have been discarded.
+        const after = headerRef.current;
+        if (after && after.activityId === id) {
+          headerRef.current = { ...after, serverStarted: true };
+          persist();
+        }
+      }
+
+      // The whole backlog, one batch at a time and strictly in order. Sequential rather than
+      // parallel for the reason the drain gives: a connection that has just come back is one
+      // bar, and a six-hour hike is forty-odd requests. The loop re-reads the live buffer on
+      // every turn, so fixes that arrive while it runs are carried by this same call.
+      let reannounced = false;
+      while (outstanding() > 0) {
+        // Before each batch, not once before the loop. `sent` is already written for
+        // everything the server acknowledged, so stopping here costs nothing and re-sends
+        // nothing: the next run picks up at exactly this batch.
+        if (!stillTheirs()) {
+          noteHeldForAnother();
+          return;
+        }
         const from = sentRef.current;
         const batch = fixesRef.current.slice(from, from + SAMPLE_BATCH);
-        await onFlushRef.current(id, batch);
+        try {
+          await onFlushRef.current(id, batch);
+        } catch (error) {
+          /*
+           * The server has no row under this id any more.
+           *
+           * `serverStarted` is a one-way latch, and the thing it latches can be undone: the
+           * router's stale sweep *deletes* rather than closes a recording that never received
+           * a sample, which is exactly the shape of a hike begun with one bar and no first
+           * upload. Without this, every append for the rest of the day answers "No such
+           * recording" and the hike can only be discarded. Re-announcing is free and correct
+           * — the id is the idempotency key — and it is tried once, so a NOT_FOUND arriving
+           * for some other reason cannot spin.
+           */
+          const header = headerRef.current;
+          if (!isMissing(error) || reannounced || !header) throw error;
+          // The re-announcement is a `start` like any other, and creates a hike like any
+          // other. It gets the same gate as the first one.
+          if (!stillTheirs()) {
+            noteHeldForAnother();
+            return;
+          }
+          reannounced = true;
+          headerRef.current = { ...header, serverStarted: false };
+          await onStartRef.current({
+            id,
+            activityType: header.activityType,
+            trailId: header.trailId,
+            startedAt: new Date(header.startedAt),
+          });
+          const after = headerRef.current;
+          if (after && after.activityId === id) {
+            headerRef.current = { ...after, serverStarted: true };
+          }
+          persist();
+          continue;
+        }
         sentRef.current = from + batch.length;
         persist();
       }
       setLastSyncAt(new Date());
       setSyncError(null);
+      setSyncOffline(false);
     } catch (err) {
       // Left in the buffer, so the next flush retries it. `sent` only ever advances past
       // fixes the server has acknowledged.
-      setSyncError(err instanceof Error ? err.message : 'Could not save the last few minutes.');
+      const offline = isUnreachable(err);
+      setSyncOffline(offline);
+      setSyncError(
+        offline
+          ? 'No connection.'
+          : err instanceof Error
+            ? err.message
+            : 'Could not save the last few minutes.',
+      );
       throw err;
     } finally {
-      flushingRef.current = false;
       setSyncing(false);
+      await settle();
     }
-  }, [persist]);
+  }, [announced, outstanding, persist, settle]);
+
+  /**
+   * Upload everything outstanding, and do not return until it is up or has failed.
+   *
+   * **A second caller joins the drain that is running; it does not skip past it.** This used
+   * to be `if (flushingRef.current) return;`, which resolved immediately and without draining
+   * — and the state it guarded against is not rare. One `drain` empties the *whole* backlog in
+   * a loop, and the effect below re-fires on every fix while a batch is outstanding, so a hike
+   * that spent eight minutes in a valley and climbed back into signal is flushing continuously
+   * for tens of seconds over one bar. The Save button is live throughout. So the sequence was:
+   * `onFinish` awaits `flush`, gets an instant resolve, posts `finish`, the server sets
+   * `endedAt` and `syncedAt`, the still-running loop's next batch is refused with "already
+   * finished", the refusal is swallowed by the void-catch on the interval, and `forget()`
+   * deletes the chunks holding fixes that had never been transmitted. Nothing on the server
+   * will take them afterwards, and nothing was said. The drain's `truncated` accounting exists
+   * to announce exactly that loss, and it never saw it because the row was gone.
+   *
+   * A joiner inherits the failure of the drain it joined rather than starting a second attempt
+   * — a hiker with no signal must not pay for one request per fix — and re-checks the buffer
+   * afterwards, because a fix that landed after the loop's last look is still outstanding and
+   * a caller about to close the hike needs the difference.
+   */
+  const flush = useCallback(async (): Promise<void> => {
+    for (let joined = inFlightRef.current; joined; joined = inFlightRef.current) {
+      await joined;
+      if (outstanding() <= 0 && announced()) {
+        await settle();
+        return;
+      }
+    }
+
+    const run: Promise<void> = drain().finally(() => {
+      if (inFlightRef.current === run) inFlightRef.current = null;
+    });
+    inFlightRef.current = run;
+    return run;
+  }, [announced, drain, outstanding, settle]);
+  flushRef.current = flush;
 
   useEffect(() => {
     if (phase !== 'recording') return;
@@ -405,14 +985,20 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   // another minute, on the one part of the hike where the phone is most likely to be put
   // away again. `online` fires on the transition, so this only ever runs when there is
   // something new to try.
+  //
+  // Mounted whenever there is a recording at all, not only while `phase === 'recording'`.
+  // That guard was here and was wrong: a journal restored after a reload comes back *paused*,
+  // so neither the timer nor this listener ever ran for the hike the comment above describes.
+  // `flush` no-ops when there is nothing outstanding, so mounting it wider costs nothing. The
+  // guard stays on the interval, where polling a paused recorder would buy nothing.
   useEffect(() => {
-    if (phase !== 'recording') return;
+    if (!activityId) return;
     const onOnline = (): void => {
       void flush().catch(() => undefined);
     };
     window.addEventListener('online', onOnline);
     return () => window.removeEventListener('online', onOnline);
-  }, [phase, flush]);
+  }, [activityId, flush]);
 
   // A full batch does not wait for the timer. At 1 Hz the two coincide; on a device
   // reporting faster, this is what keeps the backlog from growing without bound.
@@ -427,7 +1013,15 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
   // -------------------------------------------------------------------------
 
   const begin = useCallback(
-    ({ id, startedAt: at, trailId: trail, resumed }: StartArgs) => {
+    ({
+      id,
+      startedAt: at,
+      trailId: trail,
+      trailName,
+      activityType,
+      resumed,
+      serverStarted,
+    }: StartArgs) => {
       if (!resumed) {
         fixesRef.current = [];
         sentRef.current = 0;
@@ -437,6 +1031,7 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
       setStartedAt(at);
       setTrailId(trail);
       setSyncError(null);
+      setSyncOffline(false);
       setGeoError(null);
       setAlert(null);
       setVersion((n) => n + 1);
@@ -444,6 +1039,44 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
       activityIdRef.current = id;
       startedAtRef.current = at;
       trailIdRef.current = trail;
+
+      // The row exists from the press, not from the server's answer. That is the whole of
+      // what makes a hike startable with no signal: there is nothing left to wait for.
+      distanceRef.current = 0;
+      const carried = fixesRef.current;
+      const chunkIndex = Math.max(0, Math.ceil(carried.length / CHUNK_FIXES) - 1);
+      chunkRef.current = { index: chunkIndex, fixes: carried.slice(chunkIndex * CHUNK_FIXES) };
+      headerRef.current = pendingActivity({
+        activityId: id,
+        startedAt: at.getTime(),
+        trailId: trail,
+        trailName: trailName ?? null,
+        activityType,
+        serverStarted: serverStarted ?? false,
+        // Whose day this is, decided at the press and not at the upload. A hike begun on a
+        // ridge can sit on the device for a week; by the time it drains the browser may be
+        // holding somebody else's session, and this is the field that stops it going there.
+        userId: writingReader(),
+      });
+      claimLive(id);
+      persist();
+    },
+    [persist],
+  );
+
+  /**
+   * The server has acknowledged this recording; the journal should say so.
+   *
+   * Written here rather than straight into the store because the header is rewritten from
+   * this hook on every fix, and a write from anywhere else would be clobbered by the next
+   * one. Getting it wrong is not fatal — a replayed `start` is adopted rather than duplicated
+   * — but it is a wasted request on every hike and a journal that says something untrue.
+   */
+  const noteServerStarted = useCallback(
+    (id: string) => {
+      const header = headerRef.current;
+      if (!header || header.serverStarted || header.activityId !== id) return;
+      headerRef.current = { ...header, serverStarted: true };
       persist();
     },
     [persist],
@@ -460,10 +1093,17 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
 
   const stop = useCallback(() => setPhase('saving'), []);
 
-  const forget = useCallback(() => {
-    clearJournal();
+  const unstop = useCallback(() => {
+    setPhase((current) => (current === 'saving' ? 'paused' : current));
+  }, []);
+
+  /** Everything both endings have in common: the screen goes back to the start panel. */
+  const clear = useCallback(() => {
     fixesRef.current = [];
     sentRef.current = 0;
+    headerRef.current = null;
+    chunkRef.current = null;
+    distanceRef.current = 0;
     offRouteRef.current = initialOffRouteState();
     setActivityId(null);
     setStartedAt(null);
@@ -475,10 +1115,31 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
     setAlongM(null);
     setAlert(null);
     setSyncError(null);
+    setSyncOffline(false);
     setLastSyncAt(null);
     setVersion((n) => n + 1);
     setPhase('idle');
   }, []);
+
+  const forget = useCallback(() => {
+    const id = activityIdRef.current;
+    releaseLive(id ?? undefined);
+    // Before the delete is queued, so a write already scheduled finds no header and does
+    // nothing rather than putting the row back after it has gone.
+    headerRef.current = null;
+    if (id) {
+      writeChainRef.current = writeChainRef.current
+        .then(() => deleteActivity(id))
+        .catch(() => undefined);
+    }
+    clear();
+  }, [clear]);
+
+  const handOff = useCallback(() => {
+    releaseLive(activityIdRef.current ?? undefined);
+    headerRef.current = null;
+    clear();
+  }, [clear]);
 
   // -------------------------------------------------------------------------
   // Derived
@@ -490,6 +1151,9 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [version],
   );
+  // Mirrored into a ref so the journal can carry it without recomputing it. The storage
+  // manager needs a distance for a hike it can no longer ask the server about.
+  distanceRef.current = stats.distanceM;
 
   const remainingM = useMemo(() => {
     if (routeLengthM == null || alongM == null) return null;
@@ -510,6 +1174,7 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
     syncing,
     geoError,
     syncError,
+    syncOffline,
     offRoute,
     offRouteDistanceM,
     remainingM,
@@ -519,11 +1184,16 @@ export function useRecorder({ onFlush, route, routeLengthM }: RecorderOptions): 
     startedAt,
     trailId,
     begin,
+    noteServerStarted,
     pause,
     resume,
     flush,
+    outstanding,
+    stillMine,
     stop,
+    unstop,
     forget,
+    handOff,
   };
 }
 

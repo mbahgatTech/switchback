@@ -64,11 +64,28 @@ export async function createContext(opts: CreateContextOptions): Promise<Context
 
   const bearer = opts.headers.get('authorization');
   if (bearer?.toLowerCase().startsWith('bearer ')) {
-    const userId = await verifyAccessToken(bearer.slice(7).trim());
-    if (userId) {
-      const user = await db.user.findUnique({ where: { id: userId } });
-      // A token whose user was deleted verifies fine but must not authenticate anyone.
-      if (user) return { ...base, user, authMethod: 'bearer' };
+    const claims = await verifyAccessToken(bearer.slice(7).trim());
+    if (claims) {
+      const user = await db.user.findUnique({ where: { id: claims.userId } });
+      /*
+       * A token whose user was deleted verifies fine but must not authenticate anyone — and
+       * neither must one minted before the account was signed out everywhere.
+       *
+       * That second check is what makes `signOutEverywhere` mean what it says. Revoking the
+       * refresh tokens and deleting the session rows leaves the access JWT alone, because
+       * nothing stores it; on the path the button exists for — a phone somebody else is now
+       * holding — that left the thief a full fifteen minutes of authenticated read and write
+       * after the owner had been told every session had ended.
+       *
+       * `iat` is whole seconds, so the comparison is `<=` rather than `<`: a token minted in
+       * the same second as the press would otherwise survive it, which is exactly the second
+       * an attacker refreshing on a timer lands in.
+       */
+      if (user) {
+        const revokedAt = user.sessionsRevokedAt;
+        const staleToken = revokedAt !== null && claims.issuedAt * 1000 <= revokedAt.getTime();
+        if (!staleToken) return { ...base, user, authMethod: 'bearer' };
+      }
     }
     // A bad bearer token falls through to the cookie rather than short-circuiting: the
     // request is unauthenticated either way, and public procedures should still work.

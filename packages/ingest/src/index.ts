@@ -13,6 +13,7 @@ export * from './derive';
 export * from './enrich';
 export * from './geocode';
 export * from './jobs';
+export * from './backpressure';
 export * from './pool';
 export * from './coverage';
 export * from './pipeline';

@@ -6,6 +6,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import type { SelfProfile, ThemePreference, UnitSystem, Visibility } from '@switchback/core';
 import { THEME_PREFERENCES, UNIT_SYSTEMS, VISIBILITIES, usernameSchema } from '@switchback/core';
 import { rememberTheme } from '../../lib/theme-action';
+import { forgetReaderNow } from '../../offline/reader';
 import { useTRPC } from '../../trpc/react';
 import { BUTTON_COLLAR, DANGER, HEIGHT, PRIMARY } from '../controls';
 
@@ -371,9 +372,40 @@ function Home({ me }: { me: SelfProfile }) {
 
 function Devices() {
   const trpc = useTRPC();
+  const router = useRouter();
   const devices = useQuery(trpc.me.devices.queryOptions());
+  /*
+   * The success handler leaves the page rather than refreshing it. `signOutEverywhere` now
+   * deletes this browser's session row along with everybody else's, so a settings page that
+   * stayed put would look signed in while every request from it failed — the "discovered
+   * after the press" version of a behaviour that ought to be obvious before it. The counts
+   * ride along in the query string so the sign-in page can say what just happened.
+   *
+   * That is also why the handover runs *here*, and is awaited before the push. `forgetReaderNow`
+   * documents the precondition — every path that ends this browser's session must call it — and
+   * this used to be the path that did not qualify, because it revoked mobile refresh tokens and
+   * left the browser signed in. It no longer is. Revoking the session server-side is invisible
+   * to everything under `offline/`: `ReaderIdentity` keys on a prop from the root layout, and a
+   * client-side `router.push` re-renders the page's subtree and not the layout, so the handover
+   * would never run. `localStorage` would go on naming the departed reader, their cached
+   * `/record` and downloaded trail pages would stay on a shared machine, and `SyncQueuedWrites`
+   * would keep drilling a dead session on every return to the foreground until the next full
+   * document load. A `router.refresh()` beside the push happens to work; calling the handover
+   * directly is what makes it true whatever the navigation does — and the await matters, since
+   * the point is to release the previous reader's data *before* the next page can be reached.
+   * See the note on `forgetReaderNow`.
+   */
   const signOut = useMutation(
-    trpc.me.signOutEverywhere.mutationOptions({ onSuccess: () => void devices.refetch() }),
+    trpc.me.signOutEverywhere.mutationOptions({
+      onSuccess: async (result) => {
+        await forgetReaderNow();
+        const params = new URLSearchParams({
+          signedOut: String(result.devicesSignedOut),
+          browsers: String(result.browsersSignedOut),
+        });
+        router.push(`/signin?${params.toString()}`);
+      },
+    }),
   );
 
   const list = devices.data ?? [];
@@ -381,7 +413,7 @@ function Devices() {
   return (
     <Section
       title="Signed in on"
-      note="Phones and tablets holding a long-lived token. This browser is signed out from the button in the header."
+      note="Phones and tablets holding a long-lived token. Sign out of this browser alone from the header."
     >
       {list.length === 0 ? (
         <p className="font-text text-body text-ink-muted">
@@ -403,29 +435,29 @@ function Devices() {
         </ul>
       )}
 
-      {list.length > 0 ? (
-        <div className="flex flex-wrap items-center gap-md">
-          <button
-            type="button"
-            disabled={signOut.isPending}
-            onClick={() => signOut.mutate()}
-            className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
-          >
-            {signOut.isPending ? 'Signing out…' : 'Sign out everywhere'}
-          </button>
-          <span className="text-caption text-ink-muted">
-            Every app has to sign in again. Anything recorded but not yet synced stays on the
-            device.
-          </span>
-        </div>
-      ) : null}
-
-      {signOut.isSuccess ? (
-        <p role="status" className="text-caption text-ink-muted">
-          Signed out of {signOut.data.devicesSignedOut}{' '}
-          {signOut.data.devicesSignedOut === 1 ? 'device' : 'devices'}.
-        </p>
-      ) : null}
+      {/*
+       * Always offered, even with no apps in the list. It used to appear only when a device
+       * was signed in, which meant the one control for "somebody has my account" was hidden
+       * from exactly the reader whose browser was the thing taken — and browsers are what it
+       * now revokes. The button is the answer to a compromise, not a tidy-up of the list
+       * above it.
+       */}
+      <div className="flex flex-wrap items-center gap-md">
+        <button
+          type="button"
+          disabled={signOut.isPending}
+          onClick={() => signOut.mutate()}
+          className={`${BUTTON_COLLAR} ${DANGER} ${HEIGHT.panel} px-md`}
+        >
+          {signOut.isPending ? 'Signing out…' : 'Sign out everywhere'}
+        </button>
+        <span className="max-w-measure text-caption text-ink-muted">
+          Ends every session on the account — every app, every browser, and this one. An app that is
+          already open stops working on its next request rather than in fifteen minutes. You will
+          land on the sign-in page and have to sign in again here. Anything recorded but not yet
+          synced stays on the device.
+        </span>
+      </div>
     </Section>
   );
 }

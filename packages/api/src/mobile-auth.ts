@@ -36,6 +36,16 @@
  * - **The redirect is allow-listed before it is stored**, not when it is used. An endpoint
  *   that will bounce a browser to an arbitrary URL after a successful sign-in is a phishing
  *   primitive on our own domain even when the code riding along with it is unredeemable.
+ *
+ * A fourth property was missing and is now here: **the row belongs to one browser.** PKCE
+ * binds the row to the device that will *claim* it; nothing bound it to the browser that
+ * *authorises* it, and those are two different halves of one credential. An attacker who runs
+ * `/start` themselves holds the verifier, and could then navigate a victim's browser to
+ * `/complete?request=<id>` — a top-level cross-site GET, on which `SameSite=Lax` sends the
+ * session cookie by design — and end up holding a token pair on the victim's account. So
+ * `/start` also mints a browser secret, keeps its digest in `browserHash`, and hands the value
+ * to the browser in a `__Host-` cookie; `/complete` will not authorise a row whose secret it
+ * cannot present. See {@link startAuthRequest} and {@link authorizeAuthRequest}.
  */
 import type { PrismaClient } from '@switchback/db';
 import { type TokenPair, hashToken, issueTokenPair, randomToken } from './tokens';
@@ -58,7 +68,9 @@ export type MobileAuthFailure =
   | 'unknown_request'
   | 'expired'
   | 'already_claimed'
-  | 'not_authorized';
+  | 'not_authorized'
+  /** The browser finishing the sign-in is not the browser that started it. */
+  | 'wrong_browser';
 
 export class MobileAuthError extends Error {
   readonly code: MobileAuthFailure;
@@ -118,15 +130,27 @@ export async function challengeFor(verifier: string): Promise<string> {
 }
 
 /**
- * Open a sign-in request. Returns the id the browser carries through OIDC.
+ * What `/start` records, and the secret it must hand to the browser.
+ *
+ * `browserSecret` is returned rather than stored so the route can put it in a cookie; only
+ * its digest is written down, on the same reasoning as the one-time code.
+ */
+export interface StartedAuthRequest {
+  id: string;
+  browserSecret: string;
+}
+
+/**
+ * Open a sign-in request. Returns the id the browser carries through OIDC, and the secret
+ * that identifies the browser it was opened in.
  *
  * Nothing here is a credential yet — the row is an intent, and stays useless until a real
- * session comes back through {@link authorizeAuthRequest}.
+ * session comes back through {@link authorizeAuthRequest} *from the same browser*.
  */
 export async function startAuthRequest(
   db: PrismaClient,
   input: { redirectUri: string; challenge: string; deviceName?: string | null },
-): Promise<string> {
+): Promise<StartedAuthRequest> {
   if (!isAllowedRedirect(input.redirectUri, developmentSchemesAllowed())) {
     throw new MobileAuthError('invalid_redirect');
   }
@@ -136,16 +160,18 @@ export async function startAuthRequest(
     throw new MobileAuthError('invalid_request', 'challenge must be base64url, 43+ chars');
   }
 
+  const browserSecret = randomToken();
   const request = await db.mobileAuthRequest.create({
     data: {
       challenge: input.challenge,
       redirectUri: input.redirectUri,
       deviceName: input.deviceName ?? null,
+      browserHash: await hashToken(browserSecret),
       expiresAt: new Date(Date.now() + AUTH_REQUEST_TTL_MS),
     },
     select: { id: true },
   });
-  return request.id;
+  return { id: request.id, browserSecret };
 }
 
 /**
@@ -154,16 +180,26 @@ export async function startAuthRequest(
  * The code is returned rather than stored in the clear for the same reason refresh tokens
  * are: a dump of this table should not be a set of live credentials, even ones that expire in
  * minutes.
+ *
+ * `browserSecret` is the value `/start` put in this browser's cookie, and it is required. A
+ * row whose `browserHash` is null — written by a build that predates the column — is treated
+ * as a mismatch rather than as unchecked: those rows live at most fifteen minutes, so the
+ * whole population is gone within a quarter of an hour of a deploy, and the alternative is a
+ * permanent hole kept open for a handful of sign-ins that can simply be started again.
  */
 export async function authorizeAuthRequest(
   db: PrismaClient,
   requestId: string,
   userId: string,
+  browserSecret: string,
 ): Promise<string> {
   const request = await db.mobileAuthRequest.findUnique({ where: { id: requestId } });
   if (!request) throw new MobileAuthError('unknown_request');
   if (request.claimedAt || request.codeHash) throw new MobileAuthError('already_claimed');
   if (request.expiresAt.getTime() <= Date.now()) throw new MobileAuthError('expired');
+  if (!request.browserHash || request.browserHash !== (await hashToken(browserSecret))) {
+    throw new MobileAuthError('wrong_browser');
+  }
 
   const code = randomToken();
   await db.mobileAuthRequest.update({

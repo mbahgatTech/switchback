@@ -26,6 +26,9 @@ import {
 } from '@switchback/geo';
 import { fillGaps } from './elevate';
 import { TerrainSource } from './elevate';
+import { admitIngest } from './backpressure';
+import type { IngestRefusal } from './backpressure';
+import type { QueueOutcome } from './coverage';
 import { enqueue, networkJobKey } from './jobs';
 import { OverpassUnavailableError } from './overpass';
 import type { OverpassElement, OverpassWay } from './overpass';
@@ -567,6 +570,26 @@ export interface NetworkCoverage {
   pending: string[];
   /** What this call put on the queue. */
   queued: string[];
+  /**
+   * True when ingest was refused, so the outstanding tiles are not on their way.
+   *
+   * Read by the route planner, which is the only consumer that can be *wrong* about it: a
+   * leg over ground we declined to fetch is not a leg with no path under it, and saying so
+   * on a hiking planner is a false claim about terrain dressed as a safety warning. See
+   * `planRoute` in the routes router.
+   */
+  busy: boolean;
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * Carried for the same reason the trail side carries it, and it was dropped here while the
+   * trail side kept it — `queueNetworkTiles` computed the reason, `ensureNetworkCoverage`
+   * read `enqueued.queued` and discarded `enqueued.refused`, and `/plan` ended up with one
+   * sentence for both refusals: "Try the route again later." That is the right instruction
+   * for a deep queue and the wrong one for a full database, which does not drain and which
+   * nobody can wait out. The reason was already computed one frame upstream.
+   */
+  busyReason: IngestRefusal | null;
   tooLarge: boolean;
   requiredTiles: number;
   maxTiles: number;
@@ -603,17 +626,33 @@ export async function ensureNetworkCoverage(
       ready: [],
       pending: [],
       queued: [],
+      busy: false,
+      busyReason: null,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
     };
   }
 
-  const existing = await db.routingTile.findMany({
-    where: { quadkey: { in: cover.quadkeys } },
-    select: { quadkey: true, status: true, fetchedAt: true },
-  });
+  /*
+   * Both lookups at once, the pair the trail side has always made.
+   *
+   * The job table is read for the same single reason `ensureCoverage` reads it: to tell a
+   * routing tile nobody has asked for apart from one somebody already asked for and is
+   * waiting on. `RoutingTile.status` cannot answer that — a row sits at `pending` whether its
+   * job is running or died five attempts ago — and the answer is what admission must not be
+   * allowed to judge. `networkTilesInFlight` keys on the unique-indexed `dedupeKey`, so this
+   * is a keyed lookup over a list we already hold, on the same round trip as the tile read.
+   */
+  const [existing, working] = await Promise.all([
+    db.routingTile.findMany({
+      where: { quadkey: { in: cover.quadkeys } },
+      select: { quadkey: true, status: true, fetchedAt: true },
+    }),
+    networkTilesInFlight(db, cover.quadkeys),
+  ]);
   const byKey = new Map(existing.map((tile) => [tile.quadkey, tile]));
+  const inFlight = new Set(working);
 
   const ready: string[] = [];
   const pending: string[] = [];
@@ -630,25 +669,101 @@ export async function ensureNetworkCoverage(
     else pending.push(quadkey);
   }
 
-  const queued = options.queue === false ? [] : await queueNetworkTiles(db, needsWork);
+  /*
+   * Split the outstanding tiles by whether anything is already coming for them, exactly as
+   * the trail path does — the fix landed there and stopped, and this is the half it missed.
+   *
+   * `enqueue` upserts on `dedupeKey`, so re-enqueueing a routing tile whose job is already
+   * `queued` or `running` writes no row and adds no fetch. Refusing it therefore bounds
+   * nothing, while the refusal costs the reader the tiles they are actually waiting on:
+   * `busy` propagates through `routes.plan` as `networkPaused`, `use-plan.ts` stops
+   * re-planning on it, and the planner freezes on a paused message while the very tiles it
+   * needs land unread behind it. Every leg over them stays `network_paused` until the reader
+   * edits an anchor — for ground that was on its way the whole time.
+   *
+   * So the depth ceiling judges only new ground here too. Tiles already on the queue are
+   * reported as what they are: coming.
+   */
+  const newGround = needsWork.filter((quadkey) => !inFlight.has(quadkey));
+
+  // Every outstanding tile is still handed to `queueNetworkTiles`; only `newGround` is what
+  // admission may judge. Re-enqueueing an in-flight tile writes no row, but it does raise the
+  // job's priority — which is how a tile a background sweep queued at 0 jumps the line the
+  // moment somebody is planning across it. Dropping those from the call would cost that.
+  const enqueued =
+    options.queue === false
+      ? { queued: [] as string[], refused: null }
+      : await queueNetworkTiles(db, needsWork, { newGround });
+  const queued = enqueued.queued;
+
+  /*
+   * New ground outstanding with nothing queued means backpressure refused it.
+   *
+   * Judged on `newGround`, not on `needsWork`, for the reason above: tiles already in flight
+   * are coming, and a refusal about other ground says nothing about them. Before this, a
+   * planning viewport whose tiles were all mid-fetch reported `busy` on every call — the
+   * refusal was raised by the tiles' own in-progress jobs — and `use-plan.ts` reads `busy` as
+   * "no tile is going to land", so it stopped the retry chain that would have picked them up.
+   *
+   * `pending` is left intact, unlike the trail side. There it is the field that makes the
+   * map poll, so clearing it is what stops a refusing database also taking a poll storm.
+   * Here its only consumers are `routes.coverage`, which reports a count nothing renders,
+   * and `planRoute` — and zeroing it there was a regression: `planRoute` used `pending` as
+   * the sole tiebreaker between "still downloading" and "no path exists", so a refusal
+   * silently relabelled every unsnappable leg as open country. `busy` is what those two read
+   * now, and the planner's retry gates on it rather than on the count.
+   */
+  const busy = options.queue !== false && newGround.length > 0 && queued.length === 0;
 
   return {
     quadkeys: cover.quadkeys,
     ready,
     pending,
     queued,
+    busy,
+    busyReason: busy ? enqueued.refused : null,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,
   };
 }
 
-/** Register routing tiles and enqueue their fetches. Tile row first, for the reason `queueTiles` gives. */
+/**
+ * Register routing tiles and enqueue their fetches. Tile row first, for the reason `queueTiles` gives.
+ *
+ * `newGround` narrows what admission is *judged* on without narrowing what is enqueued, the
+ * same split `queueTiles` makes and for the same reason: a quadkey whose network job is
+ * already `queued` or `running` adds no row when re-enqueued — the dedupe key collides — so
+ * refusing it bounds nothing, while the refusal reaches the route planner as "the network
+ * under these anchors is not coming" about tiles that are. Callers that know which of their
+ * tiles are in flight pass the rest; callers that do not leave it alone and every quadkey
+ * counts.
+ */
 export async function queueNetworkTiles(
   db: PrismaClient,
   quadkeys: readonly string[],
-  priority = NETWORK_PRIORITY,
-): Promise<string[]> {
+  options: {
+    priority?: number;
+    /** The subset of `quadkeys` with nothing already on the queue. Defaults to all of them. */
+    newGround?: readonly string[];
+  } = {},
+): Promise<QueueOutcome> {
+  if (quadkeys.length === 0) return { queued: [], refused: null };
+
+  const newGround = options.newGround ?? quadkeys;
+  const priority = options.priority ?? NETWORK_PRIORITY;
+
+  // Nothing new to bound. The upserts below are all collisions, so they add no rows and no
+  // fetches — running them keeps the priority bump without asking the guard's permission for
+  // work the guard has already admitted once.
+  if (newGround.length > 0) {
+    // The routing queue's share of the same ceiling. It used to have none: the depth guard
+    // counted `ingest_tile` only, and this path enqueues `ingest_network`, so the whole
+    // routing queue was invisible to the one thing watching. See `backpressure.ts`.
+    const refused = await admitIngest(db);
+    if (refused !== null) return { queued: [], refused };
+  }
+
   for (const quadkey of quadkeys) {
     const { x, y, z } = quadkeyToTile(quadkey);
     const [bboxW, bboxS, bboxE, bboxN] = quadkeyToBBox(quadkey);
@@ -667,10 +782,15 @@ export async function queueNetworkTiles(
     });
   }
 
-  return [...quadkeys];
+  return { queued: [...quadkeys], refused: null };
 }
 
-/** True while any of these tiles still has a network fetch queued or running. */
+/**
+ * Which of these tiles still has a network fetch queued or running.
+ *
+ * Read by `ensureNetworkCoverage` to keep already-queued tiles out of admission's way — see
+ * the split there.
+ */
 export async function networkTilesInFlight(
   db: PrismaClient,
   quadkeys: readonly string[],

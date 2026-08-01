@@ -1,16 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { JobKind, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   AREA_PRIORITY,
   MAX_AREA_TILES,
-  MAX_TILE_QUEUE_DEPTH,
   VIEWPORT_PRIORITY,
   ensureCoverage,
   queueTiles,
   requestArea,
   surveyArea,
 } from '../src/coverage';
+import { MAX_TILE_QUEUE_DEPTH } from '../src/backpressure';
 import { TILE_TTL_MS } from '../src/pipeline';
 
 /** A bbox small enough to need exactly one z9 tile. */
@@ -34,7 +34,7 @@ interface Recorded {
 interface FakeOptions {
   /** Dedupe keys the fake should report as queued or running. */
   inFlight?: string[];
-  /** What `ingestJob.count` answers — the queue-depth guard's input. */
+  /** What the admission guard's grouped count answers — the queue-depth guard's input. */
   queueDepth?: number;
 }
 
@@ -68,7 +68,8 @@ function fakeDb(
             .filter((key) => where.dedupeKey.in.includes(key))
             .map((dedupeKey) => ({ dedupeKey })),
         ),
-      count: () => Promise.resolve(options.queueDepth ?? 0),
+      groupBy: () =>
+        Promise.resolve([{ kind: JobKind.ingest_tile, _count: { _all: options.queueDepth ?? 0 } }]),
       updateMany: () => Promise.resolve({ count: 0 }),
       upsert: (args: Record<string, unknown>) => {
         recorded.jobUpserts.push(args);
@@ -331,6 +332,8 @@ describe('requestArea', () => {
   });
 
   it('refuses once the tile queue is already too deep, and says so', async () => {
+    // The guard logs its refusal for an operator; this suite is not the audience.
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db, recorded } = fakeDb([], { queueDepth: MAX_TILE_QUEUE_DEPTH });
     const result = await requestArea(HUGE, { db, now: NOW });
 

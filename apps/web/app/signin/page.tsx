@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation';
 import type { ReactNode } from 'react';
 import { BRAND } from '@switchback/core';
 import { auth, signIn } from '@/auth';
+import { safeCallback } from '@/lib/safe-callback';
 import { caller } from '@/trpc/server';
 import { MicrosoftSignInButton } from '@/components/auth/microsoft-button';
 import { AppleSignInButton } from '@/components/auth/apple-button';
@@ -90,24 +91,48 @@ const FAULTS: Record<string, string> = {
 /** Not a fault. Somewhere sent the user here because it needed an account, which is a reason. */
 const SESSION_REQUIRED = 'That page keeps things against your account, so it needs one first.';
 
-/**
- * Reduce `callbackUrl` to a path on this origin.
- *
- * Auth.js validates the destination itself before redirecting, so this is defence in depth
- * rather than the only guard — but this page also renders the value into a form and
- * redirects an already-signed-in visitor to it, and both of those are ours to get right.
- * A same-origin path only: an absolute URL, a protocol-relative `//evil.example`, or the
- * backslash variant some parsers read as one, all fall back to the front page.
- */
-function safeCallback(value: string | string[] | undefined): string {
-  const url = Array.isArray(value) ? value[0] : value;
-  if (!url || !url.startsWith('/')) return '/';
-  if (url.startsWith('//') || url.startsWith('/\\')) return '/';
-  return url;
-}
-
 function firstParam(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * The report from "Sign out everywhere".
+ *
+ * That button ends every session on the account, including the browser it was pressed in, so
+ * the reader arrives here whether they expected to or not. This is the receipt: it says what
+ * was ended, which is the difference between "I did that" and "something logged me out".
+ *
+ * Ranked above an `?error=` below, and deliberately — a reader who has just revoked
+ * everything wants to know it worked, not to read that a session was required.
+ *
+ * The counts are read out of the query string, so they are a claim the reader's own browser
+ * made and are treated as one: parsed as integers, clamped, and never rendered raw.
+ */
+function signedOutNotice(
+  devices: string | string[] | undefined,
+  browsers: string | string[] | undefined,
+): { label: string; body: string } | null {
+  const raw = firstParam(devices);
+  if (raw === undefined) return null;
+
+  const count = (value: string | undefined): number => {
+    const parsed = Number.parseInt(value ?? '', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 9999) : 0;
+  };
+  const apps = count(raw);
+  const seats = count(firstParam(browsers));
+
+  const parts: string[] = [];
+  if (apps > 0) parts.push(`${apps} ${apps === 1 ? 'app' : 'apps'}`);
+  if (seats > 0) parts.push(`${seats} ${seats === 1 ? 'browser' : 'browsers'}`);
+
+  return {
+    label: 'Done',
+    body:
+      parts.length > 0
+        ? `Every session on the account has ended — ${parts.join(' and ')}, this one included. Sign in again below.`
+        : 'Every session on the account has ended, this one included. Sign in again below.',
+  };
 }
 
 export default async function SignInPage({
@@ -126,11 +151,12 @@ export default async function SignInPage({
 
   const code = firstParam(params.error);
   const notice =
-    code === 'SessionRequired'
+    signedOutNotice(params.signedOut, params.browsers) ??
+    (code === 'SessionRequired'
       ? { label: 'Reason', body: SESSION_REQUIRED }
       : code
         ? { label: 'Fault', body: FAULTS[code] ?? GENERIC_FAULT }
-        : null;
+        : null);
 
   const anyProvider = config.providers.microsoft || config.providers.apple;
 

@@ -51,12 +51,19 @@ export type { SiteSection };
  */
 
 /**
- * The theme control rides here rather than becoming a seventh entry.
+ * The theme control and the way out ride here rather than becoming a seventh and eighth entry.
  *
- * It is not a destination and must not read as one — but it does have to be on every page,
- * because a preference you can only change in Settings is one a signed-out reader cannot
- * change at all. This row is already on every page, so it is where the control goes: inside the
- * same collar, so it reads as one more marginal note rather than as chrome.
+ * Neither is a destination and neither must read as one — but both have to be on every page.
+ * A preference you can only change in Settings is one a signed-out reader cannot change at
+ * all, and a sign-out you can only reach from Settings is one the next person to sit at a
+ * shared computer will not find. This row is already on every page, so it is where both go:
+ * inside the same collar, so they read as marginal notes rather than as chrome, and at the end
+ * of it, after the places.
+ *
+ * Sign out is the newer of the two and the more overdue. `auth.ts` has exported `signOut`
+ * since the beginning and nothing called it; the settings page told readers to press a button
+ * in the header that did not exist. `site-nav-menu.tsx` has the arithmetic showing it does not
+ * widen the fold — it replaces "Sign in", which is only there when it is not.
  *
  * It used to sit outside the `<nav>` as well, so the landmark held exactly the six places, and
  * `extra` sat outside for the same reason — a licence credit is not a destination, and neither

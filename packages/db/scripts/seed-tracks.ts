@@ -133,7 +133,13 @@ function assertNotProduction(): void {
   // The same refusal as the review seed, and it matters more here: these rows are *public*
   // recordings attributed to named accounts, which is the one kind of seed data that would
   // be visible to strangers if it ever reached a live database.
-  if (/neon\.tech|amazonaws\.com|supabase\.co/u.test(url) && !process.env.SEED_ALLOW_REMOTE) {
+  //
+  // `postgres.database.azure.com` is production from the Neon→Azure migration onward; Neon
+  // stays in the list because it remains a live, populated rollback afterwards.
+  if (
+    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u.test(url) &&
+    !process.env.SEED_ALLOW_REMOTE
+  ) {
     throw new Error(
       `refusing to seed activity into what looks like a hosted database (${url.replace(
         /:[^:@]*@/u,
