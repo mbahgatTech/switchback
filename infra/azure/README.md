@@ -51,7 +51,7 @@ privilege assertions on `sbapp`.
 | 7 Prove it is on Azure                    | done                                                        |
 | 8 Update the repository secrets           | done, 20:09:31Z / 20:09:32Z                                 |
 | 9 Keep Neon schema-current                | **not done, and not going to be.** See "Rollback expiry"    |
-| 10 Delete the `AZURE_*` migration secrets | **not done — outstanding.** See below                       |
+| 10 Delete the `AZURE_*` migration secrets | done — with one caveat. See below                           |
 
 **Step 2 was not skipped by accident; it was incoherent.** It said to copy the Neon connection
 strings into `NEON_DATABASE_URL` / `NEON_DIRECT_DATABASE_URL` as GitHub repository secrets, and
@@ -61,43 +61,27 @@ then rollback step 1 said to read them back out. GitHub Actions secrets cannot b
 store is not a copy. "Rolling back to Neon" now sources the value from somewhere a human can
 actually read at 2am.
 
-**Step 10 is outstanding, and the order matters.** The three `AZURE_*` secrets are still present
-(`gh secret list`), two of them carrying `sbadmin`, which is a member of `azure_pg_admin` and can
-execute DDL against production. Nothing reads them any more: their only consumer was the
-migration workflow, which this change deletes, and `ci.yml`'s `migrate` job reads `DATABASE_URL` /
-`DIRECT_DATABASE_URL`. So they should go. They have not gone yet because **they are also the last
-remaining copy of the admin password**, and deleting them before that password exists somewhere
-readable converts "an unreadable copy exists" into "no copy exists at all". Do these two in this
-order:
-
-```bash
-# 1. Give the admin password a home that can be read from. Rotating is the honest move here,
-#    because the current value cannot be recovered to write down — see "Redeploying".
-az postgres flexible-server update \
-  --resource-group rg-switchback-prod-northcentralus \
-  --name psql-switchback-prod-37ywppu5p7fri \
-  --admin-password "$(openssl rand -hex 32)"
-# …store it in the password manager, then rebuild and reset any secret carrying it.
-
-# 2. Then, and only then, remove the migration credentials.
-gh secret delete AZURE_DATABASE_URL        --repo mbahgatTech/switchback
-gh secret delete AZURE_DIRECT_DATABASE_URL --repo mbahgatTech/switchback
-gh secret delete AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback
-```
-
-Neither command is a change to this repository, so **merging this branch does not close step
-10** and no review of it can. Both act on live state — one on the running server, one on the
-repository's secret store — and the first needs a password manager that only a person has. The
-step is recorded here as outstanding rather than dropped so that it survives the merge, and the
-table above will keep saying `not done` until someone runs the two commands and edits the row.
-To check where it stands without reading anything else:
+**Step 10 is done, and the caveat is which half of it is provable.** The three `AZURE_*` secrets
+are gone. `gh secret list` returns `DATABASE_URL`, `DIRECT_DATABASE_URL` and
+`VERCEL_DEPLOY_HOOK` and nothing else, and direct probes for `AZURE_DATABASE_URL` and
+`AZURE_APP_DATABASE_URL` both return 404. Nothing was reading them by then: their only consumer
+was the migration workflow, which is deleted, and `ci.yml`'s `migrate` job reads `DATABASE_URL` /
+`DIRECT_DATABASE_URL`. To check where this stands without reading anything else:
 
 ```bash
 gh secret list --repo mbahgatTech/switchback | grep AZURE_
 ```
 
-Three lines means step 10 is still open. No output means it is done, and this section and the
-row in the table above should both be updated to say so.
+No output means the deletion happened.
+
+**What that check cannot tell you is whether the step ran in the right order.** Two of the three
+carried `sbadmin`, a member of `azure_pg_admin` that can execute DDL against production, and they
+were also the last remaining copy of the admin password — GitHub Actions secrets are write-only,
+so the copy was never readable, but it existed. The instruction was to give that password a home
+a human can read _before_ deleting them, precisely because deleting them first converts "an
+unreadable copy exists" into "no copy exists at all". Only the deletion leaves evidence in
+anything this repository can query; a password manager does not. **Treat the admin password as
+unconfirmed rather than safe** until someone who ran the step says otherwise.
 
 Two things the preflight caught before any data moved, both of which had been wrong in these
 files and are now fixed:
@@ -492,9 +476,9 @@ now (`git grep -ln 'AZURE_.*DATABASE_URL'` returns this file and nothing else �
 takes `*_VERIFY_URL` from the environment of whoever runs it). A migration executed from a
 workstation, which is how this one was executed, needs the three URLs in `$TMP` files and in
 that shell — not in a write-only store no step reads back. The step is kept because it is what
-was done, and because it is where the still-live secrets came from; if you do run it, **step 10
+was done, and because it is where the now-deleted secrets came from; if you do run it, **step 10
 of "Cutting over" deletes them again**, and the gap between the two is the whole of the exposure
-described under "Step 10 is outstanding".
+described under step 10 in "Status".
 
 Build each URL from `databaseUrlTemplate` / `directDatabaseUrlTemplate` /
 `applicationDatabaseUrlTemplate` with the password substituted, write it to a `$TMP` file, and
@@ -869,8 +853,8 @@ AZURE_DATABASE_URL` returns `name`, `created_at` and `updated_at` and no value f
     gh secret delete AZURE_APP_DATABASE_URL    --repo mbahgatTech/switchback
     ```
 
-    **Outstanding** — see "Status" for why the admin password has to be rotated into a password
-    manager first, and why deleting these before that would destroy the last copy of it.
+    **Done** — all three are gone. See "Status" for the one thing that check does not settle:
+    only the deletion is verifiable from here.
 
     Two of the three carry `sbadmin`, which is a member of `azure_pg_admin` and can execute DDL
     against production. Before cutover they addressed a database nothing depended on; they now
@@ -1030,9 +1014,9 @@ redeploy.
 ## Known follow-ups, deliberately not done here
 
 Operational steps that are outstanding are in [Status](#status-as-of-the-last-run), not here —
-rotating the admin password into a password manager, deleting the three `AZURE_*` secrets, and
-removing the Neon integration's seventeen Vercel variables when Neon is retired. This section is
-for code that belongs to the application rather than to the infrastructure.
+confirming where the admin password is written down, and removing the Neon integration's
+seventeen Vercel variables when Neon is retired. This section is for code that belongs to the
+application rather than to the infrastructure.
 
 - ~~**`packages/db/scripts/seed.ts`, `seed-reviews.ts`, `seed-tracks.ts`**~~ — **done in this
   change, not left for later.** All three gated on `/neon\.tech|amazonaws\.com|supabase\.co/`,
@@ -1050,8 +1034,11 @@ for code that belongs to the application rather than to the infrastructure.
   Purpose is adopted, which is precisely what the `url`/`directUrl` split exists to prevent.
   One line: read `DIRECT_DATABASE_URL ?? DATABASE_URL` into `datasourceUrl`.
 
-- **Three comments name Neon** where they now mean Azure: `packages/db/prisma/schema.prisma`
-  (why `directUrl` exists), `packages/db/src/client.ts` (why the global stash exists), and
-  `.github/workflows/ci.yml` (the `migrate` job, and the claim that the CI PostGIS image
-  matches production — CI runs 3.5, Azure ships 3.6.1, and that skew is worth recording rather
-  than papering over).
+- ~~**Comments that name Neon**~~ where they now mean Azure — **done in this change, not left
+  for later.** `packages/db/prisma/schema.prisma` (why `directUrl` exists),
+  `packages/db/src/client.ts` (why the global stash exists) and `.github/workflows/ci.yml` (the
+  `migrate` job, and the pooled/direct split) now name Azure; `.env.example` and
+  `infra/docker-compose.yml` carried the same mistake and are corrected with them. The PostGIS
+  skew is recorded rather than papered over: CI and local development run 3.5, Azure ships
+  3.6.1. Where Neon is still genuinely the rollback the mention is kept and says so, rather
+  than being deleted.

@@ -1,6 +1,7 @@
 services:
   db:
-    # PostGIS 3.5 on Postgres 17 — matches what Neon provides in production.
+    # PostGIS 3.5 on Postgres 17. The major version matches production; PostGIS does not —
+    # production is Azure, which ships 3.6.1. The same image and the same skew as CI.
     image: postgis/postgis:17-3.5
     container_name: switchback-db
     restart: unless-stopped

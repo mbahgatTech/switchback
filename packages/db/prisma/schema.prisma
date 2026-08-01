@@ -30,8 +30,10 @@ generator client {
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  // Neon pools connections through PgBouncer, which cannot run DDL. Migrations and
-  // `db push` need the unpooled endpoint; everything else uses the pooled one.
+  // A pooled endpoint in front of Postgres cannot run DDL. Migrations and `db push` need the
+  // unpooled one; everything else uses the pooled one. Production is Azure on the Burstable
+  // tier, which has no PgBouncer, so the two are the same endpoint today — the split is what
+  // keeps this correct if the tier ever changes.
   directUrl  = env("DIRECT_DATABASE_URL")
   extensions = [postgis, pg_trgm]
 }
