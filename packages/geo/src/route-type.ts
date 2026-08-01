@@ -205,6 +205,8 @@ export function climbsToADeadEnd(input: {
     maxLengthM = MAX_SPUR_LENGTH_M,
     topToleranceM = TOP_TOLERANCE_M,
   } = input;
+  // Not implied by the net gain below, which only compares the two endpoints: a line can end
+  // higher than it started and still have crossed a summit well before its end.
   if (!Number.isFinite(dropFromTopM) || dropFromTopM > topToleranceM) return false;
   if (!Number.isFinite(lengthM) || lengthM < minLengthM || lengthM > maxLengthM) return false;
   return Number.isFinite(netGainM) && netGainM >= minClimbM;
