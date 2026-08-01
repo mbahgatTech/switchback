@@ -1,14 +1,7 @@
 /**
- * Lifeline's derivations.
- *
- * Small functions, and every one of them is load-bearing for something a person will read
- * while worried. The tests are written against that: the interesting cases are not "does the
- * arithmetic work" but "what does this say at the moment it matters" — a hike one second
- * before its deadline, a hike that ended, a phone that has never sent anything at all.
- *
- * `now` is passed explicitly to every function under test. A safety feature whose behaviour
- * depends on the machine's clock zone is one that behaves differently in Seattle and in
- * Oslo, and these assertions would not catch it if they let the default through.
+ * Lifeline's derivations. `now` is passed explicitly to every function under test: a safety
+ * feature whose behaviour depends on the machine's clock zone behaves differently in Seattle
+ * and in Oslo, and default-`now` assertions would not catch it.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -39,8 +32,6 @@ describe('overdueByS', () => {
   });
 
   it('is zero exactly on the deadline, not one', () => {
-    // The boundary is the whole feature: this is the second the status flips, and being a
-    // second early would tell somebody their partner is late while they are unlocking the car.
     expect(overdueByS(NOW, NOW)).toBe(0);
   });
 
@@ -66,8 +57,7 @@ describe('isLive', () => {
   });
 
   it('stops serving a position the moment the hike is over', () => {
-    // The promise in `packages/core/src/lifeline.ts`: somebody given a link so they could stop
-    // worrying on a Tuesday does not thereby acquire a standing feed of where that person hikes.
+    // The promise in `packages/core/src/lifeline.ts`.
     expect(isLive('completed')).toBe(false);
     expect(isLive('cancelled')).toBe(false);
   });
@@ -82,8 +72,6 @@ describe('isLive', () => {
 
 describe('isStalePing', () => {
   it('treats a phone that has never reported as stale', () => {
-    // Not "current with no position": a follow page that says the fix is fresh when there is
-    // no fix would be the single most misleading thing this product could display.
     expect(isStalePing(null, NOW)).toBe(true);
   });
 
@@ -99,14 +87,11 @@ describe('isStalePing', () => {
   });
 
   it('survives several dropped pings before saying anything', () => {
-    // The ratio that keeps the page calm: one lost fix in a valley must never read as lost
-    // contact, so the threshold has to be several cadences wide.
     expect(LIFELINE_STALE_PING_S / LIFELINE_PING_INTERVAL_S).toBeGreaterThanOrEqual(4);
   });
 
   it('is not confused by a clock that runs backwards', () => {
-    // Phone clocks correct themselves mid-hike. A fix stamped in the future is odd, but it is
-    // certainly not old, and reporting it as stale would raise an alarm out of a time sync.
+    // Phone clocks correct themselves mid-hike; a fix stamped in the future is not old.
     expect(isStalePing(minutesAfter(5), NOW)).toBe(false);
   });
 });
@@ -204,8 +189,8 @@ describe('lifelinePingSchema', () => {
   });
 
   it('refuses an elevation nobody can stand at', () => {
-    // A barometric altimeter indoors will report absurdities, and one of them landing in the
-    // database would put a hiker a kilometre underground on somebody's follow page.
+    // A barometric altimeter indoors reports absurdities, and one landing in the database
+    // would put a hiker a kilometre underground on somebody's follow page.
     expect(() => lifelinePingSchema.parse({ ...base, eleM: -900 })).toThrow();
     expect(() => lifelinePingSchema.parse({ ...base, eleM: 12_000 })).toThrow();
   });

@@ -1,23 +1,13 @@
 /**
  * Wall-clock arithmetic on ISO strings that already carry their own offset.
  *
- * Every instant this product shows a user is local to the *trail*, not to the device
- * holding the screen — a hiker in London planning Mont Blanc wants 07:00 at the hut, not
- * 06:00 because their phone is on GMT. The API already answers that way: `startAt` comes
- * back as `2026-07-27T07:00:00+02:00`, which is the local wall time with the trail's real
- * offset appended, resolved server-side from a proper timezone database.
+ * Every instant shown is local to the *trail*, not the device, and the API answers that way
+ * (`2026-07-27T07:00:00+02:00`), so the client builds other start times by string surgery — swap
+ * the date, swap the hour, keep the offset — and needs no timezone database: `Intl.DateTimeFormat`
+ * with `timeZone` is not reliably available on Hermes.
  *
- * So the client never needs a timezone database of its own. Given one such string it can
- * build any other start time by string surgery — swap the date, swap the hour, keep the
- * offset — and the server resolves the resulting instant correctly. That matters more than
- * it sounds: `Intl.DateTimeFormat` with a `timeZone` option is the obvious alternative and
- * it is not reliably available on Hermes, so the iOS app would need a polyfill measured in
- * hundreds of kilobytes to do what these forty lines do exactly.
- *
- * The one thing this cannot do is cross a DST boundary: a start seven days out is built
- * with today's offset, so twice a year the far end of the week lands an hour off the hour
- * the user picked. The alternative is shipping a zone database to fix a one-hour error on
- * two days a year, and that is not a trade worth making.
+ * Known limit: a start built days ahead carries today's offset, so twice a year the far end of a
+ * week lands an hour out. Shipping a zone database to fix that is not the trade.
  */
 
 const ISO_LOCAL = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -99,13 +89,8 @@ export function formatDayLabel(date: string): string {
   return `${day} ${Number(date.slice(8, 10))} ${month}`;
 }
 
-/**
- * `27 Jul 2026`. Carries the year, which `formatDayLabel` deliberately leaves off.
- *
- * The planning rails only ever offer the next six days, so a year there would be noise. A
- * review's hiked-on date is the opposite case: it can be any date in the past, and "27 Jul"
- * on a report that turns out to be three winters old is worse than no date at all.
- */
+/** `27 Jul 2026`. Carries the year, which `formatDayLabel` leaves off: the planning rails only
+ * offer the next six days, but a review's hiked-on date can be three winters old. */
 export function formatDateLabel(date: string): string {
   const month = MONTH_NAMES_SHORT[Number(date.slice(5, 7)) - 1] ?? '';
   return `${Number(date.slice(8, 10))} ${month} ${date.slice(0, 4)}`;
@@ -116,26 +101,16 @@ export function formatHour(hour: number): string {
   return `${String(hour).padStart(2, '0')}:00`;
 }
 
-/**
- * Today's date where the reader is standing, as `YYYY-MM-DD`.
- *
- * Deliberately not `new Date().toISOString().slice(0, 10)`, which is today in UTC. At 21:00
- * in Seattle that string is already tomorrow, and a hike logged then would be rejected as
- * being in the future by a validator that is right to reject the future.
- */
+/** Today's date where the reader is standing. Not `toISOString().slice(0, 10)`, which at 21:00
+ * in Seattle is already tomorrow and gets a hike logged then rejected as being in the future. */
 export function todayLocal(now: Date = new Date()): string {
   const month = String(now.getMonth() + 1).padStart(2, '0');
   const day = String(now.getDate()).padStart(2, '0');
   return `${now.getFullYear()}-${month}-${day}`;
 }
 
-/**
- * The next date on or after `from` that falls on `dayOfWeek`.
- *
- * This is what turns "quietest on Tuesday around 06:00" — a recommendation about a
- * weekday, because busyness is a weekly shape — into a date the forecast can be asked
- * about. Today counts: a Tuesday recommendation read on a Tuesday morning is about today.
- */
+/** The next date on or after `from` falling on `dayOfWeek` — what turns a busyness recommendation
+ * about a weekday into a date the forecast can be asked about. Today counts. */
 export function nextDateOn(from: string, dayOfWeek: number): string {
   const ahead = (dayOfWeek - dayOfWeekOf(from) + 7) % 7;
   return addDays(from, ahead);
@@ -151,14 +126,8 @@ export function offsetMinutes(offset: string): number | null {
   return sign === '-' ? -total : total;
 }
 
-/**
- * What today's date is *at the trail*, from a UTC instant and the trail's offset.
- *
- * Needed for exactly one thing on each client — knowing which row of the busy-times grid
- * to mark as today — and worth doing properly, because the naive answer (the device's own
- * date) is wrong for every reader who is not standing on the trail, which is all of them
- * at the moment they are planning.
- */
+/** Today's date *at the trail*, from a UTC instant and the trail's offset. The device's own date
+ * is wrong for every reader not standing on it, which is all of them while planning. */
 export function localDateAt(utcIso: string, offset: string): string | null {
   const minutes = offsetMinutes(offset);
   const instant = new Date(utcIso).getTime();

@@ -13,33 +13,12 @@ import {
 } from './types';
 
 /**
- * Planning a route of your own.
- *
- * The catalogue answers "where shall I hike"; this answers "I want to hike *here*, and
- * here, and then back to the car". They need different data. A trail is one assembled,
- * named, curated line — `assembleTrails` keeps the primary line of a route relation and
- * drops everything under 200 m. That is exactly right for a catalogue and exactly wrong
- * for routing: the 150 m unnamed connector between two trails is the piece that makes a
- * loop possible, and it is the first thing the catalogue throws away.
- *
- * So planning runs on its own cache of the walkable network — every foot-legal way in an
- * area, named or not — fetched lazily per routing tile, the same on-demand pattern the
- * trail ingest uses. See `@switchback/geo`'s `graph` module for what is built from it.
+ * Planning a route of your own: anchors, legs, and the saved-route shapes. Planning runs on its
+ * own lazily-cached network, not the trail catalogue, which drops the short unnamed connectors a
+ * loop depends on — see `docs/architecture.md`.
  */
 
-/**
- * The kinds of way a hiker can legally and sensibly use.
- *
- * Narrower than "everything OSM tags as `highway`" and wider than "trails". A route that
- * refuses to touch a road cannot leave most car parks; a route that treats a dual
- * carriageway as walkable will get someone killed. The list is the middle: dedicated
- * hiking infrastructure, the tracks and lanes that connect it, and the quiet roads that
- * are often the only link between two path networks.
- *
- * `road` collapses OSM's residential / unclassified / service / living_street into one
- * bucket, because for a hiker the distinction between them is not worth carrying — they
- * are all "tarmac you hike along to reach the path", and they all get the same penalty.
- */
+/** Ways a hiker may legally use. `road` collapses OSM's residential/unclassified/service. */
 export const PATH_KINDS = [
   'path',
   'footway',
@@ -53,12 +32,8 @@ export const PATH_KINDS = [
 export type PathKind = (typeof PATH_KINDS)[number];
 
 /**
- * One run of walkable geometry, as cached and as shipped to a client.
- *
- * A *run*, not a way: a way arriving from Overpass with nodes missing (they sat outside
- * the query box) is split at the holes rather than dropped, so the neighbouring tile can
- * contribute the middle. The graph builder rejoins them, because both runs carry the real
- * OSM node coordinates and those match exactly.
+ * One run of walkable geometry. A *run*, not a way: a way whose nodes fall outside the query box
+ * is split at the holes, and the graph builder rejoins the pieces on their OSM node coordinates.
  */
 export const pathSegmentSchema = z.object({
   /** OSM way id. Not unique across segments — one way can yield several runs. */
@@ -75,12 +50,8 @@ export const pathSegmentSchema = z.object({
 export type PathSegment = z.infer<typeof pathSegmentSchema>;
 
 /**
- * A point the planner was told to pass through.
- *
- * `freehand` describes the leg *arriving* at this anchor, not the anchor itself. It rides
- * here rather than on a separate leg array because anchors and legs are off by one and
- * keeping them in one list is what makes "delete anchor 3" a single splice instead of two
- * correlated ones. The first anchor's flag is meaningless and ignored.
+ * A point the planner was told to pass through. `freehand` describes the leg *arriving* at this
+ * anchor, and rides here so "delete anchor 3" stays one splice. The first anchor's is ignored.
  */
 export const routeAnchorSchema = z.object({
   lng: z.number(),
@@ -89,25 +60,11 @@ export const routeAnchorSchema = z.object({
 });
 export type RouteAnchor = z.infer<typeof routeAnchorSchema>;
 
-/**
- * Who can see a saved route.
- *
- * The app-wide ladder from `profile.ts`, not one of its own. A product that gives routes a
- * private/unlisted/public scale and activities a private/followers/public one has two
- * privacy models, and the person choosing between them has to learn which page they are on
- * before they can predict what "public" does. One ladder, one meaning, everywhere.
- */
+/** Who can see a saved route. The app-wide ladder from `profile.ts`, not one of its own. */
 export const PLANNED_ROUTE_VISIBILITIES = VISIBILITIES;
 export type PlannedRouteVisibility = Visibility;
 
-/**
- * Why a leg came back as a straight line instead of following the network.
- *
- * Every one of these is shown to the user, so they are reasons rather than error codes. A
- * planner that silently draws a straight line across a lake because the path graph had a
- * hole is worse than one that says it could not find a path — the first produces a route
- * somebody might actually try to hike.
- */
+/** Why a leg came back as a straight line. Every one of these is shown to the user. */
 export const ROUTE_LEG_REASONS = [
   /** The user asked for a straight line. Not a failure. */
   'freehand',
@@ -118,28 +75,15 @@ export const ROUTE_LEG_REASONS = [
   /** The network for this ground has not finished downloading. Retrying will likely work. */
   'network_pending',
   /**
-   * The server declined to fetch the network for this ground, so nothing is downloading.
-   *
-   * Distinct from `network_pending`, and the distinction is the whole point of the reason
-   * existing: waiting fixes a pending tile and does nothing for a refused one. Distinct from
-   * `off_network`/`no_path` for a much sharper reason — those two are claims about the
-   * terrain, and a leg over ground we chose not to fetch supports no claim about the terrain
-   * at all. Before this existed, backpressure made the planner tell people that stretches of
-   * their route had no path under them, as a safety warning, about ground it had never
-   * looked at.
+   * The server declined to fetch the network here, so nothing is downloading. Waiting fixes a
+   * pending tile and not a refused one, and unlike `off_network`/`no_path` this makes no claim
+   * about terrain that was never read.
    */
   'network_paused',
 ] as const;
 export type RouteLegReason = (typeof ROUTE_LEG_REASONS)[number];
 
-/**
- * One leg of a plan: the stretch arriving at anchor `to`, from anchor `to - 1`.
- *
- * Reported per leg rather than per route because the answer genuinely varies along one
- * line. A five-anchor route can have four legs on good path and one crossing a valley the
- * network does not cover, and rolling that up into a single "partially snapped" flag would
- * hide *which* part the user needs to look at.
- */
+/** One leg: the stretch arriving at anchor `to`. Per leg, so the user sees *which* stretch. */
 export const routeLegSchema = z.object({
   to: z.number().int().positive(),
   /** False when this leg is a straight line — by request, or because nothing else was possible. */
@@ -147,14 +91,9 @@ export const routeLegSchema = z.object({
   reason: z.enum(ROUTE_LEG_REASONS).nullable(),
   lengthM: z.number().nonnegative(),
   /**
-   * Where this leg begins and ends *on the drawn line*, which is not always where the user
-   * put the anchor — a snapped anchor sits on the nearest way, up to 120 m from the click.
-   *
-   * Both endpoints ride along because a client cannot derive them. The route arrives as one
-   * geometry simplified to 5 m, so slicing it back into legs by cumulative length drifts, and
-   * an anchor between one snapped leg and one freehand leg is at a position only the server
-   * ever computed. Four numbers per leg is what lets a straight-line stretch be drawn as a
-   * straight-line stretch rather than described in a caption beside a solid line.
+   * Where this leg begins and ends *on the drawn line* — a snapped anchor sits on the nearest
+   * way, up to 120 m from the click. A client cannot derive these: the geometry arrives
+   * simplified to 5 m, so slicing it into legs by cumulative length drifts.
    */
   start: lngLatSchema,
   end: lngLatSchema,
@@ -170,24 +109,14 @@ export const routePlanSchema = z.object({
   /** Routing tiles still downloading under these anchors. The planner says so rather than pretending. */
   pendingTiles: z.number().int().nonnegative(),
   /**
-   * True when the server refused to fetch the network under these anchors.
-   *
-   * Separate from `pendingTiles` because zero pending means two opposite things: we hold
-   * everything, or we declined to go and get it. The planner needs to tell them apart —
-   * `pendingTiles` drives both the "fetching" line and the retry loop, and a refusal that
-   * arrives as a zero switches the retry off while the legs quietly turn into terrain
-   * claims. Defaulted, so a response from before this field existed still parses.
+   * True when the server refused to fetch the network here. Separate from `pendingTiles`, whose
+   * zero means either "we hold everything" or "we declined to fetch" — and a refusal arriving as
+   * a zero switches the retry loop off while the legs turn into terrain claims. Defaulted.
    */
   busy: z.boolean().default(false),
   /**
-   * Which refusal, when `busy`. Null otherwise.
-   *
-   * The trail side has carried this from the start and `/plan` did not, so both refusals
-   * arrived here as one sentence ending "Try the route again later." That is right for a
-   * deep queue and wrong for a full database: nobody can wait out a database that needs an
-   * operator to delete something, and prescribing an action that cannot work is the one
-   * thing this project's error copy is not allowed to do. Defaulted, so a response from
-   * before this field existed still parses.
+   * Which refusal, when `busy`. A deep queue can be waited out and a full database cannot, so
+   * they must not share one "try again later". Defaulted, as `busy` is.
    */
   busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
   /** True when the anchors span more ground than one plan may cover. */
@@ -223,18 +152,7 @@ export const plannedRouteDetailSchema = plannedRouteSummarySchema.extend({
 });
 export type PlannedRouteDetail = z.infer<typeof plannedRouteDetailSchema>;
 
-// ---------------------------------------------------------------------------
-// Requests
-// ---------------------------------------------------------------------------
-
-/**
- * How many points one route may be built from.
- *
- * Not a technical limit — A* over a viewport graph would happily take a thousand. It is the
- * point past which the thing being described stops being a route and starts being a traced
- * line, and every leg is a search, so the cost of an accidental double-click storm is
- * bounded rather than open-ended.
- */
+/** How many points one route may be built from. Bounds an accidental double-click storm. */
 export const MAX_ROUTE_ANCHORS = 60;
 
 export const ROUTE_NAME_MAX = 80;
@@ -248,12 +166,8 @@ export const routePlanInputSchema = z.object({
 export type RoutePlanInput = z.infer<typeof routePlanInputSchema>;
 
 /**
- * What gets saved: the anchors, never the line.
- *
- * The server replans from these before writing, so the stored geometry is always something
- * this codebase produced. That removes a trust surface — no client can post a route through
- * a cliff and have it served back as ours — and it removes a payload, since the anchors of
- * a 30 km route are a few hundred bytes against a few hundred kilobytes of geometry.
+ * What gets saved: the anchors, never the line. The server replans from these before writing, so
+ * no client can post a route through a cliff and have it served back as ours.
  */
 export const routeSaveSchema = routePlanInputSchema.extend({
   name: z.string().trim().min(1).max(ROUTE_NAME_MAX),
@@ -263,13 +177,7 @@ export const routeSaveSchema = routePlanInputSchema.extend({
 });
 export type RouteSaveInput = z.infer<typeof routeSaveSchema>;
 
-/**
- * An edit to a saved route.
- *
- * Every field optional, including the anchors: renaming a route should not require sending
- * its geometry back, and moving one waypoint should not require restating its name. Anchors
- * present means replan; anchors absent means leave the line exactly as it was.
- */
+/** An edit. All optional: anchors present means replan, anchors absent leaves the line alone. */
 export const routeUpdateSchema = z.object({
   id: z.string().min(1).max(64),
   anchors: z.array(routeAnchorSchema).max(MAX_ROUTE_ANCHORS).optional(),

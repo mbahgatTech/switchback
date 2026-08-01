@@ -10,13 +10,9 @@ import {
 } from '../src/blurhash';
 
 /**
- * BlurHash.
- *
- * The hash is written by a browser and read by a server that never sees the photograph, so
- * the only thing holding the two ends together is the format itself. These tests treat it as
- * a format: the round trip has to survive, the string has to be structurally what the spec
- * describes, and a malformed one has to degrade to a missing placeholder rather than a
- * broken page — a decorative feature must never be able to take a page of results down.
+ * BlurHash treated as a format: the round trip survives, the string is structurally what the
+ * spec describes, and a malformed hash degrades to a missing placeholder rather than a broken
+ * page — a decorative feature must never take a page of results down.
  */
 
 type Rgb = readonly [number, number, number];
@@ -117,12 +113,8 @@ describe('blurhashAverageColor', () => {
   });
 
   it('averages in linear light, not in sRGB', () => {
-    /*
-     * The distinction that makes the placeholder look right. Half black and half white
-     * averaged as stored bytes gives 0x80; averaged as *light* — which is what a squint at
-     * the photograph gives — it is far brighter, around 0xBC. Getting this wrong produces
-     * placeholders that are consistently too dark under every thumbnail on the page.
-     */
+    // Half black and half white averaged as stored bytes gives 0x80; averaged as light it is
+    // around 0xBC. Getting this wrong makes every placeholder on the page too dark.
     const hash = encodeBlurhash(halves(32, 32, [0, 0, 0], [255, 255, 255]), 32, 32);
     const [r] = parseHex(blurhashAverageColor(hash) ?? '#000000');
     expect(r).toBeGreaterThan(170);
@@ -141,13 +133,9 @@ describe('blurhashAverageColor', () => {
 
 describe('decodeBlurhash', () => {
   it('round trips a flat colour to a flat frame', () => {
-    /*
-     * Flat, but not identical pixel for pixel. BlurHash samples its cosine basis at integer
-     * pixel positions rather than at pixel centres, so the basis is not quite orthogonal and
-     * a constant image leaves small non-zero AC terms behind — the reference implementation
-     * does the same. What has to hold is what a placeholder is judged on: the frame averages
-     * to the colour, and the residual ramp across it is invisible.
-     */
+    // Flat, but not identical pixel for pixel: BlurHash samples its basis at integer pixel
+    // positions rather than centres, so a constant image leaves small AC terms behind, as it
+    // does in the reference implementation. The frame must average to the colour.
     const colour = [63, 107, 54] as const;
     const hash = encodeBlurhash(flat(32, 32, colour), 32, 32);
     const pixels = decodeBlurhash(hash, 8, 8);
@@ -170,8 +158,7 @@ describe('decodeBlurhash', () => {
   });
 
   it('keeps the vertical arrangement of a two-tone frame', () => {
-    // Top dark, bottom light. Four cosine terms cannot hold an edge, but they hold which
-    // end is which — and that is the whole job of a placeholder.
+    // Four cosine terms cannot hold an edge, but they hold which end is which.
     const hash = encodeBlurhash(halves(32, 32, [20, 20, 20], [230, 230, 230]), 32, 32);
     const pixels = decodeBlurhash(hash, 4, 4);
     const top = pixels[0] ?? 0;

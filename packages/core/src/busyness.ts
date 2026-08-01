@@ -1,18 +1,11 @@
 import { z } from 'zod';
 
 /**
- * Busy times.
- *
- * No official API sells this. Google's Places API (New) exposes no `popularTimes` or
- * `currentPopularity` field in any SKU, and scraping it violates their terms. So this
- * is *our* estimate, and the UI is required to say so — `confidence` and
- * `observationCount` exist specifically so the interface can be honest about how much
- * it actually knows about a given trail.
- *
- * The estimate starts as a parametric prior (weekly shape × seasonality × popularity ×
- * trailhead parking capacity) and is pulled toward reality by every activity our own
- * users record. A trail nobody has recorded shows a modeled curve labelled as such; a
- * trail with hundreds of recorded starts shows something closer to measurement.
+ * Busy times. No official API sells this — Google's Places API (New) exposes no `popularTimes` in
+ * any SKU and scraping it violates their terms — so this is *our* estimate and the UI is required
+ * to say so, which is what `confidence` and `observationCount` are for. The estimate starts as a
+ * parametric prior (weekly shape × seasonality × popularity × parking capacity) and is pulled
+ * toward reality by recorded activities.
  */
 
 export const BUSYNESS_CONFIDENCE = ['modeled', 'low', 'medium', 'high'] as const;
@@ -63,15 +56,9 @@ export const busynessForecastSchema = z.object({
     })
     .nullable(),
 
-  /**
-   * How crowded this trail's *busiest* hour actually is, on the same four-step scale.
-   *
-   * `score` is relative to this trail alone, which is what makes the weekly chart readable
-   * — but it also means every trail's peak is 100 and would be labelled `packed`, from a
-   * honeypot summit to a moorland path that sees nine people on a good Saturday. This
-   * field carries the absolute claim so the chart doesn't have to. `null` when we know
-   * nothing about the trail at all, which is not the same as knowing it is quiet.
-   */
+  /** How crowded this trail's *busiest* hour is, on the same four-step scale. `score` is relative
+   * to this trail alone, so every trail's peak is 100 and would read as `packed`; this carries
+   * the absolute claim. `null` when we know nothing, which is not the same as knowing it is quiet. */
   peakLevel: z.enum(BUSYNESS_LEVELS).nullable(),
 
   /** Whether the weather forecast was folded into the estimate. */
@@ -82,14 +69,9 @@ export type BusynessForecast = z.infer<typeof busynessForecastSchema>;
 
 export const busynessRequestSchema = z.object({
   trailId: z.string(),
-  /**
-   * Fold the week's weather into the curve.
-   *
-   * On by default, because "when should I go" is a weather question as much as a crowd
-   * one. Off is for the chart on a trail card, where a curve that changes shape with the
-   * forecast would be confusing rather than useful — and where the saved upstream call is
-   * the difference between a list page costing one request and costing twenty.
-   */
+  /** Fold the week's weather into the curve. Off for a trail card, where a curve that changes
+   * shape with the forecast confuses — and where the saved upstream call is the difference
+   * between a list page costing one request and twenty. */
   includeWeather: z.boolean().default(true),
 });
 export type BusynessRequest = z.infer<typeof busynessRequestSchema>;
@@ -101,11 +83,8 @@ export function levelFromScore(score: number): BusynessLevel {
   return 'quiet';
 }
 
-/**
- * Confidence is a function of how many real observations back the curve. The
- * thresholds are deliberately conservative — claiming "high confidence" from a
- * handful of recorded hikes would be the exact dishonesty this type exists to prevent.
- */
+/** Confidence as a function of how many real observations back the curve. Deliberately
+ * conservative — claiming "high" from a handful of hikes is the dishonesty this type prevents. */
 export function confidenceFromObservations(count: number): BusynessConfidence {
   if (count >= 200) return 'high';
   if (count >= 50) return 'medium';
@@ -113,12 +92,7 @@ export function confidenceFromObservations(count: number): BusynessConfidence {
   return 'modeled';
 }
 
-/**
- * The four levels in words, so both clients caption a cell identically.
- *
- * A record rather than a title-case call: these are a legend, and a legend whose entries
- * are derived by string manipulation drifts the moment one client capitalises differently.
- */
+/** The four levels in words, so both clients caption a cell identically. */
 export const BUSYNESS_LEVEL_LABEL: Readonly<Record<BusynessLevel, string>> = {
   quiet: 'Quiet',
   moderate: 'Moderate',

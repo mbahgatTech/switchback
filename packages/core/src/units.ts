@@ -1,20 +1,10 @@
-/**
- * Unit handling. Everything is stored and computed in SI (metres, seconds, °C) and
- * converted only at the render boundary — a rule worth keeping strictly, because
- * mixed-unit arithmetic in a hiking app produces errors that put people on a
- * mountain with the wrong expectations.
- */
+/** Unit handling. Everything is stored and computed in SI (metres, seconds, °C) and converted
+ * only at the render boundary. */
 
 export const UNIT_SYSTEMS = ['metric', 'imperial'] as const;
 export type UnitSystem = (typeof UNIT_SYSTEMS)[number];
 
-/**
- * Exact conversion factors, exported because a second copy is a second chance to be wrong.
- *
- * `@switchback/geo` needs these to pick an axis step in feet or miles and convert it back to
- * the metres it plots in. It could hardcode 1609.344 — and then this file and that one would
- * be two places that have to agree forever about a number nobody re-checks.
- */
+/** Exact conversion factors. Exported so `@switchback/geo` shares them rather than hardcoding. */
 export const METRES_PER_MILE = 1609.344;
 export const METRES_PER_FOOT = 0.3048;
 
@@ -37,54 +27,28 @@ export function celsiusToFahrenheit(c: number): number {
   return c * 1.8 + 32;
 }
 
-/**
- * The unit a distance or a height is *in*, with no number attached.
- *
- * A chart axis says its unit once, in the margin, and then prints bare numbers under every
- * tick — repeating "km" forty times is how you turn an axis into a list. Everything else in
- * this file answers "what is this quantity", so it returns the number and the unit together;
- * these two answer "what are these numbers", which an axis asks separately.
- */
+/** The unit alone, for a chart axis that names it once in the margin. */
 export const DISTANCE_UNIT: Record<UnitSystem, string> = { metric: 'km', imperial: 'mi' };
 export const ELEVATION_UNIT: Record<UnitSystem, string> = { metric: 'm', imperial: 'ft' };
 
-/**
- * A distance for an axis tick: bare, one decimal, in the reader's unit.
- *
- * One decimal rather than the precision the step would allow, so the axis and the stat block
- * agree. {@link formatDistance} rounds a 0.652 mi trail to `0.7 mi`; an axis that printed its
- * own end as `0.65` would be the same page giving two answers, and the reader has no way to
- * know which one is the trail. The step ladder in `@switchback/geo` is chosen so that every
- * tick below the end is exactly representable here — that is what keeps the row round.
- */
+/** A distance for an axis tick: bare, one decimal, in the reader's unit. One decimal rather than
+ * the step's own precision, so the axis and the stat block cannot print two answers for the same
+ * quantity; `@switchback/geo`'s step ladder is chosen to stay exactly representable here. */
 export function axisDistance(metres: number, system: UnitSystem): string {
   if (!Number.isFinite(metres)) return '—';
   return (system === 'imperial' ? metresToMiles(metres) : metres / 1000).toFixed(1);
 }
 
-/**
- * A height for an axis tick: bare, whole units, grouped.
- *
- * Grouped because the imperial ladder reaches five figures — `10000` on a gridline is a
- * number the eye has to count digits to read, and `10,000` is not. Fixed to `en-GB` rather
- * than the machine locale so the two clients and the printed sheet agree on the separator;
- * a section rendered on a phone set to German is still the same drawing.
- */
+/** A height for an axis tick: bare, whole units, grouped. Pinned to `en-GB` rather than the
+ * machine locale so both clients and the printed sheet agree on the separator. */
 export function axisElevation(metres: number, system: UnitSystem): string {
   if (!Number.isFinite(metres)) return '—';
   const value = system === 'imperial' ? metresToFeet(metres) : metres;
   return Math.round(value).toLocaleString('en-GB');
 }
 
-/**
- * Trail length, in the unit system the reader chose.
- *
- * One decimal all the way to three figures, then none. The decimal is dropped late rather
- * than early because a hike's own section axis runs to its true end — `13.9` — and a stat
- * block that rounds the same quantity to `14 km` two hundred pixels above it is the page
- * contradicting itself. Past a hundred units nobody is counting the last four hundred
- * metres of a thousand-kilometre route, and the decimal becomes noise.
- */
+/** Trail length, in the reader's units. One decimal to three figures, then none — the decimal is
+ * dropped late so a stat block cannot round a quantity its own section axis prints in full. */
 export function formatDistance(metres: number, system: UnitSystem): string {
   if (!Number.isFinite(metres)) return '—';
   if (system === 'imperial') {
@@ -129,35 +93,15 @@ export function formatDuration(seconds: number): string {
   return `${h}h ${m}m`;
 }
 
-/**
- * A lifetime on foot, rather than one trail's estimate.
- *
- * Past a couple of days the minutes are noise: "720h 6m" offers six minutes of precision on
- * a figure assembled from modelled hiking speeds over hundreds of hikes. Below that
- * threshold the minutes are most of the number, so they stay.
- *
- * Separate from {@link formatDuration} rather than folded into it, because a trail's own
- * estimate is never long enough to trip the threshold and would only lose precision it has
- * every right to — a 50-hour thru-hike leg reading "50h" is fine, a 3h 40m hike reading "4h"
- * is not.
- */
+/** A lifetime on foot. Past two days the minutes are noise on a figure assembled from modelled
+ * speeds. Separate from {@link formatDuration}, whose inputs never reach that threshold. */
 export function formatTimeOnFoot(seconds: number): string {
   return formatDuration(seconds >= 48 * 3600 ? Math.round(seconds / 3600) * 3600 : seconds);
 }
 
-/**
- * A running clock: `1:12:04`, or `12:04` under the hour.
- *
- * Distinct from {@link formatDuration} because the two answer different questions. "3h 40m"
- * is how long a hike *takes* — a rounded estimate, read once, before setting off. This is the
- * elapsed time on a recording that is still happening, and it has to tick: a clock that reads
- * "45m" for sixty seconds at a time looks stopped, which on the one screen where the reader
- * is checking that something is still running is the worst thing it could look like.
- *
- * The hours field is dropped rather than shown as `0:12:04`, and the minutes are padded only
- * once there are hours to pad them against — so the number grows leftward as the hike does,
- * and never jitters in width within a single unit.
- */
+/** A running clock: `1:12:04`, or `12:04` under the hour. Distinct from {@link formatDuration},
+ * which rounds: this ticks, on the one screen where a stopped-looking clock would be worst.
+ * Minutes are padded only once there are hours to pad them against. */
 export function formatClock(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '—';
   const total = Math.floor(seconds);
@@ -168,17 +112,9 @@ export function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 }
 
-/**
- * Pace, in minutes and seconds per kilometre or mile.
- *
- * Hikers and runners read pace; only cyclists read speed. The two are reciprocals, so this
- * could be derived at every call site — and would be, differently, at each one. Note the
- * argument is *seconds per unit* rather than metres per second: `Split.paceSPerUnit` is
- * already in those terms, and converting on the way in would mean converting back out.
- *
- * A pace slower than about a minute and a half per metre is not a pace, it is a stop, so the
- * upper bound reads as a dash rather than as `240:00`.
- */
+/** Pace, in minutes and seconds per kilometre or mile. The argument is *seconds per unit*, not
+ * metres per second, because `Split.paceSPerUnit` is already in those terms. Anything slower
+ * than three hours per unit is a stop, not a pace, and reads as a dash. */
 export function formatPace(secondsPerUnit: number, system: UnitSystem): string {
   const suffix = system === 'imperial' ? '/mi' : '/km';
   if (!Number.isFinite(secondsPerUnit) || secondsPerUnit <= 0 || secondsPerUnit > 3 * 3600) {
