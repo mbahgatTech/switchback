@@ -1,30 +1,15 @@
 'use client';
 
 /**
- * What is on this device.
+ * What is on this device: every download with its measured size, the origin's real usage beside
+ * the browser's ceiling, and removal in one press with one confirmation.
  *
- * A storage manager is a page about trust: a hiker who cannot see what a download cost, or
- * cannot get the space back without deleting the whole app, stops downloading. So every row
- * carries its measured size, the origin's real usage sits at the top beside the browser's
- * ceiling, and removal is one press with one confirmation.
- *
- * Two numbers are shown rather than one, because they answer different questions and neither
- * is a substitute for the other. Ours is what these trails cost. The browser's is everything
- * this origin holds — including the application shell and pages visited but never downloaded
- * — and it is the number that decides when the browser starts evicting things on its own.
- *
- * The page also carries what the device owes the server: reports written where there was no
- * signal, and hikes recorded in the same place. They are listed first, because a download is
- * a possession and a queued write is a debt, and the debt is the thing somebody would want to
- * settle before closing the tab. A hike sitting in storage with nothing on screen to say so
- * is worse than an error — it looks exactly like data loss.
- *
- * **The debts are shown in three groups, and only the first is readable.** Yours, in full, with
- * the controls that send and discard them. Somebody else's, as a count and a sentence — the
- * storage is the reader's business, the contents are not. And, once per device and then never
- * again, the ones written before this product recorded who wrote them: those are named just
- * far enough to recognise, and left for a person to claim or throw away. See `use-queue.ts`
- * for the split and `handover.ts` for why the third group exists at all.
+ * Two numbers rather than one — ours is what these trails cost, the browser's is everything the
+ * origin holds, and it is the browser's that decides when eviction starts. Queued writes are
+ * listed first: a download is a possession, a queued write is a debt. They come in three groups
+ * and only the first is readable — yours in full, somebody else's as a count, and once per
+ * device the ones written before this product recorded who wrote them. See `use-queue.ts` for
+ * the split and `handover.ts` for why the third group exists.
  */
 
 import { useRef, useState } from 'react';
@@ -55,14 +40,9 @@ function taken(at: number): string {
 }
 
 /**
- * Reports the device is holding on the server's behalf.
- *
- * Renders nothing when there is nothing owed, which is the ordinary case — a block that says
- * "no reports waiting" would be a permanent reminder of a problem nobody has.
- *
- * Water for the ones still waiting on a connection, survey for the ones the server actually
- * refused. The plates carry the difference so the words do not have to: one is the network's
- * fault and needs nothing from the reader, the other needs a decision.
+ * Reports the device is holding on the server's behalf. Renders nothing when there is nothing
+ * owed. Water while it is only the network's fault, survey once the server has actually
+ * refused — the plates carry the difference so the words do not have to.
  */
 function QueuedReports({ api }: { api: PendingReviewsApi }) {
   const { reviews, busy, flushAll, post, discard } = api;
@@ -170,14 +150,9 @@ export function DownloadsManager() {
   const status = useRef<HTMLParagraphElement | null>(null);
 
   /**
-   * The pressed control is about to be destroyed — disabling it has already taken the focus to
-   * `<body>`, and the section it lives in disappears when its queue empties. Focus lands where
-   * the outcome is written instead.
-   *
-   * Given to the unattributed section as well as the queued-hikes one. That section is the
-   * shorter-lived of the two and the argument is stronger there: it appears once per device,
-   * is about rows whose author is in doubt, and settling the last of them removes a button, a
-   * row and a whole heading in one press.
+   * The pressed control is about to be destroyed — disabling it has already taken focus to
+   * `<body>`, and the section disappears when its queue empties. Focus lands where the outcome
+   * is written instead.
    */
   const moveFocusToOutcome = (): void => {
     status.current?.focus();
@@ -220,16 +195,9 @@ export function DownloadsManager() {
 }
 
 /**
- * Writes this device is holding for somebody who is not signed in.
- *
- * A count and one sentence, and that restraint is the point. Somebody else's report and
- * somebody else's day are on this disk, which the reader is entitled to know because it is
- * their storage — but what those say, which trails they are about and when they were walked
- * are that person's, not this one's. So this block names a number and a way to resolve it and
- * stops. The rows go out untouched the moment their own author signs back in.
- *
- * Renders nothing when there is nothing held, which is the ordinary case on a phone that has
- * only ever had one hiker.
+ * Writes this device is holding for somebody who is not signed in. A count and one sentence:
+ * the storage is the reader's business, the contents are not. Renders nothing when there is
+ * nothing held, which is the ordinary case.
  */
 function HeldForAnother({ count }: { count: number }) {
   if (count === 0) return null;
@@ -251,21 +219,12 @@ function HeldForAnother({ count }: { count: number }) {
 }
 
 /**
- * Writes the device cannot name an author for.
- *
- * These are rows queued before this version shipped, and rows written on a browser that had
- * never been told who was signed in. Both obvious ways of clearing them are wrong: adopting
- * them to whoever is here now is the defect the rest of this feature exists to prevent, and
- * throwing them away destroys a hike or a report that exists in exactly one place. So the
- * decision goes to the only party who can actually make it — the person looking at the screen,
- * who knows whether they were the one on that ridge.
- *
- * Deliberately does not show the words of a queued report or the line of a queued hike, only
- * enough to recognise it: the trail, the day, and how far. If it turns out not to be yours you
- * will have read nothing of it.
- *
- * **This section stops existing.** Nothing written after this ships is unattributed, so on any
- * given device it appears once, is settled once, and never returns.
+ * Writes the device cannot name an author for — queued before this version shipped, or on a
+ * browser never told who was signed in. Adopting them to whoever is here now is the defect this
+ * feature exists to prevent, and discarding destroys a hike that exists in one place, so the
+ * decision goes to the person looking at the screen. Shown only far enough to recognise: the
+ * trail, the day, the distance. Nothing written after this ships is unattributed, so the
+ * section appears once per device and never returns.
  */
 function Unclaimed({
   hikes,
@@ -282,12 +241,9 @@ function Unclaimed({
   const units = useUnits();
   const [confirming, setConfirming] = useState<string | null>(null);
   /**
-   * The trail whose claim would destroy a report of the reader's own.
-   *
-   * Claiming re-keys the row to `reviewKey(you, trail)`, which is the same key your own queued
-   * report for that trail already occupies — so one of the two has to go, and the device may
-   * not pick. `adopt` refuses and says which case it hit; this holds that answer until the
-   * reader settles it, in the same two-tap grammar the Discard controls use.
+   * The trail whose claim would destroy a report of the reader's own. Claiming re-keys the row
+   * to `reviewKey(you, trail)`, which your own queued report already occupies; `adopt` refuses
+   * and says so, and this holds that answer until the reader settles it.
    */
   const [colliding, setColliding] = useState<string | null>(null);
   const total = hikes.unattributed.length + reports.unattributed.length;
@@ -446,20 +402,11 @@ function Unclaimed({
                         if (outcome === 'would-replace-your-own') setColliding(row.trailId);
                       })
                       /*
-                       * Every outcome answers the press, including the two that used to pass
-                       * in silence.
-                       *
-                       * `onSettled` was on the success branch alone, so a collision — the one
-                       * outcome that asks the reader a question — replaced the button that had
-                       * just been pressed, dropped focus to `<body>`, and put its explanation
-                       * in a plain `<span>` that no live region was watching. That is the same
-                       * failure this page's permanent `role="status"` paragraph was added to
-                       * fix, arriving again by a different route. `adopt` now writes the
-                       * sentence into that paragraph and focus lands on it here.
-                       *
-                       * The `catch` is not decoration either: without it a store that refuses
-                       * the claim rejected into `void`, leaving the reader looking at a button
-                       * that flickered from disabled back to enabled and said nothing.
+                       * Every outcome answers the press. `onSettled` on the success branch
+                       * alone left a collision — the one outcome that asks the reader a
+                       * question — replacing the pressed button and dropping focus to
+                       * `<body>`. The `catch` matters for the same reason: without it a store
+                       * that refuses the claim rejects into `void` and says nothing.
                        */
                       .catch(() => undefined)
                       .finally(onSettled);
@@ -510,14 +457,9 @@ function Unclaimed({
 }
 
 /**
- * Hikes recorded where there was no signal to send them over.
- *
- * First on the page, ahead of reports, because it is the larger debt: a report is a paragraph
- * and a hike is a day. Renders nothing when there is nothing owed.
- *
- * Same grammar as the reports below it — water while it is only the network's fault, survey
- * once the server has actually refused something — so the two read as one list of debts in
- * two kinds rather than as two features that happen to share a page.
+ * Hikes recorded where there was no signal to send them over. First on the page, ahead of
+ * reports, because a report is a paragraph and a hike is a day. Same water/survey grammar as
+ * the reports below, so the two read as one list of debts.
  */
 function QueuedHikes({
   api,

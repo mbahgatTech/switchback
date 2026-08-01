@@ -2,25 +2,13 @@ import Link from 'next/link';
 import { BRAND, MODERATION_CONTACT } from '@switchback/core';
 
 /**
- * The foot of a reading page.
+ * The foot of a reading page, and it exists so the notice-and-takedown route is *findable*:
+ * the people who most need it often cannot reach the page the report control sits on — a
+ * rights holder working from a screenshot, a phone that will not load the gallery.
  *
- * **It exists for one reason, and it is not tidiness.** A notice-and-takedown process has to
- * be *findable* — a report control that only appears next to the content assumes the person
- * complaining can still reach the page, and the people who most need this often cannot: a
- * rights holder who was sent a screenshot, somebody who has been told their photograph is
- * here, anyone reading on a phone that will not load the gallery. So the route in is on
- * every page of the site, in the place people have looked for it since 1996.
- *
- * Four links and a line of type. Not a sitemap: `site-nav-menu.tsx` already carries the
- * places you can *go*, and repeating them here would make this chrome rather than a
- * colophon. What belongs here is the small print — what the rules are, how to complain, where
- * the data came from — which is exactly the set that has no place in a navigation index.
- *
- * `Link` for our own routes so the app shell is kept, a plain `mailto:` for the address.
- *
- * It carries no plate and no fill: a hairline above it and `ink-muted` type at caption size,
- * the same treatment as every other marginal note in this product. Depth here would make the
- * quietest block on the page the most structural-looking thing on it.
+ * Four links and a line of type, not a sitemap: `site-nav-menu.tsx` carries the places you can
+ * go, and what belongs here is the small print. No plate and no fill, the same treatment as
+ * every other marginal note in this product.
  */
 export function SiteFooter() {
   return (

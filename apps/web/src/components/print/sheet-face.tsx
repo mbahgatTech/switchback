@@ -11,28 +11,13 @@ import { printSheetStyle } from './sheet-style';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * The mapped area, plus the collar around it.
+ * The mapped area, plus the collar around it. Two drawing systems stacked: the map canvas draws
+ * ground, and everything the reader is here for — route, waypoints, neatline, graticule — is
+ * SVG on top, so it reaches the printer as geometry rather than as pixels. A neatline at 0.2 mm
+ * either is a hairline or is a grey smudge, and which depends on exactly that.
  *
- * Two drawing systems stacked, and which mark goes in which one is the whole design of this
- * component. The map canvas draws **ground** — relief, water, names — because that is
- * imagery and imagery is what a raster canvas is for. Everything the reader is here for is
- * drawn in SVG on top: the route, the waypoints, the neatline, the graticule.
- *
- * The route is the one mark on this sheet that has to be right, and drawing it as a map
- * layer would cap it at the canvas's pixel ratio — a 0.7 mm line reproduced from a raster
- * buffer, on a printer capable of resolving a tenth of that. In SVG it goes to the printer
- * as a path and comes out at whatever the printer can do. The same applies to every hairline
- * on the sheet: a neatline at 0.2 mm either is a hairline or is a grey smudge, and which one
- * it is depends entirely on whether it arrives as geometry or as pixels.
- *
- * There is a second payoff. This component owns no GeoJSON sources at all, so the
- * source-seeding race that every other map in this app has to defend against — style not
- * loaded when the data effect runs, sources destroyed by `setStyle` — simply has nowhere to
- * happen here. The map is handed a style once and thereafter told only where to look.
- *
- * The SVG projects through `sheetPointMm`, the same function the neatline, the ticks and the
- * graticule labels use, so the route and the marginalia cannot disagree about where a
- * coordinate is. The map is kept in step by being given `sheetZoom` of the same frame.
+ * The SVG projects through `sheetPointMm`, the same function the neatline, ticks and graticule
+ * labels use, so the route and the marginalia cannot disagree about where a coordinate is.
  */
 
 export interface SheetFaceProps {
@@ -49,13 +34,9 @@ export interface SheetFaceProps {
 }
 
 /**
- * Which plate each waypoint prints in, mirroring the screen map exactly.
- *
- * The same five separations the rest of the product uses: `survey` red is the reader and
- * their safety and nothing else, so a hazard takes it and a car park does not; `water`
- * carries anything wet; `contour` is terrain, which is what a summit and a viewpoint are;
- * `woodland` is the trail itself, which is what a trailhead is; and everything built by
- * people falls to structure black.
+ * Which plate each waypoint prints in, mirroring the screen map exactly: `survey` is the reader
+ * and their safety and nothing else, `water` anything wet, `contour` terrain, `woodland` the
+ * trail itself, and everything built by people falls to structure black.
  */
 export type WaypointPlate = 'survey' | 'water' | 'contour' | 'woodland' | 'ink';
 
@@ -86,12 +67,9 @@ const LABEL_CLEARANCE_MM = 8;
 const MAX_LABELS = 16;
 
 /**
- * Shortest gap between two plotted route vertices, millimetres.
- *
- * A 4,000-point trail at 1:250 000 puts most of its vertices inside the same tenth of a
- * millimetre, and a printer will not thank anyone for a path with four thousand nodes it
- * cannot resolve. Dropping to a 0.12 mm floor keeps every bend a 300 dpi printer can render
- * and throws away only the ones it would round together anyway.
+ * Shortest gap between two plotted route vertices, millimetres. A 4,000-point trail at
+ * 1:250 000 puts most of its vertices inside the same tenth of a millimetre; 0.12 mm keeps
+ * every bend a 300 dpi printer can render and drops only the ones it would round together.
  */
 const ROUTE_MIN_STEP_MM = 0.12;
 
@@ -113,12 +91,9 @@ function placeWaypoints(waypoints: readonly Waypoint[], frame: SheetFrame): Plac
 }
 
 /**
- * Greedy label selection: named kinds first, then anything with a name, each accepted only
- * if it clears every label already placed.
- *
- * Greedy rather than optimal on purpose. The optimal packing moves labels around when the
- * reader pans, so a name that was beside its mark a moment ago is now above it — on a sheet
- * that is about to be printed once, stability is worth more than density.
+ * Greedy label selection: named kinds first, then anything with a name, each accepted only if
+ * it clears every label already placed. Greedy rather than optimal on purpose — optimal packing
+ * moves labels around when the reader pans, and on a sheet stability beats density.
  */
 function chooseLabels(placed: Placed[]): Placed[] {
   const named = placed.filter((p) => p.waypoint.name);
@@ -170,13 +145,9 @@ export function SheetFace({
   const uid = useId().replace(/:/gu, '');
 
   /*
-   * Callbacks and the frame reach the map handlers through refs.
-   *
-   * A `useEffect` that subscribed to `moveend` with `onCentreChange` in its dependency list
-   * would tear the listener down and rebuild it on every parent render — and the parent
-   * re-renders on every drag, because the drag is what changes its centre. Refs keep the
-   * construction effect at `[]`, which is the only dependency list under which a map is
-   * built once.
+   * Callbacks and the frame reach the map handlers through refs: an effect that subscribed to
+   * `moveend` with `onCentreChange` in its deps would rebuild the listener on every drag,
+   * because the drag is what changes the parent's centre.
    */
   const centreChangeRef = useRef(onCentreChange);
   const readyChangeRef = useRef(onReadyChange);
@@ -188,20 +159,16 @@ export function SheetFace({
   const initialRef = useRef(frame);
 
   /*
-   * The names this sheet draws for itself, frozen at construction.
-   *
-   * They go into the style so the basemap's peak layer skips them, and the style is handed to
-   * the map once. That is not a limitation here: waypoints belong to the trail, and the trail
-   * does not change while a reader is choosing paper.
+   * The names this sheet draws for itself, frozen at construction. They go into the style so
+   * the basemap's peak layer skips them, and the style is handed to the map once.
    */
   const namedRef = useRef(
     waypoints.map((w) => w.name).filter((name): name is string => Boolean(name)),
   );
 
   /*
-   * Read through a ref for the same reason `namedRef` is: the map is built once, in an effect
-   * whose cleanup disposes it. Depending on `units` would rebuild the sheet — and the sheet
-   * is what a reader is in the middle of choosing paper for.
+   * Read through a ref for the same reason `namedRef` is: the map is built once in an effect
+   * whose cleanup disposes it, and depending on `units` would rebuild the sheet.
    */
   const units = useUnitsRef();
 
@@ -221,15 +188,10 @@ export function SheetFace({
       pitch: 0,
       attributionControl: false,
       /*
-       * Every gesture that could change the scale is off.
-       *
-       * The collar prints "1:25 000" and a reader will hold a ruler to it. One stray wheel
-       * click over the map and that number is a lie in a form nothing on the page corrects —
-       * the sheet still looks right, the bar scale still looks right, and the distance the
-       * reader measures is wrong. The scale rungs in the control bar are the only way to
-       * change the ratio, which is also what makes the ratio a decision rather than an
-       * accident. Panning survives, because moving the sheet over the ground does not
-       * change what a millimetre means.
+       * Every gesture that could change the scale is off. The collar prints "1:25 000" and a
+       * reader will hold a ruler to it; one stray wheel click makes that a lie nothing on the
+       * page corrects. Panning survives — moving the sheet does not change what a millimetre
+       * means.
        */
       scrollZoom: false,
       boxZoom: false,
@@ -241,17 +203,15 @@ export function SheetFace({
       keyboard: false,
       dragPan: true,
       /*
-       * `preserveDrawingBuffer` belongs here, not at the top level — MapLibre folds the
-       * WebGL context attributes into their own object. Without it the browser is free to
-       * discard the colour buffer after each frame, and the printed page gets a blank
+       * `preserveDrawingBuffer` belongs here, not at the top level — MapLibre folds the WebGL
+       * context attributes into their own object. Without it the printed page gets a blank
        * rectangle where the ground should be.
        */
       canvasContextAttributes: { preserveDrawingBuffer: true },
       /*
-       * Render the ground at print density rather than screen density. A 199 mm face is 752
-       * CSS px, which on a 600 dpi printer is being asked to cover about 4,700 device dots;
-       * at ratio 1 every hillshade pixel prints six dots wide and the relief comes out
-       * visibly blocky next to a vector route that did not.
+       * Render the ground at print density rather than screen density: at ratio 1 every
+       * hillshade pixel prints six 600 dpi dots wide, and the relief comes out visibly blocky
+       * next to a vector route that did not.
        */
       pixelRatio: Math.min(3, Math.max(2, window.devicePixelRatio || 1)),
       // Nothing here fades in. The sheet is either ready to print or it is not.
@@ -309,13 +269,9 @@ export function SheetFace({
   }, [frame.centre]);
 
   /*
-   * The ratio, re-derived whenever it or the latitude moves.
-   *
-   * Latitude is in here because Mercator's scale factor is `1/cos(lat)`: the zoom that puts
-   * 25 000 mm of ground in a millimetre at 50°N puts about 21 000 in it at 60°N. Panning
-   * north with a fixed zoom would quietly falsify the collar, so the zoom follows the
-   * centre. The loop this could close is broken at `report` above, which ignores a `moveend`
-   * whose centre did not move.
+   * The ratio, re-derived whenever it or the latitude moves. Mercator's scale factor is
+   * `1/cos(lat)`, so panning north with a fixed zoom would quietly falsify the collar. The
+   * loop this could close is broken at `report` above, which ignores an unmoved `moveend`.
    */
   useEffect(() => {
     mapRef.current?.setZoom(sheetZoom(frame.denominator, frame.centre[1]));

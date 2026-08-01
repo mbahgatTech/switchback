@@ -1,21 +1,13 @@
 import { tallyMarks } from '@switchback/geo';
 
 /**
- * The tally rule.
+ * The tally rule: a map's scale bar with the divisions standing for trails instead of
+ * kilometres, each block one hike sized by its length. Alternating fill is what makes the
+ * divisions countable at a glance.
  *
- * A map's scale bar, with the divisions standing for trails instead of kilometres. Each
- * block is one hike, sized by its length, and the bar is the whole list laid end to end —
- * so six matched outings and one through-hike with five strolls attached are two different
- * pictures before either is read. Alternating fill is the scale-bar convention, and it is
- * doing real work here: it is what makes the divisions countable at a glance.
- *
- * Flex boxes rather than an SVG. `preserveAspectRatio="none"` on a rule this wide and this
- * short stretches the hairlines along with the geometry, and a scale bar whose rules are
- * thicker at one end than the other is the one thing a scale bar must not be. Flex growth
- * is exact at any width, needs no viewBox arithmetic, and is the same layout primitive
- * React Native will draw this with.
- *
- * On the contour plate, because what it measures is distance.
+ * Flex boxes rather than an SVG — `preserveAspectRatio="none"` on a rule this wide stretches
+ * the hairlines with the geometry, and a scale bar whose rules are thicker at one end is the
+ * one thing a scale bar must not be. On the contour plate, because it measures distance.
  */
 
 export interface TallyProps {
@@ -30,9 +22,8 @@ export function Tally({ lengths, label, className }: TallyProps) {
   const marks = tallyMarks(lengths);
 
   if (marks.length === 0) {
-    // An empty list still gets its rule, hollow and dashed — the frame of a measurement not
-    // yet taken. Omitting it would make an empty card a different shape from a full one, and
-    // the column would jump as lists filled up.
+    // An empty list still gets its rule, hollow and dashed, so the column does not jump as
+    // lists fill up.
     return (
       <div
         aria-hidden
@@ -50,9 +41,8 @@ export function Tally({ lengths, label, className }: TallyProps) {
       {marks.map((mark, index) => (
         <span
           key={index}
-          // `flexBasis: 0` is what makes growth purely proportional — with the default
-          // `auto` every division would first claim its own content width, and eleven empty
-          // spans would come out eleven equal blocks regardless of what they stand for.
+          // `flexBasis: 0` is what makes growth purely proportional — with the default `auto`
+          // every division first claims its own content width.
           style={{ flexGrow: mark.end - mark.start, flexBasis: 0 }}
           className={[
             index > 0 ? 'border-l border-contour' : '',

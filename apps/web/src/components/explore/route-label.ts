@@ -1,11 +1,8 @@
 import type { RouteType } from '@switchback/core';
 
 /**
- * What the three route shapes are called on screen.
- *
- * Shared by the filter chips and the cards deliberately: a reader who filters for "Out and
- * back" and then reads "Out & back" on the result has been told, quietly, that those might
- * be different things. One string, one place.
+ * What the three route shapes are called on screen. Shared by the filter chips and the cards:
+ * "Out and back" in one place and "Out & back" in the other reads as two different things.
  */
 export const ROUTE_LABEL: Record<RouteType, string> = {
   loop: 'Loop',

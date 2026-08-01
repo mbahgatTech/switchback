@@ -12,32 +12,16 @@ import { useUnits } from '../units';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * The drawing surface.
+ * The drawing surface — the one map in this product the reader writes to, so a stray gesture
+ * here destroys work and most of what is below exists to stop that.
  *
- * The fourth map in the product, and the first one the reader *writes* to. Browse reports a
- * viewport upward, the trail map is handed a line and shows it, the recorder follows a person.
- * This one takes clicks and drags and turns them into a route — which makes it the only map
- * here where a stray gesture destroys work, and most of what is below exists to make sure it
- * does not.
+ * The planned route is woodland; every leg the router could *not* follow is redrawn over it as
+ * a dashed survey line, which is why `RouteLeg` carries its own endpoints — the planned
+ * geometry is simplified to 5 m, so slicing it back into legs by cumulative distance drifts.
  *
- * **What is drawn, and in what order.** The route the server planned is woodland, because it
- * is a trail and trails are woodland everywhere in this product. Over it, every leg that could
- * *not* be routed is redrawn as a dashed survey line, because a leg that crosses ground with
- * no path on it is a safety fact and survey is the plate this product spends on safety. That
- * overdraw is the reason `RouteLeg` carries its own endpoints: the planned geometry already
- * contains those straight stretches, but a client cannot find them in it — the line is
- * simplified to 5 m, so slicing it back into legs by cumulative distance drifts. Four numbers
- * a leg is what lets an unwalkable stretch look unwalkable rather than be described in a
- * caption beside a solid green line.
- *
- * **Anchors are DOM, not a layer.** Sixty draggable numbered pins is nothing for the browser,
- * and as elements they get dragging, hit-testing, hover styling and a title attribute for
- * free. As a symbol layer they would need a sprite per number and a hand-written drag
- * handler. The one thing DOM costs is that a click on a pin bubbles to the canvas container,
- * where MapLibre raises it as a map click — so removing a point would add one on top of it.
- * Every pin stops its own click, and a drag arms a guard that swallows the click the browser
- * fires after it, because MapLibre starts a marker drag on the first pixel of movement and a
- * hand on a trackpad always moves at least one.
+ * Anchors are DOM markers rather than a symbol layer, which gets dragging, hit-testing and
+ * hover styling free. The cost is that a click on a pin bubbles to the canvas and MapLibre
+ * raises it as a map click, so every pin stops its own click and a drag arms `dragged`.
  */
 
 export interface PlanMapProps {
@@ -49,12 +33,9 @@ export interface PlanMapProps {
   onMoveAnchor: (index: number, lng: number, lat: number) => void;
   onRemoveAnchor: (index: number) => void;
   /**
-   * Where the map settled, so the ground under it can start downloading.
-   *
-   * The planner asks the server what routing tiles it holds for the current view before the
-   * user has clicked anything. That is the difference between a first route that snaps and a
-   * first route that comes back as a straight line with "still downloading paths here" under
-   * it — the fetch has a few seconds' head start instead of beginning at the second click.
+   * Where the map settled, so the routing tiles under it can start downloading before the
+   * reader has clicked anything — the difference between a first route that snaps and one
+   * that comes back as a straight line.
    */
   onViewportChange?: (bbox: BBox) => void;
   /** Where the section's cursor currently sits on the ground. Same dot as a trail page's. */
@@ -62,9 +43,8 @@ export interface PlanMapProps {
   initialCenter: readonly [number, number];
   initialZoom: number;
   /**
-   * An explicit "look here" request — opening a saved route, or framing one leg from the
-   * readout. A nonce rather than the box alone, so asking twice for the same ground moves the
-   * camera twice; the reader who pans away and presses the button again means it.
+   * An explicit "look here" request. A nonce rather than the box alone, so asking twice for the
+   * same ground moves the camera twice.
    */
   frame?: { bbox: BBox; nonce: number } | null;
 }
@@ -115,11 +95,9 @@ function straightCollection(plan: RoutePlan | null): FeatureCollection {
 }
 
 /**
- * The points joined in order, drawn only while there is no plan to draw instead.
- *
- * The first plan over cold ground takes a second or two, and a map showing two pins and
- * nothing between them reads as a map that has not understood the second click. The chain is
- * faint and it is replaced the moment a real line exists, so it never competes with one.
+ * The points joined in order, drawn only while there is no plan to draw instead: the first plan
+ * over cold ground takes a second or two, and two pins with nothing between them read as a map
+ * that did not understand the second click.
  */
 function draftCollection(
   anchors: readonly RouteAnchor[],
@@ -156,13 +134,9 @@ function cursorCollection(cursor: readonly [number, number] | null): FeatureColl
 }
 
 /**
- * One numbered pin.
- *
- * A button, so a pointer gets the cursor and the press state without a line of CSS, and so a
- * touch tap is a tap rather than a synthesised click 300 ms late. Taken out of the tab order
- * and hidden from assistive technology on purpose: the collar beside this map lists the same
- * points as real buttons with real names, and a screen reader that has to hike sixty pins
- * labelled "3" to reach the panel has been given the map's implementation, not its content.
+ * One numbered pin. A button, so it gets the cursor, the press state and a real tap for free.
+ * Out of the tab order and hidden from assistive technology on purpose: the collar beside this
+ * map lists the same points as named buttons, and sixty pins labelled "3" is not content.
  */
 function pinElement(): HTMLButtonElement {
   const element = document.createElement('button');
@@ -228,12 +202,10 @@ export function PlanMap({
   handlers.current = { onAddAnchor, onMoveAnchor, onRemoveAnchor, onViewportChange };
 
   /*
-   * Armed by a drag, disarmed on the next tick.
-   *
-   * A marker drag ends with `mouseup`, and the browser fires `click` on the same element
-   * immediately afterwards — so without this, every drag of a point would also delete it.
-   * Clearing on a zero-delay timer rather than in the click handler keeps the guard correct
-   * when a drag ends outside the pin and no click follows at all.
+   * Armed by a drag, disarmed on the next tick. A marker drag ends with `mouseup` and the
+   * browser fires `click` straight after, so without this every drag would also delete its
+   * point. Cleared on a zero-delay timer rather than in the click handler, which keeps the
+   * guard correct when a drag ends outside the pin and no click follows.
    */
   const dragged = useRef(false);
 
@@ -273,12 +245,9 @@ export function PlanMap({
     });
 
     /*
-     * Report the view once it stops moving.
-     *
-     * `moveend` rather than `move`: the intermediate frames of a drag describe ground the
-     * reader is passing over, not ground they are looking at, and each one would be a tile
-     * coverage check. `fitBounds` also raises `moveend`, so opening a saved route reports its
-     * own extent without anything extra here.
+     * Report the view once it stops moving. `moveend` rather than `move`: each intermediate
+     * frame of a drag would be another tile-coverage check. `fitBounds` raises it too, so
+     * opening a saved route reports its own extent.
      */
     const report = (): void => {
       const bounds = instance.getBounds();
@@ -316,7 +285,6 @@ export function PlanMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scaleBar]);
 
-  // ── The line ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance || !ready.current) return;
@@ -325,25 +293,20 @@ export function PlanMap({
     instance.getSource<GeoJSONSource>(DRAFT_SOURCE)?.setData(draftCollection(anchors, plan));
   }, [plan, anchors]);
 
-  // ── The section's cursor ──────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance || !ready.current) return;
     instance.getSource<GeoJSONSource>(CURSOR_SOURCE)?.setData(cursorCollection(cursor));
   }, [cursor]);
 
-  // ── The pins ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
 
     /*
-     * Reconciled in place rather than rebuilt.
-     *
-     * Marker `i` always represents anchor `i`, so a marker that already exists only needs
-     * moving — and that matters beyond the allocation: removing and re-adding the element the
-     * pointer is currently holding cancels the drag in progress, which is precisely the moment
-     * this effect runs, because the drag is what changed the anchor.
+     * Reconciled in place rather than rebuilt. Marker `i` always represents anchor `i`, and
+     * removing and re-adding the element the pointer is holding cancels the drag in progress —
+     * which is exactly when this effect runs, because the drag is what changed the anchor.
      */
     for (let index = 0; index < anchors.length; index += 1) {
       const anchor = anchors[index]!;
@@ -384,7 +347,6 @@ export function PlanMap({
     for (const extra of markers.current.splice(anchors.length)) extra.remove();
   }, [anchors]);
 
-  // ── Explicit framing ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance || !frame) return;
@@ -404,7 +366,6 @@ export function PlanMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frame?.nonce]);
 
-  // ── Base map ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -429,13 +390,11 @@ export function PlanMap({
     <div
       ref={container}
       // Sized here, never positioned. `maplibre-gl.css` sets `.maplibregl-map { position:
-      // relative }` at the same specificity as Tailwind's `.absolute` and is imported after
-      // it, so an `absolute inset-0` container silently collapses to zero height with a
-      // perfectly working map inside it. See the same note on the trail map.
+      // relative }` at the same specificity as Tailwind's `.absolute` and is imported after it,
+      // so an `absolute inset-0` container silently collapses to zero height.
       className="h-full w-full"
-      // Labelled rather than hidden: MapLibre gives its canvas `tabindex="0"` so the view can
-      // be panned from the keyboard, and `aria-hidden` over a focusable element leaves a tab
-      // stop announcing nothing. The panel beside it is where the route is actually operable.
+      // Labelled rather than hidden: MapLibre gives its canvas `tabindex="0"`, and `aria-hidden`
+      // over a focusable element leaves a tab stop announcing nothing.
       role="region"
       aria-label="Route drawing map"
     />
@@ -489,12 +448,9 @@ function addPlanLayers(instance: MapLibreMap): void {
   }
 
   /*
-   * The unroutable stretches, over the top of the line that already contains them.
-   *
-   * Dashed, in survey, at the same width as the route rather than thinner — this is not an
-   * annotation on the route, it is a statement that this part of it is not a path. A hiker
-   * who reads the dashes as a styling flourish and follows them off a ridge has been misled
-   * by the map, which is the one failure mode a route planner must not have.
+   * The unroutable stretches, drawn over the line that already contains them. Dashed, in
+   * survey, at the route's own width rather than thinner: this is not an annotation on the
+   * route, it is a statement that this part of it is not a path.
    */
   if (!instance.getLayer('plan-straight-line')) {
     instance.addLayer({
@@ -510,8 +466,7 @@ function addPlanLayers(instance: MapLibreMap): void {
     });
   }
 
-  // The same dot, the same size and the same ring as the cursor on a trail page's map. A
-  // reader who has learned what it means there should not have to learn it twice.
+  // The same dot, size and ring as the cursor on a trail page's map.
   if (!instance.getLayer('plan-cursor-dot')) {
     instance.addLayer({
       id: 'plan-cursor-dot',

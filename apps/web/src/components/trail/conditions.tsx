@@ -24,23 +24,9 @@ import {
 import { useUnitsOr } from '../units';
 
 /**
- * Conditions on the way — the flagship feature, as a timetable.
- *
- * A timetable and not a set of weather cards, because the question this answers is a
- * timetable question: *what will it be doing when I get there?* Every other weather
- * interface on the internet forecasts a place. This one forecasts a journey, so it is laid
- * out the way a journey is published — mileage on the left, named points beside it, and one
- * row per place you will actually stand in, in the order you will stand in them.
- *
- * **Plate discipline.** Weather is the water plate throughout: the block rule, the high
- * point's tint, the freezing-level line on the section above. Survey — red — appears only
- * on the safety flags and on the rows they point at, because on this product's map survey
- * means the reader or their safety and nothing else. A gust warning and a rain shower are
- * not the same kind of fact and they must not be the same colour.
- *
- * **Nothing here is decoration for missing data.** A reading upstream did not return is an
- * em dash. A sky it has no code for is an em dash. The one thing a forecast must never do
- * is look equally confident about everything.
+ * Conditions on the way, as a timetable: one row per place you will stand in, in the order you
+ * will stand in them. Weather takes the water plate; survey is reserved for the safety flags
+ * and the rows they point at. A reading that did not return is an em dash, never a guess.
  */
 
 export interface ConditionsProps {
@@ -58,12 +44,9 @@ export interface ConditionsProps {
   onStartChange: (date: string, hour: number) => void;
   units?: UnitSystem;
   /**
-   * The air over the trail, or `null` while it is being read.
-   *
-   * One reading rather than one per row, and that is not a shortcut. The model works in
-   * cells tens of kilometres across, so a column of eight would be the same number printed
-   * eight times with the strong implication that it varied — which is the one thing a
-   * timetable must not do to a figure that does not.
+   * The air over the trail, or `null` while it is being read. One reading rather than one per
+   * row: the model works in cells tens of kilometres across, so a column of eight would print
+   * the same number eight times and imply it varied.
    */
   airQuality?: AirQualityReading | null;
 }
@@ -104,26 +87,10 @@ export function Conditions({
           </h2>
 
           {/*
-           * The re-fetch signal, as a word.
-           *
-           * This block used to dim itself to 45 % while a new start loaded. The reasoning was
-           * right — the readings on screen are still true, just for the previous hour, and
-           * blanking a table someone is mid-sentence in is worse than showing it a beat stale
-           * — but 45 % opacity is not a gentler version of blanking it, it *is* blanking it,
-           * slowly. `ink-muted` starts at 4.83:1 and there is no fade of it that stays
-           * readable; see the note on `SCHEMES` in `packages/ui` for the arithmetic.
-           *
-           * So the content stays at full strength and the state is said instead. A word rather
-           * than a spinner or a bar because this is a block the reader is looking straight at,
-           * having just moved a dial — `fetch-area`'s bar exists for the opposite case, a
-           * control glanced at while doing something else. `ink` rather than a plate colour:
-           * the plates are a legend on this product and "a request is in flight" is not a fact
-           * about terrain, weather, or anyone's safety.
-           *
-           * `aria-hidden` because the `role="status"` line below is the accessible half, and
-           * announcing both would say it twice. `!isPending` because "updating" is a claim
-           * about readings that are already on screen — during the first fetch there are none,
-           * and the block below is already saying so in a full sentence.
+           * The re-fetch signal as a word rather than a dimmed block: `ink-muted` starts at
+           * 4.83:1 and there is no fade of it that stays readable. `aria-hidden` because the
+           * `role="status"` line below is the accessible half; `!isPending` because "updating"
+           * is a claim about readings that are already on screen.
            */}
           {isFetching && !isPending ? (
             <span aria-hidden className="collar text-ink">
@@ -133,9 +100,8 @@ export function Conditions({
         </div>
 
         {/*
-         * Two dials, not three. Pace belongs to the hiker and not to the trail — it will
-         * live in account settings, where it can also correct the headline time estimate,
-         * rather than being re-answered on every page.
+         * Two dials, not three. Pace belongs to the hiker rather than the trail, and will live
+         * in account settings where it can also correct the headline time estimate.
          */}
         <div className="flex items-baseline gap-xs font-mono text-caption text-ink-muted">
           <label htmlFor={dayId}>Leaving</label>
@@ -200,11 +166,10 @@ export function Conditions({
           <AirQuality reading={airQuality} />
 
           {/*
-           * Eight columns need 46rem and a phone has about 24, so the table scrolls
-           * sideways rather than shedding columns — the difference between the car park and
-           * the summit is the entire feature, and a version that drops the summit's wind to
-           * fit is not a smaller version of it. `tabIndex` and the region role are what make
-           * that scroll reachable without a mouse; a bare overflow container is not.
+           * Eight columns need 46rem and a phone has about 24, so the table scrolls sideways
+           * rather than shedding columns — a version that drops the summit's wind to fit is
+           * not a smaller version of this feature. `tabIndex` and the region role are what
+           * make that scroll reachable without a mouse.
            */}
           <div
             role="region"
@@ -213,11 +178,9 @@ export function Conditions({
             className="mt-md overflow-x-auto rounded-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
           >
             {/*
-             * Caption, not micro. `micro` is the collar size and the tokens reserve it for
-             * marginalia — labels, legend keys, axis ticks. These are the numbers the whole
-             * feature exists to publish, and setting them at label size put the flagship
-             * reading smaller than the description prose underneath it. The column heads stay
-             * at collar, which is what gives the table a head and a body.
+             * Caption, not micro: `micro` is the collar size, reserved for marginalia, and
+             * these are the numbers the feature exists to publish. The column heads stay at
+             * collar, which is what gives the table a head and a body.
              */}
             <table className="w-full min-w-[46rem] border-collapse text-left font-mono text-caption tabular-nums">
               <caption className="sr-only">
@@ -251,9 +214,8 @@ export function Conditions({
           </div>
 
           {/*
-           * Said in words rather than drawn as a fading edge. A gradient mask over the last
-           * column hides the very reading it is advertising, and on a table of numbers that
-           * is worse than one short line of type.
+           * Said in words rather than drawn as a fading edge: a gradient mask over the last
+           * column hides the very reading it is advertising.
            */}
           <p className="collar mt-xs sm:hidden">Scroll sideways for wind, rain and sky</p>
 
@@ -290,10 +252,8 @@ function Row({
       className={[
         'border-b border-bezel/60',
         high ? 'bg-water-wash text-ink' : 'text-ink-muted',
-        // The left rail says why a row matters, and only ever one thing at a time: survey
-        // for a row a warning points at, water for the high point, nothing otherwise. A
-        // warning outranks the summit — if the top of the hike is also the dangerous part,
-        // the colour that means *your safety* is the one that has to survive.
+        // The left rail says why a row matters, one thing at a time: survey for a row a
+        // warning points at, water for the high point. A warning outranks the summit.
         'border-l-2',
         warned ? 'border-l-survey' : high ? 'border-l-water' : 'border-l-transparent',
       ].join(' ')}
@@ -319,22 +279,10 @@ function Row({
 }
 
 /**
- * The air, as one reading with its footprint stated.
- *
- * It sits between the flags and the timetable because that is what it is: not a warning
- * (the flags already fire at 60 and 80, from the same numbers) and not a per-point figure,
- * but a fact about the day that changes whether the hike is a good idea for the reader's
- * lungs. The dominant pollutant is the part worth printing beside the index — the European
- * AQI is the *worst* of five sub-indices rather than a blend, so naming it converts an
- * abstract number into something a hiker can act on. Ozone peaks on exposed ground in
- * afternoon sun; particulates do not.
- *
- * **The footprint line is not a disclaimer, it is the reading.** One number over a valley
- * invites the belief that it is about that valley. Saying "one 44 km cell" is what stops
- * this from claiming a precision the model has never had.
- *
- * Plate follows the same break as the map overlay and the flags: water below 60, survey at
- * and above it, where the index turns poor.
+ * The air, as one reading with its footprint stated. The dominant pollutant is worth printing
+ * beside the index because the European AQI is the *worst* of five sub-indices, not a blend.
+ * The footprint line is the reading, not a disclaimer: one number over a valley invites the
+ * belief that it is about that valley. Plate breaks at 60, where the index turns poor.
  */
 function AirQuality({ reading }: { reading: AirQualityReading | null }) {
   if (reading === null) return null;
@@ -375,10 +323,8 @@ function AirQuality({ reading }: { reading: AirQualityReading | null }) {
 }
 
 /**
- * The safety flags, already sorted most-severe-first by the model.
- *
- * Rendered in the order given rather than re-sorted here: the server sorts by severity and
- * then by position along the trail, so reading down the list is also hiking forwards.
+ * The safety flags, rendered in the order given: the server sorts by severity and then by
+ * position along the trail, so reading down the list is also hiking forwards.
  */
 function Flags({ flags }: { flags: readonly WeatherFlag[] }) {
   if (flags.length === 0) {
@@ -422,12 +368,9 @@ function Flags({ flags }: { flags: readonly WeatherFlag[] }) {
 }
 
 /**
- * Where the numbers came from and when.
- *
- * The hour matters. A forecast read at 06:00 and a forecast read at 18:00 are different
- * forecasts, and a page that shows one without saying which is asking to be trusted more
- * than it deserves. Sunrise and sunset sit here rather than in the table because they are
- * facts about the day, not about a point on the trail.
+ * Where the numbers came from and when. The hour matters: a forecast read at 06:00 and one
+ * read at 18:00 are different forecasts. Sunrise and sunset are facts about the day, not
+ * about a point on the trail, so they sit here rather than in the table.
  */
 function Provenance({ forecast }: { forecast: AlongRouteForecast }) {
   const sunrise = clockOf(forecast.sunriseAt);
@@ -459,12 +402,9 @@ function highestIndex(samples: readonly WeatherSample[]): number {
 }
 
 /**
- * An instant as `14:00 UTC`, or `null` if it will not parse.
- *
- * UTC and labelled as such, not the reader's clock. Every other time on this page is local
- * to the *trail*, so rendering a provenance stamp in the browser's zone would put a third
- * clock on one screen with nothing to distinguish it — and the reader who notices would be
- * right to wonder which zone the arrival times were in.
+ * An instant as `14:00 UTC`, or `null` if it will not parse. UTC and labelled as such: every
+ * other time on this page is local to the *trail*, and the browser's zone would be a third
+ * clock on one screen with nothing to tell it apart.
  */
 function utcClock(iso: string): string | null {
   const at = new Date(iso);

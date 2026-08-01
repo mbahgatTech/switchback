@@ -3,13 +3,9 @@
 import type { AreaSummary, TileCoverage } from '@switchback/core';
 
 /**
- * What we hold for the box you are looking at.
- *
- * This is the visible half of the on-demand design, and it exists because the honest answer
- * to "why is this map empty" is *we have not fetched this ground yet*, not a spinner. The
- * state is carried in words rather than in a spinner or a pulse: `prefers-reduced-motion`
- * flattens every animation in this app to nothing, and a status that only exists as motion
- * would then not exist at all.
+ * What we hold for the box you are looking at — the visible half of the on-demand design. The
+ * state is carried in words rather than in a spinner: `prefers-reduced-motion` flattens every
+ * animation here, and a status that only exists as motion would then not exist at all.
  */
 
 export interface CoverageNoteProps {
@@ -30,11 +26,9 @@ export function CoverageNote({ coverage, area, loading, shown, total }: Coverage
       // Tiles land seconds after the viewport settles, and the count changes under the
       // reader. Polite, so it is announced at a pause rather than interrupting.
       aria-live="polite"
-      // Not a `.collar`. Every other collar on the sheet is a two-word label — SORT, FILTERS,
-      // DIFFICULTY — and uppercase at 0.14em is exactly right for those and wrong for this,
-      // which is a running sentence with numbers in it. It sat in the collar's slot in the
-      // layout and so inherited the collar's class, then cancelled two thirds of it back off
-      // again; what it actually wants is the collar's *size*, in the page's own voice.
+      // Not a `.collar`. Every other collar on the sheet is a two-word label, and uppercase at
+      // 0.14em is wrong for a running sentence with numbers in it; what this wants is the
+      // collar's *size*, in the page's own voice.
       className="flex items-center gap-sm text-micro tracking-normal text-ink-muted"
     >
       {message.pending ? (
@@ -58,14 +52,8 @@ function describe(
   if (coverage?.tooLarge) {
     /*
      * Wide views serve whatever ground is already cached — the ceiling bounds fetching, not
-     * reading. So the note qualifies the count rather than replacing it: what is on screen
-     * is real, it is just not a promise of completeness.
-     *
-     * What it no longer says is "zoom in". That was the only instruction available when a
-     * wide view had no way to request anything, and it was a strange thing to tell somebody
-     * who had deliberately zoomed out to compare regions. There is a button on the sheet
-     * now, so the note's job here is to report the survey behind it — how much of this view
-     * we hold, and whether anything is moving — and let the button do the asking.
+     * reading. So the note qualifies the count rather than replacing it: what is on screen is
+     * real, it is just not a promise of completeness. The button on the sheet does the asking.
      */
     if (area && area.working > 0) {
       return {
@@ -91,31 +79,17 @@ function describe(
   if (loading && !coverage) return { text: 'Reading the sheet…', pending: true };
 
   /*
-   * Ingest was refused — the queue is deep, or the database is close to full.
-   *
-   * Before the note said this, the same state showed as an ordinary pending count with a
-   * pulsing dot: tiles that were never queued, described as arriving, forever. Saying it
-   * plainly costs one line and is the difference between a map that is busy and a map that
-   * looks broken. No apology, because nothing went wrong that the reader should feel
-   * responsible for, and a time to come back, because "try again later" without one is a
-   * shrug.
+   * Ingest was refused — the queue is deep, or the database is close to full. Said plainly,
+   * with a time to come back, because the same state shown as a pending count describes tiles
+   * that were never queued as arriving, forever.
    */
   if (coverage?.busy) {
     /*
      * Which refusal decides the second half of the sentence, because the two do not share an
-     * instruction. A deep queue drains on its own and "try again in a few minutes" is a real
-     * thing to do. A full database does not drain — somebody has to decide what to delete —
-     * so telling the reader to wait for it would be prescribing an action that cannot work,
-     * which is the one thing an error message must never do.
-     *
-     * Review flagged a third case: `'queue-depth'` also covered the 20,000-job derived
-     * backlog, which is hours-to-days of drain rather than minutes, so this branch was
-     * promising a timescale nobody could hold to. Right, and fixed one layer down instead of
-     * here — the derived ceiling no longer refuses anything at all, because nothing in this
-     * deploy could drain it and a ceiling on an undrainable queue is a latch. See
-     * `DERIVED_QUEUE_WARN_DEPTH` in `backpressure.ts`. So `'queue-depth'` now means only the
-     * 600-job request queue, which does drain in minutes, and the sentence below is true of
-     * every refusal that can reach it. A new reason here needs a new sentence, not this one.
+     * instruction: a deep queue drains on its own, a full database needs somebody to decide
+     * what to delete. `'queue-depth'` means only the 600-job request queue, which does drain
+     * in minutes — the derived backlog no longer refuses anything, see
+     * `DERIVED_QUEUE_WARN_DEPTH` in `backpressure.ts`. A new reason needs a new sentence.
      */
     const why =
       coverage.busyReason === 'storage'

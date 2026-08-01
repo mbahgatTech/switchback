@@ -24,18 +24,10 @@ import {
 } from './url-state';
 
 /**
- * Explore — the map and its index.
- *
- * The layout is a map sheet: the sheet itself, and the **collar** down the left, which on a
- * printed survey sheet is the margin carrying the title block, the legend and the index.
- * That is exactly what this panel holds, in that order, and it is why the filters read as a
- * legend and the results as an index rather than as a sidebar of widgets.
- *
- * The map is loaded client-side only. MapLibre touches `window` at import time, so it
- * cannot be server-rendered, and Next 16 only allows `ssr: false` from a Client Component —
- * which is the reason this orchestrator exists as a client boundary at all.
+ * Explore — the map sheet, and down the left the collar carrying search, legend and index.
  */
 
+/** MapLibre touches `window` at import time, so the map can only be loaded client-side. */
 const TrailMap = dynamic(() => import('../map/trail-map').then((mod) => mod.TrailMap), {
   ssr: false,
   loading: () => <div className="absolute inset-0 bg-canvas" />,
@@ -45,51 +37,26 @@ const TrailMap = dynamic(() => import('../map/trail-map').then((mod) => mod.Trai
 const TYPING_MS = 300;
 
 /**
- * How often to re-ask while tiles are still being fetched.
- *
- * A poll, not the SSE stream the plan sketches. With a cap of twelve tiles per viewport and
- * an Overpass round trip measured in seconds, a stream would carry a handful of messages
- * and cost a long-lived connection per open map, a serverless function held open for its
- * duration, and reconnection handling. This is the same information at a fraction of the
- * machinery; the stream is the upgrade if a viewport ever spans hundreds of tiles.
+ * How often to re-ask while tiles are still being fetched. A poll, not the SSE stream the plan
+ * sketches: with a cap of twelve tiles per viewport, a stream would cost a long-lived
+ * connection and a held-open serverless function per open map to carry a handful of messages.
  */
 const POLL_MS = 2_500;
 
-/**
- * The gap between the fetch-area control and the layer switcher's column, plus the inset the
- * switcher itself sits at. Both are `--spacing-lg`, so this is that token doubled — written
- * as a number because it is arithmetic against a px width, and a class cannot do arithmetic.
- */
+/** Gap between the fetch-area control and the layer column, plus the switcher's own inset. */
 const LAYER_COLUMN_CLEARANCE_PX = 32;
 
 /**
- * How long the URL waits behind the map.
- *
- * Longer than the map's own idle event, on purpose. A drag fires `moveend` once, but a
- * flick-and-correct fires it three times in a second, and each one would otherwise be a
- * `replaceState`. Browsers throttle that call — Safari has historically thrown after about
- * a hundred in thirty seconds — so the debounce is a correctness guard as much as a
- * politeness one.
+ * How long the URL waits behind the map. Longer than `moveend`, which a flick-and-correct fires
+ * three times a second: browsers throttle `replaceState` — Safari has historically thrown after
+ * about a hundred calls in thirty seconds — so the debounce is a correctness guard.
  */
 const URL_WRITE_MS = 500;
 
-/**
- * How long an air-quality grid stays fresh on the client.
- *
- * The model publishes hourly and the server buckets its cache key to the hour, so half an
- * hour is comfortably inside the life of a reading and stops a pan-and-return from asking
- * again for a number that cannot have changed.
- */
+/** The model publishes hourly and the server buckets its cache key to the hour. */
 const AIR_QUALITY_STALE_MS = 30 * 60 * 1_000;
 
-/**
- * How long a heatmap grid stays fresh on the client.
- *
- * Longer than air quality, because the thing it measures moves slower than weather does:
- * an aggregate over every recorded hike changes when someone finishes a hike, and one more
- * track in a cell that already holds forty does not move it across a band. Five minutes is
- * short enough that a hiker who just synced sees their own contribution on a reload.
- */
+/** Short enough that a hiker who has just synced sees their own track on a reload. */
 const HEATMAP_STALE_MS = 5 * 60 * 1_000;
 
 export function Explore({
@@ -99,10 +66,8 @@ export function Explore({
   viewerId: string | null;
   /**
    * Where the map opens when the URL does not say — the reader's own place, ranked by
-   * `lib/place.ts`, or Seattle. Resolved on the server and handed over as data, because
-   * `lib/place.ts` imports `next/headers` and cannot be called from this side of the
-   * boundary at all. Present on the very first client render, which is what makes the
-   * opening camera correct before the map exists rather than an `easeTo` afterwards.
+   * `lib/place.ts`, or Seattle. Resolved on the server because `lib/place.ts` imports
+   * `next/headers`, and needed on the first client render so the opening camera is correct.
    */
   opening: ExploreView;
 }) {
@@ -123,18 +88,9 @@ export function Explore({
   const [frame, setFrame] = useState<MapFrame | null>(null);
 
   /**
-   * The URL, read once, after hydration.
-   *
-   * Not during render. The server has no `window` and would render the default viewport,
-   * so reading the query string inline would make the first client render disagree with the
-   * markup it is hydrating — React's own definition of a hydration error. An effect runs
-   * after that reconciliation, which costs one tick and is invisible here because the map
-   * is `ssr: false` and does not exist until this resolves anyway.
-   *
-   * `null` therefore means "not read yet", and the map waits for it. That wait is what makes
-   * a shared link land on the right mountain instead of on wherever the reader happens to be.
-   * Three steps, strongest first: the URL, then `opening` (the reader's own place, ranked by
-   * `lib/place.ts`), then Seattle. A link someone sent beats a cookie only they have.
+   * The URL, read once after hydration — reading it during render would disagree with markup
+   * the server rendered from the default viewport. `null` means "not read yet" and the map
+   * waits for it, which is what makes a shared link beat `opening` and beat Seattle.
    */
   const [initial, setInitial] = useState<ExploreUrlState | null>(null);
   useEffect(() => {
@@ -147,29 +103,11 @@ export function Explore({
   }, []);
 
   /**
-   * And written back, debounced, without touching the router.
-   *
-   * `history.replaceState` rather than `router.replace`: the App Router treats a replace as
-   * navigation, re-runs the server component, and re-renders the tree — for a pan. The
-   * existing `history.state` is passed through untouched because Next keeps its own routing
-   * state in there, and dropping it breaks the back button for every earlier entry.
-   *
-   * The guard is what stops this effect from erasing the camera it was handed. `view` is only
-   * ever set by the map's own `onViewportChange`, which lands after MapLibre has loaded and
-   * settled — comfortably later than `URL_WRITE_MS` after `initial` resolves. So on a load of
-   * `/?map=13/48.012/-121.512` this effect would fire once with `view` still null,
-   * `exploreUrlSearch` would omit `map` because there is no view to write, and the shared
-   * camera would be wiped out of the address bar about six hundred milliseconds in. Measured:
-   * three writes per load, the middle one a bare `/`. Nothing on screen moved, because the map
-   * had already been built from `initial` — but anything that re-read `window.location.search`
-   * after that point, a reload most of all, parsed no `map`, fell through to `opening`, and
-   * landed the reader on their own place instead of on the link they were sent. The URL is
-   * supposed to beat the cookie; that only holds if the URL survives the first second.
-   *
-   * Written as "do not clear what the URL already had" rather than by seeding `view` from
-   * `initial.view ?? opening`, which would also close the gap: `view.zoom` is the heatmap
-   * query's cache key, and seeding it makes that query fire against a zoom the map has not
-   * confirmed it is at.
+   * And written back, debounced. `history.replaceState` rather than `router.replace`, which the
+   * App Router treats as navigation and re-runs the server component for a pan; the existing
+   * `history.state` is passed through because Next keeps its routing state in there. The
+   * `view === null` guard stops the first write erasing a `map=` the URL arrived with, before
+   * the map has reported a viewport of its own.
    */
   useEffect(() => {
     if (!initial) return;
@@ -201,21 +139,10 @@ export function Explore({
   }, []);
 
   /**
-   * Send the map to a geocoded place.
-   *
-   * The typed text is deliberately *not* also applied as a trail filter. Someone who picks
-   * "Vesper Peak" from the list has said where, not what — and the trails around a summit
-   * are mostly not named after it, so filtering by the same string would land the map on
-   * the right mountain and then show an empty index beside it. Moving the map is the whole
-   * of what was asked for; the tiles under it are fetched by the viewport, as always.
-   *
-   * It is also the strongest statement of where somebody is interested in that we ever get,
-   * so it is written to the place cookie — which is this screen's own correction path. A bare
-   * `/` opens on whatever `lib/place.ts` ranks highest, and a searched place outranks the IP
-   * guess, so searching "Vesper Peak" once is also how a reader who keeps landing on the
-   * wrong city fixes it, with no permission prompt and nothing to configure. Named, unlike a
-   * GPS fix — this is the one source that arrives with a place name attached, which is why
-   * `/nearby` can say "Hikes near Snowdonia" without ever reverse-geocoding anything.
+   * Send the map to a geocoded place. Deliberately not also applied as a trail filter — picking
+   * "Vesper Peak" says where, not what, and the trails around a summit are mostly not named
+   * after it. Written to the place cookie too: that is how a reader who keeps landing on the
+   * wrong city corrects it, and it is the only source that arrives with a place name attached.
    */
   const onPlaceSelect = useCallback(
     (place: { bbox: BBox; name: string; lng: number; lat: number }) => {
@@ -229,9 +156,7 @@ export function Explore({
         source: 'search',
         name: place.name,
       }).catch(() => {
-        // Remembering is a courtesy to the next visit. The search itself has already
-        // worked, the map is already moving, and nothing on this screen should stop
-        // because a cookie did not get written.
+        // Remembering is a courtesy to the next visit; the map is already moving.
       });
     },
     [],
@@ -239,7 +164,7 @@ export function Explore({
 
   const onViewportChange = useCallback((next: BBox, zoom: number) => {
     setBbox(round(next));
-    // The centre of the box, not the map's own `getCenter`. Same number for an unrotated
+    // The centre of the box, not the map's own `getCenter` — the same number for an unrotated
     // north-up map, and it keeps this callback's contract to two arguments.
     setView({ center: [(next[0] + next[2]) / 2, (next[1] + next[3]) / 2], zoom });
   }, []);
@@ -269,15 +194,9 @@ export function Explore({
       // does not blank the map and then repaint it.
       placeholderData: (previous) => previous,
       /*
-       * Poll while anything upstream is still moving.
-       *
-       * Two conditions, not one. `pendingTiles` is the automatic path: tiles under a normal
-       * viewport that are being fetched right now. `area.working` is the deliberate one, and
-       * it has to be read separately because a wide viewport is `tooLarge` — which means
-       * `ensureCoverage` queued nothing and `pendingTiles` is empty by construction, however
-       * much work the user just kicked off with the button. Keying the poll on tiles alone
-       * would leave a fetch running invisibly and the map stubbornly unchanged until
-       * something else happened to refetch.
+       * Poll while anything upstream is still moving. `area.working` is read separately from
+       * `pendingTiles` because a wide viewport is `tooLarge` — `ensureCoverage` queues nothing
+       * and `pendingTiles` is empty by construction, however much work the button just started.
        */
       refetchInterval: (active) => {
         const data = active.state.data;
@@ -289,17 +208,9 @@ export function Explore({
   );
 
   /**
-   * The air over the current viewport, asked for only while the overlay is on.
-   *
-   * Deliberately keyed on the same rounded `bbox` the trail browse uses, so a pan that hits
-   * the trail cache hits this one too and the two never disagree about what "this view"
-   * means. `placeholderData` keeps the previous grid painted through the next fetch — the
-   * alternative is a wash that blinks out on every drag, which reads as a failure rather
-   * than as loading.
-   *
-   * No polling. The model publishes hourly, and the cache key on the server is bucketed to
-   * the hour, so asking more often than the reader moves the map would return the identical
-   * object.
+   * The air over the current viewport, asked for only while the overlay is on. Keyed on the
+   * same rounded `bbox` the trail browse uses, so the two never disagree about what "this
+   * view" means. No polling: the server's cache key is bucketed to the hour.
    */
   const airQualityQuery = useQuery(
     trpc.weather.airQualityGrid.queryOptions(
@@ -308,21 +219,16 @@ export function Explore({
         enabled: airQuality && bbox !== null,
         placeholderData: (previous) => previous,
         staleTime: AIR_QUALITY_STALE_MS,
-        // One bad hour upstream should dim the overlay, not retry a scalar field four times
-        // while the reader is trying to pan.
+        // One bad hour upstream should dim the overlay, not retry four times mid-pan.
         retry: 1,
       },
     ),
   );
 
   /**
-   * Where people have recorded hiking, asked for only while the overlay is on.
-   *
-   * The zoom is rounded before it goes in, and that is the whole cache design. The server
-   * turns a zoom into a lattice with `Math.round(zoom) + 5`, so every fractional zoom inside
-   * a level produces byte-identical cells; sending the raw float would give each of them its
-   * own query key and refetch an identical grid on every scroll-wheel notch. Rounding here
-   * means one request per lattice, which is one request per visible change.
+   * Where people have recorded hiking, asked for only while the overlay is on. The zoom is
+   * rounded because the server derives its lattice from `Math.round(zoom) + 5`; a raw float
+   * would give every scroll-wheel notch its own query key for a byte-identical grid.
    */
   const heatmapQuery = useQuery(
     trpc.activities.heatmap.queryOptions(
@@ -343,21 +249,9 @@ export function Explore({
   const selected = trails.find((trail) => trail.id === selectedId) ?? null;
 
   /**
-   * Selecting on the sheet scrolls the index to match.
-   *
-   * Nearest-edge alignment, computed by hand against the list's own box, and the "by hand"
-   * is the point. `scrollIntoView` does the same arithmetic and then applies it to *every*
-   * scrolling box between the element and the viewport — which is what the specification
-   * says it must do. One of those ancestors is the page shell, `overflow-hidden` on
-   * `src/components/explore/explore-shell.tsx`. Hidden is still a scrolling box: it can be
-   * scrolled programmatically, it just has no scrollbar to scroll it back. So picking a trail
-   * off the map shunted the whole page up by however far the filter rail overflowed, left the
-   * header and the filters displaced with no way to undo it, and exposed a strip of the
-   * results list where the map should have been.
-   *
-   * Scrolling only `list` cannot do that to anything above it. Smooth unless the reader has
-   * asked for less motion — a list that jumps is survivable; a list that slides when you
-   * have said not to is not.
+   * Selecting on the sheet scrolls the index to match. Not `scrollIntoView`, which by
+   * specification scrolls every ancestor scrolling box — and the `overflow-hidden` page shell
+   * is one, so picking a trail off the map shunted the whole page up with no way back.
    */
   const listRef = useRef<HTMLOListElement>(null);
   useEffect(() => {
@@ -383,20 +277,10 @@ export function Explore({
   }, [selectedId, trails]);
 
   /**
-   * How much of the bottom of the sheet the pick card is standing on.
-   *
-   * MapLibre's own chrome lives in the corners of the map: the scale bar bottom-left, the
-   * zoom control and the ODbL attribution bottom-right. The pick card is bottom-left too,
-   * and it was landing straight on top of the scale bar — and on a narrow sheet, where it
-   * runs the full width, on the attribution as well. Attribution is a licence condition,
-   * not a nicety, so "roughly clear of it" is not good enough.
-   *
-   * Measured rather than guessed. The card's height is whatever its trail's name wraps to,
-   * so any constant here is a constant that is wrong for some trail — and a constant would
-   * also have to restate `bottom-xl` below, in a second place that has to be kept in step.
-   * One subtraction against the map's own box answers the whole question: the distance from
-   * the bottom of the sheet to the top of the card is exactly the room the chrome needs to
-   * step out of. Zero when nothing is picked, which is the state the CSS reads as "stay put".
+   * How much of the bottom of the sheet the pick card is standing on, so MapLibre's own
+   * corner chrome can step up out of its way — the scale bar and the ODbL attribution both
+   * live down there, and attribution is a licence condition. Measured rather than a constant:
+   * the card's height is whatever its trail's name wraps to.
    */
   const sheetRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -429,14 +313,9 @@ export function Explore({
       <div
         ref={sheetRef}
         /*
-         * `--sb-card-lift` is the room the pick card is taking at the bottom of the sheet,
-         * measured above. MapLibre's corner containers are absolutely positioned against
-         * `bottom: 0`, so a bottom margin walks them up by exactly that much.
-         *
-         * Bottom-left always, because the card is anchored there at every width. Bottom-right
-         * only below `md`, where the card runs the full width and would otherwise sit on the
-         * attribution; from `md` up the card stops at 26rem and that corner is already clear,
-         * so lifting the zoom control there would be motion with no cause.
+         * MapLibre's corner containers are positioned against `bottom: 0`, so a bottom margin
+         * of `--sb-card-lift` walks them clear of the pick card. Bottom-right only below `md`,
+         * where the card runs the full width; above it the card stops at 26rem.
          */
         style={{ '--sb-card-lift': `${cardLift}px` } as CSSProperties}
         className="relative order-first [&_.maplibregl-ctrl-bottom-left]:mb-[var(--sb-card-lift)] max-md:[&_.maplibregl-ctrl-bottom-right]:mb-[var(--sb-card-lift)] md:order-last"
@@ -500,9 +379,8 @@ export function Explore({
         </div>
 
         {selected ? (
-          // Bottom-left, clear of the layer switcher at top-right. It stands on MapLibre's
-          // own bottom chrome, which steps up out of its way — see `--sb-card-lift` above.
-          // The attribution in particular is an ODbL condition, not a nicety.
+          // Bottom-left, clear of the layer switcher at top-right. It stands on MapLibre's own
+          // bottom chrome, which steps up out of its way — see `--sb-card-lift` above.
           <div
             ref={cardRef}
             className="clear-home-indicator pointer-events-none absolute bottom-xl left-lg right-lg flex md:right-auto"
@@ -537,8 +415,7 @@ export function Explore({
           ref={listRef}
           // `overflow-x-clip` rather than nothing: when one axis is not `visible`, CSS
           // computes the other from `visible` to `auto`, so `overflow-y-auto` alone was
-          // quietly asking for a horizontal scrollbar — the one across the bottom of the
-          // filters. `clip` refuses the axis outright instead of hiding a scroller on it.
+          // quietly asking for a horizontal scrollbar. `clip` refuses the axis outright.
           className="flex min-h-0 flex-1 flex-col gap-sm overflow-y-auto overflow-x-clip p-lg"
         >
           {trails.map((trail) => (
@@ -559,12 +436,8 @@ export function Explore({
 }
 
 /**
- * Round the viewport to ~100 m before it becomes a cache key.
- *
- * A drag ends on an arbitrary float, so unrounded boxes mean every pan is a cache miss and
- * a pan back is a second one. At three decimals a returning viewport hits the cache it
- * filled a moment ago, and the map is not meaningfully less accurate — 100 m is a third of
- * a pixel at the zoom where this matters.
+ * Round the viewport to ~100 m before it becomes a cache key, so a pan back hits the cache it
+ * just filled. A third of a pixel at the zoom where this matters.
  */
 function round(bbox: BBox): BBox {
   return bbox.map((value) => Math.round(value * 1000) / 1000) as unknown as BBox;

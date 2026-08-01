@@ -1,30 +1,16 @@
 /**
- * Apple's sign-in button, to Apple's own specification.
- *
- * The second of exactly two controls on this site that are deliberately not in this site's
- * voice — see `microsoft-button.tsx` for the argument, which is the same one. The
- * difference is that Apple's version is not a courtesy: the Human Interface Guidelines and
- * the App Store review process both require the published mark, the published wording, and
- * the published proportions, so a hand-rolled "Continue with Apple" is a control that would
- * have to be rebuilt before the provider could ship anyway.
+ * Apple's sign-in button, to Apple's own specification — the Human Interface Guidelines and
+ * App Store review both require the published mark, wording and proportions.
  *
  * Every measurement lives in `.apple-signin` in `globals.css`, derived from a single
- * `--apple-h`, because Apple states them as ratios of the button's height rather than as
- * pixels. Writing them as pixels would be correct once and wrong the moment anybody changed
- * the row.
- *
- * **The variant is chosen by CSS, not by us**, for the same reason as the Microsoft button:
- * a server component cannot know how `system` resolves for this reader, and `light-dark()`
- * lets the cascade answer it after the HTML has been sent. Apple's rule is black on light
- * and white on dark, which is exactly what that pair expresses.
+ * `--apple-h`, because Apple states them as ratios of the button's height. The light/dark
+ * variant is chosen by `light-dark()` in the cascade: a server component cannot know how
+ * `system` resolves for this reader.
  */
 
 /**
- * Apple's logo, as Apple draws it.
- *
- * A trademark reproduced under the one use Apple grants it — inside their own sign-in
- * button, unmodified, at their proportions. It is not in `packages/ui` and never will be:
- * nothing about this glyph is ours to reuse anywhere else on the site.
+ * Apple's logo, as Apple draws it. A trademark reproduced under the one use Apple grants —
+ * inside their own sign-in button, unmodified. Not in `packages/ui` and never will be.
  */
 function AppleLogo() {
   return (
@@ -44,11 +30,8 @@ function AppleLogo() {
 
 export interface AppleSignInButtonProps {
   /**
-   * Apple publishes three titles and they are not interchangeable.
-   *
-   * `in` for a returning account, `up` for a new one, and `continue` where the page cannot
-   * tell — which is this page, most of the time, since a first-time reader and a returning
-   * one arrive at the same URL.
+   * Apple publishes three titles and they are not interchangeable: `in` for a returning
+   * account, `up` for a new one, `continue` where the page cannot tell.
    */
   action?: 'in' | 'up' | 'continue';
 }

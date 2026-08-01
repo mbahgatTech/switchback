@@ -1,21 +1,10 @@
 /**
- * The explore view, in the address bar.
+ * The explore view, in the address bar — a link is how a plan gets from one person to another.
  *
- * A map without this is a map you cannot send anyone. Someone finds the right ridge, the
- * right filters, the right trail — and the only way to pass it on is to describe it in
- * words. Every mapping product worth using puts the view in the URL, and the reason is not
- * bookmarking: it is that a link is how a plan gets from one person to another.
- *
- * **`map=z/lat/lng`, the OSM spelling.** Familiar, compact, and centre-plus-zoom rather
- * than a bounding box — a box copied from one screen shows a different area on the next,
- * because it has to letterbox to fit a different aspect ratio. A centre and a zoom mean the
- * same place on a phone as on a desktop.
- *
- * **Written with `replaceState`.** Panning a map is not navigation. Pushing an entry per
- * viewport would fill the history stack in one drag and turn the back button into an undo
- * for mouse movements, which is exactly the behaviour people complain about in map apps.
- * Deliberate moves — picking a place, opening a trail — are still ordinary links elsewhere
- * in the app; this file only mirrors state that the user changed by direct manipulation.
+ * `map=z/lat/lng`, the OSM spelling: a centre and a zoom mean the same place on a phone as on
+ * a desktop, where a bounding box has to letterbox to a different aspect ratio. Written with
+ * `replaceState`, because pushing an entry per viewport turns the back button into an undo for
+ * mouse movements.
  */
 
 import { ACTIVITY_TYPES, DIFFICULTIES, ROUTE_TYPES } from '@switchback/core';
@@ -35,10 +24,7 @@ export interface ExploreUrlState {
 }
 
 /**
- * Decimal places kept in the URL.
- *
- * Five is about a metre — past the point where a shared link lands somewhere different, and
- * short enough that the whole parameter stays readable. Zoom keeps two, because fractional
+ * Decimal places kept in the URL. Five is about a metre; zoom keeps two, because fractional
  * zoom is real and `12` versus `12.4` is a visible difference in what fits on screen.
  */
 const COORD_DP = 5;
@@ -63,12 +49,9 @@ function parseView(raw: string | null): ExploreView | null {
 }
 
 /**
- * Read a comma-separated list, keeping only values the app actually knows.
- *
- * A URL is user input and arrives from anywhere — an old link from before a value was
- * renamed, a typo, someone editing the address bar. Unknown values are dropped rather than
- * passed through, because `difficulty=extreme` reaching the API is a validation error for
- * something the user cannot see or fix, and an ignored filter is the gentler failure.
+ * Read a comma-separated list, keeping only values the app knows. A URL is user input, and
+ * `difficulty=extreme` reaching the API is a validation error the reader cannot see or fix;
+ * an ignored filter is the gentler failure.
  */
 function parseEnums<T extends string>(raw: string | null, allowed: readonly T[]): T[] {
   if (!raw) return [];
@@ -92,11 +75,9 @@ function parseFlag(raw: string | null): boolean | undefined {
 }
 
 /**
- * The whole explore state, read from a query string.
- *
- * Takes the search string rather than reading `window` so it is testable and so the caller
- * decides when it runs — this is mount-time state, and re-reading it on every render would
- * fight the user for control of their own map.
+ * The whole explore state, read from a query string. Takes the search string rather than
+ * reading `window`, so it is testable and the caller decides when it runs — this is mount-time
+ * state, and re-reading it every render would fight the reader for control of their own map.
  */
 export function parseExploreUrl(search: string): ExploreUrlState {
   const params = new URLSearchParams(search);
@@ -133,12 +114,9 @@ function range(min: number | undefined, max: number | undefined): string | null 
 }
 
 /**
- * The inverse: state to a query string.
- *
- * Defaults are omitted rather than spelled out. A URL carrying every facet at its empty
- * value is unreadable and unshareable, and — more to the point — indistinguishable from one
- * where someone deliberately chose those values. What is in the URL should be what was
- * chosen.
+ * The inverse: state to a query string. Defaults are omitted rather than spelled out — a URL
+ * carrying every facet at its empty value is indistinguishable from one where somebody
+ * deliberately chose those values.
  */
 export function exploreUrlSearch(state: ExploreUrlState): string {
   const params = new URLSearchParams();
