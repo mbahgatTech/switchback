@@ -19,27 +19,13 @@ import { caller } from '@/trpc/server';
 import { Wordmark } from '@/components/wordmark';
 
 /**
- * Somebody's Lifeline.
+ * Somebody's Lifeline, arranged around one question: is this where they should be by now?
  *
- * The only page in this product written for a reader who did not choose to be here. They were
- * sent a link by somebody going up a hill, and they will open it once at lunchtime and again,
- * differently, if it gets dark. Both readings have to work, and the second one is the one
- * that matters — which is why the page is arranged around a single question, answered before
- * anything else is said: *is this where they should be by now?*
- *
- * A reading page, so `sheet`, with the map set in as a dark `field` instrument the way the
- * trail page does it. The gauge above the map is the hero rather than the map itself, on
- * purpose: a position without a deadline beside it tells a worried person almost nothing.
- *
- * **Server-rendered, and correct without JavaScript.** Lateness is derived on the server on
- * every read, so this page is right whether or not the cron that persists status has run,
- * whether or not the hiker's phone has had signal for an hour, and whether or not the
- * refresher below ever gets to run. The rendered time is printed in plain sight so a stale
- * tab is visibly stale rather than quietly wrong.
- *
- * **No account, no sign-in, no nav into the rest of the site.** The header goes home and
- * stops. Whoever holds this link is here for one person, and a row of product links across
- * the top of it would be the product asking for attention at somebody's worst hour.
+ * **Server-rendered and correct without JavaScript.** Lateness is derived on every read, so the
+ * page is right whether or not the cron that persists status has run and whether or not the
+ * refresher gets to run; the render time is printed so a stale tab is visibly stale. No account,
+ * no sign-in, and no nav into the rest of the site — whoever holds this link is here for one
+ * person.
  */
 
 interface PageProps {
@@ -55,13 +41,7 @@ export const metadata: Metadata = {
 /** Always fresh. A cached position page is a wrong position page. */
 export const dynamic = 'force-dynamic';
 
-/**
- * How often the page reloads itself while somebody is watching it.
- *
- * Two minutes, against a ping cadence measured in minutes and a hiking pace measured in
- * kilometres per hour. Faster would redraw the same dot repeatedly and read as urgency the
- * data cannot support; slower and somebody refreshing by hand would beat it.
- */
+/** Two minutes, against a ping cadence in minutes and a hiking pace in kilometres per hour. */
 const REFRESH_S = 120;
 
 export default async function LifelinePage({ params }: PageProps) {
@@ -87,11 +67,8 @@ export default async function LifelinePage({ params }: PageProps) {
     : null;
 
   const now = new Date();
-  /*
-   * The follower's own units, not the hiker's. Whoever opens this link is the person who
-   * may have to decide whether "600 m" is high enough to be worrying, and they can only do
-   * that in the units they think in — the hiker is not reading this page.
-   */
+  // The follower's own units, not the hiker's: whoever opens this link is the one deciding
+  // whether "600 m" is high enough to worry about, and the hiker is not reading this page.
   const units = await viewerUnits();
   const live = follow.status === 'active' || follow.status === 'overdue';
   const late = follow.status === 'overdue';
@@ -106,11 +83,7 @@ export default async function LifelinePage({ params }: PageProps) {
       </header>
 
       <main className="mx-auto max-w-[880px] px-xl pb-4xl">
-        {/*
-         * The status line and the headline say the same thing twice, in two registers. The
-         * chip is the machine's word for it and never changes shape; the sentence is what a
-         * person would say. Somebody scanning gets the first, somebody reading gets the second.
-         */}
+        {/* The chip is the machine's word for the status; the sentence below is a person's. */}
         <p className="collar flex flex-wrap items-center gap-sm">
           <span
             className={`inline-flex items-center rounded-hair border px-xs py-hair ${
@@ -141,10 +114,7 @@ export default async function LifelinePage({ params }: PageProps) {
           )}
         </p>
 
-        {/*
-         * The gauge. Given the width of the column and nothing else on its line, because it
-         * is the answer to the only question the reader came with.
-         */}
+        {/* The hero, not the map: a position with no deadline beside it says almost nothing. */}
         <div className="mt-xl">
           <h2 className="collar">Return time</h2>
           <ReturnGauge
@@ -234,20 +204,11 @@ export default async function LifelinePage({ params }: PageProps) {
 }
 
 /**
- * What to do about it, and the facts to do it with.
- *
- * Shown only once somebody is actually overdue. A page that carried emergency instructions at
- * all times would train the reader to scroll past them, which is the one thing that must not
- * happen on the day they matter.
- *
- * The card is the useful part. Mountain rescue and every emergency dispatcher ask the same
- * opening questions — who, where, when were they last heard from — and a person looking at a
- * map on a phone in a car park is in no state to compose that from a screen full of prose.
- * So it is set as a card to read aloud: decimal degrees to five places, which is about a
- * metre and the format every service accepts, and times in full rather than as intervals.
- *
- * No emergency number is printed. It is different in every country, this page does not know
- * where the reader is standing, and a wrong number here would be worse than none.
+ * What to do about it, and the facts to do it with. Shown only once somebody is overdue: standing
+ * instructions train the reader to scroll past them. The card is set to be read aloud — decimal
+ * degrees to five places, which is about a metre and the format every dispatcher accepts, and
+ * times in full rather than as intervals. No emergency number: it differs by country and this
+ * page does not know where the reader is standing.
  */
 function Dispatch({ follow, now }: { follow: LifelineFollow; now: Date }) {
   return (
@@ -340,11 +301,8 @@ function Figure({
 }
 
 /**
- * A link that points at nothing.
- *
- * Rendered here rather than handed to `notFound()` because the person reading it is most
- * likely somebody who mistyped or half-copied a link they were sent, at the moment they least
- * want a page that says 404. The message comes from the API, where it is written for them.
+ * A link that points at nothing. Rendered here rather than handed to `notFound()`: the reader is
+ * most likely somebody who half-copied a link, at the moment they least want a 404.
  */
 function Missing({ message }: { message: string }) {
   return (
@@ -361,10 +319,6 @@ function Missing({ message }: { message: string }) {
     </div>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Words and numbers
-// ---------------------------------------------------------------------------
 
 /** The sentence a person would say, which is not the same as the status label. */
 function headline(follow: LifelineFollow): string {
@@ -383,12 +337,7 @@ function headline(follow: LifelineFollow): string {
   }
 }
 
-/**
- * First name only, for the places where the full name would read as a form field.
- *
- * Falls back to the whole string, which is right for a single word and right for the
- * `@handle` the API supplies when somebody has no display name.
- */
+/** First name only. Falls back to the whole string — right for one word, and for an `@handle`. */
 function firstName(name: string): string {
   return name.split(' ')[0] ?? name;
 }
@@ -399,11 +348,8 @@ function ageS(at: Date | null, now: Date): number {
 }
 
 /**
- * The same duration as `formatSpan`, cut to fit a figure cell.
- *
- * `formatSpan` writes for a sentence — "nothing has come through for less than a minute" —
- * and that phrase set in mono under a four-letter label wraps to three lines and stops
- * looking like a reading. A fresh fix is "just now" anywhere it is written as a value.
+ * The same duration as `formatSpan`, cut to fit a figure cell — its sentence form wraps to three
+ * lines under a four-letter label and stops looking like a reading.
  */
 function fixAge(seconds: number): string {
   return seconds < 60 ? 'just now' : formatSpan(seconds);

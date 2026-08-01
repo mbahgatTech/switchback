@@ -9,25 +9,12 @@ import { viewerUnits } from '@/lib/units';
 import { caller } from '@/trpc/server';
 
 /**
- * Draw a route.
+ * Draw a route: the shell, plus the four facts the planner cannot work out itself — units, opening
+ * camera, whether there is anyone to save for, and whether this is a blank sheet or a reopen.
  *
- * The shell, and nothing else — chrome, licence line, and the four facts the planner cannot
- * work out for itself: which units to speak, where the camera opens, whether there is anyone
- * to save for, and whether this is a blank sheet or a route being reopened.
- *
- * **Signing in is not required to plan.** Everything except saving works signed out, which is
- * the difference between a tool and a funnel: somebody working out whether a col is walkable
- * on a borrowed laptop should get the answer, not a wall. The one action that needs an
- * account offers a link to sign in rather than a button that fails.
- *
- * `?route=<id>` reopens a saved route. Two cases, and they are not the same one:
- *
- * - **The viewer owns it** — the anchors come back with the route's name and audience, and
- *   saving updates the route in place.
- * - **Somebody else's, visible to them** — the anchors come back on their own. The line is a
- *   starting point they can move, and saving makes a route of their own rather than editing
- *   a stranger's. A shared route being a template is the useful behaviour; a shared route
- *   being editable is a bug with a lawsuit attached.
+ * Planning works signed out; only saving needs an account. `?route=<id>` reopens a saved route,
+ * and ownership decides which: the owner edits in place, anyone else gets the anchors as a
+ * template and saving makes a route of their own.
  */
 
 export const metadata: Metadata = {
@@ -36,17 +23,11 @@ export const metadata: Metadata = {
 };
 
 /**
- * How close a reopened route sits.
- *
- * Only the saved-route branch below still needs a number of its own: a stored centroid is a
- * known coordinate, as good as a fix, so it gets the zoom where a valley fits. The blank-sheet
- * branch takes its whole camera from `lib/place.ts` instead — the reader's own place, or
- * Seattle — because the alternative is a planner that opens on a different continent from the
- * map the reader just came from. That invariant is the one this page has always claimed, and
- * it used to be spelled as a copy of Explore's Snowdon constant; now it is spelled by both
- * screens asking the same function. A planner that opened on a world view would ask its first
- * question ("click to drop a point") at a scale where no click means anything, which is why
- * there is a floor here at all.
+ * Only the saved-route branch needs a number of its own — a stored centroid is a known
+ * coordinate, so it gets the zoom where a valley fits. The blank sheet takes its whole camera
+ * from `lib/place.ts`, so the planner cannot open on a different continent from the map the
+ * reader just came from. There is a floor at all because "click to drop a point" means nothing
+ * at a world view.
  */
 const ROUTE_ZOOM = 11;
 
@@ -57,8 +38,7 @@ export default async function PlanPage({
 }) {
   const { route: routeId } = await searchParams;
 
-  // None depends on the others, and a cold route fetch should not sit behind the session.
-  // `viewerPlace()` is a cookie-and-header read with no I/O, so it joins them for free.
+  // None depends on the others, and `viewerPlace()` is a cookie-and-header read with no I/O.
   const [viewer, saved, place] = await Promise.all([
     caller.me.get(),
     routeId ? caller.routes.detail({ id: routeId }).catch(() => null) : Promise.resolve(null),
@@ -69,10 +49,7 @@ export default async function PlanPage({
   const opening = placeCamera(place);
   const anchors: readonly RouteAnchor[] = saved?.anchors ?? [];
 
-  /*
-   * Only an owned route is edited. Everything else that arrives with anchors is a copy in
-   * progress, so it opens as an unnamed plan sitting on somebody else's line.
-   */
+  // Only an owned route is edited; anything else with anchors opens as an unnamed copy.
   const editing =
     saved && saved.editable
       ? {

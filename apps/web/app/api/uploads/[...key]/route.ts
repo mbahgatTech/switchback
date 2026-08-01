@@ -1,20 +1,10 @@
 /**
- * The local development object store.
+ * The local development object store: with no Cloudflare account there are no R2 credentials, so
+ * the presigned URL points back here and this route plays the bucket.
  *
- * There is no way to obtain R2 credentials without a Cloudflare account, and the photograph
- * upload has to be buildable, testable and demonstrable before anyone has one. So in
- * development the presigned URL points back here, and this route plays the part of the
- * bucket: it honours a signed, expiring, single-object `PUT`, and serves what it stored.
- *
- * It is a genuine stand-in rather than a shortcut. The signature is checked, the expiry is
- * checked, the content type is pinned to what was signed, and the size is capped — the same
- * four things R2 enforces, so an upload that works here works there. That matters more than
- * it might seem: the failure this prevents is the one where the client is written against a
- * permissive dev endpoint and then meets a real signature for the first time in production.
- *
- * The route disables itself the moment R2 is configured. Two live write paths to the same
- * keys is one more than anybody needs, and a filesystem write on a serverless host writes to
- * a container that is about to disappear.
+ * A genuine stand-in, not a shortcut — signature, expiry, pinned content type and size cap are the
+ * same four things R2 enforces, so a client written against this meets no surprises in production.
+ * It disables itself the moment R2 is configured.
  */
 import { readFile, mkdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -72,11 +62,8 @@ export async function PUT(request: Request, context: RouteContext): Promise<Next
     return NextResponse.json({ error: 'Bad signature.' }, { status: 403 });
   }
 
-  /*
-   * The header must match what was signed, exactly as it must against S3. This is the check
-   * that stops a ticket for a JPEG being used to park an HTML document at a URL our own
-   * origin serves — the stored-XSS hole that signing the content type exists to close.
-   */
+  // The header must match what was signed, exactly as against S3. This is what stops a ticket
+  // for a JPEG parking an HTML document at a URL our own origin serves.
   const sent = request.headers.get('content-type')?.split(';')[0]?.trim();
   if (sent !== contentType) {
     return NextResponse.json({ error: `Content-Type must be ${contentType}.` }, { status: 400 });
@@ -112,12 +99,9 @@ export async function HEAD(_request: Request, context: RouteContext): Promise<Ne
 }
 
 /**
- * Serve a stored object.
- *
- * Unsigned, because these are photographs on public trail pages — the same as they would be
- * from a public bucket. `Content-Disposition: inline` with a pinned type, never a type
- * inferred from the bytes, so a file that somehow got here holding something other than what
- * its extension claims is still rendered as an image and not as a document.
+ * Serve a stored object, unsigned — these are photographs on public trail pages. The type is
+ * pinned from the extension and never inferred from the bytes, so a file holding something other
+ * than what it claims is still rendered as an image rather than as a document.
  */
 export async function GET(_request: Request, context: RouteContext): Promise<NextResponse> {
   if (storage().kind !== 'local') return disabled();
@@ -135,8 +119,8 @@ export async function GET(_request: Request, context: RouteContext): Promise<Nex
         'Content-Type': contentType,
         'Content-Disposition': 'inline',
         'X-Content-Type-Options': 'nosniff',
-        // Keys contain a random id and objects are never overwritten, so the content at a
-        // given URL is immutable by construction.
+        // Keys carry a random id and objects are never overwritten, so the content at a given
+        // URL is immutable by construction.
         'Cache-Control': 'public, max-age=31536000, immutable',
       },
     });

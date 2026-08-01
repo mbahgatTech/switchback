@@ -26,23 +26,12 @@ import { viewerUnits } from '@/lib/units';
 import { caller } from '@/trpc/server';
 
 /**
- * One hike.
+ * One hike. Unlike a trail page, every number here happened — the section carries the hiker's own
+ * splits, which is why the axis gloss reads `elapsed` rather than `at`.
  *
- * The `sheet` scheme, with the map set into it as a dark instrument — the same arrangement
- * as a trail page, and for the same reason. A trail page is read before setting off and this
- * one is read afterwards, but both are reading, and reading happens on paper.
- *
- * **What makes this page different from a trail page is that every number on it happened.**
- * A trail's section carries modelled arrival times from Tobler's function over a DEM; this
- * one carries the hiker's own splits, so the times under the distance axis are what the
- * clock actually said. That is worth being explicit about in the axis gloss — `elapsed`
- * rather than `at` — because two rows of numbers under a section otherwise read as two
- * estimates rather than as an estimate and a fact.
- *
- * The section is drawn from the track's own barometric and GPS altitudes rather than from
- * the trail's DEM profile, even when the hike is attached to a trail. It is noisier. It is
- * also the hike: a recording that wandered to a viewpoint and back climbed those metres,
- * and redrawing it against the trail's idealised line would quietly delete them.
+ * The section is drawn from the track's own altitudes rather than the trail's DEM profile even
+ * when the hike is attached to a trail. It is noisier, and it is the hike: a recording that
+ * wandered to a viewpoint climbed those metres, and the idealised line would delete them.
  */
 
 interface PageProps {
@@ -118,12 +107,8 @@ export default async function ActivityPage({ params }: PageProps) {
         {activity.trail ? (
           <p className="mt-sm font-text text-body-lg text-ink-muted">
             {activity.trail.name === title ? (
-              /*
-               * The heading is already the trail's name — which is what the recorder proposes
-               * for a hike that was logged against one — so saying it again a line below in a
-               * lighter face is a stutter. The line keeps only what the heading does not say:
-               * where this is, and the way through to the trail itself.
-               */
+              /* The heading is already the trail's name, so this line keeps only what it does not
+               * say: where this is, and the way through to the trail itself. */
               <>
                 {activity.trail.regionName ? `${activity.trail.regionName} · ` : null}
                 <Link
@@ -162,22 +147,15 @@ export default async function ActivityPage({ params }: PageProps) {
           </p>
         )}
 
-        {/*
-         * The stat block is a row of gauge faces, not a table: mono numerals over collar
-         * labels, hairline-divided, in the reading order somebody actually wants — how far,
-         * how much up, how long on the move, how fast.
-         */}
+        {/* Gauge faces, in the order somebody wants them: how far, how much up, how long, how fast. */}
         <dl className="mt-xl grid grid-cols-2 gap-px overflow-hidden rounded-hair border border-bezel bg-bezel sm:grid-cols-3 lg:grid-cols-6">
           <Figure label="Distance" value={formatDistance(activity.distanceM, units)} />
           <Figure label="Ascent" value={`↑${formatElevation(activity.gainM, units)}`} />
           <Figure label="Descent" value={`↓${formatElevation(activity.lossM, units)}`} />
           <Figure label="Moving" value={formatClock(activity.movingTimeS)} />
           <Figure label="Elapsed" value={formatClock(activity.elapsedTimeS)} />
-          {/*
-           * Moving pace, not elapsed pace. `avgSpeedMps` is derived from moving time in
-           * `summariseTrack`, so a two-hour lunch on the summit does not read as a slower
-           * hike than it was.
-           */}
+          {/* Moving pace: `avgSpeedMps` is derived from moving time, so a long lunch on the
+           * summit does not read as a slower hike than it was. */}
           <Figure label="Pace" value={paceFromSpeed(activity.avgSpeedMps, units)} />
         </dl>
 
@@ -248,16 +226,9 @@ function Figure({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * The splits.
- *
- * The one statistic on this page that a total cannot say: an even hike and a hike that fell
- * apart on the last climb have the same average and look nothing alike here. The bar is
- * drawn from the *slowest* split rather than from zero, because every hiking pace is a long
- * way from zero and a bar scaled from there is six near-identical bars.
- *
- * Ascent sits in the same row as pace because it is usually the explanation for it, and a
- * reader who has to look in two places to connect a slow kilometre to a 180 m climb will
- * mostly not bother.
+ * The splits — the one statistic a total cannot say. The bar is drawn from the *slowest* split
+ * rather than from zero, because every hiking pace is a long way from zero and a bar scaled from
+ * there is six near-identical bars. Ascent shares the row because it is usually the explanation.
  */
 function Splits({ splits, units }: { splits: readonly Split[]; units: UnitSystem }) {
   const unitLabel = units === 'imperial' ? 'mi' : 'km';
@@ -265,12 +236,8 @@ function Splits({ splits, units }: { splits: readonly Split[]; units: UnitSystem
   const slowest = paces.length > 0 ? Math.max(...paces) : 0;
   const fastest = paces.length > 0 ? Math.min(...paces) : 0;
   const span = slowest - fastest;
-  /*
-   * No bars on a hike with one split, or with several that came out identical. The bar is a
-   * comparison, and a single bar drawn at full width is not a comparison — it is the table
-   * claiming this was the fastest kilometre of a set of one. The column goes rather than
-   * standing empty, so the pace stays against the ascent where it can be read against it.
-   */
+  // A bar is a comparison, so the column goes entirely when there is one split or several
+  // identical ones, rather than standing empty.
   const comparable = span > 0;
 
   return (

@@ -1,27 +1,8 @@
 /**
- * Turn a file somebody chose into the three things the upload needs.
- *
- * All of it happens in the browser, before a byte leaves the machine, and that is the whole
- * design rather than an optimisation. The server has no image decoder — no `sharp`, no native
- * module, nothing that needs a per-platform build in a repository that has no build step — so
- * the downscale, the thumbnail and the BlurHash are computed here, in one pass over an image
- * the canvas has already decoded.
- *
- * What that buys, in order of how much it matters:
- *
- * - **A 4 MB phone photograph becomes ~500 kB before it is sent.** On a trailhead's worth of
- *   signal that is the difference between an upload and an abandoned one.
- * - **EXIF is stripped.** Re-encoding through a canvas drops every tag, so the camera serial,
- *   the owner's name and the coordinates do not reach the bucket. What we *want* from that
- *   metadata is read first, deliberately, and sent as ordinary fields the server can reason
- *   about — see `exif.ts`, and the bounding-box check in `photos.commit` that decides whether
- *   a coordinate is plausible enough to keep.
- * - **HEIC works.** Every iPhone shoots it and no browser but Safari can decode it, so it is
- *   not an accepted upload format. But the phone that took the picture can always decode its
- *   own file, so it re-encodes locally and everyone downstream receives a JPEG.
- *
- * The fallback, when a browser cannot decode the file at all, is to send it untouched if the
- * format is one we accept. Rare, worse in every way, and still better than refusing.
+ * Turn a chosen file into the three things the upload needs — downscaled image, thumbnail and
+ * BlurHash — entirely in the browser. The server has no image decoder, and re-encoding through a
+ * canvas is also what strips EXIF (read first by `exif.ts`) and what converts HEIC to something
+ * every browser can display. When decoding fails, an accepted format is sent untouched.
  */
 import {
   BLURHASH_SAMPLE_EDGE,
@@ -64,8 +45,8 @@ function fitWithin(width: number, height: number, edge: number): { w: number; h:
   const longest = Math.max(width, height);
   if (longest <= edge) return { w: width, h: height };
   const scale = edge / longest;
-  // At least one pixel each way — a panorama scaled to a 32 px sample would otherwise round
-  // its short edge to zero, and a zero-height canvas throws on `getImageData`.
+  // At least one pixel each way: a panorama scaled to a 32 px sample would round its short edge
+  // to zero, and a zero-height canvas throws on `getImageData`.
   return { w: Math.max(1, Math.round(width * scale)), h: Math.max(1, Math.round(height * scale)) };
 }
 
@@ -78,9 +59,8 @@ function draw(source: Source, w: number, h: number): HTMLCanvasElement {
   const context = canvas.getContext('2d', { alpha: false });
   if (!context) throw new PhotoPrepareError('This browser cannot process images.');
 
-  // JPEG has no alpha, and an unpainted canvas is transparent black — so a PNG with a
-  // transparent background would arrive as a photograph on a black card. White is what a
-  // person expects a transparent region to look like on a page.
+  // JPEG has no alpha and an unpainted canvas is transparent black, so a PNG with a transparent
+  // background would arrive as a photograph on a black card.
   context.fillStyle = '#ffffff';
   context.fillRect(0, 0, w, h);
   context.imageSmoothingEnabled = true;
@@ -96,11 +76,8 @@ function encode(canvas: HTMLCanvasElement, type: string, quality: number): Promi
 }
 
 /**
- * Encode once, preferring WebP.
- *
- * A browser that cannot encode WebP does not say so — `toBlob` quietly hands back a PNG,
- * which for a photograph is several times larger than the JPEG we would have asked for. So
- * the result's own `type` is the test, not a feature-detect table.
+ * Encode once, preferring WebP. A browser that cannot encode WebP does not say so — `toBlob`
+ * quietly hands back a PNG — so the result's own `type` is the test, not a feature-detect table.
  */
 async function encodeBest(
   canvas: HTMLCanvasElement,
@@ -116,21 +93,16 @@ async function encodeBest(
 }
 
 /**
- * Decode the file.
- *
- * `createImageBitmap` with `imageOrientation: 'from-image'` is the path that matters: it
- * applies the EXIF orientation tag while decoding, so a photograph taken in portrait is
- * upright on the canvas. Without it, every sideways holiday photograph on the internet
- * happens again — the tag is stripped by the re-encode, and the rotation it described is lost
- * with it. The `<img>` fallback is for browsers without the option, where the element's own
- * decoder honours orientation anyway.
+ * Decode the file. `imageOrientation: 'from-image'` is the part that matters — it applies the
+ * EXIF orientation tag while decoding, and the re-encode strips that tag, so without it every
+ * portrait photograph ships sideways. The `<img>` fallback honours orientation in its own decoder.
  */
 async function decode(file: Blob): Promise<Source> {
   if (typeof createImageBitmap === 'function') {
     try {
       return await createImageBitmap(file, { imageOrientation: 'from-image' });
     } catch {
-      // Fall through — Safari has historically rejected the options bag rather than ignoring it.
+      // Safari has historically rejected the options bag rather than ignoring it.
     }
     try {
       return await createImageBitmap(file);
@@ -148,8 +120,7 @@ async function decode(file: Blob): Promise<Source> {
       image.src = url;
     });
   } finally {
-    // Safe immediately: a loaded `<img>` holds its own decoded copy, and a failed one is
-    // never going to need the blob again.
+    // Safe immediately: a loaded `<img>` holds its own decoded copy.
     URL.revokeObjectURL(url);
   }
 }
@@ -160,12 +131,7 @@ function dimensionsOf(source: Source): { width: number; height: number } {
     : { width: source.width, height: source.height };
 }
 
-/**
- * The last thing sent when the canvas route failed entirely.
- *
- * No dimensions, no hash, no thumbnail, full size — but the photograph reaches the trail
- * page, which is what the person was trying to do.
- */
+/** The last resort when the canvas route failed: no dimensions, no hash, full size, but it lands. */
 function untouched(file: File, exif: Awaited<ReturnType<typeof readExif>>): PreparedPhoto {
   if (!ACCEPTED.has(file.type)) {
     throw new PhotoPrepareError('That file is not an image we can read. Try a JPEG or a PNG.');
@@ -185,10 +151,9 @@ function untouched(file: File, exif: Awaited<ReturnType<typeof readExif>>): Prep
 export async function preparePhoto(file: File): Promise<PreparedPhoto> {
   if (file.size === 0) throw new PhotoPrepareError('That file is empty.');
   if (file.size > MAX_PHOTO_BYTES * 4) {
-    // Checked before decoding rather than after: a 200 MB file will exhaust the tab's memory
-    // on `createImageBitmap` and take the page down with it, and no amount of re-encoding is
-    // going to rescue something that far past the limit. Four times the ceiling leaves room
-    // for a large raw-ish JPEG that will comfortably clear it once re-encoded.
+    // Checked before decoding: a 200 MB file exhausts the tab's memory on `createImageBitmap`
+    // and takes the page with it. Four times the ceiling leaves room for a large JPEG that will
+    // clear the limit once re-encoded.
     throw new PhotoPrepareError(
       `That photograph is ${formatBytes(file.size)}, which is too large to process.`,
     );
@@ -214,8 +179,8 @@ export async function preparePhoto(file: File): Promise<PreparedPhoto> {
       PHOTO_JPEG_QUALITY,
     );
 
-    // The thumbnail is always JPEG — it is what the key's `_t.jpg` suffix says it is, and the
-    // server signs `image/jpeg` for that object without knowing what the full image became.
+    // Always JPEG: it is what the key's `_t.jpg` suffix says it is, and the server signs
+    // `image/jpeg` for that object without knowing what the full image became.
     const thumbSize = fitWithin(natural.width, natural.height, PHOTO_THUMB_EDGE);
     const thumb = await encode(draw(source, thumbSize.w, thumbSize.h), 'image/jpeg', 0.78);
 
@@ -226,8 +191,7 @@ export async function preparePhoto(file: File): Promise<PreparedPhoto> {
       const pixels = canvas.getContext('2d')?.getImageData(0, 0, sample.w, sample.h);
       if (pixels) blurhash = encodeBlurhash(pixels.data, sample.w, sample.h);
     } catch {
-      // A placeholder is decoration. Losing it costs a grey rectangle for a few hundred
-      // milliseconds; failing the upload over it costs the photograph.
+      // A placeholder is decoration; failing the upload over it costs the photograph.
       blurhash = null;
     }
 

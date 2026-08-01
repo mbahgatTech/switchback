@@ -5,11 +5,8 @@ import { prisma } from '@switchback/db';
 import { IdentityTokenError, verifyIdentityToken } from '@/auth-native';
 
 /**
- * POST /api/auth/mobile/exchange
- *
- * Trade a provider identity token for a Switchback token pair. This is the native
- * equivalent of the callback the browser goes through, and the only endpoint the app hits
- * while signed out.
+ * Trade a provider identity token for a Switchback token pair — the native equivalent of the
+ * browser callback, and the only endpoint the app hits while signed out.
  */
 export const runtime = 'nodejs';
 
@@ -21,9 +18,9 @@ const bodySchema = z.object({
   /** Shown in the "signed-in devices" list. Cosmetic, and therefore never trusted. */
   deviceName: z.string().trim().max(80).optional(),
   /**
-   * Apple returns the user's name exactly once, in the *authorization response* rather
-   * than the identity token, and never again. If the app does not forward it here on that
-   * first call, the account has no name forever.
+   * Apple returns the user's name exactly once, in the authorization response rather than the
+   * identity token. If the app does not forward it on that first call, the account has no name
+   * for ever.
    */
   fullName: z.string().trim().max(80).optional(),
 });
@@ -67,20 +64,10 @@ export async function POST(request: Request): Promise<Response> {
 
     if (byEmail && !identity.emailVerified) {
       /**
-       * An account with this email exists and the provider will not vouch for the address.
-       * Linking here would let anyone who can get a token asserting `you@example.com` take
-       * over that account, which is the classic account-linking hole — and for Entra it is
-       * not theoretical: `email` is a tenant-mutable attribute, we sign against `/common`,
-       * and a free tenant costs nothing. `auth-native.ts` has the full reasoning.
-       *
-       * Refusing costs a legitimate user one extra step. Allowing it costs someone their
-       * account, along with every activity, photograph and list on it.
-       *
-       * The message names the only recovery that exists. An earlier draft said to "link this
-       * device from settings", and there is no such control — `me.ts` exposes no linking
-       * procedure and `settings-form.tsx` has no linking affordance, so the sentence sent the
-       * reader looking for a button nobody has written. Signing in with the provider the
-       * account was made with is a thing they can actually do, on this screen, now.
+       * The classic account-linking hole: linking on an address the provider will not vouch for
+       * lets anyone who can mint a token asserting `you@example.com` take the account over. Not
+       * theoretical for Entra — see `auth-native.ts`. The message names the only recovery that
+       * exists; there is no device-linking control in settings to send anyone to.
        */
       return Response.json(
         {
@@ -94,25 +81,18 @@ export async function POST(request: Request): Promise<Response> {
 
     if (byEmail) {
       /*
-       * Reached only for Apple, which asserts `email_verified` itself. Entra never gets here
-       * now, and this branch is the one to delete once the forward-looking cost is understood
-       * — see `scripts/report-email-linked-accounts.ts`.
-       *
-       * Note what removal does *not* cost, because an earlier comment here had it wrong: the
-       * `account.create` below runs on this path as well as the create path, so anybody linked
-       * this way already has a row keyed on (provider, providerAccountId) and resolves through
-       * the `existing` lookup above on every later sign-in. Deleting these two lines cannot
-       * strand them. What it changes is which future unknown-`sub` sign-ins may link at all —
-       * an Entra user whose browser account has a different `sub` is then permanently 409ed by
-       * the branch above, on a message that promises the device will be added.
+       * Apple only — it asserts `email_verified` itself. Deleting these two lines cannot strand
+       * anyone already linked this way (`account.create` below runs on this path too, so they
+       * resolve through `existing` on every later sign-in); what it changes is which future
+       * unknown-`sub` sign-ins may link at all. See `scripts/report-email-linked-accounts.ts`.
        */
       userId = byEmail.id;
     } else {
       const created = await prisma.user.create({
         data: {
           email: identity.email,
-          // Apple's name only ever arrives on the first authorization, so prefer it over
-          // the token claim, which for Apple is absent.
+          // Apple's name only arrives on the first authorization, so prefer it over the token
+          // claim, which for Apple is absent.
           name: fullName ?? identity.name,
           emailVerified: identity.emailVerified ? new Date() : null,
         },

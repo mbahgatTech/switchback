@@ -12,12 +12,9 @@ import { caller } from '@/trpc/server';
 import './globals.css';
 
 /**
- * Self-hosted at build time rather than requested from Google — no third-party connection
- * at runtime, and no layout shift.
- *
- * Archivo carries the width axis explicitly: `wght` comes with any variable font, `wdth`
- * has to be asked for, and without it `font-stretch: 78%` on the collar label silently
- * does nothing. That failure is invisible in a screenshot, which is why it is called out.
+ * Self-hosted at build time — no third-party connection at runtime, and no layout shift.
+ * `axes: ['wdth']` is required: without it `font-stretch: 78%` on the collar label silently
+ * does nothing, and that failure is invisible in a screenshot.
  */
 const archivo = Archivo({
   subsets: ['latin'],
@@ -47,45 +44,20 @@ export const metadata: Metadata = {
   description: BRAND.tagline,
   applicationName: BRAND.name,
   /*
-   * Launching from the home screen without the address bar, on two eras of iOS.
-   *
-   * Since iOS 17 Safari reads the manifest's `display` member, and the `standalone` in
-   * `manifest.ts` is what actually does this on any current phone. Before 17 the manifest was
-   * ignored and the launch keyed off a meta tag instead — and added to the home screen
-   * without it, the site opens in a Safari tab with the address bar and toolbar taking a
-   * third of the screen, which for a map is the difference between an app and a bookmark.
-   *
-   * `capable: true` used to emit that tag. It now emits the standardised
-   * `mobile-web-app-capable`, which iOS 16 and earlier do not recognise, so the Apple-prefixed
-   * name is set by hand below. Neither line costs anything; the hand-written one is the only
-   * thing standing between an older phone and a bookmark.
-   *
-   * `title` is the label under the icon. Without it the launcher falls back to `<title>`, and
-   * relying on that is one metadata edit away from a truncated word: the start URL used to be
-   * `/explore`, whose title read "Explore · Switchback" and got cut to "Explore". It is `/`
-   * now, which sets its own title absolutely and reads correctly — so this line is currently
-   * belt to that page's braces, and it stays because the braces belong to a different file.
-   *
-   * No `statusBarStyle`. The only value with an effect is `black-translucent`, which pulls
-   * the page up under the clock and the battery — and this page's top edge is the neatline
-   * and the wordmark, not the map. `viewportFit: 'cover'` below is what the map needs, and
-   * it does not require the status bar to be given away.
+   * Launching from the home screen without the address bar. `capable: true` now emits the
+   * standardised `mobile-web-app-capable`, which iOS 16 and earlier do not recognise — so the
+   * Apple-prefixed name below is written by hand and is not a duplicate. `title` is the label
+   * under the icon; without it the launcher falls back to `<title>` and can truncate. No
+   * `statusBarStyle`: the only value with an effect pulls the page under the clock.
    */
   appleWebApp: { capable: true, title: BRAND.name },
   other: { 'apple-mobile-web-app-capable': 'yes' },
 };
 
 /**
- * The colour behind the iOS status bar and the Android address bar.
- *
- * A function rather than a constant because it depends on the reader. When they have
- * chosen, there is one right answer and we give it. When they have not, we hand the browser
- * *both* answers keyed on `prefers-color-scheme` and let it pick — which is the same
- * decision `theme.css` makes for the page itself, made the same way, so the chrome and the
- * canvas cannot disagree at dusk.
- *
- * `field.canvas` in either case: the document below declares the field scheme outright, so
- * this is the colour immediately under the notch, not a guess at an average.
+ * The colour behind the iOS status bar and the Android address bar. A function because it
+ * depends on the reader: with no choice made, the browser gets both answers keyed on
+ * `prefers-color-scheme`, the same way `theme.css` decides it for the page.
  */
 export async function generateViewport(): Promise<Viewport> {
   const theme = await currentTheme();
@@ -106,27 +78,17 @@ export async function generateViewport(): Promise<Viewport> {
 }
 
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
-  /*
-   * Both reads are `cache()`d per request and every page below already does one of them, so
-   * this costs a layout that was going to be dynamic anyway — the session is a cookie read,
-   * and there is no version of "remember my theme" that can be answered at build time.
-   */
+  // Both reads are `cache()`d per request and every page below already does one of them.
   const [viewer, theme] = await Promise.all([caller.me.get(), currentTheme()]);
 
   /*
-   * `sheet` is the token default — an unmarked page is a reading page. This app is not one:
-   * the map is its ground, so the document declares `field` and reading views opt back out
-   * on their own wrapper. Declaring it on <html> rather than on a div inside is what makes
-   * the overscroll area, the scrollbar, and the address bar agree with the page.
+   * `sheet` is the token default; this app's ground is the map, so the document declares `field`
+   * and reading views opt back out on their own wrapper. On <html> rather than an inner div so
+   * the overscroll area, the scrollbar and the address bar agree with the page.
    *
-   * `data-mode` is the second axis and sits on the same element: scheme says *which sheet
-   * this is*, mode says *which light you are reading it in*. Keeping them orthogonal is what
-   * lets a reading page nested inside a dark document stay a reading page — it flips its own
-   * scheme and inherits the mode, rather than having to know about four palettes.
-   *
-   * Absent when the reader follows their device, which is not the same as `data-mode="system"`:
-   * the stylesheet's `prefers-color-scheme` fallbacks are keyed on `html:not([data-mode])`,
-   * so writing the attribute at all would switch them off.
+   * `data-mode` is the orthogonal axis and is *absent* when the reader follows their device —
+   * not `"system"`. The stylesheet's `prefers-color-scheme` fallbacks key on
+   * `html:not([data-mode])`, so writing the attribute at all switches them off.
    */
   return (
     <html
@@ -138,18 +100,12 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <body>
         {/*
          * Before the provider and before the queue, because it is what tells the queue whose
-         * rows are whose. The session was already read for the nav and the units, so naming
-         * the reader here costs nothing; what it buys is that a browser which has changed
-         * hands says so — and sets aside the previous person's unsent hikes and reports —
-         * rather than posting them under whoever is signed in now. See `offline/handover.ts`.
+         * rows are whose — a browser that has changed hands sets aside the previous person's
+         * unsent hikes rather than posting them under whoever is signed in now.
          */}
         <ReaderIdentity readerId={viewer?.id ?? null} />
         <TRPCReactProvider>
-          {/*
-           * Mounted here rather than per page because a measurement can be rendered by any
-           * client component on any route, and the one thing this must not be is somewhere
-           * a new card can forget to opt into.
-           */}
+          {/* Mounted here, not per page: any client component on any route may render a measurement. */}
           <UnitsProvider units={viewer?.units ?? 'metric'}>
             {children}
             {/* Inside the provider, not beside it: it posts with the tRPC client. */}
