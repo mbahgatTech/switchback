@@ -4,6 +4,7 @@ import { healthRouter } from './routers/health';
 import { lifelineRouter } from './routers/lifeline';
 import { listsRouter } from './routers/lists';
 import { meRouter } from './routers/me';
+import { moderationRouter } from './routers/moderation';
 import { photosRouter } from './routers/photos';
 import { placesRouter } from './routers/places';
 import { reviewsRouter } from './routers/reviews';
@@ -25,6 +26,7 @@ export const appRouter = router({
   lifeline: lifelineRouter,
   lists: listsRouter,
   me: meRouter,
+  moderation: moderationRouter,
   photos: photosRouter,
   places: placesRouter,
   reviews: reviewsRouter,

@@ -12,6 +12,7 @@ import {
   addDays,
   formatDateLabel,
   formatDayLabel,
+  REMOVED_NOTICE_OWN,
   hikedOnSchema,
   todayLocal,
 } from '@switchback/core';
@@ -199,6 +200,26 @@ export function ReportForm({ trailId }: { trailId: string }) {
         >
           <Text style={styles.openLabel}>Sign in</Text>
         </Pressable>
+      </View>
+    );
+  }
+
+  if (existing?.hidden) {
+    /*
+     * The author of a removed report is told before they type, not after.
+     *
+     * `reviews.mine` returns the hidden row, but `toReview` empties it on the way out:
+     * rating and body come back null, conditions empty, activity null, helpful count zero.
+     * Only the dates and the author survive. So opening the form on it would show a blank
+     * screen where their report was — reading as though the app had lost it rather than
+     * removed it — and both buttons on that screen are refused server-side: `reviews.upsert`
+     * will not edit a hidden row and `reviews.remove` will not delete one. Offering the
+     * screen at all invites the two actions that cannot succeed. The notice carries the
+     * address, which is the move that is actually available.
+     */
+    return (
+      <View style={styles.removed}>
+        <Text style={styles.removedProse}>{REMOVED_NOTICE_OWN}</Text>
       </View>
     );
   }
@@ -551,6 +572,17 @@ const styles = StyleSheet.create({
     padding: theme.space.lg,
   },
   promptProse: { ...theme.text('body', { family: 'text' }), color: theme.color.inkMuted },
+
+  // ── Removed by a moderator ──
+  // Survey, and a hairline: this is about the reader's own standing on the site rather than
+  // about the trail, which is the one thing that plate means.
+  removed: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.color.survey,
+    borderRadius: theme.radius.hair,
+    padding: theme.space.lg,
+  },
+  removedProse: { ...theme.text('body', { family: 'text' }), color: theme.color.ink },
 
   // ── The way in ──
   open: {

@@ -21,6 +21,7 @@ import { SaveControls } from '@/components/lists/save-controls';
 import { DownloadTrail } from '@/components/offline/download-trail';
 import { TrailExport } from '@/components/trail/trail-export';
 import { PhotoGallery } from '@/components/photos/gallery';
+import { SiteFooter } from '@/components/site-footer';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
 import { TrailPlanner } from '@/components/trail/planner';
@@ -134,7 +135,10 @@ export default async function TrailPage({ params }: PageProps) {
   // render of the part that matters. Requested together rather than in sequence. `me.get`
   // costs nothing extra — the request context has already loaded the user for `ctx.user`.
   const [photos, nearby, viewer] = await Promise.all([
-    caller.trails.photos({ trailId: trail.id, limit: 12 }),
+    // `includeHidden` is asked for on every render and granted to nobody but an operator —
+    // `trails.photos` reads the role from the session. It is what puts a taken-down frame in
+    // front of the one control that can put it back.
+    caller.trails.photos({ trailId: trail.id, limit: 12, includeHidden: true }),
     caller.trails.nearby({ at: trail.centroid, radiusM: 30_000, limit: 7 }),
     caller.me.get(),
   ]);
@@ -402,6 +406,7 @@ export default async function TrailPage({ params }: PageProps) {
           trailName={trail.name}
           trailPath={`/trails/${trail.slug}`}
           viewerId={viewer?.id ?? null}
+          viewerRole={viewer?.role ?? 'member'}
         />
 
         {/*
@@ -417,6 +422,7 @@ export default async function TrailPage({ params }: PageProps) {
           trailPath={`/trails/${trail.slug}`}
           initial={photos}
           isViewerKnown={viewer !== null}
+          viewerRole={viewer?.role ?? 'member'}
         />
 
         {/* ── Nearby ───────────────────────────────────────────────────────────────── */}
@@ -480,6 +486,16 @@ export default async function TrailPage({ params }: PageProps) {
             </p>
           ) : null}
         </footer>
+
+        {/*
+         * The site colophon, under the trail's own provenance note and distinct from it.
+         * That one is about where this route came from; this one is the small print — the
+         * rules, and the way to complain about something on this page. It is here in
+         * particular because this is the page that carries other people's writing and
+         * photographs, and somebody who cannot find the Report control beside a frame has
+         * to be able to find the route in at the bottom of the page.
+         */}
+        <SiteFooter />
       </main>
     </div>
   );

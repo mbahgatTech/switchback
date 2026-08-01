@@ -165,8 +165,11 @@ export async function hikerStats(
       LIMIT ${TOP_REGIONS}
     `,
 
-    db.review.count({ where: { userId } }),
-    db.photo.count({ where: { userId } }),
+    // A hiker's totals count what is still standing. Content a moderator removed is not a
+    // contribution any more, and leaving it in the tally would let somebody's profile keep
+    // credit for the thing that was taken down.
+    db.review.count({ where: { userId, hiddenAt: null } }),
+    db.photo.count({ where: { userId, hiddenAt: null } }),
   ]);
 
   return shapeStats({ totals, records, months, regions, reviews, photos, now });

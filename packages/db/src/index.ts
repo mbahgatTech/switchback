@@ -12,6 +12,7 @@ export type {
   ActivitySample,
   BusynessBucket,
   Completion,
+  ContentReport,
   ElevationProfile,
   IngestJob,
   IngestTile,
@@ -43,4 +44,8 @@ export {
   Visibility,
   WaypointKind,
   LifelineStatus,
+  ReportReason,
+  ReportStatus,
+  ReportSubject,
+  UserRole,
 } from '@prisma/client';

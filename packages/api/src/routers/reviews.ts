@@ -24,6 +24,7 @@ import {
   CONDITIONS_WINDOW_DAYS,
   REVIEW_PHOTOS_IN_LIST,
   REVIEW_SORTS,
+  REMOVED_NOTICE_OWN,
   averageRating,
   normaliseConditions,
   reviewWriteSchema,
@@ -58,6 +59,12 @@ const reviewSelect = {
   helpfulCount: true,
   createdAt: true,
   updatedAt: true,
+  /*
+   * Read on every row so `toReview` can print a tombstone rather than a report. Only the
+   * timestamp: `hiddenReason` is the moderator's note and is answered on appeal, not
+   * published back to the page that the complaint was about.
+   */
+  hiddenAt: true,
   user: { select: { id: true, username: true, name: true, image: true } },
   /*
    * The photographs filed with the report, oldest first and capped.
@@ -68,6 +75,12 @@ const reviewSelect = {
    * one go stays in the order it was picked, which on a hike is the order it was hiked.
    */
   photos: {
+    /*
+     * A photograph a moderator has taken down must not come back attached to a report that
+     * was left up. The strip simply gets shorter — there is no tombstone here, because a
+     * gap in a row of thumbnails communicates nothing and a grey box communicates less.
+     */
+    where: { hiddenAt: null },
     select: {
       id: true,
       url: true,
@@ -119,18 +132,49 @@ export function toUtcMidnight(value: string): Date {
 }
 
 export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
+  const hidden = row.hiddenAt !== null;
+
   return {
     id: row.id,
     trailId: row.trailId,
-    rating: row.rating,
-    body: row.body,
+    /*
+     * **A hidden report is a tombstone, not a 404 and not a deletion.**
+     *
+     * The row survives and the list still returns it, so the page prints "removed by a
+     * moderator" where the report was. Dropping it from the list instead was the obvious
+     * alternative and it is worse in both directions: to its author the report silently
+     * vanishes, which reads as a bug in the product rather than as a decision somebody
+     * made and can be argued with; and to anybody who linked to the page, a thread of
+     * replies loses its subject with no explanation.
+     *
+     * What is stripped is everything the moderator objected to — the prose, the
+     * photographs, the condition chips — and, since a review of this PR, every *number*
+     * the row carried as well. The rule the first pass got wrong is that a value which no
+     * renderer draws is still published: it ships in the JSON, and it can be read off the
+     * row's position in a sorted list even by somebody who never opens the network tab.
+     *
+     * `rating` used to survive here on the reasoning that both renderers decline to draw
+     * it. But `rating_desc` and `rating_asc` order on the database column, so a tombstone
+     * standing first under "Highest rated" and last under "Lowest rated" announced the
+     * withdrawn number without printing it — while `ratingCounts` excluded that same row
+     * from the average, so the page both refused the rating and leaked it. `helpfulCount`
+     * was worse than leaked, it was *drawn*: with `activityType` nulled the footer's
+     * condition collapsed to the count alone, and a removed report printed "3 found this
+     * useful" directly beneath its own tombstone — the page endorsing the report it had
+     * just withdrawn. Roughly eight in nine seeded reviews carry a non-zero count, so that
+     * was the ordinary case rather than an edge.
+     *
+     * What survives is that somebody reported on this trail and when. Nothing numeric.
+     */
+    rating: hidden ? null : row.rating,
+    body: hidden ? null : row.body,
     hikedOn: toDateString(row.hikedOn),
     // Re-normalised on the way out as well as in. Rows predating this router, or written by
     // a future admin path, have no guarantee of canonical order and the chips must not
     // reshuffle between two reviews saying the same thing.
-    conditions: normaliseConditions(row.conditions),
-    activityType: row.activityType,
-    helpfulCount: row.helpfulCount,
+    conditions: hidden ? [] : normaliseConditions(row.conditions),
+    activityType: hidden ? null : row.activityType,
+    helpfulCount: hidden ? 0 : row.helpfulCount,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     author: {
@@ -139,10 +183,31 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
       name: row.user.name,
       image: row.user.image,
     },
-    photos: row.photos,
+    photos: hidden ? [] : row.photos,
     isMine: viewerId !== null && row.userId === viewerId,
+    hidden,
   };
 }
+
+/**
+ * Tombstones last, as a block, in every sort whose key a tombstone no longer carries.
+ *
+ * `nulls: 'first'` puts the visible rows (`hiddenAt IS NULL`) ahead of the removed ones, and
+ * the removed ones then fall newest-takedown-first among themselves.
+ *
+ * This is the half of the leak that stripping the shape does not close. `toReview` runs after
+ * Postgres has already sorted, so nulling `rating` on the way out changes what the row *says*
+ * and nothing about where it *stands* — and under `rating_desc` a tombstone in position one
+ * says "five stars" to anybody who can count, as loudly as printing it would. The fix has to
+ * be in the query. Ordering the tombstones into one block at the end means their position
+ * asserts only that they were removed, which is the one thing the page is already saying out
+ * loud.
+ *
+ * Deliberately **not** applied to `recent`. That sort keys on `createdAt`, which the tombstone
+ * still prints on its own face ("Written 15 March"), so there is nothing to leak — and holding
+ * a removed report in its chronological place is the whole point of keeping the row at all.
+ */
+const TOMBSTONES_LAST = { hiddenAt: { sort: 'desc', nulls: 'first' } } as const;
 
 /**
  * Sort orders, each with a full tiebreak chain.
@@ -154,22 +219,31 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
  */
 export const ORDER_BY: Readonly<Record<ReviewSort, Prisma.ReviewOrderByWithRelationInput[]>> = {
   recent: [{ createdAt: 'desc' }, { id: 'desc' }],
-  rating_desc: [{ rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
-  rating_asc: [{ rating: 'asc' }, { createdAt: 'desc' }, { id: 'desc' }],
-  helpful: [{ helpfulCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  rating_desc: [TOMBSTONES_LAST, { rating: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  rating_asc: [TOMBSTONES_LAST, { rating: 'asc' }, { createdAt: 'desc' }, { id: 'desc' }],
+  helpful: [TOMBSTONES_LAST, { helpfulCount: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
 };
 
 // ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
 
-/** Counts indexed by rating − 1, so `counts[0]` is the one-star bucket. */
 type RatingCounts = [number, number, number, number, number];
 
+/**
+ * Counts indexed by rating − 1, so `counts[0]` is the one-star bucket.
+ *
+ * **Hidden reports are not counted, anywhere.** A rating the page is not permitted to show
+ * that is still inside the mean is a number on a card corresponding to nothing anybody
+ * said, and it never self-corrects — nothing recomputes a trail's average until the next
+ * person writes a review, so one moderated one-star can sit in the figure for months. The
+ * filter belongs here rather than at each call site because this is the only function that
+ * reads ratings, and a filter written once cannot be forgotten in one of three places.
+ */
 async function ratingCounts(db: Prisma.TransactionClient, trailId: string): Promise<RatingCounts> {
   const buckets = await db.review.groupBy({
     by: ['rating'],
-    where: { trailId },
+    where: { trailId, hiddenAt: null },
     _count: { _all: true },
   });
   const counts: RatingCounts = [0, 0, 0, 0, 0];
@@ -195,8 +269,15 @@ function total(counts: RatingCounts): number {
  *
  * The average goes through `averageRating`, the same function the summary endpoint uses, so
  * the number in the title block and the number over the histogram cannot round differently.
+ *
+ * Exported because `routers/moderation.ts` has to call it too: hiding a review changes the
+ * mean exactly as much as deleting one does, and a takedown that skipped this would leave a
+ * rating on the card that includes a report the page refuses to show.
  */
-async function refreshAggregates(db: Prisma.TransactionClient, trailId: string): Promise<void> {
+export async function refreshRatingAggregates(
+  db: Prisma.TransactionClient,
+  trailId: string,
+): Promise<void> {
   const counts = await ratingCounts(db, trailId);
   await db.trail.update({
     where: { id: trailId },
@@ -269,6 +350,10 @@ export const reviewsRouter = router({
         ctx.db.review.findMany({
           where: {
             trailId: input.trailId,
+            // Same rule as the ratings: what a moderator took down is not evidence about
+            // the ground, and a chip tallied out of a removed report is a claim with no
+            // source a reader can go and check.
+            hiddenAt: null,
             // Dated by when they were *there*, falling back to when they wrote it. A report
             // filed today about a hike last spring is not evidence about this week's ground,
             // and treating it as such is the failure mode this window exists to avoid.
@@ -329,6 +414,32 @@ export const reviewsRouter = router({
     .mutation(async ({ ctx, input }): Promise<ReviewShape> => {
       await assertTrail(ctx.db, input.trailId);
 
+      /*
+       * **A report a moderator took down cannot be edited back into existence.**
+       *
+       * Without this the takedown lever is a suggestion: the write path here is an upsert
+       * keyed on `(trailId, userId)`, so the author of a hidden review re-submitting the
+       * form would update the same row — leaving `hiddenAt` set but replacing the body,
+       * and, on the day somebody adds an "unhide" to a queue, restoring exactly the text
+       * that was removed. Refusing the write is the only version of this that holds.
+       *
+       * **`remove` refuses a hidden review for the same reason**, and it has to, or this
+       * guard is two calls from useless: delete the tombstone and the next upsert finds no
+       * row, passes this check, and republishes the removed prose under a fresh id — with
+       * the `hiddenAt`/`hiddenById`/`hiddenReason` audit gone and every report filed against
+       * the old id now pointing at nothing.
+       */
+      const existing = await ctx.db.review.findUnique({
+        where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
+        select: { hiddenAt: true },
+      });
+      if (existing?.hiddenAt) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: `${REMOVED_NOTICE_OWN} You cannot edit it while it is removed.`,
+        });
+      }
+
       const fields = {
         rating: input.rating,
         // Trimmed to null rather than kept as "": an empty body and no body are the same
@@ -346,7 +457,7 @@ export const reviewsRouter = router({
           update: fields,
           select: reviewSelect,
         });
-        await refreshAggregates(tx, input.trailId);
+        await refreshRatingAggregates(tx, input.trailId);
         return saved;
       });
 
@@ -358,17 +469,42 @@ export const reviewsRouter = router({
    *
    * Keyed by trail rather than by review id, which makes it structurally impossible to
    * delete someone else's: the unique index is `(trailId, userId)` and `userId` is the
-   * caller's, never an input. A count of zero means there was nothing of theirs to remove.
+   * caller's, never an input.
+   *
+   * **A removed review cannot be withdrawn**, and that is not pedantry about a row. Delete
+   * was the hole in the upsert guard above: deleting the tombstone frees the `(trailId,
+   * userId)` key, so the next upsert creates a fresh row with the same prose and no
+   * `hiddenAt` — the takedown undone in two calls by the person it was made against, the
+   * audit trail gone with it, and every `ContentReport` filed against the old id now
+   * pointing at a subject that no longer exists.
+   *
+   * The tombstone is not a punishment. What it publishes is one line saying a report here
+   * was removed; the prose, the photographs and the condition chips left the page the moment
+   * the moderator pressed the button, and the rating left the trail's average with them.
+   * Somebody who wants it gone entirely writes to the address in the notice.
    */
   remove: protectedProcedure.input(trailIdInput).mutation(async ({ ctx, input }) => {
     return ctx.db.$transaction(async (tx) => {
       const { count } = await tx.review.deleteMany({
-        where: { trailId: input.trailId, userId: ctx.user.id },
+        where: { trailId: input.trailId, userId: ctx.user.id, hiddenAt: null },
       });
       if (count === 0) {
+        // Two reasons the delete matched nothing, and they are owed different answers. The
+        // second read only happens on the failure path, so the ordinary delete is still one
+        // statement.
+        const existing = await tx.review.findUnique({
+          where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
+          select: { hiddenAt: true },
+        });
+        if (existing?.hiddenAt) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: `${REMOVED_NOTICE_OWN} You cannot delete it while it is removed.`,
+          });
+        }
         throw new TRPCError({ code: 'NOT_FOUND', message: 'You have not reviewed this trail.' });
       }
-      await refreshAggregates(tx, input.trailId);
+      await refreshRatingAggregates(tx, input.trailId);
       return { removed: true };
     });
   }),

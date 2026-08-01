@@ -121,16 +121,28 @@ describe('processTile', () => {
 
 describe('chooseHero', () => {
   /**
-   * A database reduced to the two facts this decision reads: who owns each photo, and which
-   * photo each trail is currently flying as its hero.
+   * A database reduced to the three facts this decision reads: who owns each photo, which
+   * photo each trail is currently flying as its hero, and which photos a moderator has taken
+   * down.
    */
-  function fakeDb(owners: Record<string, string>, heroes: Record<string, string>): PrismaClient {
+  function fakeDb(
+    owners: Record<string, string>,
+    heroes: Record<string, string>,
+    hidden: readonly string[] = [],
+  ): PrismaClient {
+    const isHidden = new Set(hidden);
     return {
       photo: {
         findUnique: ({ where }: { where: { id: string } }) => {
           const owner = owners[where.id];
-          return Promise.resolve(owner === undefined ? null : { trailId: owner });
+          return Promise.resolve(
+            owner === undefined
+              ? null
+              : { trailId: owner, hiddenAt: isHidden.has(where.id) ? new Date() : null },
+          );
         },
+        findMany: ({ where }: { where: { id: { in: string[] } } }) =>
+          Promise.resolve(where.id.in.filter((id) => !isHidden.has(id)).map((id) => ({ id }))),
       },
       trail: {
         findMany: ({
@@ -186,6 +198,29 @@ describe('chooseHero', () => {
     // Belt and braces against a hero whose row went away without the foreign key firing.
     const db = fakeDb({ fresh_1: 'trail_a' }, {});
     await expect(chooseHero(db, 'trail_a', 'vanished', ['fresh_1'])).resolves.toBe('fresh_1');
+  });
+
+  it('moves the hero off a photograph a moderator took down', async () => {
+    // Without this the "keep what the trail already owns" rule above re-pins hidden content
+    // to the top of the trail page on the next enrich pass — the most visible place on the
+    // site, and the one where an undone takedown would be noticed last, because nothing
+    // recomputes the hero again until somebody uploads.
+    const db = fakeDb({ removed: 'trail_a', fresh_1: 'trail_a' }, { trail_a: 'removed' }, [
+      'removed',
+    ]);
+    await expect(chooseHero(db, 'trail_a', 'removed', ['fresh_1'])).resolves.toBe('fresh_1');
+  });
+
+  it('will not promote a hidden candidate into the empty slot', async () => {
+    // The other direction: having correctly moved off the removed hero, it must not pick
+    // another removed one to replace it with.
+    const db = fakeDb({}, {}, ['fresh_1']);
+    await expect(chooseHero(db, 'trail_a', null, ['fresh_1', 'fresh_2'])).resolves.toBe('fresh_2');
+  });
+
+  it('leaves the trail heroless when every candidate has been taken down', async () => {
+    const db = fakeDb({}, {}, ['fresh_1', 'fresh_2']);
+    await expect(chooseHero(db, 'trail_a', null, ['fresh_1', 'fresh_2'])).resolves.toBeNull();
   });
 });
 

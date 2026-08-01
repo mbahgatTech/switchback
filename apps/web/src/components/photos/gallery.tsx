@@ -22,13 +22,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMutation } from '@tanstack/react-query';
-import { MAX_CAPTION_LENGTH, blurhashAverageColor, formatDistance } from '@switchback/core';
-import type { UnitSystem } from '@switchback/core';
+import {
+  MAX_CAPTION_LENGTH,
+  blurhashAverageColor,
+  canModerate,
+  formatDistance,
+} from '@switchback/core';
+import type { UnitSystem, UserRole } from '@switchback/core';
 import type { TrailPhoto } from '@switchback/api/routers/photos';
 import { useTRPC } from '../../trpc/react';
 import { useUnitsOr } from '../units';
 import { PhotoUploader } from './uploader';
 import { Photograph, PhotographMissing, PhotographUnavailable } from './photograph';
+import { ModerateControl, ReportControl } from '../moderation/report-control';
 import { BUTTON_COLLAR, DANGER, HEIGHT, OUTLINE, SECONDARY } from '../controls';
 
 export interface PhotoGalleryProps {
@@ -38,6 +44,12 @@ export interface PhotoGalleryProps {
   trailPath: string;
   initial: TrailPhoto[];
   isViewerKnown: boolean;
+  /**
+   * Whether to draw a take-down control under a frame. `member` for everybody who is not an
+   * operator. It decides what is drawn and nothing about what is permitted —
+   * `moderatorProcedure` re-reads the column server-side on every call.
+   */
+  viewerRole?: UserRole;
   units?: UnitSystem;
 }
 
@@ -61,6 +73,7 @@ export function PhotoGallery({
   trailPath,
   initial,
   isViewerKnown,
+  viewerRole = 'member',
   units: given,
 }: PhotoGalleryProps) {
   const units = useUnitsOr(given);
@@ -76,14 +89,31 @@ export function PhotoGallery({
    * Re-seed from the server's list when it changes.
    *
    * `initial` is a fresh array on every render of the page above, so this cannot simply run
-   * on every change — the guard is the length, which is the thing that actually moves when a
-   * `router.refresh()` brings back a different set. Local additions win in between.
+   * on every change or a local addition would be wiped by the next render. The guard is a
+   * stamp of the set — every id, and whether it is hidden — rather than the length it used
+   * to be: a takedown by an operator leaves the length identical, because an operator's copy
+   * of this list carries taken-down frames too, and the length guard therefore left the
+   * lightbox holding a photograph it had just hidden and a button still offering to hide it.
+   * Local additions still win, because the page above does not re-render when one arrives.
    */
+  const stamp = initial.map((photo) => `${photo.id}${photo.hidden ? '!' : ''}`).join(',');
   useEffect(() => {
-    setPhotos((current) => (current.length === initial.length ? current : initial));
-  }, [initial]);
+    setPhotos((current) =>
+      current.map((photo) => `${photo.id}${photo.hidden ? '!' : ''}`).join(',') === stamp
+        ? current
+        : initial,
+    );
+  }, [stamp, initial]);
 
   const open = openIndex === null ? null : (photos[openIndex] ?? null);
+
+  /*
+   * The count over the strip is of frames a reader can actually look at. An operator's copy
+   * of this list carries the taken-down ones too (see `trails.photos`), and "14 frames" over
+   * a strip where one of them is a removal notice would be the one number on the page that
+   * disagrees with `Trail.photoCount`, which excludes them.
+   */
+  const visible = photos.filter((photo) => !photo.hidden).length;
 
   useEffect(() => {
     const node = dialogRef.current;
@@ -139,9 +169,9 @@ export function PhotoGallery({
     <section className="mt-3xl">
       <div className="flex flex-wrap items-baseline justify-between gap-sm">
         <h2 className="collar">Photographs</h2>
-        {photos.length > 0 ? (
+        {visible > 0 ? (
           <p className="font-mono text-micro text-ink-muted">
-            {photos.length} {photos.length === 1 ? 'frame' : 'frames'}
+            {visible} {visible === 1 ? 'frame' : 'frames'}
           </p>
         ) : null}
       </div>
@@ -174,8 +204,15 @@ export function PhotoGallery({
                 </button>
                 <p className="mt-xs flex items-baseline justify-between gap-sm font-mono text-micro text-ink-muted">
                   <span className="truncate">
-                    {creditOf(photo)}
-                    {photo.license ? ` · ${photo.license}` : ''}
+                    {/*
+                     * Only an operator ever sees a hidden frame here — the server refuses
+                     * `includeHidden` to anybody else — and it arrives with its URL already
+                     * blanked, so the tile is a `PhotographMissing` plate. This line is what
+                     * distinguishes "taken down" from "the file 404s", which are otherwise
+                     * the same picture.
+                     */}
+                    {photo.hidden ? 'Removed' : creditOf(photo)}
+                    {photo.license && !photo.hidden ? ` · ${photo.license}` : ''}
                   </span>
                   {photo.distM !== null ? (
                     <span className="shrink-0 text-contour">
@@ -238,7 +275,18 @@ export function PhotoGallery({
 
             <div className="flex flex-wrap items-start gap-md border-t border-bezel p-md">
               <div className="min-w-0 flex-1">
-                {open.isMine ? (
+                {open.hidden ? (
+                  /*
+                   * Only an operator gets here. It states what happened and leaves the caption
+                   * field and the remove button off entirely — both are refused server-side on
+                   * a hidden row, and drawing a control that always fails is worse than not
+                   * drawing it. The put-back is in the group on the right.
+                   */
+                  <p className="max-w-measure rounded-hair border border-survey px-md py-sm text-caption text-survey">
+                    Removed by a moderator. It is out of the gallery, out of the count, and out of
+                    the running for the hero.
+                  </p>
+                ) : open.isMine ? (
                   <form
                     onSubmit={(event) => {
                       event.preventDefault();
@@ -302,7 +350,7 @@ export function PhotoGallery({
                   </>
                 ) : null}
 
-                {open.isMine ? (
+                {open.hidden ? null : open.isMine ? (
                   <button
                     type="button"
                     onClick={() => remove.mutate({ photoId: open.id })}
@@ -310,6 +358,37 @@ export function PhotoGallery({
                   >
                     {remove.isPending ? 'Removing…' : 'Remove'}
                   </button>
+                ) : (
+                  /*
+                   * Reporting somebody else's frame, from the one place it is big enough to
+                   * judge. The strip's thumbnails deliberately carry no control of their
+                   * own: a report button on a 102px tile is a mis-tap waiting to happen,
+                   * and nobody should be filing a complaint about a picture they have not
+                   * actually looked at.
+                   */
+                  <ReportControl
+                    subject="photo"
+                    subjectId={open.id}
+                    isViewerKnown={isViewerKnown}
+                    what={`this photograph by ${creditOf(open)}`}
+                  />
+                )}
+
+                {canModerate(viewerRole) ? (
+                  <ModerateControl
+                    subject="photo"
+                    subjectId={open.id}
+                    hidden={open.hidden}
+                    onDone={() => {
+                      // Both directions change what this frame is, and neither is something
+                      // the lightbox can restate in place: the taken-down one loses its image
+                      // and the put-back one regains it, both server-side. Close and reload
+                      // from the server, which is also what settles the hero at the top of
+                      // the page and the count over the strip.
+                      setOpenIndex(null);
+                      router.refresh();
+                    }}
+                  />
                 ) : null}
 
                 <button

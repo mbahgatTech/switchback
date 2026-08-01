@@ -8,6 +8,7 @@
 import { TRPCError, initTRPC } from '@trpc/server';
 import superjson from 'superjson';
 import { ZodError } from 'zod';
+import { canAdminister, canModerate } from '@switchback/core';
 import type { User } from '@switchback/db';
 import type { Context } from './context';
 
@@ -143,3 +144,46 @@ const enforcePlus = enforceAuth.unstable_pipe(({ ctx, next }) => {
 
 export const protectedProcedure = t.procedure.use(enforceAuth);
 export const plusProcedure = t.procedure.use(enforcePlus);
+
+/**
+ * The takedown lever.
+ *
+ * **Piped onto `enforceAuth`, and the role is read from `ctx.user`** — which `createContext`
+ * loaded from the database on this request — rather than from anything the caller sent. A
+ * session cookie proves who you are; it carries no claim about what you may do, and the one
+ * mistake this tier exists to make impossible is trusting a client that says it is an
+ * operator.
+ *
+ * It is a *procedure tier*, not a check the UI performs. Every moderation procedure is built
+ * on one of these two, so hiding a button changes what is easy and changes nothing about
+ * what is permitted: a signed-in member calling `moderation.hide` directly over HTTP gets a
+ * FORBIDDEN from this middleware before the resolver runs and before the database is
+ * touched. `packages/api/test/moderation.test.ts` asserts exactly that, for both tiers.
+ *
+ * The message says what is true rather than pretending the procedure does not exist. A 404
+ * would leak slightly less and would send an operator whose role was never granted looking
+ * for a bug in the client.
+ */
+const enforceModerator = enforceAuth.unstable_pipe(({ ctx, next }) => {
+  if (!canModerate(ctx.user.role)) {
+    throw new TRPCError({ code: 'FORBIDDEN', message: 'That needs a moderator.' });
+  }
+  return next({ ctx });
+});
+
+/**
+ * Changing somebody's role, and nothing else.
+ *
+ * Separate from `enforceModerator` because the two privileges must not travel together: a
+ * moderator who can appoint moderators is an administrator, and the role column would then
+ * be documenting a distinction the code does not keep.
+ */
+const enforceAdmin = enforceAuth.unstable_pipe(({ ctx, next }) => {
+  if (!canAdminister(ctx.user.role)) {
+    throw new TRPCError({ code: 'FORBIDDEN', message: 'That needs an administrator.' });
+  }
+  return next({ ctx });
+});
+
+export const moderatorProcedure = t.procedure.use(enforceModerator);
+export const adminProcedure = t.procedure.use(enforceAdmin);

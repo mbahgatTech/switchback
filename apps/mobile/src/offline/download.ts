@@ -131,8 +131,11 @@ export async function downloadTrail(
     const photo = wanted[i];
     if (!photo) return;
     stop();
+    // A photograph a moderator took down comes back with no URL — the API blanks it rather
+    // than hand out a live object. Nothing to pull, so nothing is stored, and the bundle a
+    // hiker carries down a valley does not become the last place a removed image survives.
     const [full, thumb] = await Promise.all([
-      pull(photo.url, trailId, `${i}-full`),
+      photo.url ? pull(photo.url, trailId, `${i}-full`) : Promise.resolve(null),
       photo.thumbUrl ? pull(photo.thumbUrl, trailId, `${i}-thumb`) : Promise.resolve(null),
     ]);
     local[i] = { url: full, thumbUrl: thumb };

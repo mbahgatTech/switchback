@@ -1103,19 +1103,35 @@ export async function chooseHero(
   candidates: readonly string[],
 ): Promise<string | null> {
   if (current !== null) {
-    const held = await db.photo.findUnique({ where: { id: current }, select: { trailId: true } });
+    const held = await db.photo.findUnique({
+      where: { id: current },
+      select: { trailId: true, hiddenAt: true },
+    });
     // A user-uploaded photo, once chosen, outranks anything we scraped, and a re-run of
-    // enrichment must not quietly take it back.
-    if (held?.trailId === trailId) return current;
+    // enrichment must not quietly take it back — unless a moderator took it down, in which
+    // case the hero has to move. Without the `hiddenAt` check this branch would re-pin a
+    // hidden photograph to the top of the trail page on the next enrich pass, which is the
+    // most visible place on the site and the one an undone takedown would be noticed in
+    // last: nothing recomputes it again until somebody uploads.
+    if (held?.trailId === trailId && held.hiddenAt === null) return current;
   }
   if (candidates.length === 0) return null;
 
-  const claimed = await db.trail.findMany({
-    where: { id: { not: trailId }, primaryPhotoId: { in: [...candidates] } },
-    select: { primaryPhotoId: true },
-  });
+  const [claimed, visible] = await Promise.all([
+    db.trail.findMany({
+      where: { id: { not: trailId }, primaryPhotoId: { in: [...candidates] } },
+      select: { primaryPhotoId: true },
+    }),
+    // The candidates are ids enrichment just wrote, so in the ordinary case all of them are
+    // visible — but a re-run over a trail where one was moderated must not promote it.
+    db.photo.findMany({
+      where: { id: { in: [...candidates] }, hiddenAt: null },
+      select: { id: true },
+    }),
+  ]);
   const taken = new Set(claimed.map((row) => row.primaryPhotoId));
-  return candidates.find((id) => !taken.has(id)) ?? null;
+  const showable = new Set(visible.map((row) => row.id));
+  return candidates.find((id) => showable.has(id) && !taken.has(id)) ?? null;
 }
 
 /**
@@ -1188,7 +1204,11 @@ export async function enrichTrailPhotos(trailId: string, deps: PipelineDeps): Pr
 
   // Counted rather than assumed. `savedIds.length` is what enrichment just wrote, which
   // stops being the trail's photo count the moment a user uploads one of their own.
-  const photoCount = await db.photo.count({ where: { trailId: trail.id } });
+  //
+  // `hiddenAt: null` for the same reason `refreshTrailPhotos` carries it: the count is what
+  // the gallery will show, and an enrich pass that recounted the hidden ones back in would
+  // silently undo the numeric half of a takedown weeks after it was decided.
+  const photoCount = await db.photo.count({ where: { trailId: trail.id, hiddenAt: null } });
   const primaryPhotoId = await chooseHero(db, trail.id, trail.primaryPhotoId, savedIds);
 
   await db.trail.update({
