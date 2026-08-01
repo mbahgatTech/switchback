@@ -1,9 +1,6 @@
 /**
- * @switchback/ingest — OpenStreetMap in, trails out.
- *
- * The pipeline is lazy by design: nothing is imported ahead of time, and a tile is only
- * fetched when somebody looks at it. See `pipeline.ts` for the orchestration and
- * `overpass.ts` for why the client is as careful as it is.
+ * @switchback/ingest — OpenStreetMap in, trails out. Lazy per z9 tile; see `pipeline.ts` for
+ * the orchestration and `overpass.ts` for the etiquette the public instances require.
  */
 
 export * from './overpass';

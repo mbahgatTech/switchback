@@ -1,33 +1,15 @@
 /**
- * Overpass API client.
+ * Overpass API client. Instances are donated hardware that block clients who misbehave, so
+ * the etiquette below is a correctness requirement, not a courtesy:
  *
- * Overpass is a free public service run on donated hardware, and the instances enforce
- * their own fair use by blocking clients that misbehave. That makes etiquette a
- * correctness requirement here rather than a courtesy: a client that hammers the API
- * gets the whole product blocked, not throttled. Five mechanisms, each doing one job:
+ * - A serialized queue at `maxConcurrent` (default 2) — slots are allotted per client IP.
+ * - Backoff with jitter that honours `Retry-After`, 429 and 504 over its own schedule.
+ * - Mirror failover: `url` is a list, because an IP block arrives as a reset with no status.
+ * - A circuit breaker after `failureThreshold` consecutive failures across every mirror;
+ *   callers fail soft to cached data.
+ * - A descriptive User-Agent carrying a contact URL, validated and never defaulted.
  *
- * - **A serialized queue at `maxConcurrent` (default 2).** The single most important
- *   one. Overpass allots slots per client IP, and exceeding them earns a 429 that
- *   escalates to a ban. Twelve tiles from one viewport therefore run two at a time.
- * - **Backoff that honours the server.** `429` and `504` are Overpass explicitly saying
- *   "later"; we wait, with jitter, rather than retrying into the same wall. `Retry-After`
- *   wins over our own schedule when present.
- * - **Mirror failover.** `url` is a list, not a string. Overpass runs several independent
- *   public instances precisely because any one of them can be down, overloaded, or
- *   blocking your IP — and a block arrives as a TCP reset with no HTTP status, which no
- *   amount of retrying against the same host will get past. An attempt that fails for any
- *   reason other than our own bad query moves to the next instance.
- * - **A circuit breaker.** After `failureThreshold` consecutive failures the client stops
- *   calling out entirely for `openMs`, and callers fail soft to cached data. Because a
- *   failure is only recorded once every mirror has refused, the breaker now means "OSM is
- *   unreachable", not "one host is having an afternoon".
- * - **A descriptive User-Agent with a contact URL.** Their operators block anonymous
- *   traffic first. `OVERPASS_USER_AGENT` carries it and is validated, not defaulted —
- *   shipping `node-fetch` as a UA is how a project gets banned before anyone notices.
- *
- * The class holds no global state so tests can build one per case, but the app uses a
- * single shared instance (`defaultOverpass`) because a queue that isn't shared isn't a
- * queue.
+ * The app uses one shared instance (`defaultOverpass`) — a queue that isn't shared isn't one.
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -84,17 +66,15 @@ export interface OverpassResponse {
   elements: OverpassElement[];
   /**
    * Overpass's own postscript on a query that did not fully succeed. Present at HTTP 200
-   * alongside a plausible-looking `elements` array — see `assertUsable`, which is the only
-   * thing standing between a timed-out query and a tile cached empty for thirty days.
+   * alongside a plausible-looking `elements` array — see `assertUsable`.
    */
   remark?: string;
 }
 
 export interface OverpassOptions {
   /**
-   * One endpoint, or several tried in order. A single string is the same as a list of one.
-   * Empty entries are dropped, so a half-filled `OVERPASS_URL` degrades to the defaults
-   * rather than to a request against the empty string.
+   * One endpoint, or several tried in order. Empty entries are dropped, so a half-filled
+   * `OVERPASS_URL` degrades to the defaults rather than to a request against `''`.
    */
   url?: string | readonly string[];
   userAgent?: string;
@@ -117,30 +97,14 @@ export interface OverpassOptions {
 }
 
 /**
- * Public instances, tried in this order.
- *
- * Two rules govern what belongs on this list, and both were learned the expensive way.
- *
- * **A mirror must serve the planet.** Several instances on the OSM wiki carry a regional
- * extract and answer an out-of-area query with `200 OK` and an empty `elements` array —
- * indistinguishable from "there are genuinely no trails here", which is how a tile gets
- * marked empty and cached that way for thirty days. `overpass.osm.ch` fails exactly this
- * way outside Switzerland and is deliberately absent. Every entry below was checked
- * against three widely separated points — a Washington summit, a Welsh footpath, and the
- * Pacific Crest Trail's superroute relation — before being trusted.
- *
- * **A mirror must be a distinct host.** The previous list read as three names and was two:
- * `overpass.kumi.systems` and `overpass.private.coffee` both resolve to 193.219.97.30. A
- * rotation across aliases of one machine is not a rotation, it is the same outage three
- * times, and it is what left the ingest queue stalled with every tile reporting a bare
- * `fetch failed`.
- *
- * The list is ordered by measured reachability rather than by reputation. `overpass-api.de`
- * is the reference instance and the better-maintained one, but it publishes two A records
- * of which one has been persistently unreachable from some networks; resolvers that hand
- * out the dead address make it a coin flip per connection. It stays on the list — when it
- * answers it is excellent — but it is no longer the first thing tried, because the first
- * endpoint is the one that decides whether a cold tile feels instant or takes a retry.
+ * Public instances, tried in this order. Two rules govern the list. A mirror must serve the
+ * planet: a regional extract answers an out-of-area query `200 OK` with no elements, which is
+ * indistinguishable from "no trails here" and caches a tile empty for thirty days
+ * (`overpass.osm.ch` fails this way and is deliberately absent). And a mirror must be a
+ * distinct host — `kumi.systems` and `private.coffee` share an address, so rotating between
+ * them is the same outage twice. Ordered by measured reachability, not reputation:
+ * `overpass-api.de` is the reference instance but publishes an A record that is unreachable
+ * from some networks, and the first endpoint decides whether a cold tile feels instant.
  */
 const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
@@ -167,47 +131,26 @@ export class OverpassUnavailableError extends Error {
   }
 }
 
-/**
- * A 429 or 504 is Overpass asking us to come back later. `Retry-After` is in seconds
- * when Overpass sends it at all; it usually does not, hence the fallback schedule.
- */
+/** Statuses meaning "come back later". `Retry-After` is in seconds when it is sent at all. */
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
 /**
- * Overpass phrasings that mean "this answer is not the answer to your query".
- *
- * Matched against the `remark` field, which arrives at HTTP 200 next to an `elements`
- * array that looks perfectly well-formed and is empty or truncated. This is the most
- * dangerous failure mode the service has: a tile fetched during a busy minute comes back
- * with zero trails, gets committed as `ready`, and stays cached for thirty days. The map
- * then shows bare ground over a range full of trails and nothing anywhere reports an
- * error, because as far as every layer above is concerned the fetch succeeded.
+ * Overpass phrasings that mean "this answer is not the answer to your query". Matched against
+ * `remark`, which arrives at HTTP 200 beside a well-formed but empty or truncated `elements`
+ * array — the most dangerous failure the service has, because every layer above sees success.
  */
 const REMARK_FAILURE = /error|timed out|too busy|out of memory|please try again/i;
 
 /**
- * Hosts that mean "I never filled this in".
- *
- * `example.com` and friends are reserved by RFC 2606 precisely so that nobody can receive
- * mail at them, which makes a contact address there worse than none — it looks like a
- * contact and reaches nobody. Overpass's front end agrees and is blunter about it: a
- * request whose User-Agent contains one comes back `406 Not Acceptable`, from Apache,
- * before Overpass sees the query at all. Every tile fails, the error mentions content
- * negotiation, and nothing anywhere points at the User-Agent.
- *
- * This list is what turns that into a startup error naming the actual problem. It is
- * checked in the constructor rather than per request because a bad UA is never transient
- * and never worth one retry, let alone four.
+ * Hosts that mean "I never filled this in". Overpass's front end answers a User-Agent
+ * containing one with `406 Not Acceptable` from Apache, before the query runs at all.
+ * Checked in the constructor: a bad UA is never transient and never worth a retry.
  */
 const PLACEHOLDER_HOSTS = ['example.com', 'example.org', 'example.net', 'localhost', 'yourdomain'];
 
 /**
- * Reject a User-Agent a public instance will refuse, at the point where it can still be
- * fixed by editing `.env`.
- *
- * Overpass operators block traffic they cannot contact; the failure mode is the whole
- * product going dark with no signal about why. Two rules, both learned from a real 406:
- * there must be a contact URL, and it must not be a placeholder.
+ * Reject a User-Agent a public instance will refuse, while it can still be fixed by editing
+ * `.env`. Two rules, both learned from a real 406: a contact URL, and not a placeholder.
  */
 function assertUsableUserAgent(userAgent: string): void {
   const hint =
@@ -249,12 +192,8 @@ export class OverpassClient {
   private breakerOpenedAt: number | null = null;
 
   /**
-   * Where the next request goes.
-   *
-   * Deliberately an instance field rather than a per-call local: once a mirror has proved
-   * itself unreachable there is no reason for the next tile to rediscover that from
-   * scratch. The cursor stays where the last success left it, so a dead primary costs one
-   * failed attempt in total rather than one per tile.
+   * Where the next request goes. An instance field, not a per-call local, so a dead primary
+   * costs one failed attempt in total rather than one per tile.
    */
   private cursor = 0;
 
@@ -266,20 +205,9 @@ export class OverpassClient {
     this.userAgent = options.userAgent ?? '';
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? 2);
     /*
-     * Two passes over the mirror list, not one.
-     *
-     * One attempt per mirror is enough to route around a host that is *down*, and that was
-     * the case this number was first sized for. It is not enough for the case that actually
-     * costs us: every public mirror is busy at the same minute — they serve the same
-     * planet-wide traffic and get busy together — and a single rotation burns all three
-     * inside a few seconds and gives up while the backoff schedule is still measured in
-     * milliseconds. A second pass is the first one that sleeps, and a sleep is the only
-     * thing that helps when the answer is "come back later".
-     *
-     * This is sized by the Pacific Crest Trail. A route job spends half an hour fetching
-     * twenty-nine sections and then throws all of it away if any one request runs out of
-     * attempts, so the cheapest possible request failing transiently is not a small loss.
-     * An explicit `maxAttempts` still wins — a caller asking for one attempt means one.
+     * Two passes over the mirror list, not one. One pass routes around a host that is down
+     * but never sleeps — and the case that costs us is every public mirror busy in the same
+     * minute, where only a sleep helps. An explicit `maxAttempts` still wins.
      */
     this.maxAttempts = options.maxAttempts ?? Math.max(6, this.endpoints.length * 2);
     this.baseBackoffMs = options.baseBackoffMs ?? 2_000;
@@ -313,9 +241,8 @@ export class OverpassClient {
   }
 
   /**
-   * Run one Overpass QL query. Resolves with the parsed response, or throws
-   * `OverpassUnavailableError` when the breaker is open — which is the signal to serve
-   * whatever is cached rather than to fail the user's request.
+   * Run one Overpass QL query. Throws `OverpassUnavailableError` when the breaker is open,
+   * which is the signal to serve cache rather than to fail the reader's request.
    */
   async query(ql: string): Promise<OverpassResponse> {
     this.assertBreakerClosed();
@@ -333,16 +260,15 @@ export class OverpassClient {
     if (elapsed < this.openMs) {
       throw new OverpassUnavailableError(this.openMs - elapsed);
     }
-    // Half-open: let exactly one request through. If it succeeds the breaker closes; if
-    // it fails, `recordFailure` re-opens it for another full window.
+    // Half-open: let exactly one request through. `recordFailure` re-opens it for a full
+    // window if that one fails.
     this.breakerOpenedAt = null;
   }
 
   private async attempt(ql: string): Promise<OverpassResponse> {
     let lastError: unknown;
-    // Which mirrors this call has already burned. Rotating onto a fresh one is free —
-    // it is a different machine and owes us nothing — so the backoff sleep is charged
-    // only once the rotation wraps back onto a host we have already annoyed.
+    // Rotating onto a fresh mirror is free, so the backoff sleep is charged only once the
+    // rotation wraps back onto a host we have already annoyed.
     const tried = new Set<string>();
 
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
@@ -362,19 +288,16 @@ export class OverpassClient {
         const response = await this.send(ql, endpoint);
 
         if (response.ok) {
-          // Read as text, not `.json()`. A 200 from Overpass is not a promise of JSON: a
-          // busy dispatcher answers with an XHTML error page and the correct status code,
-          // and `.json()` would surface that as "Unexpected token '<'" — a parse error
-          // that reads like our bug and gets recorded as the tile's `lastError`.
+          // Read as text, not `.json()`: a busy dispatcher answers 200 with an XHTML error
+          // page, which `.json()` would surface as a parse error that reads like our bug.
           const body = assertUsable(await response.text(), endpoint);
           this.recordSuccess();
           return body;
         }
 
         if (!RETRYABLE_STATUS.has(response.status)) {
-          // A 400 is almost always our own query being wrong, and retrying a broken
-          // query four times is exactly the behaviour that gets a client blocked. Every
-          // mirror runs the same Overpass, so failing over would only spread the blame.
+          // Almost always our own query being wrong, and every mirror runs the same
+          // Overpass — retrying a broken query is exactly what gets a client blocked.
           const text = await safeText(response);
           this.recordFailure();
           throw new OverpassFatalError(
@@ -388,8 +311,8 @@ export class OverpassClient {
         if (attempt < this.maxAttempts) await retry();
       } catch (error) {
         if (error instanceof OverpassFatalError) throw error;
-        // A transport error is the case mirrors exist for: an IP-level block arrives as a
-        // reset with no status at all, and no amount of waiting makes this host answer.
+        // The case mirrors exist for: an IP-level block arrives as a reset with no status,
+        // and no amount of waiting makes this host answer.
         lastError = error instanceof Error ? new Error(`${endpoint}: ${error.message}`) : error;
         if (attempt < this.maxAttempts) await retry();
       }
@@ -419,9 +342,8 @@ export class OverpassClient {
   }
 
   /**
-   * Exponential with full jitter. The jitter is not decoration: without it, twelve tiles
-   * queued at once fail at once and retry in perfect lockstep, which is a thundering herd
-   * aimed at a service that just told us it was overloaded.
+   * Exponential with full jitter. Without the jitter, twelve tiles queued at once fail at
+   * once and retry in lockstep — a herd aimed at a service that just said it was overloaded.
    */
   private backoffMs(attempt: number, retryAfter: string | null): number {
     const serverAsked = retryAfter === null ? NaN : Number(retryAfter) * 1000;
@@ -470,26 +392,12 @@ async function safeText(response: Response): Promise<string> {
 }
 
 /**
- * Turn a 200 response body into a response we are willing to believe.
- *
- * Overpass signals most of its failures inside a successful HTTP exchange, in two shapes:
- *
- * 1. **An XHTML error page.** `runtime error: … Dispatcher_Client::request_read_and_idx::
- *    timeout. The server is probably too busy` arrives as `200 OK` with `<?xml …` as the
- *    body. Observed against `overpass-api.de` while building this, not hypothesised.
- * 2. **JSON carrying a `remark`.** `{"elements":[],"remark":"runtime error: Query timed
- *    out in \"query\" at line 3 after 179 seconds."}` — valid JSON, plausible shape, no
- *    data.
- *
- * The second is why this throws rather than returning the parsed body with a warning. A
- * partial answer is indistinguishable from a complete one downstream: `assembleTrails`
- * assembles nothing, `processTile` records zero trails and marks the tile `ready`, and the
- * result is thirty days of cached emptiness over real terrain with nothing anywhere
- * reporting an error. Treating it as a retryable failure is the only handling that cannot
- * silently lose ground.
- *
- * A plain `Error` deliberately, not `OverpassFatalError` — `attempt` retries these and
- * rotates mirrors, which is the right response to a server that is merely busy.
+ * Turn a 200 response body into one we are willing to believe. Overpass signals most
+ * failures inside a successful exchange: an XHTML error page, or valid JSON carrying a
+ * `remark` and no data. Both must throw rather than return, because a partial answer is
+ * indistinguishable from a complete one downstream — the tile would be marked `ready` and
+ * cached empty for thirty days over real terrain. A plain `Error`, not `OverpassFatalError`,
+ * so `attempt` retries and rotates mirrors.
  */
 function assertUsable(text: string, endpoint: string): OverpassResponse {
   if (text.trimStart().slice(0, 1) !== '{') {
@@ -514,13 +422,10 @@ function assertUsable(text: string, endpoint: string): OverpassResponse {
 }
 
 /**
- * A one-line cause for the statuses whose body explains nothing.
- *
- * A 406 arrives as an Apache content-negotiation page, which is a fair description of the
- * mechanism and a useless description of the problem: the request was refused by the front
- * end over the User-Agent, and the query never ran. The constructor catches the common
- * case, but a mirror can have its own rules, so the hint is repeated where the operator
- * will actually be reading — `ingest_tiles.lastError`.
+ * A one-line cause for the statuses whose body explains nothing. A 406 arrives as an Apache
+ * content-negotiation page, which describes the mechanism and not the problem: the front end
+ * refused the User-Agent and the query never ran. Repeated here as well as in the constructor
+ * because a mirror can have its own rules, and this is what lands in `ingest_tiles.lastError`.
  */
 function explain(status: number): string {
   if (status === 406) {
@@ -533,34 +438,17 @@ function explain(status: number): string {
 }
 
 /**
- * Overpass QL for one tile.
+ * Overpass QL for one tile: route relations (somebody's assertion that these ways are one
+ * named trail) plus named standalone path-like ways, for the most of the world that has no
+ * relation coverage. The name filter is what keeps every garden path out.
  *
- * Two element classes, deliberately:
+ * **`out body geom` — the verbosity is load-bearing.** `tags` is a *verbosity*, not an
+ * addition: `out geom tags` reads as "geometry and tags" and silently drops `members` from
+ * every relation, so relations arrive well-formed with nothing to assemble and the tile still
+ * commits its standalone ways and looks healthy. `body` is the verbosity that keeps members.
  *
- * 1. **Route relations** (`route=hiking|foot|hiking|running`) — the curated thing. A
- *    relation is somebody's assertion that these ways form one named trail, which is
- *    exactly the object we want and cannot derive reliably ourselves.
- * 2. **Named standalone ways** on path-like highways. Most of the world has no relation
- *    coverage, and a named `highway=path` is the next best signal that a way is a trail
- *    rather than an unnamed connector. The name filter is what keeps this from returning
- *    every garden path in a city.
- *
- * `out body geom` returns member coordinates inline, so assembly needs no second round trip
- * for node positions — one request per tile rather than two.
- *
- * **The verbosity is load-bearing and easy to get wrong.** `out` takes a verbosity level and
- * a geometry mode, and `tags` is a *verbosity*, not an addition: it means "ids and tags,
- * nothing else", which silently drops the `members` array from every relation. `out geom
- * tags` therefore reads as "geometry and tags" and behaves as "tags only" — relations come
- * back looking well-formed, with a name and a route tag and zero members, and the assembler
- * skips every one of them for having nothing to assemble. The failure is invisible: named
- * standalone ways still arrive, so tiles commit trails and look healthy while the curated
- * route relations — the whole first half of this query — quietly produce nothing. `body` is
- * the verbosity that keeps members; `geom` then hangs coordinates off them.
- *
- * The guards matter as much as the filters. `[timeout:180]` bounds the server's work so
- * a pathological tile fails cleanly instead of holding a slot for ten minutes, and
- * `[maxsize:]` caps memory so Overpass rejects the query up front rather than dying
+ * `[timeout:180]` bounds the server's work so a pathological tile fails cleanly instead of
+ * holding a slot, and `[maxsize:]` makes Overpass reject the query up front rather than die
  * partway through.
  */
 export function buildTileQuery(
@@ -570,8 +458,7 @@ export function buildTileQuery(
   const [w, s, e, n] = bbox;
   const timeout = options.timeoutS ?? 180;
   const maxSize = options.maxSizeBytes ?? 536_870_912;
-  // Overpass bbox order is (south, west, north, east) — the transposition of GeoJSON's,
-  // and the single easiest thing to get silently wrong in this file.
+  // Overpass bbox order is (south, west, north, east) — the transposition of GeoJSON's.
   const box = `${s},${w},${n},${e}`;
 
   return `[out:json][timeout:${timeout}][maxsize:${maxSize}];
@@ -583,21 +470,11 @@ out body geom;`;
 }
 
 /**
- * Which route relations *contain* the ones we just assembled.
- *
- * A bbox query cannot reach a superroute, and this is not a tuning problem — it is how
- * Overpass defines the filter. `relation(bbox)` selects relations with a node or way
- * member inside the box, and it does not recurse into member relations. A superroute's
- * members are relations, so the Pacific Crest Trail — 4,270 km, crossing hundreds of our
- * tiles — is a member of none of them, and no amount of panning will ever surface it.
- * What a tile *does* see is a section: "PCT - California Section I", 111 km, which is
- * exactly the kind of answer that looks plausible enough to ship.
- *
- * `rel(br)` is the inverse: given relations, give me the relations they belong to. One
- * cheap query per tile turns "here are 24 routes" into "…and three of them are pieces of
- * something longer". `out tags` is right here and only here — we want ids and names to
- * decide what is worth fetching, and deliberately not the member lists, which for a
- * superroute is the expensive part.
+ * Which route relations *contain* the ones we just assembled. `relation(bbox)` does not
+ * recurse into member relations, so no tile can ever see the Pacific Crest Trail itself —
+ * only its sections, which look plausible enough to ship. `rel(br)` is the inverse. `out
+ * tags` is right here and only here: ids and names are enough to decide what to fetch, and
+ * a superroute's member lists are the expensive part.
  */
 export function buildParentRouteQuery(
   ids: readonly number[],
@@ -611,22 +488,15 @@ out tags;`;
 }
 
 /**
- * Full geometry for named relations, fetched by id rather than by area.
+ * Full geometry for named relations, selected by id so the response is bounded by the route
+ * rather than by a box — the only way to get a long-distance trail in one piece.
  *
- * The counterpart to `buildTileQuery` for work that is not tile-shaped. Selecting by id
- * means the response is bounded by the route rather than by a box, which is the only way
- * to get a whole long-distance trail in one piece.
- *
- * `maxsize` is raised well above the tile query's, because a batch of route sections is
- * legitimately hundreds of megabytes of node coordinates in Overpass's working memory and
- * the tile ceiling would reject it as if it were a runaway. The *timeout* is deliberately
- * not raised to match: it stays inside the client's own abort window, because a server
- * granted ten minutes on a query we hang up on after three spends the remaining seven
- * generating a response nobody will read. Bounding the response size is the caller's job —
- * see `ROUTE_BATCH_SIZE` — not this timeout's.
- *
- * `out body geom` for the same reason as the tile query: `tags` is a verbosity that drops
- * the `members` array, and a relation with no members assembles to nothing.
+ * `maxsize` is well above the tile query's because a batch of route sections is legitimately
+ * hundreds of megabytes of Overpass working memory. The timeout is deliberately *not* raised
+ * to match: it stays inside the client's own abort window, since a server granted ten minutes
+ * on a query we hang up on after three spends the rest generating a response nobody reads.
+ * Bounding the response is the caller's job — see `ROUTE_BATCH_SIZE`. `out body geom` for the
+ * same reason as the tile query.
  */
 export function buildRouteQuery(
   ids: readonly number[],
@@ -640,16 +510,9 @@ out body geom;`;
 }
 
 /**
- * A relation's member list without any geometry.
- *
- * Half of the escape hatch for a section that no mirror will serve whole. `out body` is the
- * same verbosity as the query above — so `members` is present with its refs and roles — but
- * without `geom` there are no coordinates, and the response for even the largest PCT
- * section is a few hundred kilobytes that comes back in under a second.
- *
- * On its own this is useless: a member with no geometry assembles to nothing. It is only
- * ever paired with `buildWayGeometryQuery`, which fetches the coordinates the caller then
- * splices back in.
+ * A relation's member list without geometry — half the escape hatch for a section no mirror
+ * will serve whole. Useless alone: only ever paired with `buildWayGeometryQuery`, whose
+ * coordinates the caller splices back in.
  */
 export function buildRelationSkeletonQuery(
   ids: readonly number[],
@@ -662,16 +525,9 @@ out body;`;
 }
 
 /**
- * Geometry for ways, fetched by id.
- *
- * The other half. `out geom` on a list of way ids returns each way with its inline node
- * coordinates and nothing else — no tags, no relation context — which is exactly the part
- * of a route response that is expensive, and now it can be asked for in batches the caller
- * chooses rather than in one lump the relation's size dictates.
- *
- * This is what turns "the server cannot serve this relation" into "the server can serve
- * this relation in six requests". The recursion in `fetchRelations` halves until the unit
- * is a single relation; below that, the unit is its ways, and this is how they are asked for.
+ * Geometry for ways by id — the other half, and the expensive part of a route response, now
+ * askable in batches the caller chooses. `fetchRelations` halves down to a single relation;
+ * below that the unit is its ways.
  */
 export function buildWayGeometryQuery(
   ids: readonly number[],
@@ -684,17 +540,10 @@ out geom;`;
 }
 
 /**
- * Which country and region a point falls in.
- *
- * Run once per tile rather than once per trail. A z9 tile is roughly 78 km across, so
- * every trail in it shares a region to a good approximation — and the alternative, a
- * reverse-geocode per trail, would be forty Nominatim requests against a service with a
- * one-per-second policy. One `is_in` query is both more accurate about administrative
- * boundaries and about two orders of magnitude cheaper.
- *
- * Admin levels 2–6 covers country through county with the same query; the caller picks
- * the most useful level present, because level 4 means "state" in the US and "region" in
- * France but is absent entirely in some countries.
+ * Which country and region a point falls in. Run once per tile, not once per trail: a z9 tile
+ * is ~78 km across, and the alternative is forty Nominatim calls against a one-per-second
+ * policy. Admin levels 2–6 in one query because level 4 means "state" in the US, "region" in
+ * France and nothing at all in some countries — the caller picks the most useful level present.
  */
 export function buildRegionQuery(at: LngLat, options: { timeoutS?: number } = {}): string {
   const [lng, lat] = at;
@@ -706,12 +555,8 @@ out tags;`;
 }
 
 /**
- * Waypoint and amenity query for an assembled trail's buffer.
- *
- * Kept separate from the tile query on purpose. The tile query is the expensive one and
- * runs against a 78 km box; this one runs against a trail's bbox and only after assembly
- * has decided the trail is worth keeping, so we never pay for waypoints around a way we
- * are about to discard.
+ * Waypoints and amenities in an assembled trail's buffer. Separate from the tile query so it
+ * runs against a trail's bbox, and only after assembly has decided the trail is worth keeping.
  */
 export function buildFeatureQuery(bbox: BBox, options: { timeoutS?: number } = {}): string {
   const [w, s, e, n] = bbox;

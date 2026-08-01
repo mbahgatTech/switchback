@@ -1,12 +1,7 @@
 /**
- * The job-kind → handler map, in one place.
- *
- * Every caller of the queue uses this: the cron route drains with it, the tRPC router's
- * `waitUntil` kick drains with it, and so does the CLI. Keeping the mapping here rather
- * than in the routes is what makes those paths provably the same code — the immediate path
- * is an optimisation over the durable one, never a divergent implementation of it. A job
- * the request path finishes is one the cron then finds already done, because both went
- * through the same claim.
+ * The job-kind to handler map. Every caller of the queue uses this — the cron route, the tRPC
+ * router's `waitUntil` kick, the CLI — so the immediate path is provably an optimisation over
+ * the durable one rather than a divergent implementation of it.
  */
 
 import { JobKind } from '@switchback/db';
@@ -55,32 +50,21 @@ export function ingestHandlers(deps?: Partial<PipelineDeps>): Partial<Record<Job
 }
 
 /**
- * How many derived jobs a drain claims on top of its batch, unless told otherwise.
- *
- * Two, and the number is chosen against the two places this runs rather than against the
- * backlog. A cron tick has a 60 s budget mostly spent on tile fetches; an inline kick is
- * `waitUntil` work hanging off a map request, where the cost is a background function
- * holding a connection a little longer. `enrichTrailPhotos` is the cheap end of the job
- * table — a lookup and an image fetch, not an Overpass query — so two of them fit in the
- * slack of either caller.
- *
- * It is a rate, not a target: two per drain times every viewport that finds new ground is
- * what makes the backlog fall with traffic, which is the same thing it rises with. The
- * alternative — one big periodic sweep — needs a scheduler this deploy does not have.
+ * How many derived jobs a drain claims on top of its batch. Sized against the two callers
+ * rather than the backlog: a cron tick's 60 s budget and a `waitUntil` kick hanging off a map
+ * request both have slack for two `enrichTrailPhotos` calls, which are a lookup and an image
+ * fetch. It is a rate, not a target — two per drain times every viewport that finds new ground
+ * is what makes the backlog fall with the traffic it rises with.
  */
 export const DEFAULT_DERIVED_SHARE = 2;
 
 /**
  * Drain a batch of ingest work. This is the cron route's entire body.
  *
- * `limit` is small on purpose. A Vercel cron invocation has a wall-clock budget and a tile
- * can take a minute; claiming twenty would mean nineteen locks expiring unhelpfully. Four
- * per minute, with the immediate `waitUntil` path handling anything a user is watching, is
- * the right shape.
- *
- * `derivedLimit` is separate from `limit` and defaults to a share rather than to zero,
- * because derived work is enqueued below every requestable kind and `claimJobs` orders by
- * priority — a batch that does not reserve room for it never runs any. See `drainJobs`.
+ * `limit` is small on purpose: a Vercel cron invocation has a wall-clock budget and a tile can
+ * take a minute, so claiming twenty would mean nineteen locks expiring unhelpfully.
+ * `derivedLimit` defaults to a share rather than zero because derived work sits below every
+ * requestable kind and a batch that reserves no room for it never runs any. See `drainJobs`.
  */
 export async function drainIngest(
   options: {

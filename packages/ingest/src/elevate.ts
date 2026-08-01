@@ -1,19 +1,6 @@
 /**
- * Elevation, from AWS Terrain Tiles.
- *
- * `@switchback/geo` owns the maths — decoding a terrarium pixel, bilinear sampling,
- * working out which tiles a line needs. This module owns the network and the cache,
- * which is the half that has to be careful.
- *
- * Why terrarium rather than a hosted elevation API: a 17 km trail resampled every 25 m is
- * 680 points, and a hosted API bills or rate-limits per point. Terrarium is a static
- * object on S3, free and unlimited, and a trail that size touches perhaps four z13 tiles.
- * So the cost is four HTTP GETs regardless of how densely we sample — and the sampling
- * density is what makes the grade calculation honest.
- *
- * The LRU exists for the same reason. Adjacent trails in one tile share terrain tiles
- * almost completely, so ingesting a tile of 40 trails without a cache would fetch the
- * same handful of PNGs 40 times.
+ * Elevation tiles from AWS Terrain Tiles — the network and cache half; `@switchback/geo` owns
+ * the maths. See `docs/architecture.md` for why terrarium PNGs rather than an elevation API.
  */
 
 import { PNG } from 'pngjs';
@@ -30,8 +17,8 @@ import {
 import type { TerrariumTile } from '@switchback/geo';
 
 /**
- * Terrarium tiles are 64 KB decoded. 256 of them is ~16 MB, which fits a serverless
- * function comfortably and covers a whole z9 ingest tile's worth of terrain.
+ * Terrarium tiles are 64 KB decoded. 256 of them is ~16 MB, which fits a serverless function
+ * and covers a whole z9 ingest tile's worth of terrain.
  */
 const DEFAULT_CACHE_SIZE = 256;
 
@@ -45,11 +32,8 @@ export interface TerrainSourceOptions {
 }
 
 /**
- * Fetches and caches terrarium tiles.
- *
- * `Map` iterates in insertion order, which is all an LRU needs: delete-then-set on read
- * moves an entry to the end, and the eviction victim is the first key. No dependency and
- * no linked list.
+ * Fetches and caches terrarium tiles. `Map` iterates in insertion order, which is all an LRU
+ * needs: delete-then-set on read moves an entry to the end, and the victim is the first key.
  */
 export class TerrainSource {
   private readonly urlTemplate: string | undefined;
@@ -88,9 +72,8 @@ export class TerrainSource {
   }
 
   /**
-   * One tile, from cache or the network. Resolves to `null` for a tile that does not
-   * exist — the S3 bucket 404s over open ocean and outside the DEM's coverage, and that
-   * is data rather than an error.
+   * One tile, from cache or the network. `null` for a tile that does not exist — the bucket
+   * 404s over open ocean and outside the DEM's coverage, and that is data, not an error.
    */
   async tile(z: number, x: number, y: number): Promise<TerrariumTile | null> {
     const key = tileKey(z, x, y);
@@ -200,19 +183,12 @@ export interface ElevateOptions {
   spacingM?: number;
   zoom?: number;
   /**
-   * The true along-line length of the geometry these samples were taken from.
-   *
-   * **Give this whenever the coordinates came out of `resampleLine`, which is always here.**
-   * Resampling hikes the original line and drops a point every `spacingM` *along it*, so the
-   * samples sit on the line but the straight lines between them cut every corner in between.
-   * Measuring chord to chord therefore reports less ground than the trail covers, and the
-   * error grows with the spacing: negligible at 25 m, and 24 % on the Pacific Crest Trail,
-   * where 4,220 km of switchbacks has to fit inside a 6,000-point profile at 725 m spacing.
-   * That is how a Mexico-to-Canada thru-hike came to be published as a 3,214 km hike.
-   *
-   * With the length given, the distances are exact rather than merely better: `resampleLine`
-   * spaces its output evenly along the source, so sample `i` of `n` is at `length·i/(n−1)` by
-   * construction. Omit it only for coordinates that were not evenly resampled.
+   * The true along-line length of the geometry these samples came from. **Give this whenever
+   * the coordinates came out of `resampleLine`, which is always here.** Chord-to-chord
+   * measurement cuts every corner between samples: negligible at 25 m spacing, 24% on the
+   * Pacific Crest Trail at 725 m, which is how a thru-hike was published as 3,214 km. With the
+   * length given the distances are exact by construction — `resampleLine` spaces its output
+   * evenly along the source, so sample `i` of `n` is at `length·i/(n−1)`.
    */
   alongLengthM?: number;
 }
@@ -225,11 +201,8 @@ export interface ElevatedProfile {
 }
 
 /**
- * Build the elevation profile for a resampled line.
- *
- * Takes coordinates already resampled to a fixed interval, because the interval is a
- * property of the profile record and the caller records it. Returns points in the
- * `ElevationPoint` shape the chart, the ETA model, and the weather sampler all read.
+ * Build the elevation profile for a line already resampled to a fixed interval — the interval
+ * is a property of the profile record and the caller records it.
  */
 export async function elevateLine(
   coords: readonly LngLat[],
@@ -255,19 +228,9 @@ export async function elevateLine(
 }
 
 /**
- * Where along the trail each sample sits.
- *
- * Two answers, and the difference between them is the difference between a thru-hike and a
- * day hike. Measuring chord to chord — the fallback — assumes the straight lines between
- * samples *are* the trail. For a 25 m profile that is true to within a rounding error. For a
- * 725 m profile it deletes every switchback between one sample and the next, which is how a
- * 4,221 km trail came to be stored as 3,214 km: not a bug in the measurement, a bug in
- * measuring the wrong line.
- *
- * When the caller knows the real along-line length — and the ingest always does, because
- * `resampleLine` computed it before throwing the detail away — the answer is exact instead.
- * Resampling emits `steps + 1` points spaced evenly *along* the source, so sample `i` of `n`
- * is at `length·i/(n−1)`. That is the definition of what resampling did, not an estimate of it.
+ * Where along the trail each sample sits. The chord-to-chord fallback assumes the straight
+ * lines between samples *are* the trail, which at 725 m spacing deletes every switchback in
+ * between. Given the real along-line length, the answer is exact instead — see `alongLengthM`.
  */
 function alongDistancesM(coords: readonly LngLat[], alongLengthM?: number): number[] {
   const n = coords.length;
@@ -279,15 +242,10 @@ function alongDistancesM(coords: readonly LngLat[], alongLengthM?: number): numb
 }
 
 /**
- * Fill null samples by linear interpolation between their nearest known neighbours.
- *
- * A gap is a tile that 404'd or failed, and it is almost always at the coast or at the
- * DEM's edge. Interpolating across one is honest — the alternative is a null in the
- * middle of a profile array, which every consumer would have to handle and most would
- * handle by rendering a hole in the chart. Leading and trailing gaps clamp to the nearest
- * known value rather than extrapolating a trend off the end of real data.
- *
- * A profile that is *entirely* gap comes back as sea level, and `gapCount` equal to the
+ * Fill null samples by linear interpolation between their nearest known neighbours — a gap is
+ * a tile that 404'd, almost always at the coast or the DEM's edge, and a null in the middle of
+ * a profile array renders as a hole in the chart. Leading and trailing gaps clamp rather than
+ * extrapolate. An entirely-gap profile comes back as sea level, and `gapCount` equal to the
  * sample count is how the caller detects that and declines to store the trail.
  */
 export function fillGaps(raw: ReadonlyArray<number | null>): {
@@ -297,8 +255,8 @@ export function fillGaps(raw: ReadonlyArray<number | null>): {
   const n = raw.length;
   const isKnown = (i: number): boolean => raw[i] !== null && raw[i]! > NO_DATA_ELEVATION;
 
-  // Two linear passes rather than a search per gap: for every index, the nearest known
-  // sample to its left and to its right. Both are -1 when there is none on that side.
+  // Two linear passes rather than a search per gap: for every index, the nearest known sample
+  // to its left and to its right. Both are -1 when there is none on that side.
   const prev: number[] = new Array<number>(n).fill(-1);
   const next: number[] = new Array<number>(n).fill(-1);
 

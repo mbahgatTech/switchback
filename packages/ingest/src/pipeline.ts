@@ -1,27 +1,6 @@
 /**
- * `processTile` — the whole lazy ingest, one z9 tile at a time.
- *
- * This is where the pieces meet: Overpass gives raw elements, `assemble` turns them into
- * ordered lines, `elevate` gives each line a profile, `derive` turns that into the numbers
- * on a trail card, `enrich` attaches what is around it, and this module commits the lot
- * and marks the tile ready.
- *
- * Three properties matter more than anything else here, because this runs unattended:
- *
- * **Idempotent.** Every trail is keyed by `(osmType, osmId)` and every write is an upsert,
- * so running a tile twice produces the same rows, not duplicates. That is what makes the
- * at-least-once job queue safe.
- *
- * **Per-trail failure isolation.** One trail with broken geometry must not cost the other
- * thirty-nine in its tile. Each trail commits in its own transaction and its own try.
- *
- * **Honest tile status.** A tile is only `ready` when Overpass actually answered. A tile
- * that failed stays `failed` with the reason on it, so the next request re-queues it
- * rather than serving an empty map as though the area had no trails.
- *
- * The one thing deliberately *not* done here is photos. Commons lookups are one HTTP
- * request per trail and they are decoration; doing them inline would double the wall-clock
- * of a tile to no benefit. They are enqueued as `enrich_trail` jobs and land a minute later.
+ * `processTile` — the whole lazy ingest, one z9 tile at a time. Idempotent upserts, per-trail
+ * failure isolation and honest tile status; see `docs/architecture.md` for why each matters.
  */
 
 import type { BBox, LngLat, LineString } from '@switchback/core';
@@ -79,64 +58,28 @@ const PROFILE_SPACING_M = 25;
 const RENDER_SIMPLIFY_M = 5;
 
 /**
- * Ceilings that turn "long trail" into "trail we can actually store and draw".
- *
- * Both constants exist because of one class of route: the continental ones. A 20 km path
- * sampled every 25 m is 800 elevation points and a few hundred rendered vertices, and
- * nothing about that needs a limit. The Pacific Crest Trail is 4,270 km — the same rules
- * give it 170,000 terrain samples across several thousand DEM tiles, and a `geometryJson`
- * measured in megabytes that `browse` would then return up to 300 of at once. Neither is a
- * slow version of the right answer; they are a stalled ingest and an unusable map.
- *
- * The honest cost is stated rather than hidden: a route past the ceiling gets a coarser
- * profile, so its gain figure is sampled at hundreds of metres and will understate the
- * real climbing. That is the correct trade at this scale — nobody reads a 4,270 km
- * elevation chart for a 25 m feature — but it is a trade, and `ElevationProfile.spacingM`
- * records which one each trail got rather than letting every profile claim 25 m.
+ * Ceilings that turn "long trail" into "trail we can store and draw". The Pacific Crest Trail
+ * at 25 m spacing is 170,000 terrain samples and megabytes of `geometryJson` that `browse`
+ * would return 300 of. A route past the ceiling gets a coarser profile and so understates its
+ * climbing — `ElevationProfile.spacingM` records which spacing each trail actually got.
  */
 const MAX_PROFILE_POINTS = 6_000;
 const MAX_RENDER_VERTICES = 3_000;
 
 /**
- * How many trails are committed at once, process-wide.
- *
- * This number is the difference between a map that fills in and a map that appears broken.
- * A z9 tile in the Cascades assembles around 150 trails, and each one waits on terrain
- * tiles over HTTP and then on a transaction's worth of round-trips to Postgres — a few
- * seconds of almost pure latency, of which this process spends nearly none doing work.
- * Sequentially that is eight minutes per tile, which is not slow so much as it is
- * indistinguishable from broken: the user sees "trails appear as they land" and then
- * nothing at all for longer than anybody waits.
- *
- * Six, not sixty. The ceiling is not our CPU, it is the two scarce resources underneath:
- * `TerrainSource` already caps its own fetches at six and dedupes in-flight requests, and
- * the ingest holds a pool of `BACKGROUND_POOL_SIZE` connections, of which this may take all
- * but the four the queue's own bookkeeping needs. Pushing past that converts the wait from
- * "fetching terrain" into "waiting for a connection", which is the same wall clock with
- * worse failure modes. Six saturates the latency without contending for either.
- *
- * Measured on quadkey 021231030 (144 trails, Cascades): 490.5 s sequential, 88.0 s at six,
- * 95.5 s at twelve. The curve is flat past six and then bends the wrong way, which is what
- * saturating a latency and then contending for a pool looks like. Raise this by raising
- * `BACKGROUND_POOL_SIZE` and `TerrainSource.maxConcurrent` together, and only with a number.
- *
- * Overpass is untouched by this. Its per-tile queries happen before this loop, and the one
- * place a trail might reach it — `discoverParentRoutes` — runs after.
+ * How many trails are committed at once, process-wide. The ceiling is not our CPU but the two
+ * scarce resources underneath — `TerrainSource` caps its own fetches at six, and the ingest
+ * holds `BACKGROUND_POOL_SIZE` connections less the four the queue's bookkeeping needs. On
+ * quadkey 021231030 (144 trails): 490.5 s sequential, 88.0 s at six, 95.5 s at twelve. Raise
+ * this only by raising `BACKGROUND_POOL_SIZE` and `TerrainSource.maxConcurrent` together.
  */
 const COMMIT_CONCURRENCY = Math.max(1, Math.min(6, BACKGROUND_POOL_SIZE - 4));
 
 /**
- * The ceiling above, enforced across drains rather than within one.
- *
- * `forEachConcurrent` bounds the loop it is given, which was enough for as long as one drain
- * ran at a time. Three code paths start them — the trails router's `waitUntil` kick, the
- * routes router's, and the cron — and each is guarded only against starting a second of its
- * own kind, so all three can be committing at once while each one obeys the six. Eighteen
- * open transactions is not a number anybody chose; it is what independently-reasonable local
- * limits multiply out to. The gate is module-level so the resource sees one ceiling.
- *
- * Inside a single drain it never blocks: the loop below asks for exactly as many permits as
- * exist, so this costs one already-resolved promise per trail and changes nothing.
+ * The ceiling above, enforced across drains rather than within one: three code paths start
+ * drains, each guarded only against a second of its own kind, so all three can commit at once
+ * while each obeys the six. Module-level so the resource sees one ceiling. Inside a single
+ * drain it never blocks — the loop asks for exactly as many permits as exist.
  */
 const commitGate = new Gate(COMMIT_CONCURRENCY);
 
@@ -149,12 +92,9 @@ function profileSpacingFor(lengthM: number): number {
 }
 
 /**
- * The rendered copy, coarsened until it fits.
- *
- * Douglas-Peucker takes a tolerance, not a vertex count, and the relationship between them
- * depends on how wiggly the line is — so this asks rather than predicts, quadrupling the
- * tolerance until the result is small enough. Ordinary trails exit on the first pass at
- * the 5 m tolerance they have always had.
+ * The rendered copy, coarsened until it fits. Douglas-Peucker takes a tolerance, not a vertex
+ * count, and the relation between them depends on how wiggly the line is — so this asks rather
+ * than predicts. Ordinary trails exit on the first pass at the 5 m tolerance.
  */
 function renderGeometry(coords: readonly LngLat[]): LngLat[] {
   let toleranceM = RENDER_SIMPLIFY_M;
@@ -167,11 +107,8 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
 }
 
 /**
- * A tile is re-fetched when its data is older than this.
- *
- * 30 days is a compromise between two real costs: OSM trail geometry changes slowly, so
- * refetching weekly is mostly wasted Overpass load; but a trail closure or a rerouted path
- * mapped today should not take a season to reach us.
+ * A tile is re-fetched when its data is older than this. Weekly would be mostly wasted
+ * Overpass load; a season would let a rerouted path go unnoticed. See `docs/architecture.md`.
  */
 export const TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -209,12 +146,9 @@ export function isTileFresh(
 }
 
 /**
- * Fetch, assemble, and commit every trail in one z9 tile.
- *
- * Returns rather than throws for the ordinary failure modes, because the caller is a job
- * handler that needs to record the outcome either way. It *does* throw when Overpass is
- * unavailable, so the job queue backs off rather than burning attempts against a service
- * that has already told us it is down.
+ * Fetch, assemble and commit every trail in one z9 tile. Returns rather than throws for the
+ * ordinary failure modes — the caller is a job handler that records the outcome either way —
+ * but throws when Overpass is unavailable, so the queue backs off instead of burning attempts.
  */
 export async function processTile(quadkey: string, deps: PipelineDeps): Promise<ProcessTileResult> {
   const db = deps.db ?? backgroundPrisma;
@@ -291,11 +225,9 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const region = await lookupRegion(bbox, deps);
 
   /**
-   * Waypoints for the whole tile in one query rather than one per trail.
-   *
-   * Forty trails would be forty Overpass requests at two concurrent — several minutes of
-   * a public service's time to fetch overlapping data. One tile-wide query costs the same
-   * as one trail's, and `attachWaypoints` does the per-trail assignment locally.
+   * Waypoints for the whole tile in one query rather than one per trail: forty trails would
+   * be forty Overpass requests at two concurrent, for overlapping data. `attachWaypoints`
+   * does the per-trail assignment locally.
    */
   let features: OverpassElement[] = [];
   if (deps.enrichWaypoints !== false) {
@@ -312,15 +244,8 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   let skipped = 0;
   let failed = 0;
 
-  /**
-   * Commit trails concurrently, `COMMIT_CONCURRENCY` at a time.
-   *
-   * The failure isolation the sequential loop had is preserved exactly: each trail is its
-   * own try, its own transaction, and its own line in the log. What changes is only how
-   * many are in flight — which is why the try lives here, in the body, rather than inside
-   * `forEachConcurrent`. A trail that throws must cost its tile one row, not the rest of
-   * the tile.
-   */
+  // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
+  // throws must cost its tile one row, not the rest of the tile.
   await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
     try {
       const outcome = await commitGate.run(() =>
@@ -362,12 +287,9 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
 }
 
 /**
- * Queue the long-distance routes that this tile's trails turn out to be pieces of.
- *
- * Runs after the tile is marked ready, and swallows its own failures, because it is
- * strictly additive: a tile that ingested forty trails and then failed to notice one of
- * them belongs to the Pacific Crest Trail is a good tile with a missing extra, not a
- * failed one. Marking it failed would re-run the expensive half to retry the cheap half.
+ * Queue the long-distance routes this tile's trails turn out to be pieces of. Runs after the
+ * tile is marked ready and swallows its own failures: it is strictly additive, and marking
+ * the tile failed would re-run the expensive half to retry the cheap half.
  */
 async function discoverParentRoutes(
   db: PrismaClient,
@@ -385,9 +307,8 @@ async function discoverParentRoutes(
     );
 
     for (const parent of parents) {
-      // `type=superroute` is the tag that means "this relation's members are routes". A
-      // parent that is a plain `type=route` is a section container we already ingest by
-      // bbox, and re-fetching it whole would duplicate work rather than add anything.
+      // `type=superroute` means "this relation's members are routes". A plain `type=route`
+      // parent is a section container tiles already ingest by bbox.
       if (parent.tags?.type !== 'superroute') continue;
       if (!(parent.tags.name ?? parent.tags['name:en'])) continue;
 
@@ -395,7 +316,7 @@ async function discoverParentRoutes(
         kind: JobKind.ingest_route,
         dedupeKey: routeIngestJobKey(parent.id),
         payload: { osmId: parent.id },
-        // Below tile work. A user is waiting on the tile under their cursor; nobody is
+        // Below tile work: somebody is waiting on the tile under their cursor, nobody is
         // waiting on a continental route, and it is the most expensive job we run.
         priority: -10,
       });
@@ -410,43 +331,22 @@ async function discoverParentRoutes(
 const MAX_ROUTE_DEPTH = 3;
 
 /**
- * How many route relations are asked for in one Overpass request.
- *
- * Not politeness — feasibility. `out body geom` on all 31 sections of the Pacific Crest
- * Trail is a single response holding the inline coordinates of roughly 400,000 nodes:
- * tens of megabytes down one socket that the server spends minutes generating before it
- * sends the first byte. The first real attempt died exactly there, with a transport-level
- * `fetch failed` after every mirror had been given its turn — no status code, because the
- * connection never got far enough to have one.
- *
- * Four sections is around 500 km, which arrives in a few megabytes and well inside the
- * client's abort window. Eight sequential requests instead of one is slower in the best
- * case and the only version that finishes in the actual case.
+ * How many route relations are asked for in one Overpass request. Feasibility, not politeness:
+ * `out body geom` on all 31 PCT sections is ~400,000 inline node coordinates down one socket,
+ * which dies as a transport-level `fetch failed` with no status. Four sections is ~500 km and
+ * arrives well inside the client's abort window.
  */
 const ROUTE_BATCH_SIZE = 4;
 
 /**
- * Fetch route relations by id, halving the batch whenever a request fails.
+ * Fetch route relations by id, halving the batch whenever a request fails. A fixed stride
+ * cannot be right: `[timeout:180]` is a promise about Overpass's own execution and says
+ * nothing about the reverse proxy in front of a mirror, one of which gives up at ~38 s with a
+ * 504. Halving turns that cliff into a slope, bottoming out at a single id.
  *
- * A fixed stride cannot be right, because the ceiling it has to stay under is not ours and
- * is not advertised. `[timeout:180]` is a promise Overpass makes about its own execution;
- * it says nothing about the reverse proxy in front of a given mirror, and the one this
- * project depends on most gives up at roughly 38 seconds and answers `504`. So the same
- * batch of four sections is comfortable against one mirror and impossible against another,
- * and no single constant tuned on a good day survives a bad one.
- *
- * Halving turns that from a cliff into a slope. A batch that fails is not evidence that
- * the route is unfetchable, only that this many sections at once was too much for whoever
- * answered; two halves are each half the work and get a fresh mirror from the rotation.
- * The recursion bottoms out at a single id, and a single id that still fails after the
- * client has exhausted its own mirrors and backoff is a real failure and is thrown.
- *
- * **It throws rather than skipping.** Dropping an unfetchable section and committing the
- * rest is the tempting recovery and it is the exact bug this whole module exists to fix: a
- * Pacific Crest Trail quietly missing 300 km still renders, still looks finished, and lies
- * about its length in the one place a user would check. A route that fails to assemble
- * leaves the previous data in place and the job retryable; a route that assembles wrongly
- * is committed, cached, and believed.
+ * **It throws rather than skipping.** A Pacific Crest Trail quietly missing 300 km still
+ * renders, still looks finished, and lies about its length. A route that fails to assemble
+ * leaves the previous data in place and the job retryable.
  */
 async function fetchRelations(
   ids: readonly number[],
@@ -465,9 +365,8 @@ async function fetchRelations(
       log('route batch', { depth, ids: batch.length, found: found.length });
     } catch (error) {
       if (batch.length === 1) {
-        // The unit is one relation and it still will not come. Below a relation there is a
-        // smaller unit — its ways — so this is a continuation of the halving, not a
-        // different strategy. Only if that also fails is the route genuinely unfetchable.
+        // Below a relation there is a smaller unit — its ways — so this continues the
+        // halving rather than switching strategy.
         found.push(await fetchRelationInParts(batch[0]!, deps, log, depth, error));
         return;
       }
@@ -485,34 +384,19 @@ async function fetchRelations(
 }
 
 /**
- * How many way geometries are asked for in one request.
- *
- * The unit below a relation. A PCT section is on the order of a thousand ways, so 250 is
- * four or five requests per section — each a couple of megabytes, which every mirror serves
- * comfortably, including the one whose proxy gives up at 38 seconds.
+ * How many way geometries are asked for in one request. The unit below a relation: a PCT
+ * section is on the order of a thousand ways, so 250 is four or five requests per section.
  */
 const WAY_GEOMETRY_BATCH_SIZE = 250;
 
 /**
- * Rebuild one relation from a skeleton plus its ways, when it cannot be fetched whole.
+ * Rebuild one relation from a skeleton plus its ways, when no mirror will serve it whole.
+ * The result is spliced back into the members and is structurally identical to what `out body
+ * geom` would have returned, so `assembleTrails` needs no second code path.
  *
- * `out body geom` asks a mirror to assemble a relation and all of its coordinates in one
- * response, and for the largest PCT sections no public mirror reliably will — the halving
- * in `fetchRelations` runs out of things to halve and the whole 4,270 km route fails on one
- * section. This is the step below that: ask for the member list without geometry, which is
- * always cheap, then ask for the coordinates in batches sized by us instead of by the
- * relation.
- *
- * The result is spliced back into the members and is structurally identical to what
- * `out body geom` would have returned, so nothing downstream knows this happened. That is
- * the point — `assembleTrails` chains members by their inline geometry and must not grow a
- * second code path for routes that took the long way here.
- *
- * **A missing way is fatal, deliberately.** The failure this module exists to prevent is a
- * route that assembles from most of its parts, renders, and lies about its length. If the
- * geometry for even one member never arrives, the original error is thrown and the job stays
- * retryable — the previous data, right or wrong, is left alone rather than replaced with
- * something confidently incomplete.
+ * **A missing way is fatal, deliberately.** A route that assembles from most of its parts
+ * renders and lies about its length; throwing leaves the previous data alone and the job
+ * retryable.
  */
 async function fetchRelationInParts(
   id: number,
@@ -526,9 +410,8 @@ async function fetchRelationInParts(
   const skeleton = await deps.overpass
     .query(buildRelationSkeletonQuery([id]))
     .catch((error: unknown) => {
-      // The member list is the cheapest thing we ask any mirror for. If even this fails the
-      // problem is not the relation's size, so report the original failure rather than this
-      // one — it is the more informative of the two.
+      // The member list is the cheapest thing we ask any mirror for, so a failure here is
+      // not about size — report the original, more informative error.
       log('route skeleton failed', { depth, id, error: String(error) });
       throw cause;
     });
@@ -560,23 +443,11 @@ async function fetchRelationInParts(
 }
 
 /**
- * Way geometry for one relation, halving on failure exactly as `fetchRelations` does.
- *
- * The batch size above is a guess about what a mirror will serve, and on the heaviest PCT
- * sections it is sometimes wrong — 250 ways through a dense stretch is a bigger response
- * than the same count through open desert, and the mirror answers 504. Without this the
- * whole 4,270 km route failed on that one timeout, which is what kept happening: the largest
- * sections are both the ones that need this path and the ones whose batches are heaviest.
- *
- * So the recovery is the one this module already uses a level up. Ask for less, then less
- * again. `fetchRelations` halves relations and then descends to ways; this halves ways, and
- * below a way there is nothing smaller to ask Overpass for — so a single-way request that
- * still fails is allowed to throw, and the caller treats it as the fatal gap it is. That
- * keeps the guarantee that matters: a route is committed whole or not at all.
- *
- * The error that escapes is the way-level one rather than the relation-level `cause` the
- * caller started with. It names the request that actually failed, which is the more useful
- * of the two when someone reads the job's `lastError` a day later.
+ * Way geometry for one relation, halving on failure exactly as `fetchRelations` does — 250
+ * ways through a dense stretch is a much bigger response than through open desert, and the
+ * mirror answers 504. Below a way there is nothing smaller to ask for, so a single-way request
+ * that still fails throws, keeping the guarantee that a route is committed whole or not at all.
+ * The escaping error is the way-level one, which names the request that actually failed.
  */
 export async function fetchWayGeometries(
   ids: readonly number[],
@@ -620,21 +491,11 @@ export interface ProcessRouteResult {
 }
 
 /**
- * Ingest one long-distance route whole, by relation id rather than by area.
- *
- * The case this exists for: OSM models the Pacific Crest Trail as a `type=superroute`
- * whose members are the section relations, and a bbox query returns relations by their
- * node and way members only — it never recurses into member relations. So no tile can ever
- * see the PCT itself. Every tile along it sees a section, commits it under the section's
- * own name, and the product ends up insisting that the Pacific Crest Trail is 111 km long,
- * or 61 km, depending on which fragment won. The trail is not missing; it is misdescribed,
- * which is worse, because nothing looks wrong.
- *
- * Resolution hikes the hierarchy: fetch the root, fetch its member relations, repeat until
- * the members are ways. Then the flattened member list is handed to the ordinary assembler
- * as a single synthetic relation, so chaining, gap-bridging, and orientation are the same
- * code that every other trail goes through — a superroute is a long trail, not a new kind
- * of object.
+ * Ingest one long-distance route whole, by relation id rather than by area — a bbox query
+ * never recurses into member relations, so no tile can see the Pacific Crest Trail itself,
+ * only its sections, and the product insists the PCT is 111 km long. See
+ * `docs/architecture.md`. The flattened member list goes to the ordinary assembler as one
+ * synthetic relation, so chaining and orientation stay a single code path.
  */
 export async function processRoute(osmId: number, deps: PipelineDeps): Promise<ProcessRouteResult> {
   const db = deps.db ?? backgroundPrisma;
@@ -671,12 +532,9 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
   }
 
   /**
-   * Flatten the hierarchy into one member list, in the order the relations declare.
-   *
-   * Order is the whole point. The assembler chains by matching endpoints and bridges what
-   * it cannot match, and a shuffled member list turns a continuous route into a hundred
-   * disjoint lines of which it keeps the longest. Depth-first over the declared order is
-   * the order a hiker would meet them in.
+   * Flatten the hierarchy into one member list, in the order the relations declare. Order is
+   * the whole point: the assembler chains by matching endpoints, and a shuffled member list
+   * becomes a hundred disjoint lines of which it keeps the longest.
    */
   const members: OverpassRelation['members'] = [];
   const seen = new Set<number>();
@@ -699,8 +557,8 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
   }
 
   // Sections abut rather than overlap, and the join is where one mapper's way ends and
-  // another's begins — reliably within a few hundred metres, occasionally more where a
-  // route crosses a road. Tighter than the default and the PCT arrives in 31 pieces.
+  // another's begins — reliably within a few hundred metres. Tighter and the PCT arrives
+  // in 31 pieces.
   const [assembled] = assembleTrails([{ ...root, members }], { gapToleranceM: 2_000 });
   if (!assembled) {
     return { osmId, name, status: 'skipped', lengthM: 0, fetchMs: Date.now() - startedAt };
@@ -741,12 +599,9 @@ interface CommitContext {
 }
 
 /**
- * One trail, committed or skipped.
- *
- * The transaction covers the trail row, its geometry, its profile, and its waypoints,
- * because a trail row whose `geom` write failed is invisible to every spatial query while
- * still appearing in search — the worst kind of partial state, since nothing about it
- * looks broken.
+ * One trail, committed or skipped. The transaction covers the trail row, its geometry, its
+ * profile and its waypoints: a trail row whose `geom` write failed is invisible to every
+ * spatial query while still appearing in search, and nothing about it looks broken.
  */
 async function commitTrail(
   db: PrismaClient,
@@ -758,13 +613,10 @@ async function commitTrail(
   if (resampled.length < 2) return 'skipped';
 
   /*
-   * `alongLengthM` is not an optimisation — it is the difference between publishing a
-   * thru-hike and publishing a lie about one. A long trail's profile is capped at 6,000
-   * points, so the Pacific Crest Trail resamples at 725 m, and the straight lines between
-   * those samples skip every switchback in between. Measured that way it comes out at
-   * 3,214 km instead of 4,221. Handing the true along-line length down makes the sample
-   * distances exact, and everything derived from them — the stats, the chart axis, the
-   * waypoint distances, the weather sample points — correct with it.
+   * `alongLengthM` is not an optimisation. A capped profile resamples the PCT at 725 m, and
+   * the straight lines between samples skip every switchback: measured that way it comes out
+   * at 3,214 km instead of 4,221. Handing the true along-line length down keeps the sample
+   * distances — and every stat, axis and weather point derived from them — exact.
    */
   const { points, gapCount } = await elevateLine(resampled, ctx.terrain, {
     spacingM,
@@ -786,10 +638,8 @@ async function commitTrail(
   });
 
   // `derived.coords` and `derived.profile`, never `trail.coords` and `points`. OSM stores
-  // roughly half of all point-to-point paths running downhill, and `deriveTrail` flips
-  // those so the stats describe the hike rather than the mapper's drawing direction.
-  // Everything below has to agree with the numbers: the drawn line, the profile chart, and
-  // the waypoint distances all measure from whichever end is now the start.
+  // about half of all point-to-point paths running downhill and `deriveTrail` flips those,
+  // so the drawn line, the chart and the waypoint distances must all agree with the stats.
   const oriented = derived.coords;
   const profile = [...derived.profile];
 
@@ -845,8 +695,7 @@ async function commitTrail(
       where: { osmType_osmId: { osmType, osmId } },
       create: row,
       // `slug` is omitted from the update on purpose: it is a public URL from the moment
-      // the trail is first indexed, and a rename in OSM must not silently 404 every link
-      // to it. Renames land on `name` and are reconciled deliberately, not by ingest.
+      // the trail is first indexed, and a rename in OSM must not 404 every link to it.
       update: { ...row, slug: undefined },
     });
 
@@ -874,14 +723,10 @@ async function commitTrail(
       },
     });
 
-    // Waypoints are replaced wholesale rather than diffed. They are derived data with no
-    // user-owned state attached, and OSM ids on nodes are not stable enough across a
-    // retag to make a diff more correct than a rewrite.
-    //
-    // Three statements for any number of waypoints, not two per waypoint: the rows go in
-    // one `createMany`, and `writeWaypointPoints` derives every PostGIS point from the
-    // `lng`/`lat` it just wrote. See the note on that function for why the round-trip count
-    // rather than the work is what used to exhaust this transaction's budget.
+    // Waypoints are replaced wholesale rather than diffed: derived data with no user-owned
+    // state, and OSM node ids are not stable enough across a retag for a diff to be better.
+    // Three statements for any number of waypoints — one `createMany`, then
+    // `writeWaypointPoints` derives every PostGIS point from the `lng`/`lat` just written.
     await tx.waypoint.deleteMany({ where: { trailId: saved.id } });
     if (allWaypoints.length > 0) {
       await tx.waypoint.createMany({
@@ -916,14 +761,8 @@ async function commitTrail(
 
 /**
  * How long one trail's transaction may take, and how long it may wait for a connection.
- *
- * Prisma's defaults are 5 s and 2 s, both sized for a web request rather than for this. A
- * trail's transaction is a slug lookup, an upsert, two spatial writes, a profile upsert,
- * and a write per waypoint — dozens of round-trips — and with several running at once the
- * 5 s ceiling starts aborting perfectly healthy commits under nothing worse than load.
- * That failure is expensive and misleading: the trail is counted failed, the terrain work
- * that produced it is discarded, and the tile records "1 trail(s) failed to commit" for a
- * problem that is entirely ours.
+ * Prisma's 5 s / 2 s defaults are sized for a web request; a trail's transaction is dozens of
+ * round-trips, and under load the default aborts healthy commits and blames the trail.
  */
 const TRAIL_TX_TIMEOUT_MS = 30_000;
 
@@ -931,31 +770,18 @@ const TRAIL_TX_TIMEOUT_MS = 30_000;
 const UNIQUE_VIOLATION = 'P2002';
 
 /**
- * Attempts allowed per trail, one for each slug `uniqueSlug` can offer.
- *
- * It offers four — bare name, region-qualified, id-qualified, and type-and-id-qualified —
- * and each losing attempt burns exactly one, because the winner of the race is committed by
- * the time we look again. So the cap has to be the candidate count: any lower and the last
- * candidate is unreachable, and the last candidate is the only one unique by construction.
- * Stopping at three would mean giving up one step before the answer that cannot fail.
+ * Attempts allowed per trail — must stay equal to the number of slugs `uniqueSlug` can offer,
+ * since each losing attempt burns exactly one. Any lower and the last candidate is
+ * unreachable, and the last candidate is the only one unique by construction.
  */
 const MAX_SLUG_ATTEMPTS = 4;
 
 /**
- * Run a trail's transaction, retrying when it loses a race for a slug.
- *
- * `uniqueSlug` reads and the upsert writes, and between those two moments another worker
- * may take the name. That gap was unreachable while trails committed one at a time and is
- * routine now that six do: a tile holding a hundred and fifty paths in one valley contains
- * several called "Lake Trail", and they are now in flight together.
- *
- * A retry is the whole fix, because the read is inside the transaction. The second attempt
- * finds the row that beat us, `uniqueSlug` moves on to its next candidate — region-
- * qualified, then id-qualified, then type-and-id-qualified — and that last one is unique by
- * construction, so this terminates rather than spins.
- *
- * Only unique violations are retried. Every other error belongs to that trail and is
- * rethrown to `processTile`, which records it and carries on with the rest of the tile.
+ * Run a trail's transaction, retrying when it loses a race for a slug. `uniqueSlug` reads and
+ * the upsert writes; with six trails in flight and several called "Lake Trail" in one valley,
+ * another worker takes the name in between. A retry is the whole fix because the read is
+ * inside the transaction, and the last candidate is unique by construction, so this
+ * terminates. Only unique violations are retried — everything else belongs to that trail.
  */
 async function commitWithSlugRetry(
   db: PrismaClient,
@@ -989,12 +815,9 @@ function elevationAt(
 }
 
 /**
- * A slug that is unique and stays that way.
- *
- * Tries the bare name first, because `/trails/ben-nevis` is the URL somebody would guess.
- * On collision it qualifies with the region, which is genuinely informative — there are
- * several Eagle Peak Trails and the region says which one. Only if that also collides does
- * it fall back to the OSM id, which is unlovely but unique and stable.
+ * A slug that is unique and stays that way. The bare name first, because `/trails/ben-nevis`
+ * is what somebody would guess; then region-qualified, which says which Eagle Peak Trail this
+ * is; then the OSM id, unlovely but unique and stable.
  */
 async function uniqueSlug(
   tx: Prisma.TransactionClient,
@@ -1025,11 +848,9 @@ export interface RegionInfo {
 }
 
 /**
- * Country and region for a tile, from one `is_in` query at its centre.
- *
- * Fails soft to nulls. A trail with no region name is fully usable — it just ranks
- * slightly differently in search and gets a plainer slug — and a boundary lookup is not
- * worth failing a tile of otherwise good data over.
+ * Country and region for a tile, from one `is_in` query at its centre. Fails soft to nulls: a
+ * trail with no region name is fully usable, and a boundary lookup is not worth failing a
+ * tile of otherwise good data over.
  */
 async function lookupRegion(bbox: BBox, deps: PipelineDeps): Promise<RegionInfo> {
   const centre: LngLat = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
@@ -1042,11 +863,9 @@ async function lookupRegion(bbox: BBox, deps: PipelineDeps): Promise<RegionInfo>
 }
 
 /**
- * Choose the most useful administrative level present.
- *
- * Descending from level 6 (county) to 4 (state/region), because the more local name is
- * the more informative one — "Snowdonia" beats "Wales" beats "United Kingdom" on a trail
- * card. Level 2 is only ever read for its ISO country code, never as a display name.
+ * Choose the most useful administrative level present. Descending from 6 (county) to 4
+ * (state/region), because the more local name is the more informative one on a trail card.
+ * Level 2 is only ever read for its ISO country code, never as a display name.
  */
 export function pickRegion(elements: readonly OverpassElement[]): RegionInfo {
   let regionName: string | null = null;
@@ -1076,25 +895,11 @@ export function pickRegion(elements: readonly OverpassElement[]): RegionInfo {
 }
 
 /**
- * Which photo becomes the trail's hero, given what it already has and what just landed.
- *
- * `Trail.primaryPhotoId` is one half of a one-to-one relation, so Prisma requires it to be
- * `@unique` and Postgres therefore enforces that **no two trails may share a hero**. That
- * makes the obvious `trail.primaryPhotoId ?? savedIds[0]` a write that can fail — and it
- * did. An earlier version of the upsert below keyed photos on `(source, sourceId)` alone,
- * so a neighbouring trail's enrichment re-parented rows out from under a trail that had
- * already claimed one as its hero. The key was fixed; the rows it left behind were not,
- * and each one is now a trail whose enrichment dies on a unique violation before it can
- * write anything at all.
- *
- * So both ends are checked rather than assumed:
- *
- * - the hero already on the trail is kept only if that photograph is genuinely ours. A
- *   pointer at another trail's photo is a wrong picture at the top of the page, not a
- *   preference worth preserving.
- * - a replacement is the first candidate nobody else has claimed.
- *
- * `null` when nothing qualifies, which clears a stolen hero rather than re-writing it.
+ * Which photo becomes the trail's hero. `Trail.primaryPhotoId` is `@unique`, so **no two
+ * trails may share a hero** and the obvious `current ?? candidates[0]` is a write that can
+ * fail — historic rows re-parented by an older upsert key still point across trails. So both
+ * ends are checked: the existing hero is kept only if that photograph is genuinely ours, and
+ * a replacement is the first candidate nobody else has claimed. `null` clears a stolen hero.
  */
 export async function chooseHero(
   db: PrismaClient,
@@ -1107,12 +912,9 @@ export async function chooseHero(
       where: { id: current },
       select: { trailId: true, hiddenAt: true },
     });
-    // A user-uploaded photo, once chosen, outranks anything we scraped, and a re-run of
-    // enrichment must not quietly take it back — unless a moderator took it down, in which
-    // case the hero has to move. Without the `hiddenAt` check this branch would re-pin a
-    // hidden photograph to the top of the trail page on the next enrich pass, which is the
-    // most visible place on the site and the one an undone takedown would be noticed in
-    // last: nothing recomputes it again until somebody uploads.
+    // A user-uploaded hero outranks anything we scraped and a re-run must not take it back —
+    // unless a moderator hid it, in which case the hero has to move. Without the `hiddenAt`
+    // check the next enrich pass re-pins a hidden photograph to the top of the trail page.
     if (held?.trailId === trailId && held.hiddenAt === null) return current;
   }
   if (candidates.length === 0) return null;
@@ -1122,8 +924,8 @@ export async function chooseHero(
       where: { id: { not: trailId }, primaryPhotoId: { in: [...candidates] } },
       select: { primaryPhotoId: true },
     }),
-    // The candidates are ids enrichment just wrote, so in the ordinary case all of them are
-    // visible — but a re-run over a trail where one was moderated must not promote it.
+    // Ordinarily all of these are visible, but a re-run over a trail where one was moderated
+    // must not promote it.
     db.photo.findMany({
       where: { id: { in: [...candidates] }, hiddenAt: null },
       select: { id: true },
@@ -1135,14 +937,10 @@ export async function chooseHero(
 }
 
 /**
- * Attach seed photos to one trail.
- *
- * Runs as its own job so a slow Commons response delays a photo, not a tile of trails.
- *
- * Upserts on `(source, sourceId, trailId)`. The trail belongs in that key because Commons
- * geosearch is a radius query and neighbouring trails share photographs: without it, the
- * second trail's upsert would reassign the row and silently strip the first trail of a
- * photo its `photoCount` still claimed.
+ * Attach seed photos to one trail, as its own job so a slow Commons response delays a photo
+ * rather than a tile of trails. Upserts on `(source, sourceId, trailId)` — the trail belongs
+ * in that key because Commons geosearch is a radius query and neighbouring trails share
+ * photographs, so without it the second trail's upsert reassigns the row.
  */
 export async function enrichTrailPhotos(trailId: string, deps: PipelineDeps): Promise<number> {
   const db = deps.db ?? backgroundPrisma;
@@ -1202,12 +1000,9 @@ export async function enrichTrailPhotos(trailId: string, deps: PipelineDeps): Pr
     savedIds.push(saved.id);
   }
 
-  // Counted rather than assumed. `savedIds.length` is what enrichment just wrote, which
-  // stops being the trail's photo count the moment a user uploads one of their own.
-  //
-  // `hiddenAt: null` for the same reason `refreshTrailPhotos` carries it: the count is what
-  // the gallery will show, and an enrich pass that recounted the hidden ones back in would
-  // silently undo the numeric half of a takedown weeks after it was decided.
+  // Counted rather than assumed: `savedIds.length` stops being the trail's photo count the
+  // moment a reader uploads one. `hiddenAt: null` because the count is what the gallery
+  // shows, and recounting hidden photographs would undo the numeric half of a takedown.
   const photoCount = await db.photo.count({ where: { trailId: trail.id, hiddenAt: null } });
   const primaryPhotoId = await chooseHero(db, trail.id, trail.primaryPhotoId, savedIds);
 
