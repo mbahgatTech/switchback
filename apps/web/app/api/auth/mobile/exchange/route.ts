@@ -67,16 +67,45 @@ export async function POST(request: Request): Promise<Response> {
 
     if (byEmail && !identity.emailVerified) {
       /**
-       * An account with this email exists and the provider will not vouch for the
-       * address. Linking here would let anyone who can get an unverified token for
-       * `you@example.com` take over that account, which is the classic account-linking
-       * hole. Refusing costs a legitimate user one extra step; allowing it costs someone
-       * their account.
+       * An account with this email exists and the provider will not vouch for the address.
+       * Linking here would let anyone who can get a token asserting `you@example.com` take
+       * over that account, which is the classic account-linking hole — and for Entra it is
+       * not theoretical: `email` is a tenant-mutable attribute, we sign against `/common`,
+       * and a free tenant costs nothing. `auth-native.ts` has the full reasoning.
+       *
+       * Refusing costs a legitimate user one extra step. Allowing it costs someone their
+       * account, along with every activity, photograph and list on it.
+       *
+       * The message names the only recovery that exists. An earlier draft said to "link this
+       * device from settings", and there is no such control — `me.ts` exposes no linking
+       * procedure and `settings-form.tsx` has no linking affordance, so the sentence sent the
+       * reader looking for a button nobody has written. Signing in with the provider the
+       * account was made with is a thing they can actually do, on this screen, now.
        */
-      return Response.json({ error: 'email_taken_unverified' }, { status: 409 });
+      return Response.json(
+        {
+          error: 'email_taken_unverified',
+          message:
+            'That email address already has a Switchback account. Sign in with the provider you first used, and this device will be added to it.',
+        },
+        { status: 409 },
+      );
     }
 
     if (byEmail) {
+      /*
+       * Reached only for Apple, which asserts `email_verified` itself. Entra never gets here
+       * now, and this branch is the one to delete once the forward-looking cost is understood
+       * — see `scripts/report-email-linked-accounts.ts`.
+       *
+       * Note what removal does *not* cost, because an earlier comment here had it wrong: the
+       * `account.create` below runs on this path as well as the create path, so anybody linked
+       * this way already has a row keyed on (provider, providerAccountId) and resolves through
+       * the `existing` lookup above on every later sign-in. Deleting these two lines cannot
+       * strand them. What it changes is which future unknown-`sub` sign-ins may link at all —
+       * an Entra user whose browser account has a different `sub` is then permanently 409ed by
+       * the branch above, on a message that promises the device will be added.
+       */
       userId = byEmail.id;
     } else {
       const created = await prisma.user.create({

@@ -12,8 +12,8 @@
  * who asked for what.
  */
 
-import { MEDIA_CACHE, PAGE_CACHE, TILE_CACHE } from './caches';
-import { deleteOfflineTrail, getOfflineTrail, referencedUrls } from './store';
+import { ASSET_CACHE, MEDIA_CACHE, PAGE_CACHE, TILE_CACHE } from './caches';
+import { deleteOfflineTrail, getOfflineTrail, listOfflineTrails, referencedUrls } from './store';
 
 export interface EvictionResult {
   /** Downloads removed from the ledger. */
@@ -55,6 +55,24 @@ export async function evictTrails(trailIds: readonly string[]): Promise<Eviction
       if (await cache.delete(url)) urls += 1;
     }
   }
+
+  /*
+   * The build assets are the one thing not in the set difference, because they are not in the
+   * ledger: `download.ts` deliberately does not list a page's `/_next/static/*` against the
+   * trail that happened to fetch them, since every trail page shares them and evicting them
+   * with one trail would blank the others.
+   *
+   * That leaves them with no owner, and `ASSET_CACHE` is hand-versioned precisely so a deploy
+   * does not sweep it — so without this it only ever grows, a chunk set per build a download
+   * was ever made on. The moment there are no downloads left there is nothing that can need
+   * them: an online page fetches its own chunks and `handleStatic` refills the shell. So the
+   * whole cache goes, all at once, which is cheap and needs no ledger.
+   *
+   * Anything short of "none left" is deliberately not attempted. Working out which chunk a
+   * remaining download still names would mean re-reading its stored markup, and getting it
+   * wrong costs a hiker a page that will not render in a place with no signal to repair it.
+   */
+  if ((await listOfflineTrails()).length === 0) await caches.delete(ASSET_CACHE);
 
   return { trails: departing.length, urls };
 }

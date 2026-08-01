@@ -213,6 +213,20 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// When "sign out everywhere" was last pressed on this account.
+  ///
+  /// The refresh tokens and the session rows can be deleted; the access JWT cannot, because
+  /// verifying it is a signature check with no database round trip and that is the whole
+  /// reason it is cheap enough to put on every request. So it lived for up to its full fifteen
+  /// minutes after the press — on the one path this button exists for, a stolen phone, the
+  /// thief kept full read/write API access while the owner read "every session on the account
+  /// has ended".
+  ///
+  /// This closes it without giving up the property: `createContext` already loads the user row
+  /// to authenticate a bearer caller, so rejecting a token issued at or before this costs no
+  /// extra query. Null means never pressed, which is almost every row.
+  sessionsRevokedAt DateTime?
+
   accounts    Account[]
   sessions    Session[]
   reviews     Review[]
@@ -306,6 +320,19 @@ model MobileAuthRequest {
   /// Where the browser is sent when OIDC finishes. Scheme allow-listed before this is stored.
   redirectUri String
   deviceName  String?
+
+  /// SHA-256 of the secret `/start` put in a `__Host-` cookie on the browser that opened it.
+  ///
+  /// This is what ties the row to one browser. Without it, an attacker could call `/start`
+  /// themselves — so that they hold the PKCE verifier — and then navigate a victim's browser
+  /// to `/complete?request=<id>`; the victim's session cookie rides along on a top-level
+  /// cross-site GET, because that is exactly what `SameSite=Lax` is for, and the attacker
+  /// claims a token pair on the victim's account. The verifier defends the deep-link leg and
+  /// says nothing at all about *whose* session authorised the row.
+  ///
+  /// Nullable only because the column arrived after the table did. A null is treated as a
+  /// mismatch, not as "unchecked" — see `authorizeAuthRequest`.
+  browserHash String?
 
   createdAt DateTime @default(now())
   expiresAt DateTime

@@ -50,7 +50,7 @@ import { Prisma } from '@switchback/db';
 import type { PrismaClient, TrailList, User } from '@switchback/db';
 import { ensureSystemLists } from '../provisioning';
 import { summarySelect, toSummary } from '../trail-shape';
-import { protectedProcedure, publicProcedure, router } from '../trpc';
+import { deliberateServerError, protectedProcedure, publicProcedure, router } from '../trpc';
 
 /**
  * A list, minus its items.
@@ -660,10 +660,9 @@ export const listsRouter = router({
         select: { id: true },
       });
       if (!list) {
-        throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: 'Your saved lists are missing.',
-        });
+        // Marked, so the error formatter leaves the sentence alone: `save-controls.tsx`
+        // renders `error.message` raw, and the generic 500 copy says nothing about lists.
+        throw deliberateServerError('Your saved lists are missing.');
       }
 
       const existing = await ctx.db.trailListItem.findUnique({

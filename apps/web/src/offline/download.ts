@@ -26,7 +26,7 @@ import { MAX_CORRIDOR_TILES, TERRARIUM_URL_TEMPLATE, tileCorridor, tileUrl } fro
 import type { CorridorResult } from '@switchback/geo';
 import type { TrailDetail } from '@switchback/core';
 import { glyphsUrl, openMapTilesUrl } from '../components/map/basemap';
-import { MEDIA_CACHE, PAGE_CACHE, SHELL_CACHE, staticAssets, TILE_CACHE } from './caches';
+import { ASSET_CACHE, MEDIA_CACHE, PAGE_CACHE, staticAssets, TILE_CACHE } from './caches';
 import { putOfflineTrail, type OfflineTrail } from './store';
 
 /**
@@ -176,12 +176,18 @@ async function storeDocument(
  * browsing, but only for pages visited *while it was already in control*, which a hiker who
  * installed the app and immediately pressed download has not done.
  *
+ * **Into `ASSET_CACHE`, not the shell, and that is the whole point of it existing.** The shell
+ * is named after the build and swept by `activate` when the next one takes over. Writing a
+ * download's chunks there meant a deploy deleted them while the page that names them sat in
+ * `PAGE_CACHE` untouched — a download that survives and no longer renders. Nothing re-harvests
+ * them either: this function is called from `downloadTrail` and nowhere else.
+ *
  * Assets already held are skipped rather than re-fetched: they are content-hashed, so a URL
  * that resolved once resolves forever, and the second trail in a valley would otherwise pay
  * for the same forty files.
  */
 async function storeShell(html: string, signal?: AbortSignal): Promise<void> {
-  const cache = await caches.open(SHELL_CACHE);
+  const cache = await caches.open(ASSET_CACHE);
   const assets = staticAssets(html).map((path) => new URL(path, location.origin).toString());
   const held = await Promise.all(assets.map((url) => cache.match(url, { ignoreVary: true })));
   const missing = assets.filter((_url, index) => held[index] === undefined);
@@ -324,6 +330,7 @@ export async function downloadTrail(
   // The page's own build assets. Not counted against this trail's size and not listed in its
   // manifest, both on purpose: they belong to the deployment rather than to the download,
   // every trail page shares them, and evicting them with one trail would blank the others.
+  // They go into `ASSET_CACHE`, which no deploy sweeps — see `storeShell`.
   await storeShell(page.html, signal);
 
   // ── Tiles ────────────────────────────────────────────────────────────────────────────

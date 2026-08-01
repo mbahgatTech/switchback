@@ -72,9 +72,16 @@ describe.skipIf(!IS_LOCAL).sequential('mobile tokens', () => {
   });
 
   describe('access tokens', () => {
-    it('round-trips the user id', async () => {
+    it('round-trips the user id, and the issue time a revocation is measured against', async () => {
+      const before = Math.floor(Date.now() / 1000);
       const token = await signAccessToken(userId);
-      await expect(verifyAccessToken(token)).resolves.toBe(userId);
+      const claims = await verifyAccessToken(token);
+
+      expect(claims?.userId).toBe(userId);
+      // `createContext` compares this against `User.sessionsRevokedAt`, so a token that
+      // verified without a usable `iat` would be the one shape that outlives a sign-out.
+      expect(claims?.issuedAt).toBeGreaterThanOrEqual(before);
+      expect(claims?.issuedAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000));
     });
 
     it('returns null rather than throwing for a malformed token', async () => {
@@ -156,7 +163,7 @@ describe.skipIf(!IS_LOCAL).sequential('mobile tokens', () => {
       const second = await rotateRefreshToken(prisma, first.refreshToken);
 
       expect(second.refreshToken).not.toBe(first.refreshToken);
-      await expect(verifyAccessToken(second.accessToken)).resolves.toBe(userId);
+      await expect(verifyAccessToken(second.accessToken)).resolves.toMatchObject({ userId });
 
       const rows = await tokenRows(userId);
       expect(rows).toHaveLength(2);

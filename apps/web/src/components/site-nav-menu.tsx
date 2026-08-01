@@ -4,11 +4,13 @@ import { type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { ThemePreference } from '@switchback/core';
+import { signOutAction } from './auth/sign-out-action';
 import { BUTTON_COLLAR, HEIGHT, SECONDARY } from './controls';
 import { ThemeChoice } from './theme-choice';
 
 /**
- * The six places this product goes, and the disclosure that holds them when they do not fit.
+ * The six places this product goes, the controls that ride beside them, and the disclosure
+ * that holds all of it when it does not fit.
  *
  * The list and the section names live here rather than in `site-nav.tsx` because this file is
  * a client component and that one is not: `site-nav.tsx` imports `caller` from `../trpc/server`,
@@ -249,6 +251,42 @@ export function SiteNavMenu({
         </div>
 
         {extra}
+
+        {/*
+         * Leaving, and it is a control rather than a destination — so it sits at the end of
+         * the row beside the theme strip, not among the six words. Adding it to those six
+         * would break the argument in `site-nav.tsx` that keeps this a collar instead of a
+         * navigation bar, and it would be wrong on its own terms: every other entry answers
+         * "where do I go", and this one answers "stop being me".
+         *
+         * **It does not widen the fold.** The 1,117px measurement above counts "Sign in",
+         * which the map sheet passes through `extra` for a signed-out reader. Signed in, that
+         * link is gone and this one is here instead; the two are within a few pixels of each
+         * other and never render together, so the densest header is the same width it was.
+         *
+         * A `<form>` around a server action, not an `onClick`. It works before hydration and
+         * with scripting off, which the disclosure around it does not — so on the widths where
+         * this row is a plain collar, signing out is the one thing here that never needs
+         * JavaScript. That matters most on the case this exists for: a shared computer, where
+         * the person who needs to leave may not be the person who set the browser up.
+         */}
+        {signedIn ? (
+          <form action={signOutAction}>
+            {/*
+             * `min-h-6` and `inline-flex` for the reason `theme-choice.tsx` gives about the
+             * strip beside it: the six words are inline prose and exempt from WCAG 2.5.8,
+             * a `<button>` is not, and eleven-pixel caps on their own land just under the
+             * 24px floor. A full touch rung would make leaving the tallest thing in a row
+             * that is meant to read as a margin note.
+             */}
+            <button
+              type="submit"
+              className="collar inline-flex min-h-6 items-center rounded-hair hover:text-ink"
+            >
+              Sign out
+            </button>
+          </form>
+        ) : null}
 
         <ThemeChoice value={theme} signedIn={signedIn} />
       </div>
