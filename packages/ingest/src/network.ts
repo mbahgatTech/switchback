@@ -1,17 +1,7 @@
 /**
- * The walkable network, fetched for its own sake.
- *
- * The trail pipeline and this one look similar and answer different questions. `pipeline.ts`
- * asks "what named hikes exist here", assembles route relations into single curated lines,
- * and throws away everything that is not one of those: `pickPrimary` keeps the longest
- * contiguous run of a relation and discards the branches, and `MIN_TRAIL_LENGTH_M` drops
- * anything under 200 m. That is the right catalogue and the wrong graph. The 150 m unnamed
- * spur joining two trails is the piece that turns an out-and-back into a loop, and it is
- * the first thing the catalogue deletes.
- *
- * So planning gets its own cache: every foot-legal way in an area, named or not, kept as
- * raw runs rather than assembled lines, at a finer tile than the catalogue uses. Same lazy
- * pattern, same terrain source, different query and different table.
+ * The walkable network, cached per z12 tile for route planning. Separate from the trail
+ * catalogue because the 150 m unnamed connector that makes a loop possible is the first thing
+ * `pickPrimary` and `MIN_TRAIL_LENGTH_M` throw away. See `docs/architecture.md`.
  */
 
 import type { BBox, LngLat, PathKind, PathSegment } from '@switchback/core';
@@ -35,37 +25,25 @@ import type { OverpassElement, OverpassWay } from './overpass';
 import type { PipelineDeps } from './pipeline';
 
 /**
- * Routing tiles are z12 — about 10 km across at mid-latitudes, against the catalogue's z9.
- *
- * The catalogue can afford big tiles because it only keeps named trails, so a z9 tile over
- * a national park is a few hundred rows. This query keeps every path, alley and service
- * road; the same z9 tile over a city is hundreds of thousands of ways and an Overpass
- * timeout. Smaller tiles also match how planning is actually used — you plan inside one
- * valley, not across a province — so a session usually touches one or two of them.
+ * Routing tiles are z12 — about 10 km across — against the catalogue's z9. This query keeps
+ * every path, alley and service road, and a z9 tile over a city is hundreds of thousands of
+ * ways and an Overpass timeout.
  */
 export const ROUTING_ZOOM = 12;
 
 /**
- * How far past the tile edge to fetch, in degrees of latitude — roughly 250 m.
- *
- * Without it, every tile boundary is a wall. A way crossing the edge is clipped, its far
- * vertices are missing, and the graph gains a dead end exactly where the network is in
- * fact continuous. The pad means the neighbouring tile's first few hundred metres arrive
- * with this one, the shared vertices carry identical coordinates, and `buildGraph` fuses
- * the two copies into one network with no merge step. Overlap is the cheap fix; stitching
- * clipped ways back together afterwards is the expensive one.
+ * How far past the tile edge to fetch, in degrees of latitude — roughly 250 m. Without it a
+ * way crossing the boundary is clipped and the graph gains a dead end where the network is
+ * continuous. The overlap carries identical shared coordinates, so `buildGraph` fuses the two
+ * copies with no merge step.
  */
 export const ROUTING_TILE_PAD_DEG = 0.00225;
 
 /**
- * Which OSM `highway` values become which `PathKind`.
- *
- * Two judgements are baked in. The first is the ceiling: nothing above `tertiary`. A
- * planner that offers to hike someone along a primary A-road has produced a technically
- * valid route and a bad one, and the parallel footway is almost always mapped. The second
- * is the floor: roads *are* included, because a route that refuses tarmac cannot leave most
- * car parks, and the penalty in `KIND_PENALTY` — not exclusion — is the right tool for
- * "possible but unpleasant".
+ * Which OSM `highway` values become which `PathKind`. Two judgements: nothing above
+ * `tertiary`, because hiking someone along a primary A-road is a valid route and a bad one;
+ * and roads *are* included, because a route refusing tarmac cannot leave most car parks —
+ * `KIND_PENALTY`, not exclusion, is the tool for "possible but unpleasant".
  */
 const HIGHWAY_KIND: Record<string, PathKind> = {
   path: 'path',
@@ -89,26 +67,18 @@ const HIGHWAY_VALUES = Object.keys(HIGHWAY_KIND);
 const BARRED_ACCESS = /^(private|no|permit|customers)$/u;
 
 /**
- * `service` values that are not through-routes: a driveway to one house, a parking aisle,
- * the lane behind a drive-through. Forest and access tracks keep the bare `service` tag or
- * a value not in this list, and those are exactly the ways a hiker uses to reach a trail.
+ * `service` values that are not through-routes. Forest and access tracks keep the bare
+ * `service` tag or a value not listed here, and those are how a hiker reaches a trail.
  */
 const BARRED_SERVICE = /^(driveway|parking_aisle|drive-through)$/u;
 
 /**
- * Every way a hiker may legally use in the box.
- *
- * Note what is absent: the `["name"]` filter that the trail query carries. That filter is
- * what keeps the catalogue from cataloguing every garden path, and it is precisely wrong
- * here — the connectors that make routes possible are overwhelmingly unnamed.
- *
- * The access filters run server-side rather than in `classifyWay` below because they are
- * the difference between a response that fits in memory and one that does not. Overpass
- * treats `["k"!~"v"]` as satisfied when the key is absent, so an untagged way passes, which
- * is the behaviour we want: OSM's default for a path is that you may hike it.
- *
- * `out body geom` for the same reason as everywhere else in this file's neighbour: `tags`
- * is a verbosity that would drop the geometry we came for.
+ * Every way a hiker may legally use in the box. Note what is absent: the `["name"]` filter the
+ * trail query carries, which is exactly wrong here — the connectors that make routes possible
+ * are overwhelmingly unnamed. The access filters run server-side because they are the
+ * difference between a response that fits in memory and one that does not; Overpass treats
+ * `["k"!~"v"]` as satisfied when the key is absent, which matches OSM's default that a path is
+ * walkable. `out body geom` because `tags` is a verbosity that would drop the geometry.
  */
 export function buildNetworkQuery(
   bbox: BBox,
@@ -133,9 +103,8 @@ export function classifyWay(
   const kind = HIGHWAY_KIND[tags.highway ?? ''];
   if (!kind) return null;
 
-  // Re-checked here as well as in the query, because a segment can also arrive from a
-  // cached tile fetched under an older filter set, and because the server-side test is a
-  // performance measure rather than the definition.
+  // Re-checked here as well as in the query: a segment can arrive from a tile cached under an
+  // older filter set, and the server-side test is a performance measure, not the definition.
   if (BARRED_ACCESS.test(tags.access ?? '')) return null;
   if (BARRED_ACCESS.test(tags.foot ?? '') || tags.foot === 'use_sidepath') return null;
   if (BARRED_SERVICE.test(tags.service ?? '')) return null;
@@ -165,17 +134,11 @@ function isSacScale(value: string | undefined): value is NonNullable<PathSegment
 }
 
 /**
- * Overpass ways to segments, splitting each way at any hole rather than dropping it.
- *
- * This is the one place where the routing ingest deliberately disagrees with
- * `wayToCoords`. The catalogue drops a clipped way whole, because a trail with an
- * interpolated hole through it is a wrong trail and the neighbouring tile will supply a
- * correct one. A graph has no such luxury: dropping the way removes a *connection*, and
- * the resulting dead end is indistinguishable from real topology. Splitting keeps both
- * halves, each true, and the tile that owns the middle contributes the join.
- *
- * Elevations come back as zeros; `elevateSegments` fills them. Keeping the two apart means
- * the geometry step is synchronous and testable without a terrain source.
+ * Overpass ways to segments, splitting each way at any hole rather than dropping it. This
+ * deliberately disagrees with `wayToCoords`: the catalogue drops a clipped way whole, but for
+ * a graph that removes a *connection* and the dead end is indistinguishable from real
+ * topology. Elevations come back as zeros; `elevateSegments` fills them, which keeps this step
+ * synchronous and testable without a terrain source.
  */
 export function waysToSegments(elements: readonly OverpassElement[]): PathSegment[] {
   const segments: PathSegment[] = [];
@@ -213,16 +176,10 @@ export function waysToSegments(elements: readonly OverpassElement[]): PathSegmen
 }
 
 /**
- * Ground elevation at every vertex, in one batched pass over the whole tile.
- *
- * Deliberately *not* `elevateLine`. That resamples to a fixed 25 m spacing, which is right
- * for a profile chart and wrong for a graph — the resampled points are not OSM nodes, so
- * two ways that share a junction would stop sharing a coordinate and the network would
- * fall apart into disconnected fragments. Here the vertices are the graph, so they are
- * sampled exactly where they lie.
- *
- * Batching matters: a z12 tile is tens of thousands of vertices across maybe a dozen
- * terrain tiles, and `tilesFor` fetches each of those once for all of them.
+ * Ground elevation at every vertex, batched over the whole tile. Deliberately *not*
+ * `elevateLine`: that resamples to 25 m, and resampled points are not OSM nodes, so two ways
+ * sharing a junction would stop sharing a coordinate and the graph would fall apart. Here the
+ * vertices are the graph, so they are sampled exactly where they lie.
  */
 export async function elevateSegments(
   segments: readonly PathSegment[],
@@ -252,11 +209,9 @@ export async function elevateSegments(
 }
 
 /**
- * The bbox to actually ask Overpass for: the tile, grown by the pad.
- *
- * Longitude is scaled by `1/cos(lat)` so the pad is 250 m on the ground at every latitude
- * rather than 250 m at the equator and 60 m in northern Norway. Clamped at the poles, where
- * the scaling diverges and the whole idea stops meaning anything.
+ * The bbox to ask Overpass for: the tile, grown by the pad. Longitude is scaled by `1/cos(lat)`
+ * so the pad is 250 m on the ground at every latitude, clamped near the poles where the
+ * scaling diverges.
  */
 export function padBBox(bbox: BBox, padDeg = ROUTING_TILE_PAD_DEG): BBox {
   const [w, s, e, n] = bbox;
@@ -270,14 +225,7 @@ export function padBBox(bbox: BBox, padDeg = ROUTING_TILE_PAD_DEG): BBox {
   ];
 }
 
-/**
- * How much of a tile's payload is worth keeping, as a rough byte count.
- *
- * Used only to decide whether a tile is pathologically large before it is written. A z12
- * tile in open country is a few hundred kilobytes; one over central London is tens of
- * megabytes of alley and parking aisle, and a planner does not need that resolution to get
- * someone out of a city.
- */
+/** Rough byte count for a tile's payload, used only to spot a pathologically large one. */
 export function segmentsBytes(segments: readonly PathSegment[]): number {
   let bytes = 0;
   for (const segment of segments)
@@ -286,26 +234,17 @@ export function segmentsBytes(segments: readonly PathSegment[]): number {
 }
 
 /**
- * The point past which a tile is trimmed rather than written whole.
- *
- * A z12 tile in open country is a few hundred kilobytes. The same tile over central London
- * is the entire street network plus every parking aisle and alley, and writing it costs more
- * than the routes it enables are worth.
+ * The point past which a tile is trimmed rather than written whole. A z12 tile in open country
+ * is a few hundred kilobytes; the same tile over central London is the entire street network.
  */
 export const MAX_TILE_BYTES = 12_000_000;
 
 /**
- * Bring an oversized tile under budget by dropping the road network, keeping the foot one.
- *
- * The honest trade, stated plainly: in a dense city this can disconnect two footpaths that
- * were only joined by a residential street, and a route across that join will come back as
- * "no path found" rather than as a bad route. That is the better failure. The alternative —
- * truncating at an arbitrary row count — drops ways in Overpass's order, which is to say at
- * random, and produces a network with holes nobody can predict or explain.
- *
- * Paths are never dropped, so a tile that is still over budget with roads gone is written
- * over budget. At that point the size is the pedestrian network itself, which is the data
- * we came for.
+ * Bring an oversized tile under budget by dropping the road network and keeping the foot one.
+ * The trade, stated plainly: in a dense city this can disconnect two footpaths joined only by
+ * a residential street, and that route comes back "no path found" rather than as a bad route.
+ * Truncating at a row count instead drops ways in Overpass's order — holes nobody can predict.
+ * Paths are never dropped, so a tile still over budget with roads gone is written over budget.
  */
 export function trimForBudget(
   segments: readonly PathSegment[],
@@ -317,11 +256,9 @@ export function trimForBudget(
 }
 
 /**
- * How many distinct coordinates the tile contributes — the graph's node count.
- *
- * Rounded to seven decimals, matching `buildGraph`'s interning, so this is the number of
- * nodes the tile will actually produce rather than the number of vertices it stores. The
- * difference is large: a junction shared by four ways is four vertices and one node.
+ * How many distinct coordinates the tile contributes — the graph's node count. Rounded to
+ * seven decimals to match `buildGraph`'s interning: a junction shared by four ways is four
+ * vertices and one node.
  */
 export function countNodes(segments: readonly PathSegment[]): number {
   const seen = new Set<string>();
@@ -334,11 +271,8 @@ export function countNodes(segments: readonly PathSegment[]): number {
 }
 
 /**
- * Routing tiles go stale on the same 30-day clock as trail tiles.
- *
- * Same reasoning, same number, deliberately not shared as a constant: these are two caches
- * of two different queries, and the day one of them wants a different TTL, it should be able
- * to have one without an edit that silently changes the other.
+ * Routing tiles go stale on the same 30-day clock as trail tiles. Deliberately not shared as
+ * one constant: two caches of two different queries, either of which may want its own TTL.
  */
 export const ROUTING_TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -369,13 +303,9 @@ export interface ProcessNetworkTileResult {
 const WRITE_CHUNK = 500;
 
 /**
- * Fetch and cache the walkable network for one z12 tile.
- *
- * Shaped after `processTile` and diverging in one respect: there is no per-segment failure
- * isolation, because there is no per-segment work to isolate. A trail is derived, enriched
- * and committed individually, so one bad geometry costs one row; a network segment is
- * geometry and nothing else, and the whole tile is written in one statement. If that
- * statement fails the tile failed, which is the truth.
+ * Fetch and cache the walkable network for one z12 tile. Shaped after `processTile` but with
+ * no per-segment failure isolation: a segment is geometry and nothing else, and the whole tile
+ * is written in one statement, so a failure there means the tile failed.
  */
 export async function processNetworkTile(
   quadkey: string,
@@ -422,8 +352,8 @@ export async function processNetworkTile(
       where: { quadkey },
       data: { status: TileStatus.failed, lastError: message.slice(0, 1000) },
     });
-    // Same contract as the trail pipeline: a breaker-open is the service's problem, not this
-    // tile's, and rethrowing lets the queue back off instead of burning an attempt.
+    // A breaker-open is the service's problem, not this tile's; rethrowing lets the queue
+    // back off instead of burning an attempt.
     if (error instanceof OverpassUnavailableError) throw error;
     throw error;
   }
@@ -462,10 +392,9 @@ export async function processNetworkTile(
   const nodeCount = countNodes(segments);
 
   /**
-   * `run` disambiguates the several rows one way can produce — a way split at a hole, or a
-   * way whose geometry the tile clips into two pieces. Numbered per way in arrival order,
-   * which is stable for a given Overpass response and irrelevant across responses, since the
-   * whole tile is replaced at once.
+   * `run` disambiguates the several rows one way can produce — split at a hole, or clipped
+   * into two pieces. Numbered per way in arrival order, which is irrelevant across responses
+   * since the whole tile is replaced at once.
    */
   const runs = new Map<number, number>();
   const rows = segments.map((segment) => {
@@ -501,12 +430,9 @@ export async function processNetworkTile(
   });
 
   /**
-   * Replace rather than merge, in one transaction.
-   *
-   * A tile's segments are meaningful only as a set: OSM renumbers nothing, but a way deleted
-   * upstream leaves a row that upserting would never touch and the graph would keep routing
-   * over. Delete-then-insert is the only version of this that can remove things, and doing it
-   * in a transaction means a reader never sees the half-empty middle.
+   * Replace rather than merge, in one transaction. A way deleted upstream leaves a row an
+   * upsert would never touch and the graph would keep routing over; delete-then-insert is the
+   * only version that can remove things, and the transaction hides the half-empty middle.
    */
   await db.$transaction(
     async (tx) => {
@@ -540,25 +466,16 @@ export async function processNetworkTile(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Coverage
-// ---------------------------------------------------------------------------
-
 /**
- * Priority for a routing tile somebody is planning on.
- *
- * Below `VIEWPORT_PRIORITY`, because a blank map is a worse thing to be staring at than a
- * planner that has not offered to snap yet — the planner still draws freehand meanwhile.
- * Above the area sweep, because this one has a person waiting on it.
+ * Priority for a routing tile somebody is planning on. Below `VIEWPORT_PRIORITY` — a blank map
+ * is worse to stare at than a planner that has not offered to snap yet — and above the area
+ * sweep, which has nobody waiting on it.
  */
 export const NETWORK_PRIORITY = 4;
 
 /**
- * How many z12 tiles one planning viewport may pull.
- *
- * Nine is a 3×3 block, roughly 30 km across — a day's hike in any direction from the middle,
- * which is the honest limit of what one route is going to cover. Past that the planner asks
- * the user to zoom in, and says why.
+ * How many z12 tiles one planning viewport may pull. Nine is a 3×3 block, roughly 30 km
+ * across; past that the planner asks the reader to zoom in, and says why.
  */
 export const MAX_ROUTING_TILES = 9;
 
@@ -571,23 +488,15 @@ export interface NetworkCoverage {
   /** What this call put on the queue. */
   queued: string[];
   /**
-   * True when ingest was refused, so the outstanding tiles are not on their way.
-   *
-   * Read by the route planner, which is the only consumer that can be *wrong* about it: a
-   * leg over ground we declined to fetch is not a leg with no path under it, and saying so
-   * on a hiking planner is a false claim about terrain dressed as a safety warning. See
-   * `planRoute` in the routes router.
+   * True when ingest was refused, so the outstanding tiles are not on their way. Read by the
+   * route planner, which is the only consumer that can be *wrong* about it: a leg over ground
+   * we declined to fetch is not a leg with no path under it, and saying so on a hiking planner
+   * is a false claim about terrain dressed as a safety warning. See `planRoute`.
    */
   busy: boolean;
   /**
-   * Which refusal, when `busy`. Null otherwise.
-   *
-   * Carried for the same reason the trail side carries it, and it was dropped here while the
-   * trail side kept it — `queueNetworkTiles` computed the reason, `ensureNetworkCoverage`
-   * read `enqueued.queued` and discarded `enqueued.refused`, and `/plan` ended up with one
-   * sentence for both refusals: "Try the route again later." That is the right instruction
-   * for a deep queue and the wrong one for a full database, which does not drain and which
-   * nobody can wait out. The reason was already computed one frame upstream.
+   * Which refusal, when `busy`. Null otherwise. `/plan` needs the distinction: "try again
+   * later" is right for a deep queue and wrong for a full database, which nobody can wait out.
    */
   busyReason: IngestRefusal | null;
   tooLarge: boolean;
@@ -604,12 +513,9 @@ export interface NetworkCoverageOptions {
 }
 
 /**
- * Work out which routing tiles a planning viewport needs, and queue what is missing.
- *
- * The trail equivalent (`ensureCoverage`) distinguishes `refreshing` from `pending`, because
- * a month-old trail is still worth drawing while its refresh runs. This one does not: a
- * month-old path network is equally worth planning on, so a stale-but-present tile is simply
- * `ready` and its refresh is queued behind the scenes with nothing said about it.
+ * Work out which routing tiles a planning viewport needs, and queue what is missing. Unlike
+ * `ensureCoverage` there is no `refreshing` state: a month-old path network is worth planning
+ * on, so a stale-but-present tile is simply `ready` and its refresh runs unannounced.
  */
 export async function ensureNetworkCoverage(
   bbox: BBox,
@@ -635,14 +541,9 @@ export async function ensureNetworkCoverage(
   }
 
   /*
-   * Both lookups at once, the pair the trail side has always made.
-   *
-   * The job table is read for the same single reason `ensureCoverage` reads it: to tell a
-   * routing tile nobody has asked for apart from one somebody already asked for and is
-   * waiting on. `RoutingTile.status` cannot answer that — a row sits at `pending` whether its
-   * job is running or died five attempts ago — and the answer is what admission must not be
-   * allowed to judge. `networkTilesInFlight` keys on the unique-indexed `dedupeKey`, so this
-   * is a keyed lookup over a list we already hold, on the same round trip as the tile read.
+   * The job table is read to tell a tile nobody has asked for apart from one somebody is
+   * already waiting on — `RoutingTile.status` cannot answer that, since a row sits at
+   * `pending` whether its job is running or died five attempts ago.
    */
   const [existing, working] = await Promise.all([
     db.routingTile.findMany({
@@ -670,26 +571,16 @@ export async function ensureNetworkCoverage(
   }
 
   /*
-   * Split the outstanding tiles by whether anything is already coming for them, exactly as
-   * the trail path does — the fix landed there and stopped, and this is the half it missed.
-   *
-   * `enqueue` upserts on `dedupeKey`, so re-enqueueing a routing tile whose job is already
-   * `queued` or `running` writes no row and adds no fetch. Refusing it therefore bounds
-   * nothing, while the refusal costs the reader the tiles they are actually waiting on:
-   * `busy` propagates through `routes.plan` as `networkPaused`, `use-plan.ts` stops
-   * re-planning on it, and the planner freezes on a paused message while the very tiles it
-   * needs land unread behind it. Every leg over them stays `network_paused` until the reader
-   * edits an anchor — for ground that was on its way the whole time.
-   *
-   * So the depth ceiling judges only new ground here too. Tiles already on the queue are
-   * reported as what they are: coming.
+   * The depth ceiling judges only new ground. `enqueue` upserts on `dedupeKey`, so refusing a
+   * tile whose job is already queued bounds nothing — and the refusal reaches the planner as
+   * `networkPaused`, which stops `use-plan.ts` re-planning while the tiles it needs land
+   * unread behind it.
    */
   const newGround = needsWork.filter((quadkey) => !inFlight.has(quadkey));
 
   // Every outstanding tile is still handed to `queueNetworkTiles`; only `newGround` is what
-  // admission may judge. Re-enqueueing an in-flight tile writes no row, but it does raise the
-  // job's priority — which is how a tile a background sweep queued at 0 jumps the line the
-  // moment somebody is planning across it. Dropping those from the call would cost that.
+  // admission may judge. Re-enqueueing an in-flight tile writes no row but does raise the
+  // job's priority, which is how a tile a background sweep queued at 0 jumps the line.
   const enqueued =
     options.queue === false
       ? { queued: [] as string[], refused: null }
@@ -697,21 +588,14 @@ export async function ensureNetworkCoverage(
   const queued = enqueued.queued;
 
   /*
-   * New ground outstanding with nothing queued means backpressure refused it.
+   * New ground outstanding with nothing queued means backpressure refused it. Judged on
+   * `newGround`, not `needsWork`: tiles already in flight are coming, and a refusal about
+   * other ground says nothing about them.
    *
-   * Judged on `newGround`, not on `needsWork`, for the reason above: tiles already in flight
-   * are coming, and a refusal about other ground says nothing about them. Before this, a
-   * planning viewport whose tiles were all mid-fetch reported `busy` on every call — the
-   * refusal was raised by the tiles' own in-progress jobs — and `use-plan.ts` reads `busy` as
-   * "no tile is going to land", so it stopped the retry chain that would have picked them up.
-   *
-   * `pending` is left intact, unlike the trail side. There it is the field that makes the
-   * map poll, so clearing it is what stops a refusing database also taking a poll storm.
-   * Here its only consumers are `routes.coverage`, which reports a count nothing renders,
-   * and `planRoute` — and zeroing it there was a regression: `planRoute` used `pending` as
-   * the sole tiebreaker between "still downloading" and "no path exists", so a refusal
-   * silently relabelled every unsnappable leg as open country. `busy` is what those two read
-   * now, and the planner's retry gates on it rather than on the count.
+   * `pending` is left intact, unlike the trail side, where clearing it is what stops a
+   * refusing database also taking a poll storm. Here `planRoute` uses it as the tiebreaker
+   * between "still downloading" and "no path exists", and zeroing it relabelled every
+   * unsnappable leg as open country. `busy` is what that reads now.
    */
   const busy = options.queue !== false && newGround.length > 0 && queued.length === 0;
 
@@ -729,15 +613,10 @@ export async function ensureNetworkCoverage(
 }
 
 /**
- * Register routing tiles and enqueue their fetches. Tile row first, for the reason `queueTiles` gives.
- *
- * `newGround` narrows what admission is *judged* on without narrowing what is enqueued, the
- * same split `queueTiles` makes and for the same reason: a quadkey whose network job is
- * already `queued` or `running` adds no row when re-enqueued — the dedupe key collides — so
- * refusing it bounds nothing, while the refusal reaches the route planner as "the network
- * under these anchors is not coming" about tiles that are. Callers that know which of their
- * tiles are in flight pass the rest; callers that do not leave it alone and every quadkey
- * counts.
+ * Register routing tiles and enqueue their fetches. Tile row first, for the reason
+ * `queueTiles` gives. `newGround` narrows what admission is *judged* on without narrowing what
+ * is enqueued: a quadkey already queued adds no row when re-enqueued, so refusing it bounds
+ * nothing while telling the planner the network under those anchors is not coming.
  */
 export async function queueNetworkTiles(
   db: PrismaClient,
@@ -753,13 +632,11 @@ export async function queueNetworkTiles(
   const newGround = options.newGround ?? quadkeys;
   const priority = options.priority ?? NETWORK_PRIORITY;
 
-  // Nothing new to bound. The upserts below are all collisions, so they add no rows and no
-  // fetches — running them keeps the priority bump without asking the guard's permission for
-  // work the guard has already admitted once.
+  // Nothing new to bound: the upserts below are all collisions, so they keep the priority
+  // bump without asking the guard about work it has already admitted once.
   if (newGround.length > 0) {
-    // The routing queue's share of the same ceiling. It used to have none: the depth guard
-    // counted `ingest_tile` only, and this path enqueues `ingest_network`, so the whole
-    // routing queue was invisible to the one thing watching. See `backpressure.ts`.
+    // The routing queue's share of the same ceiling — it enqueues `ingest_network`, which the
+    // depth guard once did not count. See `backpressure.ts`.
     const refused = await admitIngest(db);
     if (refused !== null) return { queued: [], refused };
   }
@@ -786,10 +663,8 @@ export async function queueNetworkTiles(
 }
 
 /**
- * Which of these tiles still has a network fetch queued or running.
- *
- * Read by `ensureNetworkCoverage` to keep already-queued tiles out of admission's way — see
- * the split there.
+ * Which of these tiles still has a network fetch queued or running. Read by
+ * `ensureNetworkCoverage` to keep already-queued tiles out of admission's way.
  */
 export async function networkTilesInFlight(
   db: PrismaClient,
@@ -812,13 +687,10 @@ function numbers(value: Prisma.JsonValue): number[] {
 }
 
 /**
- * Read back every cached segment for a set of tiles, ready for `buildGraph`.
- *
- * Deliberately returns the cross-tile duplicates rather than filtering them: the padded
- * fetch means neighbouring tiles hold overlapping copies of the same way, carrying identical
- * OSM node coordinates, and `buildGraph`'s edge set reconciles them for free. Filtering here
- * would mean choosing which copy to keep, which is a decision with no correct answer and a
- * real chance of dropping the half that reaches across the boundary.
+ * Read back every cached segment for a set of tiles, ready for `buildGraph`. Deliberately
+ * returns the cross-tile duplicates the padded fetch creates: they carry identical OSM node
+ * coordinates and `buildGraph`'s edge set reconciles them, whereas filtering here would mean
+ * choosing which copy to keep and risking the half that reaches across the boundary.
  */
 export async function loadNetworkSegments(
   db: PrismaClient,

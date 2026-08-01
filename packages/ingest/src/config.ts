@@ -1,14 +1,8 @@
 /**
- * Process-wide ingest singletons.
- *
- * The Overpass queue only means anything if everyone shares it: two clients with
- * `maxConcurrent: 2` are a client with `maxConcurrent: 4`, which is exactly the behaviour
- * that gets an IP blocked. So the client is built once per process and every caller — the
- * tRPC router's `waitUntil` kick, the cron drain, the CLI script — goes through this.
- *
- * Lazy rather than eager because the constructor throws on a missing `OVERPASS_USER_AGENT`,
- * and a module that throws at import time takes down the whole app including the routes
- * that never touch ingest.
+ * Process-wide ingest singletons. The Overpass queue only means anything if everyone shares
+ * it: two clients at `maxConcurrent: 2` are one client at 4, which is what gets an IP blocked.
+ * Lazy, because the constructor throws on a missing `OVERPASS_USER_AGENT` and a module that
+ * throws at import time takes down routes that never touch ingest.
  */
 
 import { OverpassClient } from './overpass';
@@ -30,11 +24,8 @@ export function getOverpass(): OverpassClient {
 }
 
 /**
- * `OVERPASS_URL` as a list of mirrors, comma- or newline-separated.
- *
- * One value is still one value, so nothing that already set this needs to change. An unset
- * or blank variable yields an empty list, which the client reads as "use the defaults" —
- * better than one request against `""` and a stack trace about an invalid URL.
+ * `OVERPASS_URL` as a list of mirrors, comma- or newline-separated. An unset or blank variable
+ * yields an empty list, which the client reads as "use the defaults".
  */
 function splitList(value: string | undefined): string[] {
   return (value ?? '')

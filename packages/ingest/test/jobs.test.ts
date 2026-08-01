@@ -63,12 +63,8 @@ function fakeDb(claimable: ClaimedJob[] = []): { db: Db; recorded: Recorded } {
 }
 
 /**
- * A `Prisma.sql` fragment, structurally.
- *
- * Matched by shape rather than `instanceof`: `Prisma.Sql` is a type in the generated
- * namespace, not a constructor at runtime, so there is nothing to test against. The pair of
- * arrays is the whole contract anyway — `strings` is the SQL either side of each hole and
- * `values` is what fills them.
+ * A `Prisma.sql` fragment, structurally. Matched by shape rather than `instanceof`:
+ * `Prisma.Sql` is a type in the generated namespace, not a runtime constructor.
  */
 interface SqlFragment {
   strings: readonly string[];
@@ -76,12 +72,9 @@ interface SqlFragment {
 }
 
 /**
- * The `AND …` fragment `claimJobs` splices into its `WHERE` clause.
- *
- * The real client flattens nested fragments into one statement before it reaches the
- * driver; the fake above is an ordinary tagged template, so the fragment arrives intact as
- * a value and can be inspected directly. That is the point — asserting on the fragment
- * proves the keys are bound parameters rather than interpolated text.
+ * The `AND …` fragment `claimJobs` splices into its `WHERE` clause. The real client flattens
+ * nested fragments before the driver sees them; the fake above is an ordinary tagged template,
+ * so asserting on the fragment proves the keys are bound parameters, not interpolated text.
  */
 function scopeFragment(values: unknown[]): SqlFragment {
   const fragment = values.find(
@@ -107,11 +100,8 @@ function fragmentValues(value: unknown): readonly unknown[] {
 }
 
 /**
- * Every spliced fragment's SQL, joined.
- *
- * `claimJobs` splices two now — the `dedupeKey` scope and the kind scope — and `scopeFragment`
- * above returns only the first, so a test asserting on the kind filter would otherwise be
- * reading the wrong hole.
+ * Every spliced fragment's SQL, joined. `claimJobs` splices two — the `dedupeKey` scope and
+ * the kind scope — and `scopeFragment` returns only the first.
  */
 function allScopeSql(values: unknown[]): string {
   return values
@@ -139,8 +129,8 @@ describe('job keys', () => {
   it('are stable and namespaced by kind', () => {
     expect(tileJobKey('033311323')).toBe('ingest_tile:033311323');
     expect(trailEnrichJobKey('abc')).toBe('enrich_trail:abc');
-    // The same tile always produces the same key — that is what makes twelve map requests
-    // for one cold tile collapse into one job.
+    // The same tile always produces the same key, which is what collapses twelve map requests
+    // for one cold tile into one job.
     expect(tileJobKey('033311323')).toBe(tileJobKey('033311323'));
   });
 });
@@ -173,19 +163,15 @@ describe('enqueue', () => {
     });
 
     const args = recorded.upserts[0] as { update: Record<string, unknown> };
-    // A job that has already backed off twice must not have its backoff cleared by a fresh
-    // page load — so `runAfter` is untouched on collision. Priority may rise, because
-    // somebody is now actively waiting on the tile.
+    // `runAfter` untouched on collision, or a fresh page load clears a backoff. Priority may
+    // rise, because somebody is now waiting on the tile.
     expect(args.update).not.toHaveProperty('runAfter');
     expect(args.update.priority).toBe(5);
   });
 
   it('revives a finished job so the same work can be requested again later', async () => {
-    // The regression this pins down: a `dedupeKey` is forever, so without a revival step a
-    // tile that reached `done` could never be re-ingested — not by the thirty-day
-    // staleness refresh, not by a retry after a fix, not by a user staring at a viewport
-    // that never fills. And a tile that exhausted its attempts during an upstream outage
-    // stayed `dead` for the life of the database.
+    // A `dedupeKey` is forever, so without revival a tile that reached `done` could never be
+    // re-ingested, and one that exhausted its attempts during an outage stayed `dead`.
     const { db, recorded } = fakeDb();
     const runAfter = new Date('2026-03-04T05:06:07Z');
     await enqueue(db, {
@@ -247,13 +233,9 @@ describe('claimJobs', () => {
   });
 
   /**
-   * The case that turns a scoped claim into an unscoped one if it is missed.
-   *
-   * `IN ()` is not valid SQL, so an empty list cannot be expressed the obvious way, and the
-   * tempting shortcut — treat empty like `undefined` — is exactly backwards: a caller with
-   * nothing to ask for would claim whatever happened to be at the head of the table. That is
-   * silent, because the drain succeeds and does real work; it is just never the work anybody
-   * asked for.
+   * `IN ()` is not valid SQL, so the tempting shortcut — treat empty like `undefined` — is
+   * exactly backwards: a caller with nothing to ask for would claim the head of the table,
+   * silently, because the drain then succeeds and does real work nobody asked for.
    */
   it('claims nothing when the scope is empty rather than everything', async () => {
     const { db, recorded } = fakeDb();
@@ -272,8 +254,8 @@ describe('claimJobs', () => {
 
     const sql = allScopeSql(recorded.rawValues);
     expect(sql).toContain('kind = ANY(');
-    // The cast belongs on the parameter. On the column it would silently drop
-    // `@@index([kind, status])`, which is the index this queue's hot path depends on.
+    // The cast belongs on the parameter: on the column it silently drops
+    // `@@index([kind, status])`, which this queue's hot path depends on.
     expect(sql).toContain('::"JobKind"[]');
     expect(sql).not.toContain('kind::text');
     expect(recorded.rawValues.flatMap(fragmentValues)).toEqual([
@@ -282,7 +264,6 @@ describe('claimJobs', () => {
   });
 
   it('claims nothing when the kind list is empty rather than everything', async () => {
-    // The same trap as the empty `dedupeKeys` list one line up, and the same answer.
     const { db, recorded } = fakeDb();
     await claimJobs(db, 'cron', 2, new Date(), undefined, []);
 
@@ -292,16 +273,9 @@ describe('claimJobs', () => {
 });
 
 /**
- * The starvation this share exists to break.
- *
- * `claimJobs` orders `priority DESC` and `pipeline.ts` enqueues `enrich_trail` and
- * `ingest_route` at `-10`, below every requestable kind — so a plain claim reaches a derived
- * job only when the whole rest of the table is empty, which on a live deploy is never. The
- * inline kicks made it absolute: both scope to the tile keys they just queued, so they could
- * not touch a derived row at all. Measured on this branch the derived backlog drained at four
- * jobs a day in theory and zero in practice, against a fan-out of ~339 per tile. That is what
- * made a ceiling on the derived queue a one-way latch, and it is a defect on its own terms
- * whether or not there is a ceiling above it.
+ * The starvation this share exists to break: `claimJobs` orders `priority DESC` and derived
+ * work sits at `-10`, while both inline kicks scope to the tile keys they just queued and so
+ * cannot reach a derived row at all.
  */
 describe('the derived share', () => {
   it('claims derived work in a second, kind-scoped pass', async () => {
@@ -313,16 +287,14 @@ describe('the derived share', () => {
     // The first claim is the caller's own work, scoped by key and unrestricted by kind.
     expect(allScopeSql(recorded.rawCalls[0]!)).toContain('"dedupeKey" IN');
     expect(allScopeSql(recorded.rawCalls[0]!)).not.toContain('kind = ANY(');
-    // The second is the reservation: kind-scoped, and deliberately *not* key-scoped, because
-    // reaching work nobody asked for by name is the entire point.
+    // The second is the reservation: kind-scoped, and deliberately *not* key-scoped.
     expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind = ANY(');
     expect(allScopeSql(recorded.rawCalls[1]!)).not.toContain('"dedupeKey" IN');
     expect(recorded.rawCalls[1]!).toContain(2);
   });
 
   it('reaches derived work even when the caller scoped itself to nothing', async () => {
-    // A kick whose tiles were all refused still drains: the share does not ride on the
-    // primary claim finding anything.
+    // The share does not ride on the primary claim finding anything.
     const { db, recorded } = fakeDb();
 
     await drainJobs({}, { db, dedupeKeys: [], derivedLimit: 2 });
@@ -344,23 +316,16 @@ describe('the derived share', () => {
 
     const result = await drainJobs({ [JobKind.ingest_tile]: async () => {} }, { db });
 
-    // Zero here rather than absent: the fake yields rows on the first claim only, so this
-    // pins that the count reports the second claim's haul and not the batch's.
+    // Zero rather than absent: the fake yields rows on the first claim only, so this pins that
+    // the count reports the second claim's haul and not the batch's.
     expect(result.derived).toBe(0);
     expect(result.claimed).toBe(1);
   });
 
   it('drains the primary batch even when the derived claim fails', async () => {
-    /*
-     * Ordering is the whole argument. `claimJobs` is a claim, not a read: by the time the
-     * derived pass runs, the primary batch is already `running` with a lock stamped on it.
-     * Letting that rejection out of `drainJobs` would strand those rows until the lock
-     * expired ten minutes later — one failing fairness reservation costing the queue the
-     * work it had just taken, on every tick.
-     *
-     * The thrown message is the shape a bad `kind = ANY($1::"JobKind"[])` would actually
-     * take, which is the failure this guard was written for.
-     */
+    // Ordering is the argument: by the time the derived pass runs, the primary batch is
+    // already `running` with a lock stamped, so letting the rejection out would strand it for
+    // `LOCK_TIMEOUT_MS`. The thrown message is the shape a bad enum cast would take.
     const { db, recorded } = fakeDb([job()]);
     const raw = (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> })
       .$queryRaw;

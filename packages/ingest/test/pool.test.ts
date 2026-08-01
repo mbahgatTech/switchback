@@ -37,14 +37,6 @@ describe('forEachConcurrent', () => {
     ]);
   });
 
-  /**
-   * The property the whole helper exists for.
-   *
-   * The ceiling is not our CPU, it is the scarce resources underneath — `TerrainSource`
-   * caps its own fetches, and Prisma's pool is finite. A helper that quietly let a
-   * fifty-item list put fifty transactions in flight would convert "fetching terrain" into
-   * "waiting for a connection", which is the same wall clock with worse failure modes.
-   */
   it('never exceeds the concurrency ceiling', async () => {
     let inFlight = 0;
     let peak = 0;
@@ -67,12 +59,9 @@ describe('forEachConcurrent', () => {
   });
 
   /**
-   * A shared cursor rather than fixed batches, asserted by the case that distinguishes
-   * them: one slow item among fast ones.
-   *
-   * With batches of two, item 1 blocks the whole second batch and only two items finish
-   * before it resolves. With a cursor, the free worker keeps pulling — so everything except
-   * the slow item is done while it is still outstanding.
+   * A shared cursor rather than fixed batches, asserted by the case that distinguishes them:
+   * with batches of two, one slow item blocks its whole batch; with a cursor the free worker
+   * keeps pulling.
    */
   it('keeps free workers pulling past a slow item', async () => {
     const slow = deferred();
@@ -116,11 +105,8 @@ describe('forEachConcurrent', () => {
   });
 
   /**
-   * Rejections propagate rather than being swallowed.
-   *
-   * `processTile` wraps its body in a `try` so one bad trail costs its tile a single row,
-   * and that is the caller's decision to make. A helper that caught on the caller's behalf
-   * would make the other choice — silently finish, report success — impossible to opt out of.
+   * Rejections propagate rather than being swallowed: `processTile` wraps its body in a `try`
+   * so one bad trail costs its tile a single row, and that is the caller's decision to make.
    */
   it('rejects when the body throws', async () => {
     await expect(
@@ -153,12 +139,8 @@ describe('Gate', () => {
   });
 
   /**
-   * The property `forEachConcurrent` cannot give us, and the reason this class exists.
-   *
-   * Three code paths start ingest drains and each is guarded only against starting a second
-   * of its own kind, so three well-behaved six-at-a-time loops are eighteen transactions
-   * against one connection pool. Two independent loops here, each obeying a ceiling of four,
-   * must still be four in total — not eight.
+   * The property `forEachConcurrent` cannot give: three drains each obeying a local ceiling of
+   * four are twelve against one pool, so two independent loops here must still total four.
    */
   it('holds the ceiling across separate loops', async () => {
     const gate = new Gate(4);
@@ -182,9 +164,8 @@ describe('Gate', () => {
   });
 
   /**
-   * A permit leaked on failure is worse than the contention the gate prevents: the ingest
-   * would run one fewer commit at a time after every failed trail and eventually stop
-   * entirely, while the queue kept claiming jobs and the tiles kept not filling in.
+   * A permit leaked on failure is worse than the contention the gate prevents: ingest would
+   * run one fewer commit after every failed trail and eventually stop entirely.
    */
   it('returns the permit when the body throws', async () => {
     const gate = new Gate(1);
@@ -199,10 +180,7 @@ describe('Gate', () => {
     await expect(gate.run(async () => 'after')).resolves.toBe('after');
   });
 
-  /**
-   * FIFO, because the alternative starves a long tile behind a stream of short ones while
-   * its job holds a claim the whole time.
-   */
+  /** FIFO, or a long tile starves behind short ones while its job holds a claim. */
   it('admits waiters in the order they arrived', async () => {
     const gate = new Gate(1);
     const order: number[] = [];
