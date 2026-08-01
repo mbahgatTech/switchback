@@ -2,15 +2,9 @@ import type { LngLat } from '@switchback/core';
 import { EARTH_RADIUS_M, cumulativeDistancesM, haversineM } from './distance';
 
 /**
- * Resample a line to evenly spaced points.
- *
- * Raw OSM geometry has wildly uneven vertex spacing — a straight forest road may be
- * two points a kilometre apart, while a switchback stack has a vertex every two
- * metres. Every downstream calculation (elevation sampling, grade, ETA, chart
- * rendering) assumes uniform spacing, so this normalisation happens once at ingest
- * and everything after it can be simple.
- *
- * The first and last vertices are always preserved exactly.
+ * Resample a line to evenly spaced points, preserving the first and last vertices exactly. Raw
+ * OSM spacing is wildly uneven, and everything downstream — elevation sampling, grade, ETA,
+ * charts — assumes uniform spacing, so this normalisation happens once at ingest.
  */
 export function resampleLine(coords: readonly LngLat[], spacingM: number): LngLat[] {
   if (spacingM <= 0) throw new Error('resampleLine: spacingM must be positive');
@@ -41,24 +35,17 @@ export function resampleLine(coords: readonly LngLat[], spacingM: number): LngLa
 }
 
 /**
- * Ramer–Douglas–Peucker simplification with a metre-denominated tolerance.
- *
- * Used to shrink geometry for map rendering at low zoom and for offline bundles,
- * where a 12,000-point trail is wasteful. Never applied to the geometry used for
- * distance or gain calculations — simplifying before measuring would understate both.
+ * Ramer–Douglas–Peucker simplification with a metre tolerance, for map rendering at low zoom and
+ * offline bundles. Never applied to geometry used for distance or gain — that would understate both.
  */
 export function simplifyLine(coords: readonly LngLat[], toleranceM: number): LngLat[] {
   return simplifyIndices(coords, toleranceM).map((i) => coords[i]!);
 }
 
 /**
- * The indices `simplifyLine` would keep.
- *
- * Split out because a recorded track is not only coordinates: every fix also carries a
- * timestamp, an accuracy, a heart rate. Simplifying the coordinates and then trying to
- * match the survivors back to their fixes by value is both slow and wrong — a track that
- * crosses its own path has duplicate coordinates and no way to tell which one survived.
- * Indices carry that identity for free.
+ * The indices `simplifyLine` would keep. Split out because a recorded fix carries a timestamp,
+ * accuracy and heart rate too, and matching survivors back by coordinate value is both slow and
+ * wrong — a track crossing its own path has duplicate coordinates.
  */
 export function simplifyIndices(coords: readonly LngLat[], toleranceM: number): number[] {
   if (coords.length <= 2 || toleranceM <= 0) return coords.map((_, i) => i);
@@ -67,12 +54,9 @@ export function simplifyIndices(coords: readonly LngLat[], toleranceM: number): 
   keep[0] = 1;
   keep[coords.length - 1] = 1;
 
-  // Project once into a local equirectangular frame in metres, then do the whole search
-  // in plane geometry. The inner loop runs O(n²) times on the input that matters most —
-  // a jittery recorded track, where consecutive fixes alternate either side of the line
-  // so no subrange can be pruned — and a haversine per iteration turns that into tens of
-  // seconds for a few hours of 1 Hz recording. Over the extent of one trail the
-  // projection error is orders of magnitude below a metre-scale tolerance.
+  // Project once into a local equirectangular frame in metres and search in plane geometry: the
+  // inner loop is O(n²) on a jittery recorded track, and a haversine per iteration turns that
+  // into tens of seconds. Over one trail's extent the projection error is far below a metre.
   const mPerDegLat = (EARTH_RADIUS_M * Math.PI) / 180;
   const mPerDegLng = mPerDegLat * Math.cos((coords[coords.length >> 1]![1] * Math.PI) / 180);
   const xs = new Float64Array(coords.length);
@@ -101,8 +85,8 @@ export function simplifyIndices(coords: readonly LngLat[], toleranceM: number): 
     for (let i = first + 1; i < last; i++) {
       const px = xs[i]! - ax;
       const py = ys[i]! - ay;
-      // Clamped to the segment, matching nearestPointOnSegment: an outlier beyond either
-      // end is measured to the endpoint, not to the infinite line it happens to lie near.
+      // Clamped to the segment, matching nearestPointOnSegment: an outlier beyond either end is
+      // measured to the endpoint, not to the infinite line it happens to lie near.
       const t = spanSq === 0 ? 0 : Math.min(1, Math.max(0, (px * dx + py * dy) / spanSq));
       const ex = px - dx * t;
       const ey = py - dy * t;
@@ -124,10 +108,7 @@ export function simplifyIndices(coords: readonly LngLat[], toleranceM: number): 
   return out;
 }
 
-/**
- * Whether a line returns to its own start, within `thresholdM`.
- * The basis of loop detection.
- */
+/** Whether a line returns to its own start within `thresholdM` — the basis of loop detection. */
 export function isClosedLoop(coords: readonly LngLat[], thresholdM = 200): boolean {
   if (coords.length < 3) return false;
   return haversineM(coords[0]!, coords[coords.length - 1]!) <= thresholdM;

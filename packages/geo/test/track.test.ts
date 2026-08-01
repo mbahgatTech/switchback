@@ -13,13 +13,9 @@ import {
 import { offset } from './helpers';
 
 /**
- * These are the numbers a hike is remembered by, so the tests are written against the
- * failure modes of real GPS rather than against clean synthetic lines: a lunch stop that
- * invents a kilometre, a canopy fix that teleports across a valley, a phone whose first
- * position is 300 m out.
- *
- * Every fixture is built from metre offsets, so each expectation comes from the intent
- * ("an hour at 1 m/s") rather than from whatever the implementation returned first.
+ * Written against the failure modes of real GPS rather than clean synthetic lines: a lunch stop
+ * that invents a kilometre, a canopy fix that teleports, a cold-start position 300 m out.
+ * Fixtures are built from metre offsets, so expectations come from the intent.
  */
 
 const ORIGIN: [number, number] = [-121.4, 48.0];
@@ -51,8 +47,7 @@ describe('summariseTrack', () => {
   });
 
   it('does not invent distance out of a lunch stop', () => {
-    // The headline bug this file exists for: ten minutes of 1 Hz jitter while stationary
-    // sums to hundreds of metres if every wobble is credited.
+    // Ten minutes of 1 Hz jitter while stationary sums to hundreds of metres if credited.
     const stats = summariseTrack(stand(600, 0, 0));
     expect(stats.distanceM).toBe(0);
     expect(stats.elapsedTimeS).toBe(599);
@@ -68,8 +63,8 @@ describe('summariseTrack', () => {
   });
 
   it('still counts a slow hiker whose steps are under the jitter floor', () => {
-    // 0.6 m/s at 1 Hz is a 0.6 m step — well below MIN_STEP_M. Discarding those steps one
-    // by one would report a two-kilometre amble as standing still for an hour.
+    // 0.6 m/s at 1 Hz is a 0.6 m step, below MIN_STEP_M: discarding each in turn would report
+    // a two-kilometre amble as standing still.
     expect(0.6).toBeLessThan(MIN_STEP_M);
     const stats = summariseTrack(hike(0.6, 3_600));
     expect(stats.distanceM).toBeGreaterThan(2_100);
@@ -85,8 +80,7 @@ describe('summariseTrack', () => {
     // The real climb is 100 m; naive summing of the ±3 m noise would report several hundred.
     expect(stats.gainM).toBeGreaterThan(90);
     expect(stats.gainM).toBeLessThan(115);
-    // Min and max are the raw extremes, not the filtered ones — the hysteresis is about how
-    // much climbing happened, not about how high the hiker got.
+    // Min and max are raw extremes: the hysteresis is about climbing, not about height.
     expect(stats.minEleM).toBe(500);
     expect(stats.maxEleM).toBeGreaterThanOrEqual(600);
   });
@@ -185,9 +179,8 @@ describe('simplifyTrack', () => {
   });
 
   it('does not flatten ten minutes of straight hiking to two points', () => {
-    // The failure this guard exists for. A straight line is geometrically two points, and
-    // storing it as two points throws away every split, every heart rate, and the whole
-    // pace curve — the recording becomes an outline of a hike rather than the hike.
+    // A straight line is geometrically two points, and storing it as two throws away every
+    // split, heart rate and the pace curve.
     const straight = hike(1.4, 600);
     const thinned = simplifyTrack(straight);
     expect(thinned.length).toBeGreaterThanOrEqual(600 / MAX_SAMPLE_GAP_S);
@@ -197,8 +190,7 @@ describe('simplifyTrack', () => {
   });
 
   it('still measures the same hike after thinning', () => {
-    // Thinning is a storage decision, so it must not move the numbers. Within a metre or
-    // two: the retained fixes are a subset, and a chord is marginally shorter than its arc.
+    // Thinning is a storage decision and must not move the numbers, within a metre or two.
     const fixes = [...hike(1.4, 900), ...stand(300, 901, 1_260), ...hike(1.2, 600, 1_201, 1_260)];
     const before = summariseTrack(fixes);
     const after = summariseTrack(simplifyTrack(fixes));
@@ -207,8 +199,7 @@ describe('simplifyTrack', () => {
   });
 
   it('leaves an already-sparse track alone', () => {
-    // A fix a minute is already coarser than the gap cap, and there is nothing to insert —
-    // the refill must never invent a point that was not recorded.
+    // The refill must never invent a point that was not recorded.
     const sparse = Array.from({ length: 20 }, (_, i) => {
       const [lng, lat] = offset(ORIGIN, i * 80, 0);
       return { t: i * 60, lng, lat, accuracyM: 5 };

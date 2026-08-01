@@ -56,9 +56,8 @@ describe('tileCorridor', () => {
   });
 
   it('never skips a tile along a segment that crosses several', () => {
-    // One straight segment across ~8 tiles of longitude at z10, checked against the tiles
-    // a naive scan of the line's own bounding row would produce. A sampled hike that
-    // stepped too coarsely would leave gaps in the middle of this run.
+    // One straight segment across ~8 tiles of longitude at z10: a hike sampling too coarsely
+    // would leave gaps in the middle of this run.
     const line: LineString = {
       type: 'LineString',
       coordinates: [
@@ -88,12 +87,8 @@ describe('tileCorridor', () => {
   });
 
   /**
-   * The whole reason this function exists rather than a bbox hike.
-   *
-   * The saving is not a constant — it *grows with zoom*, and that is the point. A corridor
-   * is a line, so its tile count roughly doubles per zoom level; a bounding box is an area,
-   * so its count quadruples. Two levels deeper is a fourfold better bargain, which is why
-   * z15 offline maps for a thru-hike are arguable at all and a box hike is not.
+   * The saving grows with zoom: a corridor is a line so its count doubles per level, a box is
+   * an area so its count quadruples. Two levels deeper is a fourfold better bargain.
    */
   it('beats the trail bounding box by a margin that widens with zoom', () => {
     function ratioAt(z: number): number {

@@ -2,36 +2,17 @@ import type { LineString } from '@switchback/core';
 import { MERCATOR_MAX_LAT, type Tile } from './tiles';
 
 /**
- * Which map tiles a trail actually needs, for downloading it.
- *
- * The obvious answer is "every tile in the trail's bounding box", and it is wrong in a way
- * that gets worse the more interesting the trail is. A bounding box is a rectangle; a trail
- * is a line. The Pennine Way's box contains most of northern England, of which the hiker
- * will see a strip a few hundred metres wide. At z15 that box is on the order of a hundred
- * thousand tiles against a corridor of a few thousand — the difference between a download
- * that is refused and one that finishes over a café's wifi.
- *
- * So this hikes the line and takes the tiles it passes through, then dilates that set by a
- * ring of neighbours. The ring is what makes it usable rather than merely correct: a
- * corridor exactly one tile wide shows the trail pinned to the edge of the world with
- * nothing either side of it, and "what is that valley over there" is a question people ask
- * on ridges.
- *
- * Everything here is integer tile arithmetic on a Web Mercator pyramid, so it is shared
- * verbatim by the terrain tiles that draw the hillshade, the vector tiles that draw the
- * names, and any raster base a deployment adds later.
+ * Which map tiles a trail needs for offline download: the tiles its line passes through, dilated
+ * by a ring of neighbours. A bounding box is the wrong shape — the Pennine Way's box is most of
+ * northern England, ~100k tiles at z15 against a few thousand for the corridor.
  */
 
 /** Tiles either side of the line, at every zoom. One ring is about a screen's worth at z14. */
 const DEFAULT_RING = 1;
 
 /**
- * Refuse past this many tiles in one download.
- *
- * At roughly 12 kB a vector tile and 60 kB a terrain tile, 8,000 is on the order of 200 MB
- * for a full corridor — already beyond what anyone should hand a phone without being asked.
- * The cap is not a guess at what the device can hold; it is the point past which the honest
- * answer is "this is a thru-hike, download it in sections".
+ * Refuse past this many tiles in one download — at ~12 kB a vector tile and 60 kB a terrain
+ * tile, 8,000 is around 200 MB, the point past which the answer is "download it in sections".
  */
 export const MAX_CORRIDOR_TILES = 8_000;
 
@@ -53,11 +34,8 @@ export interface CorridorResult {
 }
 
 /**
- * Where a coordinate falls on the tile grid, as a fraction rather than a tile index.
- *
- * Kept local rather than borrowed from `terrarium.ts`, which returns a tile plus a pixel
- * offset in a fixed 256 px tile — a raster idea. Fractional tile units are the right
- * currency for hiking a line across a grid, and they are the same at any tile size.
+ * Where a coordinate falls on the tile grid, in fractional tile units. Local rather than
+ * `terrarium.ts`'s tile-plus-pixel-offset, which assumes a fixed 256 px raster tile.
  */
 function fractionalTile(lng: number, lat: number, z: number): { x: number; y: number } {
   const clamped = Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, lat));
@@ -76,13 +54,9 @@ function normalise(x: number, y: number, z: number): { x: number; y: number } {
 }
 
 /**
- * Tiles touched by the line at one zoom, before dilation.
- *
- * Segments are sampled rather than rasterised with a DDA, at a spacing of half a tile in
- * the dominant axis. Two consecutive samples are then under half a tile apart on *both*
- * axes, so no tile between them can be stepped over — which is the only property a DDA
- * would buy here, at more code. The ring dilation that follows makes the distinction
- * academic anyway.
+ * Tiles touched by the line at one zoom, before dilation. Sampled at half a tile in the dominant
+ * axis rather than rasterised with a DDA: consecutive samples are then under half a tile apart on
+ * both axes, so no tile between them is stepped over.
  */
 function touchedAtZoom(coords: LineString['coordinates'], z: number, into: Set<string>): void {
   const first = coords[0];
@@ -129,14 +103,9 @@ function dilate(keys: Set<string>, z: number, ring: number): Set<string> {
 }
 
 /**
- * The tile corridor for a route.
- *
- * Zooms are added coarsest first and the whole of a zoom is either taken or dropped. That
- * ordering is deliberate: a download cut off part-way through z15 leaves a map that is
- * sharp for the first third of the hike and blank for the rest, which is worse than useless
- * because it looks like it worked. Dropping the deepest zoom instead leaves a map that is
- * complete and slightly soft — the failure mode of every paper map ever folded into a
- * pocket, and one every hiker already knows how to read.
+ * The tile corridor for a route. Zooms are added coarsest first and a zoom is taken whole or
+ * dropped whole: a download cut off mid-z15 is sharp for the first third of the hike and blank
+ * for the rest, which looks like it worked. Dropping the deepest zoom leaves a complete, soft map.
  */
 export function tileCorridor(line: LineString, options: CorridorOptions): CorridorResult {
   const ring = options.ring ?? DEFAULT_RING;
@@ -165,11 +134,8 @@ export function tileCorridor(line: LineString, options: CorridorOptions): Corrid
     coveredMaxZoom = z;
   }
 
-  /*
-   * The coarsest zoom always goes in, even alone and even over the cap. A corridor at z10
-   * is a few tiles for any trail on earth, and a downloaded trail that renders as a grey
-   * void is not a smaller download — it is a broken one.
-   */
+  // The coarsest zoom always goes in, even alone and even over the cap: a downloaded trail that
+  // renders as a grey void is not a smaller download, it is a broken one.
   if (tiles.length === 0) {
     const touched = new Set<string>();
     touchedAtZoom(line.coordinates, minZoom, touched);
@@ -184,10 +150,8 @@ export function tileCorridor(line: LineString, options: CorridorOptions): Corrid
 }
 
 /**
- * Fill a `{z}/{x}/{y}` template.
- *
- * `{-y}` is understood as well, because TMS-ordered sources exist and getting the flip
- * wrong shows up as a map of somewhere else entirely rather than as an error.
+ * Fill a `{z}/{x}/{y}` template. `{-y}` is understood too, because TMS-ordered sources exist and
+ * getting the flip wrong renders somewhere else entirely rather than erroring.
  */
 export function tileUrl(template: string, tile: Tile): string {
   return template

@@ -4,20 +4,10 @@ import { FIT_EPOCH_MS, encodeBase64, fitCrc16, toFitActivity, toFitCourse } from
 import { summariseTrack } from '../src/track';
 
 /**
- * These tests decode the bytes rather than snapshotting them, because a FIT file is only
- * correct relative to a reader.
- *
- * A snapshot would pin the output and prove nothing about whether a watch can read it: the
- * failure mode of this format is a field width that disagrees with its definition, and that
- * produces a stable, reproducible, entirely wrong file. So below is a small independent
- * decoder — written from the spec, not from the encoder — and the assertions are on what it
- * recovers. If the encoder and the decoder ever agree on something wrong, they will have to
- * do it by making the same mistake twice from opposite directions.
+ * These tests decode the bytes rather than snapshotting them: a field width disagreeing with its
+ * definition produces a stable, reproducible, entirely wrong file. The decoder below is written
+ * from the spec, not from the encoder, so agreeing on something wrong takes two mistakes.
  */
-
-// ---------------------------------------------------------------------------
-// A minimal FIT reader
-// ---------------------------------------------------------------------------
 
 /** Width, invalidity and signedness by base-type index — the reader's whole type table. */
 const BASE_INFO: Readonly<Record<number, { width: number; invalid: number; signed: boolean }>> = {
@@ -163,10 +153,6 @@ const number = (value: number | string | null): number => {
   return value as number;
 };
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
 const STARTED_AT = new Date('2026-05-17T06:30:00Z');
 
 function makeFixes(count: number, withHeartRate = false): TrackFix[] {
@@ -187,10 +173,6 @@ function makeRoutePoints(count: number): Array<{ lng: number; lat: number; eleM:
     return { lng: -4.05 + i * 0.0004, lat: 53.07 + i * 0.0002, eleM: 300 + rung * 40 };
   });
 }
-
-// ---------------------------------------------------------------------------
-// Activity files
-// ---------------------------------------------------------------------------
 
 describe('toFitActivity', () => {
   it('writes a well-formed file a reader can walk end to end', () => {
@@ -452,10 +434,6 @@ describe('toFitActivity', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Course files
-// ---------------------------------------------------------------------------
-
 const CREATED_AT = new Date('2026-04-02T09:00:00Z');
 
 describe('toFitCourse', () => {
@@ -611,10 +589,6 @@ describe('toFitCourse', () => {
     expect(number(one(file, MESG.lap).fields[9]!)).toBe(0);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
 
 describe('encodeBase64', () => {
   it('agrees with a reference implementation, including on the padding cases', () => {

@@ -34,9 +34,8 @@ describe('classifyRouteType', () => {
   });
 
   it('classifies a there-and-back as out_and_back, not as a loop', () => {
-    // Regression: closure used to be tested before retracing, which labelled every
-    // out-and-back a loop — hiking back to the car closes the line exactly as a
-    // circuit does, so the endpoints alone cannot tell the two apart.
+    // Regression: closure used to be tested before retracing, labelling every out-and-back a
+    // loop — hiking back to the car closes the line exactly as a circuit does.
     expect(classifyRouteType(outAndBack([0, 45], 2000))).toBe('out_and_back');
   });
 
@@ -127,10 +126,8 @@ describe('endpointSeparationM', () => {
 });
 
 /**
- * The Pyg Track problem: a path drawn once, from a car park to a summit. Geometry alone can
- * only call it point-to-point, and it is hiked out and back by everybody who hikes it.
- *
- * The fixture is that path — 4 km north, with whatever features are named at each end.
+ * The Pyg Track problem: a path drawn once from a car park to a summit, which geometry can only
+ * call point-to-point. The fixture is that path — 4 km north, with features named at each end.
  */
 const TRAILHEAD: LngLat = [-4.076, 53.079];
 const PATH = lineNorth(TRAILHEAD, 4000, 21);

@@ -3,46 +3,18 @@ import { computeGainLoss } from './profile';
 import { cleanFixes, fixDistancesM, summariseTrack } from './track';
 
 /**
- * FIT — the format a watch actually wants.
+ * FIT encoder, written by hand against the published FIT Protocol (the Garmin SDK is a 2 MB
+ * generated dependency for nine messages). GPX is what everything reads; FIT is what a Garmin
+ * *loads*, arriving with the climb profile and virtual partner a GPX course cannot carry.
  *
- * GPX is the interchange format everything reads; FIT is the format Garmin devices *load*.
- * The distinction is not academic. A GPX course sideloaded to a Fenix arrives as a bare line
- * with no ascent profile, no virtual partner and no turn prompts, because GPX has nowhere to
- * put them; the same route as a FIT course arrives with the climb graph on the watch face
- * before the hike starts. Both ship, because both are the right answer to different questions
- * — "give me my data" is GPX, "put this on my wrist" is FIT.
+ * File layout: a 14-byte header, then records, then a 2-byte CRC. A definition message names the
+ * fields of a *local type* (0–15), and every data message on that type is those fields in that
+ * order, with no keys on the wire — so a width wrong by one byte silently garbles every field
+ * after it and the file still parses. Hence the tests decode bytes back rather than snapshot them.
  *
- * Written by hand against the published FIT Protocol rather than pulled from the Garmin SDK,
- * for the same reason `toGpx` is hand-written: the encoder is the small half of this file and
- * the SDK is a 2 MB generated dependency whose profile tables we would use nine messages of.
- * What follows is the whole format, and it is genuinely small:
- *
- * ```
- * ┌──────────────┐  14 bytes: size, protocol, profile, data length, ".FIT", CRC
- * │    header    │
- * ├──────────────┤  a definition message names the fields of a *local type* (0–15)
- * │   records    │  every data message that follows on that local type is those fields,
- * │              │  in that order, with no keys on the wire at all
- * ├──────────────┤
- * │     CRC      │  2 bytes over everything above
- * └──────────────┘
- * ```
- *
- * **The one thing that makes FIT unforgiving:** a data message carries no field identity. It
- * is a bare run of bytes whose meaning comes entirely from the definition emitted earlier on
- * the same local type. Get a width wrong by one byte and every field after it in every
- * message of that type is garbage, and the file still parses — it just says the hike climbed
- * 40,000 metres. That is why the tests decode the bytes back rather than snapshotting them.
- *
- * **Absent values are written, not skipped.** Every base type reserves a value meaning
- * "invalid" (0xFF for uint8, 0xFFFF for uint16, and so on) and a fix with no heart rate
- * writes that. Skipping the field instead would shorten the message and desynchronise the
- * reader from the definition — see above.
+ * Absent values are written as the base type's invalid sentinel (0xFF for uint8, and so on),
+ * never skipped: skipping shortens the message and desynchronises the reader from the definition.
  */
-
-// ---------------------------------------------------------------------------
-// Constants of the format
-// ---------------------------------------------------------------------------
 
 /** FIT counts seconds from 1989-12-31T00:00:00Z, not from the Unix epoch. */
 export const FIT_EPOCH_MS = Date.UTC(1989, 11, 31);
@@ -56,11 +28,8 @@ const PROTOCOL_VERSION = 0x20;
 const PROFILE_VERSION = 2151;
 
 /**
- * Manufacturer 255 is "development" — the id the spec reserves for anyone without one.
- *
- * Garmin Connect, Strava and every reader tested accept it. Claiming a real manufacturer id
- * we do not own would be the alternative, and it would put our files in someone else's
- * device statistics.
+ * Manufacturer 255 is "development", the id the spec reserves for anyone without one. Claiming
+ * a real manufacturer id would put our files in someone else's device statistics.
  */
 const MANUFACTURER_DEVELOPMENT = 255;
 const PRODUCT_ID = 1;
@@ -84,13 +53,10 @@ const MESG = {
 const FILE_TYPE = { activity: 4, course: 6 } as const;
 
 /**
- * FIT's `sport` enum, for the activity types we record.
- *
- * Several of ours have no FIT equivalent and are mapped to the nearest one a device
- * understands rather than to `generic`: a scramble recorded as `mountaineering` gets sensible
- * ascent handling on a watch, and recorded as `generic` gets none. `sub_sport` recovers the
- * distinction that matters most — trail running against road running, mountain biking against
- * road — because those two pairs differ in how a device computes everything else.
+ * FIT's `sport` enum. Activity types with no FIT equivalent map to the nearest one a device
+ * understands rather than `generic` — a scramble as `mountaineering` gets sensible ascent
+ * handling, as `generic` gets none. `sub_sport` carries trail-vs-road, which devices treat
+ * differently for everything downstream.
  */
 const FIT_SPORT: Readonly<Record<ActivityType, number>> = {
   hiking: 17,
@@ -121,17 +87,10 @@ const COURSE_POINT_TYPE = { generic: 0, summit: 1 } as const;
 const COURSE_POINT_NAME_BYTES = 16;
 
 /**
- * The pace a course is timed at when nothing better is known: 1.1 m/s, about 4 km/h.
- *
- * Only reached when a route has no stored estimate. Every route saved through the planner
- * carries a Tobler estimate over its real profile, which is a far better virtual partner than
- * any constant.
+ * Fallback course pace, 1.1 m/s (~4 km/h). Only reached when a route has no stored estimate;
+ * every route saved through the planner carries a Tobler estimate over its real profile.
  */
 const COURSE_DEFAULT_SPEED_MPS = 1.1;
-
-// ---------------------------------------------------------------------------
-// Base types
-// ---------------------------------------------------------------------------
 
 interface BaseType {
   /** The base-type byte written into a definition: bit 7 is endian ability. */
@@ -165,16 +124,9 @@ interface FitEntry {
   readonly value: number | string | null;
 }
 
-// ---------------------------------------------------------------------------
-// CRC
-// ---------------------------------------------------------------------------
-
 /**
- * FIT's CRC-16, table-driven a nibble at a time.
- *
- * The polynomial is the same as Modbus but the table is indexed by four bits rather than
- * eight, which is exactly how the spec presents it — reproduced in that shape so it can be
- * checked against the document line by line.
+ * FIT's CRC-16, table-driven a nibble at a time. Same polynomial as Modbus, but indexed by four
+ * bits rather than eight — the shape the spec presents, so it checks against the document.
  */
 const CRC_TABLE = [
   0x0000, 0xcc01, 0xd801, 0x1400, 0xf001, 0x3c00, 0x2800, 0xe401, 0xa001, 0x6c00, 0x7800, 0xb401,
@@ -195,15 +147,9 @@ export function fitCrc16(bytes: Uint8Array): number {
   return crc & 0xffff;
 }
 
-// ---------------------------------------------------------------------------
-// The writer
-// ---------------------------------------------------------------------------
-
 /**
- * A growable little-endian byte sink.
- *
- * Little-endian throughout, and the definition messages say so in their architecture byte, so
- * nothing here is host-dependent — a file written on a big-endian machine would be identical.
+ * A growable little-endian byte sink. Definition messages declare little-endian in their
+ * architecture byte, so output is identical on a big-endian host.
  */
 class FitWriter {
   private buffer = new Uint8Array(4096);
@@ -244,12 +190,9 @@ class FitWriter {
 }
 
 /**
- * UTF-8 bytes for `text`, truncated to `maxBytes` **at a character boundary**.
- *
- * Hand-rolled rather than `TextEncoder` because this package is imported by the iOS app and
- * Hermes does not reliably provide one. Boundary-safe truncation is the part that matters:
- * cutting a name mid-sequence produces bytes that are not UTF-8 at all, and a watch shows the
- * replacement character where the last letter of the route should be.
+ * UTF-8 bytes for `text`, truncated to `maxBytes` at a character boundary. Hand-rolled because
+ * this package is imported by the iOS app and Hermes does not reliably provide `TextEncoder`;
+ * cutting mid-sequence yields bytes that are not UTF-8 and a watch shows a replacement character.
  */
 function utf8Bytes(text: string, maxBytes: number): number[] {
   const out: number[] = [];
@@ -279,11 +222,9 @@ function fieldWidth(field: FitField): number {
 }
 
 /**
- * Announce the shape of every data message that follows on this local type.
- *
- * A local type is a slot, 0–15, not an identity: redefining slot 2 halfway through a file is
- * legal and changes what every subsequent slot-2 message means. This encoder never reuses a
- * slot, which is why each definition is emitted exactly once at the point of first use.
+ * Announce the shape of every data message that follows on this local type. A local type is a
+ * slot, 0–15, not an identity: redefining one mid-file legally changes what its later messages
+ * mean. This encoder never reuses a slot, so each definition is emitted once at first use.
  */
 function emitDefinition(
   writer: FitWriter,
@@ -357,18 +298,14 @@ function sealFile(records: Uint8Array): Uint8Array {
   view.setUint16(2, PROFILE_VERSION, true);
   view.setUint32(4, records.length, true);
   out.set([0x2e, 0x46, 0x49, 0x54], 8); // ".FIT"
-  // The header carries its own CRC over its first twelve bytes; the file CRC at the end
-  // covers the header *including* that one, plus every record.
+  // The header carries its own CRC over its first twelve bytes; the file CRC covers the header
+  // *including* that one, plus every record.
   view.setUint16(12, fitCrc16(out.subarray(0, 12)), true);
 
   out.set(records, HEADER_SIZE);
   view.setUint16(total - 2, fitCrc16(out.subarray(0, total - 2)), true);
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// Scaling
-// ---------------------------------------------------------------------------
 
 /** Degrees to semicircles: FIT stores position as a signed 32-bit fraction of a turn. */
 const SEMICIRCLES_PER_DEGREE = 2 ** 31 / 180;
@@ -406,10 +343,6 @@ function speedRaw(mps: number | null | undefined): number | null {
 function distanceRaw(metres: number): number {
   return Math.max(0, Math.round(metres * 100));
 }
-
-// ---------------------------------------------------------------------------
-// Fields, by message
-// ---------------------------------------------------------------------------
 
 const FILE_ID = {
   type: { num: 0, base: 'enum' },
@@ -526,21 +459,13 @@ function fileIdEntries(type: number, createdMs: number): FitEntry[] {
   ];
 }
 
-// ---------------------------------------------------------------------------
-// Activity files
-// ---------------------------------------------------------------------------
-
 export interface FitActivityOptions {
   name: string;
   startedAt: Date;
   activityType: ActivityType;
   /**
-   * Seconds east of UTC where the hike happened.
-   *
-   * Written as `activity.local_timestamp`, which is how a reader recovers the offset: it
-   * subtracts `timestamp` from it. Omitted when unknown rather than guessed — a reader that
-   * sees no local timestamp shows UTC, and a reader that sees a wrong one shows a hike that
-   * started at four in the morning.
+   * Seconds east of UTC where the hike happened, written as `activity.local_timestamp` — a
+   * reader recovers the offset by subtracting `timestamp`. Omitted when unknown, never guessed.
    */
   utcOffsetS?: number;
 }
@@ -548,15 +473,12 @@ export interface FitActivityOptions {
 /**
  * A recorded hike as a FIT activity file.
  *
- * The message order is the one every device writes and every reader expects: identity, timer
- * start, the records, timer stop, then the summaries from narrowest to widest — lap, session,
- * activity. Readers that stream rather than index depend on it, and a session that arrives
- * before the records it summarises is the classic way a file imports with zero distance.
+ * Message order is load-bearing: identity, timer start, records, timer stop, then summaries
+ * narrowest to widest — lap, session, activity. Streaming readers depend on it, and a session
+ * arriving before the records it summarises is the classic zero-distance import.
  *
- * Totals come from `summariseTrack`, not from re-adding the records. That is deliberate: the
- * summary a watch displays and the summary this product displays are then the same number by
- * construction, including the jitter floor and the moving-time threshold, which no device
- * would otherwise reproduce.
+ * Totals come from `summariseTrack`, not from re-adding the records, so the watch and this
+ * product show the same number including the jitter floor and moving-time threshold.
  */
 export function toFitActivity(fixes: readonly TrackFix[], options: FitActivityOptions): Uint8Array {
   const clean = cleanFixes(fixes);
@@ -575,7 +497,7 @@ export function toFitActivity(fixes: readonly TrackFix[], options: FitActivityOp
   emitOne(writer, 0, MESG.fileId, fileIdEntries(FILE_TYPE.activity, startMs));
 
   // Defined up front so the matching stop can be written after the records without a second
-  // definition — one local type, two rows, the run of records in between.
+  // definition — one local type, two rows, the records in between.
   const eventFields = [EVENT.event, EVENT.eventType, EVENT.data, EVENT.timestamp];
   emitDefinition(writer, 1, MESG.event, eventFields);
   emitData(writer, 1, eventFields, [
@@ -678,12 +600,9 @@ export function toFitActivity(fixes: readonly TrackFix[], options: FitActivityOp
     { field: ACTIVITY.type, value: ACTIVITY_TYPE_MANUAL },
     { field: ACTIVITY.event, value: ACTIVITY_EVENT },
     { field: ACTIVITY.eventType, value: EVENT_TYPE_STOP },
-    // Dropped from the definition rather than written as the invalid sentinel when we do
-    // not know the offset, the same way heart rate is dropped from the record definition
-    // when nothing recorded it. The sentinel is the correct encoding and a strict reader
-    // discards it, but 0xFFFFFFFF is also 136 years of seconds, and a reader that forgets
-    // to check invalid on this one field shows the hike as happening in 2126. Absent is a
-    // state every reader handles; present-but-invalid is one some of them get wrong.
+    // Dropped from the definition rather than written as the invalid sentinel: 0xFFFFFFFF is
+    // also 136 years of seconds, and a reader that forgets to check invalid on this one field
+    // shows the hike happening in 2126. Absent is a state every reader handles.
     ...(options.utcOffsetS != null
       ? [
           {
@@ -697,10 +616,6 @@ export function toFitActivity(fixes: readonly TrackFix[], options: FitActivityOp
 
   return sealFile(writer.toBytes());
 }
-
-// ---------------------------------------------------------------------------
-// Course files
-// ---------------------------------------------------------------------------
 
 export interface RoutePoint {
   lng: number;
@@ -718,28 +633,18 @@ export interface FitCourseOptions {
 }
 
 /**
- * A planned route as a FIT course file.
- *
- * The difference from an activity is not the geometry — it is that a course is a *plan*, so a
- * device is expected to navigate it rather than replay it. That changes three things:
- *
- * 1. **The timestamps are fiction, and they have a job.** A course's record timestamps are
- *    what a Garmin turns into the virtual partner: the little second figure that tells you
- *    whether you are ahead of schedule. They are spread over the route in proportion to
- *    distance, from the Tobler estimate the planner already computed against the real
- *    profile, so "ahead of schedule" means ahead of a pace that accounts for the climb.
- * 2. **The lap message is required, not summary.** A course with no lap does not load on
- *    several Garmin models — it appears in the list and refuses to start.
- * 3. **Three course points ship.** Start, high point and finish, which is what turns a line
- *    on the map into something with the summit marked on the climb graph. We have no
- *    turn-by-turn instructions to offer beyond that and do not invent any.
+ * A planned route as a FIT course file. A course is navigated, not replayed, which changes three
+ * things: record timestamps are fiction that a Garmin turns into the virtual partner, spread over
+ * the route from the planner's Tobler estimate so "ahead of schedule" accounts for the climb; the
+ * lap message is required, since a course without one refuses to start on several Garmin models;
+ * and three course points ship — start, high point, finish — to mark the summit on the climb graph.
  */
 export function toFitCourse(points: readonly RoutePoint[], options: FitCourseOptions): Uint8Array {
   const createdMs = options.createdAt.getTime();
   const startTime = fitTimestamp(createdMs);
 
-  // Cumulative distance along the drawn line, plus the running elevation series the lap's
-  // ascent comes from. One pass, because the two must describe the same line.
+  // Cumulative distance plus the running elevation series the lap's ascent comes from. One
+  // pass, because the two must describe the same line.
   const distances: number[] = [];
   let running = 0;
   for (let i = 0; i < points.length; i++) {
@@ -811,8 +716,8 @@ export function toFitCourse(points: readonly RoutePoint[], options: FitCourseOpt
     ]);
   }
 
-  // Start, summit, finish — and only if they are distinct. A three-point course whose start
-  // and high point are the same index would otherwise carry two markers on one pixel.
+  // Start, summit, finish — only if distinct, or a course whose start is its high point would
+  // carry two markers on one pixel.
   const marks: Array<{ index: number; type: number; name: string }> = [];
   if (first) marks.push({ index: 0, type: COURSE_POINT_TYPE.generic, name: 'Start' });
   if (highIndex > 0 && highIndex < points.length - 1) {
@@ -851,10 +756,8 @@ export function toFitCourse(points: readonly RoutePoint[], options: FitCourseOpt
 }
 
 /**
- * Great-circle metres between two route points.
- *
- * Local rather than imported from `./distance` only because that module speaks `LngLat`
- * tuples and this one speaks objects; the formula and the earth radius are identical.
+ * Great-circle metres between two route points. Local rather than imported from `./distance`
+ * only because that module speaks `LngLat` tuples and this one speaks objects.
  */
 function haversine(a: RoutePoint, b: RoutePoint): number {
   const R = 6_371_008.8;
@@ -867,19 +770,11 @@ function haversine(a: RoutePoint, b: RoutePoint): number {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 /**
- * Base64 for the wire.
- *
- * FIT is binary and the API that serves it is JSON, so the bytes have to be text somewhere.
- * Hand-rolled for the same reason `utf8Bytes` is: this package is imported by the iOS app,
- * where `Buffer` does not exist and `btoa` is not guaranteed — and on that side base64 is not
- * an encoding step to undo but the exact form `expo-file-system` wants to write.
+ * Base64 for the wire, hand-rolled for the same reason as `utf8Bytes`: on iOS `Buffer` does not
+ * exist and `btoa` is not guaranteed — and there base64 is the exact form `expo-file-system` wants.
  */
 export function encodeBase64(bytes: Uint8Array): string {
   let out = '';

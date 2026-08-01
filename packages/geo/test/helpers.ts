@@ -2,11 +2,8 @@ import type { LngLat } from '@switchback/core';
 import { EARTH_RADIUS_M } from '@switchback/geo';
 
 /**
- * Synthetic-geometry helpers for the geo tests.
- *
- * Fixtures are built from metre offsets rather than hand-typed coordinates so that the
- * expected values in each test are derived from the intent ("a 1 km path climbing 100 m")
- * instead of from whatever the implementation happened to produce.
+ * Synthetic-geometry helpers, built from metre offsets rather than hand-typed coordinates so
+ * expectations derive from the intent ("a 1 km path climbing 100 m").
  */
 
 /** Metres per degree of latitude on the sphere the distance code assumes. */
@@ -50,10 +47,7 @@ export function square(origin: LngLat, sideM: number): LngLat[] {
   return out;
 }
 
-/**
- * An out-and-back: north to a turnaround, then back along a line offset by
- * `offsetM` — a few metres, as a real GPS-traced return leg would be.
- */
+/** An out-and-back: north to a turnaround, then back along a line offset by `offsetM`. */
 export function outAndBack(origin: LngLat, legLengthM: number, offsetM = 3): LngLat[] {
   const out = lineNorth(origin, legLengthM, 21);
   const back = out

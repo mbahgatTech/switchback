@@ -19,13 +19,9 @@ import {
 } from '@switchback/geo';
 
 /**
- * The section's projection, which two renderers now share.
- *
- * `apps/web/src/components/section.tsx` and `apps/mobile/src/components/section.tsx` both
- * draw from these functions and neither re-derives a curve, so a change here moves the
- * graphic on the website and on the phone at once. That is the reason for the last block
- * below: the two plots have different rectangles, different units and different type sizes,
- * and the one thing that must survive all of it is that they are the same drawing.
+ * The section's projection, shared by `apps/web/src/components/section.tsx` and
+ * `apps/mobile/src/components/section.tsx` — neither re-derives a curve, so a change here moves
+ * both. The last block below asserts the two remain the same drawing.
  */
 
 /** A profile with a given spacing and an elevation function of distance. */
@@ -46,21 +42,16 @@ function profileOf(
 const PEAK = profileOf(25, 201, (d) => 200 + 600 * Math.sin((Math.PI * d) / 5000));
 
 /**
- * The Pacific Crest Trail's length, at a spacing that keeps the fixture cheap.
- *
- * 4,270 km is three orders of magnitude past the day hike everything else here tests, and
- * it is where the station ladder used to run out: the old one stopped at 50 km, so `find`
- * returned nothing, the fallback took over at its top rung, and the axis drew eighty-five
- * labels into a solid band of overprinted digits.
+ * The Pacific Crest Trail's length, at a spacing that keeps the fixture cheap. Where the station
+ * ladder used to run out: it stopped at 50 km, so `find` returned nothing and the fallback drew
+ * eighty-five labels into a band of overprinted digits.
  */
 const THRU_HIKE = profileOf(10_000, 428, (d) => 1000 + 500 * Math.sin(d / 250_000));
 
 /**
- * The American Perimeter Trail, at 7,681 km the longest walkable route there is.
- *
- * The Pacific Crest Trail fits under a 1,000 km rung and this does not, which is the whole
- * reason it is here: a ladder tested only against the trail that prompted it will be
- * exactly one rung too short for the trail nobody thought of.
+ * The American Perimeter Trail, at 7,681 km the longest walkable route there is. The PCT fits
+ * under a 1,000 km rung and this does not — a ladder tested only against the trail that prompted
+ * it is exactly one rung too short for the trail nobody thought of.
  */
 const PERIMETER = profileOf(20_000, 385, (d) => 400 + 400 * Math.sin(d / 400_000));
 
@@ -74,8 +65,8 @@ describe('toSectionPoints', () => {
   });
 
   it('keeps the summit and the low point when it thins', () => {
-    // A stride that lands on neither extreme is the case this exists for: a section whose
-    // high point is lower than the stat block above it is worse than no section at all.
+    // A stride landing on neither extreme: a section whose high point is lower than the stat
+    // block above it is worse than no section.
     const profile = profileOf(25, 401, (d) => (d === 25 * 137 ? 999 : d === 25 * 202 ? 3 : 500));
     const points = toSectionPoints(profile, { maxPoints: 60 });
 
@@ -126,13 +117,8 @@ describe('elevationTicks', () => {
   });
 
   /**
-   * The whole point of choosing the step in the display unit.
-   *
-   * A metric ladder relabelled in feet gives gridlines at 1,640 and 3,281 — evenly spaced,
-   * correctly converted, and useless, because a gridline exists to be subtracted from
-   * another gridline in the reader's head. So the step is picked in feet and converted back
-   * to the metres the renderer plots in, and this asserts the conversion survives the round
-   * trip: what `axisElevation` prints must be the rung the ladder chose, to the foot.
+   * The step is picked in feet and converted back to metres, so what `axisElevation` prints is
+   * the rung the ladder chose, to the foot — a metric ladder relabelled gives 1,640 and 3,281.
    */
   it('labels an imperial axis in round feet, not in converted metres', () => {
     for (const max of SUMMITS) {
@@ -175,9 +161,8 @@ describe('toStations', () => {
   });
 
   it('drops a round mark that would sit on top of the finish', () => {
-    // 1,050 m at a 200 m step: 1,000 lands 50 m from the end, inside the third-of-a-step
-    // guard. Printing "1.0" beside "1.1" is two labels where the reader needed one, and it
-    // is the round one that goes — the finish is not optional.
+    // 1,050 m at a 200 m step: 1,000 lands inside the third-of-a-step guard, and it is the
+    // round label that goes — the finish is not optional.
     const stations = toStations(
       profileOf(25, 43, () => 100),
       { system: 'metric' },
@@ -192,12 +177,9 @@ describe('toStations', () => {
   });
 
   /**
-   * Round miles for an imperial reader, by the same argument as the gridlines.
-   *
-   * Every mark but the last is a whole mile; the last is the finish, which lands wherever
-   * the trail ends and is the one label allowed a decimal. The axis and the stat block are
-   * both written to one decimal, so this also asserts they cannot disagree about the same
-   * distance — a 3.107 mi trail reading `3.1` in both places.
+   * Round miles, by the same argument as the gridlines. Every mark but the last is a whole
+   * mile; the last is the finish. Both axis and stat block write one decimal, so a 3.107 mi
+   * trail must read `3.1` in both places.
    */
   it('marks round miles for an imperial reader', () => {
     const labels = toStations(PEAK, { system: 'imperial' }).map((s) =>
@@ -207,8 +189,7 @@ describe('toStations', () => {
   });
 
   it('thins a thru-hike to marks a reader can tell apart', () => {
-    // The regression: a 4,270 km trail off the top of the old ladder drew a station every
-    // 50 km. Both systems now reach a rung coarse enough to keep the row legible.
+    // Regression: a 4,270 km trail off the top of the old ladder drew a station every 50 km.
     for (const system of ['metric', 'imperial'] as const) {
       const stations = toStations(THRU_HIKE, { system });
       expect(stations.length).toBeLessThanOrEqual(7);
@@ -217,10 +198,8 @@ describe('toStations', () => {
   });
 
   it('still has a rung left for the longest route on earth', () => {
-    // Not a hypothetical ceiling: 7,681 km is a real trail, and it is the one that proved
-    // the ladder could still be fallen off after the PCT fix. Reaching the top rung is the
-    // failure — `find` returning nothing is what makes an axis unreadable, so assert the
-    // step was chosen rather than defaulted, by way of the mark count it produces.
+    // 7,681 km is a real trail, and the one that proved the ladder could still be fallen off
+    // after the PCT fix. Reaching the top rung is the failure, asserted via the mark count.
     for (const system of ['metric', 'imperial'] as const) {
       expect(toStations(PERIMETER, { system }).length).toBeLessThanOrEqual(6);
     }
@@ -277,8 +256,8 @@ describe('positionAt', () => {
 
 describe('sampleSection', () => {
   it('agrees with the stored profile wherever both are defined', () => {
-    // The cursor dot rides the drawn line, not the stored one. When nothing was thinned away
-    // the two have to be the same curve, or the dot floats off the line it is marking.
+    // The cursor dot rides the drawn line, not the stored one: with nothing thinned away the
+    // two must be the same curve.
     const points = toSectionPoints(PEAK, { maxPoints: 1000 });
     for (const d of [0, 137, 1250, 3333, 4999, 5000]) {
       expect(sampleSection(points, d)).toBeCloseTo(elevationAt(PEAK, d), 9);
@@ -386,14 +365,9 @@ describe('path emission', () => {
 
 describe('placeCallouts', () => {
   /*
-   * The website's plot rectangle, in its own viewBox units, because the case this function
-   * exists for is a matter of specific numbers rather than of principle.
-   *
-   * On the Appalachian Trail the high point is roughly 240 km into 3,404, which is 7% of the
-   * way across a 904-unit plot — 63 units from the trailhead, with two blocks about 162 units
-   * wide wanting to stand there. The graphic printed `TRAILHEAD 07:0HIGH POINT 09:54` on one
-   * line and two interleaved temperatures on the next, and drew the high point's rule through
-   * the trailhead's words on the way past.
+   * The website's plot rectangle in its own viewBox units. On the Appalachian Trail the high
+   * point is 7% across a 904-unit plot, with two ~162-unit blocks wanting to stand there — the
+   * graphic printed `TRAILHEAD 07:0HIGH POINT 09:54` on one line.
    */
   const PLOT = { x0: 68, x1: 972 };
   /** The width of `68°F · gusts 5 mph` set in 15-unit mono, near enough. */
@@ -412,8 +386,7 @@ describe('placeCallouts', () => {
   });
 
   it('leaves a well-spaced pair exactly where they asked to stand', () => {
-    // A day hike: trailhead at the left edge, summit two-thirds along. Nothing to solve, and
-    // the sweep must not invent a displacement for a row that was already correct.
+    // A day hike: nothing to solve, and the sweep must not invent a displacement.
     const placed = placeCallouts(
       [
         { at: 68, width: BLOCK },
@@ -436,8 +409,7 @@ describe('placeCallouts', () => {
       PLOT,
     );
     expect(overlap(placed[0]!, placed[1]!)).toBe(false);
-    // The trailhead does not move: it was not in anyone's way, and a block that shifts for
-    // no reason is a block whose leader now points somewhere it did not need to.
+    // The trailhead does not move: it was not in anyone's way.
     expect(placed[0]).toEqual({ left: 78, right: 240 });
     expect(placed[1]!.left).toBe(256);
   });
@@ -445,8 +417,7 @@ describe('placeCallouts', () => {
   it('pulls a block back off the right edge rather than hanging it off the sheet', () => {
     const [placed] = placeCallouts([{ at: 970, width: BLOCK }], PLOT);
     expect(placed!.right).toBe(PLOT.x1);
-    // And it now sits to the *left* of the rule it serves, which is what the renderer reads
-    // to decide that the leader meets its right edge instead of its left.
+    // And it now sits left of its rule, which is how the renderer picks which edge to meet.
     expect(placed!.left).toBeLessThan(970);
   });
 
@@ -464,8 +435,7 @@ describe('placeCallouts', () => {
   });
 
   it('hands the placements back in the order it was given them', () => {
-    // The sweep works in distance order; the renderer iterates its own callout array. The two
-    // agreeing by luck on a two-element list would hide the bug until a third annotation.
+    // The sweep works in distance order; the renderer iterates its own callout array.
     const placed = placeCallouts(
       [
         { at: 600, width: BLOCK },
@@ -492,8 +462,7 @@ describe('placeCallouts', () => {
   });
 
   it('never overlaps, wherever along the trail the high point turns out to be', () => {
-    // The summit of a long route is wherever the range is, and it is under no obligation to
-    // be anywhere convenient. Every whole unit of a real plot, against a real pair of widths.
+    // Every whole unit of a real plot, against a real pair of widths.
     for (let at = PLOT.x0; at <= PLOT.x1; at += 1) {
       const placed = placeCallouts(
         [
@@ -511,9 +480,8 @@ describe('placeCallouts', () => {
   });
 
   it('packs from the left and runs off the right when the row simply cannot fit', () => {
-    // Six 200-unit blocks need 1,280 units of a 904-unit sheet. Something has to give, and it
-    // is the right margin rather than the left, where the elevation labels are. Deciding that
-    // six annotations is too many is the caller's call — it knows which of them matters.
+    // Six 200-unit blocks need 1,280 units of a 904-unit sheet: the right margin gives, not
+    // the left, where the elevation labels are.
     const placed = placeCallouts(
       Array.from({ length: 6 }, (_, i) => ({ at: PLOT.x0 + i * 40, width: 200 })),
       PLOT,
@@ -528,11 +496,9 @@ describe('placeCallouts', () => {
 
 describe('one drawing, two plots', () => {
   /*
-   * The website plots into a 1000-unit viewBox; the phone plots into real points on a
-   * ~340pt screen. Everything else about the two renderers differs — hatch spacing, type
-   * size, whether there is an animation — and the invariant that makes them the same graphic
-   * is that a distance sits at the same fraction across both plots, and an elevation at the
-   * same fraction up both.
+   * The website plots into a 1000-unit viewBox and the phone into real points on a ~340pt
+   * screen. The invariant that makes them one graphic: a distance sits at the same fraction
+   * across both plots, an elevation at the same fraction up both.
    */
   const WEB = { x0: 68, x1: 972, y0: 76, y1: 318 };
   const PHONE = { x0: 42, x1: 340, y0: 12, y1: 160 };
@@ -562,8 +528,8 @@ describe('one drawing, two plots', () => {
     const classify = (grade: number) => (Math.abs(grade) < 0.1 ? 0 : 1);
     const breaks = (plotted: SectionPoint[]) =>
       sectionBands(plotted, classify).map((band) => band.points[0]!.distanceM);
-    // The bands come from the points and the ramp, never from the plot — this asserts that
-    // no sheet-layout decision has quietly leaked into the classification.
+    // The bands come from the points and the ramp, never the plot — no sheet-layout decision
+    // has leaked into the classification.
     expect(breaks(points)).toEqual(breaks(points));
     expect(sectionBands(points, classify).length).toBeGreaterThan(1);
   });

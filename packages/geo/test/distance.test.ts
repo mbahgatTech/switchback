@@ -171,10 +171,8 @@ describe('compassPoint', () => {
   });
 
   it('centres each sector on its direction rather than starting it there', () => {
-    // The off-by-half-a-sector bug is `Math.floor(deg / 45)`, which makes north the sector
-    // 0°–45° instead of the one centred on 0°. Every assertion here is a bearing the two
-    // versions disagree about: under the buggy one, a trail 44° round the rose — all but
-    // due northeast — is written up as due north.
+    // Regression: `Math.floor(deg / 45)` makes north the sector 0°–45° rather than the one
+    // centred on 0°, so a trail 44° round the rose is written up as due north.
     expect(compassPoint(22.4)).toBe('N');
     expect(compassPoint(22.6)).toBe('NE');
     expect(compassPoint(44)).toBe('NE');
@@ -191,8 +189,8 @@ describe('compassPoint', () => {
   });
 
   it('survives a bearing that is not a number', () => {
-    // `bearingDeg` of a point to itself is well defined, but a coordinate read from a
-    // cookie or a URL is not, and a compass rose is not where that should surface.
+    // A coordinate read from a cookie or a URL may not be a number, and a compass rose is not
+    // where that should surface.
     expect(compassPoint(Number.NaN)).toBe('N');
     expect(compassPoint(Infinity)).toBe('N');
   });
