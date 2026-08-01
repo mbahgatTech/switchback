@@ -131,9 +131,18 @@ export default async function ReportPage({
               <h2 className="collar">What happens next</h2>
               <div className="mt-md max-w-measure-wide space-y-md text-body leading-relaxed">
                 <p>
-                  We answer within {MODERATION_CONTACT.responseDays} days. Something dangerous, or
-                  somebody&rsquo;s private information, comes down faster than that — before we have
-                  finished deciding the rest.
+                  {/*
+                   * The space lives inside the template literal on purpose. Written the obvious
+                   * way — `{responseDays} days.` — the compiler drops it and the page reads "5days",
+                   * because this text node runs on past the end of the line and its leading space is
+                   * trimmed with the newline. It is not a line-ending artefact; it survives
+                   * converting the file to LF, and it shipped into the screenshots in this pull
+                   * request before anyone read them closely. Keeping the number and its unit in one
+                   * string puts the space somewhere no JSX whitespace rule reaches.
+                   */}
+                  We answer within {`${MODERATION_CONTACT.responseDays} days`}. Something dangerous,
+                  or somebody&rsquo;s private information, comes down faster than that — before we
+                  have finished deciding the rest.
                 </p>
                 <p>
                   Then one of two things: we take it down, or we leave it up and tell you why.

@@ -123,9 +123,10 @@ export default function TermsPage() {
             would rather say so than imply a machine is watching.
           </p>
           <p>
-            We answer within {MODERATION_CONTACT.responseDays} days. Something that is dangerous or
-            is somebody&rsquo;s private information comes down faster than that, before we have
-            finished deciding the rest.
+            {/* See the note in app/report/page.tsx — the space must live inside the string. */}
+            We answer within {`${MODERATION_CONTACT.responseDays} days`}. Something that is
+            dangerous or is somebody&rsquo;s private information comes down faster than that, before
+            we have finished deciding the rest.
           </p>
           <p>
             The outcome is one of two things: we take it down, or we leave it up and tell you why.
