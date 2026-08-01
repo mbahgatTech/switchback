@@ -11,55 +11,23 @@ import { computeGainLoss } from './profile';
 import { simplifyIndices } from './polyline';
 
 /**
- * Turning a bag of GPS fixes into the numbers a hike is remembered by.
- *
- * Everything here runs on the server against what was actually uploaded, never on the
- * client's own totals — `packages/core/activities.ts` explains why. It is also the reason
- * this file is in `geo` rather than `api`: the recorder needs the same distance and ascent
- * on screen while the hike is happening, and two implementations of "how far have I come"
- * that disagree by 4% is the kind of thing people notice and never trust again.
- *
- * **Three corrections separate a plausible number from a real one**, and all three exist
- * because a phone is not a survey instrument:
- *
- * 1. **Bad fixes are dropped, not averaged in.** A 300 m accuracy fix from a cold start is
- *    not a position. Averaging it moves the whole track; keeping it adds phantom distance
- *    twice, going and coming back.
- * 2. **Distance ignores movement below the noise floor.** Standing at a viewpoint for ten
- *    minutes at 1 Hz produces six hundred fixes scattered over a few metres, and summing
- *    them adds a kilometre to a hike where nobody moved. See `MIN_STEP_M`.
- * 3. **Ascent uses the same hysteresis filter as trail stats.** `computeGainLoss` with the
- *    standard 10 m threshold, so a recorded hike and the trail it followed report ascent
- *    on the same terms and can honestly be compared.
+ * Turning recorded GPS fixes into a hike's headline numbers. Lives in `geo` rather than `api` so
+ * the recorder shows the same distance and ascent on screen as the server computes afterwards.
  */
 
 /**
- * Movement between consecutive fixes below this is treated as jitter, not travel.
- *
- * Consumer GPS wanders by a couple of metres while stationary, and at 1 Hz that wander is
- * sampled thousands of times over a lunch stop. Four metres sits above the wander and below
- * a hiking pace's per-second step of roughly 1.4 m — which is why the threshold cannot
- * simply be applied per fix. It is applied against the *last accepted position*, so a slow
- * hiker's 1.4 m steps accumulate until they clear 4 m and then count in full. Nothing real
- * is lost; only the standing still is.
+ * Movement between consecutive fixes below this is jitter, not travel. Applied against the last
+ * *accepted* position, not per fix, so a slow hiker's 1.4 m steps accumulate and then count in
+ * full — four metres sits above consumer GPS wander and below a hiking pace's per-second step.
  */
 export const MIN_STEP_M = 4;
 
-/**
- * Below this speed the hiker is considered stopped, for moving-time purposes.
- *
- * Moving time is the statistic people compare against each other, and it is meaningless if
- * a two-hour lunch counts. 0.5 m/s is about 1.8 km/h — slower than anyone hikes and faster
- * than anyone stands.
- */
+/** Below this speed the hiker is stopped, for moving-time purposes. 0.5 m/s is about 1.8 km/h. */
 export const STOPPED_SPEED_MPS = 0.5;
 
 /**
- * A speed above this, between two fixes, is a GPS jump rather than a person.
- *
- * Under canopy a fix can leap a hundred metres and come straight back. That is 100 m/s at
- * 1 Hz — beyond any activity we support, including the downhill ones — so it is rejected
- * outright, and the next fix is measured from the last position we believed.
+ * A speed above this between two fixes is a GPS jump, not a person — under canopy a fix can leap
+ * 100 m and come straight back. Rejected outright; the next fix measures from the last believed.
  */
 export const MAX_PLAUSIBLE_SPEED_MPS = 30;
 
@@ -71,16 +39,9 @@ export const SPLIT_UNIT_M: Readonly<Record<'metric' | 'imperial', number>> = {
 
 const round1 = (n: number): number => Math.round(n * 10) / 10;
 
-// ---------------------------------------------------------------------------
-// Cleaning
-// ---------------------------------------------------------------------------
-
 /**
- * Drop fixes that are not positions, and order what remains by time.
- *
- * Ordering matters more than it looks: batches arrive over the network and a retried batch
- * can land after the one that followed it, which would otherwise put a fix from minute
- * three between two fixes from minute nine and draw a spike across the map.
+ * Drop fixes that are not positions, and order what remains by time. Ordering matters: a retried
+ * batch can land after the one that followed it and draw a spike across the map.
  */
 export function cleanFixes(fixes: readonly TrackFix[]): TrackFix[] {
   const ordered = [...fixes]
@@ -92,8 +53,8 @@ export function cleanFixes(fixes: readonly TrackFix[]): TrackFix[] {
     )
     .sort((a, b) => a.t - b.t);
 
-  // Two fixes with the same `t` is a duplicate upload, not a decision to make: keep the
-  // first and let the second go, so a retried batch cannot double a hike's distance.
+  // Two fixes with the same `t` is a duplicate upload: keep the first, so a retried batch
+  // cannot double a hike's distance.
   const out: TrackFix[] = [];
   let lastT = -1;
   let lastKept: TrackFix | null = null;
@@ -102,8 +63,8 @@ export function cleanFixes(fixes: readonly TrackFix[]): TrackFix[] {
     if (lastKept) {
       const dt = fix.t - lastKept.t;
       const step = haversineM([lastKept.lng, lastKept.lat], [fix.lng, fix.lat]);
-      // A teleport. Rejecting it rather than clamping keeps the *next* fix measured from
-      // somewhere real, which is what stops one bad fix costing two spurious legs.
+      // Rejecting a teleport rather than clamping keeps the *next* fix measured from somewhere
+      // real, which is what stops one bad fix costing two spurious legs.
       if (dt > 0 && step / dt > MAX_PLAUSIBLE_SPEED_MPS) continue;
     }
     out.push(fix);
@@ -114,26 +75,16 @@ export function cleanFixes(fixes: readonly TrackFix[]): TrackFix[] {
 }
 
 /**
- * The longest a thinned track may go without a stored fix.
- *
- * Douglas–Peucker is a *geometric* filter and knows nothing about time, so a straight
- * kilometre of towpath reduces to its two endpoints — correct as a shape, and ruinous as a
- * recording. Everything a track carries besides its outline is sampled at those points:
- * heart rate, per-split gain, the elevation series, the pace curve. Two points for twenty
- * minutes of hiking means one leg, one heart rate, and a split table with nothing in it.
- *
- * So the thinned track is topped back up to at least one fix every half minute. It costs
- * 720 rows for a six-hour hike — nothing — and it is the difference between a recording
- * that can be redrawn and one that can only be outlined.
+ * The longest a thinned track may go without a stored fix. Douglas–Peucker is geometric and knows
+ * nothing about time, so a straight kilometre reduces to two endpoints — and heart rate, per-split
+ * gain, elevation and pace are all sampled at the points that survive.
  */
 export const MAX_SAMPLE_GAP_S = 30;
 
 /**
- * Thin a track for storage, keeping the shape, the endpoints, and the time series.
- *
- * Run after `cleanFixes` and after `summariseTrack` — never before. Simplification removes
- * the fixes a stationary pause is made of, which is exactly the data moving time is
- * computed from; measure first, then thin.
+ * Thin a track for storage, keeping the shape, the endpoints, and the time series. Run after
+ * `cleanFixes` and after `summariseTrack`, never before: simplification removes the fixes a
+ * stationary pause is made of, which is exactly what moving time is computed from.
  */
 export function simplifyTrack(
   fixes: readonly TrackFix[],
@@ -145,9 +96,8 @@ export function simplifyTrack(
   const kept = simplifyIndices(coords, toleranceM);
   if (maxGapS <= 0) return kept.map((i) => fixes[i]!);
 
-  // Hike the survivors and refill any stretch the geometry filter flattened. Evenly spaced
-  // within the gap rather than "every maxGapS from the left", so a 70-second stretch keeps
-  // two fixes at 23 s apart instead of one at 30 and a straggler at 10.
+  // Refill any stretch the geometry filter flattened, evenly spaced within the gap rather than
+  // "every maxGapS from the left", so a 70-second stretch keeps two fixes 23 s apart.
   const out: TrackFix[] = [];
   for (let k = 0; k < kept.length; k++) {
     const at = kept[k]!;
@@ -176,10 +126,6 @@ export function simplifyTrack(
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Summary
-// ---------------------------------------------------------------------------
-
 interface Leg {
   /** Distance credited for this leg, after the jitter floor. */
   distanceM: number;
@@ -192,11 +138,8 @@ interface Leg {
 }
 
 /**
- * Hike the fixes once, producing the per-leg facts every statistic is built from.
- *
- * Both the totals and the splits need the same traversal, and doing it twice invites the
- * two to drift apart — a split table whose distances do not sum to the headline distance is
- * a bug report waiting to happen.
+ * Hike the fixes once, producing the per-leg facts every statistic is built from. Totals and
+ * splits share this traversal so the split table always sums to the headline distance.
  */
 function toLegs(fixes: readonly TrackFix[]): Leg[] {
   const legs: Leg[] = [];
@@ -209,9 +152,8 @@ function toLegs(fixes: readonly TrackFix[]): Leg[] {
     const dtS = Math.max(0, fix.t - anchor.t);
 
     if (step < MIN_STEP_M) {
-      // Below the noise floor. The leg still happened in time — it is stopped time — but
-      // it covered no ground, and the anchor deliberately does not advance, so a genuine
-      // slow hike accumulates against a fixed point instead of being erased step by step.
+      // Below the noise floor: still stopped time, but no ground. The anchor deliberately does
+      // not advance, so a genuine slow hike accumulates against a fixed point.
       legs.push({ distanceM: 0, dtS, moving: false, to: i });
       continue;
     }
@@ -224,22 +166,11 @@ function toLegs(fixes: readonly TrackFix[]): Leg[] {
 }
 
 /**
- * Cumulative distance at each fix, in metres, aligned index-for-index with the input.
+ * Cumulative distance at each fix, index-aligned with the input. Distinct from
+ * `cumulativeDistancesM` in `distance.ts`: this runs the same `toLegs` traversal the totals use,
+ * so the series and the summary agree — a FIT file shows a watch both at once.
  *
- * Named apart from `cumulativeDistancesM` in `distance.ts` because it is a different
- * measurement, not an overload: that one adds up raw haversine hops between coordinates,
- * this one runs the same `toLegs` traversal the totals and the splits use, so a fix that
- * moved less than the jitter floor contributes nothing here either.
- *
- * That is the whole point of it existing. A per-point series computed the naive way
- * disagrees with the headline figure at the last point by a few metres, and the one place
- * that shows is a FIT file, where a watch reads the series and the summary and displays
- * both.
- *
- * Expects fixes that have already been through `cleanFixes` — it does not clean them itself,
- * because the callers that want a per-point series have invariably just cleaned the track to
- * compute something else, and cleaning twice would produce a series that no longer lines up
- * with the array the caller is holding.
+ * Expects fixes already through `cleanFixes`; cleaning again would misalign the returned array.
  */
 export function fixDistancesM(fixes: readonly TrackFix[]): number[] {
   const out = Array.from({ length: fixes.length }, () => 0);
@@ -252,12 +183,8 @@ export function fixDistancesM(fixes: readonly TrackFix[]): number[] {
 }
 
 /**
- * The headline numbers for a recording.
- *
- * `elapsedTimeS` is wall clock from first fix to last; `movingTimeS` excludes the stops.
- * Both are reported because they answer different questions — "how long were you out" and
- * "how fast were you going" — and a product that only shows one of them is answering the
- * question the user did not ask half the time.
+ * The headline numbers for a recording. `elapsedTimeS` is wall clock from first fix to last;
+ * `movingTimeS` excludes the stops. Both are reported because they answer different questions.
  */
 export function summariseTrack(fixes: readonly TrackFix[]): ActivityStats {
   const clean = cleanFixes(fixes);
@@ -301,24 +228,16 @@ export function summariseTrack(fixes: readonly TrackFix[]): ActivityStats {
     maxEleM: elevations.length > 0 ? Math.round(Math.max(...elevations)) : null,
     movingTimeS: Math.round(movingTimeS),
     elapsedTimeS,
-    // Average against moving time, not elapsed. A pace that counts the summit lunch is not
-    // a pace anybody recognises, and it is not what any other tracker reports either.
+    // Average against moving time, not elapsed — a pace counting the summit lunch is not one
+    // anybody recognises, and not what any other tracker reports.
     avgSpeedMps: movingTimeS > 0 ? round1((distanceM / movingTimeS) * 100) / 100 : null,
     maxSpeedMps: maxSpeedMps > 0 ? round1(maxSpeedMps * 100) / 100 : null,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Splits
-// ---------------------------------------------------------------------------
-
 /**
- * Per-unit splits, in the hiker's own unit system.
- *
- * A leg that straddles a boundary is divided in proportion to distance rather than being
- * assigned whole to one side. Legs are seconds long, so the error either way is tiny — but
- * assigning whole legs makes the split distances fail to sum to the total, and a table whose
- * column does not add up to the number above it reads as broken even when it is close.
+ * Per-unit splits, in the hiker's own unit system. A leg straddling a boundary is divided in
+ * proportion to distance, so the split distances sum to the total shown above the table.
  */
 export function computeSplits(
   fixes: readonly TrackFix[],
@@ -350,7 +269,7 @@ export function computeSplits(
       gainM: Math.round(gainM),
       lossM: Math.round(lossM),
       // Pace is quoted per whole unit even for the partial final split, which is what makes
-      // that last row comparable to the ones above it rather than just shorter.
+      // that last row comparable to the ones above it.
       paceSPerUnit: bucketDist > 0 ? Math.round((bucketMoving / bucketDist) * unitM) : 0,
       complete,
     });
@@ -365,8 +284,7 @@ export function computeSplits(
     let remaining = leg.distanceM;
     let remainingTime = leg.dtS;
 
-    // A single leg can in principle span a boundary (a long gap in the fixes), so this is
-    // a loop rather than an if.
+    // A single leg can span a boundary (a long gap in the fixes), hence a loop not an if.
     while (bucketDist + remaining >= unitM && remaining > 0) {
       const need = unitM - bucketDist;
       const share = remaining > 0 ? need / remaining : 0;
@@ -384,16 +302,11 @@ export function computeSplits(
     if (leg.moving) bucketMoving += remainingTime;
   }
 
-  // The tail, if the hike did not end on a boundary. A zero-distance tail is a pause at the
-  // end of the last full unit and is not a split of its own.
+  // A zero-distance tail is a pause at the end of the last full unit, not a split of its own.
   if (bucketDist >= 1) bank(clean.length - 1, false);
 
   return splits;
 }
-
-// ---------------------------------------------------------------------------
-// Export
-// ---------------------------------------------------------------------------
 
 /** `[lng, lat, eleM | null]` triples — the wire form of a track. */
 export function toTrackTuples(fixes: readonly TrackFix[]): Array<[number, number, number | null]> {
@@ -428,15 +341,9 @@ export interface GpxOptions {
 }
 
 /**
- * GPX 1.1 for a recorded track.
- *
- * Hand-written rather than generated by a library because the output is forty lines of
- * well-specified XML and the dependency would be the larger thing to maintain. It is a
- * `<trk>` and not a `<rte>`: a route is a plan, a track is what happened, and importing a
- * recording as a route is what makes it show up in Garmin Connect as a course with no times.
- *
- * Every point carries an absolute `<time>`, reconstructed from `startedAt + t`. Without it
- * the file still draws, but every consumer computes zero for pace and moving time.
+ * GPX 1.1 for a recorded track. A `<trk>`, not a `<rte>`: importing a recording as a route makes
+ * it a course with no times. Every point carries an absolute `<time>` reconstructed from
+ * `startedAt + t`, without which consumers compute zero for pace and moving time.
  */
 export function toGpx(fixes: readonly TrackFix[], options: GpxOptions): string {
   const start = options.startedAt.getTime();
@@ -485,22 +392,10 @@ export interface RouteGpxOptions {
 }
 
 /**
- * GPX 1.1 for a planned route.
- *
- * A second writer rather than a flag on `toGpx`, because the difference is `<rte>` against
- * `<trk>` and that is not a formatting detail — it is the whole meaning of the file. A track
- * is a record of a hike that happened, and every point on it carries the instant it was
- * reached. A route is a line somebody intends to hike, and it has no times at all, because
- * nobody has hiked it yet.
- *
- * Importing a plan as a track is how a route shows up in Garmin Connect as an activity you
- * are recorded as having completed at 00:00 on the first of January, at infinite pace. The
- * two documents are close enough in XML and far enough apart in consequence that keeping
- * them as separate functions is cheaper than keeping the distinction in a caller's head.
- *
- * `<ele>` is written for every point because the profile is the reason to plan on this
- * product rather than by dragging a line on a satellite photo, and a device that gets the
- * line without the ground recomputes ascent from its own coarser DEM.
+ * GPX 1.1 for a planned route. Separate from `toGpx` rather than a flag, because `<rte>` against
+ * `<trk>` is the meaning of the file: importing a plan as a track records it in Garmin Connect as
+ * an activity completed at 00:00 on 1 January at infinite pace. `<ele>` is written for every
+ * point so a device does not recompute ascent from its own coarser DEM.
  */
 export function toRouteGpx(
   points: ReadonlyArray<{ lng: number; lat: number; eleM: number }>,

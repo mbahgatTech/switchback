@@ -14,11 +14,9 @@ import {
 } from '@switchback/geo';
 
 /**
- * A synthetic network built in degrees near the equator, where a degree of longitude and a
- * degree of latitude are close enough to the same length that "which of these two routes is
- * longer" is answerable by eye. Every fixture below is small enough to reason about by hand,
- * which is the point — a routing test that needs its own routing engine to state the
- * expected answer proves nothing.
+ * A synthetic network in degrees near the equator, where a degree of longitude and a degree of
+ * latitude are close enough in length that "which route is longer" is answerable by eye. A
+ * routing test that needs its own routing engine to state the expected answer proves nothing.
  */
 function seg(
   wayId: number,
@@ -66,8 +64,7 @@ describe('buildGraph', () => {
   });
 
   it('does not join two ways that merely pass close by — a bridge over a path', () => {
-    // A metre apart at the crossing, which is what a footbridge and the path beneath it
-    // actually measure. Welding these would route a hiker off the side of a bridge.
+    // A metre apart at the crossing, as a footbridge and the path beneath it measure.
     const under = flat(1, [0, 0], [0.01, 0]);
     const over = seg(2, [
       [0.005, -0.001, 4],
@@ -187,9 +184,8 @@ describe('snapToGraph', () => {
   });
 
   it('picks the true nearest across a wide longitude span, not the nearest in degrees', () => {
-    // At 60°N a degree of longitude is half a degree of latitude on the ground. A snap that
-    // compared raw degrees would pick the eastern node; the cos(lat) scaling picks the
-    // northern one, which is genuinely closer.
+    // At 60°N a degree of longitude is half a degree of latitude on the ground, so a raw-degree
+    // comparison picks the eastern node and the cos(lat) scaling picks the northern one.
     const high = buildGraph([flat(1, [0, 60], [0.0018, 60]), flat(2, [0, 60], [0, 60.0006])]);
     const hit = snapToGraph(high, [0, 60.0006]);
 
@@ -236,9 +232,8 @@ describe('findPath', () => {
   });
 
   it('costs by Tobler over the horizontal run, so it climbs the long way round', () => {
-    // Two routes to the same summit node. The direct one is 400 m at a punishing 50 %; the
-    // dog-leg is 1,200 m at a walkable 17 %. Tobler makes the long way faster (≈1,537 s
-    // against ≈1,643 s) — a router costing by distance would send someone up the wall.
+    // 400 m at 50% against a 1,200 m dog-leg at 17%. Tobler makes the long way faster
+    // (≈1,537 s against ≈1,643 s); a router costing by distance sends someone up the wall.
     const graph = buildGraph([
       seg(1, [
         [0, 0, 0],
@@ -274,10 +269,8 @@ describe('findPath', () => {
   });
 
   it('switches to the road only when told to ignore preference', () => {
-    // The path rail crosses an 80 m hummock; the road rail is flat asphalt but 220 m longer.
-    // On the clock the road wins (≈916 s against ≈1,121 s). With the kind penalty applied it
-    // loses badly (≈1,446 s). One graph, two defensible answers, and the default is the one
-    // a hiker wants.
+    // Path rail over an 80 m hummock against a flat road rail 220 m longer. On the clock the
+    // road wins (≈916 s against ≈1,121 s); with the kind penalty it loses badly (≈1,446 s).
     const graph = buildGraph([
       seg(1, [
         [0, 0, 0],
@@ -324,9 +317,8 @@ describe('findPath', () => {
   });
 
   it('finds the optimum, not merely a route — the detour is never taken', () => {
-    // Two ways from west to east: a straight one and a dog-leg through the north. Both are
-    // paths, so only distance separates them. An inadmissible heuristic would sometimes
-    // settle for the dog-leg; this asserts it never does.
+    // A straight way and a dog-leg, both paths, so only distance separates them. An
+    // inadmissible heuristic would sometimes settle for the dog-leg.
     const graph = buildGraph([
       flat(1, [0, 0], [0.01, 0]),
       flat(2, [0, 0], [0.005, 0.004]),
@@ -338,8 +330,8 @@ describe('findPath', () => {
   });
 
   it('settles fewer nodes than the graph holds — the heuristic is doing work', () => {
-    // A long east-west corridor with a dead-end spur hanging off every vertex. A blind
-    // Dijkstra sweep would settle the spurs too; A* aimed at the far end mostly should not.
+    // A corridor with a dead-end spur off every vertex: a blind Dijkstra sweep settles the
+    // spurs too, A* aimed at the far end mostly should not.
     const segments: PathSegment[] = [];
     for (let i = 0; i < 40; i++) {
       segments.push(flat(i + 1, [i * 0.001, 0], [(i + 1) * 0.001, 0]));
@@ -373,9 +365,8 @@ describe('pathGeometry', () => {
 
 describe('MAX_HIKE_SPEED_KMH', () => {
   it('is a true upper bound on every speed the cost model can produce', () => {
-    // The admissibility proof in one assertion. If someone adds a surface faster than
-    // tarmac and forgets this, A* stops returning optima — silently, which is the worst
-    // way for a router to be wrong.
+    // The admissibility proof: a surface faster than tarmac added without this and A* stops
+    // returning optima, silently.
     const fastest = toblerSpeedKmh(-0.05) * 1.05;
 
     expect(MAX_HIKE_SPEED_KMH).toBeGreaterThanOrEqual(fastest - 1e-9);

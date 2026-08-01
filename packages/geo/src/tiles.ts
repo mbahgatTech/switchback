@@ -1,13 +1,8 @@
 import type { BBox, LngLat } from '@switchback/core';
 
 /**
- * Slippy-map tile and quadkey maths (Web Mercator, EPSG:3857).
- *
- * Quadkeys are the unit of ingest coverage: the map viewport is covered with z9
- * quadkeys, each of which is either already cached or gets queued for fetching from
- * OSM. A z9 tile is roughly 78 km across at the equator — large enough that a typical
- * viewport needs only a handful, small enough that one Overpass query for it returns
- * in seconds rather than timing out.
+ * Slippy-map tile and quadkey maths (Web Mercator, EPSG:3857). Quadkeys are the unit of ingest
+ * coverage: a z9 tile is ~78 km across, small enough that one Overpass query returns in seconds.
  *
  * @see https://learn.microsoft.com/en-us/bingmaps/articles/bing-maps-tile-system
  */
@@ -15,43 +10,25 @@ import type { BBox, LngLat } from '@switchback/core';
 /** Zoom level at which ingest coverage is tracked. */
 export const INGEST_ZOOM = 9;
 
-/**
- * Refuse to cover more than this many tiles in one request. Beyond it the user is
- * asking for a continent, and the honest answer is "zoom in" rather than queuing
- * hundreds of Overpass queries that will be rate-limited into next week.
- */
+/** Refuse to cover more than this many tiles in one request — beyond it, the ask is a continent. */
 export const MAX_TILES_PER_REQUEST = 12;
 
 /** Web Mercator is undefined at the poles; this is the standard clamp. */
 export const MERCATOR_MAX_LAT = 85.0511287798;
 
-/**
- * Length of the equator on the sphere Web Mercator is drawn on, metres.
- *
- * The one distance in the projection that is true, and therefore the one every other
- * distance is derived from: at latitude φ the projection stretches ground by 1/cos φ, so a
- * metre of paper at 60° buys half the ground a metre at the equator does.
- */
+/** Length of the equator on Web Mercator's sphere — the one true distance in the projection. */
 export const EARTH_CIRCUMFERENCE_M = 40_075_016.686;
 
 /**
- * How many pixels the whole world is across at zoom 0.
- *
- * **512, not 256.** The slippy-map convention this file's quadkey maths comes from is a
- * 256-pixel tile, but MapLibre — the only renderer here that turns a zoom into a distance —
- * counts a 512-pixel world. A ground resolution computed against 256 is out by a factor of
- * two, which reads as a zoom exactly one level too close, and every camera height and print
- * scale derived from it is half what it should be.
+ * World width in pixels at zoom 0. **512, not 256**: the quadkey convention here is 256-pixel
+ * tiles, but MapLibre counts a 512-pixel world, and a ground resolution against 256 is out by a
+ * factor of two — one zoom level too close in every camera height and print scale derived from it.
  */
 export const MERCATOR_WORLD_PX = 512;
 
 /**
- * Metres of ground under one pixel, at a zoom and a latitude.
- *
- * The bridge between the two ways this product talks about scale: a renderer says "zoom
- * 13.4" and a map sheet says "1:25 000", and this is the only thing that converts one to
- * the other. Exported rather than kept private because three callers now need it — the
- * flyover camera, the printed sheet, and the scale bar drawn on both.
+ * Metres of ground under one pixel, at a zoom and a latitude — the only bridge between a
+ * renderer's "zoom 13.4" and a sheet's "1:25 000".
  */
 export function groundResolution(zoom: number, latDeg: number): number {
   const latRad = (Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, latDeg)) * Math.PI) / 180;
@@ -60,11 +37,8 @@ export function groundResolution(zoom: number, latDeg: number): number {
 
 /**
  * A point as a fraction of the whole Mercator world: `[0, 0]` north-west, `[1, 1]` south-east.
- *
- * The unit everything else in the projection is a scaling of — tiles are this times `2^z`,
- * pixels are this times the world width in pixels, and millimetres of paper are this times
- * the world width in millimetres. Working in fractions first means each of those is one
- * multiplication rather than its own copy of the logarithm.
+ * Tiles, pixels and paper millimetres are all this times a scale, so each is one multiplication
+ * rather than its own copy of the logarithm.
  */
 export function mercatorFraction(lng: number, lat: number): [number, number] {
   const clampedLat = Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, lat));
@@ -154,10 +128,8 @@ export interface CoverResult {
 }
 
 /**
- * Cover a bounding box with quadkeys at `z`, refusing anything above `maxTiles`.
- *
- * Antimeridian-crossing boxes (west > east) are split and covered in two passes,
- * because a viewport over the Pacific is a real thing users produce by dragging.
+ * Cover a bounding box with quadkeys at `z`, refusing anything above `maxTiles`. Boxes crossing
+ * the antimeridian (west > east) are split and covered in two passes.
  */
 export function coverBBox(
   bbox: BBox,
@@ -206,21 +178,13 @@ export interface CentreCoverResult {
 }
 
 /**
- * Cover a bounding box at `z`, keeping the `maxTiles` tiles nearest its centre.
+ * Cover a bounding box at `z`, keeping the `maxTiles` tiles nearest its centre. `coverBBox`
+ * refuses an oversized box because nobody asked for it — a map merely panned; this serves
+ * somebody who pressed a button, so the cap is a selection rather than a rejection and what was
+ * left out is reported through `requiredTiles`.
  *
- * The difference from `coverBBox` is what happens when the box is too big, and it turns on
- * who is asking. `coverBBox` answers the automatic path — a map that merely panned — and
- * refusing there is right: nobody asked to fetch a continent, and queueing three hundred
- * Overpass queries because a viewport got wide would be a product that punishes zooming out.
- *
- * This answers somebody who pressed a button. Refusing them is not an option, and neither is
- * fetching everything, so the cap becomes a *selection* rather than a rejection: the tiles
- * closest to the middle of the view, which is the ground the person is looking at. What was
- * left out is reported through `requiredTiles` so the caller can say so out loud.
- *
- * Ordering is load-bearing, not cosmetic. Queueing hikes this array and jobs of equal
- * priority come off the queue in the order they went on, so centre-first here is why the
- * middle of the screen fills before the corners.
+ * Centre-first ordering is load-bearing: equal-priority jobs leave the queue in insertion order,
+ * so this is why the middle of the screen fills before the corners.
  */
 export function coverBBoxFromCentre(
   bbox: BBox,
@@ -233,12 +197,9 @@ export function coverBBoxFromCentre(
   const nw = lngLatToTile(w, n, z);
   const se = lngLatToTile(e, s, z);
 
-  /*
-   * X runs unwrapped. A box crossing the antimeridian has west > east, and its eastern edge
-   * is one world *further along* rather than behind; tiles are taken modulo the world on the
-   * way out. That is what makes a viewport over the Pacific cover Kamchatka and Alaska
-   * instead of the entire land mass between them.
-   */
+  // X runs unwrapped: a box crossing the antimeridian has west > east and its eastern edge one
+  // world further along, taken modulo the world on the way out. Without this a Pacific viewport
+  // covers the whole land mass between Kamchatka and Alaska rather than the two ends.
   const x0 = nw.x;
   const x1 = se.x >= nw.x ? se.x : se.x + world;
   const y0 = Math.min(nw.y, se.y);
@@ -251,19 +212,10 @@ export function coverBBoxFromCentre(
   const cx = x0 + (cols - 1) / 2;
   const cy = y0 + (rows - 1) / 2;
 
-  /*
-   * How far from the centre to look.
-   *
-   * Bounded by the cap rather than by the box, because only tiles near the centre can make
-   * the cut and a world view spans 262,144 of them at z9. Enumerating a quarter of a million
-   * tiles to sort them and throw away all but ninety-six is the kind of thing that works fine
-   * until somebody zooms out on a phone.
-   *
-   * `√maxTiles` covers the square case with room to spare — the nearest m tiles fill a disc
-   * of radius ≈0.56·√m — but a box one tile tall and four hundred wide has its nearest m in a
-   * *strip*, and a reach of ten would clip it to twenty-one. So each axis also allows for the
-   * other one being clipped short by the box.
-   */
+  // Search radius is bounded by the cap, not the box: a world view spans 262,144 tiles at z9 and
+  // enumerating them to keep ninety-six is what breaks when somebody zooms out on a phone.
+  // √maxTiles covers the square case (the nearest m tiles fill a disc of radius ≈0.56·√m), so
+  // each axis also allows for the other being clipped short by a long thin box.
   const reach = Math.ceil(Math.sqrt(maxTiles));
   const reachX = Math.max(reach, Math.ceil(maxTiles / Math.min(rows, 2 * reach + 1)));
   const reachY = Math.max(reach, Math.ceil(maxTiles / Math.min(cols, 2 * reach + 1)));
@@ -280,9 +232,7 @@ export function coverBBoxFromCentre(
     }
   }
 
-  // Ties broken on x then y so the same box always produces the same order — the queue is
-  // deduped by quadkey, and a set that reshuffles between calls would be harder to reason
-  // about for no gain.
+  // Ties broken on x then y so the same box always produces the same order.
   candidates.sort((a, b) => a.d - b.d || a.x - b.x || a.y - b.y);
 
   const quadkeys = candidates

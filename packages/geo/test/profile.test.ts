@@ -112,19 +112,9 @@ describe('maxSustainedGrade', () => {
   });
 
   it('measures a spacing that does not divide the window', () => {
-    /*
-     * Every other case here is spaced at exactly 25 m, which divides 100 four ways with
-     * nothing left over — and that is the one spacing this function used to get right.
-     *
-     * Real profiles never land there. `resampleLine` walks a nominal 25 m and spreads the
-     * remainder along the line, so the step comes out at 25.2 or 25.066 or 25.123, and four
-     * of them measure 100.8 m rather than 100.0. The window tail advanced to keep the run
-     * under 100, which left 75.6 m — below the tolerance in the function, so the head was
-     * skipped, and the tail never moves back, so every later head was skipped too. It
-     * returned its initial `max` of 0 on 1,136 trails with over 200 m of climb, one in eight
-     * of everything that goes uphill, while the 88% spaced a hair under 25 m read correctly.
-     * A spacing this test could not distinguish from the others by eye.
-     */
+    // Regression: `resampleLine` spreads its remainder, so a nominal 25 m lands at 25.2 or
+    // 25.066, and the window tail used to advance past every head — 0% on one climbing trail
+    // in eight, while the ones spaced a hair under 25 m read correctly.
     for (const spacing of [25.2, 25.066, 25.123, 24.9, 33.4, 51]) {
       const grade = maxSustainedGrade(profileOf(spacing, 41, (d) => d * 0.24));
       expect(grade, `${spacing} m spacing`).toBeCloseTo(0.24, 2);
@@ -132,10 +122,8 @@ describe('maxSustainedGrade', () => {
   });
 
   it('measures over the window nearest 100 m, from either side of it', () => {
-    // A 300 m pitch at 30% with 200 m of flat on each side. Whichever samples the window
-    // lands on, a run of roughly 100 m inside that pitch is available at every spacing — so
-    // a reading materially under 30% means the window stretched out past the steep ground,
-    // and one over it means the window collapsed onto a single noisy step.
+    // A 300 m pitch at 30% with 200 m of flat each side: under 30% means the window stretched
+    // past the steep ground, over it means the window collapsed onto one noisy step.
     for (const spacing of [24.9, 25, 25.2, 26.5]) {
       const p = profileOf(spacing, 29, (d) => Math.min(Math.max(d - 200, 0), 300) * 0.3);
       expect(maxSustainedGrade(p), `${spacing} m spacing`).toBeCloseTo(0.3, 1);
@@ -164,16 +152,8 @@ describe('despike', () => {
   });
 
   it('leaves a cliff alone, because a climb is not a spike', () => {
-    /*
-     * The rule this replaced the obvious one with. "Reject any step steeper than X" cannot
-     * tell a bad pixel from ground the trail genuinely climbs, and flattening real terrain is
-     * the worse failure of the two — nothing on the page would look wrong afterwards.
-     *
-     * These are Finney Peak's samples across its steepest hundred metres: 148 m of rise in
-     * 100 m, which reads as an implausible 148% and is nonetheless what the DEM says all the
-     * way along. Every sample continues where the last left off, so none stands off its own
-     * chord, so none is discarded.
-     */
+    // Finney Peak's steepest hundred metres: 148 m of rise in 100 m, an implausible-looking
+    // 148% that the DEM says all the way along. No sample stands off its own chord.
     const eles = [1379, 1408.8, 1443.2, 1484.7, 1526.9, 1542.7];
     expect(despike(eles, at(eles.length))).toEqual(eles);
   });
@@ -193,33 +173,18 @@ describe('despike', () => {
   });
 
   it('leaves a steep sample alone when the ground is already that steep', () => {
-    /*
-     * Citadel Peak Route, verbatim, across the col it crosses. Sample 4 stands 81 m off the
-     * chord between its neighbourhoods over a 34 m run — a deviation of 237%, comfortably past
-     * the bar that rejects a bad pixel. It is real ground nonetheless, and what says so is the
-     * company it keeps: the two references are already 190% apart from each other, so a rough
-     * sample here is in character. On the flat, 237% would be hundreds of times its
-     * surroundings; here it is not even twice.
-     *
-     * This is the case the deviation test alone gets wrong, and deleting the ratio condition
-     * gouges four samples out of a real col — the whole descent into it and back out.
-     */
+    // Citadel Peak Route across its col: sample 4 stands 237% off the chord, past the deviation
+    // bar, but the two references are already 190% apart — so a rough sample is in character.
+    // Deleting the ratio condition gouges four samples out of a real col.
     const dist = [0, 22, 35, 59, 82, 103, 127, 152, 176];
     const eles = [2518.2, 2532.0, 2540.5, 2555.4, 2531.9, 2411.3, 2378.8, 2383.2, 2441.1];
     expect(despike(eles, dist)).toEqual(eles);
   });
 
   it('still catches a notch in a ridge, where the ground either side is steep but agrees', () => {
-    /*
-     * Isabelle Peak Route, verbatim, and the closest call in the corpus — the sample the
-     * threshold was placed to catch. It reads 2,747 m where the ridge either side of it holds
-     * 2,884 and 2,902: a 148 m hole about 45 m wide, which no ground does.
-     *
-     * What separates it from Citadel above is not how far out it stands but what its
-     * neighbourhood is doing. Citadel's references disagree with each other by 190%, so a
-     * rough sample belongs there. Isabelle's agree to within 27% — the ridge is level across
-     * the gap — and a lone sample 148 m under a level ridge is a bad pixel.
-     */
+    // Isabelle Peak Route, the closest call in the corpus: a 148 m hole 45 m wide in a ridge
+    // whose references agree to within 27%. Citadel above passes because its references
+    // disagree by 190%; here they do not.
     const dist = [0, 23, 41, 62, 85, 107, 132, 150];
     const eles = [2873.0, 2884.4, 2883.8, 2843.5, 2747.2, 2901.6, 2898.0, 2902.5];
     expect(despike(eles, dist)).toEqual([
@@ -235,34 +200,23 @@ describe('despike', () => {
   });
 
   it('leaves the ends unjudged, and a bad end cannot take its neighbour with it', () => {
-    // A first or last sample has a neighbourhood on one side only, and nothing there can tell
-    // a bad reading from a trailhead on a cliff edge. Leaving them costs nothing, because one
-    // sample never moves a median: the -958.7 at each end shifts no reference far enough to
-    // put the real ground between them under suspicion.
+    // One sample never moves a median, so a bad end shifts no reference far enough to put the
+    // real ground between them under suspicion.
     const eles = [-958.7, 5, 6, 7, -958.7];
     expect(despike(eles, at(5))).toEqual(eles);
   });
 
   it('catches a run of bad pixels, not just the first of them', () => {
-    // A tile-edge artefact arrives as more than one sample. The reference is a median over
-    // seven samples a side, so it survives a run of three intact — a mean, or a window of
-    // three, would take its bearing from the hole and excuse all of them.
+    // A median over seven a side survives a run of three; a mean, or a window of three, would
+    // take its bearing from the hole and excuse all of them.
     const cleaned = despike([5, 6, 7, -958.7, -958.7, 9, 10, 11], at(8));
     expect(cleaned).toEqual([5, 6, 7, null, null, 9, 10, 11]);
   });
 
   it('erodes a run long enough to outvote a single reference', () => {
-    /*
-     * Kalaloch Beaches, verbatim, where its line crosses the mouth of a creek — six consecutive
-     * samples of sea floor between a beach at 5 m and a beach at 6.7 m.
-     *
-     * A run this long hides its own ends. The sample in the middle has three bad readings on
-     * one side of it, which outvotes a median over five; that reference then reports the hole
-     * as the ground, the trend between the two references clears `SPIKE_GRADE`, and the cliff
-     * gate waves the entire run through. This is the case that costs the most when it is
-     * missed — 6.4 km of phantom ascent on a walk along the sand — and the one a single pass
-     * over a five-sample window cannot see at all.
-     */
+    // Kalaloch Beaches at a creek mouth: six consecutive samples of sea floor. A run this long
+    // hides its own ends — the middle sample outvotes a median over five, that reference
+    // reports the hole as ground, and the cliff gate waves the whole run through in one pass.
     const dist = [0, 25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300];
     const eles = [5.9, 5, 5, -567.2, -1175.2, -1546.8, -2027.1, -1291.7, -556.6, 6.7, 5.7, 7, 7.5];
     expect(despike(eles, dist)).toEqual([
@@ -395,9 +349,7 @@ describe('mirrorProfile', () => {
   });
 
   it('gets the statistics a doubling would get wrong', () => {
-    // The reason this is geometry rather than arithmetic. On the way out the trail loses
-    // nothing; doubled, it still loses nothing, and the return leg's 100 m of descent
-    // vanishes from a figure the reader uses to judge their knees.
+    // Doubling loses the return leg's 100 m of descent, a figure readers judge their knees by.
     const stats = computeTrailStats(mirrorProfile(SPUR));
     const outward = computeTrailStats(SPUR);
 
@@ -405,7 +357,6 @@ describe('mirrorProfile', () => {
     expect(outward.lossM).toBe(0);
     expect(stats.lossM).toBeCloseTo(100, 0);
     expect(stats.gainM).toBeCloseTo(outward.gainM, 0);
-    // And the day is shorter than twice the climb, because half of it is now downhill.
     expect(stats.estimatedTimeS).toBeLessThan(2 * outward.estimatedTimeS);
   });
 
@@ -439,9 +390,8 @@ describe('hikedProfile', () => {
   });
 
   it('leaves an out-and-back whose stored line already retraces itself', () => {
-    // 132 trails in the catalogue are this kind: classified out-and-back *from* their own
-    // retracing, so both legs are in the geometry. Keying on the route type alone would
-    // advertise 800 m of walking to someone doing 400.
+    // 132 trails are this kind: classified out-and-back *from* their own retracing, so both
+    // legs are already in the geometry.
     const hiked = hikedProfile(SPUR, { routeType: 'out_and_back', lengthM: 400 });
     expect(hiked).toHaveLength(5);
     expect(hiked[hiked.length - 1]!.distM).toBe(400);
@@ -451,10 +401,7 @@ describe('hikedProfile', () => {
     const legs = (lengthM: number) =>
       hikedProfile(SPUR, { routeType: 'out_and_back', lengthM }).length;
 
-    // The switch is at 600 m — where 2 × 400 and 400 are equidistant from the published
-    // figure. Below it the stored line is the better match and nothing happens; above it the
-    // round trip is, and the profile is completed. Ties refuse, because doing nothing is the
-    // conservative answer.
+    // The switch is at 600 m, where 2 × 400 and 400 are equidistant. Ties refuse.
     expect(legs(599)).toBe(5);
     expect(legs(600)).toBe(5);
     expect(legs(601)).toBe(9);
@@ -486,9 +433,8 @@ describe('hikedProfile', () => {
   });
 
   it('puts the axis and the stat block on the same number', () => {
-    // The defect, stated as the assertion that would have caught it: the Llanberis Path is
-    // 5,987 m of stored geometry under a published 11,974 m, and the section drew the first
-    // figure beneath a table quoting the second.
+    // Regression: the Llanberis Path drew 5,987 m of stored geometry under a table quoting the
+    // published 11,974 m.
     const stored = profileOf(25, 240, (d) => 100 + d * 0.18);
     const publishedM = 2 * stored[stored.length - 1]!.distM;
 

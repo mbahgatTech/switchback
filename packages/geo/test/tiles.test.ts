@@ -183,12 +183,8 @@ describe('coverBBoxFromCentre', () => {
     const box: [number, number, number, number] = [-10, 35, 30, 60];
     const { quadkeys } = coverBBoxFromCentre(box, INGEST_ZOOM, 9);
 
-    /*
-     * The centre of the *tile grid*, not `lngLatToTile` of the box's mid-latitude. Mercator
-     * rows are linear in screen space and not in degrees, so on a box 25° tall those two
-     * are several tiles apart — and the grid centre is the one that means "the middle of
-     * what the user is looking at", which is what this ordering is for.
-     */
+    // The centre of the *tile grid*, not `lngLatToTile` of the box's mid-latitude: Mercator
+    // rows are linear in screen space, so on a 25°-tall box those are several tiles apart.
     const nw = lngLatToTile(box[0], box[3], INGEST_ZOOM);
     const se = lngLatToTile(box[2], box[1], INGEST_ZOOM);
     const cx = (nw.x + se.x) / 2;
@@ -214,8 +210,7 @@ describe('coverBBoxFromCentre', () => {
   });
 
   it('fills a one-row strip along its own axis rather than clipping to a square', () => {
-    // Built from a real tile's own bounds, so the strip is exactly one row tall by
-    // construction rather than by an arithmetic guess about how many degrees a z9 row spans.
+    // Built from a real tile's own bounds, so the strip is one row tall by construction.
     const [, s, , n] = tileToBBox({ x: 100, y: 184, z: INGEST_ZOOM });
     const mid = (s + n) / 2;
 
@@ -242,8 +237,8 @@ describe('coverBBoxFromCentre', () => {
   });
 
   it('does not enumerate a quarter of a million tiles for a world view', () => {
-    // z9 spans 262,144 tiles. If the candidate window were the box rather than the cap,
-    // this call would allocate all of them; the assertion is really that it returns at all.
+    // z9 spans 262,144 tiles: a candidate window sized by the box would allocate all of them,
+    // so the assertion is really that this returns at all.
     const result = coverBBoxFromCentre([-180, -85, 180, 85], INGEST_ZOOM, 96);
     expect(result.quadkeys).toHaveLength(96);
     expect(result.requiredTiles).toBe(512 * 512);

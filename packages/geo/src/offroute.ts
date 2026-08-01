@@ -2,18 +2,10 @@ import type { LngLat } from '@switchback/core';
 import { nearestPointOnLine } from './distance';
 
 /**
- * Wrong-turn detection.
- *
- * The naive version — alert whenever cross-track distance exceeds a threshold — is
- * unusable in the field. GPS under tree cover routinely throws single fixes 100 m
- * sideways, and an app that cries wolf on every one of them gets muted, which means
- * it is not there for the turn that actually matters. Worse, a muted app that then
- * fires correctly has already lost the user's trust.
- *
- * So the detector requires *persistence*: a run of consecutive fixes, spanning a
- * minimum wall-clock duration, all off-route. It also uses hysteresis — the
- * back-on-route threshold is tighter than the off-route one — so hiking the edge of
- * the corridor does not produce an alert every few seconds.
+ * Wrong-turn detection. A bare cross-track threshold is unusable in the field — GPS under canopy
+ * throws single fixes 100 m sideways — so an alert requires *persistence*: a run of consecutive
+ * off-route fixes spanning a minimum wall-clock duration, with hysteresis on the return threshold
+ * so hiking the edge of the corridor does not alert every few seconds.
  */
 
 export interface OffRouteConfig {
@@ -82,20 +74,15 @@ export interface OffRouteUpdate {
   alongM: number | null;
 }
 
-/**
- * Fold one GPS fix into the detector.
- *
- * Pure and state-in/state-out so it can be unit tested against synthetic tracks and
- * run identically on web and native without a shared runtime.
- */
+/** Fold one GPS fix into the detector. Pure state-in/state-out, so web and native agree. */
 export function updateOffRoute(
   state: OffRouteState,
   fix: Fix,
   route: readonly LngLat[],
   config: OffRouteConfig = DEFAULT_OFF_ROUTE_CONFIG,
 ): OffRouteUpdate {
-  // A fix we cannot trust is worse than no fix: acting on it produces exactly the
-  // false alarm this detector exists to avoid.
+  // A fix we cannot trust is worse than no fix: acting on it produces the false alarm this
+  // detector exists to avoid.
   if (fix.accuracyM != null && fix.accuracyM > config.maxAccuracyM) {
     return { state, shouldAlert: false, didReturn: false, distanceM: null, alongM: null };
   }
@@ -113,8 +100,7 @@ export function updateOffRoute(
     lastAlongM: alongM,
   };
 
-  // Hysteresis: leaving requires crossing the outer threshold, returning requires
-  // crossing the tighter inner one.
+  // Hysteresis: leaving crosses the outer threshold, returning crosses the tighter inner one.
   const threshold = state.isOffRoute ? config.onRouteThresholdM : config.offRouteThresholdM;
 
   if (distanceM > threshold) {

@@ -2,17 +2,12 @@ import type { ElevationPoint } from '@switchback/core';
 import { SAC_SCALES, type SacScale } from '@switchback/core';
 
 /**
- * Hiking pace, via Tobler's hiking function.
+ * Hiking pace, via Tobler's hiking function:
  *
  *     W = 6 · exp(−3.5 · |S + 0.05|)   km/h,  where S = rise/run
  *
- * The +0.05 offset encodes the real observation that people hike fastest on a gentle
- * *downhill* (about −5% grade, 6 km/h) rather than on the flat (5.04 km/h), and that
- * steep descents are slow again because they are braked.
- *
- * This matters here for one reason: it is what turns a static forecast into a useful
- * one. Knowing the summit will be −1 °C with 60 km/h gusts is only actionable
- * alongside knowing you will be standing on it at 11:20 rather than at 09:00.
+ * The +0.05 offset encodes that people hike fastest on a gentle *downhill* (−5%, 6 km/h) rather
+ * than the flat (5.04 km/h), and that steep descents are slow again because they are braked.
  *
  * @see Tobler, W. (1993). Three Presentations on Geographical Analysis and Modeling.
  */
@@ -23,9 +18,8 @@ export const TOBLER_DECAY = 3.5;
 export const TOBLER_OFFSET = 0.05;
 
 /**
- * Speed floor. Tobler decays smoothly toward zero on extreme slopes, which would make
- * a single bad DEM sample on a cliff face contribute hours to an estimate. Nobody
- * moves slower than this on ground they can still hike.
+ * Speed floor. Tobler decays smoothly toward zero on extreme slopes, so a single bad DEM sample
+ * on a cliff face would otherwise contribute hours to an estimate.
  */
 const MIN_SPEED_KMH = 0.6;
 
@@ -33,9 +27,8 @@ const MIN_SPEED_KMH = 0.6;
 export const OFF_PATH_FACTOR = 0.6;
 
 /**
- * Terrain multipliers by OSM `sac_scale`. Tobler models hiking, not scrambling; on
- * alpine ground the limiting factor stops being aerobic and starts being route-finding
- * and hand-over-hand movement, which the slope term alone will not capture.
+ * Terrain multipliers by OSM `sac_scale`. Tobler models hiking, not scrambling: on alpine ground
+ * the limiting factor is route-finding and hand-over-hand movement, not the slope term.
  */
 export const SAC_TERRAIN_FACTOR: Record<SacScale, number> = {
   hiking: 1.0,
@@ -100,14 +93,8 @@ export function terrainFactorFor(opts: {
 }
 
 /**
- * Cumulative moving time at each profile point, in seconds.
- *
- * Returned per-point rather than as a single total because the weather feature needs
- * arrival time at arbitrary positions along the trail, and recomputing the integral
- * per sample would be wasteful and inconsistent.
- *
- * Moving time only — no rest stops, no lunch, no photographs. Real elapsed time runs
- * longer, and the UI says so rather than quietly padding the number.
+ * Cumulative moving time at each profile point, seconds. Per-point rather than a total because
+ * the weather sampler needs arrival time at arbitrary positions. Moving time only — no stops.
  */
 export function cumulativeTimeS(
   profile: readonly ElevationPoint[],
@@ -143,10 +130,7 @@ export function estimateMovingTimeS(
   return cum[cum.length - 1]!;
 }
 
-/**
- * Elapsed seconds at a given distance along the trail, interpolating between profile
- * points. This is the lookup the weather sampler uses.
- */
+/** Elapsed seconds at a distance along the trail, interpolated between profile points. */
 export function timeAtDistanceS(
   profile: readonly ElevationPoint[],
   cumTimeS: readonly number[],

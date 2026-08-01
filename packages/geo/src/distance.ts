@@ -6,12 +6,9 @@ export const EARTH_RADIUS_M = 6_371_008.8;
 const DEG = Math.PI / 180;
 
 /**
- * Great-circle distance in metres.
- *
- * Haversine rather than the spheroidal Vincenty: at trail scales the ellipsoidal
- * correction is well under 0.5%, far below the error already present in OSM geometry
- * and DEM sampling, and haversine is numerically stable for the short segments that
- * dominate a resampled trail.
+ * Great-circle distance in metres. Haversine rather than Vincenty: at trail scales the
+ * ellipsoidal correction is under 0.5%, well below the error already in OSM geometry and DEM
+ * sampling, and haversine is numerically stable for short segments.
  */
 export function haversineM(a: LngLat, b: LngLat): number {
   const [lng1, lat1] = a;
@@ -36,23 +33,16 @@ export function bearingDeg(a: LngLat, b: LngLat): number {
 }
 
 /**
- * The eight points of the compass, in bearing order from north.
- *
- * Eight rather than sixteen on purpose. A bearing is only ever shown here alongside a
- * distance from somewhere approximate — the reader's town, an IP lookup, a GPS fix taken
- * indoors — and "NNW" claims a precision the origin does not have. Eight points is the
- * resolution a person can actually act on: up the valley, back toward the coast.
+ * The eight points of the compass, in bearing order from north. Eight rather than sixteen:
+ * a bearing here is always from an approximate origin, and "NNW" claims precision it lacks.
  */
 const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'] as const;
 
 export type CompassPoint = (typeof COMPASS)[number];
 
 /**
- * A bearing as a compass point, the way a signpost writes it.
- *
- * Each point owns 45° centred on its own direction, so north is 337.5°–22.5° and not
- * 0°–45° — the off-by-half-a-sector version of this is the classic bug, and it puts a
- * trail due east of you in the northeast column.
+ * A bearing as a compass point. Each point owns 45° *centred* on its own direction, so north is
+ * 337.5°–22.5° — the off-by-half-a-sector version puts a trail due east in the northeast column.
  */
 export function compassPoint(deg: number): CompassPoint {
   if (!Number.isFinite(deg)) return 'N';
@@ -70,8 +60,8 @@ export function lineLengthM(coords: readonly LngLat[]): number {
 }
 
 /**
- * Cumulative distance at each vertex. `result[0]` is always 0 and `result.length`
- * equals `coords.length`, which lets callers index profile and geometry in lockstep.
+ * Cumulative distance at each vertex. `result[0]` is 0 and the length matches `coords`, so
+ * callers can index profile and geometry in lockstep.
  */
 export function cumulativeDistancesM(coords: readonly LngLat[]): number[] {
   const out = new Array<number>(coords.length);
@@ -112,10 +102,8 @@ export function padBBox(bbox: BBox, metres: number): BBox {
 }
 
 /**
- * Local tangent-plane projection: longitude/latitude degrees to metres, relative to
- * an origin. Segment-level geometry (nearest point, cross-track distance) is done in
- * this flat space because the error over a few hundred metres is negligible and the
- * maths is exact rather than approximate.
+ * Local tangent-plane projection: degrees to metres relative to an origin. Segment-level geometry
+ * is done in this flat space because the error over a few hundred metres is negligible.
  */
 function toLocalM(p: LngLat, origin: LngLat): [number, number] {
   const cos = Math.cos(origin[1] * DEG);
@@ -158,11 +146,9 @@ export interface NearestOnLine extends NearestOnSegment {
 }
 
 /**
- * Nearest point on a polyline. This is the primitive behind wrong-turn alerts
- * (`distM` is cross-track error) and behind "you are 4.2 km in" (`alongM`).
- *
- * Linear in vertex count. Callers tracking a live GPS feed should pass a windowed
- * slice around the last known position rather than the whole trail on every fix.
+ * Nearest point on a polyline — `distM` is cross-track error, `alongM` is progress along it.
+ * Linear in vertex count: callers tracking a live GPS feed should pass a windowed slice around
+ * the last known position rather than the whole trail on every fix.
  */
 export function nearestPointOnLine(p: LngLat, coords: readonly LngLat[]): NearestOnLine {
   if (coords.length === 0) throw new Error('nearestPointOnLine: empty line');

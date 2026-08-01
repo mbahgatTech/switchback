@@ -1,14 +1,6 @@
 /**
- * Terrarium terrain-tile elevation decoding.
- *
- * Elevation comes from AWS's public Terrain Tiles (Mapzen/Tilezen `terrarium` format)
- * rather than a hosted elevation API. The reason is rate limits: a hosted elevation
- * endpoint caps at a few thousand calls a day, and a single 20 km trail resampled at
- * 25 m is 800 points. Terrain tiles are plain PNGs on S3 with no quota, and one z13
- * tile answers hundreds of samples at once.
- *
- * The encoding packs metres into RGB with a 32768 m offset so below-sea-level terrain
- * survives:
+ * Terrarium terrain-tile elevation decoding. AWS Terrain Tiles rather than a hosted elevation
+ * API, because one z13 PNG answers hundreds of samples with no quota:
  *
  *     elevation_m = (R * 256 + G + B / 256) - 32768
  *
@@ -76,15 +68,9 @@ function elevationAtPixel(tile: TerrariumTile, px: number, py: number): number {
 }
 
 /**
- * Bilinearly interpolated elevation at a sub-pixel position.
- *
- * Nearest-neighbour sampling produces a visible staircase in the elevation profile
- * and, worse, inflates computed gain — each step across a pixel boundary registers as
- * a real climb. Interpolating removes both artefacts.
- *
- * Samples that touch a no-data pixel fall back to nearest-neighbour rather than
- * blending -32768 into the result, which would otherwise drag a coastal trail's
- * elevation to nonsense.
+ * Bilinearly interpolated elevation at a sub-pixel position. Nearest-neighbour staircases the
+ * profile and inflates gain — each pixel-boundary step registers as a real climb. Samples
+ * touching a no-data pixel fall back to nearest-neighbour rather than blending in -32768.
  */
 export function sampleTileBilinear(tile: TerrariumTile, px: number, py: number): number {
   const x0 = Math.floor(px - 0.5);
@@ -122,12 +108,9 @@ export function terrariumUrl(z: number, x: number, y: number): string {
 }
 
 /**
- * Sample many coordinates against an already-loaded tile set, keyed by `tileKey`.
- * Separating the sampling from the fetching keeps this module pure and testable;
- * `@switchback/ingest` owns the network and the cache.
- *
- * Returns `null` for coordinates whose tile is missing, so the caller can decide
- * between refetching and interpolating across the gap.
+ * Sample coordinates against an already-loaded tile set keyed by `tileKey`; `@switchback/ingest`
+ * owns the network. Returns null where the tile is missing, so the caller chooses between
+ * refetching and interpolating across the gap.
  */
 export function sampleElevations(
   coords: ReadonlyArray<readonly [number, number]>,

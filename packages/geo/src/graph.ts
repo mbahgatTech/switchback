@@ -8,49 +8,21 @@ import {
 } from './tobler';
 
 /**
- * The walkable network, as a graph you can search.
+ * The walkable network as a searchable graph, built identically on server and browser so
+ * dragging a waypoint re-routes without a round trip.
  *
- * Two decisions shape everything below, and both are worth stating because the obvious
- * alternatives are what most routing code does.
- *
- * **Every vertex is a node.** The textbook routing graph contracts chains — a way of
- * fifty vertices between two junctions becomes one edge carrying fifty coordinates. That
- * is the right trade when edges are long and you never need to stop partway along one.
- * Here the opposite holds: a hiker drops a pin in the middle of a ridge, and a graph
- * whose nearest node is four hundred metres away at the next junction would silently move
- * their route. Keeping every vertex costs perhaps five times the nodes — tens of
- * thousands, which a modern engine searches in single-digit milliseconds — and buys
- * snapping accurate to the resolution OSM was drawn at. It also deletes an entire class of
- * bug: there is no per-edge polyline to keep in step with the node it hangs off.
- *
- * **Nodes match on exact coordinates.** Two ways join if and only if they share an OSM
- * node, and a shared node arrives from Overpass as bit-identical coordinates in both ways.
- * Snapping to a tolerance would be strictly worse, not merely unnecessary: a footbridge
- * and the path beneath it pass within a metre of each other and must not connect, and a
+ * Two deliberate departures from textbook routing. Every vertex is a node rather than
+ * contracting chains between junctions, so a pin dropped mid-ridge snaps to OSM's own
+ * resolution instead of the next junction 400 m away. And nodes match on exact coordinates,
+ * never a tolerance: a footbridge and the path beneath it pass within a metre, and a
  * two-metre quantum would weld them together and route someone off a bridge.
- *
- * The graph is built on whichever side needs it — the browser rebuilds it from the
- * segments the server sends, so dragging a waypoint re-routes without a round trip, and
- * the server builds the same structure from the same function when it plans on behalf of
- * a client that cannot.
  */
 
-// ---------------------------------------------------------------------------
-// Cost model
-// ---------------------------------------------------------------------------
-
 /**
- * How much a hiker would rather be on this than on something else, as a multiplier on
- * time. Always ≥ 1: it can make a way less attractive, never faster.
- *
- * Without it the router paves everything. Tobler says a hiker moves at 6 km/h on tarmac
- * and about 5.7 on dirt, so pure fastest-path down a lane beats the parallel path through
- * the trees every single time — technically correct and completely useless, because
- * nobody drives to a national park to hike along the road. The penalty encodes the thing
- * the clock cannot: that the path *is the point*.
- *
- * Being a multiplier on cost rather than a subtraction from speed is what keeps the A*
- * heuristic admissible — see `heuristicS`.
+ * How much a hiker would rather be on this than something else, as a multiplier on time.
+ * Always ≥ 1, and a multiplier rather than a speed subtraction so the A* heuristic stays
+ * admissible (see `heuristicS`). Without it the router paves everything: Tobler makes tarmac
+ * faster than dirt, so pure fastest-path beats the parallel path through the trees every time.
  */
 export const KIND_PENALTY: Record<PathKind, number> = {
   path: 1,
@@ -64,23 +36,15 @@ export const KIND_PENALTY: Record<PathKind, number> = {
 };
 
 /**
- * The fastest anyone can move on any edge, km/h — Tobler's peak times the most generous
- * surface multiplier we hold.
- *
- * Derived from the tables rather than written down, because a hard-coded 6.3 would
- * silently stop being an upper bound the day someone adds a surface faster than tarmac,
- * and an inadmissible heuristic does not throw — it just quietly returns a route that
- * is not the best one.
+ * The fastest anyone can move on any edge, km/h. Derived from the tables, not written down: a
+ * hard-coded bound stops bounding the day a faster surface is added, and an inadmissible
+ * heuristic does not throw — it quietly returns a route that is not the best one.
  */
 export const MAX_HIKE_SPEED_KMH =
   TOBLER_BASE_KMH * Math.max(1, ...Object.values(SURFACE_TERRAIN_FACTOR));
 
 /** Snapping beyond this is a miss, not a snap. Roughly how far off a path you can stand. */
 export const DEFAULT_SNAP_RADIUS_M = 120;
-
-// ---------------------------------------------------------------------------
-// Structure
-// ---------------------------------------------------------------------------
 
 /** The provenance and cost character of one OSM way, shared by all edges cut from it. */
 export interface GraphWay {
@@ -94,12 +58,9 @@ export interface GraphWay {
 }
 
 /**
- * Typed arrays throughout, and adjacency in compressed-sparse-row form.
- *
- * A county-sized graph is a few hundred thousand edges. As arrays of objects that is tens
- * of megabytes of pointer-chasing and a garbage collector pause in the middle of a drag;
- * as six flat buffers it is a couple of megabytes with every inner-loop read contiguous.
- * The structure is private to this module — nothing outside it indexes these directly.
+ * Typed arrays with adjacency in compressed-sparse-row form: a county-sized graph is a few
+ * hundred thousand edges, which as objects is tens of megabytes and a GC pause mid-drag.
+ * Private to this module — nothing outside indexes these directly.
  */
 export interface RouteGraph {
   /** Node positions, flattened `[lng, lat, …]`. */
@@ -121,39 +82,23 @@ export interface RouteGraph {
 }
 
 /**
- * The position of a node.
- *
- * `!` on every typed-array read throughout this module, here and below. Reading a
- * `Float64Array` in range cannot yield undefined, but `noUncheckedIndexedAccess` cannot
- * distinguish a typed array from a sparse one and types it as such. The assertion states
- * the fact the checker is missing; the alternative is a bounds test in the inner loop of
- * a search, which is a real cost paid to reassure a checker about something guaranteed by
- * the buffer's own length.
+ * The position of a node. `!` on every typed-array read throughout this module:
+ * `noUncheckedIndexedAccess` cannot tell a typed array from a sparse one, and the alternative
+ * is a bounds test in a search's inner loop for something the buffer's length guarantees.
  */
 export function graphNodeAt(graph: RouteGraph, node: number): LngLat {
   return [graph.coords[node * 2]!, graph.coords[node * 2 + 1]!];
 }
 
-/**
- * The same key `assemble.ts` joins ways on, and for the same reason: seven decimals is
- * the precision OSM stores, so this is exact identity rather than a tolerance.
- */
+/** The same key `assemble.ts` joins ways on: seven decimals is the precision OSM stores. */
 function nodeKey(lng: number, lat: number): string {
   return `${lng.toFixed(7)},${lat.toFixed(7)}`;
 }
 
-// ---------------------------------------------------------------------------
-// Building
-// ---------------------------------------------------------------------------
-
 /**
- * Segments in, searchable graph out.
- *
- * Duplicate edges are dropped, which matters more than it sounds: a way that straddles
- * two routing tiles is cached under both, so the overlapping stretch arrives twice. Both
- * copies carry the same OSM node coordinates, so both produce the same node pair, and the
- * second is discarded. This is why partial runs can be stored per tile without any
- * merging step — the graph builder is where they are reconciled.
+ * Segments in, searchable graph out. Duplicate edges are dropped, which is what lets partial
+ * runs be cached per routing tile with no merging step: a way straddling two tiles arrives
+ * twice with identical OSM coordinates, so the second copy produces the same node pairs.
  */
 export function buildGraph(segments: readonly PathSegment[]): RouteGraph {
   const index = new Map<string, number>();
@@ -199,8 +144,8 @@ export function buildGraph(segments: readonly PathSegment[]): RouteGraph {
       const node = nodeFor(segment.coords[i * 2]!, segment.coords[i * 2 + 1]!, segment.eleM[i]!);
       if (node === prev) continue;
 
-      // Pairing on the ordered node pair gives one integer per undirected edge, so
-      // deduplication is a Set of numbers rather than of concatenated strings.
+      // Pairing on the ordered node pair gives one integer per undirected edge, so dedup is a
+      // Set of numbers rather than of concatenated strings.
       const lo = Math.min(prev, node);
       const hi = Math.max(prev, node);
       const key = lo * 4_294_967_296 + hi;
@@ -215,9 +160,8 @@ export function buildGraph(segments: readonly PathSegment[]): RouteGraph {
       prev = node;
     }
 
-    // Every edge this run would have added was already present — the run is the overlap
-    // between two routing tiles that both cached the same way. Drop the way record too,
-    // or a well-travelled boundary accumulates thousands of unreferenced ones.
+    // Every edge was already present: the run is a tile overlap. Drop the way record too, or a
+    // well-travelled boundary accumulates thousands of unreferenced ones.
     if (!contributed) ways.pop();
   }
 
@@ -275,10 +219,6 @@ export function buildGraph(segments: readonly PathSegment[]): RouteGraph {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Snapping
-// ---------------------------------------------------------------------------
-
 export interface SnapResult {
   node: number;
   point: LngLat;
@@ -287,13 +227,9 @@ export interface SnapResult {
 }
 
 /**
- * The node nearest a clicked point, or null if the click was nowhere near a path.
- *
- * Linear over the node array, which sounds careless and is not: a viewport-sized graph is
- * tens of thousands of nodes, the loop body is two array reads and an equirectangular
- * approximation, and it runs once per click. A spatial index would be faster and would
- * also be a second structure to build, keep in step, and get wrong. If planning ever
- * spans a whole country this is the first thing to change.
+ * The node nearest a clicked point, or null if the click was nowhere near a path. Linear over
+ * the node array: a viewport-sized graph is tens of thousands of nodes and this runs once per
+ * click. If planning ever spans a whole country, a spatial index is the first thing to add.
  */
 export function snapToGraph(
   graph: RouteGraph,
@@ -302,9 +238,8 @@ export function snapToGraph(
 ): SnapResult | null {
   if (graph.nodeCount === 0) return null;
 
-  // Compare in a locally-flat plane scaled by cos(lat): monotonic in true distance, so it
-  // picks the same winner as haversine at a fraction of the cost. The winner alone is then
-  // measured properly, because the caller sees that number.
+  // Compare in a locally-flat plane scaled by cos(lat): monotonic in true distance, so it picks
+  // the same winner as haversine. The winner alone is then measured properly.
   const [lng, lat] = point;
   const kx = Math.cos((lat * Math.PI) / 180);
 
@@ -326,18 +261,10 @@ export function snapToGraph(
   return distanceM > maxDistanceM ? null : { node: best, point: at, distanceM };
 }
 
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
-
 /**
- * What to optimise for.
- *
- * Deliberately not extending `PaceOptions`. A pace factor and a global terrain override
- * both scale every edge by the same constant, so they cannot change which route is
- * cheapest — they would be carried through the whole search to arrive at the identical
- * answer. Pace belongs where the totals are computed, on the finished line, via
- * `estimateMovingTimeS`.
+ * What to optimise for. Deliberately not extending `PaceOptions`: a pace factor and a global
+ * terrain override scale every edge by the same constant, so they cannot change which route is
+ * cheapest. Pace belongs on the finished line, via `estimateMovingTimeS`.
  */
 export interface RouteCostOptions {
   /**
@@ -365,12 +292,9 @@ function edgeSeconds(
 }
 
 /**
- * Straight-line seconds to the goal at the fastest speed anything can be hiked.
- *
- * Admissible by construction. Great-circle distance never exceeds the along-ground
- * distance of any real route between the same two points, `MAX_HIKE_SPEED_KMH` is an upper
- * bound over every edge's Tobler-times-terrain speed, and every penalty is ≥ 1 — so this
- * can never over-estimate, and A* returns the true optimum rather than something close.
+ * Straight-line seconds to the goal at the fastest speed anything can be hiked. Admissible by
+ * construction: great-circle distance never exceeds along-ground distance, `MAX_HIKE_SPEED_KMH`
+ * bounds every edge's Tobler-times-terrain speed, and every penalty is ≥ 1.
  */
 function heuristicS(graph: RouteGraph, node: number, goal: LngLat): number {
   const metres = haversineM(graphNodeAt(graph, node), goal);
@@ -378,11 +302,8 @@ function heuristicS(graph: RouteGraph, node: number, goal: LngLat): number {
 }
 
 /**
- * A binary min-heap keyed by f-score.
- *
- * Written out rather than reached for because the alternative in a dependency-light
- * package is sorting an array on every push, which turns an O(E log V) search into
- * something quadratic and shows up as a stutter the moment a route crosses a town.
+ * A binary min-heap keyed by f-score. Written out because the alternative in a dependency-light
+ * package is re-sorting an array on every push, which makes an O(E log V) search quadratic.
  */
 class MinHeap {
   private readonly items: number[] = [];
@@ -441,12 +362,9 @@ export interface GraphPath {
 }
 
 /**
- * A* from one node to another, minimising hiking time.
- *
- * Returns null when the two are in different components of the network — which is a real
- * and common answer, not a failure. Two valleys with no path between them are two valleys
- * with no path between them, and the planner says so and offers to draw the leg freehand
- * rather than inventing a link.
+ * A* from one node to another, minimising hiking time. Null means the two are in different
+ * components — a real answer, not a failure; the planner offers a freehand leg rather than
+ * inventing a link.
  */
 export function findPath(
   graph: RouteGraph,
@@ -500,13 +418,10 @@ export function findPath(
 }
 
 /**
- * The path as ground: coordinates and elevations, ready to become a profile.
- *
- * Note what is *not* here — length, gain, time. Those come from `profileFromLine` and
- * `estimateMovingTimeS`, the same functions the trail pipeline uses, so a planned route
- * and an ingested trail of identical shape report identical numbers. A planner that
- * computed its own totals would drift from the catalogue, and the drift would show up as
- * "the app says 8.1 km here and 8.3 km there" long before anyone found the cause.
+ * The path as ground: coordinates and elevations, ready to become a profile. Deliberately no
+ * length, gain or time — those come from `profileFromLine` and `estimateMovingTimeS`, the same
+ * functions the trail pipeline uses, so a planned route and an ingested trail of identical
+ * shape report identical numbers.
  */
 export function pathGeometry(
   graph: RouteGraph,

@@ -9,11 +9,8 @@ import {
 } from '@switchback/geo';
 
 /**
- * A padded grid whose elevation is a function of its position in the *tile*, so a fixture
- * says what the ground does rather than what the array index is.
- *
- * `at` is called with coordinates running from -1 to `size`, the padding included: the ring
- * is real neighbouring ground here, exactly as it is when the protocol assembles nine tiles.
+ * A padded grid whose elevation is a function of its position in the *tile*. `at` is called with
+ * coordinates from -1 to `size`, padding included, as when the protocol assembles nine tiles.
  */
 function padded(size: number, at: (x: number, y: number) => number): Float32Array {
   const stride = size + 2;
@@ -28,15 +25,13 @@ function padded(size: number, at: (x: number, y: number) => number): Float32Arra
 
 describe('groundResolutionM', () => {
   it('gives the standard Web Mercator figure at the equator', () => {
-    // The number every tile-scheme table opens with: one z0 tile spans the world, so a pixel
-    // of it is 1/256th of the equator.
+    // One z0 tile spans the world, so a pixel of it is 1/256th of the equator.
     expect(groundResolutionM(0, 0)).toBeCloseTo(156_543.034, 2);
     expect(groundResolutionM(13, 0)).toBeCloseTo(19.109, 3);
   });
 
   it('halves at 60 degrees, where the meridians have closed by half', () => {
-    // Mercator's scale factor is 1/cos(lat). Getting this wrong scales every angle the
-    // overlay reports, which is why it is measured rather than assumed constant.
+    // Mercator's scale factor is 1/cos(lat); getting it wrong scales every reported angle.
     expect(groundResolutionM(13, 60)).toBeCloseTo(groundResolutionM(13, 0) / 2, 3);
     expect(groundResolutionM(13, -60)).toBeCloseTo(groundResolutionM(13, 60), 6);
   });
@@ -83,8 +78,8 @@ describe('slopeDegrees', () => {
       size,
       1,
     );
-    // A 45° plane facing north-east: the rise is spread over a diagonal step, so the run per
-    // axis is 1/√2. A naive `max(dzdx, dzdy)` would call this 35°.
+    // A 45° plane facing north-east: run per axis is 1/√2, and a naive `max(dzdx, dzdy)`
+    // would call this 35°.
     const diagonal = slopeDegrees(
       padded(size, (x, y) => (x + y) / Math.SQRT2),
       size,
@@ -126,8 +121,8 @@ describe('slopeDegrees', () => {
     grid[0] = NO_DATA_ELEVATION;
 
     const degrees = slopeDegrees(grid, size, 1);
-    // Only the pixel whose kernel reaches it is blanked — a -32768 in the window would put a
-    // 32 km cliff on the map, and blanking the whole tile would hide a real coastline.
+    // Only the pixel whose kernel reaches it is blanked: a -32768 in the window is a 32 km
+    // cliff, and blanking the whole tile hides a real coastline.
     expect(degrees[0]).toBe(0);
     expect(degrees[1]).toBeCloseTo(45, 6);
     expect(degrees[size]).toBeCloseTo(45, 6);
@@ -155,8 +150,7 @@ describe('shadeSlope', () => {
   const bandFor = (angle: number): number => shadeSlope(Float32Array.of(angle), bands)[0]!;
 
   it('leaves gentle ground unpainted', () => {
-    // Fully transparent, not faintly tinted: most of any map is gentle, and shading all of it
-    // would make the overlay a filter over the sheet rather than a reading off it.
+    // Fully transparent, not faintly tinted: most of any map is gentle ground.
     expect(alphaFor(0)).toBe(0);
     expect(alphaFor(26.9)).toBe(0);
   });
@@ -174,8 +168,7 @@ describe('shadeSlope', () => {
   });
 
   it('gets denser with every step up', () => {
-    // The property that carries the ramp when the hue does not — greyscale, a colour-blind
-    // reader, a phone in bright sun.
+    // The property carrying the ramp when hue does not: greyscale, colour blindness, sunlight.
     const alphas = [27, 35, 50].map(alphaFor);
     expect(alphas).toEqual([...alphas].sort((a, b) => a - b));
     expect(new Set(alphas).size).toBe(3);

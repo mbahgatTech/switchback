@@ -97,8 +97,8 @@ describe('simplifyLine', () => {
   });
 
   it('stays fast on the worst input there is — a jittery recorded track', () => {
-    // Six hours of 1 Hz recording with GPS jitter either side of the line: nothing can
-    // be pruned, so RDP does its full O(n²) work. This must not take tens of seconds.
+    // Six hours of 1 Hz jitter either side of the line: nothing prunes, so RDP does its full
+    // O(n²) work and must not take tens of seconds.
     const start: LngLat = [0, 45];
     const jittery = Array.from({ length: 20_000 }, (_, i) =>
       offset(start, i * 5, i % 2 === 0 ? 0 : 30),

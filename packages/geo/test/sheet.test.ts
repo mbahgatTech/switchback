@@ -25,15 +25,9 @@ import {
 } from '@switchback/geo';
 
 /**
- * The thing worth protecting here is that the number printed in the collar is true.
- *
- * A sheet claiming 1:25 000 is a claim the reader can check with a ruler, and it degrades
- * worse than anything else in this product when it is slightly wrong: a bearing measured off
- * a sheet whose scale is out hikes somebody into the wrong valley, and nothing on the paper
- * shows that it happened. So the load-bearing assertions below invert the whole chain
- * independently — millimetres of paper back to metres of ground, by formulas written out
- * differently from the ones in the module — rather than agreeing with the module's own
- * arithmetic.
+ * The number printed in the collar is a claim the reader can check with a ruler, so the
+ * load-bearing assertions invert the whole chain independently — millimetres of paper back to
+ * metres of ground, by formulas written out differently from the module's.
  */
 
 /** The map face on a landscape A4 sheet, roughly what the print route lays out. */
@@ -54,9 +48,7 @@ function frameAt(denominator: number, face: SheetSizeMm = FACE): SheetFrame {
 
 describe('sheetMetresPerPx', () => {
   it('turns a ratio into ground metres per CSS pixel', () => {
-    // A CSS pixel is a 96th of an inch by definition, so at 1:25 000 it covers 25 000 ×
-    // 0.2646 mm of ground — 6.61 m. Get this wrong and every printed distance is wrong by
-    // the same factor, silently, because the map still looks exactly like a map.
+    // A CSS pixel is a 96th of an inch, so at 1:25 000 it covers 6.61 m of ground.
     expect(sheetMetresPerPx(25_000)).toBeCloseTo((25_000 * 25.4) / 96 / 1_000, 9);
     expect(sheetMetresPerPx(25_000)).toBeCloseTo(6.614_583, 5);
     expect(MM_PER_CSS_PX).toBeCloseTo(0.264_583_333, 9);
@@ -79,8 +71,7 @@ describe('sheetZoom', () => {
   });
 
   it('pulls back nearer the poles, where a Mercator pixel covers less ground', () => {
-    // The same printed ratio needs a smaller zoom number further north, because the
-    // projection has already magnified the ground. A sheet ignoring this is out by a third at
+    // The same ratio needs a smaller zoom further north: ignoring this is out by a third at
     // Scottish latitudes and by half in Iceland.
     expect(sheetZoom(25_000, 60)).toBeLessThan(sheetZoom(25_000, 0));
     expect(sheetZoom(25_000, 60)).toBeCloseTo(
@@ -108,9 +99,8 @@ describe('sheetPointMm', () => {
   });
 
   it('places a kilometre of ground at the millimetres the ratio promises', () => {
-    // Due east of the centre by 1 km, offset using the length of a degree of longitude rather
-    // than anything the module knows. At 1:25 000 it must land exactly 40 mm right of the
-    // middle — precisely the claim the collar makes, in the one form a ruler can check.
+    // 1 km due east, offset using a degree of longitude rather than anything the module
+    // knows: at 1:25 000 it must land exactly 40 mm right of the middle.
     const east: [number, number] = [ASSINIBOINE[0] + 1_000 / M_PER_DEG_LNG, ASSINIBOINE[1]];
     expect(sheetPointMm(east, frameAt(25_000))[0] - FACE.widthMm / 2).toBeCloseTo(40, 6);
     // And the same kilometre is 20 mm on a sheet at half the scale.
@@ -132,9 +122,8 @@ describe('sheetPointMm', () => {
   });
 
   it('lets a route run off the sheet rather than clamping it to the neatline', () => {
-    // A clamped point draws the trail along the edge of the map, which reads as a path
-    // following the border of the page — the one line on a sheet that is definitely not
-    // terrain. Off the paper is the honest answer, and the caller can then say so out loud.
+    // A clamped point draws the trail along the neatline, which is the one line on a sheet
+    // that is definitely not terrain.
     const [x] = sheetPointMm([ASSINIBOINE[0] + 2, ASSINIBOINE[1]], frameAt(25_000));
     expect(x).toBeGreaterThan(FACE.widthMm);
   });
@@ -158,8 +147,7 @@ describe('sheetBBox and sheetCoverageM', () => {
 
     const [west, south, east, north] = sheetBBox(frame);
     expect((east - west) * M_PER_DEG_LNG).toBeCloseTo(widthM, 3);
-    // Latitude is the loose one: Mercator's scale changes across the face, so the north–south
-    // ground span only equals the nominal coverage at the centre. Out by centimetres here.
+    // Mercator scale changes across the face, so north–south only matches at the centre.
     expect(((north - south) * 40_075_016.686) / 360).toBeCloseTo(heightM, 0);
   });
 
@@ -181,9 +169,8 @@ describe('sheetCentre', () => {
     ((2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180) / Math.PI;
 
   it('takes the projected middle, not the average of two latitudes', () => {
-    // A box from 45° to 55° has its paper midpoint above 50°, because Mercator spaces the
-    // northern degrees further apart. Averaging gives 50.0 and puts a fitted route a few
-    // millimetres high on the sheet — enough to clip one edge while leaving white at the other.
+    // A box from 45° to 55° has its paper midpoint above 50°; averaging gives 50.0 and clips
+    // one edge of a fitted route while leaving white at the other.
     const centre = sheetCentre([-1, 45, 1, 55]);
     expect(centre[0]).toBeCloseTo(0, 9);
     expect(centre[1]).toBeCloseTo(isoLat((isoY(45) + isoY(55)) / 2), 9);
@@ -207,8 +194,7 @@ describe('fitSheetScale', () => {
   }
 
   it('picks the largest scale on the ladder that still holds the route', () => {
-    // A route just inside what 1:25 000 covers must come back as 1:25 000: one rung finer and
-    // it would not fit, and any coarser is detail thrown away for nothing.
+    // One rung finer would not fit; any coarser throws detail away for nothing.
     expect(fitSheetScale(bboxCovering(24_900), FACE)).toBe(25_000);
     expect(fitSheetScale(bboxCovering(14_900), FACE)).toBe(15_000);
     // A hair too big for 15 000 steps down to the next rung, not to a made-up ratio.
@@ -229,9 +215,7 @@ describe('fitSheetScale', () => {
   });
 
   it('falls through to the coarsest rung for a route that does not go on a page', () => {
-    // The Pacific Crest Trail is 4,265 km of this database and there is no honest sheet for
-    // it. The caller is expected to notice via `sheetFits` and say so, rather than print a
-    // ratio that is a lie.
+    // No honest sheet exists for the 4,265 km PCT; the caller notices via `sheetFits`.
     const pct: BBox = [-121, 32.6, -116.4, 49];
     const denominator = fitSheetScale(pct, FACE);
     expect(denominator).toBe(SHEET_SCALES[SHEET_SCALES.length - 1]);
@@ -247,8 +231,7 @@ describe('fitSheetScale', () => {
 
 describe('sheetBarScale', () => {
   it('spans a round number of metres, never a fitted one', () => {
-    // 60 mm at 1:25 000 is 1.5 km of ground, and 1.5 km is not a distance anyone divides by
-    // eye. The bar is 1 km and stops short of the space available.
+    // 60 mm at 1:25 000 is 1.5 km, which no eye divides; the bar is 1 km and stops short.
     expect(sheetBarScale(25_000, 60)).toEqual({ groundM: 1_000, lengthMm: 40, rungs: 4 });
     expect(sheetBarScale(50_000, 60)).toEqual({ groundM: 2_000, lengthMm: 40, rungs: 4 });
     expect(sheetBarScale(100_000, 60)).toEqual({ groundM: 5_000, lengthMm: 50, rungs: 5 });
@@ -297,8 +280,7 @@ describe('sheetGraticule', () => {
     const coarse = sheetGraticule(frameAt(100_000)).intervalDeg;
     const fine = sheetGraticule(frameAt(10_000)).intervalDeg;
     expect(fine).toBeLessThan(coarse);
-    // Every rung divides its neighbour, so the finer sheet's lines include the coarser's and
-    // a reader stepping between two scales is not re-learning the frame.
+    // Every rung divides its neighbour, so the finer sheet's lines include the coarser's.
     expect(Math.round((coarse / fine) * 1e6) % 1e6).toBe(0);
   });
 
@@ -330,11 +312,8 @@ describe('sheetGraticule', () => {
   });
 
   it('drops a rung rather than leaving the short axis unruled', () => {
-    /*
-     * A 260 × 150 mm face at 1:40 000 covers 8′53″ of longitude and 3′14″ of latitude, so the
-     * 5′ interval the wider axis asks for does not fit between the top and bottom of the sheet
-     * at all. Sized off the wide axis alone, this sheet prints meridians and no parallels.
-     */
+    // A 260 × 150 mm face at 1:40 000 covers 8′53″ of longitude and 3′14″ of latitude, so the
+    // 5′ interval the wide axis asks for prints meridians and no parallels.
     const frame = frameAt(40_000);
     const { intervalDeg, meridians, parallels } = sheetGraticule(frame);
     expect(intervalDeg).toBeCloseTo(2 / 60, 9);

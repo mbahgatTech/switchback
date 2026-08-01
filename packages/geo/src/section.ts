@@ -7,27 +7,10 @@ import {
 import { cumulativeTimeS, timeAtDistanceS, type PaceOptions } from './tobler';
 
 /**
- * The section: an elevation profile projected onto a drawing.
- *
- * The section is the product's signature graphic and it is drawn twice — as SVG in the
- * browser and as `react-native-svg` on the phone. This module is why those two are one
- * graphic rather than two that resemble each other: every number either renderer plots
- * comes from here, down to the `d` attribute of the hatched mass.
- *
- * **Why it lives in `@switchback/geo` and not in `@switchback/ui`.** Nearly all of it is
- * the elevation profile in a different coordinate system — downsampling that keeps the
- * summit, an elapsed-time axis that has to agree with `cumulativeTimeS` to the second,
- * interpolation between 25 m samples. That maths belongs beside the maths it calls. The
- * tokens package is deliberately dependency-free and could not import `cumulativeTimeS`
- * without giving that up.
- *
- * **Why SVG strings.** A path `d` is a geometry serialisation that both renderers accept
- * verbatim, so producing it here is what stops the two from re-deriving the same curve
- * with subtly different rounding. Nothing about colour, type or layout is decided here;
- * the plot rectangle is passed in, because a 1000-unit-wide sheet and a phone screen want
- * different padding and different label sizes.
- *
- * Everything in this file is pure.
+ * The section: an elevation profile projected onto a drawing, down to the SVG path `d`, so the
+ * web and React Native renderers plot one graphic rather than two that resemble each other.
+ * Lives here rather than in `@switchback/ui` because it needs `cumulativeTimeS`, which the
+ * deliberately dependency-free tokens package cannot import. Everything in this file is pure.
  */
 
 /** One plotted sample. Distance along the trail, height above sea level. */
@@ -80,27 +63,18 @@ export interface SectionScale {
 }
 
 /**
- * How many samples the section is drawn from by default.
- *
- * The stored profile is sampled every 25 m, so a 20 km trail arrives as 800 points. Drawing
- * all of them is not the problem; the hatching is. Each change of grade band opens a new
- * path, and at 25 m spacing DEM noise flips the band constantly — a gentle valley path can
- * produce two hundred alternating fills that read as static rather than as terrain.
- * Downsampling to roughly this many points puts the effective grade window at 50–100 m,
- * which is the same window `maxSustainedGrade` uses and the same one a hiker feels.
+ * Samples the section is drawn from by default. Not a cost limit — the hatching is: each change
+ * of grade band opens a new path, and at the stored 25 m spacing DEM noise flips the band into
+ * static. This puts the effective grade window at 50–100 m, the same one `maxSustainedGrade` uses.
  */
 export const SECTION_DISPLAY_POINTS = 220;
 
 /**
- * Elevation gridline steps, **in the reader's own unit of height**. First one that yields
- * ≤5 lines wins.
+ * Elevation gridline steps, in the reader's own unit of height. First one yielding ≤5 lines wins.
  *
- * Two ladders rather than one converted ladder, because a round number of metres is not a
- * round number of feet. Relabelling a 500 m rung in imperial gives gridlines at 1,640 ft and
- * 3,281 ft — evenly spaced, correctly converted, and useless, because the whole job of a
- * gridline is to be a number you can subtract from another number in your head. The step is
- * therefore chosen in the unit it will be *printed* in, and only then converted back to
- * metres for plotting; the geometry stays SI and the ladder stops being a translation.
+ * Two ladders rather than one converted ladder: a round number of metres is not a round number of
+ * feet, and relabelling a 500 m rung gives gridlines at 1,640 ft and 3,281 ft. The step is chosen
+ * in the unit it will be printed in, then converted back to metres for plotting.
  */
 const TICK_STEPS = {
   metric: [10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000],
@@ -108,43 +82,21 @@ const TICK_STEPS = {
 } as const satisfies Record<UnitSystem, readonly number[]>;
 
 /**
- * Distance station steps, in the reader's own unit of length. Same rule, aiming for 4–7.
+ * Distance station steps, in the reader's own unit of length, aiming for 4–7 marks. One ladder for
+ * both systems, since kilometres and miles are both decimal; only the conversion differs.
  *
- * One ladder for both systems: kilometres and miles are both decimal, so the rungs that are
- * round in one are round in the other. Only the conversion to metres differs.
- *
- * It starts at 0.2 rather than 0.25 because the labels are written to one decimal — that is
- * what keeps them in step with the stat block above, which rounds the same way. A quarter
- * rung cannot be written to one decimal, and the attempt is what printed the `0.0 0.3 0.5
- * 0.8 1.0 1.1` row on a 1.1 km trail: five *converted* quarters, none of them round, on an
- * axis whose entire purpose is round numbers. 0.2 is exact at that precision, and lands a
- * mark every 200 m on the short walks that need them most.
- *
- * The top of the ladder is 5,000 rather than 50 because thru-routes exist. The old ceiling
- * meant `find` returned nothing for anything past 300 km, the fallback took over at 50, and
- * the Pacific Crest Trail drew eighty-five stations into a band of overprinted digits.
- *
- * It reaches 5,000 rather than stopping at 1,000 because the Pacific Crest Trail is not the
- * long one. The American Perimeter Trail is 7,681 km, which divides by a 1,000 rung into
- * 7.7 — past `maxMarks`, so `find` missed it and the fallback took over again, one rung
- * lower than the row needed. Two more rungs cost nothing and put the ceiling beyond any
- * walkable route on earth; a ladder whose last rung is reachable is a ladder that will be
- * fallen off, and the fallback is a worse axis every time it is used.
+ * Starts at 0.2, not 0.25: labels are written to one decimal to match the stat block, and
+ * converted quarters print as `0.0 0.3 0.5 0.8 1.0`. Reaches 5,000 so no walkable route falls off
+ * the top — the American Perimeter Trail is 7,681 km, and the fallback is a worse axis every time.
  */
 const STATION_STEPS = [
   0.2, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000,
 ] as const;
 
 /**
- * Thin the profile for drawing, keeping the extremes.
- *
- * A plain every-Nth stride would drop the summit whenever the summit is not on the stride,
- * and a section whose high point is 40 m lower than the stat block above it is worse than
- * no section. The first, last, highest and lowest samples are pinned; the rest are strided.
- *
- * `maxPoints` is a parameter rather than a constant because a phone draws the same trail
- * into a third of the width — past a point the extra samples are sub-pixel detail that
- * still costs a path each.
+ * Thin the profile for drawing, pinning the first, last, highest and lowest samples: a plain
+ * every-Nth stride drops the summit whenever it is off the stride, and a section whose high
+ * point is 40 m below the stat block above it is worse than no section.
  */
 export function toSectionPoints(
   profile: readonly ElevationPoint[],
@@ -173,20 +125,11 @@ export function toSectionPoints(
 }
 
 /**
- * Gridlines from the ground up, in the reader's units.
+ * Gridlines from the ground up, in the reader's units, returned in metres. Zero is always
+ * included, and the top tick is the first at or above the summit.
  *
- * Zero is always included because the section's vertical scale starts there — a baseline
- * with no line on it leaves the hatched mass floating. The top tick is the first one at or
- * above the summit, so the summit never sits above the highest labelled line.
- *
- * Returns **metres**, as everything in this package does, even though the ladder was chosen
- * in feet for an imperial reader. The values are exact rungs of that ladder converted once,
- * so `axisElevation` rounds each back to the whole number it came from — the renderer never
- * has to know which system picked the step.
- *
- * `system` is required rather than defaulted. A defaulted `'metric'` is precisely how this
- * drew a metric axis under an imperial stat block for as long as it did: every call site
- * took the default, and the default was invisible at all of them.
+ * `system` is required rather than defaulted: a defaulted `'metric'` is exactly how this drew a
+ * metric axis under an imperial stat block at every call site at once.
  */
 export function elevationTicks(maxEleM: number, system: UnitSystem): number[] {
   const perUnitM = system === 'imperial' ? M_PER_FT : 1;
@@ -199,18 +142,9 @@ export function elevationTicks(maxEleM: number, system: UnitSystem): number[] {
 }
 
 /**
- * Distance marks along the bottom, each carrying elapsed moving time.
- *
- * The trailhead and the finish are always marked, and a nice round mark that lands within
- * a third of a step of either is dropped — "18.0" and "18.4" sitting side by side is two
- * labels where the reader needed one, and it is always the round one that is redundant.
- *
- * `maxMarks` lowers the target count for a narrow screen. The step ladder is the same, so a
- * phone gets a coarser round number rather than the same numbers set smaller.
- *
- * Returns metres, chosen on a ladder of round miles or round kilometres — see
- * {@link elevationTicks} on why the choice is made in the display unit and why `system` is
- * not optional.
+ * Distance marks along the bottom, each carrying elapsed moving time. Trailhead and finish are
+ * always marked, and a round mark within a third of a step of either is dropped as redundant.
+ * Returns metres, chosen on a ladder of round miles or kilometres — see {@link elevationTicks}.
  */
 export function toStations(
   profile: readonly ElevationPoint[],
@@ -238,12 +172,7 @@ export function toStations(
   return marks.map((distanceM) => ({ distanceM, time: at(distanceM) }));
 }
 
-/**
- * Elapsed moving time as `h:mm`, or `mm` under an hour.
- *
- * Colon-separated rather than `1h 25m` because these sit in a row of axis labels under a
- * row of distances: same character width, same rhythm, no unit noise repeated six times.
- */
+/** Elapsed moving time as `h:mm`, or `mm` under an hour — sits in a row of axis labels. */
 export function formatElapsed(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '—';
   const minutes = Math.round(seconds / 60);
@@ -253,33 +182,14 @@ export function formatElapsed(seconds: number): string {
 }
 
 /**
- * Slide the collar annotations along until none of them overprints another.
+ * Slide the collar annotations along until none overprints another. The block moves, the leader
+ * does not: a callout drawn away from its distance would be a lie about the trail.
  *
- * A callout points at a place on the trail, and where that place lands is the trail's
- * business, not the sheet's. On a day hike the two the section carries — the trailhead and
- * the high point — are half a plot apart and there is nothing to solve. On the Appalachian
- * Trail the high point is 240 km in, which is 7% of 3,404 km, so its block was drawn on top
- * of the trailhead's: `TRAILHEAD 07:0HIGH POINT 09:54` on one line and two temperatures
- * interleaved on the next. Not a rare case either — the summit of a long route is wherever
- * the range is, and it is under no obligation to be in the middle.
- *
- * The block moves; the leader does not. That is the whole trade. A callout drawn somewhere
- * other than its distance would be a lie about the trail, so the rule and the dot stay put
- * and the renderer draws an arm across to wherever the text ended up — which is what a
- * printed sheet does with a crowded margin, and why the annotation is a *leader* line.
- *
- * Three passes, and each one exists because the pass before it can leave the row wrong:
- *
- * 1. Left to right, opening a gap: nothing begins until the block in front of it has ended.
- * 2. Right to left, pulling the row back inside the sheet: a block pushed past the right
- *    edge by pass 1 drags its neighbours left with it rather than hanging off the paper.
- * 3. Left to right again, because pass 2 has no floor: a row wider than the sheet would
- *    otherwise be pushed off the *left* edge, into the elevation labels.
- *
- * Blocks come back in the order they were given, whatever order they were in. When the row
- * genuinely cannot fit — more callouts than the sheet has room for — it packs from the left
- * and runs off the right, where there is a margin. Culling is the caller's decision to make
- * and it needs to know which annotation matters, which this cannot.
+ * Three passes, each needed because the one before can leave the row wrong: left to right opening
+ * gaps; right to left pulling a row pushed past the right edge back inside; left to right again,
+ * because pass 2 has no floor and would push a too-wide row off the left edge. Blocks return in
+ * the order given. A row that genuinely cannot fit packs left and runs off the right margin;
+ * culling needs to know which annotation matters, which this cannot.
  */
 export function placeCallouts(
   boxes: readonly CalloutBox[],
@@ -375,11 +285,9 @@ export function sampleSection(points: readonly SectionPoint[], distanceM: number
 
 /**
  * Split the profile into runs of one grade band so each can take its own hatch density.
- *
- * `classify` is passed in rather than imported: the grade ramp is a design token and lives
- * in `@switchback/ui`, which this package deliberately does not depend on. What is shared
- * here is the part that is easy to get subtly wrong — runs hand their boundary sample to
- * the next run, so adjacent fills meet with no seam down the middle of a climb.
+ * `classify` is passed in because the grade ramp is a design token in `@switchback/ui`, which
+ * this package does not depend on. Runs hand their boundary sample to the next, so fills meet
+ * with no seam down the middle of a climb.
  */
 export function sectionBands(
   points: readonly SectionPoint[],
@@ -399,12 +307,9 @@ export function sectionBands(
 }
 
 /**
- * Map distance and elevation onto the plot rectangle.
- *
- * The vertical scale starts at zero rather than at the lowest sample. A section that crops
- * its own base exaggerates the climb, which is the one lie a hiker cannot afford — the
- * ticks are folded in so the top of the scale is the highest labelled line, never a summit
- * floating above it.
+ * Map distance and elevation onto the plot rectangle. The vertical scale starts at zero, not at
+ * the lowest sample: a section that crops its own base exaggerates the climb. Ticks are folded
+ * in so the top of the scale is the highest labelled line.
  */
 export function sectionScale(
   points: readonly SectionPoint[],
