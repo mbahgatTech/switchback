@@ -104,6 +104,16 @@ jobs:
     name: format · typecheck · lint · unit
     runs-on: ubuntu-latest
 
+    env:
+      # `eslint .` runs the type-aware rules, so it holds a TypeScript program for the whole
+      # monorepo in memory at once. That peaks just under V8's default old-space cap on the
+      # Node 22 this job pins, which puts it on the wrong side of the line as soon as a branch
+      # adds files: the step aborts with "Reached heap limit" and exit 134. That reads like a
+      # lint failure and is not one — it reports no rule and no file, and the same tree lints
+      # clean under a larger cap. Nothing is relaxed here; `--max-warnings=0` still holds.
+      # The pass is only given room to finish, on a runner with 16 GB to spare.
+      NODE_OPTIONS: --max-old-space-size=4096
+
     services:
       db:
         # The same image infra/docker-compose.yml uses, and the same major versions Neon
