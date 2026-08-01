@@ -1,23 +1,17 @@
 /**
- * Re-run route-type classification over trails already in the database.
+ * Re-run route-type classification over trails already in the database. The classifier gained
+ * `hasImpliedReturnLeg` and `climbsToADeadEnd` after most of the catalogue was ingested, and
+ * nothing about a trail changes when our reading of it does, so the staleness sweep will never
+ * touch those rows.
  *
- * The classifier gained two second opinions — `hasImpliedReturnLeg` and `climbsToADeadEnd` —
- * after most of the catalogue had already been ingested, and there is no way for those rows
- * to learn about them on their own: nothing about a trail changes when our reading of it
- * does, so the staleness sweep will never touch them. Every trail ingested before the change
- * is still labelled from geometry alone, which is why a catalogue of real mountain paths
- * reads 91% "Point to point".
- *
- * **This does not re-fetch anything.** Both signals are already stored — what is mapped at
- * each end, as `Waypoint` rows with a kind and a position, and the shape of the climb, as the
- * elevation profile and its high-point index. So this is a pure re-derivation over data we
- * hold, and it costs nothing upstream.
+ * Re-fetches nothing: both signals are already stored — the mapped ends as `Waypoint` rows,
+ * the shape of the climb as the elevation profile and its high-point index.
  *
  *   npx tsx scripts/reclassify-route-types.ts            # report only, changes nothing
  *   npx tsx scripts/reclassify-route-types.ts --apply    # write the corrections
  *
- * Dry run is the default, and deliberately so: a wrong verdict here doubles every published
- * figure for a trail, so the operator should read the sample below before believing it.
+ * Dry run is the default, deliberately: a wrong verdict here doubles every published figure
+ * for a trail, so read the sample before believing it.
  */
 import type { ElevationPoint, LngLat, SacScale } from '@switchback/core';
 import { classifyDifficulty } from '@switchback/core';
@@ -69,12 +63,9 @@ interface Correction {
 }
 
 /**
- * Does this trail's stored shape imply a return leg nobody drew?
- *
- * Only the two endpoints of the profile are read: `terminusKinds` measures straight-line
- * distance from each end, and the climb rule wants the net between them, so the 1,998 samples
- * in between are not part of the question — the one thing they contribute, where the high
- * point sits, is already stored as `highPointIndex`.
+ * Does this trail's stored shape imply a return leg nobody drew? Only the two endpoints are
+ * read; the one thing the samples between them contribute — where the high point sits — is
+ * already stored as `highPointIndex`.
  */
 function reclassify(trail: {
   id: string;
@@ -104,8 +95,8 @@ function reclassify(trail: {
     kind: w.kind as PlacedFeature['kind'],
   }));
 
-  // The stored length is the one-way figure for a point-to-point trail, which is exactly
-  // what the length band in both rules is expressed in.
+  // The stored length is the one-way figure for a point-to-point trail, which is what the
+  // length band in both rules is expressed in.
   const kinds = terminusKinds(ends, placed);
   const byTerminus = hasImpliedReturnLeg(kinds, trail.lengthM);
   const byClimb =

@@ -3,33 +3,17 @@ import { PROBE_SESSION_TOKEN, VESPER } from './fixtures';
 import type { BrowserContext, Page } from '@playwright/test';
 
 /**
- * Does the whole product go dark, and does it remember who asked?
- *
- * Two separate claims, checked separately.
- *
- * The first is a *palette* claim: every page, in both palettes, is painted out of the same
- * ink and canvas. Checking that by eye means twenty-odd routes times two, which is a lot of
- * looking and very little evidence — a pale panel three scrolls down on `/settings` is
- * exactly the thing an eye slides past. So it is asked of the browser instead: is anything
- * large still painted light in dark mode, and does every piece of text clear WCAG AA
- * against whatever is actually behind it once the translucent layers are composited. Both
- * questions have exact answers, and a failure arrives with a selector attached.
- *
- * The second is a *precedence* claim, and it is the one the reader actually asked for —
- * "recalled by account or browser/person". An explicit account choice has to follow you to
- * a second device; a browser choice has to survive being signed out; and `system` has to
- * genuinely mean the OS decides. That is a table, so it is written as one.
+ * Two separate claims: that every page is painted out of one palette in both modes (asked of
+ * the browser, because a pale panel three scrolls down is what an eye slides past), and that
+ * an explicit choice is remembered with the right precedence between account, browser and OS.
  */
 
 /** Mirrors `THEME_COOKIE` in `apps/web/src/lib/theme.ts` — the wire contract under test. */
 const THEME_COOKIE = 'sb-theme';
 
 /**
- * A cross-section of the product, not every route.
- *
- * One of each kind of page: the two map-heavy ones, a detail sheet, a list, a form, an
- * empty state, and the signed-out door. A palette leak is a component-level defect, and
- * every component in the app appears somewhere in this list.
+ * One of each kind of page rather than every route: a palette leak is a component-level
+ * defect, and every component in the app appears somewhere in this list.
  */
 const ROUTES = [
   '/',
@@ -54,12 +38,7 @@ interface Findings {
   contrast: string[];
 }
 
-/**
- * Runs in the page.
- *
- * Passed to `evaluate` as one self-contained function because it executes in the browser,
- * where nothing from this module is in scope.
- */
+/** Self-contained because it runs inside `evaluate`, where nothing from this module is in scope. */
 function audit(mode: 'dark' | 'light'): Findings {
   const parse = (c: string): number[] | null => {
     const m = /rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.]+))?/.exec(c);
@@ -81,12 +60,9 @@ function audit(mode: 'dark' | 'light'): Findings {
     [0, 1, 2].map((i) => fg[i]! * fg[3]! + bg[i]! * (1 - fg[3]!));
 
   /**
-   * The colour actually behind an element.
-   *
-   * Naively reading the parent's `background-color` gives `rgba(0,0,0,0)` on almost every
-   * wrapper in the tree, which would score a black backdrop and report contrast failures
-   * that nobody can see. Hiking up to the first opaque layer and compositing back down
-   * gives the pixel a reader is looking at.
+   * The colour actually behind an element. Reading the parent's `background-color` naively
+   * gives `rgba(0,0,0,0)` on almost every wrapper, scoring a black backdrop and reporting
+   * failures nobody can see; this hikes to the first opaque layer and composites back down.
    */
   const backdrop = (el: Element): number[] => {
     const stack: number[][] = [];
@@ -106,12 +82,9 @@ function audit(mode: 'dark' | 'light'): Findings {
   };
 
   /*
-   * Three exemptions, each for a reason.
-   *
-   * The print sheet is paper by definition and stays white in both palettes. The map canvas
-   * is cartography — a topographic sheet with its terrain shading inverted is unreadable,
-   * which is why the reader gets a layer switcher instead. And `nextjs-portal` is the dev
-   * server's own toolbar, which is not ours and does not ship.
+   * The print sheet is paper by definition; the map canvas is cartography, where inverted
+   * terrain shading is unreadable (the reader gets a layer switcher instead); `nextjs-portal`
+   * is the dev server's own toolbar and does not ship.
    */
   const skip = (el: Element): boolean =>
     el.closest('[data-print-sheet], .maplibregl-map, nextjs-portal') !== null ||
@@ -129,11 +102,9 @@ function audit(mode: 'dark' | 'light'): Findings {
     if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
 
     /*
-     * A large area painted out of the current palette is what the visual pass was looking
-     * for: a pale slab in dark mode, or a black rectangle in light. Controls are exempt —
-     * a primary button is `bg-ink text-canvas`, so it is light-on-dark in dark mode *by
-     * design*, and that inversion is the whole point of it. Its text still has to clear
-     * contrast below, which is the assertion that actually protects the reader.
+     * A large area painted out of the current palette. Controls are exempt: a primary button
+     * is `bg-ink text-canvas`, so it is light-on-dark in dark mode by design. Its text still
+     * has to clear the contrast check below, which is what protects the reader.
      */
     const own = parse(cs.backgroundColor);
     const control = el.closest('button, a, summary, [role="button"], [role="tab"]') !== null;
@@ -184,8 +155,8 @@ function audit(mode: 'dark' | 'light'): Findings {
 async function settle(page: Page): Promise<void> {
   await page.evaluate(() => document.fonts.ready);
   await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => {
-    // A page with a live map never goes idle. Auditing it mid-tile-stream is still valid —
-    // the palette is a property of the DOM, not of how many tiles have landed.
+    // A page with a live map never goes idle; the palette is a property of the DOM, not of
+    // how many tiles have landed.
   });
 }
 
@@ -197,8 +168,8 @@ for (const mode of ['dark', 'light'] as const) {
     const context = await browser.newContext({
       baseURL: origin,
       viewport: { width: 1400, height: 900 },
-      // The opposite of the cookie, deliberately: if the cookie is not being honoured, the
-      // page comes back in the wrong palette and every assertion below inverts loudly.
+      // The opposite of the cookie, deliberately: if the cookie is not honoured the page
+      // comes back in the wrong palette and every assertion below inverts loudly.
       colorScheme: mode === 'dark' ? 'light' : 'dark',
     });
     await context.addCookies([
@@ -221,10 +192,6 @@ for (const mode of ['dark', 'light'] as const) {
     expect(failures.join('\n'), `${mode} palette findings`).toBe('');
   });
 }
-
-// ---------------------------------------------------------------------------
-// Precedence
-// ---------------------------------------------------------------------------
 
 interface Resolved {
   /** `data-mode` on `<html>`, or `(unset)` — which is itself meaningful. */
@@ -265,10 +232,9 @@ for (const os of ['dark', 'light'] as const) {
     const r = await resolve(context, baseURL ?? '', null);
     await context.close();
     /*
-     * The attribute stays *unset*, on purpose. Writing `data-mode="system"` would be worse
-     * than writing nothing: the stylesheet's `prefers-color-scheme` fallbacks key on
-     * `html:not([data-mode])`, and a device that switches to dark at dusk with the tab open
-     * has to follow along without a round trip.
+     * The attribute stays *unset* on purpose: the stylesheet's `prefers-color-scheme`
+     * fallbacks key on `html:not([data-mode])`, so a device that switches to dark at dusk
+     * with the tab open follows along without a round trip.
      */
     expect(r.attr).toBe('(unset)');
     expect(r.canvas).toBe(CANVAS[os]);
@@ -294,8 +260,8 @@ test('an account set to system falls through to the browser choice', async ({
   ]);
   const r = await resolve(context, origin, 'dark');
   await context.close();
-  // The probe account ships as `theme: 'system'`, which means "I have not chosen" rather
-  // than "follow the OS on the server" — so the cookie, not the device, decides.
+  // The probe account ships as `theme: 'system'`, meaning "I have not chosen" rather than
+  // "follow the OS on the server" — so the cookie, not the device, decides.
   expect(r.attr).toBe('dark');
   expect(r.canvas).toBe(CANVAS.dark);
 });

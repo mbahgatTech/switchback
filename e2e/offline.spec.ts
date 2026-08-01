@@ -1,45 +1,30 @@
 import { VESPER, expect, test } from './fixtures';
 
 /**
- * Taking a trail offline, and then taking the network away.
- *
- * This is the last line of the plan's verification and the only one that cannot be faked:
- * *"download offline → network killed → trail still loads."* Everything else in this suite
- * would still pass against a product that merely had a button labelled "Take offline".
- *
- * The download is done for real — the corridor is planned, the tiles are fetched from the
- * keyless hosts the relief basemap actually uses, and the page HTML is stored — and then
- * Playwright cuts the context's network at the socket. Nothing is stubbed, because a stub
- * would be asserting that our own cache-writing code writes to our own cache, which is not
- * the claim. The claim is that Chromium, offline, serves a page it has never re-requested.
+ * Download a trail, then cut the network at the socket. Nothing is stubbed: a stub would only
+ * assert that our cache-writing code writes to our own cache. The claim is that Chromium,
+ * offline, serves a page it has never re-requested.
  */
 
 /**
- * The cache the service worker keeps map tiles in.
- *
- * Named here rather than imported because `sw.js` is a plain script served from `public/`
- * and has no module boundary to import from. If the two ever disagree, this test fails with
- * "no tiles were stored", which is the right failure — a renamed cache is a download that
- * quietly stops working.
+ * The cache `sw.js` keeps map tiles in. Named rather than imported — `sw.js` is a plain script
+ * served from `public/` with no module boundary. If the two disagree this fails with "no tiles
+ * were stored", which is the right failure: a renamed cache is a download that stops working.
  */
 const TILE_CACHE = 'sb-tiles-v1';
 
 test.describe('Offline', () => {
   test('a downloaded trail still opens with the network cut', async ({ page, context }) => {
-    // Real tiles over a real network, on a dev server that is compiling routes underneath.
-    // Slow is expected here; the assertions are all specific, so slow never reads as passing.
+    // Real tiles over a real network, on a dev server compiling routes underneath.
     test.setTimeout(300_000);
 
     await page.goto(`/trails/${VESPER.slug}`, { waitUntil: 'domcontentloaded' });
     await expect(page.getByRole('heading', { level: 1 })).toHaveText(VESPER.name);
 
     /*
-     * Register the worker by hand.
-     *
-     * `RegisterServiceWorker` returns early unless `NODE_ENV === 'production'`, deliberately:
-     * a worker that caches `/_next/static` in front of a dev server which rebuilds those
-     * files on every keystroke is the worst debugging experience this stack can produce. The
-     * test opts in for itself, in a browser context that is thrown away afterwards.
+     * Registered by hand: `RegisterServiceWorker` returns early unless production, because a
+     * worker caching `/_next/static` in front of a dev server that rebuilds those files on
+     * every keystroke is the worst debugging experience this stack can produce.
      */
     await page.evaluate(async () => {
       await navigator.serviceWorker.register('/sw.js', { scope: '/' });
@@ -47,49 +32,38 @@ test.describe('Offline', () => {
     });
 
     // `ready` says installed; `controller` says it is in front of *this* page, which is what
-    // the reload below depends on. `sw.js` calls `clients.claim()` on activate to get there.
+    // the reload below depends on.
     await expect
       .poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null), {
         timeout: 60_000,
       })
       .toBe(true);
 
-    // The control says what it will cost before it costs it. That estimate existing at all
-    // means the corridor was planned rather than guessed.
+    // The estimate existing at all means the corridor was planned rather than guessed.
     const take = page.getByRole('button', { name: /^Take offline/ });
     await expect(take).toBeVisible({ timeout: 60_000 });
     await take.click();
 
-    // Planning → page → tiles → media → saving. The only fatal step is the page itself; a
-    // terrarium tile 404ing over a ridge is ordinary and non-fatal by design.
+    // Planning → page → tiles → media → saving. Only the page step is fatal; a terrarium tile
+    // 404ing over a ridge is ordinary and non-fatal by design.
     await expect(page.getByText(/^Offline ·/)).toBeVisible({ timeout: 240_000 });
 
-    /*
-     * Tiles actually landed in Cache Storage.
-     *
-     * "Offline" that means "offline until you zoom in past the ridge" is the exact failure
-     * this feature exists to prevent, and the size in the label alone would not catch it —
-     * the page HTML has a size too.
-     */
+    // Tiles actually landed in Cache Storage. "Offline until you zoom past the ridge" is the
+    // failure this feature exists to prevent, and the size in the label would not catch it.
     const tiles = await page.evaluate(async (cacheName: string) => {
       const cache = await caches.open(cacheName);
       return (await cache.keys()).length;
     }, TILE_CACHE);
     expect(tiles).toBeGreaterThan(0);
 
-    // ── The part that matters ────────────────────────────────────────────────────────
     await context.setOffline(true);
     await page.reload({ waitUntil: 'domcontentloaded' });
 
     /*
-     * The trail is still there.
-     *
      * Served by `handleNavigation` falling through to `fromOurCaches` after `fetch` threw.
-     * The heading is server-rendered, so this holds even though the dev build's chunk URLs
-     * contain characters `STATIC_ASSET_PATTERN` does not match and therefore never got
-     * stored — offline in development renders without hydrating. In a production build the
-     * hashed chunks are stored alongside the page and it hydrates too; the assertion below
-     * is the one that is true of both, which is why it is the one being made.
+     * The heading is server-rendered, so this holds in dev even though the dev build's chunk
+     * URLs never matched `STATIC_ASSET_PATTERN` and so never got stored — offline in
+     * development renders without hydrating. This assertion is true of both builds.
      */
     await expect(page.getByRole('heading', { level: 1 })).toHaveText(VESPER.name);
 
@@ -98,15 +72,11 @@ test.describe('Offline', () => {
       await expect(page.getByText(label, { exact: true })).toBeVisible();
     }
 
-    // ── Back on the network, and give the storage back ───────────────────────────────
     /*
-     * A fresh page rather than a reload of this one.
-     *
-     * The document currently on screen was served by the worker out of Cache Storage, and
-     * reloading it in the same beat as the network returning races Chromium's own teardown
-     * of the requests that failed while offline — `net::ERR_ABORTED`, reliably, and about
-     * the browser rather than about us. A new page in the same context shares the caches,
-     * the worker and the storage, which is all this last step needs.
+     * A fresh page, not a reload: the document on screen was served out of Cache Storage, and
+     * reloading it in the same beat as the network returning races Chromium's teardown of the
+     * requests that failed while offline (`net::ERR_ABORTED`, reliably). A new page in the
+     * same context shares the caches, the worker and the storage.
      */
     await context.setOffline(false);
     const fresh = await context.newPage();
@@ -140,11 +110,9 @@ test.describe('Offline', () => {
     await page.goto('/trails/mount-dickerman-trail', { waitUntil: 'domcontentloaded' });
 
     /*
-     * `/offline` is precached at install precisely for this: a real screen that says what is
-     * available, rather than the browser's dinosaur. The distinction is the whole reason the
-     * shell cache exists, and it only shows up in a test that goes somewhere it did not
-     * download. Both assertions are on server-rendered markup, because this page's own
-     * doctrine is that it has to work with its JavaScript missing.
+     * `/offline` is precached at install precisely for this: a real screen saying what is
+     * available rather than the browser's dinosaur. Both assertions are on server-rendered
+     * markup, because this page's own doctrine is that it works with its JavaScript missing.
      */
     await expect(page.getByRole('heading', { level: 1 })).toHaveText(
       'This page was not downloaded',

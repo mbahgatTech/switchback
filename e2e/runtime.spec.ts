@@ -2,23 +2,10 @@ import { expect, test } from '@playwright/test';
 import { PROBE_SESSION_TOKEN, VESPER } from './fixtures';
 
 /**
- * Nothing throws on the pages that carry a map.
- *
- * This exists because of a specific bug that shipped past every other gate. The scale bar
- * kept a reference to a MapLibre control and called `setUnit` on it after the map had been
- * torn down; the control had already had its `_map` cleared by `onRemove`, so the call
- * dereferenced `undefined` and the whole page went blank below the header.
- *
- * Typecheck was clean. Lint was clean. The unit tests were clean. `curl` returned a
- * complete, correct HTML document — the server render never runs the effect. Only a real
- * browser, mounting the component and then unmounting it, could see it, and the visible
- * symptom was "the trail page is empty", which reads as a data problem rather than a
- * client one.
- *
- * So the assertion is deliberately blunt and deliberately broad: open every route with a
- * map on it, leave, come back, and let nothing reach `window.onerror`. It does not know
- * what the next crash of this kind will be, which is the point — an uncaught exception in
- * a React effect is never acceptable, whatever it says.
+ * Nothing throws on the pages that carry a map. Typecheck, lint, unit tests and a `curl` of
+ * the server render are all blind to an uncaught exception in a React effect — only a real
+ * browser mounting and unmounting the component sees it. Deliberately blunt: it does not know
+ * what the next crash of this kind will be, which is the point.
  */
 
 /** Every route that constructs a MapLibre instance. */
@@ -43,17 +30,14 @@ test('no uncaught errors on the routes that carry a map', async ({ browser, base
 
   for (const route of MAP_ROUTES) {
     await page.goto(route, { waitUntil: 'domcontentloaded' });
-    // Long enough for the map to build, the controls to attach, and — under React's dev
-    // StrictMode — for the second pass to tear the first one down again. That teardown is
-    // the half of the lifecycle the original bug lived in.
+    // Long enough for the map to build and — under StrictMode — for the second pass to tear
+    // the first one down. That teardown is the half of the lifecycle the bug lived in.
     await page.waitForTimeout(4_000);
 
     /*
-     * Away and back, through the client router rather than a reload.
-     *
-     * A reload gets a fresh JS context and would hide exactly this class of defect: the
-     * failure needs a component to unmount while the page keeps running. `/attribution` is
-     * the cheapest route in the app and has no map of its own to confuse the trace.
+     * Away and back through the client router, not a reload: a reload gets a fresh JS context
+     * and would hide this class of defect, which needs a component to unmount while the page
+     * keeps running. `/attribution` has no map of its own to confuse the trace.
      */
     await page.goto('/attribution', { waitUntil: 'domcontentloaded' });
     await page.goBack({ waitUntil: 'domcontentloaded' });

@@ -7,16 +7,13 @@
  *   npm run ingest:tile -- --at 53.07,-4.07
  *   npm run ingest:route -- 1225378    -- fetch one long-distance route by relation id
  *
- * Two reasons this exists. Locally there is no Vercel cron, so a job that `after()` drops
- * would sit in the table forever; `--watch` is that missing minute-hand. And `tile` is the
- * smoke test — point it at a tile whose trails you know and read the summary.
+ * `--watch` is the minute-hand local development has no Vercel cron for; `tile` is the smoke
+ * test. Everything goes through the same `pipelineDeps` singletons the server uses, so the
+ * Overpass concurrency cap is one cap rather than one per entry point.
  *
- * Everything goes through the same `pipelineDeps` singletons the server uses, so the
- * Overpass concurrency cap is one cap, not one per entry point.
- *
- * The npm scripts pass `--env-file-if-exists=.env`, because unlike Next this process has
- * nothing that loads `.env` for it. `-if-exists` rather than `--env-file` so the same
- * command still works where the environment is supplied by the platform and no file exists.
+ * The npm scripts pass `--env-file-if-exists=.env` — unlike Next, this process has nothing
+ * that loads `.env` for it, and `-if-exists` keeps the command working where the platform
+ * supplies the environment and no file exists.
  */
 
 import { drainIngest, pipelineDeps, processRoute, processTile } from '@switchback/ingest';
@@ -59,11 +56,10 @@ async function tile(argv: string[]): Promise<void> {
   let quadkey = argv.find((arg) => /^[0-3]+$/.test(arg));
 
   if (at) {
-    // `--at lat,lng` — human order, because that is the order every map app shows and the
-    // order you copy out of one. Everything downstream is lng/lat; the swap happens here.
+    // `--at lat,lng` — the order every map app shows. Everything downstream is lng/lat.
     const [lat, lng] = at.split(',').map(Number);
-    // `Number.isFinite` is not a type guard, so the undefined check has to be its own
-    // clause — `"53"` splits to one element and would otherwise reach `lngLatToTile`.
+    // `Number.isFinite` is not a type guard, so the undefined check needs its own clause:
+    // `"53"` splits to one element and would otherwise reach `lngLatToTile`.
     if (lat === undefined || lng === undefined || !Number.isFinite(lat) || !Number.isFinite(lng)) {
       fail(`--at wants "lat,lng", got "${at}"`);
     }
@@ -88,12 +84,9 @@ async function tile(argv: string[]): Promise<void> {
 }
 
 /**
- * `route <osmId>` — ingest one long-distance route whole, by OSM relation id.
- *
- * Normally queued by tile ingest when it notices a trail belongs to a superroute. Exposed
- * here because these are the jobs worth watching: they are the slowest thing the pipeline
- * does, and "did the Pacific Crest Trail come back as 4,270 km or as 111 km" is a question
- * you want answered in a terminal, not inferred from a row count.
+ * Ingest one long-distance route whole, by OSM relation id. Normally queued by tile ingest
+ * when it notices a trail belongs to a superroute; exposed here because these are the slowest
+ * jobs the pipeline runs and the ones worth watching in a terminal.
  */
 async function route(argv: string[]): Promise<void> {
   const raw = argv.find((arg) => /^\d+$/.test(arg));
