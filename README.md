@@ -17,9 +17,9 @@ client re-asks `browse` every 2.5 s while tiles are pending.
 
 ## Quick start
 
-Node 22 or 24, and Docker for the local database. `.npmrc` sets `engine-strict=true`, so a Node
-below the floor fails the install with a readable message instead of crashing Metro three commands
-later.
+Node 20.19.4 or newer, and Docker for the local database. `.npmrc` sets `engine-strict=true`, so
+the `engines` range in `package.json` is what the install actually enforces, and a Node below the
+floor fails with a readable message instead of crashing Metro three commands later.
 
 ```bash
 npm install
@@ -41,8 +41,8 @@ credentials into `.env` without echoing the secret.
 
 ## Workspaces
 
-npm workspaces, all source-only — no build step and no `dist/`. TypeScript project references
-resolve the packages directly, so a one-line change in `packages/core` is visible to both apps
+npm workspaces, all source-only — no build step and no `dist/`. The root tsconfig's `paths` point
+straight at `packages/*/src`, so a one-line change in `packages/core` is visible to both apps
 without a rebuild.
 
 | Path                | What it is                                                                     |
