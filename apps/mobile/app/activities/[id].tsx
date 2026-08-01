@@ -47,24 +47,14 @@ import { ExploreMap, type ExploreMapHandle } from '@/components/explore-map';
 import { SECTION_HEIGHT, Section, distanceAtX } from '@/components/section';
 
 /**
- * One hike, read back.
+ * One hike, read back. Parity with `apps/web/app/activities/[id]`: the derivations are ports
+ * of that page's helpers rather than a second opinion, so the two cannot disagree about ascent.
  *
- * Parity with `apps/web/app/activities/[id]`, drawn on a phone. Same numbers, same section,
- * same map layers — the derivations are ports of the web page's local helpers rather than a
- * second opinion, so a hike cannot report 412 m of ascent on one screen and 418 m on the
- * other.
+ * The inline map takes no touches — a finished hike is framed once, so a panning map here would
+ * only trap a finger trying to scroll past it. Inspection gets a full screen of its own.
  *
- * **The inline map does not take touches.** A finished hike is framed once and will never
- * move again, so a map that panned here would only ever be a trap for a finger trying to
- * scroll past it — the reader would lose their place in the page to reach a camera position
- * they did not want. Inspection gets a full screen of its own, which is where a map should
- * be when it is actually being used.
- *
- * **What is editable is exactly what the hiker owns:** the name, the notes, who can see
- * it, and what kind of outing it was. The track, the distance and the times are what the
- * phone recorded and are not offered for adjustment — a log you can quietly improve is not
- * a log. Export hands the whole thing over in both formats a watch or another app will
- * read, so the record is never trapped here.
+ * Editable is exactly what the hiker owns: name, notes, visibility, kind of outing. The track,
+ * the distance and the times are what the phone recorded and are not offered for adjustment.
  */
 
 const theme = nativeTheme('sheet');
@@ -74,11 +64,8 @@ const dark = nativeTheme('field');
 const MAP_HEIGHT = 260;
 
 /**
- * Simplification before the track goes over the bridge.
- *
- * The server already thins to 2 m, which on a long day is still several thousand points and
- * a JSON string injected into a `WebView` as a JavaScript literal. Five metres is under a
- * pixel at any zoom this map opens at, and it roughly halves the string.
+ * Simplification before the track goes over the bridge. Five metres is under a pixel at any
+ * zoom this map opens at, and roughly halves the literal injected into the `WebView`.
  */
 const BRIDGE_TOLERANCE_M = 5;
 
@@ -96,10 +83,8 @@ export default function ActivityScreen() {
   const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: signedIn });
   const units: UnitSystem = me.data?.units ?? 'metric';
   /*
-   * Wait for the hiker's own unit setting before asking for the hike. `activities.get`
-   * computes splits in the units it is given, so fetching on the default and again on the
-   * real one would recompute every split on the server and repaint the table under the
-   * reader's eyes a beat after it appeared.
+   * Wait for the hiker's unit setting before asking for the hike: `activities.get` computes
+   * splits in the units it is given, so fetching twice would repaint the table a beat later.
    */
   const unitsReady = status === 'signedOut' || (signedIn && !me.isPending);
 
@@ -370,11 +355,8 @@ const SCRUB_SLOP = 4;
 // The map
 
 /**
- * The track, on a map.
- *
- * `browse={false}`, so the page inside runs no viewport search — the only thing on this
- * canvas is the line handed over the bridge. `ExploreMap` queues messages until the page
- * reports `ready`, so the send below is safe on the frame it mounts.
+ * The track, on a map. `browse={false}` so the page runs no viewport search — the only thing
+ * on this canvas is the line handed over the bridge, and `ExploreMap` queues until `ready`.
  */
 function HikeMap({
   line,
@@ -422,13 +404,9 @@ function HikeMap({
 // Splits
 
 /**
- * The splits.
- *
- * The one statistic a total cannot say: an even hike and a hike that fell apart on the last
- * climb have the same average and look nothing alike here. The bar is drawn from the
- * *slowest* split rather than from zero, because every hiking pace is a long way from zero
- * and a bar scaled from there is six near-identical bars. Ascent sits in the same row as
- * pace because it is usually the explanation for it.
+ * The splits — the one statistic a total cannot say. The bar is drawn from the *slowest*
+ * split rather than from zero: every hiking pace is far from zero, and a bar scaled from there
+ * is six near-identical bars. Ascent sits beside pace because it usually explains it.
  */
 function Splits({ splits, units }: { splits: readonly Split[]; units: UnitSystem }) {
   const unitLabel = units === 'imperial' ? 'mi' : 'km';
@@ -546,11 +524,8 @@ function ExportRow({ id }: { id: string }) {
 }
 
 /**
- * The document, as a file the share sheet can carry.
- *
- * The cache directory rather than documents: this is a copy made to be handed to another
- * app, and iOS is free to reclaim it the moment it is no longer needed. `overwrite` because
- * sharing the same hike twice must not fail on the second press.
+ * The document, as a file the share sheet can carry. The cache directory rather than documents,
+ * since iOS may reclaim it; `overwrite` because sharing the same hike twice must not fail.
  */
 function write(filename: string, data: string, base64: boolean): File {
   const file = new File(Paths.cache, filename);
@@ -572,13 +547,9 @@ interface Editable {
 }
 
 /**
- * Rename, re-describe, re-scope, or throw away.
- *
- * One sheet rather than four inline controls, because every field on it is a considered
- * change to a record — nothing here should be one stray thumb away from happening while
- * the page is being scrolled. Delete lives at the bottom behind a confirmation and is the
- * only thing in the app's phone UI drawn in survey red, which is reserved for controls that
- * destroy data.
+ * Rename, re-describe, re-scope, or throw away. One sheet rather than four inline controls:
+ * nothing here should be one stray thumb away while the page is scrolled. Delete sits at the
+ * bottom behind a confirmation, in survey red, which is reserved for destructive controls.
  */
 function Editor({
   activity,
@@ -829,12 +800,9 @@ function Chrome({
 // how many marks fit on one screen — and the two screens are different sizes.
 
 /**
- * The recorded track as a section.
- *
- * Fixes with no elevation are dropped rather than interpolated: a phone that lost its
- * altitude for a stretch did not record a flat stretch, and drawing one would be an
- * invention. If more than two thirds of the hike came back without height there is no
- * honest curve to draw and the section is left off the page entirely.
+ * The recorded track as a section. Fixes with no elevation are dropped rather than
+ * interpolated — a phone that lost its altitude did not record a flat stretch. Past two thirds
+ * missing there is no honest curve, and the section is left off the page.
  */
 function buildSection(
   track: ReadonlyArray<readonly [number, number, number | null]>,
@@ -891,10 +859,8 @@ function longDate(at: Date): string {
 }
 
 /**
- * Every edge pinned.
- *
- * Spelled out rather than `StyleSheet.absoluteFillObject`, which React Native 0.86 removed —
- * `absoluteFill` survives but is a registered style id, so it cannot be spread.
+ * Every edge pinned. Spelled out because React Native 0.86 removed `absoluteFillObject`, and
+ * `absoluteFill` is a registered style id, so it cannot be spread.
  */
 const fill = { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 } as const;
 

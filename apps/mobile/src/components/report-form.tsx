@@ -24,35 +24,13 @@ import { Mark } from '@/components/marks';
 import { ConditionToggle } from './condition-chip';
 
 /**
- * Filing a report, from the trail.
+ * Filing a report, from the trail — the same field card the website prints, in the same order.
  *
- * The same field card the website prints, in the same order, because the order is the
- * argument rather than the layout: what you thought is one line of it and the rest is what
- * was actually there — the day, the ground, the way you travelled. A rating tells the next
- * hiker whether they will enjoy it; the conditions tell them whether to bring different
- * boots, and only one of those two facts goes stale in a fortnight.
- *
- * **A screen, not an expanding block.** The website opens the form in place under the
- * reports. That does not survive the translation: this form has a multi-line field in it,
- * and a text input inside a long scroll on a phone means the keyboard covers what you are
- * typing while the reports you were reading get shoved somewhere off screen. A slide-up
- * screen is what the hardware already does for composing anything, and it gives the writer
- * the whole display for the one thing they came here to do.
- *
- * **Rating is the only required field.** Everything else is optional and none of it nagged
- * for: a form that refuses "four, no comment" collects fewer reports and no more information.
- *
- * **The date is a rail of days, not a calendar.** This is the one form in the product most
- * likely to be filled in within an hour of the hike it describes, standing next to the car.
- * A wheel picker to say *today* is three gestures for the answer that is right nine times
- * out of ten. The fortnight is one tap each, and *Earlier* opens a typed date for the hike
- * somebody is writing up in January — which the website supports and this must not drop.
- *
- * **Photographs are not filed here.** They go through the strip further up the same screen,
- * where the rest of somebody's pictures of this trail already are. The website can afford a
- * second uploader inside the form because it has the width to show both; on a phone it would
- * be two controls that do the same thing on one small screen, and the one that is already
- * there works whether or not anyone is writing a report.
+ * A slide-up screen rather than the website's in-place block: a multi-line field inside a long
+ * scroll means the keyboard covers what is being typed. Rating is the only required field.
+ * The date is a rail of days rather than a calendar, with *Earlier* opening a typed date for a
+ * hike written up in January. Photographs are filed through the strip further up the screen,
+ * not here.
  */
 
 const theme = nativeTheme('sheet');
@@ -60,11 +38,8 @@ const theme = nativeTheme('sheet');
 const RATINGS = [1, 2, 3, 4, 5] as const;
 
 /**
- * What each rating means, said in words.
- *
- * Bare numbers make everyone's four a different four. These are deliberately about the hike
- * and not about enthusiasm — "would do it again" is a fact a reader can act on in a way that
- * "great!" is not.
+ * What each rating means, said in words — bare numbers make everyone's four a different four.
+ * Deliberately about the hike rather than enthusiasm: "would do it again" is actionable.
  */
 const RATING_HINT: Readonly<Record<number, string>> = {
   1: 'Would not go back',
@@ -74,13 +49,7 @@ const RATING_HINT: Readonly<Record<number, string>> = {
   5: 'One of the best',
 };
 
-/**
- * How far back the rail of days reaches.
- *
- * A fortnight. Long enough to cover the hike somebody meant to write up last weekend and
- * didn't, short enough that the rail is still a rail rather than a scroll with an end nobody
- * reaches. Anything older is a typed date, and typing one is the rarer act.
- */
+/** How far back the rail of days reaches. Anything older is a typed date. */
 const RAIL_DAYS = 14;
 
 export function ReportForm({ trailId }: { trailId: string }) {
@@ -104,24 +73,16 @@ export function ReportForm({ trailId }: { trailId: string }) {
   const [activityType, setActivityType] = useState<ActivityType | ''>('');
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
 
-  /**
-   * The fortnight, newest first.
-   *
-   * Built once for the life of the screen. It goes one day stale if somebody leaves the trail
-   * page open across midnight, which costs them a chip labelled *Today* that means yesterday
-   * — against rebuilding this list on every keystroke in the notes field.
-   */
+  /** The fortnight, newest first. Built once, so it goes a day stale across midnight. */
   const days = useMemo(() => {
     const today = todayLocal();
     return Array.from({ length: RAIL_DAYS }, (_, index) => addDays(today, -index));
   }, []);
 
   /**
-   * Fill the form in from the server's copy, and only while it is closed.
-   *
-   * The guard is the whole point: `mine.data` changes identity after every successful save,
-   * and without it a re-render halfway through a second edit would overwrite what the person
-   * is currently typing with what they last published.
+   * Fill the form in from the server's copy, and only while it is closed. `mine.data` changes
+   * identity after every save, so without the guard a re-render mid-edit would overwrite what
+   * the person is typing with what they last published.
    */
   useEffect(() => {
     if (open) return;
@@ -137,10 +98,8 @@ export function ReportForm({ trailId }: { trailId: string }) {
   }, [existing, days, open]);
 
   /**
-   * What is wrong with the typed date, if anything, in the schema's own words.
-   *
-   * Held off until all eight digits are in. Telling somebody that `2026-0` is not a date
-   * while they are three keystrokes into typing one is technically true and useless.
+   * What is wrong with the typed date, in the schema's own words. Held off until all eight
+   * digits are in — `2026-0` is not a date, and saying so mid-keystroke is useless.
    */
   const dateIssue = useMemo(() => {
     if (!typing || typed.length < 10) return null;
@@ -206,16 +165,10 @@ export function ReportForm({ trailId }: { trailId: string }) {
 
   if (existing?.hidden) {
     /*
-     * The author of a removed report is told before they type, not after.
-     *
-     * `reviews.mine` returns the hidden row, but `toReview` empties it on the way out:
-     * rating and body come back null, conditions empty, activity null, helpful count zero.
-     * Only the dates and the author survive. So opening the form on it would show a blank
-     * screen where their report was — reading as though the app had lost it rather than
-     * removed it — and both buttons on that screen are refused server-side: `reviews.upsert`
-     * will not edit a hidden row and `reviews.remove` will not delete one. Offering the
-     * screen at all invites the two actions that cannot succeed. The notice carries the
-     * address, which is the move that is actually available.
+     * The author of a removed report is told before they type, not after. `reviews.mine`
+     * returns the hidden row but `toReview` empties it, so the form would open on a blank
+     * screen — and both its buttons are refused server-side: `upsert` will not edit a hidden
+     * row and `remove` will not delete one. The notice carries the address instead.
      */
     return (
       <View style={styles.removed}>
@@ -239,9 +192,8 @@ export function ReportForm({ trailId }: { trailId: string }) {
       rating,
       body: body.trim() || null,
       hikedOn: dayHiked || null,
-      // Copied out of state rather than passed by reference: the input schema takes a mutable
-      // array, and handing zod the same array this component is still rendering from is an
-      // aliasing bug waiting for the first `.sort()` anyone adds upstream.
+      // Copied rather than passed by reference: the input schema takes a mutable array, and
+      // handing zod the array this component still renders from is an aliasing bug in waiting.
       conditions: [...conditions],
       ...(activityType ? { activityType } : {}),
     });
@@ -268,9 +220,8 @@ export function ReportForm({ trailId }: { trailId: string }) {
             ]}
             keyboardShouldPersistTaps="handled"
             keyboardDismissMode="on-drag"
-            // Lets the notes field lift clear of the keyboard without a
-            // `KeyboardAvoidingView` wrapping — and without the layout jump one causes on a
-            // screen whose content is already taller than the display.
+            // Lets the notes field lift clear of the keyboard without a `KeyboardAvoidingView`,
+            // and without the layout jump one causes on content taller than the display.
             automaticallyAdjustKeyboardInsets
           >
             <View style={styles.head}>
@@ -288,15 +239,13 @@ export function ReportForm({ trailId }: { trailId: string }) {
               </Pressable>
             </View>
 
-            {/* ── Rating ──────────────────────────────────────────────────────────────── */}
+            {/* Rating */}
             <View style={styles.field}>
               <Text style={styles.fieldLabel}>How was it</Text>
               {/*
                * The five cells are the scale bar the reports are read with, at a size a thumb
-               * can hit — you fill the same instrument you have been reading. The division
-               * rules change colour with the fill exactly as they do there: woodland across
-               * the empty cells, canvas across the filled ones, so a five still reads as five
-               * divisions rather than one solid block.
+               * can hit. The division rules change colour with the fill exactly as they do
+               * there, so a five still reads as five divisions rather than one solid block.
                */}
               <View style={styles.scale}>
                 {RATINGS.map((value) => {
@@ -329,7 +278,7 @@ export function ReportForm({ trailId }: { trailId: string }) {
               </Text>
             </View>
 
-            {/* ── When ────────────────────────────────────────────────────────────────── */}
+            {/* When */}
             <View style={styles.field}>
               <Text style={styles.fieldLabel}>Hiked on</Text>
               <ScrollView
@@ -364,9 +313,8 @@ export function ReportForm({ trailId }: { trailId: string }) {
                 <View style={styles.typed}>
                   {/*
                    * Digits only, dashes inserted as they arrive. A number pad has no dash key
-                   * and `numbers-and-punctuation` hands somebody a keyboard they can type
-                   * `2026/7/4` on — which is a date, and is not one this schema takes. Masking
-                   * makes the malformed string unreachable rather than rejected.
+                   * and `numbers-and-punctuation` lets somebody type `2026/7/4`, which this
+                   * schema does not take. Masking makes the malformed string unreachable.
                    */}
                   <TextInput
                     value={typed}
@@ -388,7 +336,7 @@ export function ReportForm({ trailId }: { trailId: string }) {
               ) : null}
             </View>
 
-            {/* ── How ─────────────────────────────────────────────────────────────────── */}
+            {/* How */}
             <View style={styles.field}>
               <Text style={styles.fieldLabel}>Travelling by</Text>
               <ScrollView
@@ -413,7 +361,7 @@ export function ReportForm({ trailId }: { trailId: string }) {
               </ScrollView>
             </View>
 
-            {/* ── Conditions ──────────────────────────────────────────────────────────── */}
+            {/* Conditions */}
             <View style={styles.field}>
               <Text style={styles.fieldLabel}>What was the ground like</Text>
               <View style={styles.tags}>
@@ -428,7 +376,7 @@ export function ReportForm({ trailId }: { trailId: string }) {
               </View>
             </View>
 
-            {/* ── Notes ───────────────────────────────────────────────────────────────── */}
+            {/* Notes */}
             <View style={styles.field}>
               <Text style={styles.fieldLabel}>Anything else worth knowing</Text>
               <TextInput
@@ -444,7 +392,7 @@ export function ReportForm({ trailId }: { trailId: string }) {
               />
             </View>
 
-            {/* ── Actions ─────────────────────────────────────────────────────────────── */}
+            {/* Actions */}
             <View style={styles.actions}>
               <Pressable
                 onPress={submit}
@@ -475,9 +423,8 @@ export function ReportForm({ trailId }: { trailId: string }) {
             {remove.isError ? <Text style={styles.error}>{remove.error.message}</Text> : null}
 
             {/*
-             * Two taps to withdraw, and the second one is the only control on this screen
-             * allowed the survey plate — not because losing a report is dangerous, but
-             * because it is the one thing here that destroys something. It says what will go.
+             * Two taps to withdraw, and the second is the only control here allowed the survey
+             * plate — it is the one thing on this screen that destroys something.
              */}
             {existing === null ? null : (
               <View style={styles.danger}>
@@ -528,12 +475,9 @@ export function ReportForm({ trailId }: { trailId: string }) {
 }
 
 /**
- * One stop on a rail — a day, or a way of travelling.
- *
- * Not `Chip` from `./chip`. That one is built for a rail of twenty-four hours where the
- * label is two mono digits; these carry sentence-case words at a size somebody reads rather
- * than scans, and the tap target has to clear 44pt without slop because two of these rails
- * sit directly above a scrolling form.
+ * One stop on a rail — a day, or a way of travelling. Not `Chip` from `./chip`: that one is
+ * built for two mono digits, and these carry sentence-case words at a 44pt target without slop,
+ * because two of these rails sit directly above a scrolling form.
  */
 function Day({ label, on, onPress }: { label: string; on: boolean; onPress: () => void }) {
   return (
@@ -561,7 +505,6 @@ function maskDate(input: string): string {
 }
 
 const styles = StyleSheet.create({
-  // ── Signed out ──
   prompt: {
     gap: theme.space.md,
     alignItems: 'flex-start',
@@ -573,8 +516,7 @@ const styles = StyleSheet.create({
   },
   promptProse: { ...theme.text('body', { family: 'text' }), color: theme.color.inkMuted },
 
-  // ── Removed by a moderator ──
-  // Survey, and a hairline: this is about the reader's own standing on the site rather than
+  // Survey and a hairline: this is about the reader's own standing on the site rather than
   // about the trail, which is the one thing that plate means.
   removed: {
     borderWidth: StyleSheet.hairlineWidth,
@@ -584,7 +526,6 @@ const styles = StyleSheet.create({
   },
   removedProse: { ...theme.text('body', { family: 'text' }), color: theme.color.ink },
 
-  // ── The way in ──
   open: {
     alignSelf: 'flex-start',
     minHeight: CONTROL_HEIGHT.touch,
@@ -599,7 +540,6 @@ const styles = StyleSheet.create({
   openPressed: { opacity: 0.55 },
   openLabel: { ...theme.collarLabel, color: theme.color.ink },
 
-  // ── The form ──
   screen: { flex: 1, backgroundColor: theme.color.canvas },
   body: { gap: theme.space.xl, paddingHorizontal: theme.space.xl },
   head: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
@@ -610,7 +550,6 @@ const styles = StyleSheet.create({
   fieldLabel: { ...theme.collarLabel, color: theme.color.inkMuted },
   hint: { ...theme.text('caption', { family: 'text' }), color: theme.color.inkMuted },
 
-  // ── Rating ──
   scale: {
     flexDirection: 'row',
     alignSelf: 'flex-start',
@@ -619,10 +558,8 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius.hair,
     overflow: 'hidden',
   },
-  // Wider than tall because the row is five of them and the number wants room, but the height
-  // is the touch rung like every other control in this form — it was 44, which is Apple's
-  // floor rather than ours, and the only raw number in a stylesheet that reaches for
-  // `CONTROL_HEIGHT.touch` five other times.
+  // Wider than tall because the row is five of them, but the height is the touch rung like
+  // every other control in this form.
   cell: {
     width: 52,
     height: CONTROL_HEIGHT.touch,
@@ -635,7 +572,6 @@ const styles = StyleSheet.create({
   rule: { borderLeftWidth: StyleSheet.hairlineWidth, borderLeftColor: theme.color.woodland },
   ruleOnFill: { borderLeftWidth: StyleSheet.hairlineWidth, borderLeftColor: theme.color.canvas },
 
-  // ── Rails ──
   rail: { flexDirection: 'row', gap: theme.space.xs, paddingRight: theme.space.xl },
   day: {
     minHeight: CONTROL_HEIGHT.touch,
@@ -654,7 +590,6 @@ const styles = StyleSheet.create({
   typed: { gap: theme.space.xs },
   tags: { flexDirection: 'row', flexWrap: 'wrap', gap: theme.space.xs },
 
-  // ── Typed fields ──
   input: {
     ...theme.text('body', { family: 'text' }),
     color: theme.color.ink,
@@ -669,7 +604,6 @@ const styles = StyleSheet.create({
   date: { ...theme.text('body', { family: 'mono' }), alignSelf: 'flex-start', width: 168 },
   notes: { minHeight: 132, textAlignVertical: 'top' },
 
-  // ── Actions ──
   actions: { flexDirection: 'row', alignItems: 'center', gap: theme.space.sm },
   file: {
     minHeight: CONTROL_HEIGHT.touch,

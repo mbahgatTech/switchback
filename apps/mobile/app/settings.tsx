@@ -20,25 +20,9 @@ import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 
 /**
- * Settings.
- *
- * **Read it as the margin block of a map sheet.** A published sheet states its scale, its
- * contour interval and its datum in the margin, because those declarations are what make
- * every measurement on the map mean something. That is exactly what this screen is, so each
- * section prints its current value in mono beside its own heading: the whole configuration
- * can be read on one scroll without opening a single control, which is the question somebody
- * usually came here to answer.
- *
- * **Units first, unlike the website.** The web page opens with who you are, because a profile
- * is a public thing and the page it lives on is where people go to fix it. The phone is the
- * instrument. Somebody who opens settings on the phone is nine times out of ten an American
- * looking at kilometres, and putting three text fields above the control they came for makes
- * them scroll past their own bio to change a unit.
- *
- * **Each section commits on its own.** They are unrelated decisions, and a single Save at the
- * bottom would make changing your units feel like it might also publish your bio. Nothing
- * saves as you type: a profile is public, and a field that writes on every keystroke publishes
- * every draft of a sentence somebody was still working out.
+ * Settings, laid out as the margin block of a map sheet: each section prints its current value
+ * beside its own heading, so the whole configuration reads on one scroll. Units come first
+ * because the phone is the instrument. Each section commits on its own, never as you type.
  */
 
 const theme = nativeTheme('sheet');
@@ -137,17 +121,10 @@ export default function SettingsScreen() {
   );
 }
 
-// ---------------------------------------------------------------------------
-// How it reads
-// ---------------------------------------------------------------------------
-
 /**
- * The declaration every other number on the phone is drawn against.
- *
- * One tap commits, and the tapped option goes selected immediately rather than waiting for the
- * round trip — the mutation's own variables are the truth for as long as it is in flight. A
- * control that stays on the old answer for 300 ms after being pressed reads as a control that
- * did not work, and gets pressed again.
+ * The declaration every other number on the phone is drawn against. The tapped option goes
+ * selected immediately — the mutation's own variables are the truth while it is in flight, and
+ * a control that stays on the old answer for 300 ms gets pressed again.
  */
 function Reading({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -177,10 +154,6 @@ function Reading({ me }: { me: SelfProfile }) {
     </Section>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Who sees a hike
-// ---------------------------------------------------------------------------
 
 function Sharing({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -213,17 +186,10 @@ function Sharing({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Who you are
-// ---------------------------------------------------------------------------
-
 /**
- * Name, handle and bio — the three that are published.
- *
- * State is seeded from the props at mount and never re-seeded, which is safe because the
- * parent does not render this until the profile has loaded. Re-seeding on every change of
- * `me` would overwrite what somebody is halfway through typing the moment any other section
- * on this screen invalidated the profile query.
+ * Name, handle and bio — the three that are published. State is seeded from the props at mount
+ * and never re-seeded: another section invalidating the profile query must not overwrite what
+ * somebody is halfway through typing.
  */
 function Identity({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -243,9 +209,7 @@ function Identity({ me }: { me: SelfProfile }) {
   const parsed = usernameSchema.safeParse(trimmed);
   const changed = trimmed !== (me.username ?? '');
 
-  // A query per keystroke against a unique index. A quarter second is long enough to catch
-  // the pause after a word and short enough that the answer is there before the finger leaves
-  // the key.
+  // Debounced: this is a query per keystroke against a unique index.
   const settled = useDebounced(trimmed, 250);
 
   const availability = useQuery({
@@ -271,9 +235,8 @@ function Identity({ me }: { me: SelfProfile }) {
     if (!dirty || blocked) return;
     update.mutate({
       name: name.trim() || null,
-      // An empty box means "leave it alone", not "release my handle" — a username is a URL
-      // other people have, and clearing it by backspacing would break every link to you
-      // without ever saying so.
+      // An empty box means "leave it alone", not "release my handle": a username is a URL
+      // other people hold, and backspacing it would break every link without saying so.
       ...(changed && trimmed ? { username: trimmed } : {}),
       bio: bio.trim() || null,
     });
@@ -303,10 +266,8 @@ function Identity({ me }: { me: SelfProfile }) {
         hint={trimmed ? `switchback.app/u/${trimmed}` : 'gives you a public address'}
       >
         {/*
-         * Lowercased as it is typed rather than on submit. The schema only takes lowercase, the
-         * phone keyboard capitalises the first letter of anything by default, and correcting
-         * somebody's handle silently at the moment they save is worse than never letting the
-         * capital appear.
+         * Lowercased as it is typed, not on submit: the schema only takes lowercase and the
+         * keyboard capitalises the first letter, so correcting it silently at save is worse.
          */}
         <TextInput
           value={username}
@@ -371,17 +332,9 @@ function Identity({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Where the map opens
-// ---------------------------------------------------------------------------
-
 /**
- * Home.
- *
- * Searched by name rather than taken from the GPS. The phone could offer *use where I am*,
- * and it would be wrong nearly every time this screen is open: settings get filled in at the
- * kitchen table, and "near me" is meant to point at the hills somebody drives to, not at the
- * kitchen.
+ * Home, searched by name rather than taken from the GPS: settings get filled in at the kitchen
+ * table, and "near me" is meant to point at the hills somebody drives to.
  */
 function Home({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -399,8 +352,7 @@ function Home({ me }: { me: SelfProfile }) {
     }),
   );
 
-  // The gazetteer allows about one request a second and is shared with everyone else using
-  // it, so this waits for a pause in typing rather than firing per keystroke.
+  // The gazetteer allows about one request a second and is shared, so this waits for a pause.
   const results = useQuery({
     ...trpc.places.search.queryOptions({ q: settled, limit: 5 }),
     enabled: settled.length >= 2,
@@ -479,24 +431,14 @@ function Home({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Devices
-// ---------------------------------------------------------------------------
-
 /**
  * Everything holding a credential, including the phone reading this.
  *
- * The list is `me.devices`, which is refresh tokens — phones and tablets. The button is
- * `me.signOutEverywhere`, which is not: it revokes the refresh tokens, deletes the browser
- * session rows, and stamps the account so access tokens already issued stop being accepted.
- * The two have to be described separately or the sheet lies by omission. It used to say "this
- * phone is the only one signed in, so this signs you out here" to somebody with a signed-in
- * laptop, and take the laptop down too, unannounced and uncounted — the same "discovered after
- * the press" failure the website's copy was rewritten to stop making.
- *
- * The count in the sentence is of phones, because the list is of phones and that is the number
- * the reader can check. Browsers are named without a number: nothing on this screen knows how
- * many there are before the press, and inventing one would be worse than saying "any browser".
+ * The list is `me.devices` — refresh tokens, so phones and tablets. The button is
+ * `me.signOutEverywhere`, which is wider: it also deletes browser sessions and stamps the
+ * account so live access tokens stop being accepted. Describe the two separately, or the sheet
+ * takes down a signed-in laptop unannounced. The count is of phones, because the list is; a
+ * number for browsers would be invented.
  */
 function Devices() {
   const trpc = useTRPC();
@@ -507,9 +449,8 @@ function Devices() {
   const revoke = useMutation(
     trpc.me.signOutEverywhere.mutationOptions({
       onSuccess: () => {
-        // This phone's own refresh token is one of the ones just revoked. Dropping the local
-        // copy now is what keeps the app honest — otherwise it carries on rendering a signed-in
-        // account until the access token quietly expires fifteen minutes later.
+        // This phone's own refresh token is one of the ones just revoked, so the local copy has
+        // to go now — otherwise the app renders a signed-in account for another fifteen minutes.
         void signOut().then(() => router.replace('/you'));
       },
     }),
@@ -517,9 +458,8 @@ function Devices() {
 
   const list = devices.data ?? [];
 
-  // Which row is this phone. Only claimed when exactly one device reports this name — two
-  // phones called "iPhone" are common enough that guessing between them would be a label
-  // that lies on the one screen where being sure matters.
+  // Which row is this phone, claimed only when exactly one device reports this name — two
+  // phones called "iPhone" are common enough that a guess would be a label that lies.
   const here = typeof Constants.deviceName === 'string' ? Constants.deviceName : null;
   const named = here === null ? [] : list.filter((device) => device.deviceName === here);
   const hereId = named.length === 1 ? (named[0]?.id ?? null) : null;
@@ -579,10 +519,9 @@ function Devices() {
         </View>
       ) : (
         /*
-         * Offered even with an empty list, which it was not before. The list is phones; the
-         * button now also revokes browsers and live access tokens, so gating it on "a phone is
-         * signed in" hid the compromise control from exactly the reader whose browser is the
-         * thing that was taken. Same reasoning as the web settings form.
+         * Offered even with an empty list: the button revokes browsers and live access tokens
+         * too, so gating it on "a phone is signed in" would hide the compromise control from
+         * exactly the reader whose browser was taken.
          */
         <Pressable
           onPress={() => setConfirming(true)}
@@ -597,10 +536,6 @@ function Devices() {
     </Section>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Parts
-// ---------------------------------------------------------------------------
 
 /** The scroll container and the way back, shared by every state this screen has. */
 function Chrome({
@@ -639,12 +574,8 @@ function Chrome({
         {children}
 
         {/*
-         * Outside `children`, so it is on the screen in all four states this file renders —
-         * including signed out. Attribution is a condition of the licences the map data comes
-         * under, and a condition does not wait for somebody to have an account.
-         *
-         * Set as one more margin block, because that is what it is: the sheet declaring the
-         * terms it was published under, in the same place it declares its units.
+         * Outside `children`, so it is on the screen in all four states including signed out:
+         * attribution is a condition of the map licences and does not wait for an account.
          */}
         <Pressable
           onPress={() => router.push('/attribution')}
@@ -661,10 +592,8 @@ function Chrome({
 }
 
 /**
- * One margin block: what it declares, what it currently reads, and why it matters.
- *
- * The reading sits on the heading line in mono, right-aligned, so the screen can be scanned
- * as a specification rather than opened control by control.
+ * One margin block: what it declares, what it currently reads, and why it matters. The reading
+ * sits on the heading line so the screen scans as a specification.
  */
 function Section({
   title,
@@ -716,12 +645,8 @@ function Field({
 }
 
 /**
- * A short set of mutually exclusive answers, stacked rather than in a row.
- *
- * The website lays these out as a wrapping row of pills. Three sentence-length options at a
- * 44pt tap target do not fit across a phone, and a row that wraps mid-set makes the second
- * line look like a different question. Stacked, each option is a full-width target that says
- * its whole answer.
+ * Mutually exclusive answers, stacked rather than in a row: three sentence-length options at a
+ * 44pt tap target do not fit across a phone, and a row that wraps reads as a second question.
  */
 function Choice<T extends string>({
   options,
@@ -762,10 +687,8 @@ function Choice<T extends string>({
 }
 
 /**
- * A value that settles.
- *
- * Both live lookups on this screen reach something rate-limited — a unique index and a shared
- * public gazetteer — so they wait for a pause in typing rather than firing on every keystroke.
+ * A value that settles. Both live lookups on this screen reach something rate-limited — a
+ * unique index and a shared public gazetteer.
  */
 function useDebounced<T>(value: T, ms: number): T {
   const [settled, setSettled] = useState(value);
@@ -800,7 +723,6 @@ const styles = StyleSheet.create({
   error: { ...theme.text('caption', { family: 'text' }), color: theme.color.survey },
   free: { ...theme.text('caption', { family: 'text' }), color: theme.color.woodland },
 
-  // ── Margin blocks ──
   section: {
     gap: theme.space.xs,
     marginTop: theme.space.lg,
@@ -837,7 +759,6 @@ const styles = StyleSheet.create({
     borderTopColor: theme.color.bezel,
   },
 
-  // ── Choices ──
   choice: { gap: theme.space.xs },
   option: {
     minHeight: CONTROL_HEIGHT.touch,
@@ -855,7 +776,6 @@ const styles = StyleSheet.create({
   optionLabel: { ...theme.text('body'), color: theme.color.inkMuted },
   optionLabelOn: { color: theme.color.canvas },
 
-  // ── Typed fields ──
   field: { gap: theme.space.xs },
   fieldHead: {
     flexDirection: 'row',
@@ -883,7 +803,6 @@ const styles = StyleSheet.create({
   mono: { ...theme.text('body', { family: 'mono' }) },
   multiline: { minHeight: 108, textAlignVertical: 'top' },
 
-  // ── Save ──
   saveRow: { flexDirection: 'row', alignItems: 'center', gap: theme.space.md },
   save: {
     minHeight: CONTROL_HEIGHT.touch,
@@ -898,7 +817,6 @@ const styles = StyleSheet.create({
   saveOff: { opacity: 0.4 },
   saveLabel: { ...theme.collarLabel, color: theme.color.canvas },
 
-  // ── Plain controls ──
   action: {
     alignSelf: 'flex-start',
     minHeight: CONTROL_HEIGHT.touch,
@@ -914,7 +832,6 @@ const styles = StyleSheet.create({
   quiet: { minHeight: CONTROL_HEIGHT.touch, justifyContent: 'center', alignSelf: 'flex-start' },
   quietLabel: { ...theme.text('caption', { family: 'text' }), color: theme.color.inkMuted },
 
-  // ── Place results ──
   results: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.color.bezel },
   result: {
     flexDirection: 'row',
@@ -935,7 +852,6 @@ const styles = StyleSheet.create({
   },
   resultKind: { ...theme.collarLabel, color: theme.color.inkMuted },
 
-  // ── Devices ──
   devices: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.color.bezel },
   device: {
     flexDirection: 'row',

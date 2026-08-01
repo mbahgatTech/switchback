@@ -20,21 +20,11 @@ import { Photograph } from '@/components/photograph';
 import { useOfflineIndex } from '@/offline/store';
 
 /**
- * You.
+ * You. Drawn in `sheet` like the trail screen, because this is a page to be read.
  *
- * `sheet` rather than `field`, matching the trail screen: this is a page to be read, and the
- * paper scheme is what the product uses for reading. Explore stays dark because it is the
- * map, and the map is the ground.
- *
- * Deliberately *first-person only*. The website has `/u/<username>` for reading somebody
- * else's record; the app has this, which needs no username, works before you have chosen one,
- * and never has to explain whose figures are on screen. Strangers' profiles are a browsing
- * feature and the phone is the recording device.
- *
- * The order is the website's, for the same reasons: how much hiking, then when it happened,
- * then the three hikes worth telling someone about, then where. Nothing here is ranked
- * against anyone else — the moment a total is scored against other people, the honest thing
- * to do becomes logging hikes you did not do.
+ * Deliberately first-person only: the website has `/u/<username>` for somebody else's record,
+ * and this needs no username and works before one has been chosen. Nothing here is ranked
+ * against anyone else — a total scored against other people rewards logging hikes you did not do.
  */
 
 const theme = nativeTheme('sheet');
@@ -50,23 +40,15 @@ export default function YouScreen() {
   const stats = useQuery({ ...trpc.me.stats.queryOptions(), enabled: signedIn });
   const lists = useQuery({ ...trpc.lists.mine.queryOptions(), enabled: signedIn });
   /*
-   * The same query the routes screen runs, fetched here for a count — which sounds wasteful
-   * and is the opposite. React Query holds one cache entry for it, so the screen behind the
-   * row opens on data that is already in hand rather than on a spinner, and the row itself
-   * can say how many there are instead of saying "Routes" and making the tap the question.
+   * The same query the routes screen runs, shared through one React Query cache entry: the row
+   * can say how many there are, and the screen behind it opens on data already in hand.
    */
   const routes = useQuery({ ...trpc.routes.mine.queryOptions(), enabled: signedIn });
 
   /*
    * Your own photographs, asked for here only so a takedown has somewhere to appear.
-   *
-   * `photos.mine` is the one query in the product that returns a hidden photograph, and
-   * until this call it had no iOS caller at all — the website rendered the tombstone on
-   * `/profile` and the phone rendered nothing. A removed frame therefore left the trail
-   * gallery and silently took one off the contributed count below (this PR changed
-   * `hikerStats` to exclude hidden rows), with no notice anywhere on the device. That is
-   * exactly the silent disappearance the review tombstone exists to prevent, and half of it
-   * shipped to iOS while this half did not.
+   * `photos.mine` is the one query that returns a hidden photograph; without this call a
+   * removed frame would leave the gallery and the contributed count with no notice anywhere.
    */
   const photos = useQuery({ ...trpc.photos.mine.queryOptions({}), enabled: signedIn });
 
@@ -327,20 +309,10 @@ export default function YouScreen() {
 
       {removed.length > 0 ? (
         /*
-         * Only the removed frames, and only when there are some.
-         *
-         * The website's `/profile` prints your whole gallery with the taken-down tiles marked
-         * in place. This tab has never had a photo grid — it is the record and the settings —
-         * and inventing one here to carry a notice would be a new feature wearing a
-         * moderation fix as a hat. What the notice actually needs is that the owner is told,
-         * with the address to write to and enough to know which frame it was, which is a
-         * place name. So: the tombstones, named by trail, and nothing when nobody has had
-         * anything removed.
-         *
-         * Survey plate. This is the reader's own standing on the site, which is the one thing
-         * survey is for. The frames are already blank — `toPhoto` stripped url, thumbUrl,
-         * blurhash and caption server-side — so there is no image to draw and nothing here
-         * could print one if it tried.
+         * Only the removed frames, named by trail, and only when there are some — this tab is
+         * the record and the settings, not a photo grid. Survey plate: this is the reader's own
+         * standing on the site. `toPhoto` strips url, thumbUrl, blurhash and caption
+         * server-side, so there is no image to draw here in any case.
          */
         <Block title="Removed">
           {removed.map((photo) => (
@@ -378,11 +350,8 @@ export default function YouScreen() {
 }
 
 /**
- * The scroll container, shared by every state this screen has.
- *
- * No back control: this is a tab, and the way out of it is the bar underneath. The bottom pad
- * is a plain measure rather than the safe-area inset, because the bar already stands the
- * content off the home indicator.
+ * The scroll container, shared by every state this screen has. No back control — this is a tab.
+ * The bottom pad is a plain measure: the tab bar already clears the home indicator.
  */
 function Chrome({
   insets,
@@ -402,11 +371,8 @@ function Chrome({
 }
 
 /**
- * The hiker, or the initial standing in for them.
- *
- * A square with a hairline round it, not a circle: circular avatars carry a social-feed
- * connotation this product does not want, and a square plate reads as a specimen label, which
- * is the register everything else on the screen is written in.
+ * The hiker, or the initial standing in for them. A square with a hairline, not a circle:
+ * circular avatars read as a social feed, a square plate reads as a specimen label.
  */
 function Portrait({ src, name }: { src: string | null; name: string }) {
   return (
@@ -416,10 +382,8 @@ function Portrait({ src, name }: { src: string | null; name: string }) {
       style={styles.portrait}
       fallback={
         /*
-         * The initial, which is also where a stale avatar lands. These URLs belong to whichever
-         * identity provider signed the hiker in and stop resolving when they change their
-         * picture there — a hiker who has one is otherwise the person most likely to see an
-         * empty square on their own screen.
+         * The initial, which is also where a stale avatar lands: these URLs belong to the
+         * identity provider and stop resolving when the hiker changes their picture there.
          */
         <View style={styles.portraitEmpty}>
           <Text style={styles.portraitInitial}>
@@ -459,10 +423,8 @@ function Reading({ label, value, note }: { label: string; value: string; note: s
 }
 
 /**
- * One record, or the reason there isn't one.
- *
- * An absent record still occupies its row rather than collapsing, so the three read as a set
- * of three whether or not the ingest produced a summit elevation.
+ * One record, or the reason there isn't one. An absent record still occupies its row, so the
+ * three read as a set of three whether or not the ingest produced a summit elevation.
  */
 function Record({
   label,
@@ -504,10 +466,8 @@ function Record({
 }
 
 /**
- * Where somebody hikes, as a ranked set of proportional rules.
- *
- * The rule is distance rather than count for the same reason the cadence columns are: a region
- * with one long traverse in it is not beaten by a region with two evening laps.
+ * Where somebody hikes, as a ranked set of proportional rules. Distance rather than count: a
+ * region with one long traverse is not beaten by a region with two evening laps.
  */
 function Regions({ regions, units }: { regions: readonly HikeRegion[]; units: UnitSystem }) {
   const peak = Math.max(...regions.map((region) => region.lengthM), 1);

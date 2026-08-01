@@ -20,33 +20,22 @@ import {
 } from '@switchback/geo';
 
 /**
- * The recording engine, as a module rather than a hook.
+ * The recording engine, at module scope rather than in a hook: a recorder living in the Record
+ * screen's state would end the hike the first time somebody switched tabs. React subscribes.
  *
- * The website's recorder is a hook because a browser tab has one screen and closing it ends
- * the session either way. A phone does not work like that. The moment the app grew a tab bar,
- * a recorder living in `useState` inside the Record screen would end a hike the first time
- * someone tapped Saved to check what was next — the screen unmounts, the watch is torn down,
- * and six kilometres go with it. So the state machine lives here, at module scope, and React
- * subscribes to it. Switching tabs is now what it looks like: looking at something else.
+ * The rules are the web recorder's, and deliberately identical — both call `summariseTrack` and
+ * the same off-route watchdog out of `@switchback/geo`, so the two clients compute the same
+ * numbers from the same fixes. See `apps/web/src/components/record/use-recorder.ts`.
  *
- * Everything else is the same design the web recorder states at the top of
- * `apps/web/src/components/record/use-recorder.ts`, and deliberately so — the two clients
- * compute identical numbers from identical fixes because they call the same
- * `summariseTrack` and the same off-route watchdog out of `@switchback/geo`.
+ * 1. The buffer on the device is the truth while hiking; fixes are never removed once sent, so
+ *    a failed upload is a retry and not a hole.
+ * 2. Nothing waits for the end — a batch goes up about every minute.
+ * 3. The journal survives a crash (a file, not `localStorage`) and the recording comes back
+ *    **paused**, because the honest thing after an interruption is to ask.
  *
- * 1. **The buffer on the device is the truth while hiking.** Fixes are never removed once
- *    sent, so a failed upload is a retry and not a hole.
- * 2. **Nothing waits for the end.** A batch goes up about every minute.
- * 3. **The journal survives a crash**, here as a file rather than `localStorage`, and the
- *    recording comes back **paused** — the honest thing to say after an interruption is
- *    "you were recording; carry on?" rather than pretending the gap did not happen.
- *
- * **What this cannot do in Expo Go.** Background location needs a native task registration
- * that the Expo Go client does not carry, so recording runs while the app is in the
- * foreground. The screen is held awake for the duration, which is what keeps that honest
- * rather than surprising, and the Record screen says so in as many words. A development
- * build lifts the limitation without changing anything here: `expo-task-manager` would feed
- * the same `pushFix` this file already exposes.
+ * Expo Go carries no background-location task registration, so recording only runs in the
+ * foreground and the screen is held awake for the duration. A development build lifts that
+ * without changing anything here: `expo-task-manager` would feed the same `pushFix`.
  */
 
 export type RecorderPhase = 'idle' | 'locating' | 'recording' | 'paused' | 'saving';
@@ -57,13 +46,9 @@ export interface RecorderSnapshot {
   startedAt: Date | null;
   trailId: string | null;
   /**
-   * The planned route being hiked, if the hike was started from one.
-   *
-   * Beside `trailId` rather than instead of it, because they are different claims. A trail
-   * id says "this hike is on a line other people have hiked and the catalogue holds"; a
-   * route id says "this hike is following a line I drew myself". Only one is ever set, and
-   * the server only knows about the first — `activities.start` takes no route — so this is
-   * the device's own note about what the wrong-turn watchdog is watching.
+   * The planned route being hiked, if the hike was started from one. Never set alongside
+   * `trailId`, and unknown to the server — `activities.start` takes no route, so this is the
+   * device's own note about what the wrong-turn watchdog is watching.
    */
   routeId: string | null;
   /** Seconds of wall clock since the hike began, ticking while it runs. */
@@ -109,19 +94,14 @@ interface Journal {
   startedAt: number;
   trailId: string | null;
   /**
-   * Optional on read, always written. A journal from a build before planned routes existed
-   * simply has no key here and restores as `null`, so no version bump is needed — and a
-   * version bump would have thrown that hike away, which is the one thing a crash journal
-   * exists to prevent.
+   * Optional on read, always written. A journal from before planned routes existed restores as
+   * `null`, so no version bump is needed — and a bump would throw that hike away, which is the
+   * one thing a crash journal exists to prevent.
    */
   routeId: string | null;
   fixes: TrackFix[];
   sent: number;
 }
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
 
 const listeners = new Set<() => void>();
 
@@ -161,9 +141,8 @@ let flushing = false;
 let hydrated = false;
 
 /**
- * `summariseTrack` hikes the whole buffer, so it is computed once per emit rather than once
- * per reader. On a six-hour hike the buffer is ~20,000 fixes and four subscribed components
- * would otherwise each re-derive it every second.
+ * `summariseTrack` walks the whole buffer, so it is computed once per emit rather than once per
+ * reader — on a six-hour hike that is ~20,000 fixes times four subscribers, every second.
  */
 let statsCache: ActivityStats = summariseTrack([]);
 let snapshot: RecorderSnapshot = build();
@@ -214,10 +193,6 @@ export function useRecording(): RecorderSnapshot {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-// ---------------------------------------------------------------------------
-// The hike, as the tab bar needs it
-// ---------------------------------------------------------------------------
-
 export interface ActiveHike {
   /** Elapsed, formatted for a label: `12:04`, or `1:12:04` past the hour. */
   clock: string;
@@ -260,10 +235,6 @@ export function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-// ---------------------------------------------------------------------------
-// Journal
-// ---------------------------------------------------------------------------
-
 function journalFile(): FileSystem.File {
   return new FileSystem.File(FileSystem.Paths.document, JOURNAL_NAME);
 }
@@ -284,9 +255,8 @@ function persist(): void {
     if (!file.exists) file.create({ intermediates: true });
     file.write(JSON.stringify(journal));
   } catch {
-    // A full disk, most likely. The recording is unaffected — only its ability to survive
-    // a crash is, and telling someone mid-hike that their journal did not write is a worse
-    // outcome than quietly carrying on.
+    // A full disk, most likely. Only the ability to survive a crash is affected, and saying so
+    // mid-hike is worse than carrying on.
   }
 }
 
@@ -317,8 +287,7 @@ function parseJournal(raw: string): Journal | null {
       sent: typeof record.sent === 'number' ? record.sent : 0,
     };
   } catch {
-    // A corrupt journal is worse than none: it would put the recorder into a state whose
-    // activity id may not exist on the server. Drop it and start clean.
+    // A corrupt journal is worse than none — its activity id may not exist on the server.
     return null;
   }
 }
@@ -357,10 +326,6 @@ export function hydrate(): void {
   phase = 'paused';
   emit();
 }
-
-// ---------------------------------------------------------------------------
-// The position watch
-// ---------------------------------------------------------------------------
 
 function pushFix(reading: Location.LocationObject): void {
   if (!startedAt) return;
@@ -409,9 +374,8 @@ function pushFix(reading: Location.LocationObject): void {
   persist();
 
   if (route && route.length >= 2) {
-    // `updateOffRoute` measures its own timings in milliseconds — unlike `TrackFix.t`, which
-    // is seconds since the start. Passing the wrong one makes the watchdog fire after 45 ms
-    // or after 45,000 seconds, and both look like it is broken.
+    // `updateOffRoute` measures its own timings in milliseconds, unlike `TrackFix.t` which is
+    // seconds since the start. The wrong one fires the watchdog after 45 ms or 45,000 seconds.
     const update = updateOffRoute(
       offRouteState,
       { t: Date.now(), lng: longitude, lat: latitude, accuracyM: accuracy ?? null },
@@ -456,15 +420,15 @@ async function startWatch(): Promise<void> {
     return;
   }
 
-  // The screen stays on for the duration. Without background location this is not a nicety
-  // — it is the only thing keeping the hike being recorded, and the Record screen says so.
+  // The screen stays on for the duration. Without background location this is the only thing
+  // keeping the hike being recorded, and the Record screen says so.
   void KeepAwake.activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => undefined);
 
   try {
     watch = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
-        // One a second, and never a cached one: on a hike, a fix from five minutes ago is a
+        // One a second, and never a cached one: on a hike a fix from five minutes ago is a
         // wrong answer dressed as a right one.
         timeInterval: 1000,
         distanceInterval: 0,
@@ -485,16 +449,12 @@ function stopWatch(): void {
 }
 
 /**
- * The recorder's latest reading, stamped, or nothing.
+ * The recorder's latest reading, stamped, or nothing. Exported for the Lifeline, which reuses a
+ * fix the warm radio has already paid for; the stamp is what makes that safe, since a Lifeline
+ * must never send an old fix and only the caller can judge how old is too old.
  *
- * Exported for the Lifeline, which would rather spend a fix that has already been paid for:
- * while a hike is recording the watch is running and the radio is warm, so asking the GPS for
- * its own position would wake it a second time for the same answer. The stamp is what makes
- * that safe — a Lifeline must never send an old fix, and only the caller can judge how old is
- * too old. See `freshFix` in `@/record/lifeline`.
- *
- * Null between hikes, and null immediately after a crash is recovered: the journal restores
- * the last recorded position but not a claim about when it was true.
+ * Null between hikes and immediately after a crash is recovered: the journal restores the last
+ * position but not a claim about when it was true. See `freshFix` in `@/record/lifeline`.
  */
 export function latestFix(): RecordedFix | null {
   if (!position || positionAt == null) return null;
@@ -513,10 +473,6 @@ async function buzz(kind: 'left' | 'returned'): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Uploading
-// ---------------------------------------------------------------------------
-
 /** Set once, at the app root, where the tRPC client already exists. */
 export function setUploader(next: Uploader | null): void {
   uploader = next;
@@ -530,7 +486,7 @@ export async function flush(): Promise<void> {
   syncing = true;
   emit();
   try {
-    // One batch per call, oldest first. Draining the whole backlog in a loop would turn a
+    // One batch per call, oldest first: draining the whole backlog in a loop would turn a
     // reconnection after an hour of no signal into sixty simultaneous requests.
     while (fixes.length - sent > 0) {
       const from = sent;
@@ -542,8 +498,7 @@ export async function flush(): Promise<void> {
     lastSyncAt = new Date();
     syncError = null;
   } catch (cause) {
-    // Left in the buffer, so the next flush retries it. `sent` only ever advances past
-    // fixes the server has acknowledged.
+    // Left in the buffer for the next flush. `sent` only ever advances past acknowledged fixes.
     syncError = cause instanceof Error ? cause.message : 'Could not save the last few minutes.';
     throw cause;
   } finally {
@@ -580,10 +535,6 @@ function stopClock(): void {
   clearInterval(clockTimer);
   clockTimer = null;
 }
-
-// ---------------------------------------------------------------------------
-// Controls
-// ---------------------------------------------------------------------------
 
 export interface BeginArgs {
   id: string;

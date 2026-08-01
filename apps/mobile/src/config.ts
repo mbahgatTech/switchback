@@ -1,26 +1,15 @@
 import Constants from 'expo-constants';
 
 /**
- * Where the API lives.
- *
- * In production this is a constant. In development it is a small puzzle worth solving
- * properly: the app runs in Expo Go *on a phone*, so `localhost` is the phone itself and
- * points at nothing. The usual workaround is to paste a LAN IP into a file and re-paste it
- * every time the router reassigns one.
- *
- * Metro already knows the answer. Expo exposes the host the bundle was served from, and
- * the machine serving the bundle is the machine running `next dev` — so the API is that
- * same host on port 3000, derived rather than configured.
+ * Where the API lives. A constant in production; in development it is derived rather than
+ * configured — a phone cannot reach `localhost`, but Expo exposes the host Metro served the
+ * bundle from, and that machine is the one running `next dev`.
  */
 const DEV_API_PORT = 3000;
 
 /**
- * Both fields below are read as `unknown` and narrowed rather than trusted.
- *
- * That is not defensive habit: `extra` is typed `Record<string, any>` because its contents
- * are whatever `app.config.ts` put there, and `expoGoConfig` is populated only under Expo
- * Go — it is absent in a dev client and in a release build. Narrowing turns both into the
- * `string | null` the rest of the file already has to handle.
+ * `extra` is typed `Record<string, any>` and `expoGoConfig` exists only under Expo Go, so both
+ * are read as `unknown` and narrowed to the `string | null` the rest of the file handles.
  */
 function nonEmptyString(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
@@ -34,17 +23,15 @@ function field(source: unknown, key: string): string | null {
 function configuredApiUrl(): string | null {
   const fromExtra = field(Constants.expoConfig?.extra, 'apiUrl');
   if (fromExtra) return fromExtra;
-  // `EXPO_PUBLIC_*` is inlined by Metro at bundle time, so this is a literal by the time it
-  // runs. Checked second: an explicit value in `extra` came from the same variable anyway,
-  // and this branch is the escape hatch for a bundle built without app.config.ts running.
+  // `EXPO_PUBLIC_*` is inlined by Metro at bundle time and is readable by anyone holding the
+  // app — never put a secret behind it. Checked second: it is the escape hatch for a bundle
+  // built without app.config.ts running.
   return nonEmptyString(process.env.EXPO_PUBLIC_API_URL);
 }
 
 function metroHost(): string | null {
-  /**
-   * `hostUri` is "192.168.1.42:8081" in Expo Go and on a dev client. `debuggerHost` is the
-   * older field, still the only one populated in some Expo Go builds — hence both.
-   */
+  // `hostUri` is "192.168.1.42:8081" in Expo Go and on a dev client; `debuggerHost` is the
+  // older field, still the only one populated in some Expo Go builds — hence both.
   const hostUri =
     nonEmptyString(Constants.expoConfig?.hostUri) ?? field(Constants.expoGoConfig, 'debuggerHost');
   if (!hostUri) return null;
@@ -58,11 +45,8 @@ export function apiBaseUrl(): string {
   const host = metroHost();
   if (host) return `http://${host}:${DEV_API_PORT}`;
 
-  /**
-   * Reached only in a production bundle with no `EXPO_PUBLIC_API_URL`, which is a build
-   * misconfiguration rather than a runtime condition — every request would 404 against a
-   * host that does not exist. Failing here names the actual problem.
-   */
+  // Reached only in a production bundle with no `EXPO_PUBLIC_API_URL` — a build
+  // misconfiguration, not a runtime condition. Failing here names the actual problem.
   throw new Error(
     'No API URL: set EXPO_PUBLIC_API_URL in the root .env before building a release bundle.',
   );

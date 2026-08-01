@@ -7,27 +7,17 @@ import { type TokenPair, adopt } from './session';
 import { clearPendingHandshake, readPendingHandshake, writePendingHandshake } from './storage';
 
 /**
- * Signing in, by way of a browser.
+ * Signing in, by way of a browser. The app never talks to Entra: it opens *our* sign-in page in
+ * a system browser sheet, the server completes OIDC against its own registered `https://`
+ * redirect URI, and the browser deep-links back with a one-time code. See `docs/mobile.md` and
+ * `packages/api/src/mobile-auth.ts`.
  *
- * The app never talks to Entra. It opens *our* sign-in page in a system browser sheet, the
- * server completes OIDC against its own registered `https://` redirect URI, and the browser
- * comes back to a deep link carrying a one-time code. The full reasoning — and why the direct
- * `expo-auth-session` route is unavailable in Expo Go — is in
- * `packages/api/src/mobile-auth.ts` and `docs/mobile.md`.
+ * The code arriving over `switchback://` is not on its own a credential — any app can register
+ * a URL scheme it does not own. The server also demands the **verifier**, 256 bits generated
+ * here, kept in the Keychain and sent only over TLS; the browser leg carries only its SHA-256.
  *
- * The one thing this file must get right is that the code arriving over `switchback://` or
- * `exp://` is not on its own a credential. Any app on the device can register a URL scheme it
- * does not own, so a code intercepted there has to be worthless. It is: the server also
- * demands the **verifier**, 256 bits generated here, stored in the Keychain, and sent only
- * over TLS to the API. The browser leg carries its SHA-256 and never the value.
- *
- * There are two ways back in, and both end in the same claim:
- *
- * - **The sheet returns.** `openAuthSessionAsync` watches for the return URL, dismisses
- *   itself, and hands us the URL directly. The screen never unmounts.
- * - **The app was killed while the sheet was open.** iOS delivers the deep link as a cold
- *   start, expo-router routes it to `/signin`, and the screen finds `code` in its params.
- *   That is the only reason the verifier is in the Keychain rather than in a local.
+ * The verifier is in the Keychain rather than a local because iOS may deliver the deep link as
+ * a cold start, with the app killed while the sheet was open.
  */
 
 export type SignInOutcome =
@@ -37,12 +27,8 @@ export type SignInOutcome =
 const RETURN_PATH = '/signin';
 
 /**
- * What the server may say went wrong, in words for somebody holding a phone.
- *
- * Anything not listed gets the generic line. These are the codes `mobile-auth.ts` can put on
- * the deep link; `invalid_grant` is the one the claim endpoint returns, and it deliberately
- * covers four different server-side causes with one message, because the answer to all four
- * is the same.
+ * The codes `mobile-auth.ts` can put on the deep link, in words for somebody holding a phone.
+ * `invalid_grant` deliberately covers four server-side causes: the answer to all four is one.
  */
 const REASONS: Record<string, string> = {
   expired: 'That took longer than fifteen minutes, so the sign-in lapsed. Try again.',
@@ -58,11 +44,8 @@ function reasonFor(code: string): string {
 }
 
 /**
- * The name this device shows up as under "signed-in devices".
- *
- * Cosmetic, and treated as such by the server, which trims it and never trusts it. `null`
- * rather than a fabricated "iPhone" when the OS will not say: an honest blank is more use in
- * that list than a label every device shares.
+ * The name this device shows up as under "signed-in devices". Cosmetic, and never trusted by
+ * the server. `null` rather than a fabricated "iPhone" when the OS will not say.
  */
 function deviceName(): string | null {
   return typeof Constants.deviceName === 'string' && Constants.deviceName.length > 0
@@ -87,11 +70,9 @@ async function challengeFor(verifier: string): Promise<string> {
 }
 
 /**
- * Built by hand rather than with `URL`.
- *
- * React Native's `URL` is a partial polyfill and `searchParams` on it has been incomplete for
- * long enough that relying on it here — where a mangled `redirect` parameter means the browser
- * never comes home — is not worth the tidier code.
+ * Built by hand rather than with `URL`: React Native's is a partial polyfill whose
+ * `searchParams` has long been incomplete, and a mangled `redirect` means the browser never
+ * comes home.
  */
 function startUrl(challenge: string, returnUrl: string): string {
   const name = deviceName();
@@ -108,11 +89,9 @@ function firstParam(value: string | string[] | undefined | null): string | null 
 }
 
 /**
- * Open the browser, wait for it, and sign in if it came back with a code.
- *
- * `dismiss` and `cancel` are both the user closing the sheet, which is a decision rather than
- * a fault — hence a distinct outcome, so the screen can go quiet instead of showing an error
- * for something the user did on purpose.
+ * Open the browser, wait for it, and sign in if it came back with a code. `dismiss` and
+ * `cancel` are the user closing the sheet — a decision, not a fault, so they get their own
+ * outcome and the screen stays quiet.
  */
 export async function signInWithBrowser(): Promise<SignInOutcome> {
   const verifier = await newVerifier();
@@ -155,10 +134,9 @@ export async function signInWithBrowser(): Promise<SignInOutcome> {
 }
 
 /**
- * Finish a handshake whose deep link arrived without the sheet — the cold-start path.
- *
- * Returns `cancelled` when there is no stored verifier, which is what a stale link tapped
- * days later looks like. Not an error: nothing went wrong, there is simply nothing to finish.
+ * Finish a handshake whose deep link arrived without the sheet — the cold-start path. Returns
+ * `cancelled` when there is no stored verifier, which is what a stale link tapped days later
+ * looks like: nothing went wrong, there is simply nothing to finish.
  */
 export async function resumeSignIn(state: string, code: string): Promise<SignInOutcome> {
   const pending = await readPendingHandshake();
@@ -177,9 +155,9 @@ async function claim(requestId: string, code: string, verifier: string): Promise
     });
   } catch {
     /*
-     * The code is still good and the verifier is still in the Keychain, so this is left
-     * pending on purpose — hiking out of signal mid-sign-in should be retryable, and the
-     * server's own window is what eventually closes it.
+     * Left pending on purpose: the code is still good and the verifier is still in the
+     * Keychain, so hiking out of signal mid-sign-in stays retryable until the server's own
+     * window closes it.
      */
     return {
       kind: 'failed',

@@ -2,18 +2,12 @@ import { authUrl } from '@/config';
 import { clearRefreshToken, readRefreshToken, writeRefreshToken } from './storage';
 
 /**
- * The token lifecycle.
+ * The token lifecycle. A plain module, not a hook: the tRPC link needs an access token while
+ * building headers, outside React's render, where a stale closure would send an expired token.
  *
- * Deliberately a plain module rather than a hook: the tRPC link needs an access token
- * while building request headers, which happens outside React's render, and a stale
- * closure over a `useState` value there would send an expired token forever.
- *
- * The one hard rule in this file is **single-flight refresh**, and it is a correctness
- * requirement rather than an optimisation. The server rotates refresh tokens and treats a
- * *replaced* token coming back as theft, revoking every session the user has. A batched
- * screen load that fires three queries at once would, without the shared promise below,
- * present the same refresh token three times and sign the user out of all their devices
- * as their reward for opening the app.
+ * **Single-flight refresh is correctness, not optimisation.** The server rotates refresh tokens
+ * and treats a replaced one coming back as theft, revoking every session. Without the shared
+ * promise below, a batched screen load would present the same token three times.
  */
 
 export interface TokenPair {
@@ -71,22 +65,14 @@ async function rotate(): Promise<string | null> {
       body: JSON.stringify({ refreshToken }),
     });
   } catch {
-    /**
-     * Offline, or the dev server is not running. Emphatically *not* a reason to discard the
-     * refresh token — the whole point of an app that works on a mountain is that losing
-     * signal does not sign you out. The caller gets null, the request fails as
-     * unauthenticated, and the next attempt tries again with the token still in place.
-     */
+    // Offline, or the dev server is down. Emphatically *not* a reason to discard the refresh
+    // token: losing signal on a mountain must not sign anybody out.
     return null;
   }
 
   if (!response.ok) {
-    /**
-     * 401 means the token is unknown, expired, revoked, or reused — the server refuses to
-     * say which, and the app's response is the same for all four: this credential is dead,
-     * so drop it and show the sign-in screen. Any other status is the server having a bad
-     * day, and keeping the token lets a retry succeed once it recovers.
-     */
+    // Only a 401 is the server saying this credential is dead. Any other status is a bad day,
+    // and keeping the token lets a retry succeed once it recovers.
     if (response.status === 401) await signOutLocally();
     return null;
   }
@@ -97,11 +83,7 @@ async function rotate(): Promise<string | null> {
   return pair.accessToken;
 }
 
-/**
- * A valid access token, refreshing if needed, or null when not signed in.
- *
- * Concurrent callers share one rotation — see the single-flight note at the top.
- */
+/** A valid access token, refreshing if needed, or null when not signed in. Single-flight. */
 export async function getAccessToken(): Promise<string | null> {
   if (accessToken && Date.now() < accessExpiresAt - REFRESH_SKEW_MS) return accessToken;
 
@@ -119,13 +101,8 @@ async function signOutLocally(): Promise<void> {
 }
 
 /**
- * Sign out this device.
- *
- * The server call is best-effort and its result is ignored: if the network is down, the
- * user still expects the app to be signed out when it comes back to the foreground. The
- * token dies of old age within 60 days regardless, and a user worried about a lost phone
- * has "sign out everywhere", which is a server-side operation that does not depend on the
- * lost phone cooperating.
+ * Sign out this device. The server call is best-effort and its result ignored — the app must
+ * be signed out even with the network down. A lost phone is what "sign out everywhere" is for.
  */
 export async function signOut(): Promise<void> {
   const refreshToken = await readRefreshToken();

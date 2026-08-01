@@ -4,30 +4,19 @@ import superjson from 'superjson';
 import type { RouterOutputs } from '@switchback/api';
 
 /**
- * Trails saved onto the phone.
+ * Trails saved onto the phone. A module rather than a hook, like `@/record/store`: the trail
+ * screen, the download control and the storage manager all read the same index.
  *
- * A module rather than a hook, for the same reason `@/record/store` is one: this is state
- * that belongs to the app, not to whichever screen happens to be mounted. The trail screen,
- * the download control and the storage manager all read the same index, and a save started
- * on one of them has to be visible on the other two the moment it lands.
+ * Two files per trail plus one small index. `manifest.json` is read synchronously at launch;
+ * the payload — thousands of elevation points on a long route — lives in `<trailId>/trail.json`
+ * and is read only when that trail is opened.
  *
- * **Two files per trail, plus one small index.** `manifest.json` is a flat list of what is
- * saved — name, size, when — and it is read synchronously at launch. The payload for one
- * trail, which for a long route is thousands of elevation points, lives in its own
- * `<trailId>/trail.json` and is read only when somebody opens that trail. Reading every
- * payload at startup would parse megabytes on the JS thread to draw a list of names.
+ * The payload is superjson, not `JSON.stringify`: photos and reports carry real `Date`s over the
+ * superjson tRPC link, and plain JSON would hand back strings that break *only* offline. The
+ * index stays plain JSON so it stays readable when a payload from an older build is not.
  *
- * **superjson, not `JSON.stringify`.** A photo carries `capturedAt` and `createdAt` as real
- * `Date`s, and reports carry dates too — they arrive that way because the tRPC link is
- * superjson end to end. Plain JSON would quietly hand back strings, and the components that
- * format them would break *only* offline, which is the worst place to find out. The index is
- * plain JSON deliberately: it holds nothing but strings and numbers, and it has to be
- * readable even if a payload written by an older build is not.
- *
- * **Documents, not Caches.** iOS empties Caches under storage pressure. A download somebody
- * made the night before a hike with no signal is exactly the file the system would take, so
- * it goes in Documents, which is never reclaimed. The cost is that these bytes are included
- * in the device backup; that is the right side of the trade for data somebody asked for.
+ * Documents, not Caches: iOS empties Caches under storage pressure, and a download made the
+ * night before a signal-less hike is exactly the file it would take. The cost is device backup.
  */
 
 /** Bumped when the shape of a stored payload changes. Old copies are dropped, not migrated. */
@@ -54,11 +43,8 @@ export interface OfflineTrailSummary {
 }
 
 /**
- * Everything one saved trail can answer without a network.
- *
- * No size and no save time: both are measurements *of* this file and the frames beside it,
- * so they cannot be inside it without being written before they are known. They live in the
- * index, which is written after the payload and is where every screen reads them from.
+ * Everything one saved trail can answer without a network. No size and no save time: both are
+ * measurements *of* this file, so they live in the index, which is written after the payload.
  */
 export interface OfflineTrail {
   version: number;
@@ -86,10 +72,6 @@ const listeners = new Set<() => void>();
  */
 let index: OfflineIndex = { ready: false, trails: [], bytes: 0 };
 
-/* -------------------------------------------------------------------------- */
-/* Where things live                                                          */
-/* -------------------------------------------------------------------------- */
-
 function root(): Directory {
   return new Directory(Paths.document, 'offline');
 }
@@ -99,9 +81,8 @@ function manifestFile(): File {
 }
 
 /**
- * A trail id is a cuid, so this is belt and braces — but it is the one string from the
- * server that gets concatenated into a filesystem path, and a `../` in it would write
- * outside the offline directory. Cheaper to check than to reason about.
+ * A trail id is a cuid, so this is belt and braces — but it is the one server string
+ * concatenated into a filesystem path, and a `../` would write outside the offline directory.
  */
 function safeId(trailId: string): string {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(trailId)) throw new Error('Bad trail id.');
@@ -121,10 +102,6 @@ function payloadFile(trailId: string): File {
   return new File(trailDirectory(trailId), 'trail.json');
 }
 
-/* -------------------------------------------------------------------------- */
-/* Reading                                                                     */
-/* -------------------------------------------------------------------------- */
-
 function isSummary(value: unknown): value is OfflineTrailSummary {
   if (typeof value !== 'object' || value === null) return false;
   const row = value as Partial<OfflineTrailSummary>;
@@ -141,8 +118,8 @@ function readManifest(): OfflineTrailSummary[] {
     if (!Array.isArray(rows)) return [];
     return rows.filter(isSummary);
   } catch {
-    // A truncated index is a save that died mid-write. Everything on disk is still there
-    // and still reconcilable below; losing the index costs one re-download, not a crash.
+    // A truncated index is a save that died mid-write. Everything on disk is still there and
+    // reconcilable below; losing the index costs one re-download, not a crash.
     return [];
   }
 }
@@ -155,14 +132,10 @@ function writeManifest(trails: readonly OfflineTrailSummary[]): void {
 }
 
 /**
- * Read disk and reconcile the index against it.
- *
- * The reconciliation is what makes an interrupted save harmless. A download writes its
- * directory first and its index entry last, so a crash in between leaves a directory the
- * index has never heard of — an orphan holding real bytes that no screen can show and no
- * button can remove. Those get deleted here. The mirror case, an index entry whose payload
- * is gone, is dropped from the index for the same reason: it would offer a download that
- * cannot open.
+ * Read disk and reconcile the index against it, which is what makes an interrupted save
+ * harmless. A download writes its directory first and its index entry last, so a crash between
+ * the two leaves an orphan directory — deleted here. An index entry whose payload is gone is
+ * dropped for the mirror reason: it would offer a download that cannot open.
  */
 function reload(): void {
   let trails: OfflineTrailSummary[] = [];
@@ -211,11 +184,8 @@ function subscribe(listener: () => void): () => void {
 }
 
 /**
- * Hydration happens on the first read rather than from a bridge at the app root.
- *
- * The work is a directory listing and one small `JSON.parse`, synchronous and measured in
- * single-digit milliseconds, and doing it lazily means a launch that never opens a trail
- * never touches the disk at all. Every read after the first returns the cached object.
+ * Hydrated on first read rather than from a bridge at the app root: the work is a directory
+ * listing and one small `JSON.parse`, so a launch that never opens a trail never touches disk.
  */
 function getIndex(): OfflineIndex {
   if (!index.ready) reload();
@@ -247,21 +217,16 @@ export interface OfflineCopy {
   /** The payload, or null when there is none. */
   trail: OfflineTrail | null;
   /**
-   * False only while the read is still in flight.
-   *
-   * A screen needs this to tell "no copy" from "not looked yet". Without it, a trail opened
-   * out of signal races its own disk read: the fetch fails, the screen has no data, and it
-   * says the trail cannot be found — on a phone that is holding all of it. Waiting for
-   * `settled` costs a few milliseconds and removes that entirely.
+   * False only while the read is still in flight. Screens need it to tell "no copy" from "not
+   * looked yet" — without it a trail opened out of signal races its own disk read and reports
+   * that it cannot be found, on a phone holding all of it.
    */
   settled: boolean;
 }
 
 /**
- * The stored payload for one trail, read off disk in the background.
- *
- * Re-reads when `savedAt` moves, which is how an "Update" repaints the screen with what it
- * has just fetched.
+ * The stored payload for one trail, read off disk in the background. Re-reads when `savedAt`
+ * moves, which is how an "Update" repaints the screen with what it has just fetched.
  */
 export function useOfflineCopy(slug: string | null | undefined): OfflineCopy {
   const saved = useOfflineSaved(slug);
@@ -286,8 +251,8 @@ export function useOfflineCopy(slug: string | null | undefined): OfflineCopy {
 
   if (trailId === null || savedAt === null) return { trail: null, settled: true };
 
-  // Keyed on the save, so a read that belongs to the previous trail — or to the copy this
-  // one just replaced — counts as not-yet-read rather than as an answer.
+  // Keyed on the save, so a read belonging to the previous trail — or to the copy this one just
+  // replaced — counts as not-yet-read rather than as an answer.
   if (read === null || read.key !== `${trailId}:${savedAt}`) return { trail: null, settled: false };
   return { trail: read.trail?.slug === slug ? read.trail : null, settled: true };
 }
@@ -304,17 +269,10 @@ export async function readTrail(trailId: string): Promise<OfflineTrail | null> {
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Writing                                                                     */
-/* -------------------------------------------------------------------------- */
-
 /**
- * Clear the ground for a save.
- *
- * A download always starts from an empty directory rather than writing over what is there.
- * An update that fetched eleven frames where the last one fetched twelve would otherwise
- * leave the twelfth behind — bytes charged to the download, referenced by nothing, and
- * removed only when the whole trail is.
+ * Clear the ground for a save. A download always starts from an empty directory: an update
+ * fetching eleven frames where the last fetched twelve would otherwise leave the twelfth
+ * behind, charged to the download and referenced by nothing.
  */
 export function resetTrailDirectory(trailId: string): Directory {
   const dir = trailDirectory(trailId);
@@ -343,10 +301,9 @@ export function directoryBytes(dir: Directory): number {
 }
 
 /**
- * Put a trail in the index, replacing any earlier entry for it.
- *
- * Written last, on purpose: until this returns, the download does not exist as far as any
- * screen is concerned, and a crash before it leaves an orphan that hydration cleans up.
+ * Put a trail in the index, replacing any earlier entry. Written last on purpose: until it
+ * returns the download does not exist to any screen, and a crash before it leaves an orphan
+ * hydration cleans up.
  */
 export function recordTrail(summary: OfflineTrailSummary): void {
   const trails = [summary, ...getIndex().trails.filter((row) => row.trailId !== summary.trailId)];

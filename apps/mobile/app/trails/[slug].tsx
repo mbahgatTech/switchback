@@ -58,16 +58,8 @@ import { useOfflineCopy } from '@/offline/store';
 import { useRecorderActions, useRecording } from '@/record/store';
 
 /**
- * One trail.
- *
- * The reading screen, so it is `sheet` — the same reversal the website makes when a trail
- * page opts out of the document's dark scheme. The app is a map first and dark by default;
- * a page of prose, figures and provenance is not the map.
- *
- * **The section graphic carries the geography, not a map.** The explore tab is where a map
- * belongs; here the question is what the hike is like rather than where it is, and a profile
- * you can scrub answers that better than a thumbnail of a line. It gets the whole width for
- * the same reason.
+ * One trail. Drawn in `sheet` rather than the app's default `field` — this is a reading screen,
+ * not the map. The geography is carried by the scrubbable section graphic, not a thumbnail map.
  */
 
 const theme = nativeTheme('sheet');
@@ -93,11 +85,8 @@ const BUSYNESS_MESSAGE =
   'Busy times could not be worked out just now. Everything else on this screen is unaffected.';
 
 /**
- * SAC grades with their T-numbers, the same table the website prints.
- *
- * Shortened from the Swiss Alpine Club's own descriptions rather than paraphrased. The bare
- * OSM value means nothing to a reader and the T-number means everything to anyone who has
- * hiked in the Alps, so both are shown.
+ * SAC grades with their T-numbers, the same table the website prints. Both are shown: the bare
+ * OSM value means nothing to a reader, the T-number means everything to an Alpine hiker.
  */
 const SAC_LABEL: Record<SacScale, { grade: string; text: string }> = {
   hiking: { grade: 'T1', text: 'Well marked, no head for heights needed' },
@@ -118,15 +107,8 @@ export default function TrailScreen() {
   const { status } = useAuth();
 
   /**
-   * The hiker's own units, for every figure on this screen.
-   *
-   * Read once and passed down, because the alternative is what was here: `'metric'` inlined
-   * at fourteen call sites as a placeholder while the setting was being built, and never
-   * replaced. Changing units in Settings moved a column in the database and nothing on this
-   * page. Every other screen in the app already binds it this way — this one was the outlier.
-   *
-   * Signed out there is nobody to have a preference, so metric stands. Offline the query has
-   * no answer either, and the trail read off the disk is measured the same way it was drawn.
+   * The hiker's own units, read once and passed to every figure on this screen. Signed out
+   * there is nobody to have a preference; offline the query has no answer either, so metric.
    */
   const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: status === 'signedIn' });
   const units: UnitSystem = me.data?.units ?? 'metric';
@@ -136,10 +118,8 @@ export default function TrailScreen() {
   );
 
   /*
-   * The copy on the phone, put back under the same query keys the live ones use. Nothing
-   * below this line knows a download exists: `query.data` is the saved trail when there is
-   * no signal and the fetched one the moment there is, and the gallery and the reports are
-   * seeded the same way. See `@/offline/hydrate`.
+   * The phone's copy, put back under the same query keys the live ones use, so nothing below
+   * this line knows a download exists. See `@/offline/hydrate`.
    */
   const offline = useOfflineCopy(slug);
   useOfflineHydration(offline.trail);
@@ -153,12 +133,9 @@ export default function TrailScreen() {
   const [cursorDistanceM, setCursorDistanceM] = useState<number | null>(null);
 
   /**
-   * The hike, which on an out-and-back is not the line OSM drew.
-   *
-   * A spur is mapped once, uphill, and stored that way, while every published figure for it —
-   * `totalM` on the next line included — describes the round trip. `hikedProfile` decides from
-   * the geometry which of the two the stored line is, so the section, its cursor readout and
-   * the stat block above cannot disagree about how long the day is.
+   * The hike, which on an out-and-back is not the line OSM drew: the spur is mapped once but
+   * every published figure describes the round trip. `hikedProfile` reconciles the two, so the
+   * section, its cursor readout and the stat block cannot disagree about how long the day is.
    */
   const profile = useMemo(
     () =>
@@ -174,17 +151,12 @@ export default function TrailScreen() {
   const hasProfile = profile.length >= 2;
 
   /**
-   * The start time, and the two questions that hang off it.
+   * The start time, held here rather than in Conditions or BusyTimes because the recommendation
+   * from one is the input to the other.
    *
-   * Busy times answers *when should I go*; conditions answers *what will it be like when I
-   * do*. Held here rather than in either component because the recommendation from one is
-   * the input to the other — without that, a reader has to carry “quietest Tuesday around
-   * six” up the screen by hand and re-enter it.
-   *
-   * The offset is never computed on this device. `forecast.startAt` arrives carrying the
-   * trail's real UTC offset, so every other start time is that string with the date and the
-   * hour swapped — which is what lets the phone do this without a timezone database Hermes
-   * cannot supply. See `@switchback/core`'s `localtime`.
+   * The UTC offset is never computed on this device — Hermes has no timezone database.
+   * `forecast.startAt` arrives carrying the trail's real offset and every other start time is
+   * that string with the date and hour swapped. See `@switchback/core`'s `localtime`.
    */
   const [start, setStart] = useState<{ date: string; hour: number } | null>(null);
   const anchor = useRef<{ date: string; offset: string } | null>(null);
@@ -283,19 +255,11 @@ export default function TrailScreen() {
   );
 
   /**
-   * Scrubbing, without taking the page hostage.
-   *
-   * The section sits two-thirds of the way down a long scroll, so claiming the touch on
-   * press would mean a swipe that starts on the graphic cannot scroll the page. Instead the
-   * responder is only claimed once the finger has travelled further across than down: a
-   * vertical swipe reaches the `ScrollView` untouched, a horizontal one scrubs.
-   *
+   * Scrubbing without taking the page hostage. The responder is claimed only once the finger
+   * has travelled further across than down, so a vertical swipe still reaches the `ScrollView`;
    * `onPanResponderTerminationRequest` then refuses to hand it back, or the `ScrollView`
-   * reclaims the gesture the moment a scrub drifts a few points off the horizontal.
-   *
-   * The cursor stays where the finger lifts. On a pointer the readout can follow the mouse
-   * and clear on exit; a finger is opaque and has to be moved away before the number under
-   * it can be read at all.
+   * reclaims a scrub that drifts off the horizontal. The cursor stays where the finger lifts —
+   * a finger is opaque, so the number under it can only be read once it has moved away.
    */
   const pan = useMemo(
     () =>
@@ -387,16 +351,9 @@ export default function TrailScreen() {
       </View>
 
       {/*
-       * Above the controls that start a hike, deliberately.
-       *
-       * Everything below this line is written to be encouraging — save it, hike it, download
-       * it — and a route up a 55° face reads exactly like a route up a valley once it is
-       * wearing that furniture. If the ground is steeper than hiking, the reader has to have
-       * been told before they are offered the button, not after.
-       *
-       * Survey red, which this product spends on two things only: your own safety, and
-       * controls that destroy data. Nothing else is allowed to borrow the plate, which is
-       * what makes it mean something here.
+       * Above the controls that start a hike, deliberately: everything below is written to be
+       * encouraging, and a route up a 55° face must not read like one up a valley. Survey red,
+       * which this product spends only on the reader's safety and on destructive controls.
        */}
       {caution ? (
         <View style={styles.caution} accessibilityRole="alert">
@@ -445,8 +402,8 @@ export default function TrailScreen() {
 
           {/*
            * `box-only` makes this View the touch target rather than whichever SVG shape the
-           * finger happens to be over, which is what makes `locationX` mean "points from the
-           * left of the plot" on every move instead of only on some of them.
+           * finger is over, which is what makes `locationX` mean "points from the left of the
+           * plot" on every move instead of only on some of them.
            */}
           <View
             onLayout={onFrameLayout}
@@ -556,18 +513,10 @@ export default function TrailScreen() {
         ) : null}
       </Section_>
 
-      {/*
-       * Photographs, then reports. Both are what people brought back rather than what the map
-       * holds, and the pictures come first because they answer the question the figures above
-       * cannot: what does the ground actually look like.
-       */}
+      {/* Photographs before reports: the pictures answer what the figures above cannot. */}
       <Photos trailId={trail.id} trailName={trail.name} />
 
-      {/*
-       * Reports last, above nothing but the provenance, and in the same place the website
-       * puts them. Everything above this describes the trail as the map has it; this is the
-       * only block on the screen written by someone who was actually standing on it.
-       */}
+      {/* Reports last: the one block written by someone who was standing on the trail. */}
       <Reviews trailId={trail.id} />
 
       <View style={styles.provenance}>
@@ -581,11 +530,7 @@ export default function TrailScreen() {
             Reconciled with OSM on {new Date(trail.sourceUpdatedAt).toLocaleDateString()}.
           </Text>
         ) : null}
-        {/*
-         * The way from the credit to the credits. Everything above this screen's provenance
-         * block is one trail; this goes to the full statement of what every layer of the map
-         * is made of and under which licence.
-         */}
+        {/* The way from the credit to the full statement of what every layer is made of. */}
         <Pressable
           onPress={() => router.push('/attribution')}
           accessibilityRole="button"
@@ -600,13 +545,7 @@ export default function TrailScreen() {
   );
 }
 
-/**
- * What the control says, and what the line under it promises.
- *
- * A table rather than nested ternaries in the markup, because the interesting thing about this
- * control is that it is four controls wearing one coat and that is easier to check as a list
- * than as an expression.
- */
+/** Four controls wearing one coat, as a table — easier to check than nested ternaries. */
 type StartState = 'ready' | 'starting' | 'here' | 'elsewhere' | 'signedOut';
 
 const START_COPY: Record<StartState, { label: string; note: string }> = {
@@ -630,16 +569,9 @@ const START_COPY: Record<StartState, { label: string; note: string }> = {
 };
 
 /**
- * Start a hike on this trail.
- *
- * The website sends you to `/record?trail=<slug>` and lets you press Start there. This does not
- * — it starts the hike here and then shows you the recorder, because the extra screen only
- * exists on the web to choose an activity type and a visibility, and both of those are already
- * decided: the type is the trail's own primary use, and the visibility is the one on your
- * account. A tap saved at the trailhead is worth more than a form.
- *
- * Its own component so that it, and not the whole trail page, is what re-renders every second
- * while a recording is running.
+ * Start a hike on this trail. Unlike the website it starts here rather than routing to a form:
+ * the activity type is the trail's own and the visibility is the account's, so nothing is left
+ * to ask. Its own component so a running recording re-renders this and not the whole page.
  */
 function StartHike({
   trailId,
@@ -685,9 +617,9 @@ function StartHike({
       {
         onSuccess: (activity) => {
           actions.begin({ id: activity.id, startedAt: activity.startedAt, trailId });
-          // Handed over here as well as resolved on the Record screen, because the first fix
-          // can land before that screen has mounted — and a wrong-turn watchdog that only arms
-          // once its screen is on is one that misses the turn out of the car park.
+          // Handed over here as well as on the Record screen: the first fix can land before
+          // that screen has mounted, and a wrong-turn watchdog that only arms once its screen
+          // is on misses the turn out of the car park.
           actions.setFollowing(geometry.coordinates, lengthM);
           router.navigate('/record');
         },
@@ -719,11 +651,9 @@ function StartHike({
 }
 
 /**
- * The scroll container and the way back, shared by the three states this screen has.
- *
- * The back control is drawn here rather than by a navigation header because the root
- * `Stack` runs headerless: a platform header would bring its own typeface, its own rule
- * and its own tint, and this app's chrome is set in Archivo on a paper canvas.
+ * The scroll container and the way back, shared by this screen's three states. The back control
+ * is drawn here because the root `Stack` runs headerless — a platform header would bring its own
+ * typeface, rule and tint.
  */
 function Chrome({
   insets,
@@ -761,12 +691,7 @@ function Chrome({
   );
 }
 
-/**
- * A titled block.
- *
- * Named with a trailing underscore because `Section` in this file is the graphic, and the
- * graphic is the one that deserves the plain name.
- */
+/** A titled block. Trailing underscore because `Section` in this file is the graphic. */
 function Section_({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <View style={styles.block}>
@@ -788,12 +713,8 @@ function Fact({ label, value }: { label: string; value: string }) {
 }
 
 /**
- * What went wrong, in terms of what the reader can do about it.
- *
- * Two failures are worth telling apart — ours and theirs. A trail whose elevation pass has
- * not run cannot have a route forecast at all and will not until it does; an upstream
- * outage is worth waiting out. Anything else gets a plain apology, which is the honest
- * answer when we genuinely do not know.
+ * What went wrong, in terms of what the reader can do about it. A trail with no elevation pass
+ * cannot be forecast along at all; an upstream outage is worth waiting out.
  */
 function weatherMessage(error: unknown): string {
   switch (codeOf(error)) {
@@ -857,13 +778,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: theme.space.sm,
     paddingVertical: theme.space.hair,
   },
-  // Canvas on the plate rather than white: the chip is a printed patch of one separation,
-  // and the paper showing through it is the paper this page is already on.
+  // Canvas on the plate rather than white: the chip is a printed patch of one separation, and
+  // the paper showing through it is the paper this page is already on.
   plateLabel: { ...theme.collarLabel, color: theme.color.canvas },
   rating: { ...theme.text('caption', { family: 'mono' }), color: theme.color.inkMuted },
 
-  // The one filled control on a page of hairlines. Ink rather than woodland, because this is
-  // not a fact about the trail — it is the thing the page is for, and the plates stay honest.
+  // The one filled control on a page of hairlines, in ink rather than woodland: it is not a
+  // fact about the trail, so it does not take a plate.
   startBlock: { gap: theme.space.sm },
   start: {
     alignItems: 'center',
@@ -939,8 +860,8 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: theme.color.bezel,
   },
-  // Fixed width so the distances form a column the eye can run down, which is the whole
-  // reason this list is ordered by distance rather than by importance.
+  // Fixed width so the distances form a column the eye can run down, which is why this list is
+  // ordered by distance rather than by importance.
   waypointDist: {
     ...theme.text('caption', { family: 'mono' }),
     color: theme.color.inkMuted,
@@ -966,10 +887,8 @@ const styles = StyleSheet.create({
   },
   sacText: { ...theme.text('caption', { family: 'text' }), color: theme.color.inkMuted, flex: 1 },
 
-  // A rule rather than a filled panel. A survey-red fill at this size would be the loudest
-  // thing on a screen whose whole argument is that the figures above it are quiet and exact;
-  // a rule down the edge is enough to say "this one is not like the others" and leaves the
-  // words to do the work.
+  // A rule rather than a filled panel: survey red at this size would be the loudest thing on a
+  // screen whose whole argument is that the figures above it are quiet and exact.
   caution: {
     gap: theme.space.xs,
     borderLeftWidth: 2,

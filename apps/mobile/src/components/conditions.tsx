@@ -15,26 +15,15 @@ import { nativeTheme } from '@switchback/ui';
 import { Chip, ChipRail } from './chip';
 
 /**
- * Conditions on the way, on a phone.
+ * Conditions on the way. The website's eight-column timetable folded to two lines per point —
+ * where and when, then what it will be doing — rather than truncated: the point of the feature
+ * is the difference between the car park and the summit.
  *
- * The website publishes this as a timetable — eight columns, one row per point you will
- * stand on. Eight columns do not fit here and shrinking them until they do produces a
- * table nobody can read, so each point gets **two lines instead of one**: where and when on
- * the first, what it will be doing on the second. Same rows, same order, same question —
- * *what will it be doing when I get there?* — folded rather than truncated. Nothing is
- * dropped, which matters because the point of this feature is the difference between the
- * car park and the summit, and a phone is where you check it from the car park.
+ * This row is also where the section's weather callouts go, at full size and for every sample,
+ * because 46pt of collar cannot hold "Summit 11:20 · 1 °C · gusts 61" legibly.
  *
- * This is also the row the section's doc comment promised: the graphic on this screen
- * carries no callouts, because 46pt of collar cannot hold "Summit 11:20 · 1 °C · gusts 61"
- * legibly. It goes here, at full size, for every sample rather than two.
- *
- * **Plate discipline is identical to the website's.** Weather is the water plate; survey —
- * red — appears only on the safety flags and the rows they point at. A gust warning and a
- * rain shower are not the same kind of fact and must not be the same colour.
- *
- * **Missing readings are em dashes.** A forecast that looks equally confident about
- * everything is the one thing this must never be.
+ * Plate discipline is the website's: weather takes the water plate, and survey red appears
+ * only on safety flags and the rows they point at. Missing readings print as em dashes.
  */
 
 const theme = nativeTheme('sheet');
@@ -165,11 +154,8 @@ export function Conditions({
 }
 
 /**
- * One point on the route: where and when, then what it will be doing there.
- *
- * The named points are the trailhead, the high point and the finish; the rest are
- * distances, and printing "6.4 km" twice on one row is noise. So the middle rows carry the
- * distance alone and the second line does all the work.
+ * One point on the route: where and when, then what it will be doing there. Only the
+ * trailhead, high point and finish are named; the middle rows carry the distance alone.
  */
 function Row({
   sample,
@@ -270,12 +256,9 @@ function Flags({ flags }: { flags: readonly WeatherFlag[] }) {
 }
 
 /**
- * Where the numbers came from and when.
- *
- * The hour matters: a forecast read at 06:00 and one read at 18:00 are different forecasts,
- * and showing one without saying which asks to be trusted more than it deserves. Sunrise
- * and sunset sit here rather than in the rows because they are facts about the day, not
- * about a point on the trail.
+ * Where the numbers came from and when — the hour matters, since a forecast read at 06:00 and
+ * one read at 18:00 are different forecasts. Sunrise and sunset sit here rather than in the
+ * rows because they are facts about the day, not about a point on the trail.
  */
 function Provenance({ forecast }: { forecast: AlongRouteForecast }) {
   const sunrise = clockOf(forecast.sunriseAt);
