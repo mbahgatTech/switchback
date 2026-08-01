@@ -19,23 +19,13 @@ import {
 } from '../src/offline/caches';
 
 /**
- * The service worker cannot import anything.
- *
- * It has to be served from the origin root to have scope over the whole site, which means it
- * lives under `public/` as a plain file outside the module graph. So the cache names exist
- * twice, and the failure mode of them drifting is silent and delayed: the app writes tiles
- * into `sb-tiles-v2`, the worker looks in `sb-tiles-v1`, every download reports success, and
- * the map is blank in a place with no signal to fix it from. Nothing in typecheck or lint
- * can see across that boundary — so this test does, by reading the worker as text.
+ * The service worker is served from the origin root, outside the module graph, so it cannot import
+ * anything: every cache name and pattern exists twice. Drift is silent and only shows up offline,
+ * and no typecheck or lint can see across that boundary — so this file reads the worker as text.
  */
 const SW = readFileSync(fileURLToPath(new URL('../public/sw.js', import.meta.url)), 'utf8');
 
-/**
- * The registration, read as text for the same reason.
- *
- * The build id reaches the worker through the URL it is registered with, so the two halves of
- * that channel are in different files and neither can typecheck against the other.
- */
+/** The registration, read as text: the build id reaches the worker through its URL, not an import. */
 const REGISTER = readFileSync(
   fileURLToPath(new URL('../src/offline/register.tsx', import.meta.url)),
   'utf8',
@@ -65,12 +55,8 @@ describe('service worker cache names', () => {
     expect(literal(name)).toBe(expected);
   });
 
-  /**
-   * The shell cache is the one name neither side can spell out, because it carries the build
-   * id: the app reads `NEXT_PUBLIC_BUILD_ID`, the worker reads `?v=` off its own URL, and the
-   * two only agree at runtime. So what is checked is the shape — same prefix, same
-   * interpolation — plus, below, that the worker really does take the value from its URL.
-   */
+  // The shell name carries the build id, so the two sides only agree at runtime: what is checked
+  // is the shape, plus (below) that the worker really does take the value from its own URL.
   it('scopes the shell cache to the build, in both copies', () => {
     const inWorker = /const\s+SHELL_CACHE\s*=\s*`sb-shell-\$\{BUILD_ID\}`/u.test(SW);
     expect(inWorker).toBe(true);
@@ -78,18 +64,6 @@ describe('service worker cache names', () => {
     expect(SHELL_CACHE.startsWith(CACHE_PREFIX)).toBe(true);
   });
 
-  /**
-   * The regression this file exists to stop happening twice.
-   *
-   * `storeShell` harvests a downloaded page's `/_next/static/*` chunks, and it is called from
-   * exactly one place — `downloadTrail` — so nothing ever re-harvests them. Put them in the
-   * build-scoped shell and the next deploy's `activate` sweep deletes them while the page that
-   * names them sits in `PAGE_CACHE` untouched: the download survives, and stops rendering. The
-   * hiker sees "This page couldn't load" from a cache that contains the page, in the one place
-   * they cannot fix it.
-   *
-   * So: the cache `storeShell` writes to must not be the one `activate` collects.
-   */
   it('does not harvest a download into the cache a deploy sweeps', () => {
     const write =
       /async function storeShell\([^)]*\)[^{]*\{\s*const cache = await caches\.open\((\w+)\)/u.exec(
@@ -102,18 +76,6 @@ describe('service worker cache names', () => {
     expect(SW).toMatch(/async function handleStatic[\s\S]*?caches\.open\(ASSET_CACHE\)/u);
   });
 
-  /**
-   * The half of that regression that had already shipped.
-   *
-   * The test above stops a *future* deploy sweeping a download's chunks. It does nothing for
-   * the downloads already on phones: those were harvested into the flat `sb-shell-v1`, which
-   * scoping the shell to the build drops out of `OFFLINE_CACHES` — so the first activate after
-   * the split deletes them, and `storeShell` runs only inside `downloadTrail`, so nothing puts
-   * them back. The download stays in `PAGE_CACHE` and stops rendering, offline, permanently.
-   *
-   * So the worker has to empty the old name before it collects it, and it must copy into the
-   * cache that is *not* swept.
-   */
   it('carries a pre-split download’s chunks out of the old shell before sweeping it', () => {
     expect(literal('LEGACY_SHELL_CACHE')).toBe(LEGACY_SHELL_CACHE);
     // Not adopted into the keep-list: it is emptied and then collected, not retained.
@@ -128,16 +90,14 @@ describe('service worker cache names', () => {
   });
 
   it('takes the build id from the URL it was registered with', () => {
-    // `offline/register.tsx` appends `?v=<build id>`; `self.location` in a worker is the
-    // script URL it was registered with. That query string is the only channel into a file
-    // outside the module graph, and a changed one is also what forces the upgrade.
+    // That query string is the only channel into a file outside the module graph, and a changed
+    // one is also what forces the upgrade.
     expect(SW).toMatch(/new URL\(self\.location\.href\)\.searchParams\.get\('v'\)/u);
     expect(REGISTER).toMatch(/register\(`\/sw\.js\?v=\$\{encodeURIComponent\(BUILD_ID\)\}`/u);
   });
 
   it('lists every cache in OFFLINE_CACHES, so activate does not evict a live one', () => {
-    // The worker deletes any `sb-` cache missing from this array on activate. A cache the
-    // app writes to but the worker has not been told about is deleted on the next deploy.
+    // The worker deletes any `sb-` cache missing from this array on activate.
     const match = /const\s+OFFLINE_CACHES\s*=\s*\[([^\]]*)\]/u.exec(SW);
     expect(match).not.toBeNull();
 
@@ -153,15 +113,12 @@ describe('service worker cache names', () => {
   });
 
   it('keeps every cache under the prefix it sweeps by', () => {
-    // `activate` deletes caches starting with the prefix and not in the list. A cache named
-    // outside the prefix would never be collected when its version is bumped.
+    // A cache named outside the prefix would never be collected when its version is bumped.
     for (const name of OFFLINE_CACHES) expect(name.startsWith(CACHE_PREFIX)).toBe(true);
   });
 
   it('keeps the downloads a reader made off the build id', () => {
-    // Tiles, pages, photographs and the chunks those pages need are somebody's deliberate
-    // download, quite possibly for a trip they are on. Versioning any of them off the build
-    // would empty them on every deploy.
+    // Versioning any of these off the build would empty somebody's download on every deploy.
     for (const name of [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE]) {
       expect(name).not.toContain(BUILD_ID);
     }
@@ -170,8 +127,7 @@ describe('service worker cache names', () => {
 
 describe('service worker routing', () => {
   it('never caches the API', () => {
-    // A stale tRPC read served silently is worse than an honest failure: it makes a review
-    // look posted and a Lifeline ping look sent.
+    // A stale tRPC read served silently makes a review look posted and a Lifeline ping look sent.
     expect(SW).toMatch(/url\.pathname\.startsWith\('\/api\/'\)/u);
   });
 
@@ -181,10 +137,9 @@ describe('service worker routing', () => {
 });
 
 /**
- * A cached page without its chunks renders Next's error boundary — "This page couldn't load"
- * — from a cache that contains the page. Both the worker (for `/offline`, at install) and the
- * downloader (for a trail page) harvest the asset list out of the markup, with the same
- * expression, and these are the tests that keep the two honest.
+ * A cached page without its chunks renders Next's error boundary from a cache that contains the
+ * page. The worker and the downloader harvest the asset list with the same expression; these keep
+ * the two honest.
  */
 describe('build assets referenced by a cached page', () => {
   /** Pull the inside of a ``String.raw`…` `` binding out of a source file. */
@@ -205,19 +160,14 @@ describe('build assets referenced by a cached page', () => {
   });
 
   it('precaches the shell pages one at a time', () => {
-    /*
-     * These pages share components, and a server asked to render two overlapping module
-     * graphs in the same instant may answer 500 for whichever lands second — Next's dev
-     * server does, reproducibly. The cost is a worker that installed successfully and has no
-     * fallback page, which is invisible until somebody is offline. Install has no deadline,
-     * so nothing is won back by running them together.
-     */
+    // These pages share components, and Next's dev server answers 500, reproducibly, for
+    // whichever of two overlapping module graphs lands second. Install has no deadline.
     expect(SW).toMatch(/for \(const path of SHELL_PAGES\) \{\s*await precache\(/u);
   });
 
   it('retries a shell page rather than giving up on one bad response', () => {
-    // `install` fires once per worker version and nothing re-runs it, so a 500 lasting the
-    // half-second a deploy takes to swap over would cost this worker its fallback for life.
+    // `install` fires once per worker version, so a 500 lasting the half-second a deploy takes
+    // to swap over would cost this worker its fallback for life.
     expect(SW).toMatch(/attempt <= PRECACHE_ATTEMPTS/u);
     // And any later navigation that succeeds is a chance to put back what install missed.
     expect(SW).toMatch(/void repairShell\(\)/u);
@@ -232,19 +182,14 @@ describe('build assets referenced by a cached page', () => {
   });
 
   it('keeps the recorder in the shell', () => {
-    // Named separately from the equality above, which only says the two lists agree. Dropping
-    // `/record` from both would keep that test green and hand every hiker at a trailhead the
-    // offline fallback instead of the screen they came to use.
+    // Named separately from the equality above, which only says the two lists agree: dropping
+    // `/record` from both would keep that test green.
     expect(SHELL_PAGES).toContain('/record');
   });
 
   it('names only per-reader pages as the ones a handover deletes', () => {
-    /*
-     * `handover.ts` used to delete `SHELL_CACHE` by name, which took the offline fallback, the
-     * storage manager and every harvested build chunk with it — and nothing puts those back
-     * until a full-document navigation, which App Router client routing never performs. So the
-     * sweep is scoped to these entries, and they have to be pages the shell actually holds.
-     */
+    // Deleting `SHELL_CACHE` by name took the fallback, the storage manager and every harvested
+    // chunk with it, and nothing puts those back without a full-document navigation.
     for (const path of READER_SHELL_PAGES) expect(SHELL_PAGES).toContain(path);
     // The two that take no server input are right for everybody and are not anybody's to lose.
     expect(READER_SHELL_PAGES).not.toContain(OFFLINE_FALLBACK_PATH);
@@ -252,48 +197,27 @@ describe('build assets referenced by a cached page', () => {
   });
 
   it('never stores a redirect under a shell page', () => {
-    /*
-     * `/record` is auth-gated. A signed-out install follows its 307 to `/signin` and gets a
-     * 200, so without this guard the sign-in form would be cached under the key `/record` —
-     * which is worse than the entry being missing, because it looks like it works.
-     *
-     * Both guards are pinned by *shape and position*, not by a substring. This used to assert
-     * `/if \(response\.redirected\) return;/`, which only ever matched the `refreshShell` copy
-     * below — `precache`'s is a block, so the assertion that was supposed to protect the new
-     * `/record` entry matched a different function entirely. Two mutations proved it: making
-     * `precache`'s condition unreachable, and hoisting the `cache.put` above it so the redirect
-     * is stored and only then recorded, each left all 22 tests in this file green while a
-     * signed-out install cached the sign-in form under `/record`.
-     *
-     * Text rather than an importable predicate, for the reason at the top of this file: the
-     * worker cannot import, so a `shouldStoreShellPage()` in `caches.ts` would be a second
-     * copy of the decision rather than the one the worker runs — and the text assertion that
-     * kept the two in step would be back here anyway, weaker for being a level removed.
-     */
+    // `/record` is auth-gated: a signed-out install follows its 307 to `/signin` and gets a 200,
+    // so an unguarded put caches the sign-in form under the key `/record`.
+    //
+    // Asserted by *shape and position*, not by substring: `/if \(response\.redirected\) return;/`
+    // matched only `refreshShell`'s copy, leaving `precache`'s guard untested and mutable.
     expect(SW).toMatch(
       /if \(response\.redirected\) \{\s*redirectedShellPages\.add\(path\);\s*return;\s*\}[\s\S]*?await cache\.put\(path, response\);/u,
     );
-    // And `refreshShell`'s, which stores the reader's own navigation: it returns before the
-    // `caches.open` that would put it.
+    // And `refreshShell`'s, which returns before the `caches.open` that would put it.
     expect(SW).toMatch(/if \(response\.redirected\) return;[\s\S]*?caches\s*$/mu);
   });
 
   it('stops asking for a shell page the reader is not allowed to see', () => {
-    /*
-     * `repairShell` runs on every successful navigation and fills any entry `cache.match`
-     * misses — and a signed-out `/record` misses for ever, because the guard above refuses
-     * to store it. Measured before this: three extra origin requests for `/record` and three
-     * for `/signin` on every page view, indefinitely, each one a server render. The refusal
-     * has to be remembered, and `refreshShell` clears it the moment a signed-in navigation
-     * proves the page is available after all.
-     */
+    // `repairShell` fills any entry `cache.match` misses, and a signed-out `/record` misses for
+    // ever — six extra server renders per page view. `refreshShell` clears the refusal.
     expect(SW).toMatch(/if \(redirectedShellPages\.has\(path\)\) continue;/u);
     expect(SW).toMatch(/redirectedShellPages\.delete\(url\.pathname\)/u);
   });
 
   it('matches a shell page by pathname when the query differs', () => {
-    // `cache.match` is query-sensitive, so `/record?trail=vesper-peak` — the link from every
-    // trail page — misses the stored `/record`. Same for `/?place=…` and `/explore?bbox=…`.
+    // `cache.match` is query-sensitive, so `/record?trail=vesper-peak` misses the stored `/record`.
     expect(SW).toMatch(
       /SHELL_PAGES\.includes\(url\.pathname\)\) \{\s*const page = await shell\.match\(url\.pathname\)/u,
     );

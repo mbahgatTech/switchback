@@ -1,30 +1,13 @@
 /**
- * The device's own database, and the one place its schema is declared.
- *
- * Two things live here: the ledger of what has been downloaded, and the queue of writes made
- * where there was no signal to make them over. They are separate concerns with separate
- * modules above this one, but they cannot be separate *databases* without a real cost —
- * `onupgradeneeded` fires once per version for a whole database, so two modules each opening
- * "their own" store at their own version would race. Whichever opened first would create its
- * store, and the other's would be missing until a version bump that never comes.
- *
- * So the schema is declared once, every store is created together, and the modules above own
- * only what goes in them.
- *
- * Hand-rolled rather than wrapped in a library. Four object stores, one key path each, and no
- * migrations beyond adding a store; the wrapper would be larger than the thing it wrapped.
+ * The device's own database, and the one place its schema is declared. One database for both the
+ * downloads ledger and the write queues: `onupgradeneeded` fires per database, so two would race.
  */
 
 const DB_NAME = 'switchback-offline';
 
 /**
- * Version 1 held downloads. Version 2 added the review queue. Version 3 added the recording
- * journal and the hikes it owes the server. Version 4 re-keyed the review queue on the person
- * as well as the trail — see `PENDING_REVIEWS_STORE`.
- *
- * The upgrade creates whatever it does not find rather than switching on the version it came
- * from, so a browser arriving from 1, from 2, from nothing, or from a rolled-back deploy all
- * end up holding the same four stores.
+ * The upgrade creates whatever it does not find rather than switching on the version it came from,
+ * so a browser arriving from 1, from 2, from nothing or from a rolled-back deploy converges.
  */
 const DB_VERSION = 4;
 
@@ -32,73 +15,39 @@ const DB_VERSION = 4;
 export const TRAILS_STORE = 'trails';
 
 /**
- * One row per report written where there was nothing to file it with.
- *
- * Keyed by *person and* trail. Postgres keys the published report `[trailId, userId]` and this
- * store used to key it on the trail alone, which was right for as long as a browser was
- * assumed to hold one hiker. It does not: a shared laptop holds whoever last sat at it, and on
- * the trail-only key a second person writing about the same trail did not queue a second
- * report — `put` silently replaced the first person's, which is the one outcome `queue.ts`
- * promises never to produce. Amending your own draft still replaces it, because your own key
- * is the same key.
- *
- * The value is built by `reviewKey`, and it is the row's `key` field rather than a composite
- * key path so that the store keeps a single string key and `get`/`delete` stay one argument.
+ * One row per report written where there was nothing to file it with. Keyed by person *and* trail:
+ * on the old trail-only key a second person writing about the same trail silently replaced the
+ * first person's row. Amending your own draft still replaces it, because your own key is the same.
  */
 export const PENDING_REVIEWS_STORE = 'pending-reviews-owned';
 
 /**
- * What version 3 and earlier called the review queue, keyed on `trailId`.
- *
- * Read once, by the upgrade below, and then dropped. Nothing else may touch it: a row that is
- * still in here after an upgrade is a row that was lost.
+ * What version 3 and earlier called the review queue, keyed on `trailId`. Read once by the upgrade
+ * below and then dropped; a row still in here afterwards is a row that was lost.
  */
 const LEGACY_PENDING_REVIEWS_STORE = 'pending-reviews';
 
 /**
- * The key of a queued report: who wrote it, and which trail it is about.
- *
- * The empty string stands for "the device cannot say who wrote this" — a row carried across
- * from the trail-keyed store, or one written by a browser with no session it could name. It
- * is a real key rather than a missing one so those rows are addressable, listable, and
- * therefore something a person can be shown and asked about, which is the whole of what
- * `handover.ts` does with them.
- *
- * A colon separates the halves. Ids on both sides are cuids, which have no colon in them.
+ * The key of a queued report. The empty string stands for "cannot say who wrote this" — a real key
+ * rather than a missing one, so those rows stay addressable and can be shown to a person.
  */
 export function reviewKey(userId: string | null, trailId: string): string {
   return `${userId ?? ''}:${trailId}`;
 }
 
 /**
- * One row per hike the device is holding on the server's behalf.
- *
- * Keyed by the activity's own id, which the device mints before the first fix — so this row
- * and the server's row are the same hike under the same name from the moment the button is
- * pressed. It is the header only: who, when, how far through the upload it is, and the
- * `finish` payload once there is one.
+ * One row per hike the device is holding on the server's behalf: the header only. Keyed by the
+ * activity's own id, which the device mints before the first fix and the server stores under.
  */
 export const PENDING_ACTIVITIES_STORE = 'pending-activities';
 
 /**
- * The fixes of those hikes, five hundred to a row.
- *
- * Chunked rather than held as one array on the header, because the header is rewritten on
- * every fix and rewriting a growing array on every fix is quadratic — at 1 Hz a six-hour
- * hike would end up serialising a 21,600-element array once a second. A chunk is bounded, so
- * the per-fix cost is constant, and a chunk is exactly one upload batch so the drain never
- * has to re-slice anything.
+ * The fixes of those hikes, five hundred to a row. Chunked rather than one array on the header,
+ * which is rewritten on every fix: a growing array would make the per-fix cost quadratic.
  */
 export const ACTIVITY_FIXES_STORE = 'activity-fixes';
 
-/**
- * What each store keys on.
- *
- * Was a single `trailId` while the schema was the downloads ledger and the review queue,
- * which both key on a trail. A hike is keyed by itself and its chunks by a composite of
- * activity and index; a queued report is keyed by `reviewKey`, which is person and trail. So
- * the key path is now per store.
- */
+/** What each store keys on. */
 const KEY_PATHS: Record<string, string> = {
   [TRAILS_STORE]: 'trailId',
   [PENDING_REVIEWS_STORE]: 'key',
@@ -109,20 +58,10 @@ const KEY_PATHS: Record<string, string> = {
 const STORES = Object.keys(KEY_PATHS);
 
 /**
- * Carry the trail-keyed review queue into the person-and-trail-keyed one.
- *
- * Every row arrives **unattributed** — `userId: null` — and that is the honest answer rather
- * than a lazy one. These reports were written before anything recorded whose they were, on a
- * browser that may since have changed hands, and the two tidy alternatives are both wrong:
- * adopting them to whoever is signed in now is exactly the defect this schema change exists
- * to close, and dropping them destroys words that exist nowhere else. So they are kept,
- * marked as belonging to nobody the device can name, never sent automatically, and shown to a
- * person on `/downloads` to be claimed or discarded. See `handover.ts`.
- *
- * Runs inside the upgrade transaction, so it either lands whole or not at all: a browser that
- * is closed half-way through re-runs the same version upgrade next time with the legacy store
- * still in place. The legacy store is dropped only once its rows are written, and only from
- * inside that same transaction.
+ * Carries the trail-keyed review queue into the person-and-trail-keyed one. Every row arrives
+ * unattributed: adopting them to whoever is signed in now is the defect this re-key closes, and
+ * dropping them destroys words that exist nowhere else. Runs inside the upgrade transaction, so it
+ * lands whole or not at all — the legacy store is dropped only once its rows are written.
  */
 function carryReviewsForward(db: IDBDatabase, tx: IDBTransaction | null): void {
   if (!tx || !db.objectStoreNames.contains(LEGACY_PENDING_REVIEWS_STORE)) return;
@@ -158,24 +97,10 @@ function open(): Promise<IDBDatabase> {
 }
 
 /**
- * One request, in its own transaction, on a connection that is closed afterwards.
- *
- * **It resolves on the transaction's commit, not on the request's success**, and that
- * distinction is what two callers above this file are built on. A `put` reports success as
- * soon as the object store has accepted it, which is some way short of "the write happened":
- * the transaction can still abort afterwards — eviction under storage pressure, a tab torn
- * down mid-commit, a quota error raised at commit time — and the value goes with it. This
- * used to resolve on `request.onsuccess`, so `markFinished` returning meant "accepted", while
- * the caller reading it — the offline branch of `onFinish` — treats it as "known to have
- * happened": on the strength of it `handOff()` throws away the in-memory buffer, which that
- * code calls the last copy of the day, and the screen prints "Saved on this device". Same for
- * `writeChunk`, which `writeJournal` awaits before writing a header whose `count` describes
- * those fixes. So the result is captured on success and handed back on commit, and an abort
- * rejects rather than resolving into silence.
- *
- * The connection is closed on the transaction rather than after the request for the same
- * reason. Holding one open across the tab's life would be faster and would also block the
- * next version upgrade until every tab was shut.
+ * One request, in its own transaction, on a connection closed afterwards. **Resolves on the
+ * transaction's commit, not the request's success**: a `put` reports success as soon as the store
+ * accepts it, and the transaction can still abort under storage pressure or a quota error at commit
+ * time. Callers treat a resolve as "known to have happened", so an abort must reject.
  */
 export function run<T>(
   storeName: string,

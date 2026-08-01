@@ -1,40 +1,11 @@
 /**
- * Who this browser is acting as.
- *
- * The offline queue exists to hold writes that cannot be sent yet, and a write that cannot be
- * sent yet is a write whose author cannot be checked yet either. Until this module existed
- * there was nothing on a queued row that said whose it was, and nothing anywhere that noticed
- * the person at the keyboard had changed — so a report written on a shared laptop by the
- * person who left was posted, whole, under the name of the person who arrived.
- *
- * Two facts are kept here and nowhere else.
- *
- * **The remembered reader.** One string in `localStorage`, written only by `ReaderIdentity` in
- * the root layout and only for an id the origin has just confirmed. That last clause is the
- * load-bearing one: a page served from Cache Storage is the *previous* reader's HTML, so
- * trusting the id in it would let a stale copy re-assert an account that has since gone. What
- * makes reading it safe at all is that `handover.ts` deletes those copies the moment the
- * reader changes, so there is never a cached page belonging to somebody other than the
- * remembered reader.
- *
- * `localStorage` rather than a React context threaded from the layout, because the two places
- * that most need this — the recorder writing a fix on a ridge and the report form catching a
- * failed post — are deep in the tree, are already holding a dozen values, and need the answer
- * *synchronously at the moment of the write*. A hook would give them a value that is one
- * render stale exactly when the reader has just changed, which is the case that matters.
- *
- * **Whether a row is this reader's.** `ownedBy` is the only test the drains are allowed to
- * make, and it is deliberately strict in both directions: a row with no owner belongs to
- * nobody rather than to everybody, and a browser with no session owns nothing rather than
- * everything.
+ * Who this browser is acting as, and whether a queued row is theirs. Kept in `localStorage` rather
+ * than a React context because a write needs the answer synchronously, not one render stale.
  */
 
 /**
- * Where the remembered reader is kept.
- *
- * `localStorage` and not a cookie: a cookie would be sent to the server on every request, and
- * this is a note the browser writes to itself about a decision the server already made. It
- * also has to survive with no network, which is the whole point.
+ * Where the remembered reader is kept. `localStorage` and not a cookie: the server never needs it,
+ * and it has to survive with no network.
  */
 const READER_KEY = 'sb-reader';
 
@@ -45,12 +16,8 @@ export interface RememberedReader {
   /** The account the browser is acting as, or null when it is acting as nobody. */
   id: string | null;
   /**
-   * False before the first page the network served — a brand-new browser, or one that has not
-   * loaded a page since this shipped.
-   *
-   * Told apart from `id: null` because they mean opposite things. "Nobody is signed in" is a
-   * fact worth acting on; "we have never looked" is not, and `handover.ts` treats the first
-   * sighting as a starting point rather than as a change of hands.
+   * False before the first page the network served. Told apart from `id: null` because they mean
+   * opposite things: `handover.ts` treats a first sighting as a starting point, not a handover.
    */
   known: boolean;
 }
@@ -69,8 +36,7 @@ export function rememberedReader(): RememberedReader {
   try {
     raw = store()?.getItem(READER_KEY) ?? null;
   } catch {
-    // A quota error on read is not a thing, but a locked profile throws on the property
-    // access above and a sandboxed iframe throws here. Neither is worth failing a hike over.
+    // A locked profile throws on the property access above, a sandboxed iframe throws here.
     return { id: null, known: false };
   }
   if (raw === null) return { id: null, known: false };
@@ -78,33 +44,18 @@ export function rememberedReader(): RememberedReader {
 }
 
 /**
- * The id a write made right now should be stamped with, and the id a drain running right now
- * may send.
- *
- * Null when the browser is acting as nobody, and null when it has never been told — both of
- * which mean the same thing to a row being written: **unattributed**. Such a row is never sent
- * automatically and never adopted silently; it is shown to a person and claimed or discarded
- * by hand. See `handover.ts`.
- *
- * **Read at the moment of the write, never from a render.** A React value is a snapshot of who
- * was here when something last rendered, and the whole of this file exists because that is not
- * the same as who is here now: another tab signs in, or a document comes back out of the
- * back/forward cache, and the rendered answer is a person who left while the cookie on the
- * request belongs to the person who arrived. Sending on the rendered answer is how a report
- * written by one hiker is published under another — which is the defect, not a symptom of it.
- * So `sync.tsx` and `use-queue.ts` call this function at the moment they act, and use the
- * subscribed value from `reader.tsx` only to decide what to *draw*.
+ * The id a write made right now should be stamped with, and the id a drain running right now may
+ * send. Null — acting as nobody, or never told — means unattributed: never sent automatically.
+ * **Read at the moment of the write, never from a render**: another tab's sign-in or a bfcache
+ * restore makes the rendered answer a person who left while the cookie belongs to the one who came.
  */
 export function writingReader(): string | null {
   return rememberedReader().id;
 }
 
 /**
- * Does this `storage` event move the remembered reader?
- *
- * `storage` fires on every *other* document of this origin, which is the only notice a tab
- * gets that somebody signed in elsewhere. A null key means another document called `clear()`,
- * which takes the reader with it, so that counts too.
+ * Does this `storage` event move the remembered reader? A null key means another document called
+ * `clear()`, which takes the reader with it, so that counts too.
  */
 export function readerKeyChanged(key: string | null): boolean {
   return key === null || key === READER_KEY;
@@ -114,9 +65,8 @@ export function rememberReader(id: string | null): void {
   try {
     store()?.setItem(READER_KEY, id ?? NOBODY);
   } catch {
-    // Full, or refused. The consequence is that the next load treats this reader as new and
-    // runs the handover again, which is idempotent — a worse outcome than remembering, and a
-    // far better one than throwing out of a layout effect.
+    // Full, or refused: the next load treats this reader as new and runs the handover again,
+    // which is idempotent, and far better than throwing out of a layout effect.
   }
 }
 
@@ -130,41 +80,18 @@ export function forgetReader(): void {
 }
 
 /**
- * May this browser, acting as `readerId`, send this row?
- *
- * The whole of the answer, and the only question either drain asks. Both `null`s are refusals
- * rather than matches:
- *
- * - A row with `userId: null` was written before anything recorded authorship, or by a browser
- *   that could not name a session. Sending it would be a guess about a person, made silently,
- *   about words they wrote — which is precisely the defect this file exists to close.
- * - A reader of `null` is a signed-out browser. It owns nothing, so a drain that runs before
- *   somebody signs in sends nothing rather than everything.
+ * May this browser, acting as `readerId`, send this row? The only question either drain asks, and
+ * both nulls are refusals: an unowned row belongs to nobody, and a signed-out browser owns nothing.
  */
 export function ownedBy(row: { userId: string | null }, readerId: string | null): boolean {
   return row.userId !== null && row.userId === readerId;
 }
 
 /**
- * Is the browser still acting as the reader a drain started under?
- *
- * `ownedBy` answers "may this row go" once. This answers "may it still go" — and the two are
- * different questions because a drain is not an instant. A six-hour hike is forty-odd requests
- * over one bar, tens of seconds to minutes of wall clock, and the account the browser is
- * holding can change in the middle of that: a second tab signs somebody in, or a `storage`
- * event announces that another document did. The cookie the origin sends is then the new
- * person's while the drain's own `readerId` is still the old one, so `ownedBy(row, 'A')` stays
- * true of A's report and it goes up over B's session.
- *
- * Pinning the reader once per flush shrinks that window to the length of one drain rather than
- * closing it. So both drains ask this immediately before every request they make, and stop —
- * without marking, without blocking, without deleting — the moment the answer is no. Whatever
- * is left is still on the device, still owned by whoever wrote it, and goes out on the next
- * drain that runs as that person.
- *
- * `ask` is passed in rather than being `writingReader` directly, for the same reason `post` is:
- * `queue.ts` and `activities.ts` stay plain functions over a store, testable with no
- * `localStorage` in the environment.
+ * Is the browser still acting as the reader a drain started under? `ownedBy` answers "may this row
+ * go" once; a drain is minutes of requests, and the account can change in the middle. Both drains
+ * ask this immediately before every request and stop — without marking or deleting — on a no.
+ * `ask` is injected so `queue.ts` and `activities.ts` stay testable with no `localStorage`.
  */
 export function stillActingAs(readerId: string | null, ask: () => string | null): boolean {
   return ask() === readerId;

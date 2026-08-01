@@ -1,13 +1,8 @@
 'use client';
 
 /**
- * The offline state a component can actually use.
- *
- * Three separate hooks rather than one context, because they have three different lifetimes.
- * Connectivity changes constantly and everything wants it; the download list changes when the
- * user acts on it and only two pages care; a single trail's download state belongs to the
- * button that started it and dies with the page. A provider holding all three would re-render
- * a map on every flicker of the network.
+ * The offline state a component can use. Three hooks rather than one context, because they have
+ * three lifetimes — a provider would re-render a map on every flicker of the network.
  */
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
@@ -26,16 +21,9 @@ function subscribeToConnectivity(onChange: () => void): () => void {
 }
 
 /**
- * Whether the browser thinks it has a connection.
- *
- * `navigator.onLine` is famously weak — it reports the link, not the internet, so a phone
- * attached to a café's captive portal reads as online. It is still worth having, because the
- * case this product cares about is the honest one: airplane mode, or no bars on a ridge.
- * Everything downstream treats it as a hint and still handles a failed fetch.
- *
- * `useSyncExternalStore` rather than state in an effect, so the server render and the first
- * client render agree — the server snapshot is `true`, which is the assumption every page is
- * already written under.
+ * Whether the browser thinks it has a connection. `navigator.onLine` reports the link, not the
+ * internet, so everything downstream treats it as a hint and still handles a failed fetch. The
+ * server snapshot is `true`, which is the assumption every page is already written under.
  */
 export function useOnline(): boolean {
   return useSyncExternalStore(
@@ -106,11 +94,8 @@ export interface TrailDownloadApi {
 }
 
 /**
- * One trail's download, driving one button.
- *
- * Deliberately does not use react-query. The work is neither a server read nor a server
- * mutation — it is a long local job that reports progress and can be cancelled, and modelling
- * it as a query means either a cache key that lies or a mutation that cannot report progress.
+ * One trail's download, driving one button. Deliberately not react-query: the work is a long local
+ * job that reports progress and can be cancelled, which is neither a query nor a mutation.
  */
 export function useTrailDownload(trail: TrailDetail): TrailDownloadApi {
   const [state, setState] = useState<TrailDownloadState>({ status: 'checking' });
@@ -130,8 +115,8 @@ export function useTrailDownload(trail: TrailDetail): TrailDownloadApi {
         setState(row ? { status: 'ready', row } : plan());
       })
       .catch(() => {
-        // A browser with IndexedDB blocked (private mode, some enterprise policies) is not a
-        // broken page — it is a page where downloading is not on offer.
+        // IndexedDB blocked (private mode, some enterprise policies) is not a broken page —
+        // it is a page where downloading is not on offer.
         if (live)
           setState({
             status: 'failed',
@@ -145,8 +130,7 @@ export function useTrailDownload(trail: TrailDetail): TrailDownloadApi {
 
   useEffect(
     () => () => {
-      // Leaving the page stops the download rather than letting it run against a component
-      // that can no longer report on it.
+      // Leaving the page stops the download rather than running it against a dead component.
       abort.current?.abort();
     },
     [],
