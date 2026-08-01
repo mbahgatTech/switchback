@@ -10,6 +10,7 @@ import {
   OFFLINE_CACHES,
   OFFLINE_FALLBACK_PATH,
   PAGE_CACHE,
+  READER_SHELL_PAGES,
   SHELL_CACHE,
   SHELL_PAGES,
   STATIC_ASSET_PATTERN,
@@ -228,6 +229,74 @@ describe('build assets referenced by a cached page', () => {
       (m) => m[1] ?? (m[2] === 'OFFLINE_FALLBACK_PATH' ? OFFLINE_FALLBACK_PATH : m[2]),
     );
     expect(listed).toEqual([...SHELL_PAGES]);
+  });
+
+  it('keeps the recorder in the shell', () => {
+    // Named separately from the equality above, which only says the two lists agree. Dropping
+    // `/record` from both would keep that test green and hand every hiker at a trailhead the
+    // offline fallback instead of the screen they came to use.
+    expect(SHELL_PAGES).toContain('/record');
+  });
+
+  it('names only per-reader pages as the ones a handover deletes', () => {
+    /*
+     * `handover.ts` used to delete `SHELL_CACHE` by name, which took the offline fallback, the
+     * storage manager and every harvested build chunk with it — and nothing puts those back
+     * until a full-document navigation, which App Router client routing never performs. So the
+     * sweep is scoped to these entries, and they have to be pages the shell actually holds.
+     */
+    for (const path of READER_SHELL_PAGES) expect(SHELL_PAGES).toContain(path);
+    // The two that take no server input are right for everybody and are not anybody's to lose.
+    expect(READER_SHELL_PAGES).not.toContain(OFFLINE_FALLBACK_PATH);
+    expect(READER_SHELL_PAGES).not.toContain('/downloads');
+  });
+
+  it('never stores a redirect under a shell page', () => {
+    /*
+     * `/record` is auth-gated. A signed-out install follows its 307 to `/signin` and gets a
+     * 200, so without this guard the sign-in form would be cached under the key `/record` —
+     * which is worse than the entry being missing, because it looks like it works.
+     *
+     * Both guards are pinned by *shape and position*, not by a substring. This used to assert
+     * `/if \(response\.redirected\) return;/`, which only ever matched the `refreshShell` copy
+     * below — `precache`'s is a block, so the assertion that was supposed to protect the new
+     * `/record` entry matched a different function entirely. Two mutations proved it: making
+     * `precache`'s condition unreachable, and hoisting the `cache.put` above it so the redirect
+     * is stored and only then recorded, each left all 22 tests in this file green while a
+     * signed-out install cached the sign-in form under `/record`.
+     *
+     * Text rather than an importable predicate, for the reason at the top of this file: the
+     * worker cannot import, so a `shouldStoreShellPage()` in `caches.ts` would be a second
+     * copy of the decision rather than the one the worker runs — and the text assertion that
+     * kept the two in step would be back here anyway, weaker for being a level removed.
+     */
+    expect(SW).toMatch(
+      /if \(response\.redirected\) \{\s*redirectedShellPages\.add\(path\);\s*return;\s*\}[\s\S]*?await cache\.put\(path, response\);/u,
+    );
+    // And `refreshShell`'s, which stores the reader's own navigation: it returns before the
+    // `caches.open` that would put it.
+    expect(SW).toMatch(/if \(response\.redirected\) return;[\s\S]*?caches\s*$/mu);
+  });
+
+  it('stops asking for a shell page the reader is not allowed to see', () => {
+    /*
+     * `repairShell` runs on every successful navigation and fills any entry `cache.match`
+     * misses — and a signed-out `/record` misses for ever, because the guard above refuses
+     * to store it. Measured before this: three extra origin requests for `/record` and three
+     * for `/signin` on every page view, indefinitely, each one a server render. The refusal
+     * has to be remembered, and `refreshShell` clears it the moment a signed-in navigation
+     * proves the page is available after all.
+     */
+    expect(SW).toMatch(/if \(redirectedShellPages\.has\(path\)\) continue;/u);
+    expect(SW).toMatch(/redirectedShellPages\.delete\(url\.pathname\)/u);
+  });
+
+  it('matches a shell page by pathname when the query differs', () => {
+    // `cache.match` is query-sensitive, so `/record?trail=vesper-peak` — the link from every
+    // trail page — misses the stored `/record`. Same for `/?place=…` and `/explore?bbox=…`.
+    expect(SW).toMatch(
+      /SHELL_PAGES\.includes\(url\.pathname\)\) \{\s*const page = await shell\.match\(url\.pathname\)/u,
+    );
   });
 
   it('finds scripts, stylesheets and fonts in real Next markup', () => {
