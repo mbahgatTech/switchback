@@ -695,6 +695,11 @@ model IngestJob {
 
   @@index([status, runAfter, priority])
   @@index([lockedAt])
+  /// What admission control counts. Leading with `kind` because the claim index above
+  /// starts at `status`, and the planner will not use it for a query filtered on both —
+  /// `admitIngest` planned as a sequential scan over every job ever recorded, on the hot
+  /// path behind `trails.browse`.
+  @@index([kind, status])
   @@map("ingest_jobs")
 }
 

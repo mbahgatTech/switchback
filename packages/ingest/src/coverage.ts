@@ -24,6 +24,8 @@ import {
   quadkeyToTile,
 } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
+import { admitIngest } from './backpressure';
+import type { IngestRefusal } from './backpressure';
 import { enqueue, tileJobKey } from './jobs';
 import { isTileFresh } from './pipeline';
 
@@ -46,6 +48,27 @@ export interface CoverageResult {
   refreshing: string[];
   /** Tiles left with outstanding work by this call. What the caller should kick. */
   queued: string[];
+  /**
+   * True when ingest was refused, so *new* ground here is not on its way.
+   *
+   * Distinct from "nothing to do": `queued` is empty in both cases, and the client needs to
+   * tell a fully cached viewport apart from one whose fetch was turned down.
+   *
+   * Scoped to new ground on purpose. Tiles this viewport already has a job for are still
+   * coming and are still reported in `pending`, so a refusal about ground nobody has asked
+   * for yet does not stop the reader's own tiles from landing — nor stop the client polling
+   * for them.
+   */
+  busy: boolean;
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * Carried rather than collapsed into the boolean because the two refusals need different
+   * sentences: a deep queue clears on its own and "try again in a few minutes" is true of
+   * it; a full database does not, and telling somebody to wait for it is prescribing an
+   * action that cannot work.
+   */
+  busyReason: IngestRefusal | null;
   /** True when the bbox needed more tiles than we will cover in one request. */
   tooLarge: boolean;
   requiredTiles: number;
@@ -86,17 +109,38 @@ export async function ensureCoverage(
       pending: [],
       refreshing: [],
       queued: [],
+      busy: false,
+      busyReason: null,
       tooLarge: true,
       requiredTiles: cover.requiredTiles,
       maxTiles,
     };
   }
 
-  const existing = await db.ingestTile.findMany({
-    where: { quadkey: { in: cover.quadkeys } },
-    select: { quadkey: true, status: true, fetchedAt: true },
-  });
+  /*
+   * Both lookups at once, the same pair `surveyArea` makes.
+   *
+   * The job table is read for one reason: to tell a tile nobody has asked for apart from a
+   * tile somebody already asked for and is waiting on. `IngestTile.status` cannot answer
+   * that — a row sits at `pending` whether its job is running or died five attempts ago, so
+   * trusting it would make a dead tile permanently "in flight" and permanently unqueueable.
+   * `dedupeKey` is unique-indexed, so this is a keyed lookup over a list we already hold.
+   */
+  const [existing, jobs] = await Promise.all([
+    db.ingestTile.findMany({
+      where: { quadkey: { in: cover.quadkeys } },
+      select: { quadkey: true, status: true, fetchedAt: true },
+    }),
+    db.ingestJob.findMany({
+      where: {
+        dedupeKey: { in: cover.quadkeys.map(tileJobKey) },
+        status: { in: [JobStatus.queued, JobStatus.running] },
+      },
+      select: { dedupeKey: true },
+    }),
+  ]);
   const byKey = new Map(existing.map((tile) => [tile.quadkey, tile]));
+  const inFlight = new Set(jobs.map((job) => job.dedupeKey));
 
   const ready: string[] = [];
   const pending: string[] = [];
@@ -120,18 +164,79 @@ export async function ensureCoverage(
     }
   }
 
-  const queued = await queueTiles(db, needsWork, { urgent: options.urgent ?? true });
+  /*
+   * Split the outstanding tiles by whether anything is already coming for them, because
+   * admission has no business seeing the ones that are.
+   *
+   * `enqueue` upserts on `dedupeKey`. Re-enqueueing a quadkey whose job is already `queued`
+   * or `running` writes no row and costs nothing, so refusing it protects nothing — while
+   * the refusal itself is expensive: `queueTiles` returned `queued: []` for the whole set,
+   * which made `busy` true, which cleared `pending`, which stopped the client polling
+   * (`explore.tsx` gates `refetchInterval` on `pendingTiles.length`). The reader whose tiles
+   * were genuinely in flight and about to land got told fetching was paused, and the map
+   * stopped updating until they panned — into another refusal. Under master, with no guard
+   * at all, that same reader kept polling and watched the trails arrive.
+   *
+   * So the depth ceiling now judges only *new ground*, which is the thing it exists to
+   * bound. Tiles already on the queue are reported as what they are: coming.
+   */
+  const newGround = needsWork.filter((quadkey) => !inFlight.has(tileJobKey(quadkey)));
+
+  // Every outstanding tile is still handed to `queueTiles`; only `newGround` is what
+  // admission is allowed to judge. Re-enqueueing an in-flight tile writes no row — `enqueue`
+  // upserts on `dedupeKey` — but it does raise the job's priority, which is how a tile a
+  // background sweep queued at 0 jumps the line the moment somebody is looking at it.
+  // Dropping those from the call would have quietly cost that promotion.
+  const enqueued = await queueTiles(db, needsWork, {
+    urgent: options.urgent ?? true,
+    newGround,
+  });
+  const queued = enqueued.queued;
+
+  /*
+   * Nothing queued despite *new* ground outstanding means backpressure refused it, and what
+   * the client is told about that matters more than it looks.
+   *
+   * Reporting the refused tiles as `pending` would be truthful and much worse. `pending` is
+   * the client's "still loading" set, and it polls every few seconds for as long as it is
+   * non-empty — so a database under enough pressure to refuse ingest would get a poll storm
+   * from every open map, forever, over tiles that are never going to arrive. The same
+   * argument `coverageFor` makes in the trails router about a failed coverage read.
+   *
+   * So the refused tiles fall back to whatever we hold: `ready` keeps anything with data
+   * behind it, the rest simply are not claimed to be coming, and `busy` carries the reason
+   * up so the coverage note can say it in words instead of leaving a spinner to imply it.
+   *
+   * Tiles that were already in flight are exempt from all of that. They *are* coming, they
+   * are worth polling for, and a refusal about other ground says nothing about them.
+   *
+   * `busyReason` rides along because the two refusals are not the same sentence. "Try again
+   * in a few minutes" is true of a deep queue and false of a full database — waiting does
+   * not empty one, and the note must not prescribe an action that cannot work.
+   */
+  const busy = newGround.length > 0 && queued.length === 0;
+  const stillComing = pending.filter((quadkey) => inFlight.has(tileJobKey(quadkey)));
 
   return {
     quadkeys: cover.quadkeys,
     ready,
-    pending,
+    pending: busy ? stillComing : pending,
     refreshing,
     queued,
+    busy,
+    busyReason: busy ? enqueued.refused : null,
     tooLarge: false,
     requiredTiles: cover.requiredTiles,
     maxTiles,
   };
+}
+
+/** What an enqueue call did, and — when it did nothing — why. */
+export interface QueueOutcome {
+  /** The quadkeys now on the queue. Empty when admission refused. */
+  queued: string[];
+  /** The refusal, or `null` when nothing was refused. */
+  refused: IngestRefusal | null;
 }
 
 /**
@@ -142,12 +247,42 @@ export async function ensureCoverage(
  * request over the same area repairs, because a `pending` tile is never fresh. The reverse
  * order would leave a job pointing at a tile row that does not exist, and the handler
  * would have to invent one anyway.
+ *
+ * Returns the refusal rather than an empty array alone. The reason was already computed —
+ * `admitIngest` types it — and dropping it here is what made a full database and a deep
+ * queue arrive at the reader as the same sentence.
+ *
+ * `newGround` narrows what admission is *judged* on without narrowing what is enqueued. A
+ * quadkey whose job is already `queued` or `running` adds no row when re-enqueued — the
+ * dedupe key collides — so refusing it bounds nothing, while the refusal costs the reader
+ * their poll. Callers that know which of their tiles are already in flight pass the rest;
+ * callers that do not, and the deliberate area fetch which is asking for genuinely new
+ * ground by definition, leave it alone and every quadkey counts.
  */
 export async function queueTiles(
   db: PrismaClient,
   quadkeys: readonly string[],
-  options: { urgent?: boolean; priority?: number } = {},
-): Promise<string[]> {
+  options: {
+    urgent?: boolean;
+    priority?: number;
+    /** The subset of `quadkeys` with nothing already on the queue. Defaults to all of them. */
+    newGround?: readonly string[];
+  } = {},
+): Promise<QueueOutcome> {
+  if (quadkeys.length === 0) return { queued: [], refused: null };
+
+  const newGround = options.newGround ?? quadkeys;
+
+  // Nothing new to bound. The upserts below are all collisions, so they add no rows and no
+  // fetches — running them keeps the priority bump without asking the guard's permission for
+  // work the guard has already admitted once.
+  if (newGround.length > 0) {
+    // The one place every trail-ingest path crosses, and so the place backpressure belongs.
+    // See `backpressure.ts` for why it is not at the call sites any more.
+    const refused = await admitIngest(db);
+    if (refused !== null) return { queued: [], refused };
+  }
+
   // Explicit priority wins; `urgent` is the two-value shorthand the viewport path uses.
   const priority = options.priority ?? (options.urgent === false ? 0 : VIEWPORT_PRIORITY);
 
@@ -171,7 +306,7 @@ export async function queueTiles(
     });
   }
 
-  return [...quadkeys];
+  return { queued: [...quadkeys], refused: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -198,21 +333,18 @@ export const MAX_AREA_TILES = 96;
  */
 export const AREA_PRIORITY = 2;
 
-/**
- * Refuse to accept new area requests past this many tile jobs already waiting.
+/*
+ * Backpressure lives in `backpressure.ts` now, and `MAX_TILE_QUEUE_DEPTH` with it.
  *
- * The one guard rail that is about strangers rather than about us. Everything else bounds a
- * single call — the tile cap, the freshness check that makes a repeat press free, the job
- * dedupe — but nothing stops somebody scripting a thousand presses across a thousand
- * different bounding boxes and filling the queue with ground nobody is looking at. That
- * would not cost us money or get us blocked (the Overpass client's own concurrency limit
- * sees to both), but it would put every live viewport behind hours of junk, which is the
- * same thing as breaking the map.
+ * It was here because this file held the only call site that checked it. That was the bug:
+ * `requestArea` is the path a person reaches by pressing a button, and the two paths that
+ * queue without anybody pressing anything — the viewport ingest above and the routing
+ * ingest in `network.ts` — went round it. The check now sits inside `queueTiles` and
+ * `queueNetworkTiles`, which every writing path crosses, and counts all three job kinds
+ * rather than `ingest_tile` alone.
  *
- * So depth is the backpressure, and it is reported rather than hidden: a caller who gets
- * `busy` is told the queue is deep and asked to try later, which is true.
+ * Re-exported nowhere: import it from `./backpressure`, which is the one place it lives.
  */
-export const MAX_TILE_QUEUE_DEPTH = 600;
 
 export interface AreaCoverage {
   /** Every tile this survey covers, nearest the centre of the box first. */
@@ -304,8 +436,10 @@ export async function surveyArea(bbox: BBox, options: AreaOptions = {}): Promise
 export interface AreaRequest extends AreaCoverage {
   /** What this call put on the queue. What the caller should kick. */
   queued: string[];
-  /** True when the queue was already too deep to accept more, so nothing was queued. */
+  /** True when admission refused, so nothing was queued. */
   busy: boolean;
+  /** Which refusal, when `busy`. The two need different sentences on screen. */
+  busyReason: IngestRefusal | null;
 }
 
 /**
@@ -319,13 +453,31 @@ export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promis
   const db = options.db ?? prisma;
   const area = await surveyArea(bbox, options);
 
-  if (area.outstanding.length === 0) return { ...area, queued: [], busy: false };
+  if (area.outstanding.length === 0) {
+    return { ...area, queued: [], busy: false, busyReason: null };
+  }
 
-  const depth = await db.ingestJob.count({
-    where: { kind: JobKind.ingest_tile, status: { in: [JobStatus.queued, JobStatus.running] } },
+  // No depth check here any more: `queueTiles` runs it, and running it in both places was
+  // how the routing queue ended up unguarded — a check at one call site guards one call
+  // site. An empty return with work outstanding is the refusal, and it now says which.
+  //
+  // `newGround` is the outstanding tiles minus the ones `surveyArea` already found a job
+  // for, so admission judges only what this press actually adds. Pressing "fetch this area"
+  // twice must not be refused the second time for work the first press queued — the second
+  // enqueue writes no row, and the refusal would tell somebody their fetch was turned down
+  // while it was running. The set is already computed here, so this costs nothing.
+  const working = new Set(area.working);
+  const { queued, refused } = await queueTiles(db, area.outstanding, {
+    priority: AREA_PRIORITY,
+    newGround: area.outstanding.filter((quadkey) => !working.has(quadkey)),
   });
-  if (depth >= MAX_TILE_QUEUE_DEPTH) return { ...area, queued: [], busy: true };
+  if (queued.length === 0) return { ...area, queued: [], busy: true, busyReason: refused };
 
-  const queued = await queueTiles(db, area.outstanding, { priority: AREA_PRIORITY });
-  return { ...area, queued, working: [...new Set([...area.working, ...queued])], busy: false };
+  return {
+    ...area,
+    queued,
+    working: [...new Set([...area.working, ...queued])],
+    busy: false,
+    busyReason: null,
+  };
 }

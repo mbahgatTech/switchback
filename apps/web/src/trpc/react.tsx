@@ -5,7 +5,7 @@ import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import { createTRPCClient, httpBatchLink, httpLink, splitLink } from '@trpc/client';
 import { createTRPCContext } from '@trpc/tanstack-react-query';
 import superjson from 'superjson';
-import { isUnbatched } from '@switchback/core';
+import { isUnbatched, MAX_BATCH_SIZE } from '@switchback/core';
 import type { AppRouter } from '@switchback/api';
 import { makeQueryClient } from './query-client';
 
@@ -43,7 +43,11 @@ export function TRPCReactProvider({ children }: { children: React.ReactNode }) {
         splitLink({
           condition: (op) => isUnbatched(op.path),
           true: httpLink(options),
-          false: httpBatchLink(options),
+          // `maxItems` is the client half of the server's `maxBatchSize`, and it is here so
+          // that a tick which somehow exceeds the ceiling splits into two requests rather
+          // than building one the server will reject outright. Same constant on both ends,
+          // for the reason `MAX_BATCH_SIZE` gives.
+          false: httpBatchLink({ ...options, maxItems: MAX_BATCH_SIZE }),
         }),
       ],
     });

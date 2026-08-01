@@ -90,6 +90,43 @@ function describe(
 
   if (loading && !coverage) return { text: 'Reading the sheet…', pending: true };
 
+  /*
+   * Ingest was refused — the queue is deep, or the database is close to full.
+   *
+   * Before the note said this, the same state showed as an ordinary pending count with a
+   * pulsing dot: tiles that were never queued, described as arriving, forever. Saying it
+   * plainly costs one line and is the difference between a map that is busy and a map that
+   * looks broken. No apology, because nothing went wrong that the reader should feel
+   * responsible for, and a time to come back, because "try again later" without one is a
+   * shrug.
+   */
+  if (coverage?.busy) {
+    /*
+     * Which refusal decides the second half of the sentence, because the two do not share an
+     * instruction. A deep queue drains on its own and "try again in a few minutes" is a real
+     * thing to do. A full database does not drain — somebody has to decide what to delete —
+     * so telling the reader to wait for it would be prescribing an action that cannot work,
+     * which is the one thing an error message must never do.
+     *
+     * Review flagged a third case: `'queue-depth'` also covered the 20,000-job derived
+     * backlog, which is hours-to-days of drain rather than minutes, so this branch was
+     * promising a timescale nobody could hold to. Right, and fixed one layer down instead of
+     * here — the derived ceiling no longer refuses anything at all, because nothing in this
+     * deploy could drain it and a ceiling on an undrainable queue is a latch. See
+     * `DERIVED_QUEUE_WARN_DEPTH` in `backpressure.ts`. So `'queue-depth'` now means only the
+     * 600-job request queue, which does drain in minutes, and the sentence below is true of
+     * every refusal that can reach it. A new reason here needs a new sentence, not this one.
+     */
+    const why =
+      coverage.busyReason === 'storage'
+        ? 'fetching new ground is paused: there is no room left to store it. Everything already mapped still works.'
+        : 'fetching new ground is paused while the queue clears. Try again in a few minutes.';
+    return {
+      text: shown > 0 ? `${count(shown, total)} · ${why}` : capitalise(why),
+      pending: false,
+    };
+  }
+
   const pending = coverage?.pendingTiles.length ?? 0;
   if (pending > 0) {
     return {
@@ -111,6 +148,11 @@ function describe(
   }
 
   return { text: count(shown, total), pending: false };
+}
+
+/** The same clause, used mid-sentence after a count or on its own at the start of one. */
+function capitalise(sentence: string): string {
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
 }
 
 /** "120 of 340 trails" — but never "120 of 120 trails", which reads as a truncation. */

@@ -133,6 +133,11 @@ export interface ClaimedJob {
  * falls through to `runAfter` and the oldest wins. Without this, panning to a new valley
  * starts four tiles from a viewport somebody left an hour ago and the one being watched
  * waits behind them — the work is not lost, it is merely never the work you are waiting on.
+ *
+ * `kinds` narrows it the other way, and exists for one reason: `ORDER BY priority DESC` is
+ * a starvation order, not a fairness order. Derived work is enqueued at `-10`, so while any
+ * request job is runnable a derived job is never claimed at all — see `drainJobs`, which
+ * uses this to reserve a share for them.
  */
 export async function claimJobs(
   db: Db,
@@ -140,6 +145,7 @@ export async function claimJobs(
   limit = 4,
   now = new Date(),
   dedupeKeys?: readonly string[],
+  kinds?: readonly JobKind[],
 ): Promise<ClaimedJob[]> {
   const lockCutoff = new Date(now.getTime() - LOCK_TIMEOUT_MS);
   // An empty array is a caller with nothing to ask for, not a caller asking for anything —
@@ -150,6 +156,35 @@ export async function claimJobs(
       : dedupeKeys.length === 0
         ? Prisma.sql`AND false`
         : Prisma.sql`AND "dedupeKey" IN (${Prisma.join([...dedupeKeys])})`;
+
+  // Same rule for the kind filter, for the same reason.
+  //
+  // The cast is on the *parameter*, never on the column. `kind::text = ANY(…)` would read
+  // identically and quietly throw away `@@index([kind, status])` — a cast column is not the
+  // indexed expression, so the predicate demotes from something the index can seek on to
+  // something applied to every entry it returns. Binding a text array and casting it to the
+  // enum type leaves `kind` bare on the left, where the index condition can still use it.
+  //
+  // Measured, rather than reasoned about, because this statement had never run against
+  // Postgres at all — `jobs.test.ts` stubs `$queryRaw`, so nothing had ever asked the server
+  // to parse the cast. Against a local copy of the job table (164k rows, `ANALYZE`d):
+  //
+  //   kind = ANY($1::"JobKind"[])   Index Cond: (kind = ANY(…)) AND (status = 'done')
+  //                                 Index Only Scan, cost 2595
+  //   kind::text = ANY($1::text[])  Index Cond: (status = 'done')
+  //                                 Filter:     (kind)::text = ANY(…)
+  //                                 Index Only Scan, cost 4127
+  //
+  // The cast form parses, executes, and keeps `kind` in the index condition; the column form
+  // reads the whole `status = 'done'` range and filters it. Both the cast and the empty-list
+  // branch are exercised end to end by `npm run ingest:drain`, which claims its derived share
+  // through this path on every tick.
+  const kindScope =
+    kinds === undefined
+      ? Prisma.empty
+      : kinds.length === 0
+        ? Prisma.sql`AND false`
+        : Prisma.sql`AND kind = ANY(${kinds.map(String)}::"JobKind"[])`;
 
   const rows = await db.$queryRaw<
     Array<{
@@ -171,6 +206,7 @@ export async function claimJobs(
        WHERE ((status = 'queued'  AND "runAfter" <= ${now})
            OR (status = 'running' AND "lockedAt" < ${lockCutoff}))
        ${scope}
+       ${kindScope}
        ORDER BY priority DESC, "runAfter" ASC
        LIMIT ${limit}
        FOR UPDATE SKIP LOCKED
@@ -268,7 +304,20 @@ export interface DrainResult {
   failed: number;
   /** Claimed but handed back untried — a kind this build has no handler for. */
   deferred: number;
+  /** How many of `claimed` came from the reserved derived share. */
+  derived: number;
 }
+
+/**
+ * The kinds `drainJobs` will reserve a share for.
+ *
+ * Duplicated from `backpressure.ts` rather than imported, and the duplication is the point:
+ * that module is about admission and this one is about execution, and making execution
+ * depend on the guard's list would be a cycle (`backpressure` → `coverage` → `jobs`). They
+ * are the same two kinds for the same reason — both are fan-out enqueued at `-10` — and if a
+ * third derived kind is ever added it belongs in both lists.
+ */
+const DERIVED_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as const;
 
 /**
  * Claim and run a batch of jobs.
@@ -282,6 +331,17 @@ export interface DrainResult {
  * than one drain can be running: the ceiling that matters is `commitGate` in `pipeline.ts`,
  * and the pool all of it draws from is `backgroundPrisma`, which is not the pool serving
  * requests. See `packages/db/src/client.ts` for why those are two pools and not one.
+ *
+ * **`derivedLimit` is a fairness reservation, and without it derived work never runs.**
+ * `claimJobs` orders by `priority DESC`, `pipeline.ts` enqueues `enrich_trail` and
+ * `ingest_route` at `-10`, and every requestable kind is at 0 or above — so a plain claim
+ * takes a derived job only in the moment the whole rest of the table is empty, which on a
+ * live deploy is never. The inline kicks made it stricter still: both scope their claim to
+ * the tile keys they just queued, so they cannot reach a derived job at all. Measured on
+ * this branch, the derived backlog drained at four jobs a day in theory and zero in
+ * practice, while fan-out added ~339 per tile. A second, kind-scoped claim is what turns
+ * that around: it costs one more indexed statement, it runs the same handlers through the
+ * same claim, and it means the backlog now falls at the rate of the traffic that creates it.
  */
 export async function drainJobs(
   handlers: Partial<Record<JobKind, JobHandler>>,
@@ -292,13 +352,47 @@ export async function drainJobs(
     now?: () => Date;
     /** Claim only these units of work. Omitted means "whatever is most important". */
     dedupeKeys?: readonly string[];
+    /** Additionally claim up to this many derived jobs, which priority would never reach. */
+    derivedLimit?: number;
   } = {},
 ): Promise<DrainResult> {
   const db = options.db ?? backgroundPrisma;
   const now = options.now ?? (() => new Date());
   const workerId = options.workerId ?? `drain-${now().toISOString()}`;
 
-  const jobs = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
+  const primary = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
+
+  /*
+   * Unscoped by `dedupeKey` on purpose: the whole point is to reach work nobody asked for by
+   * name. Claimed after the primary batch so a caller waiting on specific tiles still gets
+   * those first.
+   *
+   * Its own try/catch, and the ordering is why. `claimJobs` is a claim, not a read — the
+   * primary statement above has already flipped its batch to `running` and stamped a lock by
+   * the time this line runs. If the derived claim threw, that rejection would propagate out
+   * of `drainJobs` past every handler, and the primary batch — claimed, locked, untouched —
+   * would sit at `running` until `LOCK_TIMEOUT_MS` expired ten minutes later. One failing
+   * fairness reservation would cost the queue ten minutes of every drain.
+   *
+   * The derived claim is also the only statement here carrying hand-written SQL the primary
+   * path never exercises: the `kind = ANY($1::"JobKind"[])` cast in `claimJobs` is reached
+   * solely through this call, and the unit suite stubs `$queryRaw`, so it had never been put
+   * to a server. It has now — `npm run ingest:drain -- --limit 0` claims and runs a derived batch
+   * through this line against Postgres — and the plans either side of the cast are recorded in
+   * `claimJobs`. A fairness optimisation is still not worth a batch of real work, so a failure
+   * degrades to "no derived work this tick" and the drain carries on with what it holds.
+   */
+  const derivedLimit = options.derivedLimit ?? 0;
+  let derived: ClaimedJob[] = [];
+  if (derivedLimit > 0) {
+    try {
+      derived = await claimJobs(db, workerId, derivedLimit, now(), undefined, DERIVED_KINDS);
+    } catch (error) {
+      console.error('[ingest] derived claim failed; draining primary batch only', error);
+    }
+  }
+
+  const jobs = [...primary, ...derived];
   let succeeded = 0;
   let failed = 0;
   let deferred = 0;
@@ -323,7 +417,7 @@ export async function drainJobs(
     }
   }
 
-  return { claimed: jobs.length, succeeded, failed, deferred };
+  return { claimed: jobs.length, succeeded, failed, deferred, derived: derived.length };
 }
 
 /** The dedupe key for a tile ingest. Exported so the router can enqueue without importing the pipeline. */
@@ -357,4 +451,54 @@ export function networkJobKey(quadkey: string): string {
  */
 export function routeIngestJobKey(osmId: number): string {
   return `${JobKind.ingest_route}:${osmId}`;
+}
+
+/**
+ * How long a finished job is kept before the drain collects it.
+ *
+ * A `done` row is pure history: `enqueue` revives a terminal row rather than reading it, so
+ * nothing in the system consults one, and deleting it simply means the next request for that
+ * quadkey creates the row fresh. A week is long enough to answer "did that tile ever run"
+ * from the table while looking at an incident.
+ *
+ * `failed` and `dead` are kept longer because they are the opposite: a `dead` row is the only
+ * record of five attempts against one tile, and `scripts/requeue-jobs.ts` reads them. A month
+ * outlives the investigation.
+ */
+export const DONE_JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const FAILED_JOB_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Delete terminal jobs past their window.
+ *
+ * Nothing pruned this table until now, which made it grow with lifetime job count rather
+ * than with queue depth — and admission control counts it on the hot path behind
+ * `trails.browse`, so every row ever recorded was work the guard did on every viewport that
+ * found new ground. The `@@index([kind, status])` added alongside this makes that count
+ * index-only, and this keeps the index from growing without bound underneath it.
+ *
+ * Bounded by `completedAt`, which every terminal transition sets. A row missing it — from
+ * before that column was written, or from a crash between the status flip and the stamp — is
+ * left alone rather than guessed at; there is no volume of them worth a heuristic.
+ */
+export async function pruneFinishedJobs(
+  db: Db,
+  now: Date = new Date(),
+): Promise<{ done: number; failed: number }> {
+  const [done, failed] = await Promise.all([
+    db.ingestJob.deleteMany({
+      where: {
+        status: JobStatus.done,
+        completedAt: { lt: new Date(now.getTime() - DONE_JOB_TTL_MS) },
+      },
+    }),
+    db.ingestJob.deleteMany({
+      where: {
+        status: { in: [JobStatus.failed, JobStatus.dead] },
+        completedAt: { lt: new Date(now.getTime() - FAILED_JOB_TTL_MS) },
+      },
+    }),
+  ]);
+
+  return { done: done.count, failed: failed.count };
 }

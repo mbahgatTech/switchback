@@ -75,6 +75,7 @@ import {
   loadNetworkSegments,
   networkJobKey,
 } from '@switchback/ingest';
+import type { IngestRefusal } from '@switchback/ingest';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
@@ -231,9 +232,23 @@ interface PlanOutcome {
   coords: LngLat[];
 }
 
-function emptyPlan(tooLarge: boolean, pendingTiles: number): PlanOutcome {
+function emptyPlan(
+  tooLarge: boolean,
+  pendingTiles: number,
+  busy = false,
+  busyReason: IngestRefusal | null = null,
+): PlanOutcome {
   return {
-    plan: { geometry: null, profile: [], stats: EMPTY_STATS, legs: [], pendingTiles, tooLarge },
+    plan: {
+      geometry: null,
+      profile: [],
+      stats: EMPTY_STATS,
+      legs: [],
+      pendingTiles,
+      busy,
+      busyReason,
+      tooLarge,
+    },
     coords: [],
   };
 }
@@ -349,14 +364,33 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
 
   let graph: RouteGraph | null = null;
   let pendingTiles = 0;
+  /*
+   * Whether the network under these anchors is arriving or was refused.
+   *
+   * Kept apart from `pendingTiles` deliberately. This used to be inferred from it — the leg
+   * reason was `pendingTiles > 0 ? 'network_pending' : 'off_network'` — and backpressure
+   * zeroed `pending` on refusal, so a refused fetch came out the far end as "no path near
+   * point 3": a claim about the ground, on a screen whose job is to be honest about ground.
+   */
+  let networkPaused = false;
+  let pausedReason: IngestRefusal | null = null;
 
   if (needsNetwork) {
     const coverage = await ensureNetworkCoverage(padBBox(bboxOf(raw), PLAN_PAD_M), { db: ctx.db });
     if (coverage.tooLarge) return emptyPlan(true, 0);
     kickNetwork(ctx, coverage.queued);
     pendingTiles = coverage.pending.length;
+    networkPaused = coverage.busy;
+    pausedReason = coverage.busyReason;
     graph = await graphFor(ctx.db, coverage.ready);
   }
+
+  /** What an unroutable leg is called, in the order the reasons rule each other out. */
+  const unroutable = (missing: 'off_network' | 'no_path'): RouteLegReason => {
+    if (networkPaused) return 'network_paused';
+    if (pendingTiles > 0) return 'network_pending';
+    return missing;
+  };
 
   const g = graph;
   const snapAt: Array<SnapResult | null> = g
@@ -376,12 +410,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     if (!g || !from || !arrive) {
       // A tile still downloading is the likelier explanation than genuinely open country,
       // and it is the one the user can do something about by waiting.
-      work.push({
-        snapped: false,
-        reason: pendingTiles > 0 ? 'network_pending' : 'off_network',
-        coords: null,
-        eleM: null,
-      });
+      work.push({ snapped: false, reason: unroutable('off_network'), coords: null, eleM: null });
       continue;
     }
 
@@ -398,12 +427,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
 
     const path = findPath(g, from.node, arrive.node, { preferPaths: input.preferPaths });
     if (!path) {
-      work.push({
-        snapped: false,
-        reason: pendingTiles > 0 ? 'network_pending' : 'no_path',
-        coords: null,
-        eleM: null,
-      });
+      work.push({ snapped: false, reason: unroutable('no_path'), coords: null, eleM: null });
       continue;
     }
 
@@ -467,7 +491,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     });
   }
 
-  if (coords.length < 2) return emptyPlan(false, pendingTiles);
+  if (coords.length < 2) return emptyPlan(false, pendingTiles, networkPaused, pausedReason);
 
   const lengthM = lineLengthM(coords);
   const dense = buildProfile(coords, ele);
@@ -481,6 +505,8 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
       stats: computeTrailStats(profile),
       legs,
       pendingTiles,
+      busy: networkPaused,
+      busyReason: pausedReason,
       tooLarge: false,
     },
     coords,
@@ -735,6 +761,12 @@ export const routesRouter = router({
     return {
       ready: coverage.ready.length,
       pending: coverage.pending.length,
+      // True when backpressure refused the fetch, so `pending` is zero for a reason other
+      // than "we hold it all". Reported here for symmetry with `plan`, which is where the
+      // planner actually reads it — this procedure exists to warm tiles and its result is
+      // deliberately not rendered. See `backpressure.ts` in @switchback/ingest.
+      busy: coverage.busy,
+      busyReason: coverage.busyReason,
       tooLarge: coverage.tooLarge,
       requiredTiles: coverage.requiredTiles,
       maxTiles: coverage.maxTiles,

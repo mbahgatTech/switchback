@@ -44,3 +44,42 @@ export const UNBATCHED_PROCEDURES: readonly string[] = [
 export function isUnbatched(path: string): boolean {
   return UNBATCHED_PROCEDURES.includes(path);
 }
+
+/**
+ * How many procedures one HTTP request may carry.
+ *
+ * Batching is a convenience for our clients and a multiplier for everybody else. tRPC's
+ * `maxBatchSize` is only enforced when it is a number — the check reads
+ * `typeof maxBatchSize === 'number'`, and `allowBatching` defaults true — so leaving it
+ * unset does not mean "some sensible default", it means no ceiling at all. One request
+ * would run as many procedures as its URL had commas in it, which was demonstrated at
+ * twenty-five in a single 306 ms call. Mutations batch in the POST body, so the URL length
+ * limit is not a ceiling either.
+ *
+ * That is the finding this number closes, and the reason it matters is not the one request:
+ * it is that every per-IP limit downstream of it — rate limiting, connection budget, the
+ * ingest queue guard — silently counts requests while the cost is per procedure. An
+ * unbounded multiplier makes all of them decorative.
+ *
+ * **What it is sized against.** Sixteen, against a measured worst case of seven.
+ *
+ * - The largest batch actually observed in a browser, driving the heaviest screens against
+ *   production — explore with filters open, a trail page with weather and busyness, `/plan`,
+ *   `/downloads` — was **five**, on a signed-out trail page:
+ *   `weather.alongRoute,busyness.forWeek,weather.airQualityAt,reviews.summary,reviews.list`.
+ * - Signed in, that same page adds `reviews.mine` and `lists.saveState`, both of which are
+ *   `enabled` on having a viewer, for **seven** in one tick. That is the ceiling either
+ *   client reaches; the mobile trail screen's heaviest tick is six.
+ *
+ * Sixteen is a shade over twice that, which is headroom for a screen growing a couple more
+ * panels without anybody having to think about this file.
+ *
+ * **Both ends are pinned, and that is what makes it safe to be this tight.** A server that
+ * refuses an oversized batch rejects the *whole* batch with `BAD_REQUEST`, so a screen that
+ * one day fires seventeen queries would not degrade — it would break, and it would look like
+ * the page breaking rather than like a limit. So the clients pass the same number as
+ * `maxItems`, and tRPC's batch loader splits a tick that exceeds it into two requests
+ * instead of building one the server will refuse. Our own clients therefore cannot trip
+ * this; only somebody hand-rolling a request can, which is the only caller it is for.
+ */
+export const MAX_BATCH_SIZE = 16;
