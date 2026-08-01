@@ -91,8 +91,9 @@ env:
   # overrides a variable that is already set — so these pass straight through. The vitest
   # config reads the same way (`loadEnv` with an empty prefix merges `process.env` last).
   DATABASE_URL: postgresql://switchback:switchback@localhost:5433/switchback
-  # Same endpoint. The two differ only on Neon, where DDL cannot go through PgBouncer;
-  # `prisma db push` reads `directUrl` and fails on a missing variable, not an equal one.
+  # Same endpoint. The two only diverge where a connection pooler sits in front of the database
+  # and cannot carry DDL; `prisma db push` reads `directUrl` and fails on a missing variable,
+  # not an equal one.
   DIRECT_DATABASE_URL: postgresql://switchback:switchback@localhost:5433/switchback
   AUTH_SECRET: ci-secret-not-used-for-anything-real-0123456789
   # Overpass refuses a client that will not say who it is, and rightly. A CI run that ever
@@ -116,9 +117,10 @@ jobs:
 
     services:
       db:
-        # The same image infra/docker-compose.yml uses, and the same major versions Neon
-        # provides. A CI database on plain Postgres would pass every test that does not
-        # touch PostGIS and fail the ones that matter.
+        # The same image infra/docker-compose.yml uses. Postgres 17 matches production; PostGIS
+        # does not — production is Azure, which ships 3.6.1, and this is 3.5. That skew is
+        # recorded rather than papered over. A CI database on plain Postgres would pass every
+        # test that does not touch PostGIS and fail the ones that matter.
         image: postgis/postgis:17-3.5
         env:
           POSTGRES_USER: switchback
@@ -231,10 +233,12 @@ jobs:
     timeout-minutes: 10
 
     env:
-      # Neon, from repository secrets. The pooled endpoint for queries and the direct one for
-      # DDL — `schema.prisma` names the second as `directUrl` because PgBouncer will not carry
-      # a `CREATE INDEX`. Nothing else in this workflow sees these; the two jobs above run
-      # against their own throwaway Postgres service.
+      # Azure Postgres, from repository secrets — both were repointed from Neon at the
+      # 2026-07-30 cutover. `schema.prisma` names the second as `directUrl`; on Azure's
+      # Burstable tier there is no PgBouncer, so the two are the same 5432 endpoint today and
+      # the split is what keeps DDL correct if the tier ever changes. Nothing else in this
+      # workflow sees these; the two jobs above run against their own throwaway Postgres
+      # service.
       #
       # This runs here rather than from a developer's machine for a boring, concrete reason:
       # a VPN that routes 5432 into a black hole is common enough, and the person who owns

@@ -4,11 +4,11 @@ import { PrismaClient } from '@prisma/client';
  * Two Prisma clients: one pool for requests, a separate one for background work.
  *
  * Next.js dev-mode hot reloading re-evaluates modules on every edit. Constructing a new
- * PrismaClient each time opens a new connection pool each time, and Neon's free tier
- * caps connections low enough that a few minutes of editing exhausts it — the failure
- * mode is a sudden "too many connections" that looks like a database outage and is
- * actually the dev server. Stashing the instance on `globalThis`, which survives module
- * re-evaluation, is the standard fix.
+ * PrismaClient each time opens a new connection pool each time, and a small managed Postgres
+ * caps connections low enough that a few minutes of editing exhausts it — the failure mode is
+ * a sudden "too many connections" that looks like a database outage and is actually the dev
+ * server. Stashing the instance on `globalThis`, which survives module re-evaluation, is the
+ * standard fix.
  *
  * In production the module is evaluated once and the global is never read.
  */
