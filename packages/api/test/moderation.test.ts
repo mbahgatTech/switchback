@@ -70,6 +70,9 @@ function user(role: UserRole, id = 'usr_member'): User {
     defaultActivityVisibility: 'private',
     createdAt: new Date('2026-01-01T00:00:00Z'),
     updatedAt: new Date('2026-01-01T00:00:00Z'),
+    // Never pressed "sign out everywhere", which is what almost every row says. No role
+    // check reads it — it is here because the fixture is a whole `User` and the type says so.
+    sessionsRevokedAt: null,
   };
 }
 
