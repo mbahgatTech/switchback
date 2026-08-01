@@ -4,20 +4,16 @@ import { REVIEW_SORTS } from '@switchback/core';
 import { ORDER_BY, toDateString, toReview, toUtcMidnight } from '../src/routers/reviews';
 
 /**
- * The pure decisions behind the reviews router.
- *
- * The same argument as `trails.test.ts`: none of this throws when it is wrong. A sort with a
+ * The pure decisions behind the reviews router. None of these throw when they are wrong: a
  * missing tiebreak returns the same review on two pages, a date shaped in the server's zone
- * renders the day before someone's hike, and an `isMine` that defaults open puts an edit
- * button on a stranger's report. Every one of those is silent in production and loud here.
+ * renders the day before someone's hike, and an `isMine` that defaults open puts an edit button
+ * on a stranger's report.
  */
 
 /**
- * One row as Prisma hands it over.
- *
- * The nullable fields are widened deliberately: written as bare literals TypeScript infers
- * `string` and `Date`, and then the `null` cases below — which are the interesting ones —
- * would not type-check.
+ * One row as Prisma hands it over. The nullable fields are widened deliberately: as bare
+ * literals TypeScript infers `string` and `Date`, and the `null` cases below would not
+ * type-check.
  */
 const BASE = {
   id: 'rev_1',
@@ -58,10 +54,8 @@ function row(over: Partial<typeof BASE> = {}) {
 
 describe('ORDER_BY', () => {
   it('breaks every tie all the way down to the id', () => {
-    // These pages are offset-based, and Postgres may return equal rows in any order it
-    // likes between two queries. On a trail where forty people all gave four stars, a sort
-    // that stops at `rating` can show the same review on page one and page two and drop
-    // another entirely — a paginated list that is quietly lossy.
+    // Offset-based pages, and Postgres may return equal rows in any order between queries, so
+    // a chain stopping at `rating` is quietly lossy.
     for (const sort of REVIEW_SORTS) {
       const chain = ORDER_BY[sort];
       expect(chain.length).toBeGreaterThan(1);
@@ -70,8 +64,8 @@ describe('ORDER_BY', () => {
   });
 
   it('names each field once per chain', () => {
-    // A repeated field is a chain that was edited rather than rewritten: the second mention
-    // is dead, and the tiebreak everyone assumes is there is not.
+    // A repeated field is a chain that was edited rather than rewritten: the second mention is
+    // dead, and the tiebreak everyone assumes is there is not.
     for (const sort of REVIEW_SORTS) {
       const fields = ORDER_BY[sort].flatMap((term) => Object.keys(term));
       expect(new Set(fields).size).toBe(fields.length);
@@ -79,12 +73,8 @@ describe('ORDER_BY', () => {
   });
 
   it('leads with the field the reader chose, past the tombstone term', () => {
-    /*
-     * The three sorts that key on a column a removed report no longer carries push the
-     * tombstones into one block first — see `TOMBSTONES_LAST` in the router for why position
-     * in a sorted list publishes a withdrawn number as surely as printing it does. So "the
-     * field the reader chose" is the first term that is not that one.
-     */
+    // See `TOMBSTONES_LAST` in the router: three sorts push the tombstones into a block first,
+    // so "the field the reader chose" is the first term that is not that one.
     const chosen = (sort: ReviewSort) => {
       const [first, second] = ORDER_BY[sort];
       return 'hiddenAt' in first! ? second : first;
@@ -97,20 +87,19 @@ describe('ORDER_BY', () => {
   });
 
   it('sinks the tombstones rather than floating them', () => {
-    // `nulls: 'first'` puts the visible rows — `hiddenAt IS NULL` — ahead of the removed
-    // ones. The other way round would open every rating sort on a wall of takedowns.
+    // `nulls: 'first'` puts the visible rows ahead of the removed ones. The other way round
+    // would open every rating sort on a wall of takedowns.
     for (const sort of ['rating_desc', 'rating_asc', 'helpful'] as const) {
       expect(ORDER_BY[sort][0]).toEqual({ hiddenAt: { sort: 'desc', nulls: 'first' } });
     }
 
-    // Not `recent`: it keys on a date the tombstone prints on its own face, so there is
-    // nothing to leak, and keeping a removed report in chronological place is the point.
+    // Not `recent`: it keys on a date the tombstone prints on its own face.
     expect(ORDER_BY.recent[0]).toEqual({ createdAt: 'desc' });
   });
 
   it('keeps the newest first within a rating, both ways up the scale', () => {
-    // Lowest-rated exists so the closed bridge and the washed-out ford are findable. A
-    // three-year-old one-star at the top of that list is the wrong report to lead with.
+    // Lowest-rated exists so the closed bridge is findable; a three-year-old one-star at the
+    // top of that list is the wrong report to lead with.
     expect(ORDER_BY.rating_asc[2]).toEqual({ createdAt: 'desc' });
     expect(ORDER_BY.rating_desc[2]).toEqual({ createdAt: 'desc' });
   });
@@ -118,10 +107,8 @@ describe('ORDER_BY', () => {
 
 describe('toDateString / toUtcMidnight', () => {
   it('round-trips a calendar date unchanged', () => {
-    // The whole contract. `hikedOn` is a day someone was on a hill — no time, no zone — and
-    // it has to survive the trip through a `DateTime` column as the same three numbers they
-    // typed. Formatting it in any local zone, including the server's, is what turns "hiked
-    // it on the 3rd" into the 2nd for every reader west of Greenwich.
+    // `hikedOn` is a day someone was on a hill — no time, no zone — and formatting it in any
+    // local zone turns "hiked it on the 3rd" into the 2nd for every reader west of Greenwich.
     for (const date of ['2026-03-14', '2026-01-01', '2026-12-31', '2024-02-29']) {
       expect(toDateString(toUtcMidnight(date))).toBe(date);
     }
@@ -136,13 +123,11 @@ describe('toDateString / toUtcMidnight', () => {
 
   it('reads the date out of the instant, not out of the local clock', () => {
     // 23:30 UTC on the 14th is already the 15th in Sydney and still the 14th in Denver.
-    // Slicing the ISO string is what makes the answer the same in both places.
     expect(toDateString(new Date('2026-03-14T23:30:00Z'))).toBe('2026-03-14');
     expect(toDateString(new Date('2026-03-14T00:30:00Z'))).toBe('2026-03-14');
   });
 
   it('passes no date through as no date', () => {
-    // Plenty of reports say nothing about when. That is not the epoch.
     expect(toDateString(null)).toBeNull();
   });
 });
@@ -154,9 +139,8 @@ describe('toReview', () => {
   });
 
   it('re-canonicalises the conditions on the way out', () => {
-    // Rows predating this router, or written by some future admin path, carry no guarantee
-    // of order. Two reports saying the same three things must draw the same three chips in
-    // the same three positions or the column stops being scannable.
+    // Rows predating this router carry no guarantee of order, and two reports saying the same
+    // three things must draw the same three chips in the same three positions.
     expect(toReview(row({ conditions: ['crowded', 'icy', 'dry'] }), null).conditions).toEqual([
       'dry',
       'icy',
@@ -170,15 +154,14 @@ describe('toReview', () => {
   });
 
   it('is false, never null, for a signed-out reader', () => {
-    // `isMine` drives an edit affordance. A nullish value read as truthy anywhere downstream
-    // offers a stranger the controls for someone else's report.
+    // `isMine` drives an edit affordance; a nullish value read as truthy downstream offers a
+    // stranger the controls for someone else's report.
     expect(toReview(row(), null).isMine).toBe(false);
   });
 
   it('publishes the four public author fields and nothing else', () => {
-    // The guard against the `include: { user: true }` that would put every column of the
-    // users table on the wire — which is how email addresses leak from products that grew
-    // quickly. If a field is added to the select, it has to be added here on purpose.
+    // The guard against the `include: { user: true }` that would put every column of the users
+    // table on the wire. A field added to the select has to be added here on purpose.
     expect(Object.keys(toReview(row(), null).author).sort()).toEqual([
       'id',
       'image',
@@ -188,8 +171,8 @@ describe('toReview', () => {
   });
 
   it('never puts the author id where the review id goes', () => {
-    // Both are strings and both are called `id` one level apart, which is exactly the swap
-    // that survives review and then makes React collapse every review by one author.
+    // Both are strings and both are called `id` one level apart, which is the swap that
+    // survives review and then makes React collapse every review by one author.
     const shaped = toReview(row(), null);
     expect(shaped.id).toBe('rev_1');
     expect(shaped.author.id).toBe('usr_ivy');
@@ -202,10 +185,8 @@ describe('toReview', () => {
   });
 
   it('passes the photographs through, and only the seven fields a report frame needs', () => {
-    // The report's photo shape is deliberately thinner than the gallery's — no licence, no
-    // attribution, no distance along the route, no ownership flag — because every one of
-    // these was taken by the person already named on the line above them. A field that
-    // creeps back in here is nine redundant values on the wire per photograph per report.
+    // Deliberately thinner than the gallery's shape — no licence, attribution, distance or
+    // ownership flag — because every one of these was taken by the person named above them.
     const [photo] = toReview(row(), null).photos;
     expect(Object.keys(photo ?? {}).sort()).toEqual([
       'blurhash',
@@ -219,8 +200,8 @@ describe('toReview', () => {
   });
 
   it('reports no photographs as an empty list rather than as nothing', () => {
-    // The strip renders on `photos.length`. Undefined here would be a thrown read on every
-    // report that carries no pictures, which is most of them.
+    // The strip renders on `photos.length`; undefined would be a thrown read on every report
+    // that carries no pictures, which is most of them.
     expect(toReview(row({ photos: [] }), null).photos).toEqual([]);
   });
 });

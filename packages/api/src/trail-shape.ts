@@ -1,24 +1,16 @@
 /**
- * The trail card, as one select and one mapper.
- *
- * It lives outside `routers/trails.ts` because it is no longer only the trails router's
- * business: a list, a profile's completions, and later an activity feed all render the exact
- * same card, and every one of them wants the same columns. Copying the select into each
- * router is how a photo starts appearing on a search result and not on a saved one.
- *
- * The map, detail and search shapes are still built from this in `routers/trails.ts` — they
- * extend it rather than repeat it, so a column added here reaches all of them.
+ * The trail card, as one select and one mapper. Outside `routers/trails.ts` because lists,
+ * profile completions and search all render the same card from the same columns; the map,
+ * detail and search shapes extend this rather than repeat it.
  */
 
 import type { Prisma } from '@switchback/db';
 import type { TrailSummary } from '@switchback/core';
 
 /**
- * Exactly the columns a card needs.
- *
- * Spelled out rather than defaulting to the whole row because the omissions are the point:
- * no `geom`, which Prisma cannot read anyway; no `searchVector`; and no `description`,
- * which is the largest column on the table and is never shown on a card.
+ * Exactly the columns a card needs. Spelled out because the omissions are the point: no `geom`
+ * (Prisma cannot read it), no `searchVector`, and no `description`, the largest column on the
+ * table and never shown on a card.
  */
 export const summarySelect = {
   id: true,

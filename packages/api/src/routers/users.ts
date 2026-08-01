@@ -2,18 +2,15 @@
  * Hikers: the public profile, and what somebody's record adds up to.
  *
  * **Everything here is derived at read time.** There is no `user.totalDistanceM` column and
- * there deliberately never will be. A stored total has to be kept true across a corrected
- * completion date, a deleted trail, a re-ingested length, and a Phase 4 recording that
- * writes a completion without touching this file — five paths that must all remember, and
- * the day one forgets, a profile disagrees with the completed list with no way to tell which
- * is right. The queries below are index scans on `completions_userId_completedAt_idx`.
+ * deliberately never will be — a stored total has to be kept true across a corrected completion
+ * date, a deleted trail, a re-ingested length and a recording that writes a completion without
+ * touching this file. The queries below are index scans on
+ * `completions_userId_completedAt_idx`.
  *
- * **The privacy line runs between the aggregate and the itinerary.** How far someone hikes
- * is public; where and when they hike is theirs. So the totals, the records and the cadence
- * strip render for anyone, and the list of individual hikes is gated on the `completed`
- * list's own `isPublic` flag — the same switch that governs it everywhere else, rather than
- * a second setting that could disagree with the first. `hikesVisible` is returned so the
- * page can say *why* the hikes are absent instead of drawing an unexplained hole.
+ * **The privacy line runs between the aggregate and the itinerary.** Totals, records and the
+ * cadence strip render for anyone; the list of individual hikes is gated on the `completed`
+ * list's own `isPublic` flag, the same switch that governs it everywhere else. `hikesVisible` is
+ * returned so the page can say why the hikes are absent.
  */
 
 import { TRPCError } from '@trpc/server';
@@ -23,10 +20,6 @@ import { CADENCE_MONTHS, TOP_REGIONS, cadenceMonths, fillCadence } from '@switch
 import { Prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { publicProcedure, router } from '../trpc';
-
-// ---------------------------------------------------------------------------
-// Rows as Postgres hands them back
-// ---------------------------------------------------------------------------
 
 interface TotalsRow {
   hikes: number;
@@ -66,8 +59,8 @@ function toDateString(date: Date): string {
 }
 
 function toRecord(row: RecordRow | undefined): HikeRecord | null {
-  // A null measurement is a trail whose ingest never produced that figure. Printing it as
-  // "the highest point you have reached: 0 m" would be a claim nobody made.
+  // A null measurement is a trail whose ingest never produced that figure. "The highest point
+  // you have reached: 0 m" would be a claim nobody made.
   if (!row || row.valueM === null) return null;
   return {
     trailId: row.trailId,
@@ -78,21 +71,13 @@ function toRecord(row: RecordRow | undefined): HikeRecord | null {
   };
 }
 
-// ---------------------------------------------------------------------------
-// The stats query
-// ---------------------------------------------------------------------------
-
 /**
- * Everything a hiker's record adds up to.
+ * Everything a hiker's record adds up to. Five queries rather than one, run concurrently:
+ * Postgres would scan the same index three or four times for a single statement anyway, so only
+ * the round trips are saved, and `Promise.all` saves those.
  *
- * Five queries rather than one, run concurrently. A single statement would need three
- * correlated `ORDER BY … LIMIT 1` subqueries beside two `GROUP BY`s over the same join, and
- * Postgres would scan the same index three or four times regardless — so the round trips are
- * the only thing saved, and they are saved by `Promise.all` instead.
- *
- * Exported so `me.stats` and `users.byUsername` cannot drift: the number on your own profile
- * and the number a stranger reads have to be produced by the same code, or the first bug
- * report is somebody insisting the site shows two different totals.
+ * Exported so `me.stats` and `users.byUsername` cannot drift — the number on your own profile
+ * and the number a stranger reads must come from the same code.
  */
 export async function hikerStats(
   db: PrismaClient,
@@ -117,13 +102,8 @@ export async function hikerStats(
       WHERE c."userId" = ${userId}
     `,
 
-    /*
-     * The three records, as three ordered lookups stacked into one round trip.
-     *
-     * Ties break on the earlier hike, so a record keeps the date it was actually set on
-     * rather than jumping to the most recent repeat of the same trail — the first time you
-     * hiked the longest thing you have ever hiked is the fact worth printing.
-     */
+    // Ties break on the earlier hike, so a record keeps the date it was actually set on rather
+    // than jumping to the most recent repeat of the same trail.
     db.$queryRaw<RecordRow[]>`
       (SELECT 'longest'::text AS "kind", t.id AS "trailId", t.name AS "trailName",
               t.slug AS "trailSlug", c."completedAt", t."lengthM"::float8 AS "valueM"
@@ -165,9 +145,8 @@ export async function hikerStats(
       LIMIT ${TOP_REGIONS}
     `,
 
-    // A hiker's totals count what is still standing. Content a moderator removed is not a
-    // contribution any more, and leaving it in the tally would let somebody's profile keep
-    // credit for the thing that was taken down.
+    // A hiker's totals count what is still standing: content a moderator removed is not a
+    // contribution any more.
     db.review.count({ where: { userId, hiddenAt: null } }),
     db.photo.count({ where: { userId, hiddenAt: null } }),
   ]);
@@ -187,15 +166,12 @@ export interface StatsRows {
 }
 
 /**
- * The rows, turned into the thing a page renders.
+ * The rows, turned into the thing a page renders. Separated from the queries so it can be
+ * tested against every awkward shape Postgres returns without a database.
  *
- * Separated from the queries so it can be tested against every awkward shape Postgres
- * actually returns — an empty record set, a `SUM` of nothing, a trail whose ingest never
- * produced a summit elevation — none of which needs a database to reproduce.
- *
- * Metres are rounded here and only here. `SUM(t."lengthM")` over forty hikes carries a float
- * tail that renders as `310000.00000000006`, and rounding at the display layer instead would
- * mean rounding it in the web app, the iOS app, and every export.
+ * Metres are rounded here and only here: `SUM(t."lengthM")` over forty hikes carries a float
+ * tail that renders as `310000.00000000006`, and rounding at the display layer would mean
+ * rounding it in the web app, the iOS app, and every export.
  */
 export function shapeStats({
   totals,
@@ -257,14 +233,9 @@ interface ProfileListRow {
 }
 
 /**
- * The lists to show on a profile, with their totals.
- *
- * Published lists only for a stranger; every list for the owner, because a profile that
- * hides your own private lists from you is a page you cannot use to find anything.
- *
- * The completed list is excluded here whatever its flag says. Its four numbers are already
- * the headline of the page, and a card underneath repeating "24 hikes, 310 km" is the same
- * sentence twice in two type sizes. The link to it lives with the headline instead.
+ * The lists to show on a profile, with their totals. Published lists only for a stranger, every
+ * list for the owner. The completed list is excluded whatever its flag says: its four numbers
+ * are already the headline of the page.
  */
 async function profileLists(
   db: PrismaClient,
@@ -300,10 +271,6 @@ async function profileLists(
   }));
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
 const profileSelect = {
   id: true,
   username: true,
@@ -316,11 +283,8 @@ const profileSelect = {
 type ProfileRow = Prisma.UserGetPayload<{ select: typeof profileSelect }>;
 
 /**
- * Is this person's record readable at this URL at all?
- *
- * A profile needs a username to have a URL, so an account that has never set one has no
- * public page — which is the right default for an account created by clicking "Sign in with
- * Microsoft" and never visiting settings.
+ * A profile needs a username to have a URL, so an account that has never set one has no public
+ * page — the right default for an account created by clicking "Sign in with Microsoft".
  */
 async function findByUsername(db: PrismaClient, username: string): Promise<ProfileRow> {
   const user = await db.user.findFirst({
@@ -334,12 +298,7 @@ async function findByUsername(db: PrismaClient, username: string): Promise<Profi
 }
 
 export const usersRouter = router({
-  /**
-   * One hiker's public page.
-   *
-   * `publicProcedure` — a profile readable only by signed-in people is a profile nobody can
-   * link to, and being linkable is most of what a profile is for.
-   */
+  /** One hiker's public page. Public: a profile nobody can link to is barely a profile. */
   byUsername: publicProcedure
     .input(z.object({ username: z.string().min(1).max(30) }))
     .query(async ({ ctx, input }): Promise<HikerProfile> => {
@@ -368,12 +327,11 @@ export const usersRouter = router({
         },
         stats,
         lists,
-        // Absent list means the account predates provisioning; treated as private, which is
-        // the safe reading of "we do not know".
+        // An absent list means the account predates provisioning; treated as private.
         hikesVisible,
         // A list resolves by slug for its owner and by id for everyone else, so the key is
-        // decided here rather than on the page — `/lists/completed` read by a stranger is
-        // their own completed list, which is the wrong page and looks like working software.
+        // decided here: `/lists/completed` read by a stranger is their own completed list,
+        // which is the wrong page and looks like working software.
         completedKey: hikesVisible && completed ? (isMe ? completed.slug : completed.id) : null,
         isMe,
       };

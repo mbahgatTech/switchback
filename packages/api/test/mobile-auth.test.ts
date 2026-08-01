@@ -13,16 +13,10 @@ import {
 import { verifyAccessToken } from '@switchback/api/tokens';
 
 /**
- * Integration tests for the browser-assisted sign-in handshake.
- *
- * Same shape and same reasoning as `tokens.test.ts`: the properties worth asserting here are
- * all statements about database state surviving between three separate HTTP requests — a code
- * can only be spent once, an authorized request cannot be re-authorized, a claim without the
- * matching verifier fails. None of that is observable without writing rows.
- *
- * `isAllowedRedirect` and `challengeFor` are pure and kept in the same file for the reason the
- * token suite gives: splitting one module's tests by whether they touch a socket makes them
- * harder to find, not easier.
+ * Integration tests for the browser-assisted sign-in handshake. The properties worth asserting
+ * are all statements about database state surviving between three separate HTTP requests — a
+ * code can only be spent once, an authorized request cannot be re-authorized, a claim without
+ * the matching verifier fails — none of which is observable without writing rows.
  */
 const DATABASE_URL = process.env.DATABASE_URL ?? '';
 const IS_LOCAL = /@(localhost|127\.0\.0\.1|host\.docker\.internal)[:/]/.test(DATABASE_URL);
@@ -46,9 +40,8 @@ describe('redirect allow-list', () => {
   });
 
   it('accepts Expo Go and localhost only where development schemes are allowed', () => {
-    // Expo Go hands out a URL keyed to the current Wi-Fi lease, which is the whole reason
-    // this flow exists — but it is also an address anything on the LAN can listen on, so it
-    // is a development affordance and never a production one.
+    // Expo Go's URL is keyed to the current Wi-Fi lease, which is also an address anything on
+    // the LAN can listen on — a development affordance and never a production one.
     expect(isAllowedRedirect('exp://192.168.1.42:8081/--/signin', true)).toBe(true);
     expect(isAllowedRedirect('exp://192.168.1.42:8081/--/signin', false)).toBe(false);
     expect(isAllowedRedirect('http://localhost:8081/signin', true)).toBe(true);
@@ -56,9 +49,8 @@ describe('redirect allow-list', () => {
   });
 
   it('refuses anything that would bounce a signed-in browser off our origin', () => {
-    // This endpoint redirects a browser that has just completed OIDC. An open redirect here
-    // is a phishing primitive on our own domain even when the code riding along is
-    // unredeemable, which is why the check happens before the row is written.
+    // This endpoint redirects a browser that has just completed OIDC, so an open redirect is a
+    // phishing primitive on our own domain even when the code riding along is unredeemable.
     for (const hostile of [
       'https://evil.example/steal',
       'http://evil.example/steal',
@@ -105,11 +97,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   afterAll(async () => {
-    /*
-     * By challenge rather than by user id: most of the rows this suite creates are never
-     * authorized, so they have no user id to delete them by. The challenge is the digest of a
-     * fixed 64-character verifier, which no real device will ever generate.
-     */
+    // By challenge rather than by user id: most rows this suite creates are never authorized,
+    // so they have no user id to delete them by.
     await prisma.mobileAuthRequest.deleteMany({ where: { challenge } });
     for (const id of [userId, otherUserId]) {
       await prisma.mobileAuthRequest.deleteMany({ where: { userId: id } });
@@ -130,8 +119,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     expect(row.challenge).toBe(challenge);
     expect(row.redirectUri).toBe(REDIRECT);
     expect(row.deviceName).toBe("Mazen's iPhone");
-    // The first leg is unauthenticated by necessity. Until a browser comes back through
-    // `/complete` with a session, the row is an intent with no authority attached to it.
+    // The first leg is unauthenticated by necessity: until a browser comes back through
+    // `/complete` with a session, the row is an intent with no authority attached.
     expect(row.userId).toBeNull();
     expect(row.codeHash).toBeNull();
     expect(row.claimedAt).toBeNull();
@@ -150,8 +139,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
       startAuthRequest(prisma, { redirectUri: 'https://evil.example', challenge }),
     ).rejects.toMatchObject({ code: 'invalid_redirect' });
 
-    // A short challenge is a guessable one, which would undo the point of having it: the
-    // whole defence is that an intercepted code is useless without a preimage nobody has.
+    // A short challenge is a guessable one, and the whole defence is that an intercepted code
+    // is useless without a preimage nobody has.
     await expect(
       startAuthRequest(prisma, { redirectUri: REDIRECT, challenge: 'short' }),
     ).rejects.toMatchObject({ code: 'invalid_request' });
@@ -204,8 +193,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     });
     const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
 
-    // The point of the whole design: any app on the device can register a URL scheme it does
-    // not own, so holding the code has to be worth nothing on its own.
+    // Any app on the device can register a URL scheme it does not own, so holding the code has
+    // to be worth nothing on its own.
     await expect(
       claimAuthRequest(prisma, {
         requestId: id,
@@ -214,8 +203,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
       }),
     ).rejects.toBeInstanceOf(MobileAuthError);
 
-    // And the failure did not spend the row, so the device that *does* hold the verifier can
-    // still finish — an interception attempt must not become a denial of service.
+    // And the failure did not spend the row: an interception attempt must not become a denial
+    // of service on the device that does hold the verifier.
     await expect(
       claimAuthRequest(prisma, { requestId: id, code: codeFrom(target), verifier: VERIFIER }),
     ).resolves.toBeDefined();
@@ -284,11 +273,10 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
 
   it('refuses to authorize from a browser that did not start the request', async () => {
     /*
-     * The CSRF fix, stated as a property. Without it, an attacker runs `/start` themselves —
-     * so that they, not the victim, hold the PKCE verifier — and then walks the victim's
-     * browser to `/complete?request=<id>`. `SameSite=Lax` sends the session cookie on a
-     * top-level cross-site GET by design, so the row would be authorized against the victim's
-     * account and the attacker would claim a sixty-day refresh token on it.
+     * The CSRF property. Without it an attacker runs `/start` themselves — so that they, not
+     * the victim, hold the PKCE verifier — then walks the victim's browser to
+     * `/complete?request=<id>`. `SameSite=Lax` sends the session cookie on a top-level
+     * cross-site GET by design, so the row would be authorized against the victim's account.
      */
     const mine = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
     const theirs = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
@@ -300,8 +288,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
       code: 'wrong_browser',
     });
 
-    // And the refusal did not spend the row: the browser that does hold the secret can still
-    // finish. A forgery attempt must not become a denial of service on a real sign-in.
+    // And the refusal did not spend the row: a forgery attempt must not become a denial of
+    // service on a real sign-in.
     await expect(
       authorizeAuthRequest(prisma, mine.id, userId, mine.browserSecret),
     ).resolves.toBeDefined();
@@ -309,8 +297,7 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
 
   it('refuses a row written before the binding column existed', async () => {
     // Requests in flight when this shipped have no `browserHash`, and null is treated as a
-    // mismatch rather than as unchecked. They live fifteen minutes, so the whole population
-    // clears within a quarter of an hour of a deploy; the alternative is a permanent hole.
+    // mismatch rather than as unchecked. The alternative is a permanent hole.
     const { id } = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
     await prisma.mobileAuthRequest.update({ where: { id }, data: { browserHash: null } });
 
@@ -363,8 +350,8 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     expect(pruned).toBeGreaterThanOrEqual(1);
 
     expect(await prisma.mobileAuthRequest.findUnique({ where: { id: ancient.id } })).toBeNull();
-    // Kept for the grace period so an app claiming a few seconds late gets `expired` — which
-    // it can explain — rather than `unknown_request`, which reads like a bug in the server.
+    // Kept for the grace period so an app claiming a few seconds late gets `expired`, which it
+    // can explain, rather than `unknown_request`, which reads like a bug in the server.
     expect(await prisma.mobileAuthRequest.findUnique({ where: { id: recent.id } })).not.toBeNull();
   });
 });

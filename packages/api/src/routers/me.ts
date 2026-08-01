@@ -35,11 +35,8 @@ function toSelfProfile(user: User): SelfProfile {
     defaultActivityVisibility: user.defaultActivityVisibility,
     isPlus: user.isPlus,
     plusUntil: user.plusUntil,
-    /*
-     * Read from the row the context loaded, so the client can decide whether to draw a
-     * moderator's controls. It is not an authorisation — `moderatorProcedure` is, and it
-     * re-reads the same column server-side on every call.
-     */
+    // Read from the row the context loaded, so the client can decide whether to draw a
+    // moderator's controls. Not an authorisation — `moderatorProcedure` is.
     role: user.role,
     home:
       user.homeLng !== null && user.homeLat !== null
@@ -49,25 +46,17 @@ function toSelfProfile(user: User): SelfProfile {
 }
 
 /**
- * The columns a profile edit is allowed to touch, and only those.
+ * The columns a profile edit is allowed to touch, and only those. **This is the allow-list that
+ * stops `me.update` being a privilege-escalation endpoint**, and a named function so a test can
+ * hold it to that: `data: { ...input }` would let anybody who can POST a profile edit send
+ * `role: "admin"` and be one forgotten `.strict()` away from getting it.
  *
- * **This is the allow-list that stops `me.update` being a privilege-escalation endpoint,
- * and it is a named function so a test can hold it to that.** `User` carries a `role`
- * column now; `data: { ...input }` here would let anybody who can POST a profile edit send
- * `role: "admin"` and be one forgotten `.strict()` away from getting it. Zod already
- * strips undeclared keys, so that would take two independent mistakes — and "two mistakes
- * from total compromise" is not a margin worth keeping on the one table that decides who
- * can delete other people's content.
+ * Built key by key rather than spread, which also keeps `undefined` and `null` distinct: absent
+ * leaves the column alone, explicit null clears it.
  *
- * Built key by key rather than spread, which also solves the older problem it was written
- * for: `undefined` and `null` mean different things across this boundary. Absent leaves the
- * column alone; explicit null clears it. A spread turns "did not touch bio" into "erase
- * bio".
- *
- * The rule for extending it: one named line per column, and if the field is an entitlement
- * — `role`, `isPlus`, `plusUntil` — it does not belong in this procedure at all.
- * `packages/api/test/moderation.test.ts` re-derives the key set from a deliberately
- * polluted input and fails the build if any of those three ever appears.
+ * The rule for extending it: one named line per column, and an entitlement — `role`, `isPlus`,
+ * `plusUntil` — does not belong in this procedure at all. `test/moderation.test.ts` re-derives
+ * the key set from a deliberately polluted input and fails the build if any of those appears.
  */
 export function profileUpdateData(input: ProfileUpdate): Prisma.UserUpdateInput {
   const data: Prisma.UserUpdateInput = {};
@@ -89,28 +78,24 @@ export function profileUpdateData(input: ProfileUpdate): Prisma.UserUpdateInput 
 
 export const meRouter = router({
   /**
-   * Null when signed out rather than UNAUTHORIZED. Every client calls this on boot to
-   * decide what to render, and a 401 on the happy path of a logged-out visitor makes
-   * error logs useless.
+   * Null when signed out rather than UNAUTHORIZED. Every client calls this on boot to decide
+   * what to render, and a 401 on the happy path of a logged-out visitor makes error logs
+   * useless.
    */
   get: publicProcedure.query(({ ctx }) => (ctx.user ? toSelfProfile(ctx.user) : null)),
 
   /**
-   * Your own record, whatever your profile's visibility says.
-   *
-   * The same function `users.byUsername` calls, so the total on your own page and the total
-   * a stranger reads cannot disagree. This exists separately because you can look at your
-   * own stats before you have set a username — and until you have one, there is no
-   * `/u/…` URL to look at them on.
+   * Your own record, whatever your profile's visibility says. The same function
+   * `users.byUsername` calls, so the two totals cannot disagree; separate because you can look
+   * at your own stats before you have a username, and so before there is a `/u/…` URL.
    */
   stats: protectedProcedure.query(({ ctx }): Promise<HikerStats> =>
     hikerStats(ctx.db, ctx.user.id),
   ),
 
   /**
-   * Advisory only. There is a unique index behind this, and the gap between the check and
-   * the save is a real race — `update` handles the collision properly. This exists to
-   * turn a failed submit into live feedback while typing.
+   * Advisory only. There is a unique index behind this and the gap between check and save is a
+   * real race, which `update` handles; this turns a failed submit into feedback while typing.
    */
   usernameAvailable: protectedProcedure
     .input(z.object({ username: usernameSchema }))
@@ -145,38 +130,20 @@ export const meRouter = router({
   }),
 
   /**
-   * Ends every session this account has, everywhere: the native refresh tokens, the browser
-   * session rows, and the access tokens already handed out.
+   * Ends every session this account has: the native refresh tokens, the browser session rows,
+   * and the access tokens already handed out. All three, because a stolen browser cookie or an
+   * access JWT already in a client's memory outlives a row delete — `User.sessionsRevokedAt` is
+   * the stamp that closes the JWT half, and `createContext` refuses any bearer token issued at
+   * or before it. It is set **first**, so there is no instant in which the tokens are still
+   * honoured and the rows are already gone.
    *
-   * The browsers used to be left out, which made the name a lie. `auth.ts` picks database
-   * sessions over JWT with the argument that "a session row can be deleted, so 'this account
-   * was compromised' is one query" — and nothing ever deleted one, so a stolen browser cookie
-   * survived the one button in the product for revoking access, for the whole thirty days it
-   * was good for. Reaching for this is reaching for the compromise button; the phones are not
-   * the only place an attacker could be.
+   * This signs out the caller's own browser too; there is no way to tell it apart from the one
+   * being taken back.
    *
-   * **The access tokens were the other half of the same lie.** They are JWTs and nothing
-   * stores them, so deleting rows could not touch one already in a client's memory: the copy
-   * on a stolen phone kept working for up to `ACCESS_TOKEN_TTL_S` — fifteen minutes of reading
-   * Lifeline positions and deleting activities — while the screen said every session had
-   * ended. `User.sessionsRevokedAt` is the stamp that closes it, and `createContext` refuses
-   * any bearer token issued at or before it. It is set *first*, so there is no instant in
-   * which the tokens are still honoured and the rows are already gone.
-   *
-   * **It signs out the caller's own browser too**, because that browser is one of the
-   * sessions and there is no way to tell it apart from the one being taken back. The client
-   * says so before the press and lands on the sign-in page after it — a page that still looks
-   * signed in while every request from it fails is worse than an extra sign-in.
-   *
-   * **Both counts are of things that were live**, not of rows that happened to exist. They are
-   * read before the delete, and they carry the same expiry filters as `devices` below, because
-   * they are read out on the receipt the person lands on: an expired-but-unpruned refresh token
-   * and a session row from a browser last used in March are not sessions that were ended, and
-   * counting them made the receipt claim a bigger number than the device list on the screen the
-   * reader had just left. Nothing prunes either kind — the drain cron takes refresh tokens and
-   * auth requests, and @auth/core only deletes an expired session when that browser comes back
-   * with its cookie, which a browser that never comes back never does. The deletes stay
-   * unfiltered: clearing dead rows is free and it is the honest thing to do with them.
+   * **Both counts are of things that were live**, read before the delete and carrying the same
+   * expiry filters as `devices` below, because the receipt is shown next to that list. Nothing
+   * prunes either kind — @auth/core only deletes an expired session when that browser comes
+   * back. The deletes themselves stay unfiltered: clearing dead rows is free.
    */
   signOutEverywhere: protectedProcedure.mutation(async ({ ctx }) => {
     const now = new Date();

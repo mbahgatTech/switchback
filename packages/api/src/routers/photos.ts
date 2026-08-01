@@ -1,33 +1,17 @@
 /**
- * Photographs from our users.
+ * Photographs from our users. Bytes go straight to R2 from the browser (see
+ * `docs/architecture.md`), so the upload is a three-step handshake: `presign` checks quota and
+ * mints two presigned PUTs plus a signed grant, the client PUTs the objects itself, and
+ * `commit` verifies the grant, confirms the objects landed, and writes the row.
  *
- * The upload is a three-step handshake, and the shape of it is forced by one constraint:
- * the bytes must not pass through our API. Vercel caps a request body at 4.5 MB, a phone's
- * uplink holds a serverless invocation open for as long as it takes, and we would pay for
- * the same megabytes twice. So:
+ * **Nothing exists until `commit`.** An abandoned upload is bytes with no row — invisible to
+ * every query and swept by the orphan sweeper — where a row written at presign would make
+ * every reader filter abandoned uploads forever. The grant is a short-lived HS256 token
+ * carrying the caller's id and the two keys, which is the pending-uploads table.
  *
- * 1. **`presign`** — the client says what it is about to upload. We check the caller's quota,
- *    mint two presigned `PUT` URLs (full and thumbnail), and hand back a signed grant that
- *    records what we authorised.
- * 2. The client `PUT`s straight to the object store. We are not involved.
- * 3. **`commit`** — the client returns the grant. We verify it, confirm the objects really
- *    arrived and are the size they claimed, and only then write the row.
- *
- * **Nothing exists until `commit`.** A photograph that was uploaded and never committed is
- * bytes in a bucket with no row pointing at them: invisible to every query, and swept up by
- * the orphan sweeper in the drain cron. That ordering is deliberate — the alternative, a row
- * written at presign and marked complete later, means every reader has to filter out rows for
- * uploads that were abandoned, forever, in every query.
- *
- * **The grant is the pending-uploads table.** A short-lived HS256 token carrying the caller's
- * id and the two keys, so `commit` can trust its destination without a table to write, sweep,
- * and race against. Same reasoning as the mobile auth handshake next door.
- *
- * **We never decode an image.** Width, height and BlurHash are measured by the client, in the
- * canvas pass that already produced the thumbnail, and taken on trust. That is a real
- * decision with a real cost — a liar can make their own photograph render at the wrong aspect
- * ratio — bought in exchange for keeping `sharp`, a native module needing a per-platform
- * build, out of a repository that has no build step.
+ * **We never decode an image.** Width, height and BlurHash are measured by the client and
+ * taken on trust — a liar can make their own photograph render at the wrong aspect ratio — to
+ * keep `sharp`, a native module needing a per-platform build, out of a repo with no build step.
  */
 import { TRPCError } from '@trpc/server';
 import { SignJWT, jwtVerify } from 'jose';
@@ -49,10 +33,6 @@ import { PhotoSource } from '@switchback/db';
 import type { Prisma } from '@switchback/db';
 import { photoKeys, storage } from '../storage';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
-
-// ---------------------------------------------------------------------------
-// The grant
-// ---------------------------------------------------------------------------
 
 const GRANT_ISSUER = 'switchback';
 const GRANT_AUDIENCE = 'switchback-upload';
@@ -86,11 +66,9 @@ async function signGrant(userId: string, claims: GrantClaims): Promise<string> {
 }
 
 /**
- * Verify a grant against the caller.
- *
- * The subject check is the one that matters. Without it a grant is a bearer token for a
- * *destination*, and anyone who obtained one could commit a row pointing at another user's
- * object — attributing a stranger's photograph to themselves, or worse, to a trail.
+ * Verify a grant against the caller. The subject check is the one that matters: without it a
+ * grant is a bearer token for a *destination*, and anyone holding one could commit a row
+ * pointing at another user's object.
  */
 async function verifyGrant(token: string, userId: string): Promise<GrantClaims> {
   try {
@@ -125,10 +103,6 @@ function uploadId(): string {
     .replace(/=+$/u, '');
 }
 
-// ---------------------------------------------------------------------------
-// Shaping
-// ---------------------------------------------------------------------------
-
 export const photoSelect = {
   id: true,
   source: true,
@@ -157,19 +131,9 @@ export const photoSelect = {
 type PhotoRow = Prisma.PhotoGetPayload<{ select: typeof photoSelect }>;
 
 export function toPhoto(row: PhotoRow, viewerId: string | null) {
-  /*
-   * **A hidden photograph leaves here with no URL.**
-   *
-   * Every public query already filters `hiddenAt: null`, so in practice the only caller
-   * that ever sees one is `mine` — where the uploader is shown that their photograph was
-   * removed rather than left to notice it is gone. Blanking the URL here anyway is the
-   * belt: hiding an image means the bytes must not reach a browser, and a shape that still
-   * carries a live object URL has not taken anything down, however carefully the `where`
-   * clauses are written today. A `where` can be forgotten in a query added next year;
-   * this cannot.
-   *
-   * The caption goes too. It is text the reporter may well have been complaining about.
-   */
+  // A hidden photograph leaves here with no URL, and no caption — the caption is often the
+  // text that was reported. The public queries already filter `hiddenAt`, but hiding means the
+  // bytes must not reach a browser, and a `where` can be forgotten in a query added next year.
   const hidden = row.hiddenAt !== null;
 
   return {
@@ -201,42 +165,30 @@ export function toPhoto(row: PhotoRow, viewerId: string | null) {
 
 export type TrailPhoto = ReturnType<typeof toPhoto>;
 
-// ---------------------------------------------------------------------------
-// Aggregates
-// ---------------------------------------------------------------------------
-
 /**
- * Recompute `photoCount` and settle the hero, from the photographs that actually exist.
+ * Recompute `photoCount` and settle the hero from the photographs that actually exist.
+ * Recomputed rather than incremented, like `reviews.refreshAggregates`: one `COUNT` on an
+ * indexed column self-heals a row that drifted.
  *
- * Recomputed rather than incremented for the same reason `reviews.refreshAggregates` is: an
- * increment has to know whether this was an add or a replace, and every branch is a way for
- * the count on a card to drift permanently from the strip below it. One `COUNT` on an indexed
- * column is cheap and self-heals a row that drifted for any other reason.
- *
- * The hero rule is the one `packages/ingest`'s `chooseHero` already established, restated
- * here because the two paths must not disagree: **a photograph a user took outranks anything
- * we scraped.** Within user photographs it is the oldest that holds the spot, so uploading is
- * not a way to take the top of somebody else's trail page away from them — the first person
- * to contribute keeps it, and everyone after adds to the strip.
- *
- * `primaryPhotoId` is `@unique`, so a candidate another trail is already flying has to be
- * stepped over rather than claimed; taking it would abort the whole update on a constraint
- * violation and lose the count alongside the hero.
+ * The hero rule restates `packages/ingest`'s `chooseHero`, because the two paths must not
+ * disagree: a user photograph outranks anything scraped, and within user photographs the
+ * oldest holds the spot, so uploading cannot take the top of somebody else's trail page.
+ * `primaryPhotoId` is `@unique`, so a candidate another trail already flies is stepped over —
+ * claiming it would abort the update on a constraint violation and lose the count too.
  */
 export async function refreshTrailPhotos(
   db: Prisma.TransactionClient,
   trailId: string,
 ): Promise<void> {
   const [count, candidates, trail] = await Promise.all([
-    // Both carry `hiddenAt: null`, and both have to. A count that includes a photograph the
-    // gallery will not show puts "14 photographs" over a strip of thirteen; a hero chosen
-    // from the hidden ones flies the taken-down image at the top of the trail page, which
-    // is the single most visible place it could possibly land.
+    // Both carry `hiddenAt: null`, and both must: a count including a photograph the gallery
+    // will not show puts "14 photographs" over a strip of thirteen, and a hero chosen from the
+    // hidden ones flies a taken-down image at the top of the trail page.
     db.photo.count({ where: { trailId, hiddenAt: null } }),
     db.photo.findMany({
       where: { trailId, hiddenAt: null },
-      // `source` ascending puts `user` first: the enum is declared user, wikimedia, mapillary,
-      // and Postgres sorts an enum by declaration order, which is why that order was chosen.
+      // `source` ascending puts `user` first: Postgres sorts an enum by declaration order, and
+      // the enum is declared user, wikimedia, mapillary for exactly this reason.
       orderBy: [{ source: 'asc' }, { createdAt: 'asc' }],
       select: { id: true, source: true },
       take: 20,
@@ -262,11 +214,8 @@ export async function refreshTrailPhotos(
 }
 
 /**
- * How far a coordinate may sit outside the trail's own bounding box and still be believed.
- *
- * Roughly 2 km. Wide enough for the trailhead car park and the lay-by half a kilometre before
- * it, which is where a good number of the photographs on any trail page are actually taken,
- * and narrow enough that a photograph from another valley is not quietly filed here.
+ * How far a coordinate may sit outside the trail's own bounding box and still be believed —
+ * roughly 2 km, which covers the trailhead car park without filing another valley here.
  */
 const PHOTO_BBOX_PAD_DEG = 0.02;
 
@@ -278,18 +227,14 @@ interface TrailBox {
 }
 
 /**
- * Decide what to do with a coordinate that came out of a photograph's EXIF.
+ * Decide what to do with a coordinate out of a photograph's EXIF. Kept only if it falls near
+ * the trail it is attached to: phones write GPS into frames taken at home, and someone adding
+ * a picture of their boots by the door has not decided to publish their address. The same test
+ * keeps a mistagged photograph from putting a pin in the wrong county.
  *
- * Two jobs, and the privacy one is the reason this is not simply stored as sent. Phones write
- * GPS into every frame they take, including the ones taken at home, and a person adding a
- * picture of their boots by the door has not decided to publish their address. So a coordinate
- * is kept only if it falls near the trail it is being attached to — which is the same test that
- * keeps a mistagged photograph from putting a pin in the wrong county, so one check buys both.
- *
- * `distM` is where along the trail it lands, so the gallery can pin a photograph to a point on
- * the elevation profile: *this is the summit block at 6.1 km*, not just *this is somewhere on
- * Vesper Peak*. `ST_LineLocatePoint` returns a fraction of the line's length, measured on the
- * spheroid so the metres are metres rather than degrees.
+ * `distM` is where along the trail it lands, so the gallery can pin it to a point on the
+ * elevation profile. `ST_LineLocatePoint` returns a fraction of the line's length, measured on
+ * the spheroid so the metres are metres.
  */
 async function locatePhoto(
   db: Prisma.TransactionClient,
@@ -317,19 +262,16 @@ async function locatePhoto(
     const distM = rows[0]?.distM ?? null;
     return { lng, lat, distM: distM !== null && Number.isFinite(distM) ? Math.round(distM) : null };
   } catch {
-    // The coordinate passed the box test, so it is worth keeping even if the projection failed
-    // — a trail with no geometry yet is the ordinary cause, and it will have some later.
+    // The coordinate passed the box test, so it is worth keeping even if the projection
+    // failed — a trail with no geometry yet is the ordinary cause.
     return { lng, lat, distM: null };
   }
 }
 
 /**
- * Both quota checks, run before we hand out a ticket and again before we write a row.
- *
- * **Neither filters `hiddenAt`, and that is deliberate.** A photograph a moderator removed
- * still counts against the uploader's daily allowance and against their twelve on this
- * trail. Discounting it would hand somebody whose upload was taken down a fresh slot to put
- * it straight back in, which turns the per-trail cap from a limit into a refill.
+ * Both quota checks, run before we hand out a ticket and again before we write a row. Neither
+ * filters `hiddenAt`, deliberately: discounting a removed photograph would hand its uploader a
+ * fresh slot to put it straight back in, turning the per-trail cap into a refill.
  */
 async function assertWithinQuota(
   db: Prisma.TransactionClient,
@@ -356,28 +298,18 @@ async function assertWithinQuota(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
 export const photosRouter = router({
   /**
-   * Which driver is behind the uploader, so the client can say something true.
-   *
-   * Public because the sign-in page shows the same chrome as everything else, and because the
-   * answer is a deployment fact rather than a secret. In development this reads `local`, and
-   * the uploader shows a quiet note saying photographs are being written to disk rather than
-   * to a bucket — which is exactly the sort of thing that should be visible rather than
-   * discovered later by someone wondering where their files went.
+   * Which driver is behind the uploader, so the client can say something true. Public: the
+   * answer is a deployment fact, and in development it reads `local` so the uploader can note
+   * that photographs are going to disk rather than to a bucket.
    */
   storage: publicProcedure.query(() => ({ kind: storage().kind })),
 
   /**
-   * Authorise one upload. Two objects: the image and its thumbnail.
-   *
-   * The size is declared, not proven — `commit` checks what actually landed. Declaring it
-   * anyway means a 40 MB file is refused before the phone starts sending it, which is the
-   * difference between an instant error and two minutes of progress bar followed by one.
+   * Authorise one upload — the image and its thumbnail. The size is declared, not proven;
+   * `commit` checks what actually landed. Declaring it refuses a 40 MB file before the phone
+   * starts sending it.
    */
   presign: protectedProcedure
     .input(
@@ -421,11 +353,8 @@ export const photosRouter = router({
     }),
 
   /**
-   * The bytes are up. Write the row.
-   *
-   * `stat` before `create`, always. Without it a client could commit a grant it never used
-   * and put a row on a trail page whose `url` 404s, which is worse than no photograph: it is
-   * a broken image in a gallery with no way for anyone but us to remove it.
+   * The bytes are up. Write the row. `stat` before `create`, always: without it a client could
+   * commit a grant it never used and put a row on a trail page whose `url` 404s.
    */
   commit: protectedProcedure
     .input(photoCommitSchema)
@@ -453,8 +382,8 @@ export const photosRouter = router({
         });
       }
       if (full.size > MAX_PHOTO_BYTES) {
-        // Sweep it rather than leave it: the client lied about the size at presign, the row is
-        // not going to exist, and bytes with no row are bytes nobody will ever look for.
+        // Swept rather than left: the client lied about the size at presign, so the row is not
+        // going to exist and bytes with no row are bytes nobody will look for.
         await Promise.all([driver.remove(grant.full), driver.remove(grant.thumb)]).catch(() => {});
         throw new TRPCError({
           code: 'PAYLOAD_TOO_LARGE',
@@ -462,10 +391,8 @@ export const photosRouter = router({
         });
       }
 
-      // A thumbnail is an optimisation, not a requirement. If the client could not make one —
-      // an old browser, a format its canvas would not encode — the gallery falls back to the
-      // full image, which is slower and correct. A *malformed* one is dropped for the same
-      // reason: better no thumbnail than a broken one.
+      // A thumbnail is an optimisation, not a requirement: without a usable one the gallery
+      // falls back to the full image, which is slower and correct.
       const thumbUsable = thumb !== null && thumb.size > 0 && thumb.size <= MAX_THUMB_BYTES;
 
       const row = await ctx.db.$transaction(async (tx) => {
@@ -481,7 +408,7 @@ export const photosRouter = router({
             width: input.width,
             height: input.height,
             // Validated rather than trusted: a malformed hash throws inside every renderer
-            // that tries to parse it, and this is the one place it can be caught cheaply.
+            // that parses it, and this is the one place it can be caught cheaply.
             blurhash: input.blurhash && isBlurhash(input.blurhash) ? input.blurhash : null,
             caption: input.caption?.trim() ? input.caption.trim() : null,
             lng: where.lng,
@@ -499,14 +426,10 @@ export const photosRouter = router({
     }),
 
   /**
-   * Link photographs to a review that has just been saved.
-   *
-   * Separate from `reviews.upsert` because the two happen at different times: the photographs
-   * are uploaded while the person is still writing, and the review does not have an id until
-   * they press publish. Committing the photographs against the trail immediately and adopting
-   * them here means an abandoned draft leaves photographs on the trail rather than orphaned
-   * bytes — which is the better of the two failure modes, since that is what the person
-   * pressed "add" intending to do.
+   * Link photographs to a review that has just been saved. Separate from `reviews.upsert`
+   * because the photographs are uploaded while the person is still writing and the review has
+   * no id until publish; committing them against the trail immediately means an abandoned
+   * draft leaves photographs on the trail rather than orphaned bytes.
    */
   attach: protectedProcedure
     .input(
@@ -524,7 +447,7 @@ export const photosRouter = router({
         throw new TRPCError({ code: 'NOT_FOUND', message: 'No such review.' });
       }
 
-      // Scoped by owner *and* trail. Adopting a photograph from another trail would put a
+      // Scoped by owner *and* trail: adopting a photograph from another trail would put a
       // picture of somewhere else beside a review of this one.
       const { count } = await ctx.db.photo.updateMany({
         where: { id: { in: input.photoIds }, userId: ctx.user.id, trailId: review.trailId },
@@ -542,10 +465,9 @@ export const photosRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      // `hiddenAt: null` in the predicate, not a separate check: re-captioning a photograph
-      // a moderator took down is a write to removed content, and the caption is often the
-      // part that was reported. A hidden row simply matches nothing and reads as "no such
-      // photograph", which is what the owner's gallery already says about it.
+      // `hiddenAt: null` in the predicate, not a separate check: re-captioning a photograph a
+      // moderator took down is a write to removed content, and the caption is often the part
+      // that was reported. A hidden row matches nothing and reads as "no such photograph".
       const { count } = await ctx.db.photo.updateMany({
         where: { id: input.photoId, userId: ctx.user.id, hiddenAt: null },
         data: { caption: input.caption?.trim() ? input.caption.trim() : null },
@@ -555,20 +477,14 @@ export const photosRouter = router({
     }),
 
   /**
-   * Withdraw your own photograph, bytes and all.
+   * Withdraw your own photograph, bytes and all. The row goes first and the objects after: a
+   * failed object delete leaves orphaned bytes the sweeper collects, where the other order
+   * would leave a gallery entry pointing at a 404, which nothing collects.
    *
-   * The row goes first and the objects after. If the delete of the objects fails we have
-   * orphaned bytes, which the sweeper collects; if it went the other way round and the row
-   * delete failed we would have a gallery entry pointing at a 404, which nothing collects.
-   * Given one of the two has to be able to fail, this is the one to leave failing.
-   *
-   * **A photograph a moderator took down cannot be deleted here**, for the same reason
-   * `caption` refuses to edit one — and for one more. Deleting the row frees the daily and
-   * per-trail quota slots that `assertWithinQuota` deliberately refuses to discount, so
-   * "delete, then upload the same frame again" would be a one-call refill of exactly the
-   * allowance the cap exists to spend. It also destroys the `hiddenAt`/`hiddenById`/
-   * `hiddenReason` record of the decision and orphans every report filed against the id,
-   * which is what a notice-and-takedown process is supposed to be able to show.
+   * **A photograph a moderator took down cannot be deleted here.** Deleting the row would free
+   * the quota slots `assertWithinQuota` deliberately refuses to discount, making "delete, then
+   * re-upload" a one-call refill; it would also destroy the `hiddenAt`/`hiddenById`/
+   * `hiddenReason` record and orphan every report filed against the id.
    */
   remove: protectedProcedure
     .input(z.object({ photoId: z.string().min(1).max(64) }))
@@ -597,7 +513,7 @@ export const photosRouter = router({
 
       await ctx.db.$transaction(async (tx) => {
         // `Trail.primaryPhotoId` is a nullable foreign key, so the database drops the pointer
-        // on its own; `refreshTrailPhotos` is what promotes a replacement into the empty spot.
+        // itself; `refreshTrailPhotos` promotes a replacement into the empty spot.
         await tx.photo.delete({ where: { id: photo.id } });
         if (photo.trailId) await refreshTrailPhotos(tx, photo.trailId);
       });
@@ -605,8 +521,8 @@ export const photosRouter = router({
       const driver = storage();
       const keys = photoKeys(ctx.user.id, photo.sourceId, 'image/jpeg');
       await Promise.all([
-        // Derived from the stored URL rather than re-derived from the id, because the
-        // extension depends on the format that was uploaded and only the URL still knows it.
+        // Derived from the stored URL rather than re-derived from the id: the extension
+        // depends on the format that was uploaded, and only the URL still knows it.
         driver.remove(keyFromUrl(photo.url) ?? keys.full),
         photo.thumbUrl
           ? driver.remove(keyFromUrl(photo.thumbUrl) ?? keys.thumb)
@@ -617,30 +533,14 @@ export const photosRouter = router({
     }),
 
   /**
-   * Everything the caller has contributed, newest first. The gallery on their own profile.
+   * Everything the caller has contributed, newest first — the gallery on their own profile,
+   * rendered by `components/profile/photographs.tsx`.
    *
-   * **Hidden photographs are included here and nowhere else.** Every public gallery filters
-   * them out; this one keeps them so the person who uploaded one is told it was removed
-   * rather than left to notice a gap. `toPhoto` has already blanked the URL, so the row
-   * carries the fact and not the image.
-   *
-   * Rendered by `components/profile/photographs.tsx` on `/profile` and on your own
-   * `/u/<name>`. That sentence is load-bearing: for a while this procedure had no caller at
-   * all, which made the tombstone a thing the code prepared and nobody ever saw, and made
-   * the terms page's promise that "you will see it marked as removed in your own" false.
-   *
-   * The trail travels with each row because the answer to "which one was that?" is a place,
-   * not an id, and the uploader needs somewhere to click.
-   *
-   * **Removed frames sort first, ahead of the newest visible one.** Hiding does not touch
-   * `createdAt`, so under a plain newest-first order a takedown kept whatever place it always
-   * had — and both callers ask for 24. The quotas make passing 24 ordinary (twelve per trail,
-   * a hundred a day: three trails is enough), so a contributor with thirty photographs whose
-   * twenty-sixth-newest was taken down got a page with no notice anywhere on it, while
-   * `/terms` promises they "will see it marked as removed" on their own profile. A promise
-   * that holds only for recent uploads is not one. `nulls: 'last'` is what does it: the
-   * non-null `hiddenAt` rows come first, newest takedown at the top, and everything still
-   * visible follows in the order it always had.
+   * **Hidden photographs are included here and nowhere else**, so the uploader is told one was
+   * removed rather than left to notice a gap; `toPhoto` has already blanked the URL. Removed
+   * frames sort first, which is what `nulls: 'last'` does: hiding does not touch `createdAt`,
+   * and both callers ask for 24, so under a plain newest-first order a contributor with thirty
+   * photographs would see no notice at all — and `/terms` promises they will.
    */
   mine: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(60).default(24) }))
@@ -659,13 +559,10 @@ export const photosRouter = router({
 });
 
 /**
- * Recover the object key from a stored URL.
- *
- * Both drivers build their URLs by appending an escaped key to a fixed prefix, so the key is
- * everything after `photos/` — which is stable across a move from the local driver to R2, and
- * across a change of public domain. Returns null for a URL that does not look like ours, so
- * an old row written by some other means is skipped rather than turned into a delete of
- * whatever `photos/…` that path happens to resolve to.
+ * Recover the object key from a stored URL. Both drivers append an escaped key to a fixed
+ * prefix, so the key is everything after `photos/` — stable across a move to R2 and a change
+ * of public domain. Null for a URL that does not look like ours, so an old row written by some
+ * other means is skipped rather than turned into a delete of whatever that path resolves to.
  */
 export function keyFromUrl(url: string): string | null {
   const match = /(?:^|\/)(photos\/[^?#]+)/u.exec(url);

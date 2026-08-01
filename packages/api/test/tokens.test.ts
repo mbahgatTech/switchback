@@ -15,16 +15,12 @@ import {
 } from '@switchback/api/tokens';
 
 /**
- * Integration tests for the mobile token layer.
- *
- * Like the spatial suite, these need a live local Postgres — the refresh half of this
- * module *is* database state, and the properties worth asserting (a rotated token stops
- * working, a reused one takes every sibling down with it) are only observable by writing
- * rows and reading them back.
- *
- * The access-token tests are pure and would run anywhere, but they live here rather than
- * in a second file because splitting one module's tests across two files by whether they
- * touch a socket makes them harder to find, not easier.
+ * Integration tests for the mobile token layer. These need a live local Postgres: the refresh
+ * half of this module *is* database state, and the properties worth asserting — a rotated token
+ * stops working, a reused one takes every sibling down with it — are only observable by writing
+ * rows and reading them back. The pure access-token tests live here too rather than in a second
+ * file, because splitting one module's tests by whether they touch a socket makes them harder
+ * to find.
  */
 const DATABASE_URL = process.env.DATABASE_URL ?? '';
 const IS_LOCAL = /@(localhost|127\.0\.0\.1|host\.docker\.internal)[:/]/.test(DATABASE_URL);
@@ -39,11 +35,9 @@ async function tokenRows(userId: string) {
 }
 
 /**
- * The key the module itself is signing with, for the tests that forge a token.
- *
- * Throwing rather than defaulting to `''`: an empty key would still produce a valid HS256
- * signature, so the "rejects a different secret" tests below would pass for the wrong
- * reason if `beforeAll` ever stopped running.
+ * The key the module itself is signing with, for the tests that forge a token. Throws rather
+ * than defaulting to `''`: an empty key still produces a valid HS256 signature, so the
+ * "rejects a different secret" tests would pass for the wrong reason.
  */
 function currentSecret(): Uint8Array {
   const secret = process.env.AUTH_SECRET;
@@ -55,9 +49,8 @@ describe.skipIf(!IS_LOCAL).sequential('mobile tokens', () => {
   let userId: string;
 
   beforeAll(async () => {
-    // The module reads AUTH_SECRET at call time rather than import time, so a repo whose
-    // .env has not been filled in still runs these — the value only has to be stable
-    // within the process, not correct for any real deployment.
+    // The module reads AUTH_SECRET at call time rather than import time, so the value only
+    // has to be stable within the process.
     process.env.AUTH_SECRET ??= 'x'.repeat(48);
 
     await prisma.user.deleteMany({ where: { email: EMAIL } });
@@ -240,9 +233,8 @@ describe.skipIf(!IS_LOCAL).sequential('mobile tokens', () => {
       await revokeRefreshToken(prisma, 'never-issued');
 
       // A signed-out device replaying its last refresh is a stale client, not a thief: the
-      // token has no successor, so nobody else can be holding a live copy of it. Rejecting
-      // it is right; cascading would let anyone sign a user out everywhere by signing out
-      // of one device and retrying.
+      // token has no successor, so nobody else holds a live copy. Cascading would let anyone
+      // sign a user out everywhere by signing out of one device and retrying.
       await expect(rotateRefreshToken(prisma, phone.refreshToken)).rejects.toMatchObject({
         name: 'RefreshTokenError',
         reuseDetected: false,

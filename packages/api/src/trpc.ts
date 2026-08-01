@@ -1,9 +1,7 @@
 /**
- * tRPC initialisation: the transformer, the error shape, and the three procedure tiers.
- *
- * Everything that needs `t` lives here and nothing else does, because `initTRPC` must be
- * called exactly once per app — call it twice and you get two incompatible `router`
- * builders whose types look identical and whose runtime does not.
+ * tRPC initialisation: the transformer, the error shape, and the procedure tiers. `initTRPC`
+ * must be called exactly once per app, so everything needing `t` lives here — calling it twice
+ * gives two incompatible `router` builders whose types look identical and whose runtime is not.
  */
 import { TRPCError, initTRPC } from '@trpc/server';
 import superjson from 'superjson';
@@ -12,46 +10,24 @@ import { canAdminister, canModerate } from '@switchback/core';
 import type { User } from '@switchback/db';
 import type { Context } from './context';
 
-/**
- * The one sentence every unhandled failure says.
- *
- * It reports what happened and what to do, and nothing about why — a reader cannot act on a
- * Postgres error and an attacker can. "Try again" is honest here: a 500 in this app is a
- * timed-out query or a dropped connection far more often than it is a bug, and both of those
- * do go away.
- */
+/** The one sentence every unhandled failure says: what happened and what to do, never why. */
 const SERVER_FAULT = 'Something on the server failed. Try again.';
 
 /**
- * The mark that says "this 500's message was written for a reader".
- *
- * `Symbol.for` rather than a module-local symbol: `packages/api` is transpiled by Next as
- * well as loaded directly by tests and cron routes, and two module instances holding two
- * private symbols would silently stop matching — which would look exactly like the bug this
- * exists to prevent, only intermittently.
+ * The mark that says "this 500's message was written for a reader". `Symbol.for` rather than a
+ * module-local symbol: this package is transpiled by Next as well as loaded directly by tests
+ * and cron routes, and two module instances holding two private symbols would stop matching.
  */
 const DELIBERATE = Symbol.for('switchback.trpc.deliberate-message');
 
 /**
- * A 500 that says something specific, and means to.
+ * A 500 that says something specific and means to — a corrupt trail geometry, a missing
+ * saved-lists row — where most `INTERNAL_SERVER_ERROR`s are synthesised around whatever a
+ * resolver let escape and carry Prisma's message. Only these survive the scrub below.
  *
- * Most `INTERNAL_SERVER_ERROR`s here are not thrown at all — tRPC synthesises them around
- * whatever a resolver let escape, and their message is Prisma's. Those get scrubbed. A few
- * are thrown deliberately, with a sentence somebody wrote for the person reading it: the
- * saved-lists row that is missing, a trail whose geometry is corrupt, an air-quality overlay
- * that could not be built. Those are the whole of what the failing component has to show, and
- * `save-controls.tsx` renders `error.message` raw.
- *
- * The blanket scrub swallowed all four, which among other things made `asAirQualityError` in
- * `routers/weather.ts` do nothing at all — both of its branches came out as the same generic
- * sentence, and its own comment about not sending a reader looking for a broken trail stopped
- * being true. Nothing caught it: the unit tests assert on the `TRPCError` before serialisation,
- * and serialisation is where the message was replaced.
- *
- * Marked rather than moved off code 500. The codes are load-bearing beyond the message —
+ * Marked rather than moved off code 500, because the codes are load-bearing elsewhere:
  * `trpc/query-client.ts` refuses to retry a 4xx, and `app/trails/[slug]/page.tsx` turns a
- * `NOT_FOUND` into a 404 page, which would swallow "That trail has no usable geometry."
- * entirely. A 500 is the honest code for all four: something on our side is broken.
+ * `NOT_FOUND` into a 404 page, which would swallow the message entirely.
  */
 export function deliberateServerError(message: string, cause?: unknown): TRPCError {
   const error = new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message, cause });
@@ -65,32 +41,18 @@ function writtenForTheReader(error: TRPCError, code: string): boolean {
 }
 
 const t = initTRPC.context<Context>().create({
-  /**
-   * superjson because the domain is full of `Date` — `hikedOn`, `capturedAt`, every
-   * forecast timestamp. Plain JSON turns those into strings, and a client that has to
-   * remember which fields to `new Date()` gets it wrong eventually.
-   */
+  /** superjson because the domain is full of `Date`; plain JSON turns those into strings. */
   transformer: superjson,
   /**
-   * What a client is told when something fails.
+   * An unhandled `INTERNAL_SERVER_ERROR` gets one fixed sentence: the default shape carries
+   * `error.message` through, and for a 500 that is Prisma's — the SQL, the table and column
+   * names, and the Postgres error text, handed to whoever asked. The real message stays in
+   * `console.error` in `app/api/trpc/[trpc]/route.ts`, which logs the cause with the procedure
+   * path.
    *
-   * The default shape carries `error.message` straight through, and for a 500 that message is
-   * whatever threw — which here means Prisma. A failed query answers with the SQL it was
-   * running, the table and column names in it, and the Postgres error text: schema, and a
-   * clear map of what to probe next, handed to whoever asked. Nobody has ever acted usefully
-   * on one of those in a browser.
-   *
-   * So an unhandled `INTERNAL_SERVER_ERROR` gets one fixed sentence and the real message stays
-   * where it is useful — `console.error` in `app/api/trpc/[trpc]/route.ts`, which already logs
-   * the cause with the procedure path beside it, and which goes to the server's log and
-   * nowhere else.
-   *
-   * **Not every 500.** Every other code is a message this codebase wrote on purpose — "Sign in
-   * to do that.", "That username was just taken." — and they are the whole of what a form has
-   * to show a reader. So are the four 500s built by `deliberateServerError` above, which is
-   * what the mark is for: scrubbing those replaced copy written for one exact situation with a
-   * sentence that sends the reader nowhere. The flattened Zod issues stay for the same reason:
-   * a field-level error is what turns "Bad Request" into a highlighted input.
+   * Every other code, and the 500s marked by `deliberateServerError`, are messages this
+   * codebase wrote on purpose and are the whole of what a form has to show. The flattened Zod
+   * issues stay for the same reason.
    */
   errorFormatter({ shape, error }) {
     return {
@@ -127,12 +89,9 @@ const enforceAuth = t.middleware(({ ctx, next }) => {
 });
 
 /**
- * Plus entitlement.
- *
- * Checks the expiry as well as the flag: a lapsed subscription leaves `isPlus` true until
- * the billing webhook lands, and a webhook that is late or lost should not hand out
- * offline downloads indefinitely. A null `plusUntil` means a grant with no end date —
- * comped accounts, the developer's own — and stays valid.
+ * Plus entitlement. Checks the expiry as well as the flag: a lapsed subscription leaves
+ * `isPlus` true until the billing webhook lands. A null `plusUntil` is a grant with no end
+ * date and stays valid.
  */
 const enforcePlus = enforceAuth.unstable_pipe(({ ctx, next }) => {
   const lapsed = ctx.user.plusUntil !== null && ctx.user.plusUntil.getTime() < Date.now();
@@ -146,23 +105,11 @@ export const protectedProcedure = t.procedure.use(enforceAuth);
 export const plusProcedure = t.procedure.use(enforcePlus);
 
 /**
- * The takedown lever.
- *
- * **Piped onto `enforceAuth`, and the role is read from `ctx.user`** — which `createContext`
- * loaded from the database on this request — rather than from anything the caller sent. A
- * session cookie proves who you are; it carries no claim about what you may do, and the one
- * mistake this tier exists to make impossible is trusting a client that says it is an
- * operator.
- *
- * It is a *procedure tier*, not a check the UI performs. Every moderation procedure is built
- * on one of these two, so hiding a button changes what is easy and changes nothing about
- * what is permitted: a signed-in member calling `moderation.hide` directly over HTTP gets a
- * FORBIDDEN from this middleware before the resolver runs and before the database is
- * touched. `packages/api/test/moderation.test.ts` asserts exactly that, for both tiers.
- *
- * The message says what is true rather than pretending the procedure does not exist. A 404
- * would leak slightly less and would send an operator whose role was never granted looking
- * for a bug in the client.
+ * The takedown lever. Piped onto `enforceAuth`, and **the role is read from `ctx.user`**, which
+ * `createContext` loaded from the database on this request, never from anything the caller
+ * sent. A procedure tier, not a check the UI performs: a signed-in member calling
+ * `moderation.hide` directly over HTTP is refused before the resolver runs and before the
+ * database is touched. `packages/api/test/moderation.test.ts` asserts that for both tiers.
  */
 const enforceModerator = enforceAuth.unstable_pipe(({ ctx, next }) => {
   if (!canModerate(ctx.user.role)) {
@@ -172,11 +119,9 @@ const enforceModerator = enforceAuth.unstable_pipe(({ ctx, next }) => {
 });
 
 /**
- * Changing somebody's role, and nothing else.
- *
- * Separate from `enforceModerator` because the two privileges must not travel together: a
- * moderator who can appoint moderators is an administrator, and the role column would then
- * be documenting a distinction the code does not keep.
+ * Changing somebody's role, and nothing else. Separate from `enforceModerator` because the two
+ * privileges must not travel together: a moderator who can appoint moderators is an
+ * administrator, and the role column would document a distinction the code does not keep.
  */
 const enforceAdmin = enforceAuth.unstable_pipe(({ ctx, next }) => {
   if (!canAdminister(ctx.user.role)) {

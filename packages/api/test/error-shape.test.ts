@@ -5,16 +5,9 @@ import type { Context } from '../src/context';
 import { deliberateServerError, publicProcedure, router } from '../src/trpc';
 
 /**
- * What a client is actually told, read off the wire.
- *
- * This is the gap a whole class of error-message bugs lives in. `createCaller` throws the
- * `TRPCError` object straight back, so a unit test that asserts on `error.message` passes
- * whatever the error formatter does to it afterwards — which is how a blanket scrub of every
- * `INTERNAL_SERVER_ERROR` message replaced three hand-written reader-facing sentences, and
- * made `asAirQualityError` a no-op, with every existing test still green.
- *
- * `fetchRequestHandler` is the only way to see the shape a browser sees, so these go through
- * it. No database and no session: the procedures below throw before they would need either.
+ * What a client is actually told, read off the wire. `createCaller` throws the `TRPCError`
+ * object straight back, so a unit test asserting on `error.message` passes whatever the error
+ * formatter does afterwards — `fetchRequestHandler` is the only way to see the browser's shape.
  */
 const appRouter = router({
   /** A resolver that lets an ordinary error escape — what a Prisma failure looks like. */
@@ -51,9 +44,8 @@ async function messageFor(path: string): Promise<string> {
 
 describe('the error shape a client receives', () => {
   it('replaces the message on an unhandled 500', async () => {
-    // Prisma answers a failed query with the SQL it was running, the table and column names
-    // in it, and the Postgres error text. Nobody has ever acted usefully on one of those in
-    // a browser, and an attacker can.
+    // Prisma answers a failed query with the SQL it was running, the table and column names in
+    // it, and the Postgres error text. An attacker can act on that; a reader cannot.
     const message = await messageFor('unhandled');
     expect(message).toBe('Something on the server failed. Try again.');
     expect(message).not.toMatch(/prisma/iu);
