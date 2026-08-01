@@ -11,17 +11,9 @@ import {
 } from './place';
 
 /**
- * Every route whose server render is a function of this cookie, so every route that has to be
- * rebuilt for a new answer to appear anywhere.
- *
- * It was one path — `/` — written when `/` was the nearby list and was the only reader. Both
- * halves of that stopped being true when the map became the front page. `/nearby` is now the
- * page that is a function of this cookie and nothing else, and it is where "Use my location"
- * lives, so leaving it off meant pressing the button wrote the cookie and left the list on
- * screen unchanged. `/` and its alias `/explore` read it too, through `placeCamera(place)` in
- * `components/explore/explore-shell.tsx` — the note that used to sit below said "the explore
- * map reads its own viewport", which is true of a shared URL and false of a bare load. `/plan`
- * reads it for the same camera. Nothing else does; `viewerPlace()` has exactly these callers.
+ * Every route whose server render is a function of the place cookie, so every route that must be
+ * rebuilt for a new answer to appear. `/nearby` owns the "Use my location" button; `/`, `/explore`
+ * and `/plan` read it through `placeCamera`. `viewerPlace()` has exactly these callers.
  */
 const PLACE_READERS = ['/nearby', '/', '/explore', '/plan'] as const;
 
@@ -30,20 +22,12 @@ function rebuildPlaceReaders(): void {
 }
 
 /**
- * Remember where the reader is, so the next visit opens on their trails.
+ * Remember where the reader is. Cookie, not account: where you are is a property of the device
+ * you are holding, and a signed-out reader needs it most. `source` is stored rather than inferred
+ * because a GPS fix and a searched place license different copy — see `placeLabel`.
  *
- * Called two ways, and the distinction between them is the whole reason `source` is stored
- * rather than inferred: the nearby list's "Use my location" hands over a GPS fix, and the
- * explore map hands over a place somebody searched for. Both are answers a person gave; the
- * first has no name and the second is nothing but a name.
- *
- * Cookie, not account. Where you are is a property of the device you are holding, not of
- * your identity — writing it to the account would mean a phone in the Cairngorms silently
- * moving the laptop's front page in Cardiff. It is also the one thing here a signed-out
- * reader most needs remembered, and an account row would do nothing for them.
- *
- * Every export of a `'use server'` module is a public endpoint anybody can call with
- * anything, so the coordinate is re-validated here rather than trusted from the type.
+ * Every export of a `'use server'` module is a public endpoint anybody can call with anything, so
+ * the coordinate is re-validated here rather than trusted from the type.
  */
 export async function rememberPlace(input: {
   lng: number;
@@ -83,14 +67,7 @@ export async function rememberPlace(input: {
   rebuildPlaceReaders();
 }
 
-/**
- * Forget it.
- *
- * A location control that can only be switched on is a control that has taken something.
- * This is the same act as revoking the browser's permission, on our side of it, and it
- * returns the nearby list to the question it asks when it knows nothing, and both maps to
- * their fallback camera.
- */
+/** Forget it — the same act as revoking the browser's permission, on our side of it. */
 export async function forgetPlace(): Promise<void> {
   const jar = await cookies();
   jar.delete(PLACE_COOKIE);

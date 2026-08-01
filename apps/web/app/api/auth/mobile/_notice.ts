@@ -1,18 +1,11 @@
 import { BRAND } from '@switchback/core';
 
 /**
- * A plain HTML page for the two mobile sign-in endpoints that a person can actually end up
- * looking at.
- *
- * Route handlers return `Response`, so there is no React and no Tailwind here — which is the
- * argument for keeping this page to a heading, a sentence, and nothing else rather than
- * hand-inlining the design system into a string. The colours are the `sheet` scheme's canvas
- * and ink, because this is a page to be read, and they are written as literals with the token
- * named beside them so a later divergence is at least visible.
- *
- * Nothing here links anywhere. It renders inside a system browser sheet the app opened, and
- * the only useful action is closing it and trying again in the app — a link would strand
- * someone in a browser they did not choose to be in.
+ * Plain HTML for the two mobile sign-in endpoints a person can end up looking at. Route handlers
+ * return `Response`, so there is no React and no Tailwind — hence a heading, a sentence, and
+ * colours written as literals with the token named beside them. Nothing links anywhere: this
+ * renders in a system browser sheet, and a link would strand somebody in a browser they did not
+ * choose.
  */
 const STYLE = `
   :root { color-scheme: light }
@@ -53,17 +46,9 @@ export function notice(status: number, heading: string, body: string): Response 
 }
 
 /**
- * The interstitial that turns a navigation into a decision.
- *
- * `/complete` used to mint a token pair on a GET, which meant any page on the internet could
- * navigate a signed-in browser to it and collect a sixty-day credential — `SameSite=Lax`
- * sends the session cookie on a top-level cross-site GET, because that is what Lax is for.
- * The answer is a POST that a reader has to press, carrying a token an attacker's page cannot
- * read. Both halves matter: the POST is what `SameSite=Lax` will not send cross-site, and the
- * token is what a same-site subdomain cannot forge.
- *
- * The device name is the app's own, trimmed and escaped and never trusted — it decorates the
- * question, it does not answer it.
+ * The interstitial that turns a navigation into a decision. Both halves matter: the POST is what
+ * `SameSite=Lax` will not send cross-site, and the CSRF token is what a same-site subdomain
+ * cannot forge. The device name is the app's own — escaped, and never trusted.
  */
 export function confirmation(options: {
   requestId: string;

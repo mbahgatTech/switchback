@@ -31,15 +31,8 @@ import { caller } from '@/trpc/server';
 import { BUTTON_COLLAR, HEIGHT, SECONDARY } from '@/components/controls';
 
 /**
- * A trail.
- *
- * A reading page — `data-scheme="sheet"` — with one dark instrument set into it. That
- * inversion is the structure: the map and its section are the thing you consult, and
- * everything above and below them is the thing you read before deciding to.
- *
- * Server-rendered end to end apart from the map pair. A trail page is the natural landing
- * point from a search engine, and every fact on it — the stats, the description, the
- * waypoints, the licence — is fixed at request time. Only the cursor moves.
+ * A trail: a reading page with one dark instrument (the map and its section) set into it.
+ * Server-rendered end to end apart from that pair — every fact here is fixed at request time.
  */
 
 interface PageProps {
@@ -60,13 +53,7 @@ const PLATE_BG = {
   survey: 'bg-survey',
 } as const;
 
-/**
- * SAC grades, with the T-numbers.
- *
- * The bare OSM value means nothing to a reader and the number means everything to anyone
- * who has hiked in the Alps, so both are printed. These are the Swiss Alpine Club's own
- * descriptions, shortened — not our interpretation of them.
- */
+/** The Swiss Alpine Club's own grade descriptions, shortened — not our interpretation of them. */
 const SAC_LABEL: Record<SacScale, { grade: string; text: string }> = {
   hiking: { grade: 'T1', text: 'Trail well marked, no head for heights needed' },
   mountain_hiking: { grade: 'T2', text: 'Continuous trail, some steep ground, sure footing' },
@@ -88,12 +75,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const trail = await loadTrail(slug);
   if (!trail) return { title: 'Trail not found' };
 
-  /*
-   * The reader's own units, including in the tab title and the share card. A crawler has no
-   * session and gets metric, which is the right answer for a link preview anybody might
-   * open — but a person who asked for miles and then shares the page should not have the one
-   * place they cannot see be the one that contradicts them.
-   */
+  // The reader's own units, including in the tab title and the share card. A crawler has no
+  // session and gets metric.
   const units = await viewerUnits();
 
   const summary = `${formatDistance(trail.stats.lengthM, units)} · ${formatElevation(
@@ -131,13 +114,10 @@ export default async function TrailPage({ params }: PageProps) {
   const trail = await loadTrail(slug);
   if (!trail) notFound();
 
-  // All three are additive: the page is complete without any of them, so none blocks the
-  // render of the part that matters. Requested together rather than in sequence. `me.get`
-  // costs nothing extra — the request context has already loaded the user for `ctx.user`.
+  // All three are additive — the page is complete without any of them — so none blocks the render.
   const [photos, nearby, viewer] = await Promise.all([
-    // `includeHidden` is asked for on every render and granted to nobody but an operator —
-    // `trails.photos` reads the role from the session. It is what puts a taken-down frame in
-    // front of the one control that can put it back.
+    // `includeHidden` is granted to nobody but an operator; `trails.photos` reads the role from
+    // the session. It puts a taken-down frame in front of the one control that can restore it.
     caller.trails.photos({ trailId: trail.id, limit: 12, includeHidden: true }),
     caller.trails.nearby({ at: trail.centroid, radiusM: 30_000, limit: 7 }),
     caller.me.get(),
@@ -158,9 +138,8 @@ export default async function TrailPage({ params }: PageProps) {
   const onRoute = trail.waypoints.filter((point) => point.distM !== null);
   const offRoute = trail.waypoints.filter((point) => point.distM === null);
 
-  // `activities.mine` is protected, so it can only be asked for once the viewer is known —
-  // a second round trip rather than a wider first one. Most readers of this page are signed
-  // out, and they never pay for it.
+  // `activities.mine` is protected, so it can only be asked for once the viewer is known — a
+  // second round trip rather than a wider first one that every signed-out reader would pay for.
   const myHikes = viewer ? await caller.activities.mine({ trailId: trail.id, limit: 5 }) : null;
 
   return (
@@ -171,7 +150,7 @@ export default async function TrailPage({ params }: PageProps) {
       </header>
 
       <main className="mx-auto max-w-rail px-xl pb-5xl">
-        {/* ── Title block ──────────────────────────────────────────────────────────── */}
+        {/* Title block */}
         <p className="collar flex flex-wrap items-center gap-x-md gap-y-xs">
           {trail.regionName ? <span>{trail.regionName}</span> : null}
           <span>{ROUTE_TYPE_LABEL[trail.routeType]}</span>
@@ -190,11 +169,7 @@ export default async function TrailPage({ params }: PageProps) {
             />
             {DIFFICULTY_LABEL[trail.difficulty]}
           </span>
-          {/*
-           * Difficulty without its reason is a verdict. `classifyDifficulty` already knows
-           * which input raised the band, so the page says so rather than leaving a hiker to
-           * guess whether "hard" means long or means exposed — those need different days.
-           */}
+          {/* `classifyDifficulty` knows which input raised the band, so the page says which. */}
           {raisedBy.includes('sac_scale') ? <span>raised by its alpine grade</span> : null}
           {raisedBy.includes('sustained_grade') ? (
             <span>raised by a sustained steep pitch</span>
@@ -208,17 +183,8 @@ export default async function TrailPage({ params }: PageProps) {
         </p>
 
         {/*
-         * Above the controls, deliberately.
-         *
-         * Everything under this line is written to be encouraging — save it, record it,
-         * download it, print it — and a route up a 55° face wears that furniture exactly like
-         * a route up a valley does. Difficulty cannot carry the difference, because "Hard" is
-         * the top of its scale and the ground keeps going. So this is said before the buttons
-         * are offered, not after.
-         *
-         * Survey red, the plate this product spends on your safety and on nothing else
-         * decorative. Bordered on one edge rather than filled: a filled red panel would be the
-         * loudest thing on a page whose argument is that its figures are quiet and exact.
+         * Above the controls deliberately: everything below this line is encouraging furniture,
+         * and "Hard" is the top of the difficulty scale while the ground keeps going.
          */}
         {caution ? (
           <aside role="note" className="mt-lg border-l-2 border-survey pl-md">
@@ -231,59 +197,37 @@ export default async function TrailPage({ params }: PageProps) {
           </aside>
         ) : null}
 
-        {/*
-         * Directly under the name, because "is this one of mine" is answered before any of
-         * the figures are read — and because the row's own state is part of the answer to
-         * "have I been here before", which changes how the rest of the page is read.
-         */}
         <div className="mt-lg flex flex-wrap items-center gap-lg">
+          {/* First: "is this one of mine" is answered before any of the figures are read. */}
           <SaveControls
             trailId={trail.id}
             trailPath={`/trails/${trail.slug}`}
             viewerId={viewer?.id ?? null}
           />
-          {/*
-           * Beside the marks rather than at the foot of the page. The three marks say what
-           * this trail is to you; recording is the one control that says what it is about to
-           * be, and somebody reading this page in a car park has ten seconds for it.
-           */}
+          {/* The marks say what this trail is to you; this says what it is about to be. */}
           <Link
             href={`/record?trail=${encodeURIComponent(trail.slug)}`}
             className={`${BUTTON_COLLAR} ${SECONDARY} ${HEIGHT.touch} px-md`}
           >
             Record this hike
           </Link>
-          {/*
-           * Third, because it is the control you reach for last and only sometimes — but in
-           * this row rather than at the foot of the page, since the moment it is wanted is
-           * the moment before the signal goes, not after reading the reviews.
-           */}
+          {/* Wanted at the moment before the signal goes, so not at the foot of the page. */}
           <DownloadTrail trail={trail} />
-          {/*
-           * Beside the download and not inside it, because they answer the same question —
-           * what happens when there is no signal — in the two ways that actually work. A
-           * phone in a pocket runs out; paper does not.
-           */}
+          {/* Beside the download: the same question answered the other way — paper does not run out. */}
           <Link
             href={`/trails/${trail.slug}/print`}
             className={`${BUTTON_COLLAR} ${SECONDARY} ${HEIGHT.touch} px-md`}
           >
             Print a sheet
           </Link>
-          {/*
-           * Last, and shaped unlike the four before it, because it is the only control here
-           * that sends the trail somewhere else rather than doing something on this page.
-           */}
+          {/* Last, and shaped unlike the rest: the only control that sends the trail elsewhere. */}
           <TrailExport trailId={trail.id} />
         </div>
 
         {/*
-         * ── The instrument, the figures, and the two blocks that turn them into a plan ──
-         *
-         * The planner is a client component wrapping all three because weather and busy
-         * times share one piece of state — the start time — and the stat rail sits between
-         * them in the reading order. It comes through as `children` so it stays server
-         * rendered: a slot, not a re-implementation.
+         * A client component wrapping all three: weather and busy times share one piece of state
+         * (the start time) and the stat rail sits between them. The rail comes through as
+         * `children` so it stays server rendered — a slot, not a re-implementation.
          */}
         <TrailPlanner trail={trail}>
           <dl className="mt-2xl grid grid-cols-2 gap-px overflow-hidden rounded-hair border border-bezel bg-bezel sm:grid-cols-4 lg:grid-cols-7">
@@ -313,7 +257,7 @@ export default async function TrailPage({ params }: PageProps) {
           </section>
         ) : null}
 
-        {/* ── Waypoints and access, side by side on a wide sheet ───────────────────── */}
+        {/* Waypoints and access, side by side on a wide sheet */}
         <div className="mt-3xl grid gap-3xl lg:grid-cols-[1fr_18rem]">
           <section>
             <h2 className="collar">On the way</h2>
@@ -363,15 +307,7 @@ export default async function TrailPage({ params }: PageProps) {
           </section>
         </div>
 
-        {/*
-         * ── Your own visits ───────────────────────────────────────────────────────────
-         *
-         * Above the reports, because it changes how they read. Somebody who has hiked this
-         * three times is checking the reports against their own memory of the place; somebody
-         * who has never been is taking them on trust. Signed-in only, and silent when there
-         * is nothing — an empty "you have not hiked this" block on every trail page in the
-         * product would be a permanent reproach.
-         */}
+        {/* Above the reports, because having been here changes how they read. */}
         {myHikes && myHikes.items.length > 0 ? (
           <section className="mt-3xl">
             <h2 className="collar">
@@ -393,14 +329,7 @@ export default async function TrailPage({ params }: PageProps) {
           </section>
         ) : null}
 
-        {/*
-         * ── Reports ───────────────────────────────────────────────────────────────────
-         *
-         * Above the photographs on purpose. Everything before this point describes the
-         * trail as the map has it; this is the only block on the page written by someone
-         * who was actually standing on it, and the sixty-day condition tally at the top of
-         * it is the fact most likely to change what a hiker packs.
-         */}
+        {/* Above the photographs: the only block written by somebody who stood on the ground. */}
         <Reviews
           trailId={trail.id}
           trailName={trail.name}
@@ -409,13 +338,7 @@ export default async function TrailPage({ params }: PageProps) {
           viewerRole={viewer?.role ?? 'member'}
         />
 
-        {/*
-         * ── Photographs ───────────────────────────────────────────────────────────────
-         *
-         * A client island, because everything interesting about this block happens after
-         * the page has rendered: an upload appears in the strip without a round trip, and
-         * the lightbox is the only place a caption can be written.
-         */}
+        {/* A client island: an upload appears without a round trip, and captions need the lightbox. */}
         <PhotoGallery
           trailId={trail.id}
           trailName={trail.name}
@@ -425,7 +348,7 @@ export default async function TrailPage({ params }: PageProps) {
           viewerRole={viewer?.role ?? 'member'}
         />
 
-        {/* ── Nearby ───────────────────────────────────────────────────────────────── */}
+        {/* Nearby */}
         {others.length > 0 ? (
           <section className="mt-3xl">
             <h2 className="collar">Also within 30 km</h2>
@@ -449,7 +372,7 @@ export default async function TrailPage({ params }: PageProps) {
           </section>
         ) : null}
 
-        {/* ── Provenance ───────────────────────────────────────────────────────────── */}
+        {/* Provenance */}
         <footer className="mt-3xl border-t border-bezel pt-lg">
           <p className="max-w-measure-wide text-caption text-ink-muted">
             This route was assembled from{' '}
@@ -488,12 +411,8 @@ export default async function TrailPage({ params }: PageProps) {
         </footer>
 
         {/*
-         * The site colophon, under the trail's own provenance note and distinct from it.
-         * That one is about where this route came from; this one is the small print — the
-         * rules, and the way to complain about something on this page. It is here in
-         * particular because this is the page that carries other people's writing and
-         * photographs, and somebody who cannot find the Report control beside a frame has
-         * to be able to find the route in at the bottom of the page.
+         * The site colophon, distinct from the trail's own provenance above it: this one carries
+         * the rules and the route in for reporting other people's writing and photographs.
          */}
         <SiteFooter />
       </main>
@@ -502,15 +421,8 @@ export default async function TrailPage({ params }: PageProps) {
 }
 
 /**
- * One cell of the stat rail.
- *
- * The value is set in mono one step above reading size and the label is collar text above
- * it, which is the arrangement on the margin of a survey sheet: the measurement is the
- * content, the word is the annotation. It is the same pair every other figure rail in the
- * product uses — `/downloads`, the Lifeline sheet — because seven numbers about a trail and
- * three about a download are the same kind of thing and should not be set two different
- * ways. `bg-canvas` over a `bg-bezel` grid gap draws the rules — a real table of figures,
- * ruled, rather than seven floating boxes.
+ * One cell of the stat rail: mono value under a collar label, the same pair every figure rail in
+ * the product uses. `bg-canvas` over a `bg-bezel` grid gap is what draws the rules.
  */
 function Stat({ label, value }: { label: string; value: string }) {
   return (
@@ -526,16 +438,8 @@ function Fact({ label, value }: { label: string; value: string | null }) {
     <div className="flex items-baseline justify-between gap-md border-b border-bezel py-sm">
       <dt className="text-ink-muted">{label}</dt>
       {/*
-       * "Not recorded" rather than a dash or a silent omission. An access fact that OSM has
-       * no answer for is different from a "no", and on a gate or a fee that difference is
-       * what a hiker plans around.
-       *
-       * Set in `ink-muted` at full strength. It was `ink-muted/70` — recessed further, to
-       * read as absence rather than as an answer — and that fade put it at 2.88:1 against
-       * the canvas, well under the 4.5:1 that AA asks of body text. Which defeated the
-       * point: a fact a hiker plans around is not one to make hard to read. Full-strength
-       * `ink-muted` is 5.18:1 and still a clear step down from the `ink` beside it, so the
-       * hierarchy survives the fix.
+       * "Not recorded", not a dash: on a gate or a fee, "OSM has no answer" is not "no". Full
+       * strength `ink-muted` (5.18:1) — do not re-fade it, `ink-muted/70` was 2.88:1 and failed AA.
        */}
       <dd className={value === null ? 'text-ink-muted' : 'text-ink'}>{value ?? 'Not recorded'}</dd>
     </div>

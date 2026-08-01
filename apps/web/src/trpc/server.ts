@@ -7,12 +7,9 @@ import { auth } from '@/auth';
 import { makeQueryClient } from './query-client';
 
 /**
- * Server-side tRPC.
- *
- * Server components call procedures directly — in-process, no HTTP, no serialisation
- * round trip — while using the identical procedure names the client uses. That is the
- * point of doing it this way rather than exporting a second set of data-fetching
- * functions: there is one API, and it does not fork by rendering environment.
+ * Server-side tRPC. Server components call procedures in-process — no HTTP, no serialisation —
+ * under the identical names the client uses, so there is one API that does not fork by
+ * rendering environment.
  */
 
 /** `cache` scopes this to one request, so a page and its children share a QueryClient. */
@@ -23,10 +20,8 @@ const getContext = cache(async () =>
 );
 
 /**
- * For prefetching into the QueryClient that gets streamed to the browser: a server
- * component calls `queryClient.prefetchQuery(trpc.x.y.queryOptions())`, the result
- * dehydrates with the page, and the client component's `useQuery` on the same key
- * renders from it without a second request.
+ * For prefetching into the QueryClient that streams to the browser: a server component prefetches
+ * with `trpc.x.y.queryOptions()`, and the client's `useQuery` on the same key renders from it.
  */
 export const trpc = createTRPCOptionsProxy({
   ctx: getContext,
@@ -35,9 +30,8 @@ export const trpc = createTRPCOptionsProxy({
 });
 
 /**
- * For reading a value the server component renders itself and does not hand to a client
- * component. The options proxy above only ever produces *options*; awaiting a procedure
- * needs a caller, and passing the same request-scoped context keeps `ctx.user` identical
- * between the two.
+ * For a value the server component renders itself. The options proxy above only produces
+ * *options*; awaiting a procedure needs a caller, and sharing the request-scoped context keeps
+ * `ctx.user` identical between the two.
  */
 export const caller = createCallerFactory(appRouter)(getContext);

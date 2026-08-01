@@ -9,27 +9,12 @@ import { Wordmark } from '@/components/wordmark';
 import { caller } from '@/trpc/server';
 
 /**
- * Report something, from somewhere other than the page it is on.
+ * Report something from somewhere other than the page it is on — the in-content control assumes
+ * the complainant can reach the content, and the most urgent complainants frequently cannot.
  *
- * **The control next to the content is the fast path; this is the one that has to exist.**
- * A report button that only appears beside the thing being reported quietly assumes the
- * complainant can reach it — and the people with the most urgent complaints frequently
- * cannot. A rights holder was sent a screenshot. Somebody was told by a friend that their
- * photograph is here. A phone will not load the gallery at all. None of them should be told
- * to go and find a button.
- *
- * So the page does two jobs, and which one it does depends on what it was given:
- *
- * - **With `?subject=…&id=…`** it is the form itself. That is what the in-product control
- *   deep-links to when a sheet will not do, and what an operator sends somebody who wrote in.
- * - **Without them** it explains where the control is and gives the address to write to. It
- *   deliberately does *not* offer a free-text "paste a link" box that files a report against
- *   nothing: a queue of complaints with no subject is a queue that cannot be worked, and a
- *   form that accepts anything and acts on none of it is worse than an email address,
- *   because it looks like it did something.
- *
- * `data-scheme="sheet"` because this is a reading page, and this one especially: whoever is
- * reading it is not enjoying it, and the dark instrument scheme is at its worst under prose.
+ * With `?subject=…&id=…` it is the form. Without them it explains where the control is and gives
+ * an address to write to; it deliberately offers no free-text "paste a link" box, because a queue
+ * of complaints filed against nothing cannot be worked and looks like it did something.
  */
 
 export const metadata: Metadata = {
@@ -52,11 +37,8 @@ export default async function ReportPage({
   const idRaw = params.id;
   const subjectId = (Array.isArray(idRaw) ? idRaw[0] : idRaw)?.trim() ?? '';
 
-  /*
-   * Read so the form can drop the email field for somebody we can already reach. Reporting
-   * itself needs no account — `moderation.report` is a public procedure — so a null viewer
-   * is an ordinary outcome here rather than a redirect.
-   */
+  // Read so the form can drop the email field for somebody we can already reach. Reporting needs
+  // no account — `moderation.report` is public — so a null viewer is ordinary, not a redirect.
   const viewer = await caller.me.get();
   const targeted = subject !== null && subjectId.length > 0 && subjectId.length <= 64;
 

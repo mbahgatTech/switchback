@@ -1,24 +1,11 @@
 /**
- * Just enough EXIF to answer two questions: when was this taken, and where.
+ * Just enough EXIF to answer when a photograph was taken and where. It must run before the canvas
+ * touches the file — re-encoding strips every tag, which is the right privacy default.
  *
- * Both matter here. The date is what lets a gallery say "September 2024" rather than the
- * moment somebody happened to upload it, and the coordinates are what pin a photograph to a
- * point on the elevation profile — the difference between a strip of pictures beside a trail
- * and a picture of *that* switchback, at 4.2 km, where the trees stop.
- *
- * It has to run before the canvas touches the file. Re-encoding through a canvas strips
- * every EXIF tag, which is the right default for privacy and means the metadata is only
- * readable in the seconds between choosing the file and processing it.
- *
- * **Scope is deliberate.** This is not an EXIF library — it hikes IFD0, the Exif sub-IFD and
- * the GPS sub-IFD looking for four tags, and gives up quietly on anything it does not
- * understand. A malformed or absent block is the ordinary case, not an error: PNGs have no
- * APP1 segment at all, and every screenshot and messaging app strips what it finds.
- *
- * **This file is the browser's half only.** What counts as a believable timestamp and a real
- * GPS fix lives in `@switchback/core` — iOS reads the same two facts out of a dictionary
- * Core Graphics parsed for it, and the two clients must agree about the answers even though
- * they cannot share the reading.
+ * Not an EXIF library: it hikes IFD0, the Exif sub-IFD and the GPS sub-IFD for four tags and gives
+ * up quietly on anything else, because an absent APP1 block is the ordinary case. What counts as
+ * a believable timestamp or a real fix lives in `@switchback/core`, so iOS — which reads the same
+ * two facts from a Core Graphics dictionary — cannot disagree with the browser.
  */
 
 import { exifCoordinate, parseExifDateTime } from '@switchback/core';
@@ -69,10 +56,9 @@ function readIfd(view: DataView, tiff: number, ifd: number, le: boolean): Map<nu
     const size = (TYPE_SIZES[type] ?? 0) * components;
     if (size === 0) continue;
 
-    // A value of four bytes or fewer is stored in the offset field itself rather than
-    // pointed at. Missing this is the classic EXIF bug: every short and every one-character
-    // ref tag ("N", "W") is inline, so a parser that always dereferences reads garbage from
-    // wherever those four bytes happen to point.
+    // A value of four bytes or fewer is stored in the offset field itself rather than pointed
+    // at. Missing this is the classic EXIF bug: every short and every one-character ref tag
+    // ("N", "W") is inline, so a parser that always dereferences reads garbage.
     const offset = size <= 4 ? at + 8 : tiff + view.getUint32(at + 8, le);
     entries.set(tag, { type, count: components, offset });
   }
@@ -110,17 +96,15 @@ function readCoordinate(view: DataView, entry: Entry | undefined, le: boolean): 
   return degrees + minutes / 60 + seconds / 3600;
 }
 
-/**
- * Locate the TIFF block inside a JPEG's APP1 segment, or null if there is not one.
- */
+/** Locate the TIFF block inside a JPEG's APP1 segment, or null if there is not one. */
 function findTiffOffset(view: DataView): number | null {
   if (view.byteLength < 4 || view.getUint16(0) !== 0xffd8) return null; // not a JPEG
 
   let at = 2;
   while (at + 4 <= view.byteLength) {
     const marker = view.getUint16(at);
-    // Markers are 0xFFxx. Anything else means the scan has run off into entropy-coded data,
-    // which is past every metadata segment there is.
+    // Markers are 0xFFxx; anything else means the scan has run into entropy-coded data, which
+    // is past every metadata segment there is.
     if ((marker & 0xff00) !== 0xff00) return null;
     const length = view.getUint16(at + 2);
     if (length < 2) return null;
@@ -133,16 +117,10 @@ function findTiffOffset(view: DataView): number | null {
   return null;
 }
 
-/**
- * Read what we need, or return nulls.
- *
- * Never throws. This runs on a file a person just chose, at the moment they chose it, and a
- * corrupt metadata block is not a reason to refuse their photograph.
- */
+/** Read what we need, or return nulls. Never throws: a corrupt block must not refuse a photograph. */
 export async function readExif(file: Blob): Promise<ExifFacts> {
   try {
-    // 128 kB is far past where APP1 lives in every camera and phone JPEG. Reading the whole
-    // file would mean holding a 12 MB buffer to look at its first few hundred bytes.
+    // 128 kB is far past where APP1 lives in every camera and phone JPEG.
     const head = await file.slice(0, 128 * 1024).arrayBuffer();
     const view = new DataView(head);
 

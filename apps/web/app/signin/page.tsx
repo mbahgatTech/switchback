@@ -11,23 +11,13 @@ import { AppleSignInButton } from '@/components/auth/apple-button';
 import { Wordmark } from '@/components/wordmark';
 
 /**
- * Sign in.
+ * Sign in. `auth.ts` names this route for both `pages.signIn` and `pages.error`, so it is reached
+ * three ways — a deliberate sign-in, an Auth.js `?error=` bounce, and a protected route's
+ * `?callbackUrl=`. All three are this page with a different field filled in, which is why it is
+ * built as a title block: every row a fact about the sheet, the last one blank until signed.
  *
- * `auth.ts` names this route for both `pages.signIn` and `pages.error`, so it is reached
- * three ways: a user choosing to sign in, Auth.js bouncing a failed exchange here with
- * `?error=`, and a protected route sending someone here with `?callbackUrl=`. All three
- * are the same page with a different field filled in, which is why the structure is a
- * **title block** — the boxed panel at the corner of a survey drawing where the sheet is
- * identified and, in the last field, signed. Every row is a fact about the sheet; the
- * signature field is the one that is blank until a person fills it. That is exactly the
- * shape of this page, so it is the structure rather than a decoration applied to it.
- *
- * `data-scheme="sheet"` for the same reason `/attribution` uses it: this is a reading page,
- * and the dark instrument scheme is worst at prose.
- *
- * An error prints as another field, set in ink with the label carrying the emphasis. Not in
- * the survey plate — red is reserved for the user and their safety, and a failed OAuth
- * round trip is neither. Spending it here is how it stops meaning anything on a ridge.
+ * An error prints as another field, in ink rather than the survey plate. Red is reserved for the
+ * reader's safety, and spending it here is how it stops meaning anything on a ridge.
  */
 
 export const metadata: Metadata = {
@@ -38,11 +28,8 @@ export const metadata: Metadata = {
 };
 
 /**
- * What an account actually holds, in the order it matters.
- *
- * Deliberately not a feature list. Everything below is something the product already
- * stores against a user id — promising anything else here would make the first row of the
- * title block a lie.
+ * What an account actually holds. Deliberately not a feature list: everything below is something
+ * the product already stores against a user id.
  */
 const FIELDS = [
   {
@@ -60,13 +47,8 @@ const FIELDS = [
 ] as const;
 
 /**
- * Auth.js reports failures as a code in the query string and nothing else — the codes are
- * `ErrorPageParam` and `SignInPageErrorParam` in `@auth/core`. Both land here, so both are
- * translated here.
- *
- * Each message says what happened and what to do about it. `OAuthAccountNotLinked` is the
- * one that earns its length: it is the case where the user is certain they have an account,
- * and they are right — they just made it with the other button.
+ * Auth.js reports failures as a query-string code and nothing else — `ErrorPageParam` and
+ * `SignInPageErrorParam` in `@auth/core`. Both land here, so both are translated here.
  */
 const GENERIC_FAULT = 'Sign-in did not complete. Try again.';
 
@@ -96,17 +78,10 @@ function firstParam(value: string | string[] | undefined): string | undefined {
 }
 
 /**
- * The report from "Sign out everywhere".
- *
- * That button ends every session on the account, including the browser it was pressed in, so
- * the reader arrives here whether they expected to or not. This is the receipt: it says what
- * was ended, which is the difference between "I did that" and "something logged me out".
- *
- * Ranked above an `?error=` below, and deliberately — a reader who has just revoked
- * everything wants to know it worked, not to read that a session was required.
- *
- * The counts are read out of the query string, so they are a claim the reader's own browser
- * made and are treated as one: parsed as integers, clamped, and never rendered raw.
+ * The receipt from "Sign out everywhere" — that button ends the browser it was pressed in, so the
+ * reader lands here either way, and this is the difference between "I did that" and "something
+ * logged me out". Ranked above an `?error=`. The counts come out of the query string, so they are
+ * a claim the reader's own browser made: parsed as integers, clamped, never rendered raw.
  */
 function signedOutNotice(
   devices: string | string[] | undefined,
@@ -222,11 +197,8 @@ export default async function SignInPage({
               </span>
             )}
 
-            {/*
-             * Said once, under the buttons, rather than as a third disabled control. A
-             * button that cannot be pressed is worse than an absent one: it reads as
-             * broken rather than as not yet built.
-             */}
+            {/* A sentence, not a third disabled control: a button that cannot be pressed reads
+             * as broken rather than as not yet built. */}
             {!config.providers.apple && config.providers.microsoft ? (
               <p className="mt-md font-text text-caption text-ink-muted">
                 Sign in with Apple is built and switched off until the developer enrolment is in
@@ -252,12 +224,7 @@ export default async function SignInPage({
   );
 }
 
-/**
- * One field of the title block: a label in the collar voice, a value beside it.
- *
- * The label column is fixed on a wide sheet and stacks above the value on a narrow one —
- * a title block is a grid because paper does not reflow, and this is not paper.
- */
+/** One field of the title block: a collar label, a value beside it, stacking on a narrow sheet. */
 function Field({
   label,
   first,

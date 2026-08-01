@@ -1,15 +1,7 @@
 /**
- * Native sign-in: turning a provider identity token into a Switchback account.
- *
- * The website never uses this. On iOS the OAuth dance happens inside the system — Apple's
- * native sheet, or a browser session `expo-auth-session` opens — and what comes back is an
- * OIDC identity token, not an authorization code. So we verify that token ourselves
- * against the provider's JWKS and mint our own pair.
- *
- * Everything below is the verification an OIDC relying party is required to do and that
- * is easy to skip: signature against the provider's *current* published keys, issuer,
- * audience, and expiry. A token that fails any of them is not a login attempt with bad
- * input — it is someone handing us a token minted for a different app.
+ * Native sign-in: verifying a provider's OIDC identity token into a Switchback account. The
+ * website never uses this — on iOS the dance happens in the system and returns a token, not a
+ * code, so we check signature, issuer, audience and expiry against the provider's JWKS ourselves.
  */
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 import { env } from '@/env';
@@ -34,9 +26,8 @@ export interface VerifiedIdentity {
 }
 
 /**
- * `createRemoteJWKSet` caches the key set and refetches on an unknown `kid`, so this is
- * one network round trip per key rotation rather than one per sign-in. Module scope is
- * what makes that cache shared; constructing it per request would defeat it entirely.
+ * Module scope on purpose: `createRemoteJWKSet` caches the key set and refetches on an unknown
+ * `kid`, so this is one round trip per key rotation. Constructing it per request defeats it.
  */
 const JWKS = {
   'microsoft-entra-id': createRemoteJWKSet(
@@ -46,12 +37,8 @@ const JWKS = {
 } as const;
 
 /**
- * The multi-tenant issuer.
- *
- * Because we sign in against `/common`, the `iss` claim names whichever tenant the person
- * belongs to — it is not a fixed string we can compare against, which is why this is a
- * pattern rather than an equality check. The tenant id is a GUID, and `9188040d-…` is the
- * well-known tenant for personal Microsoft accounts.
+ * A pattern, not an equality: signing in against `/common` means `iss` names whichever tenant the
+ * person belongs to. `9188040d-…` is the well-known tenant for personal Microsoft accounts.
  */
 const ENTRA_ISSUER = /^https:\/\/login\.microsoftonline\.com\/[0-9a-f-]{36}\/v2\.0$/i;
 
@@ -59,16 +46,14 @@ const APPLE_ISSUER = 'https://appleid.apple.com';
 
 function nativeAudience(provider: NativeProvider): string {
   if (provider === 'apple') {
-    // Native Apple sign-in puts the *App ID* (bundle identifier) in `aud`, not the
-    // Services ID the web flow uses. Verifying against the Services ID here fails every
-    // time and the mismatch is not obvious from the error.
+    // Native Apple sign-in puts the *App ID* (bundle identifier) in `aud`, not the Services ID
+    // the web flow uses. Verifying against the Services ID fails every time.
     const bundleId = env.AUTH_APPLE_BUNDLE_ID;
     if (!bundleId) throw new IdentityTokenError('AUTH_APPLE_BUNDLE_ID is not configured');
     return bundleId;
   }
-  // Entra can serve the browser and the app from one registration with two platform
-  // configurations, in which case this is the same client id. The override exists for
-  // the setups that keep them separate.
+  // Entra can serve the browser and the app from one registration; the override is for setups
+  // that keep them separate.
   const clientId = env.AUTH_MICROSOFT_ENTRA_ID_MOBILE_ID ?? env.AUTH_MICROSOFT_ENTRA_ID_ID;
   if (!clientId) throw new IdentityTokenError('Microsoft sign-in is not configured');
   return clientId;
@@ -94,8 +79,7 @@ export async function verifyIdentityToken(
     ({ payload } = await jwtVerify(idToken, JWKS[provider], {
       audience: nativeAudience(provider),
       issuer: provider === 'apple' ? APPLE_ISSUER : undefined,
-      // 60 s of tolerance for a phone whose clock has drifted. Any more and an expired
-      // token stays usable long enough to matter.
+      // 60 s for a phone whose clock has drifted. Any more and an expired token stays usable.
       clockTolerance: 60,
     }));
   } catch (error) {
@@ -129,25 +113,13 @@ export async function verifyIdentityToken(
     providerAccountId: payload.sub,
     email,
     /**
-     * Apple states this explicitly, and is believed.
-     *
-     * **Entra is not, and this is the whole of the nOAuth defence.** Microsoft does not emit
-     * `email_verified` at all, and the `email` claim it does emit is a tenant-mutable
-     * directory attribute — Microsoft's own guidance says it is unsuitable for identifying a
-     * user. We sign against `/common`, so the tenant on the other end is whichever one the
-     * caller belongs to, including a free one they created this morning. Anybody can set a
-     * user's `mail` to somebody else's address there and hand us a perfectly valid,
-     * correctly-signed token asserting it.
-     *
-     * So `false`, unconditionally, which is what makes the `email_taken_unverified` guard in
-     * `app/api/auth/mobile/exchange/route.ts` reachable for the only provider production has
-     * switched on. Before this it read `email !== null` — true whenever an email existed —
-     * and the guard was dead code protecting nothing.
-     *
-     * The cost is real and is paid on purpose: somebody who made their account in a browser
-     * and then signs in on the phone with the same Microsoft account, but a *different*
-     * `sub`, is refused rather than merged. That is a rare case with a clear instruction; the
-     * alternative is a takeover with none.
+     * **The nOAuth defence — do not make this conditional.** Entra emits no `email_verified`, and
+     * its `email` claim is a tenant-mutable directory attribute; signing against `/common` means
+     * anyone can set a user's `mail` to somebody else's in a tenant they made this morning and
+     * hand us a correctly-signed token. `false` unconditionally is what keeps the
+     * `email_taken_unverified` guard in `app/api/auth/mobile/exchange/route.ts` reachable. The
+     * price, paid on purpose: a browser-made account signing in on the phone under a different
+     * `sub` is refused rather than merged.
      */
     emailVerified: provider === 'apple' ? claimIsTrue(payload.email_verified) : false,
     name: typeof payload.name === 'string' ? payload.name : null,

@@ -2,15 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { safeCallback } from '../src/lib/safe-callback';
 
 /**
- * The open-redirect guard on `/signin`.
- *
- * This is the page a reader has just typed a password into — or is about to hand to Microsoft
- * — so a redirect off this origin from here is worth more to an attacker than the same bug
- * anywhere else in the product. It is also the page most likely to be sent as a link, since
- * every protected route bounces here with a `callbackUrl` of its own.
- *
- * The guard it replaced was a blacklist of two prefixes. Everything under "browsers are more
- * forgiving than a blacklist is long" below is a string that guard let through.
+ * The open-redirect guard on `/signin` — the page a reader has just typed a password into, and
+ * the one every protected route bounces to with a `callbackUrl` of its own.
  */
 describe('safeCallback', () => {
   it('keeps an ordinary same-origin path, with its query and fragment', () => {
@@ -37,15 +30,10 @@ describe('safeCallback', () => {
 
   it('refuses a URL wearing a path as a disguise', () => {
     /*
-     * Browsers are more forgiving than a blacklist is long. Every string here begins with a
-     * slash and looks like a path; a browser resolving it lands on `evil.example`.
-     *
-     * The raw control characters are the ones that got through: tab, newline and carriage
-     * return are stripped as C0 controls during URL parsing, so `/\t/evil.example` becomes
-     * `//evil.example`, a scheme-relative URL. Next decodes the query string once, so
-     * `?callbackUrl=%2F%09%2Fevil.example` arrives here in exactly that raw form. The
-     * backslashes are the same trick against a parser that normalises `\` to `/`, which the
-     * URL standard requires for special schemes.
+     * Every string here begins with a slash and looks like a path; a browser resolving it lands
+     * on `evil.example`. Tab, newline and carriage return are stripped as C0 controls during URL
+     * parsing, and Next decodes the query string once, so `%2F%09%2Fevil.example` arrives raw.
+     * The backslashes are the same trick against the `\`→`/` normalisation special schemes require.
      */
     for (const hostile of [
       '//evil.example',
@@ -63,11 +51,8 @@ describe('safeCallback', () => {
   });
 
   it('refuses an encoded control character, one decode short of the same trick', () => {
-    /*
-     * `%09` and an encoded space survive URL parsing, so `/%09/evil.example` is genuinely a
-     * same-origin path and is harmless where it stands. Refused because it stops being
-     * harmless the moment anything unescapes it before resolving it.
-     */
+    // These survive URL parsing and are harmless where they stand — refused because they stop
+    // being harmless the moment anything unescapes them before resolving.
     for (const hostile of [
       '/%09/evil.example',
       '/%0A/evil.example',
@@ -79,16 +64,13 @@ describe('safeCallback', () => {
   });
 
   it('leaves an encoded space alone where it is ordinary', () => {
-    // Only the leading position is the trick. A place name in a query is a real callback and
-    // a rule that banned `%20` outright would break it.
+    // Only the leading position is the trick; a place name in a query is a real callback.
     expect(safeCallback('/nearby?q=Vesper%20Peak')).toBe('/nearby?q=Vesper%20Peak');
     expect(safeCallback('/lists/my%20list')).toBe('/lists/my%20list');
   });
 
   it('never returns something a browser would read as scheme-relative', () => {
-    // The property, rather than the list: whatever comes out is resolved against a second
-    // origin, and it must still be that origin. A case this file has not thought of fails
-    // here even if it is not in the list above.
+    // The property rather than the list, so a case this file has not thought of still fails.
     for (const value of [
       '/lists',
       '//evil.example',

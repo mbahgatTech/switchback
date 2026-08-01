@@ -1,16 +1,11 @@
 import { z } from 'zod';
 
 /**
- * Environment validation.
+ * The single server-side allowlist for environment variables, parsed once at module load so a
+ * missing one is a startup error naming it. Everything reading `process.env` imports from here.
  *
- * Parsed once at module load so a missing variable is a startup error naming the variable,
- * rather than an `undefined` that travels three layers down and surfaces as a 500 from
- * Microsoft's token endpoint at 2am. Everything that reads `process.env` on the server
- * imports from here instead.
- *
- * `SKIP_ENV_VALIDATION` exists for `next build` in contexts that have no secrets — a
- * Docker image build, a CI typecheck. It is not for local development: if you find
- * yourself setting it to make `npm run dev` start, the fix is the missing variable.
+ * `SKIP_ENV_VALIDATION` is for `next build` where no secrets exist (a Docker image, a CI
+ * typecheck). It is not for local development: the fix there is the missing variable.
  */
 
 const bool = z
@@ -22,18 +17,14 @@ const base = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 
   DATABASE_URL: z.string().url(),
+  /** Optional because only the Prisma CLI reads it (`directUrl`) — but migrations need it set. */
   DIRECT_DATABASE_URL: z.string().url().optional(),
 
   /** Also signs the mobile access tokens — see `@switchback/api/tokens`. */
   AUTH_SECRET: z.string().min(32, 'AUTH_SECRET must be at least 32 characters'),
   AUTH_URL: z.string().url().optional(),
 
-  /**
-   * Optional in development so the app starts before you have registered anything in
-   * Azure — the provider is simply not offered, and `health.config` reports it as absent
-   * so both clients hide the button. Required in production, enforced below: a deployed
-   * Switchback with no way to sign in is a broken deploy, not a degraded one.
-   */
+  /** Optional in development so the app starts before Azure exists; required in production below. */
   AUTH_MICROSOFT_ENTRA_ID_ID: z.string().min(1).optional(),
   AUTH_MICROSOFT_ENTRA_ID_SECRET: z.string().min(1).optional(),
   /** `/common` accepts both work/school and personal Microsoft accounts. */
@@ -41,39 +32,27 @@ const base = z.object({
     .string()
     .url()
     .default('https://login.microsoftonline.com/common/v2.0'),
-  /**
-   * Only needed if the iOS app has its own Entra registration. One registration can carry
-   * both a Web and an iOS/macOS platform configuration, in which case the client id is
-   * shared and this stays unset.
-   */
+  /** Only when the iOS app has its own Entra registration; one registration can carry both. */
   AUTH_MICROSOFT_ENTRA_ID_MOBILE_ID: z.string().min(1).optional(),
 
   AUTH_APPLE_ENABLED: bool,
   /** The Services ID, not the App ID. Apple uses it as the OAuth client_id. */
   AUTH_APPLE_ID: z.string().min(1).optional(),
   /**
-   * The App ID (bundle identifier). Native Apple sign-in puts *this* in the identity
-   * token's `aud`, where the web flow puts the Services ID above — they are different
-   * strings and swapping them fails verification on every native login.
+   * The App ID (bundle identifier). Native Apple sign-in puts *this* in the identity token's
+   * `aud` where the web flow puts the Services ID above — swapping them fails every native login.
    */
   AUTH_APPLE_BUNDLE_ID: z.string().min(1).optional(),
   AUTH_APPLE_TEAM_ID: z.string().min(1).optional(),
   AUTH_APPLE_KEY_ID: z.string().min(1).optional(),
-  /**
-   * The full contents of the `.p8`, newlines and all. In a shell `.env` those newlines
-   * have to be written as `\n` inside quotes, so they are unescaped here.
-   */
+  /** The full `.p8` contents; a shell `.env` writes its newlines as `\n`, unescaped here. */
   AUTH_APPLE_PRIVATE_KEY: z.string().min(1).optional(),
 
   CRON_SECRET: z.string().min(16).optional(),
 
   /**
-   * Cloudflare R2, where user photographs live.
-   *
-   * All optional, because the app is fully usable without them: `packages/api/storage` falls
-   * back to a local filesystem driver that stands in for the bucket, and uploads work on a
-   * laptop with no Cloudflare account. What is *not* allowed is filling in some of them —
-   * see the cross-field rule below.
+   * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
+   * so uploads work with no Cloudflare account. Filling in *some* of them is refused below.
    */
   R2_ACCOUNT_ID: z.string().min(1).optional(),
   R2_ACCESS_KEY_ID: z.string().min(1).optional(),
@@ -84,11 +63,8 @@ const base = z.object({
 });
 
 /**
- * Cross-field rules.
- *
- * Apple's variables are useless individually — a Services ID with no signing key cannot
- * mint a client secret, and a signing key with no App ID cannot verify a native login —
- * so they are validated as a set, and only when the flag that would use them is on.
+ * Cross-field rules. Apple's variables are useless individually — a Services ID with no signing
+ * key cannot mint a client secret — so they are validated as a set, and only when the flag is on.
  */
 const schema = base.superRefine((env, ctx) => {
   if (env.NODE_ENV === 'production') {
@@ -104,12 +80,9 @@ const schema = base.superRefine((env, ctx) => {
   }
 
   /*
-   * R2 is all or nothing.
-   *
-   * The storage driver picks itself by whether the whole set is present, and a *partially*
-   * configured deploy therefore falls back to the local filesystem driver — writing user
-   * photographs to a serverless container that is discarded minutes later, silently, with
-   * every upload appearing to succeed. Better to refuse to start and name the missing key.
+   * R2 is all or nothing: the storage driver picks itself by whether the whole set is present, so
+   * a half-configured deploy silently writes photographs to a serverless container that is thrown
+   * away minutes later, every upload appearing to succeed.
    */
   const r2 = [
     'R2_ACCOUNT_ID',
@@ -150,10 +123,8 @@ const schema = base.superRefine((env, ctx) => {
 });
 
 /**
- * A `.env` file has no syntax for "absent" — the convention is `KEY=""`, which arrives as
- * an empty string rather than `undefined`. Without this, `.optional()` never fires for an
- * unfilled placeholder and every blank line in `.env.example` fails its own `min()` check.
- * Whitespace-only counts as blank too: a key someone half-filled and reverted is not set.
+ * A `.env` has no syntax for "absent" — the convention is `KEY=""`, which arrives as an empty
+ * string. Without this, `.optional()` never fires and every placeholder in `.env.example` fails.
  */
 function present(source: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
@@ -166,14 +137,9 @@ function present(source: NodeJS.ProcessEnv): Record<string, string> {
 function parse(): z.infer<typeof schema> {
   if (process.env.SKIP_ENV_VALIDATION) {
     /*
-     * The escape hatch skips the *checks*. It must not skip the *coercions*.
-     *
-     * Every boolean in this schema arrives from the environment as a string, and the string
-     * `"false"` is truthy. Returning `process.env` unchanged therefore switched Apple sign-in
-     * on for any build that opted out of validation — which threw on the first render of any
-     * page, because the client secret it then tried to sign has no key. A build that turns a
-     * feature on by declining to look at the environment is a worse failure than the missing
-     * variable the flag was set to get past.
+     * The escape hatch skips the checks, not the coercions: every boolean arrives as a string and
+     * `"false"` is truthy, so returning `process.env` unchanged switches Apple sign-in on for any
+     * build that opted out of validation.
      */
     return {
       ...(process.env as unknown as z.infer<typeof schema>),

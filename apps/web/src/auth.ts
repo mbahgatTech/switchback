@@ -9,27 +9,16 @@ import { env } from '@/env';
 import { appleClientSecret } from '@/auth-apple';
 
 /**
- * Auth.js configuration.
- *
- * **Database sessions, not JWT.** The default with the Prisma adapter, and the right
- * default here: a session row can be deleted, so "sign out everywhere" and "this account
- * was compromised" are one query. A JWT session cannot be revoked before it expires. The
- * cost is a database read per request, which we were making anyway to load the user for
- * `ctx.user`.
- *
- * **The config is a function.** Apple's client secret is a JWT that has to be signed on
- * each use (see `auth/apple-secret.ts`), and signing is async. Auth.js v5 accepts an async
- * factory precisely for this, which is why the providers are assembled per request rather
- * than at module load.
+ * Auth.js configuration. **Database sessions, not JWT** — a session row can be deleted, so "sign
+ * out everywhere" is one query; the cookie is an opaque pointer at that row, never a bearer claim.
+ * The config is an async factory because Apple's client secret is a JWT signed on each use.
  */
 async function buildProviders(): Promise<Provider[]> {
   const providers: Provider[] = [];
 
   /**
-   * Absent only before the Azure app registration exists — `env.ts` makes these mandatory
-   * in production. Skipping the provider rather than registering it with an undefined
-   * client id matters: Auth.js would accept that and fail at the redirect with an error
-   * from Microsoft rather than from us.
+   * Skipped rather than registered with an undefined client id — Auth.js accepts that and fails
+   * at the redirect with an error from Microsoft rather than from us.
    */
   if (env.AUTH_MICROSOFT_ENTRA_ID_ID && env.AUTH_MICROSOFT_ENTRA_ID_SECRET) {
     providers.push(
@@ -37,10 +26,7 @@ async function buildProviders(): Promise<Provider[]> {
         clientId: env.AUTH_MICROSOFT_ENTRA_ID_ID,
         clientSecret: env.AUTH_MICROSOFT_ENTRA_ID_SECRET,
         issuer: env.AUTH_MICROSOFT_ENTRA_ID_ISSUER,
-        /**
-         * Entra returns the avatar from Graph, which needs a token. Without this the
-         * provider stores a URL that 401s for anyone who loads it.
-         */
+        /** Entra's avatar comes from Graph; without `User.Read` the stored URL 401s. */
         authorization: { params: { scope: 'openid profile email User.Read' } },
       }),
     );
@@ -63,19 +49,15 @@ export const { handlers, auth, signIn, signOut } = NextAuth(async () => {
     adapter: PrismaAdapter(prisma),
     providers: await buildProviders(),
     session: { strategy: 'database', maxAge: 30 * 24 * 60 * 60 },
-    // Behind Vercel's proxy the Host header is what identifies the deployment; without
-    // this Auth.js refuses to construct callback URLs on preview deployments.
+    // Behind Vercel's proxy the Host header identifies the deployment; without this Auth.js
+    // refuses to construct callback URLs on preview deployments.
     trustHost: true,
     pages: {
       signIn: '/signin',
       error: '/signin',
     },
     callbacks: {
-      /**
-       * The default session shape has no user id, and every tRPC request needs one.
-       * Under the database strategy the `user` argument is the actual row, so this is
-       * a copy rather than a lookup.
-       */
+      /** The default session shape has no user id, and every tRPC request needs one. */
       session({ session, user }) {
         session.user.id = user.id;
         return session;
@@ -83,9 +65,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth(async () => {
     },
     events: {
       /**
-       * The three system lists are created here rather than lazily on first use — see
-       * `ensureSystemLists` for why. The native sign-in path calls the same helper, so an
-       * account created on the phone comes out identical to one created in a browser.
+       * Eagerly, not lazily on first use — see `ensureSystemLists`. The native sign-in path calls
+       * the same helper, so a phone-created account matches a browser-created one.
        */
       async createUser({ user }) {
         if (!user.id) return;
