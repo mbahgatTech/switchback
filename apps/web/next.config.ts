@@ -13,7 +13,8 @@ const BUILD_ID =
 
 /**
  * Hosts that mean "not configured" — `.env.example` ships these verbatim, and a CSP that
- * allow-lists a placeholder has stopped describing the deployment it is on.
+ * allow-lists a placeholder has stopped describing the deployment it is on. Same list as
+ * `components/map/basemap.ts`, which rejects them before offering the topo base: the two must agree.
  */
 const PLACEHOLDER_HOSTS = ['cdn.example.com', 'example.com'];
 
