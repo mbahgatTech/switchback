@@ -398,7 +398,9 @@ to `true`. Creating a lock is `Microsoft.Authorization/locks/write`, which built
 **Contributor** does not have — it is excluded by the `Microsoft.Authorization/*/Write` entry in
 Contributor's `notActions`. The service principal that deploys this subscription holds
 Contributor at subscription scope and nothing else, so with the default left alone **both
-commands below fail**, `what-if` included:
+commands below fail** — `az deployment sub create` with `AuthorizationFailed`, and
+`az deployment sub what-if` with `InvalidTemplateDeployment` wrapping the same denial, because
+preflight is preflight:
 
 ```
 ERROR: (AuthorizationFailed) The client '…' does not have authorization to perform action
@@ -472,11 +474,13 @@ az deployment sub what-if \
   --parameters infra/azure/main.bicepparam
 ```
 
-`what-if` runs the same preflight authorization check as a real deployment, so it fails with the
-same `AuthorizationFailed` if `DEPLOY_DELETE_LOCK` is unset and you cannot write locks. It is a
-preview, not a lesser permission. With the override exported it previews everything except the
-lock; with the lock enabled and the role to match, it reports the lock as a `Create` until the
-lock actually exists.
+`what-if` runs the same preflight authorization check as a real deployment, so it fails too if
+`DEPLOY_DELETE_LOCK` is unset and you cannot write locks. It reports the failure under a
+different code — `InvalidTemplateDeployment`, wrapping `Authorization failed for template
+resource 'switchback-prod-no-delete'` — so grepping for `AuthorizationFailed` alone will miss
+it. It is a preview, not a lesser permission. With the override exported it previews everything
+except the lock; with the lock enabled and the role to match, it reports the lock as a `Create`
+until the lock actually exists.
 
 ### Set the three new repository secrets
 
