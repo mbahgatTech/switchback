@@ -1,0 +1,10 @@
+# Vendored third-party code, checked in byte-for-byte.
+#
+# `core.autocrlf=true` on Windows rewrites line endings on checkout, which would change these
+# files' digests — and a digest that no longer matches the published tarball is a vendored
+# file nobody can verify. `-text` tells git to leave them exactly as committed.
+#
+# Scoped to this one directory on purpose. The repository has no line-ending policy of its own
+# and this is not the commit to invent one in; every other path keeps whatever behaviour it
+# has today.
+apps/web/public/vendor/** -text

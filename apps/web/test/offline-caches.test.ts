@@ -2,7 +2,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  ASSET_CACHE,
+  BUILD_ID,
   CACHE_PREFIX,
+  LEGACY_SHELL_CACHE,
   MEDIA_CACHE,
   OFFLINE_CACHES,
   OFFLINE_FALLBACK_PATH,
@@ -27,6 +30,23 @@ import {
  */
 const SW = readFileSync(fileURLToPath(new URL('../public/sw.js', import.meta.url)), 'utf8');
 
+/**
+ * The registration, read as text for the same reason.
+ *
+ * The build id reaches the worker through the URL it is registered with, so the two halves of
+ * that channel are in different files and neither can typecheck against the other.
+ */
+const REGISTER = readFileSync(
+  fileURLToPath(new URL('../src/offline/register.tsx', import.meta.url)),
+  'utf8',
+);
+
+/** The downloader, read as text for the third instance of the same problem. */
+const DOWNLOAD = readFileSync(
+  fileURLToPath(new URL('../src/offline/download.ts', import.meta.url)),
+  'utf8',
+);
+
 /** Pull `const NAME = 'value';` out of the worker source. */
 function literal(name: string): string | null {
   const match = new RegExp(`const\\s+${name}\\s*=\\s*'([^']*)'`, 'u').exec(SW);
@@ -39,10 +59,80 @@ describe('service worker cache names', () => {
     ['TILE_CACHE', TILE_CACHE],
     ['PAGE_CACHE', PAGE_CACHE],
     ['MEDIA_CACHE', MEDIA_CACHE],
-    ['SHELL_CACHE', SHELL_CACHE],
+    ['ASSET_CACHE', ASSET_CACHE],
     ['OFFLINE_FALLBACK_PATH', OFFLINE_FALLBACK_PATH],
   ])('%s matches the app', (name, expected) => {
     expect(literal(name)).toBe(expected);
+  });
+
+  /**
+   * The shell cache is the one name neither side can spell out, because it carries the build
+   * id: the app reads `NEXT_PUBLIC_BUILD_ID`, the worker reads `?v=` off its own URL, and the
+   * two only agree at runtime. So what is checked is the shape — same prefix, same
+   * interpolation — plus, below, that the worker really does take the value from its URL.
+   */
+  it('scopes the shell cache to the build, in both copies', () => {
+    const inWorker = /const\s+SHELL_CACHE\s*=\s*`sb-shell-\$\{BUILD_ID\}`/u.test(SW);
+    expect(inWorker).toBe(true);
+    expect(SHELL_CACHE).toBe(`sb-shell-${BUILD_ID}`);
+    expect(SHELL_CACHE.startsWith(CACHE_PREFIX)).toBe(true);
+  });
+
+  /**
+   * The regression this file exists to stop happening twice.
+   *
+   * `storeShell` harvests a downloaded page's `/_next/static/*` chunks, and it is called from
+   * exactly one place — `downloadTrail` — so nothing ever re-harvests them. Put them in the
+   * build-scoped shell and the next deploy's `activate` sweep deletes them while the page that
+   * names them sits in `PAGE_CACHE` untouched: the download survives, and stops rendering. The
+   * hiker sees "This page couldn't load" from a cache that contains the page, in the one place
+   * they cannot fix it.
+   *
+   * So: the cache `storeShell` writes to must not be the one `activate` collects.
+   */
+  it('does not harvest a download into the cache a deploy sweeps', () => {
+    const write =
+      /async function storeShell\([^)]*\)[^{]*\{\s*const cache = await caches\.open\((\w+)\)/u.exec(
+        DOWNLOAD,
+      );
+    expect(write?.[1]).toBe('ASSET_CACHE');
+    expect(ASSET_CACHE).not.toContain(BUILD_ID);
+    // And the worker has to look there, or the entries are stored and never served: a
+    // downloaded page names hashed URLs that no current build serves.
+    expect(SW).toMatch(/async function handleStatic[\s\S]*?caches\.open\(ASSET_CACHE\)/u);
+  });
+
+  /**
+   * The half of that regression that had already shipped.
+   *
+   * The test above stops a *future* deploy sweeping a download's chunks. It does nothing for
+   * the downloads already on phones: those were harvested into the flat `sb-shell-v1`, which
+   * scoping the shell to the build drops out of `OFFLINE_CACHES` — so the first activate after
+   * the split deletes them, and `storeShell` runs only inside `downloadTrail`, so nothing puts
+   * them back. The download stays in `PAGE_CACHE` and stops rendering, offline, permanently.
+   *
+   * So the worker has to empty the old name before it collects it, and it must copy into the
+   * cache that is *not* swept.
+   */
+  it('carries a pre-split download’s chunks out of the old shell before sweeping it', () => {
+    expect(literal('LEGACY_SHELL_CACHE')).toBe(LEGACY_SHELL_CACHE);
+    // Not adopted into the keep-list: it is emptied and then collected, not retained.
+    expect(OFFLINE_CACHES).not.toContain(LEGACY_SHELL_CACHE);
+    expect(SW).toMatch(
+      /async function adoptLegacyShell[\s\S]*?caches\.open\(LEGACY_SHELL_CACHE\)[\s\S]*?caches\.open\(ASSET_CACHE\)/u,
+    );
+    // Only the build assets. Shell markup for an older build is refetched on first navigation.
+    expect(SW).toMatch(/adoptLegacyShell[\s\S]*?startsWith\('\/_next\/static\/'\)/u);
+    // And before the delete pass, or the copy reads a cache that is already gone.
+    expect(SW).toMatch(/adoptLegacyShell\(\)[\s\S]*?caches\.delete\(name\)/u);
+  });
+
+  it('takes the build id from the URL it was registered with', () => {
+    // `offline/register.tsx` appends `?v=<build id>`; `self.location` in a worker is the
+    // script URL it was registered with. That query string is the only channel into a file
+    // outside the module graph, and a changed one is also what forces the upgrade.
+    expect(SW).toMatch(/new URL\(self\.location\.href\)\.searchParams\.get\('v'\)/u);
+    expect(REGISTER).toMatch(/register\(`\/sw\.js\?v=\$\{encodeURIComponent\(BUILD_ID\)\}`/u);
   });
 
   it('lists every cache in OFFLINE_CACHES, so activate does not evict a live one', () => {
@@ -52,7 +142,13 @@ describe('service worker cache names', () => {
     expect(match).not.toBeNull();
 
     const listed = [...(match?.[1] ?? '').matchAll(/[A-Z_]+/gu)].map((m) => m[0]);
-    expect(listed).toEqual(['TILE_CACHE', 'PAGE_CACHE', 'MEDIA_CACHE', 'SHELL_CACHE']);
+    expect(listed).toEqual([
+      'TILE_CACHE',
+      'PAGE_CACHE',
+      'MEDIA_CACHE',
+      'ASSET_CACHE',
+      'SHELL_CACHE',
+    ]);
     expect(OFFLINE_CACHES).toHaveLength(listed.length);
   });
 
@@ -60,6 +156,15 @@ describe('service worker cache names', () => {
     // `activate` deletes caches starting with the prefix and not in the list. A cache named
     // outside the prefix would never be collected when its version is bumped.
     for (const name of OFFLINE_CACHES) expect(name.startsWith(CACHE_PREFIX)).toBe(true);
+  });
+
+  it('keeps the downloads a reader made off the build id', () => {
+    // Tiles, pages, photographs and the chunks those pages need are somebody's deliberate
+    // download, quite possibly for a trip they are on. Versioning any of them off the build
+    // would empty them on every deploy.
+    for (const name of [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE]) {
+      expect(name).not.toContain(BUILD_ID);
+    }
   });
 });
 

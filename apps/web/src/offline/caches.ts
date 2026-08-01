@@ -10,7 +10,24 @@
  * Versioned by name rather than cleared on upgrade. Bumping a suffix orphans the old cache,
  * which the worker deletes on activate — the standard dance, and the only one that is safe
  * while an old worker is still serving pages from the cache you want to replace.
+ *
+ * **Two kinds of version, and the difference matters.** Four of these carry a hand-bumped
+ * `-v1`, because what is in them belongs to the reader: tiles, pages, photographs and the
+ * build assets those pages name are a download somebody made on purpose, possibly for a trip
+ * they are on, and a deploy must not throw them away. Only the shell is versioned off the
+ * build id, because it holds this build's own precache and is replaced wholesale by the next
+ * one.
  */
+
+/**
+ * This build, as a string that changes when the build does.
+ *
+ * `NEXT_PUBLIC_BUILD_ID` is set in `next.config.ts` — the commit on Vercel and in CI, and a
+ * fresh random string for a local production build, because two local builds sharing a name
+ * is the exact collision this is here to prevent. Inlined at compile time, so the worker
+ * (which is handed the same value as a query parameter) and this module cannot disagree.
+ */
+export const BUILD_ID = process.env.NEXT_PUBLIC_BUILD_ID ?? 'dev';
 
 /** Every cache this product owns starts with this. The worker deletes strays that do not. */
 export const CACHE_PREFIX = 'sb-';
@@ -24,10 +41,75 @@ export const PAGE_CACHE = 'sb-pages-v1';
 /** Photographs shown on a downloaded trail's page. */
 export const MEDIA_CACHE = 'sb-media-v1';
 
-/** The application shell: the offline page, and the hashed assets it needs to render. */
-export const SHELL_CACHE = 'sb-shell-v1';
+/**
+ * The build assets a *downloaded page* names — its `/_next/static/*` chunks, stylesheets and
+ * fonts.
+ *
+ * Hand-versioned, and this is the one cache name that has already been got wrong once. It was
+ * folded into the shell, the shell was then scoped to the build id, and the two together meant
+ * every deploy deleted the chunks that pages already sitting in `PAGE_CACHE` refer to. The
+ * download survived; it just stopped rendering. A hiker's phone touches wifi, the new worker
+ * activates and sweeps `sb-shell-<old build>`, they walk out of signal, and the page they
+ * downloaded is served from cache and replaced by "This page couldn't load" — which is
+ * verbatim the failure the harvesting below exists to prevent.
+ *
+ * So the assets that belong to a download live with the download, on a hand-bumped name, and
+ * the shell keeps the build id. `download.ts`'s `storeShell` is the only writer.
+ *
+ * That fixes it going forward and not backwards: chunks harvested by a build that shipped
+ * before the split are sitting in `LEGACY_SHELL_CACHE` below, which the split itself makes
+ * sweepable. `adoptLegacyShell` in the worker moves them here first.
+ *
+ * **What that costs, said plainly.** These entries are not collected on deploy, so a phone
+ * that has downloaded trails across several builds holds a chunk set per build. Two things
+ * bound it: the URLs are content-hashed, so re-downloading a trail on the same build stores
+ * nothing new, and `evict.ts` drops the whole cache once the last download is deleted. What is
+ * given up is the property the build-scoped name bought — that a bad asset cannot outlive the
+ * deploy that removed it. It cannot be had here: a downloaded page's markup names the exact
+ * hashed URLs it was built with, and serving that page offline means serving those bytes. The
+ * alternative on offer was deleting them, which is not a fix, it is the bug.
+ */
+export const ASSET_CACHE = 'sb-assets-v1';
 
-export const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, SHELL_CACHE] as const;
+/**
+ * The application shell: the offline page, and the hashed assets it needs to render.
+ *
+ * Named after the build, so every deploy starts a clean one and `activate` collects the last.
+ * What is in here is this build's own precache — `SHELL_PAGES` and the chunks those pages
+ * name — which the next build replaces wholesale, and which nothing that is not the current
+ * build ever asks for. That is what makes collecting it safe, and it is exactly the property
+ * `ASSET_CACHE` above does not have.
+ *
+ * The cost is one cold shell per deploy: the first navigation after an upgrade refetches the
+ * chunks. They are on the network at that moment by definition — the reader is online, or
+ * they would still be on the old worker.
+ */
+export const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
+
+/**
+ * The shell name every build before the split used. Not a cache anything writes — a name the
+ * worker has to empty once, on the way to deleting it.
+ *
+ * `ASSET_CACHE` above describes the bug as a thing that was caught. It was caught late: the
+ * flat `sb-shell-v1` shipped, and `storeShell` wrote downloaded pages' chunks into it, so every
+ * phone holding a download made on the live build has those chunks under this name. Introducing
+ * the build-scoped shell drops it out of `OFFLINE_CACHES`, and `activate` collects anything
+ * under the prefix that is not in that list — which would delete exactly the entries this whole
+ * split exists to protect, on the first upgrade, for the readers who had already paid for them.
+ *
+ * So the worker's `adoptLegacyShell` copies the `/_next/static/*` across before the sweep. It is
+ * declared here for the same reason as everything else in this file: `test/offline-caches.test.ts`
+ * reads the worker as text and fails the build if the two spellings drift.
+ */
+export const LEGACY_SHELL_CACHE = 'sb-shell-v1';
+
+export const OFFLINE_CACHES = [
+  TILE_CACHE,
+  PAGE_CACHE,
+  MEDIA_CACHE,
+  ASSET_CACHE,
+  SHELL_CACHE,
+] as const;
 
 /** Where the worker sends a navigation it cannot satisfy from either network or cache. */
 export const OFFLINE_FALLBACK_PATH = '/offline';

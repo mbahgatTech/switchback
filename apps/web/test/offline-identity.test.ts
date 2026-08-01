@@ -28,7 +28,16 @@ import {
   rememberedReader,
   writingReader,
 } from '../src/offline/identity';
-import { READER_SHELL_PAGES, SHELL_CACHE, SHELL_PAGES } from '../src/offline/caches';
+import {
+  ASSET_CACHE,
+  LEGACY_SHELL_CACHE,
+  MEDIA_CACHE,
+  PAGE_CACHE,
+  READER_SHELL_PAGES,
+  SHELL_CACHE,
+  SHELL_PAGES,
+  TILE_CACHE,
+} from '../src/offline/caches';
 import { clearReaderStorage, reconcileReader } from '../src/offline/handover';
 import {
   getPendingReview,
@@ -294,7 +303,7 @@ describe('the reader a write is stamped with', () => {
 
 describe('reconciling a change of reader', () => {
   it('records the first sighting without clearing anything', async () => {
-    const { store, api } = createFakeCaches(['sb-shell-v1', 'sb-tiles-v1']);
+    const { store, api } = createFakeCaches([SHELL_CACHE, TILE_CACHE]);
     vi.stubGlobal('caches', api);
 
     const changed = await reconcileReader(A);
@@ -303,7 +312,7 @@ describe('reconciling a change of reader', () => {
     // this shipped, and taking every hiker's downloads away on that afternoon to guard
     // against a handover that probably did not happen is the wrong trade.
     expect(changed).toBe(false);
-    expect([...store]).toEqual(['sb-shell-v1', 'sb-tiles-v1']);
+    expect([...store]).toEqual([SHELL_CACHE, TILE_CACHE]);
     expect(rememberedReader()).toEqual({ id: A, known: true });
   });
 
@@ -337,9 +346,11 @@ describe('reconciling a change of reader', () => {
   it('deletes the departing reader cached pages', async () => {
     rememberReader(A);
     const { store, entries, api } = createFakeCaches([
-      'sb-shell-v1',
-      'sb-pages-v1',
-      'sb-tiles-v1',
+      SHELL_CACHE,
+      ASSET_CACHE,
+      PAGE_CACHE,
+      TILE_CACHE,
+      LEGACY_SHELL_CACHE,
       'somebody-elses-cache',
     ]);
     const shell = shellHolding(entries);
@@ -347,11 +358,17 @@ describe('reconciling a change of reader', () => {
 
     await reconcileReader(B);
 
-    // The trail pages and tiles were fetched with the first reader's cookie and go whole. The
-    // shell is not dropped by name: it also holds the offline fallback, the storage manager and
-    // the build assets every one of them needs to render, and nothing puts those back until a
-    // full-document navigation — so what goes is the three pages rendered for a person.
-    expect([...store]).toEqual(['sb-shell-v1', 'somebody-elses-cache']);
+    // The trail pages and tiles were fetched with the first reader's cookie and go whole. This
+    // build's shell is not dropped by name: it also holds the offline fallback, the storage
+    // manager and the build assets every one of them needs to render, and nothing puts those
+    // back until a full-document navigation — so what goes is the three pages rendered for a
+    // person. The previous build's shell has no such claim on it. What it holds is `/`,
+    // `/explore` and `/record` as they rendered for the reader who is leaving, carrying their
+    // opening coordinate and the name and start time of any recording they left open, and the
+    // only thing the worker still reads out of it is `/_next/static/*`, which `adoptLegacyShell`
+    // has already carried across into `ASSET_CACHE` before `activate` collects it. So it goes
+    // whole, and the asset cache goes with the downloads whose lifetime it shares.
+    expect([...store]).toEqual([SHELL_CACHE, 'somebody-elses-cache']);
     for (const path of READER_SHELL_PAGES) expect(shell.has(path)).toBe(false);
     expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
   });
@@ -362,13 +379,13 @@ describe('reconciling a change of reader', () => {
     // deleting them protects nobody and costs the map for the hike being planned. The same
     // branch fires on a thirty-day session lapse on a one-person phone.
     rememberReader(null);
-    const { store, entries, api } = createFakeCaches(['sb-shell-v1', 'sb-tiles-v1']);
+    const { store, entries, api } = createFakeCaches([SHELL_CACHE, TILE_CACHE]);
     const shell = shellHolding(entries);
     vi.stubGlobal('caches', api);
 
     expect(await reconcileReader(A)).toBe(true);
 
-    expect([...store]).toEqual(['sb-shell-v1', 'sb-tiles-v1']);
+    expect([...store]).toEqual([SHELL_CACHE, TILE_CACHE]);
     expect([...shell]).toEqual([...SHELL_PAGES, '/_next/static/chunks/main-9f2c.js']);
     expect(rememberedReader()).toEqual({ id: A, known: true });
   });
@@ -377,7 +394,7 @@ describe('reconciling a change of reader', () => {
     // Somebody to nobody is a person leaving a machine, and what they leave behind was fetched
     // under their name.
     rememberReader(A);
-    const { store, api } = createFakeCaches(['sb-tiles-v1']);
+    const { store, api } = createFakeCaches([TILE_CACHE]);
     vi.stubGlobal('caches', api);
 
     await reconcileReader(null);
@@ -388,12 +405,12 @@ describe('reconciling a change of reader', () => {
   it('does nothing at all when the reader has not changed', async () => {
     rememberReader(A);
     await putPendingReview(report('a', A));
-    const { store, api } = createFakeCaches(['sb-shell-v1']);
+    const { store, api } = createFakeCaches([SHELL_CACHE]);
     vi.stubGlobal('caches', api);
 
     expect(await reconcileReader(A)).toBe(false);
 
-    expect([...store]).toEqual(['sb-shell-v1']);
+    expect([...store]).toEqual([SHELL_CACHE]);
     expect((await getPendingReview(A, 'a'))?.heldAt).toBeNull();
   });
 
@@ -428,10 +445,11 @@ describe('clearReaderStorage', () => {
 
   it('keeps the download caches when the ledger cannot be read', async () => {
     const { store, entries, api } = createFakeCaches([
-      'sb-shell-v1',
-      'sb-tiles-v1',
-      'sb-pages-v1',
-      'sb-media-v1',
+      SHELL_CACHE,
+      TILE_CACHE,
+      PAGE_CACHE,
+      MEDIA_CACHE,
+      ASSET_CACHE,
     ]);
     const shell = shellHolding(entries);
     vi.stubGlobal('caches', api);
@@ -445,8 +463,12 @@ describe('clearReaderStorage', () => {
 
     // The ledger rows survive an unreadable store; their bytes must survive with them, or
     // `/downloads` lists a trail as available offline with a byte count and nothing behind it.
+    // `ASSET_CACHE` is part of those bytes rather than a cache of its own: a downloaded page in
+    // `PAGE_CACHE` names hashed URLs that no current build serves, and `handleStatic` finds them
+    // by looking in `ASSET_CACHE` second, so taking that cache while leaving the pages hands a
+    // hiker with no signal React's error boundary out of a cache that contains the page.
     // The reader-specific pages still go — they are in no ledger and nothing lies about them.
-    expect([...store]).toEqual(['sb-shell-v1', 'sb-tiles-v1', 'sb-pages-v1', 'sb-media-v1']);
+    expect([...store]).toEqual([SHELL_CACHE, TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE]);
     expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
   });
 });

@@ -12,7 +12,11 @@
  *
  * - **The access token is a JWT and is never stored.** Verifying it is a signature check
  *   with no database round trip, which is what makes it cheap enough to put on every
- *   call. The cost is that it cannot be revoked, which is why it lives 15 minutes.
+ *   call. The cost used to be that it could not be revoked at all, which is why it lives 15
+ *   minutes. It now carries `iat`, and `createContext` refuses one issued at or before the
+ *   account's `sessionsRevokedAt` — so "sign out everywhere" is immediate rather than
+ *   eventual, and it costs nothing, because that request already loads the user row. The
+ *   15-minute life still bounds everything else.
  * - **The refresh token is opaque and *is* stored, hashed.** It is a database lookup
  *   every time, but it is used once an hour at most, and being stored is what makes
  *   revocation and reuse detection possible at all. Hashed because a leaked backup of
@@ -70,20 +74,37 @@ export async function signAccessToken(userId: string): Promise<string> {
 }
 
 /**
- * Returns the user id, or null for anything wrong with the token.
+ * A verified access token, reduced to the two things anything downstream needs.
+ *
+ * `issuedAt` is here so a revocation can be enforced against a token already in a client's
+ * memory — see `sessionsRevokedAt` on `User` and the check in `createContext`. Seconds since
+ * the epoch, which is what `iat` is.
+ */
+export interface AccessTokenClaims {
+  userId: string;
+  issuedAt: number;
+}
+
+/**
+ * Returns the claims, or null for anything wrong with the token.
  *
  * Null rather than throwing because the caller is the tRPC context, which runs on every
  * request including public ones: a stale token on a public procedure should degrade to
  * "not signed in", not 500.
+ *
+ * `iat` is required rather than defaulted. Every token we mint sets it, so a verified token
+ * without one is not ours in a way the signature check cannot see, and treating a missing
+ * `iat` as "issued now" would make it the one shape that survives a revocation.
  */
-export async function verifyAccessToken(token: string): Promise<string | null> {
+export async function verifyAccessToken(token: string): Promise<AccessTokenClaims | null> {
   try {
     const { payload } = await jwtVerify(token, secretKey(), {
       issuer: ISSUER,
       audience: AUDIENCE,
       algorithms: ['HS256'],
     });
-    return typeof payload.sub === 'string' ? payload.sub : null;
+    if (typeof payload.sub !== 'string' || typeof payload.iat !== 'number') return null;
+    return { userId: payload.sub, issuedAt: payload.iat };
   } catch {
     return null;
   }

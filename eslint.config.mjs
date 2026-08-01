@@ -37,6 +37,12 @@ export default tseslint.config(
       '**/playwright-report/**',
       '**/test-results/**',
       '**/*.d.ts',
+      // Vendored third-party code, served verbatim from `public/`. It is minified output from
+      // somebody else's build — no tsconfig covers it, so the type-aware parser fails on it,
+      // and there would be nothing to act on if it did not: the point of a vendored file is
+      // that it is byte-identical to the published one. `components/map/rtl.ts` records the
+      // version and its digest, which is the review this gets.
+      'apps/web/public/vendor/**',
     ],
   },
   js.configs.recommended,

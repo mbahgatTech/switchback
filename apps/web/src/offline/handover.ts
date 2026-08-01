@@ -70,20 +70,35 @@ import { listOfflineTrails } from './store';
  * the top.
  *
  * **The reader-specific shell pages, by entry rather than by cache.** `SHELL_CACHE` also holds
- * `/offline`, `/downloads` and every `/_next/static/*` chunk harvested from a page's markup —
- * impersonal, and unrepairable in practice once dropped, because `install` runs once per worker
- * version and `repairShell` only fires on a real navigation, which App Router client routing
- * never performs. Deleting the cache by name cost a hiker who signed in and then lost signal a
- * plain-text 503 on `/`, `/downloads` and `/record`. See `READER_SHELL_PAGES`.
+ * `/offline`, `/downloads` and the current build's own chunks — impersonal, and unrepairable in
+ * practice once dropped, because `install` runs once per worker version and `repairShell` only
+ * fires on a real navigation, which App Router client routing never performs. Deleting the cache
+ * by name cost a hiker who signed in and then lost signal a plain-text 503 on `/`, `/downloads`
+ * and `/record`. See `READER_SHELL_PAGES`.
  *
- * **Everything else under `sb-`** — tiles, trail pages, photographs, and any cache orphaned by
- * a version bump that `activate` has not got to yet.
+ * **Everything else under `sb-`** — tiles, trail pages, photographs, the previous build's shell
+ * under `LEGACY_SHELL_CACHE`, and any cache orphaned by a version bump that `activate` has not
+ * got to yet. The legacy shell belongs in that list rather than beside `SHELL_CACHE`: its copies
+ * of `/` and `/record` were rendered for the reader who is leaving, and the only thing the worker
+ * still reads out of it is `/_next/static/*`, which `adoptLegacyShell` has already carried across.
+ *
+ * `ASSET_CACHE` is swept there too, and is almost always gone before the sweep reaches it. The
+ * harvested chunks are deliberately absent from the ledger — `download.ts` will not list them
+ * against one trail, because every trail page shares them and evicting them with one trail would
+ * blank the others — so `evictTrails` owns their lifetime instead and drops the whole cache the
+ * moment the last download does. The first pass above evicts every trail, which is that moment.
+ * What can still be there afterwards is a cache belonging to no download at all, and
+ * content-hashed build output belongs to nobody in any case.
  *
  * That last pass is skipped when the ledger could not be read. Its rows would then survive
  * while their bytes did not, and `/downloads` would list a trail as available offline with a
  * byte count against it and nothing behind it — the dishonesty `evict.ts` is written to
  * prevent, arrived at from the other side. Keeping another reader's tiles is the smaller harm
- * than lying to this one about what is on the disk.
+ * than lying to this one about what is on the disk. Skipping it is also what keeps those
+ * surviving downloads legible: a page in `PAGE_CACHE` names hashed URLs no current build serves,
+ * and `handleStatic` finds them by looking in `ASSET_CACHE` second, so taking that cache while
+ * leaving the pages would give a hiker with no signal React's error boundary out of a cache that
+ * contains the page.
  *
  * There is deliberately no retry for that case, and it is worth being plain about the residual.
  * A later sweep cannot tell the departed reader's downloads from ones made since — the ledger

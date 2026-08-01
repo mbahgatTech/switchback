@@ -120,7 +120,7 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('records the request without recording anything that could sign anyone in', async () => {
-    const id = await startAuthRequest(prisma, {
+    const { id, browserSecret } = await startAuthRequest(prisma, {
       redirectUri: REDIRECT,
       challenge,
       deviceName: "Mazen's iPhone",
@@ -137,6 +137,12 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     expect(row.claimedAt).toBeNull();
     expect(row.expiresAt.getTime()).toBeGreaterThan(Date.now());
     expect(row.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + AUTH_REQUEST_TTL_MS);
+
+    // The browser binding is stored as a digest, on the same reasoning as the code: a dump of
+    // this table should not hand anybody the second half of an in-flight sign-in.
+    expect(browserSecret).toHaveLength(43);
+    expect(row.browserHash).not.toBe(browserSecret);
+    expect(row.browserHash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('refuses a redirect it will not honour, and a challenge too short to be one', async () => {
@@ -155,8 +161,11 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('completes the round trip and issues a usable token pair', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    const target = await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
 
     expect(target.startsWith('switchback://signin?')).toBe(true);
     // Echoed so the app can tell a deep link answering *its* request from one an attacker
@@ -170,14 +179,17 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
       deviceName: 'iPhone 15',
     });
 
-    await expect(verifyAccessToken(pair.accessToken)).resolves.toBe(userId);
+    await expect(verifyAccessToken(pair.accessToken)).resolves.toMatchObject({ userId });
     const tokens = await prisma.mobileRefreshToken.findMany({ where: { userId } });
     expect(tokens.some((row) => row.deviceName === 'iPhone 15')).toBe(true);
   });
 
   it('stores a hash of the code, never the code', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    const target = await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
     const code = codeFrom(target);
 
     const row = await prisma.mobileAuthRequest.findUniqueOrThrow({ where: { id } });
@@ -186,8 +198,11 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('refuses a claim without the verifier that started it', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    const target = await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
 
     // The point of the whole design: any app on the device can register a URL scheme it does
     // not own, so holding the code has to be worth nothing on its own.
@@ -207,8 +222,11 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('refuses a guessed code', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    await authorizeAuthRequest(prisma, id, userId, browserSecret);
 
     await expect(
       claimAuthRequest(prisma, { requestId: id, code: 'not-the-code', verifier: VERIFIER }),
@@ -216,8 +234,11 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('spends the code exactly once', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    const target = await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
     const code = codeFrom(target);
 
     await claimAuthRequest(prisma, { requestId: id, code, verifier: VERIFIER });
@@ -227,18 +248,23 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('cannot be authorized twice, so a second signer cannot overwrite the first', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    await authorizeAuthRequest(prisma, id, userId, browserSecret);
 
     // Without this, anyone who could replay `/complete` while signed in as themselves would
     // hand *their* account to a device that asked for somebody else's.
-    await expect(authorizeAuthRequest(prisma, id, otherUserId)).rejects.toMatchObject({
+    await expect(
+      authorizeAuthRequest(prisma, id, otherUserId, browserSecret),
+    ).rejects.toMatchObject({
       code: 'already_claimed',
     });
   });
 
   it('refuses a claim on a request nobody signed in for', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
+    const { id } = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
 
     await expect(
       claimAuthRequest(prisma, { requestId: id, code: 'anything', verifier: VERIFIER }),
@@ -246,7 +272,9 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
   });
 
   it('refuses an unknown request id', async () => {
-    await expect(authorizeAuthRequest(prisma, 'no-such-request', userId)).rejects.toMatchObject({
+    await expect(
+      authorizeAuthRequest(prisma, 'no-such-request', userId, 'anything'),
+    ).rejects.toMatchObject({
       code: 'unknown_request',
     });
     await expect(
@@ -254,9 +282,49 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     ).rejects.toMatchObject({ code: 'unknown_request' });
   });
 
+  it('refuses to authorize from a browser that did not start the request', async () => {
+    /*
+     * The CSRF fix, stated as a property. Without it, an attacker runs `/start` themselves —
+     * so that they, not the victim, hold the PKCE verifier — and then walks the victim's
+     * browser to `/complete?request=<id>`. `SameSite=Lax` sends the session cookie on a
+     * top-level cross-site GET by design, so the row would be authorized against the victim's
+     * account and the attacker would claim a sixty-day refresh token on it.
+     */
+    const mine = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
+    const theirs = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
+
+    await expect(
+      authorizeAuthRequest(prisma, mine.id, userId, theirs.browserSecret),
+    ).rejects.toMatchObject({ code: 'wrong_browser' });
+    await expect(authorizeAuthRequest(prisma, mine.id, userId, '')).rejects.toMatchObject({
+      code: 'wrong_browser',
+    });
+
+    // And the refusal did not spend the row: the browser that does hold the secret can still
+    // finish. A forgery attempt must not become a denial of service on a real sign-in.
+    await expect(
+      authorizeAuthRequest(prisma, mine.id, userId, mine.browserSecret),
+    ).resolves.toBeDefined();
+  });
+
+  it('refuses a row written before the binding column existed', async () => {
+    // Requests in flight when this shipped have no `browserHash`, and null is treated as a
+    // mismatch rather than as unchecked. They live fifteen minutes, so the whole population
+    // clears within a quarter of an hour of a deploy; the alternative is a permanent hole.
+    const { id } = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
+    await prisma.mobileAuthRequest.update({ where: { id }, data: { browserHash: null } });
+
+    await expect(authorizeAuthRequest(prisma, id, userId, 'anything')).rejects.toMatchObject({
+      code: 'wrong_browser',
+    });
+  });
+
   it('expires, on both legs', async () => {
-    const id = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
-    const target = await authorizeAuthRequest(prisma, id, userId);
+    const { id, browserSecret } = await startAuthRequest(prisma, {
+      redirectUri: REDIRECT,
+      challenge,
+    });
+    const target = await authorizeAuthRequest(prisma, id, userId, browserSecret);
     await prisma.mobileAuthRequest.update({
       where: { id },
       data: { expiresAt: new Date(Date.now() - 1000) },
@@ -268,10 +336,12 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
 
     const stale = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
     await prisma.mobileAuthRequest.update({
-      where: { id: stale },
+      where: { id: stale.id },
       data: { expiresAt: new Date(Date.now() - 1000) },
     });
-    await expect(authorizeAuthRequest(prisma, stale, userId)).rejects.toMatchObject({
+    await expect(
+      authorizeAuthRequest(prisma, stale.id, userId, stale.browserSecret),
+    ).rejects.toMatchObject({
       code: 'expired',
     });
   });
@@ -281,20 +351,20 @@ describe.skipIf(!IS_LOCAL).sequential('browser-assisted sign-in', () => {
     const recent = await startAuthRequest(prisma, { redirectUri: REDIRECT, challenge });
 
     await prisma.mobileAuthRequest.update({
-      where: { id: ancient },
+      where: { id: ancient.id },
       data: { expiresAt: new Date(Date.now() - 2 * 60 * 60 * 1000) },
     });
     await prisma.mobileAuthRequest.update({
-      where: { id: recent },
+      where: { id: recent.id },
       data: { expiresAt: new Date(Date.now() - 60 * 1000) },
     });
 
     const pruned = await pruneExpiredAuthRequests(prisma);
     expect(pruned).toBeGreaterThanOrEqual(1);
 
-    expect(await prisma.mobileAuthRequest.findUnique({ where: { id: ancient } })).toBeNull();
+    expect(await prisma.mobileAuthRequest.findUnique({ where: { id: ancient.id } })).toBeNull();
     // Kept for the grace period so an app claiming a few seconds late gets `expired` — which
     // it can explain — rather than `unknown_request`, which reads like a bug in the server.
-    expect(await prisma.mobileAuthRequest.findUnique({ where: { id: recent } })).not.toBeNull();
+    expect(await prisma.mobileAuthRequest.findUnique({ where: { id: recent.id } })).not.toBeNull();
   });
 });
