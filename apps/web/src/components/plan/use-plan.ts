@@ -6,40 +6,23 @@ import { MAX_ROUTE_ANCHORS, type RouteAnchor, type RoutePlan } from '@switchback
 import { useTRPC } from '@/trpc/react';
 
 /**
- * The planner's state machine.
+ * The planner's state machine, lifted out of the component because the interesting part is what
+ * happens between "the user moved a point" and "the line is right again".
  *
- * Lifted out of the component because the interesting part of a route planner is not what it
- * looks like — it is what happens between "the user moved a point" and "the line is right
- * again", and that has four problems in it that the rendering has none of.
- *
- * **Debounce.** Clicking out a ten-point route fires ten edits in as many seconds, and each
- * one is a fresh A* over every leg. Waiting a moment after the last one collapses a burst of
- * clicks into one plan without making a single deliberate click feel slow.
- *
- * **Ordering.** Plans return in whatever order the network delivers them, and a two-anchor
- * plan issued first can land after the five-anchor plan issued third. Every request carries a
- * sequence number and anything but the newest is dropped, so the line on screen is always the
- * line for the points on screen.
- *
- * **Waiting for ground.** The first plan over cold country comes back with `pendingTiles` and
- * straight legs, because the walkable network for that ground is still being fetched. Asking
- * again on a timer is what turns that into a route without the user having to guess that
- * nudging a point would fix it.
- *
- * **Undo.** Every edit pushes the previous anchors onto a stack. That is what makes
- * click-to-remove safe enough to offer at all: on a map, the gesture that removes a point and
- * the gesture that moves it are a few pixels apart.
+ * Four problems live here. Edits are debounced, so a burst of clicks is one plan. Every request
+ * carries a sequence number and anything but the newest is dropped, because a two-anchor plan
+ * issued first can land after a five-anchor plan issued third. A plan that comes back with
+ * `pendingTiles` is retried on a timer, since the walkable network for that ground is still
+ * being fetched. And every edit pushes the previous anchors onto an undo stack, which is what
+ * makes click-to-remove safe to offer on a map.
  */
 
 /** How long the planner waits after the last edit before asking the server. */
 const EDIT_SETTLE_MS = 250;
 
 /**
- * How often to replan while the walkable network is still downloading.
- *
- * The same interval `/explore` polls its tiles on, and for the same reason: an Overpass round
- * trip is measured in seconds, so asking faster returns the identical answer, and asking
- * slower leaves somebody looking at a straight line wondering whether it is the final one.
+ * How often to replan while the walkable network is still downloading. The same interval
+ * `/explore` polls its tiles on: an Overpass round trip is measured in seconds.
  */
 const PENDING_POLL_MS = 2_500;
 
@@ -82,11 +65,9 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
   const { mutateAsync } = planner;
 
   /**
-   * The sequence guard.
-   *
-   * `issued` counts every request ever sent; `settled` remembers the newest one whose answer
-   * has been accepted. A response is only allowed to touch state when its own number is the
-   * highest seen — which is the whole of the fix for a stale plan overwriting a fresh one.
+   * The sequence guard. `issued` counts every request sent; `settled` remembers the newest one
+   * whose answer was accepted. A response may only touch state when its number is the highest
+   * seen, which is the whole of the fix for a stale plan overwriting a fresh one.
    */
   const issued = useRef(0);
   const settled = useRef(0);
@@ -128,10 +109,8 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
         if (index < 0 || index >= previous.length) return previous;
         const next = previous.filter((_, at) => at !== index);
         /*
-         * Removing the first point promotes the second, and the second's flag described the
-         * leg that no longer exists. Left alone, deleting a snapped start would make the new
-         * start freehand for no reason the user could see — the flag would have moved from a
-         * leg to a point, which is exactly the confusion the schema's note warns about.
+         * Removing the first point promotes the second, whose flag described the leg that no
+         * longer exists — left alone, deleting a snapped start makes the new start freehand.
          */
         const first = next[0];
         if (index === 0 && first) next[0] = { ...first, freehand: false };
@@ -158,12 +137,9 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
     edit((previous) => {
       if (previous.length < 2) return previous;
       /*
-       * The return leg's flag comes from the outward leg it retraces, shifted by one.
-       *
-       * Hiking back down a freehand leg is still freehand, and hiking back down a snapped
-       * one should snap. Because a flag describes the leg *arriving* at its anchor, the
-       * mirrored point at position i takes its flag from the point one further out — get that
-       * off by one and every return leg inherits the wrong mode.
+       * The return leg's flag comes from the outward leg it retraces, shifted by one: a flag
+       * describes the leg *arriving* at its anchor, so the mirrored point at i takes its flag
+       * from the point one further out. Off by one and every return leg inherits the wrong mode.
        */
       const back: RouteAnchor[] = [];
       for (let i = previous.length - 2; i >= 0; i -= 1) {
@@ -206,11 +182,9 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
   );
 
   /**
-   * Ask the server, once the edits stop.
-   *
-   * `mutateAsync` rather than the mutation's own state, because a mutation's `data` is
-   * whichever call resolved last and that is precisely the thing the sequence guard exists to
-   * override. The result goes into local state or nowhere.
+   * Ask the server, once the edits stop. `mutateAsync` rather than the mutation's own state,
+   * because a mutation's `data` is whichever call resolved last — precisely what the sequence
+   * guard exists to override.
    */
   useEffect(() => {
     if (anchors.length < 2) {
@@ -248,18 +222,15 @@ export function usePlan(initialAnchors: readonly RouteAnchor[] = []): PlanState 
   }, [anchors, preferPaths, mutateAsync]);
 
   /**
-   * Try again while the ground is still arriving.
-   *
-   * Scheduled off the plan rather than off a flag, so the chain stops on its own: each replan
-   * replaces `plan`, and a plan with no pending tiles schedules nothing. Anchors are read from
-   * a ref so a tile landing does not have to race the edit effect above for the same state.
+   * Try again while the ground is still arriving. Scheduled off the plan rather than off a
+   * flag, so the chain stops on its own: a plan with no pending tiles schedules nothing.
+   * Anchors are read from a ref so a tile landing does not race the edit effect above.
    */
   const pending = plan?.pendingTiles ?? 0;
   /*
-   * A refused fetch is not a slow one. `busy` means the server declined to queue the network
-   * under these anchors, so no tile is going to land and re-planning on a timer would be a
-   * poll loop against a server already saying it is under pressure. The chain resumes on the
-   * next edit, which is when the refusal is worth re-testing.
+   * A refused fetch is not a slow one: `busy` means the server declined to queue the network
+   * under these anchors, so no tile will land and a timer would be a poll loop against a
+   * server already saying it is under pressure. The chain resumes on the next edit.
    */
   const busy = plan?.busy ?? false;
   const latest = useRef({ anchors, preferPaths });

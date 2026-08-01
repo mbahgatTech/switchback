@@ -3,27 +3,10 @@
 /**
  * "Report" — the control that makes a takedown process possible, and the form behind it.
  *
- * Every other button in this product does something to the reader's own things. This one
- * accuses somebody else's, which is why it is shaped the way it is:
- *
- * **It is the quietest control on the row.** Collar lettering, no border, `ink-muted`, and
- * it sits after everything else. A report button that competes with "Show more" gets pressed
- * by mistake, and a queue full of mis-taps is a queue the operator stops reading — which
- * costs the genuine report its answer. It keeps a full panel-height hit area all the same:
- * quiet is not the same as hard to press, and the person who needs this is often upset.
- *
- * **It works signed out.** The person who finds a photograph of their own front door on a
- * trail page is not going to make an account to tell us about it, and a complaints box that
- * only members can reach is not a complaints box. Signed in, the email field disappears —
- * we already have one.
- *
- * **It never says "thank you for your report".** The confirmation states what happened and
- * what happens next, with a number on it, because what somebody wants after pressing this is
- * not warmth. It is to know that a human will look, and roughly when.
- *
- * The form is exported on its own because `/report` renders it as a page: somebody who
- * cannot reach the content — a rights holder working from a screenshot, a phone that will
- * not load the gallery — must not be dependent on a control that lives next to it.
+ * The quietest control on its row, because a queue full of mis-taps is a queue the operator
+ * stops reading; it keeps a full panel-height hit area all the same. It works signed out — a
+ * complaints box only members can reach is not a complaints box. The form is exported on its
+ * own because `/report` renders it as a page, for somebody who cannot reach the content.
  */
 
 import { useEffect, useId, useRef, useState } from 'react';
@@ -51,12 +34,9 @@ export interface ReportFormProps {
 }
 
 /**
- * The fields, the submit, and the two things that can come back.
- *
- * The reason list is radios rather than a `<select>`. It is nine options a person is
- * choosing between while upset, and a dropdown hides eight of them behind a tap — this is
- * one of the few places in the product where the whole vocabulary being visible at once is
- * worth the vertical space.
+ * The fields, the submit, and the two things that can come back. Radios rather than a
+ * `<select>`: nine options a person is choosing between while upset, and a dropdown hides
+ * eight of them behind a tap.
  */
 export function ReportForm({
   subject,
@@ -77,14 +57,9 @@ export function ReportForm({
   const confirmationRef = useRef<HTMLParagraphElement>(null);
 
   /*
-   * Sending the report destroys the control that had focus.
-   *
-   * On success this component returns a different subtree, so the submit button unmounts and
-   * focus falls to `<body>` — or, inside the sheet, to the `<dialog>` itself. A screen reader
-   * announces nothing, and in the dialog the reader is left in a panel they were never told
-   * had changed, hunting blind for Close. Moving focus to the confirmation reads it out and
-   * puts the ring somewhere the keyboard can carry on from; `role="status"` below covers the
-   * page version, where focus may already be elsewhere.
+   * Sending the report unmounts the submit button, dropping focus to `<body>` — or, inside
+   * the sheet, to the `<dialog>` itself, where the reader hunts blind for Close. Moving focus
+   * to the confirmation reads it out; `role="status"` covers the page version.
    */
   useEffect(() => {
     if (file.isSuccess) confirmationRef.current?.focus();
@@ -92,11 +67,8 @@ export function ReportForm({
 
   if (file.isSuccess) {
     /*
-     * Whether there is anywhere to send the answer. Two lines above, the email field says
-     * "we use it to reply about this report"; `/report` says an anonymous report is still a
-     * report, "we just cannot reply to it". Promising every reporter an answer in five days
-     * — including the one we have no address for — makes the one screen they see after
-     * filing contradict the rest of the surface.
+     * Whether there is anywhere to send the answer. Promising every reporter a reply — including
+     * the one we have no address for — contradicts what the email field says two lines above.
      */
     const canReply = isViewerKnown || Boolean(file.variables?.contactEmail);
 
@@ -140,8 +112,8 @@ export function ReportForm({
           subjectId,
           reason,
           detail: detail.trim() || null,
-          // Never sent for a signed-in reporter: we have their address already, and asking
-          // for a second one is a way to end up replying to the wrong person.
+          // Never sent for a signed-in reporter: asking for a second address is a way to end
+          // up replying to the wrong person.
           contactEmail: isViewerKnown || !email.trim() ? null : email.trim(),
         });
       }}
@@ -207,18 +179,9 @@ export function ReportForm({
 
       {file.isError ? (
         /*
-         * Survey plate. This is the one line on the sheet that is about the reader's own
-         * position in the process rather than about the content, and it is the plate this
-         * product uses for exactly that. It says what happened and gives the way round it.
-         *
-         * **Branched on the code, because "try again" is wrong for half of them.** The most
-         * likely failure on `/report` is a stale deep link — an operator forwarded a URL, a
-         * rights holder is working from a screenshot, and the review has since been deleted
-         * — which `locateSubject` answers with NOT_FOUND. Telling that reader the report did
-         * not send and to try again advises an action that is guaranteed to fail forever,
-         * about a thing that is already gone. `role="alert"` because the paragraph appears
-         * after a press, next to a button that has quietly gone from "Sending…" back to
-         * "Send report".
+         * Branched on the code, because "try again" is wrong for half of them: a stale deep
+         * link answers NOT_FOUND, and telling that reader to retry advises an action that is
+         * guaranteed to fail forever. `role="alert"` because it appears after a press.
          */
         <p
           role="alert"
@@ -284,11 +247,9 @@ export function ReportControl({ subject, subjectId, isViewerKnown, what }: Repor
       </button>
 
       {/*
-       * `m-auto` is load-bearing. A modal `<dialog>` is centred by the UA's own
-       * `inset: 0; margin: auto`, and Tailwind's preflight resets `dialog { margin: 0 }`,
-       * which leaves it pinned to the top-left corner against the backdrop.
-       *
-       * Opaque canvas and a hairline, no shadow: a trail page can have the map behind it.
+       * `m-auto` is load-bearing: a modal `<dialog>` is centred by the UA's own `margin: auto`,
+       * and Tailwind's preflight resets `dialog { margin: 0 }`, pinning it to the top-left.
+       * Opaque canvas and a hairline, no shadow — a trail page can have the map behind it.
        */}
       <dialog
         ref={dialogRef}
@@ -301,9 +262,8 @@ export function ReportControl({ subject, subjectId, isViewerKnown, what }: Repor
             Report {what}
           </h2>
           {/*
-           * Keyed on `open` so the form is a fresh mount each time the sheet is opened. A
-           * report that has been sent must not be re-sendable by reopening the sheet, and a
-           * half-written one is not worth keeping across a dismissal.
+           * Keyed on `open` so the form is a fresh mount each time: a report that has been
+           * sent must not be re-sendable by reopening the sheet.
            */}
           <ReportForm
             key={open ? 'open' : 'closed'}
@@ -320,17 +280,10 @@ export function ReportControl({ subject, subjectId, isViewerKnown, what }: Repor
 }
 
 /**
- * The other half of the lever, where the operator stands.
- *
- * Deliberately the same size and quietness as the report control beside it. A moderator's
- * remove is a `DANGER`-plated button everywhere else in this product; here it is not,
- * because this one sits inline on somebody else's writing on a public page, and survey red
- * in a stranger's row reads as an accusation against them rather than as a tool. It is also
- * not destructive: hiding is reversible, which is what the second label says.
- *
- * **Rendered only for operators, and that is not what enforces it.** `moderatorProcedure` in
- * `packages/api/src/trpc.ts` is; this component simply declines to draw a control that would
- * always fail. Anybody who forges `role` on their own client gets a button and a FORBIDDEN.
+ * The other half of the lever, where the operator stands. Deliberately as quiet as the report
+ * control beside it: survey red in a stranger's row reads as an accusation against them, and
+ * hiding is reversible anyway. Drawn only for operators, but `moderatorProcedure` is what
+ * enforces that — a forged role here buys a button and a FORBIDDEN.
  */
 export function ModerateControl({
   subject,

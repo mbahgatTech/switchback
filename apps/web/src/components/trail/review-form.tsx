@@ -39,35 +39,12 @@ import {
 } from '../controls';
 
 /**
- * Filing a report.
+ * Filing a report — a field card rather than a review box: the rating is one line of it and
+ * the rest is what was actually there. Rating is the only required field.
  *
- * A form shaped like a field card rather than a review box: what you thought is one line of
- * it, and the rest is what was actually there — the day, the ground, the way you travelled.
- * That ordering is the product's argument. A rating tells the next hiker whether they will
- * enjoy it; the conditions tell them whether to bring different boots, and only one of those
- * two facts goes stale in a fortnight.
- *
- * **Closed by default.** An open form above the reports would make writing look like the
- * point of the page when reading is. It opens on a single control, and that control says
- * which of the two things it will do, because someone who has already written here is
- * amending rather than adding — the schema allows exactly one report per person per trail.
- *
- * **Rating is the only required field.** Everything else is optional and none of it is
- * nagged for: a form that refuses to accept "four stars, no comment" collects fewer reports
- * and no more information.
- *
- * **Photographs are uploaded before the report is filed, not with it.** They go to the trail
- * the moment they are picked and are adopted by the report afterwards, once it has an id.
- * The alternative — holding the files in the browser until publish — means an abandoned
- * draft loses them, and means the person waits for a 4 MB uplink after pressing a button
- * that says *File report*. This way the worst case is a picture on the trail that no report
- * claims, which is what somebody who pressed "add" and then wandered off was asking for.
- *
- * **A report written with no signal is kept, not lost.** This is the form most likely to be
- * filled in where there is no connection — it is about ground the person is standing on — so
- * a save that never reaches the server is written to the device instead and sent when one
- * returns. See `offline/queue.ts`. The one thing the form will not do is show a failure and
- * throw the words away.
+ * Photographs are uploaded to the trail as they are picked and adopted by the report once it
+ * has an id, so an abandoned draft does not lose them. A save that never reaches the server is
+ * written to the device and sent when signal returns; see `offline/queue.ts`.
  */
 
 export interface ReviewFormProps {
@@ -85,13 +62,7 @@ export interface ReviewFormProps {
 
 const RATINGS = [1, 2, 3, 4, 5] as const;
 
-/**
- * What each rating means, said in words.
- *
- * Bare numbers make everyone's four a different four. These are deliberately about the hike
- * and not about enthusiasm — "would do it again" is a fact a reader can act on in a way that
- * "great!" is not.
- */
+/** What each rating means, said in words, so that everyone's four is not a different four. */
 const RATING_HINT: Readonly<Record<number, string>> = {
   1: 'Would not go back',
   2: 'Disappointing',
@@ -108,21 +79,17 @@ const UPLOAD_HINT =
   "and in the trail's gallery.";
 
 /**
- * One frame in the form's strip.
- *
- * `onDiscard` is null for photographs an earlier version of this report already claims. Those
- * are managed in the gallery further up the page, where the rest of somebody's pictures are;
- * a second delete control on the same object in a second place is how people lose things they
- * meant to keep. The ones added in this sitting exist nowhere else the person can see yet, so
- * taking one back has to be possible right here.
+ * One frame in the form's strip. `onDiscard` is null for photographs the report already
+ * claims: those are managed in the gallery, and a second delete control on the same object in
+ * a second place is how people lose things they meant to keep.
  */
 function PhotoCell({ photo, onDiscard }: { photo: ReviewPhoto; onDiscard: (() => void) | null }) {
   const wash = blurhashAverageColor(photo.blurhash);
   return (
     <li className="relative">
       {/*
-       * The BlurHash wash is what it stands on while it loads; the plate is what holds the
-       * cell if it never does, so the discard control above stays where the eye left it.
+       * The BlurHash wash is what it stands on while it loads; the fallback plate holds the
+       * cell if it never does, so the discard control stays where the eye left it.
        */}
       <Photograph
         src={photo.thumbUrl ?? photo.url}
@@ -148,15 +115,9 @@ function PhotoCell({ photo, onDiscard }: { photo: ReviewPhoto; onDiscard: (() =>
 }
 
 /**
- * Where a report is, when it is not on the server yet.
- *
- * Water is the conditions plate and no signal is a condition, so an unsent report reads the
- * same as the offline page and the connection banner — one visual language for "the network,
- * not you". A report the server *refused* is a different thing and takes the survey plate:
- * that one needs a person, and saying so quietly in blue would be a lie of tone.
- *
- * There is a button in both cases because the alternative is a notice that tells somebody
- * about a problem and gives them nothing to do about it.
+ * Where a report is, when it is not on the server yet. Water is the conditions plate and no
+ * signal is a condition; a report the server *refused* takes survey instead, because that one
+ * needs a person.
  */
 function QueuedNotice({
   pending,
@@ -215,12 +176,9 @@ export function ReviewForm({
   const [activityType, setActivityType] = useState<ActivityType | ''>('');
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
   /**
-   * Photographs uploaded in this sitting and not yet claimed by the report.
-   *
-   * Deliberately *not* reset when the form is closed. Someone who adds three pictures, thinks
-   * better of the wording and comes back an hour later should find the three pictures still
-   * waiting; clearing them on cancel would leave the files on the trail with no way to file
-   * them under the report they were taken for.
+   * Photographs uploaded in this sitting and not yet claimed by the report. Deliberately not
+   * reset when the form is closed — clearing them would leave the files on the trail with no
+   * way to file them under the report they were taken for.
    */
   const [added, setAdded] = useState<ReviewPhoto[]>([]);
 
@@ -229,15 +187,10 @@ export function ReviewForm({
   const activityId = useId();
 
   /**
-   * Prefill once the existing report arrives, and only while the form is closed.
-   *
-   * The guard is the whole point: `existing` changes identity after every successful save,
-   * and without it a re-render halfway through a second edit would overwrite what the person
-   * is currently typing with what they last published.
-   *
-   * A queued draft outranks the server's copy, because by construction it is the newer of the
-   * two — it is a change the server has not been told about yet. Reopening the form on the
-   * hill shows what you wrote up there, not what you published last spring.
+   * Prefill once the existing report arrives, and only while the form is closed: `existing`
+   * changes identity after every save, so without the guard a re-render mid-edit would
+   * overwrite what the person is typing. A queued draft outranks the server's copy — by
+   * construction it is the newer of the two.
    */
   useEffect(() => {
     if (open) return;
@@ -253,11 +206,9 @@ export function ReviewForm({
   const attach = useMutation(trpc.photos.attach.mutationOptions());
 
   /**
-   * Take back a photograph added a moment ago, bytes and all.
-   *
-   * A real delete rather than a detach, because a photograph that has not been filed under a
-   * report yet is visible nowhere else — detaching it would leave it on the trail's gallery,
-   * which is the opposite of what "remove this one" means while looking at a form.
+   * Take back a photograph added a moment ago, bytes and all. A real delete rather than a
+   * detach: one not yet filed under a report is visible nowhere else, so detaching would leave
+   * it in the trail's gallery, which is not what "remove this one" means.
    */
   const discard = useMutation(
     trpc.photos.remove.mutationOptions({
@@ -273,12 +224,9 @@ export function ReviewForm({
         // The server now has it, so the device's copy is no longer owed to anyone.
         if (draft) await queued.discard();
         /*
-         * Adopt the photographs now that the report has an id to hang them on.
-         *
-         * Awaited inside `onSuccess` rather than fired alongside it, which keeps the button
-         * saying "Filing…" until both halves are done — and, more importantly, means the
-         * refetch below happens after the attach rather than racing it. Invalidating first
-         * would refill the strip under the report from rows that are still unclaimed.
+         * Adopt the photographs now the report has an id. Awaited inside `onSuccess` so the
+         * refetch below happens after the attach rather than racing it — invalidating first
+         * would refill the strip from rows that are still unclaimed.
          */
         if (added.length > 0) {
           try {
@@ -287,11 +235,8 @@ export function ReviewForm({
               photoIds: added.map((photo) => photo.id),
             });
           } catch {
-            /*
-             * The report itself saved; only the adoption failed. Leaving the form open with
-             * the photographs still listed is the one state that lets someone press the
-             * button again without picking every file a second time.
-             */
+            // The report saved; only the adoption failed. Leaving the form open with the
+            // photographs listed lets someone press the button again without re-picking files.
             onSaved();
             router.refresh();
             return;
@@ -307,17 +252,10 @@ export function ReviewForm({
       },
 
       /**
-       * Nothing came back. Keep the report on the device rather than on the screen.
-       *
-       * `navigator.onLine` is checked as well as the error shape because the two disagree in
-       * opposite directions and either one being right is enough: a request can fail for a
-       * reason that looks like a server error while the phone knows perfectly well it has no
-       * signal. The cost of queueing something that would have sent is one duplicate attempt
-       * on the next reconnection, against a person's only record of a washed-out bridge.
-       *
-       * A refusal the server actually issued — an expired session, a rating out of range —
-       * falls through to the error strip, because that is a report the person has to change
-       * rather than one the network ate.
+       * Nothing came back: keep the report on the device rather than on the screen.
+       * `navigator.onLine` is checked as well as the error shape because a request can fail
+       * looking like a server error while the phone knows it has no signal. A refusal the
+       * server actually issued falls through to the error strip — that one has to be changed.
        */
       onError: (error, variables) => {
         if (!isUnreachable(error) && navigator.onLine) return;
@@ -327,14 +265,12 @@ export function ReviewForm({
             trailName,
             trailPath,
             // `conditions` is optional going in — the schema defaults it — and required in
-            // the stored shape, so it is filled here rather than left for the sender to
-            // guess at when it finally goes out.
+            // the stored shape, so it is filled here rather than left to the sender.
             write: { ...variables, conditions: variables.conditions ?? [] },
             at: Date.now(),
-            // Read here rather than taken from a prop, because this is the moment that
-            // decides whose report it is. A prop would carry whoever the page was *rendered*
-            // for, and a downloaded trail page can be days old and one sign-in stale. Null is
-            // possible and honest: it means the row is nobody's until somebody claims it.
+            // Read here rather than taken from a prop: this is the moment that decides whose
+            // report it is, and a downloaded trail page can be one sign-in stale. Null means
+            // the row is nobody's until somebody claims it.
             userId: writingReader(),
           }),
         ).then(
@@ -354,14 +290,11 @@ export function ReviewForm({
   );
 
   const received = useCallback((photo: TrailPhoto): void => {
-    // Narrowed to the report's own shape on the way in. The uploader speaks the gallery's
-    // language — licence, attribution, distance along the route — and none of that belongs
-    // to a picture credited by the name at the top of the report it sits under.
-    //
-    // A photograph the caller uploaded seconds ago cannot already have been moderated, so
-    // the nullable `url` a taken-down frame carries is unreachable here — but it is checked
-    // rather than asserted away, because a `!` would be a promise about somebody else's
-    // code and this is one `if`.
+    // Narrowed to the report's own shape on the way in: the uploader speaks the gallery's
+    // language, and none of that belongs to a picture credited by the report's own author.
+    // A frame uploaded seconds ago cannot already be moderated, so the nullable `url` is
+    // unreachable — checked rather than asserted away, because a `!` would be a promise
+    // about somebody else's code.
     if (photo.url === null) return;
     const url = photo.url;
 
@@ -400,13 +333,7 @@ export function ReviewForm({
 
   const busy = save.isPending || remove.isPending || discard.isPending || queued.busy;
 
-  /**
-   * Photographs an earlier version of this report already claims.
-   *
-   * Read straight from the server's copy rather than mirrored into state: they are not
-   * editable here, so there is nothing for local state to hold that a refetch would not
-   * immediately overwrite.
-   */
+  /** Photographs the report already claims. Not editable here, so not mirrored into state. */
   const filed = existing?.photos ?? [];
 
   if (!isViewerKnown) {
@@ -447,9 +374,9 @@ export function ReviewForm({
           />
         ) : null}
         {/*
-         * Photographs uploaded and then left behind when the form was closed. Said out loud
-         * because the alternative is a person who cannot work out why their pictures are on
-         * the trail but not under their report.
+         * Photographs uploaded and then left behind when the form was closed. Said out loud,
+         * so nobody has to work out why their pictures are on the trail but not under the
+         * report they took them for.
          */}
         {added.length > 0 ? (
           <p className="collar mt-sm text-ink-muted">
@@ -477,9 +404,8 @@ export function ReviewForm({
       rating,
       body: body.trim() || null,
       hikedOn: hikedOn || null,
-      // Copied out of state rather than passed by reference: the input schema takes a
-      // mutable array, and handing zod the same array this component is still rendering
-      // from is an aliasing bug waiting for the first `.sort()` anyone adds upstream.
+      // Copied out of state rather than passed by reference: the input schema takes a mutable
+      // array, and handing zod the array this component still renders from is an aliasing bug.
       conditions: [...conditions],
       ...(activityType ? { activityType } : {}),
     });
@@ -493,8 +419,7 @@ export function ReviewForm({
       <fieldset disabled={busy} className="border-0 p-0">
         {/*
          * Why the fields are already filled in with something nobody else can see. Above the
-         * rating rather than below the button, because it is the first thing that explains
-         * the state of the form the person is looking at.
+         * rating, because it explains the state of the form the person is looking at.
          */}
         {draft ? (
           <QueuedNotice
@@ -507,14 +432,12 @@ export function ReviewForm({
           />
         ) : null}
 
-        {/* ── Rating ────────────────────────────────────────────────────────────────── */}
+        {/* Rating */}
         <fieldset className="border-0 p-0">
           <legend className="collar p-0">How was it</legend>
           {/*
-           * Real radios under the labels. The five cells look like the scale bar the reports
-           * are read with — you fill the same instrument you have been reading — but the
-           * keyboard behaviour underneath is the browser's own: arrow keys move within the
-           * group, tab leaves it, and the state is announced without an aria attribute.
+           * Real radios under the labels: the cells look like the scale bar the reports are
+           * read with, but arrow keys, tab and the announced state are the browser's own.
            */}
           <div className="mt-sm flex flex-wrap items-center gap-md">
             <div className="inline-flex overflow-hidden rounded-hair border border-woodland">
@@ -549,14 +472,13 @@ export function ReviewForm({
           </div>
         </fieldset>
 
-        {/* ── When, and how you travelled ───────────────────────────────────────────── */}
+        {/* When, and how you travelled */}
         <p className="mt-lg flex flex-wrap items-baseline gap-xs font-mono text-caption text-ink-muted">
           <label htmlFor={dateId}>Hiked on</label>
           {/*
-           * A date input rather than a "when did you go" dropdown of the last fortnight: an
-           * undated report is still worth having, and a report about a hike last autumn is
-           * worth having *as* a report about last autumn. The tally upstream reads this field
-           * first and the written-on date only as a fallback.
+           * A date input rather than a "when did you go" dropdown of the last fortnight: a
+           * report about last autumn is worth having *as* a report about last autumn. The
+           * tally upstream reads this field first and the written-on date only as a fallback.
            */}
           <input
             id={dateId}
@@ -582,7 +504,7 @@ export function ReviewForm({
           </select>
         </p>
 
-        {/* ── Conditions ────────────────────────────────────────────────────────────── */}
+        {/* Conditions */}
         <fieldset className="mt-lg border-0 p-0">
           <legend className="collar p-0">What was the ground like</legend>
           <div className="mt-sm flex flex-wrap gap-xs">
@@ -607,7 +529,7 @@ export function ReviewForm({
           </div>
         </fieldset>
 
-        {/* ── Notes ─────────────────────────────────────────────────────────────────── */}
+        {/* Notes */}
         <div className="mt-lg">
           <label htmlFor={bodyId} className="collar">
             Anything else worth knowing
@@ -623,7 +545,7 @@ export function ReviewForm({
           />
         </div>
 
-        {/* ── Photographs ───────────────────────────────────────────────────────────── */}
+        {/* Photographs */}
         <div className="mt-lg">
           <p className="collar">What it looked like</p>
           {filed.length + added.length > 0 ? (
@@ -648,7 +570,7 @@ export function ReviewForm({
           />
         </div>
 
-        {/* ── Actions ───────────────────────────────────────────────────────────────── */}
+        {/* Actions */}
         <div className="mt-lg flex flex-wrap items-center gap-sm border-t border-bezel pt-md">
           <button
             type="submit"
@@ -670,9 +592,9 @@ export function ReviewForm({
           </button>
 
           {/*
-           * Two taps to delete, and the second one is the only place on this page allowed to
-           * take the survey plate — not because losing a review is dangerous, but because it
-           * is the one control here that destroys something. It says what will go.
+           * Two taps to delete, and the second is the only control on this page allowed the
+           * survey plate — not because losing a review is dangerous, but because it destroys
+           * something. It says what will go.
            */}
           {existing ? (
             <div className="ml-auto flex items-center gap-sm">
@@ -709,8 +631,7 @@ export function ReviewForm({
 
         {/*
          * A queued draft answers the save error itself — "saved on this device" is a truer
-         * account of a failed fetch than "that did not save", and the two together would
-         * contradict each other on the same screen.
+         * account of a failed fetch, and the two together would contradict each other.
          */}
         {(save.isError && !draft) || remove.isError || attach.isError || discard.isError ? (
           <p className="mt-md text-caption text-survey">

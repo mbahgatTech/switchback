@@ -8,33 +8,11 @@ import { BUTTON, HEIGHT, SECONDARY } from '../controls';
 /**
  * Fetch this area — the one control that asks the pipeline for ground it has never seen.
  *
- * Everywhere else on this map, ingest is automatic: the viewport settles, the tiles under it
- * are queued, and the trails arrive. That path caps at twelve z9 tiles, which is right —
- * nobody panning a map is asking to fetch a continent, and a product that queued three
- * hundred Overpass queries because a viewport got wide would punish the act of zooming out.
- *
- * But zoomed out is the view you use to *decide where to go*, and until now it was the one
- * view with no way to say "yes, actually, fetch this". So this button appears exactly there
- * and nowhere else: past the ceiling, with ground still outstanding. At every ordinary zoom
- * it does not exist, because the map is already filling itself and a button offering to do
- * what is already happening is noise.
- *
- * **On the copy.** "Fetch this area", not AllTrails' "Search this area". Searching is what
- * already happened — the query ran, the index answered, and what came back is on screen.
- * What is missing is upstream data, and *fetch* is the word the coverage note beside it
- * already uses for that. One vocabulary for one idea.
- *
- * **On the progress.** Tiles, not a time estimate. An Overpass round trip is anywhere from
- * two seconds to a timeout-and-retry on a busy mirror, so any minutes figure would be a
- * guess presented as a fact; "18 of 96 tiles" is measured, monotonic, and visibly moving,
- * which is what a progress indicator is for.
- *
- * **On the fill.** This is the house button (`BUTTON` + `SECONDARY`) with `bg-surface` added,
- * and the fill is the only thing that differs from the same button in a panel. It used to be
- * a `.dial` — transparent, with a dotted underline — which is right for a value inside a
- * sentence and wrong for the only control floating over satellite imagery: over anything
- * darker than pale scree it was an unreadable word with no edges. Everything over the map is
- * opaque.
+ * Automatic ingest caps at twelve z9 tiles, so this button appears only past that ceiling with
+ * ground still outstanding; at every ordinary zoom the map is already filling itself. Progress
+ * is in tiles rather than minutes, because an Overpass round trip is two seconds or a
+ * timeout-and-retry. The `bg-surface` fill is the only difference from the same button in a
+ * panel, and it is there because everything floating over the map is opaque.
  */
 
 export interface FetchAreaProps {
@@ -62,10 +40,8 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
   const busyReason = fetchArea.data?.busyReason ?? null;
 
   /*
-   * Percentage of the *capped* set, which is the set this press can actually finish. Using
-   * `requiredTiles` would show a bar that stops at 12% on a continental view and never
-   * moves — technically the fraction of the box covered, and useless as a signal that the
-   * thing you pressed is working.
+   * Percentage of the *capped* set, which is the set this press can finish. `requiredTiles`
+   * would show a bar stopping at 12% on a continental view and never moving.
    */
   const percent = area.tiles > 0 ? Math.round((done / area.tiles) * 100) : 0;
 
@@ -119,10 +95,8 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
       ) : null}
 
       {busy && working === 0 ? (
-        // Admission refused. Said plainly, because the alternative — a button that reports
-        // success and then never makes anything appear — is the failure mode this message
-        // exists to prevent. Which refusal decides the sentence: a queue drains, and storage
-        // does not, so only one of them may end with "try again in a few minutes".
+        // Admission refused, said plainly. Which refusal decides the sentence: a queue drains
+        // and storage does not, so only one of them may end with "try again in a few minutes".
         <p
           role="status"
           className="max-w-[240px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted"
@@ -134,10 +108,8 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
       ) : null}
 
       {area.capped && working === 0 && !busy ? (
-        // Honest about the cap rather than silently fetching the middle and letting the
-        // edges look empty. `requiredTiles` is the whole box; `tiles` is what one press
-        // takes. Kept to one short line: this sits over the map at rest, and a three-line
-        // paragraph of caveat is more chrome than the caveat is worth.
+        // Honest about the cap rather than silently fetching the middle and letting the edges
+        // look empty. `requiredTiles` is the whole box; `tiles` is what one press takes.
         <p className="max-w-[260px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted">
           {area.requiredTiles} tiles in view · one fetch covers the nearest {area.tiles}
         </p>

@@ -30,32 +30,8 @@ import { Photograph, PhotographMissing, PhotographUnavailable } from '../photos/
 import { BUTTON_COLLAR, HEIGHT, SECONDARY } from '../controls';
 
 /**
- * What people found when they got there.
- *
- * The one part of this product that OpenStreetMap cannot supply, and so the part that has to
- * earn its own space rather than borrow the map's. Three blocks, ordered by what a hiker
- * standing at the car park actually needs:
- *
- * 1. **Reported lately** — the condition tags from the last sixty days, tallied. This is the
- *    block that justifies the section. Everything else on this page describes the trail as it
- *    is on paper; this describes the ground as it was last week, and it sits directly under
- *    the forecast for the same reason a wet Tuesday matters more than a four-star average.
- * 2. **Ratings** — the number and the distribution beside it. A mean with nothing under it
- *    hides the trail that is loved by nine people and hated by one, and that trail is a
- *    different proposition from the one that is quietly liked by ten.
- * 3. **The reports themselves**, newest first.
- *
- * **The scale bar.** A rating prints as a map scale bar — one bar, five equal divisions,
- * hairline ruled, filled in the woodland plate. Not stars. Stars are a borrowed convention
- * from a different kind of product and they read as decoration next to a contour section;
- * a divided bar is what this map's margin already contains, the divisions are discrete
- * because the rating is (nobody can say 4.3), and woodland is the plate that already means
- * *the trail itself, in good order*, which is exactly the claim a rating makes.
- *
- * The bar appears on individual reports and deliberately **not** on the average. Rounding
- * 4.3 up to four filled divisions would draw a measurement nobody made. The average is a
- * statistic, so it prints as a number over its distribution, which is what statistics look
- * like on a survey sheet.
+ * Reports from the trail: the recent condition tally, the rating distribution, then the reports
+ * themselves. The one part of this product OpenStreetMap cannot supply.
  */
 
 export interface ReviewsProps {
@@ -67,12 +43,8 @@ export interface ReviewsProps {
   /** Null when signed out — the only thing this section needs to know about the viewer. */
   viewerId: string | null;
   /**
-   * What the viewer may do about somebody else's report. `member` for everybody who is not
-   * an operator, and for everybody signed out.
-   *
-   * It decides whether a take-down control is *drawn*. It does not decide whether one
-   * works: `moderatorProcedure` on the server does, and it re-reads the column on every
-   * call. A forged role here buys a button that returns FORBIDDEN.
+   * What the viewer may do about somebody else's report. Decides whether a take-down control is
+   * *drawn*, not whether one works — `moderatorProcedure` re-reads the column on every call.
    */
   viewerRole?: UserRole;
 }
@@ -80,21 +52,10 @@ export interface ReviewsProps {
 const PAGE_SIZE = 8;
 
 /**
- * Chip treatment per plate. Written out rather than composed, because Tailwind reads class
- * names literally out of the source and a `border-${plate}/40` would compile to nothing.
- *
- * **A hairline and the plate colour, with no wash behind it.** These carried
- * `bg-<plate>-wash` — the same 12 % tint the map fills with — and it put plate-coloured text
- * on plate-coloured ground, which costs about 0.8 of contrast and is the one background the
- * token test never measures: it checks each ink against `canvas` and `surface`, and a wash is
- * neither. On the sheet that took survey and water to 4.44:1 and left contour at 4.54:1, and
- * on the field scheme survey over a card measured 4.03:1. Worse, *which* of those applied
- * depended on whether the chip happened to sit on the page or inside a panel — the same
- * undefined-backdrop problem as a translucent panel over the map, in miniature.
- *
- * Without the wash the figure stops depending on the container: 5.32–5.42 on the sheet,
- * 4.68–8.47 on the field, everywhere these render. It also makes the family consistent, since
- * `CHIP_PLAIN` below was already a hairline with no fill — the plated chips were the odd ones.
+ * Chip treatment per plate. Written out rather than composed, because Tailwind reads class names
+ * literally out of the source and a `border-${plate}/40` would compile to nothing. No wash behind
+ * them: plate ink over a plate tint falls under 4.5:1, and the token test measures each ink only
+ * against `canvas` and `surface`, so a wash is the one backdrop nothing checks.
  */
 const CHIP_PLATE = {
   survey: 'border-survey/40 text-survey',
@@ -159,13 +120,9 @@ export function Reviews({
   const total = list.data?.pages[0]?.total ?? summary.data?.count ?? 0;
 
   /**
-   * One invalidation for the whole router.
-   *
-   * A write moves the list, the distribution, and the caller's own row at once, and naming
-   * the three query keys separately is three chances to forget one when a fourth arrives.
-   *
-   * `askAgain` rather than a bare invalidation because a report can be filed while the
-   * page's first batch is still in the air — see `lib/after-write.ts` for what that costs.
+   * One invalidation for the whole router: a write moves the list, the distribution and the
+   * caller's own row at once. `askAgain` rather than a bare invalidation because a report can
+   * be filed while the page's first batch is still in the air — see `lib/after-write.ts`.
    */
   function refetchAll(): void {
     void askAgain(queryClient, trpc.reviews.pathFilter());
@@ -213,25 +170,11 @@ export function Reviews({
 
       {mine.data?.hidden ? (
         /*
-         * The author of a removed report is told before they type, not after.
-         *
-         * `reviews.mine` returns the hidden row, but `toReview` empties it on the way out:
-         * rating and body come back null, conditions empty, activity null, helpful count
-         * zero. Only the dates and the author survive. So handing it to `ReviewForm` as
-         * `existing` drew "Edit your report" over a form with nothing in it — reading as
-         * though the site had lost the whole report rather than removed it — and the two
-         * buttons that heading implies are both refused server-side: `reviews.upsert`
-         * throws FORBIDDEN on a hidden row, and `reviews.remove` will not delete the
-         * tombstone either. The save error is the worse of the two, because it reaches the
-         * error strip only after they have retyped the whole report. Those guards are right;
-         * drawing the two actions they exist to refuse is not. So the form is replaced by
-         * the notice and the address, which is the only move actually available to them.
-         *
-         * Survey plate and a hairline: this is about the reader's own standing, not about
-         * the trail. This is also the *only* place the long notice appears. The author's own
-         * row in the list below prints the short `REMOVED_NOTICE` on the section's ordinary
-         * dashed-bezel absence treatment, so the address is stated once, here, where somebody
-         * who came to write is already looking.
+         * The author of a removed report is told before they type. `reviews.mine` returns the
+         * hidden row with its content emptied, so handing it to `ReviewForm` drew "Edit your
+         * report" over two actions the server refuses — `upsert` and `remove` both throw on a
+         * hidden row. This is the only place the long notice appears; the author's own row in
+         * the list prints the short `REMOVED_NOTICE`.
          */
         <p className="mt-lg max-w-measure rounded-hair border border-survey px-md py-sm text-body leading-relaxed text-ink">
           {REMOVED_NOTICE_OWN}
@@ -295,13 +238,8 @@ export function Reviews({
 }
 
 /**
- * The condition tally — the block this section exists for.
- *
- * Ordered by how many people said it, so the loudest ground truth is leftmost, and the
- * window is printed in the label rather than implied. "12 of 27 reports" is the honest
- * denominator: the tags are a proportion of the people who hiked it *recently*, not of
- * everyone who ever reviewed it, and quoting the all-time count next to a sixty-day tally
- * would misrepresent both.
+ * The condition tally, ordered by how many people said it. The window is printed in the label
+ * because the tags are a proportion of recent hikers, not of everyone who ever reported.
  */
 function Reported({ summary }: { summary: RatingSummary }) {
   if (summary.recentConditions.length === 0) {
@@ -342,17 +280,8 @@ function Reported({ summary }: { summary: RatingSummary }) {
 }
 
 /**
- * The average and what it is an average of.
- *
- * The bars are set against a ruled track rather than floating, so an empty bucket is still
- * a visible row — a distribution with a hole in it is information, and a row that collapses
- * to nothing hides it.
- *
- * **Constrained, not full bleed.** This is six numbers on most trails. Let the track run the
- * width of the sheet and a single four-star review draws an eight-hundred-pixel bar, which
- * makes the quietest data on the page shout louder than the reports underneath it. Capped at
- * a column width, the block reads as an instrument sitting in the margin — the same way the
- * access facts do — and the reports keep the measure.
+ * The average and what it is an average of. The bars sit on a ruled track so an empty bucket is
+ * still a visible row, and the block is capped at a column width rather than running full bleed.
  */
 function Ratings({ summary }: { summary: RatingSummary }) {
   const most = Math.max(...summary.histogram.map((bucket) => bucket.count), 1);
@@ -402,16 +331,10 @@ function Ratings({ summary }: { summary: RatingSummary }) {
 }
 
 /**
- * The rating, as a map scale bar. See this module's header for why it is not stars.
- *
- * The division rules change colour with the fill, which is what keeps it a scale bar: ruled
- * in woodland across the empty divisions, and in canvas across the filled ones. Ruling them
- * all in woodland would be invisible inside the fill, so a five would print as one solid
- * block — a bar with no divisions at all, which is the one reading this graphic must never
- * give. At the fill boundary no rule is drawn, because the colour change is already the edge.
- *
- * `aria-hidden` with the reading supplied in text beside it: five nested spans announced
- * one by one is noise, and "4 out of 5" is the whole content.
+ * The rating as a map scale bar rather than stars: five discrete divisions on the woodland
+ * plate, which is what a sheet's margin already carries. The division rules flip to canvas
+ * inside the fill — ruled all in woodland they vanish, and a five prints as one solid block
+ * with no divisions at all. `aria-hidden`, with the reading supplied in text beside it.
  */
 export function ScaleBar({ value }: { value: number }) {
   return (
@@ -435,12 +358,8 @@ export function ScaleBar({ value }: { value: number }) {
 }
 
 /**
- * One report.
- *
- * The date on the right is when they *hiked* it, which is the fact that decides whether the
- * mud below is still there. When nobody recorded a hike date it says when the report was
- * written instead, and says which it is — a page that prints both as a bare date is asking
- * to be misread on exactly the reports where it matters most.
+ * One report. The date on the right is when they *hiked* it — the fact that decides whether the
+ * mud is still there — falling back to the written date, and saying which of the two it is.
  */
 function ReviewRow({
   review,
@@ -465,15 +384,10 @@ function ReviewRow({
       <div className="flex flex-wrap items-baseline justify-between gap-x-md gap-y-xs">
         <div className="flex items-center gap-sm">
           {/*
-           * The scale bar goes when the report does. A rating still drawn under a tombstone
-           * is a measurement the page is asserting on behalf of a report it has withdrawn —
-           * and it is not in the average above either, so drawing it would be the one number
-           * on this section that corresponds to nothing.
-           *
-           * Branching on `rating === null` rather than on `hidden` is deliberate. The server
-           * nulls the rating on a removed row, so this reads the value it is about to draw
-           * instead of a second flag that has to agree with it — the two cannot drift, and a
-           * row that somehow arrives hidden with a rating still on it draws nothing.
+           * No scale bar under a tombstone: the rating is not in the average above either, so
+           * drawing it would be the one number on this section corresponding to nothing.
+           * Branching on `rating === null` rather than on `hidden` reads the value it is about
+           * to draw, so the two cannot drift.
            */}
           {review.rating === null ? null : (
             <>
@@ -496,22 +410,10 @@ function ReviewRow({
       </div>
 
       {/*
-       * The tombstone. It keeps the row rather than removing it, because a report that
-       * silently vanishes reads to its author as a bug in the site rather than as a decision
-       * somebody made — and the author is exactly the person who has to be able to argue.
-       *
-       * Dashed hairline and `ink-muted` prose: the same treatment as the section's other
-       * absences ("Reading the reports…", "Nobody has reported on this trail yet"), because
-       * that is what this is. No survey plate — survey is the reader's own position and
-       * safety, and somebody else's report being taken down is neither.
-       *
-       * **The short notice even on your own row.** The longer sentence, the one carrying the
-       * address to write to, belongs in the form slot above: that slot is where the author
-       * arrives to type, and it is the one that has to answer "why can I not edit this?"
-       * before they try. Printing the same sentence again here put it on screen twice within
-       * one scroll, in two different plates — survey up there, dashed bezel down here — which
-       * reads as two separate decisions about one takedown rather than one. Said once, in the
-       * place the reader is already looking.
+       * The tombstone keeps the row rather than removing it, so its author can argue. Dashed
+       * hairline and `ink-muted`, the section's treatment for every other absence; no survey
+       * plate, which is reserved for the reader's own position and safety. The short notice
+       * even here — the long one carrying the address belongs in the form slot above.
        */}
       {review.hidden ? (
         <p className="mt-sm max-w-measure rounded-hair border border-dashed border-bezel px-md py-sm text-caption text-ink-muted">
@@ -535,10 +437,8 @@ function ReviewRow({
                   className="block rounded-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
                 >
                   {/*
-                   * The BlurHash wash underneath is what stops the strip flashing white while
-                   * these arrive. Where one does not arrive at all — an object gone from R2, a
-                   * row that outlived its file — the plate keeps the row's measure so the rest
-                   * of somebody's report does not shuffle up around the gap.
+                   * The BlurHash wash stops the strip flashing white while these arrive; the
+                   * fallback plate keeps the row's measure when an object has gone from R2.
                    */}
                   <Photograph
                     src={photo.thumbUrl ?? photo.url}
@@ -577,12 +477,9 @@ function ReviewRow({
       ) : null}
 
       {/*
-       * The controls that are about the report rather than about the trail, kept apart from
-       * everything above by being right-aligned and last.
-       *
-       * You cannot report your own — the button would only ever mean "ask a stranger to read
-       * my own writing" — and there is nothing to report about a row that has already gone,
-       * which is also the only state where a moderator is offered "Put back" instead.
+       * Controls about the report rather than the trail: right-aligned and last. You cannot
+       * report your own, and there is nothing to report about a row that has already gone —
+       * the one state where a moderator is offered "Put back" instead.
        */}
       {(canTakeDown || !review.isMine) && !(review.hidden && !canTakeDown) ? (
         <div className="mt-xs flex flex-wrap items-center justify-end gap-xs">
@@ -609,17 +506,10 @@ function ReviewRow({
 }
 
 /**
- * A report's photographs, full size.
- *
- * **One dialog for the whole section, not one per report.** Forty reports would otherwise put
- * forty `<dialog>` elements into the document, thirty-nine of them holding images nobody has
- * asked to see. The open report's frames are handed in as state instead.
- *
- * Deliberately thinner than the gallery's viewer two sections up, and each omission is a
- * decision. **No credit line** — every frame in here belongs to the one person named in the
- * heading, so repeating it under each is noise. **No caption editing and no remove**: a
- * photograph is managed where it lives, in the gallery, and a second destructive control on
- * the same object in a different place is how people delete things they meant to keep.
+ * A report's photographs, full size. One dialog for the whole section rather than one per
+ * report, which would put forty `<dialog>` elements into the document. Deliberately thinner
+ * than the gallery's viewer: no credit line, no caption editing, no remove — a photograph is
+ * managed where it lives.
  */
 function ReportViewer({
   view,
@@ -649,10 +539,8 @@ function ReportViewer({
         if (event.key === 'ArrowLeft') onStep(-1);
       }}
       /*
-       * `m-auto` is load-bearing, not a tidy-up. A modal `<dialog>` is centred by the UA's own
-       * `inset: 0; margin: auto`, and Tailwind's preflight resets `dialog { margin: 0 }` — which
-       * leaves it pinned to the top-left corner against the backdrop. The gallery lightbox
-       * carries the same class for the same reason.
+       * `m-auto` is load-bearing: a modal `<dialog>` is centred by the UA's own `margin: auto`,
+       * and Tailwind's preflight resets `dialog { margin: 0 }`, pinning it to the top-left.
        */
       className="m-auto w-full max-w-[min(1080px,92vw)] rounded-hair border border-bezel bg-canvas p-0 text-ink backdrop:bg-ink/85"
     >

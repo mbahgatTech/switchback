@@ -3,16 +3,11 @@
 import { HEIGHT } from './controls';
 
 /**
- * The chip — one filter value, on or off.
- *
- * A checkbox that looks like a button, and it is spelled that way in the DOM: `role` stays
- * `button` with `aria-pressed`, which is what a screen reader announces as "Hard, pressed".
- * A styled `<input type=checkbox>` would announce the same state but leaves the browser's
- * own box to be hidden, and hidden inputs are how keyboard focus gets lost.
- *
- * The pressed treatment is a filled bar, not a colour swap: the plate colours are a legend
- * in this product and a filter chip is not a legend entry. Weight carries state here for
- * the same reason it carries selection on the map.
+ * The chip — one filter value, on or off. A checkbox that looks like a button, and spelled that
+ * way in the DOM: `role` stays `button` with `aria-pressed`, because a styled
+ * `<input type=checkbox>` leaves the browser's own box to be hidden, and hidden inputs are how
+ * keyboard focus gets lost. The pressed treatment is a filled bar, not a colour swap: the plate
+ * colours are a legend and a filter chip is not a legend entry.
  */
 
 export interface ChipProps {
@@ -48,10 +43,8 @@ export function Chip({ label, pressed, onToggle, detail }: ChipProps) {
 }
 
 /**
- * A labelled row of chips.
- *
- * The label is a collar — the marginalia voice of a sheet — because that is literally what
- * this panel is: the printed margin beside the map, carrying the legend and the index.
+ * A labelled row of chips. The label is a collar, the marginalia voice of a sheet, because that
+ * is what this panel is: the printed margin beside the map.
  */
 export function ChipGroup({ label, children }: { label: string; children: React.ReactNode }) {
   return (

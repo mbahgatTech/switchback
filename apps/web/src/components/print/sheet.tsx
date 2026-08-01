@@ -39,32 +39,13 @@ import { SheetSection } from './sheet-section';
 import { HEIGHT } from '../controls';
 
 /**
- * The sheet.
+ * The sheet: a fixed composition rather than a viewport — a mapped face inside a collar, a rail
+ * of figures beside it, the section along the foot, and a scale a ruler can be held against.
  *
- * A printed map is not a screenshot of a screen map, and the difference is not resolution.
- * A screen map answers questions one at a time — you pan to the ridge, you tap the summit,
- * you check the profile — and it can afford to, because asking is free. Paper cannot ask.
- * Everything the sheet will ever say has to be on it at the moment it leaves the printer,
- * arranged so that the answer to *where am I and how much is left* is found without
- * unfolding anything. So the sheet is a fixed composition rather than a viewport: a mapped
- * face inside a collar, a rail of figures beside it, the section along the foot, and a
- * statement of scale that a reader can hold a ruler against.
- *
- * Three properties make it a map rather than a picture of one:
- *
- * - **The ratio is real.** CSS defines an inch as exactly 96 px and browsers honour physical
- *   units when printing, so `1:25 000` in the collar is 1:25 000 under a ruler. Every
- *   dimension here is a millimetre for that reason, and the face is snapped to whole CSS
- *   pixels (`./mm`) so the SVG overlay and MapLibre agree on where the ground is.
- * - **North is up and the projection is flat.** No bearing, no pitch, no rotation gesture.
- *   A sheet a reader cannot orient by the graticule is a poster.
- * - **Nothing on it moves.** The controls live in a `data-print-hide` bar that the print
- *   stylesheet removes; what remains on paper is only ever the composition.
- *
- * The reader gets three decisions — paper, orientation, ratio — and the sheet recomposes
- * around each. Those are the three a printed series makes for you, and the reason to hand
- * them over is that we do not know which printer is in the room or whether the hike is a
- * valley round or a section of a long path.
+ * The ratio is real, so every dimension here is a millimetre and the face is snapped to whole
+ * CSS pixels (`./mm`) so the SVG overlay and MapLibre agree on where the ground is. North is up
+ * and the projection is flat. The controls live in a `data-print-hide` bar the print stylesheet
+ * removes. The reader chooses paper, orientation and ratio, and the sheet recomposes around each.
  */
 
 export interface SheetProps {
@@ -72,7 +53,7 @@ export interface SheetProps {
   units: UnitSystem;
 }
 
-/* ── Composition, in millimetres ──────────────────────────────────────────────────────── */
+/* Composition, in millimetres. */
 
 /**
  * The dead border. Every consumer printer has an unprintable edge, typically 5 mm and
@@ -91,12 +72,9 @@ const FOOT_MM = 12;
 const GUTTER_MM = 4;
 
 /**
- * The section strip.
- *
- * 34 mm is what a full-width profile needs to stay honest: about 22 mm of plot, which at a
- * typical day's 1,000 m of relief puts a 100 m contour interval a shade over 2 mm apart —
- * readable — plus two axis rows and the elevation figures. Less and the vertical
- * exaggeration climbs past the point where the graphic flatters the hike.
+ * The section strip. 34 mm is what a full-width profile needs to stay honest: about 22 mm of
+ * plot, which at a day's 1,000 m of relief puts a 100 m contour interval a shade over 2 mm
+ * apart. Less, and the vertical exaggeration climbs past the point where the graphic flatters.
  */
 const SECTION_MM = 34;
 
@@ -104,26 +82,16 @@ const SECTION_MM = 34;
 const COLLAR_MM = 6;
 
 /**
- * The rail.
- *
- * Wider in landscape because there is width to give and the face is already generous; the
- * portrait sheet spends its narrower page on the map, since a portrait sheet is what a
- * reader picks for a route that runs north–south and needs the length.
+ * The rail. Wider in landscape because there is width to give; a portrait sheet is what a
+ * reader picks for a route that runs north–south and needs the length, so it spends it on the map.
  */
 const RAIL_MM: Record<SheetOrientation, number> = { landscape: 62, portrait: 54 };
 
 /**
- * The hair the sheet is drawn short of the paper.
- *
- * A box declared at exactly the paper's size does not quite fit on it. The browser lays the
- * box out at 96 px to the inch — 210 mm is 793.70 px — while the printed page box is
- * computed through points and lands on 793.28 px. The box overflows its own page by four
- * tenths of a pixel, and Chromium answers an overflow by starting another page: the reader
- * gets their map, then a second sheet with nothing on it.
- *
- * Four tenths of a millimetre is more slack than that rounding needs and less than a laser
- * printer can resolve. It comes off the right and bottom edges, which carry a 10 mm margin
- * and no marks, so nothing on the sheet moves and nothing is clipped.
+ * The hair the sheet is drawn short of the paper. A box declared at exactly the paper's size
+ * overflows it by four tenths of a pixel — the browser lays out at 96 px to the inch while the
+ * printed page box is computed through points — and Chromium answers an overflow with a second,
+ * blank page. Taken off the right and bottom edges, which carry a 10 mm margin and no marks.
  */
 const PAPER_BLEED_MM = 0.4;
 
@@ -158,12 +126,9 @@ function layout(paper: PaperId, orientation: SheetOrientation): SheetLayout {
 }
 
 /**
- * Which way up the sheet starts.
- *
- * From the route's own shape, corrected for latitude — a degree of longitude at 51°N is
- * 630 m, not 1,110, and an uncorrected aspect ratio calls every northern route portrait.
- * The threshold sits above 1 rather than at it because turning a sheet is a decision and a
- * route that is very nearly square should not have one made for it on a rounding error.
+ * Which way up the sheet starts, from the route's own shape corrected for latitude — a degree
+ * of longitude at 51°N is 630 m, not 1,110, and uncorrected every northern route reads portrait.
+ * The threshold sits above 1 so a nearly square route is not turned on a rounding error.
  */
 function initialOrientation(bbox: BBox): SheetOrientation {
   const [west, south, east, north] = bbox;
@@ -183,7 +148,7 @@ function kindLabel(kind: WaypointKind): string {
   return kind.charAt(0).toUpperCase() + kind.slice(1);
 }
 
-/* ── The sheet ────────────────────────────────────────────────────────────────────────── */
+/* The sheet. */
 
 export function Sheet({ trail, units }: SheetProps) {
   const sheet = SCHEMES.sheet;
@@ -197,8 +162,7 @@ export function Sheet({ trail, units }: SheetProps) {
   const [centre, setCentre] = useState<LngLat>(() => sheetCentre(bbox));
   /**
    * Whether the ratio is still ours to change. A reader who picks 1:10 000 has said the sheet
-   * is a detail sheet; turning the paper should not quietly undo that, and a fit that always
-   * ran would, because a deliberately large scale never fits by definition.
+   * is a detail sheet, and a fit that always ran would quietly undo that.
    */
   const [autoScale, setAutoScale] = useState(true);
   const [ready, setReady] = useState(false);
@@ -256,11 +220,8 @@ export function Sheet({ trail, units }: SheetProps) {
   );
 
   /*
-   * The date the sheet was printed, set after mount rather than during render.
-   *
-   * It is genuinely load-bearing on paper — a sheet says what the ground looked like when it
-   * left the printer, and OSM moves — but a clock read on the server and again in the browser
-   * disagrees across midnight and hydration fails on the difference.
+   * The date the sheet was printed, set after mount rather than during render: a clock read on
+   * the server and again in the browser disagrees across midnight and hydration fails on it.
    */
   const [printedOn, setPrintedOn] = useState('');
   useEffect(() => {
@@ -270,14 +231,11 @@ export function Sheet({ trail, units }: SheetProps) {
   }, []);
 
   /*
-   * Fit the paper to the window on screen and undo it on paper.
-   *
-   * A4 landscape is 1,123 CSS px wide, which overflows most windows once the browser chrome
-   * is counted. `transform: scale` shrinks the composition without touching the layout, so
-   * every millimetre inside it stays a millimetre and the print rule only has to say
-   * `transform: none`. Known cost: MapLibre reads pointer positions against an untransformed
-   * box, so dragging the face is off by the scale factor below about 1,160 px of viewport.
-   * At full size — which is where a reader checks the framing before printing — it is exact.
+   * Fit the paper to the window on screen and undo it on paper. `transform: scale` shrinks the
+   * composition without touching the layout, so every millimetre inside it stays a millimetre
+   * and the print rule only has to say `transform: none`. Known cost: MapLibre reads pointer
+   * positions against an untransformed box, so dragging the face is off by the scale factor
+   * below about 1,160 px of viewport.
    */
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [fit, setFit] = useState(1);
@@ -331,11 +289,9 @@ export function Sheet({ trail, units }: SheetProps) {
   ];
 
   /*
-   * The one thing on this sheet that is not a figure.
-   *
-   * A printed map is the artifact that goes up the hill when the phone is dead, so it is the
-   * last chance the product has to say this — and unlike every screen, it cannot be tapped
-   * for more. If the ground is steeper than hiking, it is printed here in ink.
+   * The one thing on this sheet that is not a figure. A printed map goes up the hill when the
+   * phone is dead and cannot be tapped for more, so if the ground is steeper than hiking it is
+   * printed here in ink.
    */
   const caution = terrainCaution(trail.stats.maxSustainedGrade);
 
@@ -400,7 +356,7 @@ export function Sheet({ trail, units }: SheetProps) {
               height: `${String(plan.contentHeightMm)}mm`,
             }}
           >
-            {/* ── Head ─────────────────────────────────────────────────────────────── */}
+            {/* Head */}
             <header
               style={{
                 height: `${String(HEAD_MM)}mm`,
@@ -462,7 +418,7 @@ export function Sheet({ trail, units }: SheetProps) {
               </div>
             </header>
 
-            {/* ── Body: the mapped face, and the rail beside it ────────────────────── */}
+            {/* Body: the mapped face, and the rail beside it */}
             <div
               style={{
                 marginTop: `${String(GUTTER_MM)}mm`,
@@ -665,7 +621,7 @@ export function Sheet({ trail, units }: SheetProps) {
               </aside>
             </div>
 
-            {/* ── Section ──────────────────────────────────────────────────────────── */}
+            {/* Section */}
             <div style={{ marginTop: `${String(GUTTER_MM)}mm`, height: `${String(SECTION_MM)}mm` }}>
               <SheetSection
                 points={section.points}
@@ -677,7 +633,7 @@ export function Sheet({ trail, units }: SheetProps) {
               />
             </div>
 
-            {/* ── Foot ─────────────────────────────────────────────────────────────── */}
+            {/* Foot */}
             <footer
               style={{
                 marginTop: `${String(GUTTER_MM)}mm`,
@@ -734,7 +690,7 @@ export function Sheet({ trail, units }: SheetProps) {
   );
 }
 
-/* ── Rail furniture ───────────────────────────────────────────────────────────────────── */
+/* Rail furniture. */
 
 type Scheme = (typeof SCHEMES)['sheet'];
 
@@ -793,11 +749,9 @@ function Key({ sheet, children }: { sheet: Scheme; children: React.ReactNode }) 
 }
 
 /**
- * The hypsometric key.
- *
- * The same seven bands at the same elevations as the face, and as the screen — `ELEVATION_BANDS`
- * carries a doc comment declaring itself scheme-independent cartography, and a key that did not
- * match it would make the sheet unreadable rather than merely inconsistent.
+ * The hypsometric key: the same seven bands at the same elevations as the face and the screen.
+ * `ELEVATION_BANDS` is scheme-independent cartography, and a key that did not match it would
+ * make the sheet unreadable rather than merely inconsistent.
  */
 function Hypsometric({ railMm, sheet }: { railMm: number; sheet: Scheme }) {
   const swatch = railMm / ELEVATION_BANDS.length;
@@ -848,12 +802,9 @@ function Hypsometric({ railMm, sheet }: { railMm: number; sheet: Scheme }) {
 }
 
 /**
- * The drawn bar.
- *
- * Printed beside the ratio rather than instead of it, because the two fail differently: a
- * stated ratio is wrong the moment a sheet is photocopied at 94 % or printed with "fit to
- * page" left on, and a drawn bar is still right. One of them survives whatever happens to
- * this piece of paper between here and the trailhead.
+ * The drawn bar, printed beside the ratio rather than instead of it: a stated ratio is wrong the
+ * moment a sheet is photocopied at 94 % or printed with "fit to page" left on, and a drawn bar
+ * is still right.
  */
 function BarScale({
   bar,
@@ -910,7 +861,7 @@ function BarScale({
   );
 }
 
-/* ── The controls, which never print ──────────────────────────────────────────────────── */
+/* The controls, which never print. */
 
 const PRESSED = 'border-ink bg-ink text-canvas';
 const UNPRESSED = 'border-bezel text-ink-muted hover:border-ink-muted hover:text-ink';

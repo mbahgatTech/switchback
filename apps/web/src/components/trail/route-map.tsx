@@ -28,22 +28,9 @@ import { useUnits } from '../units';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * One trail, drawn on the ground.
- *
- * Deliberately a different component from the browse map rather than a mode of it. Browse
- * owns a viewport and reports it upward; this one owns nothing — it is handed a route and a
- * cursor and shows them. Sharing a component would mean a viewport-reporting debounce, a
- * hover state and a selection state living inside a screen that has exactly one trail and
- * no selection to make.
- *
- * The cursor dot is the same ink, the same size and the same canvas ring as the dot on the
- * section beside it. That is the entire point of the pairing: the reader should recognise
- * one mark in two places rather than learn two marks.
- *
- * The one thing it does own is the camera during a flyover. The plan comes from `geo` and the
- * play state from the parent, but the frame loop lives here, because sixty `jumpTo` calls a
- * second are sixty React renders if the pose is a prop — and the parent would be re-rendering
- * an elevation section on every one of them.
+ * One trail, drawn on the ground. A different component from the browse map rather than a mode
+ * of it: this one owns no viewport, only the camera during a flyover — sixty `jumpTo` calls a
+ * second would be sixty React renders if the pose were a prop.
  */
 
 export interface RouteMapProps {
@@ -58,24 +45,16 @@ export interface RouteMapProps {
   slope: boolean;
   /** Render the ground as a mesh and let the reader tilt and spin it. */
   terrain: boolean;
-  /**
-   * Non-null while the route is being flown. The plan carries its own duration and pacing;
-   * this component supplies only the clock and the projection.
-   */
+  /** Non-null while the route is being flown; the plan carries its own duration and pacing. */
   flyover?: FlyoverPlan | null;
   /**
    * Called every frame with how far along the route the camera is, and once with `null` when
-   * the flight ends. The section's cursor is driven from it, which is what keeps the two
-   * halves of the instrument reading the same moment.
+   * the flight ends. The section's cursor is driven from it.
    */
   onFlyoverTick?: (distanceM: number | null) => void;
   /** Called once when the film reaches its end of its own accord, so the control can reset. */
   onFlyoverEnd?: () => void;
-  /**
-   * Reported after every gesture settles, not during one — the only reader is the slope key,
-   * which needs to know whether the overlay is drawable, and a legend re-rendering sixty
-   * times a second through a pinch buys nothing.
-   */
+  /** Reported after every gesture settles, not during one. The slope key is the only reader. */
   onZoomChange?: (zoom: number) => void;
   className?: string;
 }
@@ -85,12 +64,8 @@ const POINT_SOURCE = 'route-points';
 const CURSOR_SOURCE = 'route-cursor';
 
 /**
- * Which plate a waypoint prints on.
- *
- * `hazard` is the only kind that gets the survey plate, and it gets it for the same reason
- * the live position dot does — it is a safety fact, and the plate means safety and nothing
- * else. Water features take the water plate, high ground takes contour, and everything
- * built by people takes the muted ink so a car park never outranks a summit.
+ * Which plate a waypoint prints on. `hazard` alone takes survey, which means safety and
+ * nothing else; water features take water, high ground contour, anything built by people ink.
  */
 const WAYPOINT_PLATE: Record<WaypointKind, 'survey' | 'water' | 'contour' | 'woodland' | 'ink'> = {
   trailhead: 'woodland',
@@ -135,9 +110,8 @@ function pointCollection(waypoints: readonly Waypoint[], geometry: LineString): 
     geometry: { type: 'Point', coordinates: [waypoint.lng, waypoint.lat] },
   }));
 
-  // The two ends are always marked even when OSM has no trailhead node — a route drawn with
-  // no start is a route you cannot tell the direction of, and every stat on the page is
-  // measured from one particular end of it.
+  // The two ends are always marked even when OSM has no trailhead node: a route with no start
+  // cannot be read for direction, and every stat on the page is measured from one end of it.
   if (first && last) {
     features.push(
       {
@@ -188,9 +162,8 @@ export function RouteMap({
   const map = useRef<MapLibreMap | null>(null);
   const ready = useRef(false);
 
-  // The map is created once and closes over its first render, so callbacks and the framing
-  // are read back through refs. Putting them in the effect's deps instead would tear the map
-  // down and rebuild it every time the parent re-rendered with a fresh closure.
+  // The map closes over its first render, so callbacks and the framing are read back through
+  // refs. In the effect's deps they would tear the map down on every parent re-render.
   const report = useRef(onZoomChange);
   const tick = useRef(onFlyoverTick);
   const ended = useRef(onFlyoverEnd);
@@ -204,7 +177,6 @@ export function RouteMap({
     pitched.current = terrain;
   }, [onZoomChange, onFlyoverTick, onFlyoverEnd, bbox, terrain]);
 
-  // ── Create once ───────────────────────────────────────────────────────────────────
   const scaleBar = useScaleBar(110);
   const units = useUnits();
 
@@ -217,12 +189,12 @@ export function RouteMap({
       maplibregl.addProtocol('pmtiles', protocol.tile);
     }
 
-    // Unconditional, and never removed — the handler is cheap, and a `slope://` source in a
-    // style that arrives before the protocol does is a tile error rather than a retry.
+    // Unconditional and never removed: a `slope://` source in a style that arrives before the
+    // protocol does is a tile error rather than a retry.
     registerSlopeProtocol();
 
-    // Same shape, same reason: a right-to-left summit name drawn before the shaper loads is
-    // drawn backwards. See `map/rtl`.
+    // Same reason: a right-to-left summit name drawn before the shaper loads is drawn
+    // backwards. See `map/rtl`.
     registerRTLText();
 
     const [w, s, e, n] = bbox;
@@ -236,16 +208,11 @@ export function RouteMap({
         [e, n],
       ],
       fitBoundsOptions: { padding: 48, maxZoom: 15 },
-      // Rotation and pitch are gestures the flat map has no use for — there is one trail and
-      // no reason to spin it — so they start disabled and are switched on with terrain by the
-      // effect below. `pitchWithRotate` is deliberately left at its default: it can only be
-      // set at construction, so turning it off here would permanently cost the right-drag its
-      // tilt, and the layer switch promises exactly that gesture. `dragRotate: false` already
-      // withholds the whole handler until there is ground worth tilting.
-      //
-      // The pitch ceiling is raised here rather than in the effect for the same reason —
-      // `maxPitch` is construction-only, and a flyover pitched past MapLibre's default 60
-      // would be silently clamped with the horizon never coming into frame.
+      // Rotation and pitch start disabled and are switched on with terrain below.
+      // `pitchWithRotate` is deliberately left at its default: it can only be set at
+      // construction, so turning it off would permanently cost the right-drag its tilt.
+      // `maxPitch` is construction-only too, and a flyover past MapLibre's default 60 would
+      // be silently clamped with the horizon never coming into frame.
       dragRotate: false,
       maxPitch: 80,
       attributionControl: false,
@@ -262,9 +229,8 @@ export function RouteMap({
       instance
         .getSource<GeoJSONSource>(POINT_SOURCE)
         ?.setData(pointCollection(waypoints, geometry));
-      // The opening zoom is whatever `fitBounds` chose for this particular trail, which for
-      // a long route is far enough out that the slope layer cannot draw. Report it now so
-      // the key knows that before the reader touches anything.
+      // The opening zoom is whatever `fitBounds` chose for this trail, which on a long route
+      // is far enough out that the slope layer cannot draw. The key needs that up front.
       report.current?.(instance.getZoom());
     });
 
@@ -281,7 +247,6 @@ export function RouteMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scaleBar]);
 
-  // ── Base map ──────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance || !ready.current) return;
@@ -299,27 +264,13 @@ export function RouteMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [basemap, hillshade, slope, terrain, units]);
 
-  // ── Where the ground is, under the middle of the frame ────────────────────────────
   /*
-   * MapLibre's own answer to this is wrong for our DEM, and the symptom is the whole 3D view.
-   *
-   * With terrain on, the map holds the centre point on the surface: each frame it looks up the
-   * elevation under the centre and re-aims there. That lookup asks `Terrain.getSourceTile` for
-   * a tile at `transform.tileZoom − 1` and hikes *up* to parents from there. Our terrarium
-   * source is `tileSize: 256`, which caches its tiles one level further in than that, so the
-   * search starts below what is loaded, finds nothing, and returns **zero** — not null, not the
-   * parent's value, zero. `getCenterElevation()` duly reads 0 over a route at 2,400 m.
-   *
-   * A camera aimed at a point 2,400 m underground still has to hit the mesh somewhere, and it
-   * does so much nearer than intended: the ground arrives at better than twice the scale the
-   * zoom asked for, and the route climbs off the top of the frame. Which is what "ticking 3D
-   * terrain loses the trail" actually was — not the pitch, and not the zoom, which the probe
-   * measured as identical either way.
-   *
-   * `queryTerrainElevation` answers the same question correctly at the same instant, because it
-   * derives its own zoom from the loaded tiles instead of being handed a broken one. So the
-   * clamp is switched off and the centre elevation is set from that, on `moveend` and `idle` —
-   * the two moments the camera is at rest and the answer is worth having.
+   * Where the ground is under the middle of the frame. MapLibre's own `getCenterElevation`
+   * reads 0 over a route at 2,400 m: its terrain lookup starts a level below what our
+   * `tileSize: 256` terrarium source caches, finds nothing, and returns zero rather than null.
+   * A camera aimed underground hits the mesh far too near, and the route climbs out of frame.
+   * `queryTerrainElevation` derives its own zoom from the loaded tiles and answers correctly,
+   * so the clamp is off and the centre elevation is set from that on `moveend` and `idle`.
    */
   useEffect(() => {
     const instance = map.current;
@@ -329,8 +280,7 @@ export function RouteMap({
 
     const sync = () => {
       // `setCenterElevation` is a `jumpTo`, which fires the events that call this; a metre of
-      // slack is what stops two floats from chasing each other. The DEM does not depend on the
-      // camera height, so the second pass always sees a delta of zero and stops.
+      // slack stops two floats chasing each other.
       if (instance.isMoving()) return;
       const ground = instance.queryTerrainElevation(instance.getCenter());
       if (ground !== null && Math.abs(instance.getCenterElevation() - ground) > 1) {
@@ -349,22 +299,11 @@ export function RouteMap({
     };
   }, [terrain, flyover]);
 
-  // ── Rotation follows terrain ──────────────────────────────────────────────────────
   /*
-   * A mesh you cannot hike round is a picture of a mesh. Once the ground has a third
-   * dimension, being able to swing the camera and see which side of the ridge the path takes
-   * is most of the value — so the gestures are enabled with it and disabled again when the
-   * map goes back to being a sheet, along with any pitch the reader left behind.
-   *
-   * Re-framing on both edges is what makes the transition mean "same map, tilted" rather than
-   * "same map, somewhere else": the trail's own bounds, so the route is the thing that stays
-   * put while everything around it changes. It tilts at the same time because from directly
-   * overhead a mesh and a hillshade of the same DEM are the same picture, and without the tilt
-   * the only evidence the box did anything is a gesture the reader has not tried yet.
-   *
-   * Only from flat, though — a reader who has already dragged the view to their own angle did
-   * not ask to have it corrected — and never mid-flight, where the animation loop owns the
-   * camera and a `fitBounds` underneath it would be two hands on the same wheel.
+   * Rotation and pitch follow terrain: without them a mesh is a picture of a mesh. Both edges
+   * re-frame on the trail's own bounds so the transition reads as "same map, tilted" — but
+   * only from flat, so a reader who set their own angle keeps it, and never mid-flight, where
+   * the animation loop owns the camera.
    */
   useEffect(() => {
     const instance = map.current;
@@ -404,18 +343,11 @@ export function RouteMap({
     if (instance.getPitch() !== 0 || instance.getBearing() !== 0) reframe(0);
   }, [terrain, flyover]);
 
-  // ── The flyover ───────────────────────────────────────────────────────────────────
   /*
-   * One `requestAnimationFrame` loop, one `jumpTo` per frame, and no React state in the
-   * middle of it. `jumpTo` rather than `easeTo`: the pose already carries the easing, because
-   * the pacing is Tobler's rather than a curve chosen for how it looks, and asking MapLibre
-   * to smooth between two poses that are 16 ms apart would flatten exactly the labouring on
-   * the climb that the flyover exists to show.
-   *
-   * Pressing play usually switches terrain on in the same commit, which rebuilds the style —
-   * so the loop waits for `idle` rather than starting over a half-built map. Without that the
-   * first second of every first flight is a camera sweeping across flat ground while the mesh
-   * loads under it, which reads as the terrain failing rather than arriving.
+   * The flyover: one `requestAnimationFrame` loop, one `jumpTo` per frame, no React state in
+   * the middle. `jumpTo` rather than `easeTo` because the pose already carries Tobler's pacing,
+   * and smoothing between two poses 16 ms apart would flatten the labouring on the climb.
+   * The loop waits for `idle`, since pressing play usually rebuilds the style in the same commit.
    */
   useEffect(() => {
     if (!flyover) return;
@@ -426,18 +358,10 @@ export function RouteMap({
     let cancelled = false;
 
     /*
-     * The camera is told how high the ground is, rather than being left to find out.
-     *
-     * Same broken lookup as the effect above, with a second failure mode stacked on it: a
-     * flyover moves faster than DEM tiles load, so even a working search would miss. Told the
-     * ground is at sea level over a route at 2,500 m, MapLibre places the camera two kilometres
-     * inside the mountain, where back-face culling leaves a completely empty frame — it renders
-     * nothing at all, silently, with no console error and a progress bar that keeps counting.
-     *
-     * We already know the answer. Every pose carries `eleM` from our own DEM pass, sampled at
-     * ingest and stored with the profile, so the camera is positioned from data that is on the
-     * page rather than from tiles that are in flight — and `jumpTo` takes an explicit
-     * `elevation` in preference to its own lookup, which is what makes that stick.
+     * The camera is told how high the ground is rather than left to find out: the same broken
+     * lookup as above, plus a flyover outrunning DEM tile loads. Placed two kilometres inside
+     * the mountain, back-face culling renders an empty frame with no error at all. Every pose
+     * carries `eleM` from our own ingest pass, and `jumpTo` prefers an explicit `elevation`.
      */
     const clamped = instance.getCenterClampedToGround();
     instance.setCenterClampedToGround(false);
@@ -468,10 +392,8 @@ export function RouteMap({
     };
 
     const still = () => {
-      // No animation at all for a reader who has asked for none — a pitched camera sweeping
-      // over terrain is close to the worst thing a map can do to a vestibular setting. What
-      // survives being still is the arrangement of the ground: the whole route in frame,
-      // tilted, seen from the direction the high point lies in.
+      // No animation for a reader who has asked for none. What survives being still is the
+      // arrangement of the ground: the whole route in frame, tilted, seen from the high point.
       const pose = flyoverOverview(flyover);
       if (!pose) return;
       const [w, s, e, n] = framing.current;
@@ -485,8 +407,7 @@ export function RouteMap({
       // After the framing, not before: `fitBounds` is a `jumpTo` with no elevation of its own,
       // and under terrain that means it overwrites this with the zero the broken lookup returns.
       instance.setCenterElevation(meshEleM(pose.eleM));
-      // The section marks the summit rather than nothing, so the still has a reading to go
-      // with it — the same pairing the moving version relies on.
+      // The section marks the summit, so the still has a reading to go with it.
       tick.current?.(pose.distanceM);
     };
 
@@ -516,8 +437,7 @@ export function RouteMap({
           tick.current?.(pose.distanceM);
         }
         if (progress >= 1) {
-          // Ending is the parent's business: it owns the play state, and it setting `flyover`
-          // to null is what runs the cleanup below and puts the map back on its bounds.
+          // Ending is the parent's business: setting `flyover` to null runs the cleanup below.
           ended.current?.();
           return;
         }
@@ -538,14 +458,13 @@ export function RouteMap({
     return () => {
       cancelled = true;
       cancelAnimationFrame(frame);
-      // Hand the centre point back to the terrain before re-framing, so the map the reader is
-      // left holding tracks the ground under it again the moment they pan.
+      // Hand the centre point back to the terrain before re-framing, so the map tracks the
+      // ground under it again the moment the reader pans.
       instance.setCenterClampedToGround(clamped);
       restore();
     };
   }, [flyover]);
 
-  // ── Cursor ────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     const instance = map.current;
     if (!instance || !ready.current) return;
@@ -556,21 +475,11 @@ export function RouteMap({
     <div
       ref={container}
       className={className ?? ''}
-      // Labelled, not hidden.
-      //
-      // The route is described in full by the stats, the profile and the waypoint list on
-      // this page, so the instinct is `aria-hidden` and for a while that is what this was.
-      // It is the wrong tool. `aria-hidden` removes an element from the accessibility tree
-      // but not from the tab order, and MapLibre puts `tabindex="0"` on its canvas and ships
-      // real buttons for zoom — so hiding this left three tab stops that a screen reader
-      // arrives at with nothing to say. WCAG 4.1.2, and worse in practice than the noise it
-      // was avoiding: a user who cannot see the map now cannot tell what they have landed on
-      // or how many more presses it takes to get out.
-      //
-      // A named region costs one announcement and makes the rest legible. `region` rather
-      // than `application` because the arrow keys pan a view here; they do not drive a widget
-      // with its own key semantics, and `application` would switch off the reading-mode keys
-      // used to skip past it.
+      // Labelled, not hidden. `aria-hidden` removes an element from the accessibility tree but
+      // not from the tab order, and MapLibre puts `tabindex="0"` on its canvas and ships real
+      // zoom buttons — three tab stops with nothing to say, WCAG 4.1.2. `region` rather than
+      // `application`: the arrow keys pan a view, they do not drive a widget, and `application`
+      // would switch off the reading-mode keys used to skip past it.
       role="region"
       aria-label="Map of the trail route"
     />
@@ -578,11 +487,8 @@ export function RouteMap({
 }
 
 /**
- * The route, its waypoints, and the cursor — bottom to top.
- *
- * The line is drawn thicker here than on the browse map. There it was one of sixty and had
- * to stay out of its neighbours' way; here it is the subject, and a hairline subject on a
- * shaded hillside is a line the reader has to hunt for.
+ * The route, its waypoints and the cursor — bottom to top. Drawn thicker than on the browse
+ * map, where the line is one of sixty rather than the subject.
  */
 function addRouteLayers(instance: MapLibreMap): void {
   const field = SCHEMES.field;

@@ -7,41 +7,21 @@ import { Wordmark } from '../wordmark';
 import { Explore } from './explore';
 
 /**
- * The neatline around the map, and the chrome that surrounds it.
- *
- * A server shell holding the ruled border and title strip of a map sheet, with the whole
- * interactive sheet below it. Everything that needs a browser lives in `<Explore>`; this is
- * chrome, the session read, and the licence line.
- *
- * This file used to open "and everything that renders without JavaScript". It does not: the
- * map is `ssr: false` and the nav below `xl` is a React-state disclosure, so on this page the
- * only things that survive scripting being off are the wordmark, the heading and the credit.
- * The one of those that has to be true is the credit — see `beside`, below.
- *
- * It lives in `components/` rather than in a route file because two routes render it. The map
- * is the front page — `app/page.tsx` — and `/explore` is the alias kept alive for every link
- * already in the wild, so both are the same markup and there is exactly one copy of it.
- *
- * `atHome` is the one difference between them, and it is not a variant: it only says whether
- * the wordmark is a link to the page you are already on.
+ * The neatline around the map and the chrome that surrounds it: a server shell holding the
+ * ruled border, the session read and the licence line, with the interactive sheet below it.
+ * Two routes render it — `/` and the `/explore` alias — so there is exactly one copy.
  */
 
 export async function ExploreShell({ atHome }: { atHome: boolean }) {
   /*
-   * Both read here, and neither depends on the other.
+   * Both read on the server, and neither depends on the other. The session, so thirty save
+   * controls do not appear a beat after the list. The place, because only this side can see
+   * the cookie and the edge geo headers before the first byte — a client-side answer arrives
+   * after the map has already been built somewhere else.
    *
-   * The session, because every card wants to know whether there is anyone to save a trail
-   * *for*, and asking the browser for it means thirty controls that appear a beat after the
-   * list does. The place, because the server is the only side that can see the cookie and the
-   * edge geo headers before the first byte — a client-side answer would arrive after the map
-   * had already been built somewhere else, and moving it afterwards means an `easeTo` under a
-   * reader who may already be panning.
-   *
-   * `viewerPlace()` is a `cache()`d cookie-and-header read with no I/O, so this costs nothing
-   * and saves a round trip. Deliberately not a geolocation prompt: this screen has something
-   * to show before it is told anything, so there is a "later", and `/` is the manifest's
-   * `start_url` — making an installed app's cold launch wait on the geolocation radio is
-   * exactly backwards. The reader's own correction path is the search box; see `onPlaceSelect`.
+   * `viewerPlace()` is a `cache()`d cookie-and-header read with no I/O. Deliberately not a
+   * geolocation prompt: `/` is the manifest's `start_url`, and making an installed app's cold
+   * launch wait on the geolocation radio is backwards. The correction path is the search box.
    */
   const [viewer, place] = await Promise.all([caller.me.get(), viewerPlace()]);
 

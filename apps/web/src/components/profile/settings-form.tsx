@@ -11,15 +11,9 @@ import { useTRPC } from '../../trpc/react';
 import { BUTTON_COLLAR, DANGER, HEIGHT, PRIMARY } from '../controls';
 
 /**
- * Settings.
- *
- * Three questions in the order somebody actually asks them: who you are, how you want the
- * numbers written, and where "near me" points before you grant location permission. Each
- * section commits on its own, because they are unrelated decisions — one Save at the bottom
- * of a page like this makes changing your units feel like it might also publish your bio.
- *
- * Nothing here saves as you type. A profile is public, and a field that writes on every
- * keystroke publishes every draft of a sentence you were still working out.
+ * Settings: who you are, how the numbers are written, and where "near me" points before the
+ * reader grants location permission. Each section commits on its own, and nothing saves as you
+ * type — a profile is public, and a field that writes per keystroke publishes every draft.
  */
 
 const UNIT_LABEL: Record<UnitSystem, string> = {
@@ -34,12 +28,9 @@ const VISIBILITY_LABEL: Record<Visibility, string> = {
 };
 
 /**
- * "Follow the device" rather than "System" or "Auto".
- *
- * This is the default every account starts on, so it is the one label that has to explain
- * itself — a reader who has never touched this setting should be able to read the selected
- * option and understand why the site went dark at sunset. The collar control has room for
- * one word and says "Auto"; here there is room for the sentence, so it says it.
+ * "Follow the device" rather than "System" or "Auto". It is the default every account starts
+ * on, so it is the one label that has to explain itself; the collar control has room for a
+ * word and says "Auto", and here there is room for the sentence.
  */
 const THEME_LABEL: Record<ThemePreference, string> = {
   system: 'Follow the device',
@@ -62,9 +53,7 @@ export function SettingsForm({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Who you are
-// ---------------------------------------------------------------------------
 
 function Identity({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -202,9 +191,7 @@ function Identity({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // How it reads
-// ---------------------------------------------------------------------------
 
 function Preferences({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -262,9 +249,7 @@ function Preferences({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Where you start from
-// ---------------------------------------------------------------------------
 
 function Home({ me }: { me: SelfProfile }) {
   const trpc = useTRPC();
@@ -366,34 +351,22 @@ function Home({ me }: { me: SelfProfile }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Devices
-// ---------------------------------------------------------------------------
 
 function Devices() {
   const trpc = useTRPC();
   const router = useRouter();
   const devices = useQuery(trpc.me.devices.queryOptions());
   /*
-   * The success handler leaves the page rather than refreshing it. `signOutEverywhere` now
-   * deletes this browser's session row along with everybody else's, so a settings page that
-   * stayed put would look signed in while every request from it failed — the "discovered
-   * after the press" version of a behaviour that ought to be obvious before it. The counts
-   * ride along in the query string so the sign-in page can say what just happened.
+   * The success handler leaves the page rather than refreshing it: `signOutEverywhere` deletes
+   * this browser's session row too, so a settings page that stayed put would look signed in
+   * while every request from it failed. The counts ride in the query string.
    *
-   * That is also why the handover runs *here*, and is awaited before the push. `forgetReaderNow`
-   * documents the precondition — every path that ends this browser's session must call it — and
-   * this used to be the path that did not qualify, because it revoked mobile refresh tokens and
-   * left the browser signed in. It no longer is. Revoking the session server-side is invisible
-   * to everything under `offline/`: `ReaderIdentity` keys on a prop from the root layout, and a
-   * client-side `router.push` re-renders the page's subtree and not the layout, so the handover
-   * would never run. `localStorage` would go on naming the departed reader, their cached
-   * `/record` and downloaded trail pages would stay on a shared machine, and `SyncQueuedWrites`
-   * would keep drilling a dead session on every return to the foreground until the next full
-   * document load. A `router.refresh()` beside the push happens to work; calling the handover
-   * directly is what makes it true whatever the navigation does — and the await matters, since
-   * the point is to release the previous reader's data *before* the next page can be reached.
-   * See the note on `forgetReaderNow`.
+   * The handover runs here and is awaited before the push, because revoking the session
+   * server-side is invisible to everything under `offline/` — `ReaderIdentity` keys on a prop
+   * from the root layout, and a client-side `router.push` re-renders the subtree, not the
+   * layout, so `forgetReaderNow` would never run and the departed reader's cached pages would
+   * stay on a shared machine. See the note on `forgetReaderNow`.
    */
   const signOut = useMutation(
     trpc.me.signOutEverywhere.mutationOptions({
@@ -462,9 +435,7 @@ function Devices() {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Parts
-// ---------------------------------------------------------------------------
 
 function Section({
   title,
@@ -509,10 +480,8 @@ function Field({
 }
 
 /**
- * A short set of mutually exclusive answers, as buttons rather than a dropdown.
- *
- * Two or three options are worth showing at once: a select hides the alternatives behind a
- * click and turns "which one am I on" into a thing you have to open a menu to learn.
+ * A short set of mutually exclusive answers, as buttons rather than a dropdown: a select hides
+ * the alternatives behind a click and turns "which one am I on" into a menu you have to open.
  */
 function Choice<T extends string>({
   legend,
@@ -556,11 +525,9 @@ function Choice<T extends string>({
 }
 
 /**
- * The save control, and everything it has to say.
- *
- * Present but inert when there is nothing to save, rather than appearing when the form goes
- * dirty — a button that materialises under the cursor moves the thing you were about to
- * click. What changes is what it says.
+ * The save control. Present but inert when there is nothing to save, rather than appearing when
+ * the form goes dirty — a button that materialises under the cursor moves what you were about
+ * to click. What changes is what it says.
  */
 function Save({
   dirty,
@@ -600,11 +567,8 @@ function Save({
 }
 
 /**
- * A value that settles.
- *
- * Both live checks on this page reach something with a rate limit behind it — a unique index
- * and a shared public gazetteer — so they wait for a pause in typing rather than firing on
- * every keystroke.
+ * A value that settles. Both live checks on this page reach something rate-limited — a unique
+ * index and a shared public gazetteer — so they wait for a pause rather than fire per keystroke.
  */
 function useDebounced<T>(value: T, ms: number): T {
   const [settled, setSettled] = useState(value);

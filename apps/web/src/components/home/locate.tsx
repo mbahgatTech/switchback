@@ -5,38 +5,14 @@ import { BUTTON, BUTTON_COLLAR, GHOST, HEIGHT, SECONDARY } from '../controls';
 import { forgetPlace, rememberPlace } from '@/lib/place-action';
 
 /**
- * Where the reader is — asked for on arrival, not waited for.
+ * Where the reader is, asked for on arrival rather than behind a button — on `/nearby` the
+ * list *is* the page, so there is no "later" at which the reader would have more evidence.
  *
- * The nearby list is a list of trails near you, so a page that opens on a question and a
- * button is a page that has made the reader do the one thing it could have done itself.
- * It asks on mount. This component renders on `/nearby` and nowhere else — it was the front
- * page's until the map took that address, and the argument below is about this page rather
- * than about whichever URL it happens to sit at.
- *
- * That is a reversal, and the argument it reverses was a real one: a denied permission is
- * denied for the whole origin and cannot be walked back, so a prompt fired before the reader
- * has any reason to say yes spends something that does not come back. What makes asking
- * immediately the better trade is that this page has nothing else to show until it is
- * answered — the list *is* the page — so there is no "later" at which the reader would have
- * more evidence than they do now.
- *
- * Three guards keep the reversal from being careless:
- *
- * - **Never twice.** With a browser fix already on screen there is nothing to gain, so a
- *   reader who has answered once is never asked again.
- * - **Never after a refusal.** The Permissions API is consulted first, and a `denied` state
- *   means we do not call at all: the call would fail instantly, and raising an error banner
- *   about a decision the reader already made and remembers is noise on arrival.
- * - **Forget means forget.** Otherwise the control below is a lie — clear the cookie, the
- *   page re-renders, and this effect immediately asks the radio for it back. Pressing it
- *   writes a marker that stops the automatic ask until the reader presses the button again.
- *
- * A failure from the automatic attempt stays quiet for the same reason the `denied` state
- * does. The message below is for somebody who pressed a button and watched nothing happen;
- * pressing it is still how you get the explanation.
- *
- * The answer is written to a cookie by a server action rather than kept in React state, so
- * the list is server-rendered from it on this visit and every one after.
+ * A permission denied for the origin cannot be walked back, so three guards apply: never ask
+ * twice, never ask after a `denied` state the Permissions API reports, and never re-arm the
+ * ask after the reader presses Forget. A failure from the automatic attempt stays quiet; the
+ * message below is for somebody who pressed the button. The answer goes to a cookie by server
+ * action, so the list is server-rendered from it on this visit and every one after.
  */
 
 export interface LocateProps {
@@ -47,11 +23,8 @@ export interface LocateProps {
 }
 
 /**
- * The reader's standing answer to the automatic ask.
- *
- * `localStorage` rather than a cookie: the server has no use for it — it changes nothing
- * about what the page renders — and a cookie is sent on every request to every route to
- * answer a question only this component asks.
+ * The reader's standing answer to the automatic ask. `localStorage` rather than a cookie: the
+ * server has no use for it, and a cookie rides every request to every route.
  */
 const OFF_KEY = 'sb-locate-off';
 
@@ -79,9 +52,9 @@ export function Locate({ known, precise }: LocateProps) {
   const [fault, setFault] = useState<string | null>(null);
 
   /*
-   * StrictMode runs every effect twice on mount in development. `maximumAge` would serve the
-   * second call from cache, so it is not a second permission prompt — but it is a second
-   * server action writing the same cookie, and the ref costs less than reasoning about that.
+   * StrictMode runs every effect twice on mount in development. `maximumAge` serves the second
+   * call from cache, so it is not a second prompt — but it is a second server action writing
+   * the same cookie.
    */
   const asked = useRef(false);
 
