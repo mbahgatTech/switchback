@@ -1,23 +1,11 @@
 /**
  * Air quality over an area, drawn at the resolution the model actually has.
  *
- * The temptation with a scalar field over a map is to interpolate it into a smooth wash.
- * That is a lie with a colour ramp on it: the CAMS global model publishes one number per
- * 40 km square, and a gradient between two of those squares invents a hundred readings
- * nobody computed. So the overlay is a lattice of hard-edged cells at the model's own
- * spacing, and the key says what that spacing is. A reader who can see the cells knows
- * exactly how much to trust a boundary — the same argument the slope layer makes for
- * `raster-resampling: nearest`.
- *
- * **Two models, two resolutions.** Open-Meteo serves CAMS Europe over its regional domain
- * at 0.1° and CAMS global everywhere else at 0.4°. Both are surfaced through one endpoint
- * and it does not say which answered, so the domain test happens here. Getting this wrong
- * in the optimistic direction would draw a 0.1° lattice over ground that has one value per
- * 0.4° — sixteen identical cells pretending to be sixteen readings.
- *
- * **Coarsening is honest, refining is not.** A wide viewport gets fewer, bigger cells so the
- * upstream call stays one request; a narrow one never gets cells smaller than the model.
- * The grid says which happened, and the key tells the reader.
+ * The overlay is a lattice of hard-edged cells at the model's own spacing, never an
+ * interpolated wash: a gradient between two 40 km squares invents readings nobody computed.
+ * Open-Meteo serves CAMS Europe at 0.1° over its regional domain and CAMS global at 0.4°
+ * elsewhere, through one endpoint that does not say which answered — hence `modelFor`.
+ * Coarsening the lattice is allowed, refining it below the model's resolution is not.
  */
 
 import type { AirQualityCell, AirQualityGrid, AirQualityReading, BBox } from '@switchback/core';
@@ -27,11 +15,9 @@ import { OpenMeteoClient } from './open-meteo';
 import { HOUR_S } from './time';
 
 /**
- * The CAMS European regional domain, as CAMS publishes it: 25°W–45°E, 30°N–72°N.
- *
- * Used only when a viewport sits *wholly* inside it. A box straddling the edge would
- * otherwise get a 0.1° lattice over the half of it the global model answered, which is the
- * exact overclaim this test exists to prevent.
+ * The CAMS European regional domain as CAMS publishes it. Applied only when a viewport sits
+ * *wholly* inside it — a box straddling the edge would get a 0.1° lattice over ground the
+ * global model answered for.
  */
 export const CAMS_EUROPE_DOMAIN: BBox = [-25, 30, 45, 72];
 
@@ -41,24 +27,12 @@ export const AQI_MODEL_GLOBAL_DEG = 0.4;
 export const AQI_MODEL_EUROPE = 'CAMS Europe';
 export const AQI_MODEL_GLOBAL = 'CAMS global';
 
-/**
- * How many cells one upstream call may carry.
- *
- * Sixty-four is eight by eight, which is about the aspect of a map pane, and it keeps the
- * query string near a kilobyte. The number is a budget rather than a target: a viewport
- * over one valley in Europe asks for far fewer, because the lattice never gets finer than
- * the model no matter how much room is left.
- */
+/** How many cells one upstream call may carry — a budget, not a target; 8×8 keeps the query near 1 KB. */
 export const AQI_GRID_MAX_CELLS = 64;
 
 /**
- * The coarsest lattice worth drawing, in degrees.
- *
- * At 1.6° a cell is about 175 km across, which is still a real statement about a weather
- * system. Past that the overlay becomes six colours over a continent — technically the
- * same data, but no longer an answer to any question a hiker has. Beyond this the grid
- * comes back empty and the key says to zoom in, exactly as the slope key does below its
- * own floor.
+ * The coarsest lattice worth drawing, in degrees (~175 km a cell). Beyond it the grid comes
+ * back empty and the key asks the reader to zoom in.
  */
 export const AQI_MAX_STEP_DEG = 1.6;
 
@@ -101,16 +75,11 @@ export interface PlannedCell {
 }
 
 /**
- * Lay a lattice over the viewport.
- *
- * Cell *centres* sit on multiples of the step and footprints extend half a step either
- * side, which is how Open-Meteo's own grid is laid out — ask it about 53.07 and it answers
- * for 53.1. Building the lattice the same way means a cell we draw is a cell it computed,
- * rather than a box straddling two of them.
- *
- * Doubling, not arbitrary division, is what keeps the lattice stable under panning: every
- * step in the ladder is a whole number of model cells, anchored at zero, so the same ground
- * lands in the same cell however the reader arrived at it — and the cache key stays hot.
+ * Lay a lattice over the viewport. Cell centres sit on multiples of the step, matching how
+ * Open-Meteo lays out its own grid, so a cell we draw is a cell it computed. The step doubles
+ * rather than dividing arbitrarily, keeping every rung a whole number of model cells anchored
+ * at zero — the same ground lands in the same cell however the reader panned, and the cache
+ * key stays hot.
  */
 export function planGrid(bbox: BBox, maxCells = AQI_GRID_MAX_CELLS): GridPlan {
   const model = modelFor(bbox);
@@ -141,11 +110,8 @@ export function planGrid(bbox: BBox, maxCells = AQI_GRID_MAX_CELLS): GridPlan {
 }
 
 /**
- * The grid, fetched.
- *
- * Cells whose reading came back null are kept rather than dropped. A hole in the lattice
- * and a cell the model had no answer for look identical once painted, and the second one
- * is a fact worth being able to see.
+ * The grid, fetched. Cells whose reading came back null are kept, not dropped: "the model had
+ * no answer here" is a fact worth painting.
  */
 export async function airQualityGrid(
   bbox: BBox,
@@ -166,9 +132,8 @@ export async function airQualityGrid(
   }
 
   const client = deps.client ?? new OpenMeteoClient();
-  // Wrapped back into ±180 for the request only. The footprint keeps the un-wrapped
-  // longitude so a cell east of the antimeridian draws beside its neighbour rather than
-  // jumping the width of the world.
+  // Wrapped into ±180 for the request only: the footprint keeps the un-wrapped longitude, so a
+  // cell east of the antimeridian draws beside its neighbour rather than jumping the world.
   const asked: GeoPoint[] = plan.cells.map((cell) => ({ lat: cell.lat, lng: wrapLng(cell.lng) }));
   const readings = await client.airQualityNow(asked);
 
@@ -189,11 +154,8 @@ export async function airQualityGrid(
 }
 
 /**
- * One reading, with the pollutant behind it named.
- *
- * Snapped to the model lattice before the call, which is what makes this cacheable: every
- * trail in the same 0.1° cell breathes the same air, so they should share one upstream
- * request rather than each spending their own on the same number.
+ * One reading, with the pollutant behind it named. Snapped to the model lattice before the
+ * call, so every trail in the same cell shares one upstream request.
  */
 export async function airQualityAt(
   lng: number,
@@ -236,13 +198,9 @@ export async function airQualityAt(
 }
 
 /**
- * Which pollutant the index is worst on.
- *
- * The European AQI is the maximum of its five sub-indices, so the one that equals it is by
- * construction the one driving the number. Named only when it actually matches, within a
- * point of rounding — if the sub-indices and the headline disagree by more than that,
- * something upstream is inconsistent and the honest answer is to say nothing rather than
- * to blame the largest of five numbers that do not add up.
+ * Which pollutant the index is worst on. The European AQI is the maximum of its five
+ * sub-indices, so the matching one drives the number — named only when it matches within a
+ * point of rounding, because a larger disagreement means something upstream is inconsistent.
  */
 export function dominantPollutant(reading: AirQualityNow): AirQualityPollutant | null {
   const indices: Record<AirQualityPollutant, number | null> = {
@@ -270,13 +228,9 @@ export function dominantPollutant(reading: AirQualityNow): AirQualityPollutant |
 }
 
 /**
- * The cache key for a viewport.
- *
- * Built from the *lattice*, not the bbox: two viewports covering the same cells are the
- * same question however the reader's pan happened to end, and keying on raw coordinates
- * would make every pixel of drag a cache miss for an identical answer. The hour is in
- * there because these are hourly model fields — the same reason the forecast cache buckets
- * by hour.
+ * The cache key for a viewport, built from the *lattice* rather than the bbox: two viewports
+ * covering the same cells are the same question, so a pixel of drag is not a cache miss.
+ * Bucketed by hour, since these are hourly model fields.
  */
 export function airQualityGridKey(bbox: BBox, nowMs: number): string {
   const plan = planGrid(bbox);
@@ -293,10 +247,8 @@ export function airQualityPointKey(lng: number, lat: number, nowMs: number): str
 }
 
 /**
- * The hour the readings are actually for, preferred over our own clock.
- *
- * Upstream publishes on its own schedule and can be an hour behind wall time; stamping
- * these with `Date.now()` would date a reading to an hour it was never computed for.
+ * The hour the readings are actually for, preferred over our own clock: upstream publishes on
+ * its own schedule and can be an hour behind wall time.
  */
 function stampOf(readings: readonly AirQualityNow[], fallback: string): string {
   const timeS = readings.find((reading) => reading.timeS > 0)?.timeS;
@@ -317,13 +269,9 @@ function count(min: number, max: number, step: number): number {
 }
 
 /**
- * A viewport, made sane.
- *
- * MapLibre reports bounds in the frame the user panned into, so longitudes run past ±180
- * after crossing the seam and a world-spanning view can report a range wider than 360.
- * Latitudes are clamped because Web Mercator's poles are at ±85 but `getBounds` will
- * happily report ±90 on a zoomed-out map, and asking a weather model about 89.6°N over a
- * viewport that shows no such ground wastes cells on the grid budget.
+ * A viewport, made sane. MapLibre reports bounds in the frame the user panned into, so
+ * longitudes run past ±180 after the seam and a world view can exceed 360. Latitudes clamp to
+ * Web Mercator's ±85, which `getBounds` overshoots on a zoomed-out map.
  */
 function normalise(bbox: BBox): BBox {
   const [w, s, e, n] = bbox;

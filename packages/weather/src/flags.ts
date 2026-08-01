@@ -1,20 +1,12 @@
 /**
- * Turning a forecast into advice.
- *
- * A row of numbers is not a decision. The flags below are the small set of conditions that
- * would actually change whether, or how, someone sets off — and each one names the place it
- * applies to, because "windy" is useless and "gusts to 72 km/h at the high point" is not.
+ * Turning a forecast into advice: the small set of conditions that would change whether, or how,
+ * someone sets off. Each flag names the place it applies to.
  *
  * Three rules govern everything here:
- *
- * 1. **A flag has to be actionable.** "Partly cloudy" is not a flag. Freezing level below
- *    the summit is, because it changes what is on your feet.
- * 2. **Severity is honest.** `warning` is reserved for conditions that hurt people:
- *    thunderstorms on exposed ground, gusts that knock you over, finishing after dark.
- *    Spending it on a 40% chance of drizzle is how users learn to ignore the row.
- * 3. **A missing value is not a safe value.** Every threshold test is written so that
- *    `null` fails it. A forecast that does not know the freezing level must not read as a
- *    forecast that says the freezing level is fine.
+ * 1. A flag has to be actionable. "Partly cloudy" is not one; freezing level below the summit is.
+ * 2. `warning` is reserved for conditions that hurt people. Spending it on a 40% chance of
+ *    drizzle teaches readers to ignore the row.
+ * 3. A missing value is not a safe value — every threshold test is written so `null` fails it.
  */
 
 import type { UnitSystem, WeatherFlag, WeatherSample } from '@switchback/core';
@@ -45,11 +37,8 @@ export const AQI_CAUTION = 60;
 export const AQI_WARNING = 80;
 
 /**
- * How far past sunset counts as finishing in the dark.
- *
- * Not zero. Civil twilight gives roughly half an hour of usable light after the sun goes
- * down, and flagging a finish four minutes after sunset would be technically true and
- * practically noise.
+ * How far past sunset counts as finishing in the dark. Not zero: civil twilight gives roughly
+ * half an hour of usable light, so a finish four minutes after sunset is noise.
  */
 export const AFTER_DARK_GRACE_S = 30 * 60;
 
@@ -64,11 +53,8 @@ export interface FlagInput {
 }
 
 /**
- * Every flag the forecast supports, most severe first.
- *
- * Sorted rather than emitted in detection order so the UI can render the list as-is and the
- * first row is always the one that matters most. Within a severity, order follows the trail,
- * so a reader scanning down is also hiking forwards.
+ * Every flag the forecast supports, most severe first, so the UI can render the list as-is.
+ * Within a severity, order follows the trail.
  */
 export function deriveFlags(input: FlagInput): WeatherFlag[] {
   const { samples, unitSystem } = input;
@@ -77,8 +63,7 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
   const flags: WeatherFlag[] = [];
   const highest = highestSampleIndex(samples);
 
-  // --- Freezing level ------------------------------------------------------------------
-  // Checked at the high point only. Lower down it is either irrelevant or implied.
+  // Freezing level is checked at the high point only; lower down it is irrelevant or implied.
   const high = samples[highest];
   if (high && high.freezingLevelM !== null && high.freezingLevelM <= high.eleM) {
     flags.push({
@@ -91,7 +76,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Wind ----------------------------------------------------------------------------
   const gustiest = extremeIndex(samples, (s) => s.windGustsKmh, 'max');
   const gusts = gustiest === null ? null : samples[gustiest]!.windGustsKmh;
   if (gustiest !== null && gusts !== null && gusts >= WIND_WARNING_KMH) {
@@ -112,7 +96,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Thunderstorms -------------------------------------------------------------------
   const storm = samples.findIndex(
     (s) => s.weatherCode !== null && THUNDERSTORM_CODES.has(s.weatherCode),
   );
@@ -127,7 +110,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Rain ----------------------------------------------------------------------------
   const wettest = samples.findIndex(
     (s) =>
       (s.precipitationProbability !== null &&
@@ -148,7 +130,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Darkness ------------------------------------------------------------------------
   const finishS = input.arrivalS[input.arrivalS.length - 1];
   if (input.sunsetS !== null && finishS !== undefined && finishS > input.sunsetS) {
     const overrunS = finishS - input.sunsetS;
@@ -162,7 +143,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     }
   }
 
-  // --- UV ------------------------------------------------------------------------------
   const sunniest = extremeIndex(samples, (s) => s.uvIndex, 'max');
   const uv = sunniest === null ? null : samples[sunniest]!.uvIndex;
   if (sunniest !== null && uv !== null && uv >= UV_CAUTION) {
@@ -174,7 +154,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Heat and cold -------------------------------------------------------------------
   const hottest = extremeIndex(samples, (s) => s.apparentTemperatureC, 'max');
   const heat = hottest === null ? null : samples[hottest]!.apparentTemperatureC;
   if (hottest !== null && heat !== null && heat >= HEAT_CAUTION_C) {
@@ -197,7 +176,6 @@ export function deriveFlags(input: FlagInput): WeatherFlag[] {
     });
   }
 
-  // --- Air quality ---------------------------------------------------------------------
   if (input.aqi && input.aqi.length > 0) {
     let worst = -1;
     for (let i = 0; i < input.aqi.length; i++) {
@@ -240,10 +218,8 @@ function highestSampleIndex(samples: readonly WeatherSample[]): number {
 }
 
 /**
- * Index of the largest or smallest value of one field, skipping nulls.
- *
- * Returns null when every sample is null for that field, which is what keeps a forecast
- * with no UV data from reporting a UV index of zero — a number that would read as measured.
+ * Index of the largest or smallest value of one field, skipping nulls. Returns null when every
+ * sample is null, so a forecast with no UV data does not report a UV index of zero.
  */
 function extremeIndex(
   samples: readonly WeatherSample[],

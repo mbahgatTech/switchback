@@ -1,32 +1,15 @@
 /**
- * Development seed — user content.
+ * Development seed — user content. `seed.ts` refuses to invent trails; this invents only what
+ * the pipeline can never produce: people, and what they said after hiking somewhere. Without it
+ * the reviews surface renders empty on a fresh database and cannot be looked at.
  *
- * Separate from `seed.ts`, and separate on principle. That one refuses to invent trails
- * because a fake trail hides a broken ingest pipeline. This one invents *only* what the
- * pipeline can never produce: people, and what they said after hiking somewhere. Reviews
- * have no upstream source — they are the one part of this product that has to be typed by
- * a human — so a local database has none until somebody signs in with a real Microsoft
- * account and writes one, and until then the whole reviews surface renders empty and
- * cannot be looked at.
- *
- * Nothing here is fixture data the app depends on. Delete every row it makes and the
- * product is exactly as correct, just quieter:
- *
- *     npm run db:seed:reviews -- --reset
- *
- * The accounts it creates carry `@example.invalid` addresses. `.invalid` is reserved by
- * RFC 2606 precisely so it can never be delegated, which means these rows can never
- * collide with a real sign-in and can never send mail anywhere.
+ * Nothing here is fixture data the app depends on: `npm run db:seed:reviews -- --reset` removes
+ * it all. The accounts use `@example.invalid` — RFC 2606 reserves `.invalid` so it can never be
+ * delegated, so these rows cannot collide with a real sign-in or send mail anywhere.
  */
 import { ActivityType, TrailCondition, prisma } from '@switchback/db';
 
-/**
- * A deterministic generator, so two runs on the same database produce the same reviews.
- *
- * `Math.random()` here would mean a screenshot taken this morning and one taken this
- * afternoon disagree about the numbers, which makes visual review useless — the mulberry32
- * constants are the standard ones.
- */
+/** Deterministic (mulberry32), so two runs produce the same reviews and screenshots compare. */
 function rng(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
@@ -53,12 +36,9 @@ const HIKERS: Hiker[] = [
 ];
 
 /**
- * Reports, written to be worth reading.
- *
- * Every one names a place, a hazard, or a decision — because the point of looking at this
- * seed is to judge whether a real report is legible at this width and this measure, and a
- * column of "Great hike!!" answers that question wrongly. The ratings sit deliberately
- * across the range: a distribution that is all fours makes the histogram look broken.
+ * Reports, written to be worth reading: each names a place, a hazard, or a decision, because the
+ * point of the seed is judging whether a real report is legible at this measure. Ratings spread
+ * across the range so the histogram does not look broken.
  */
 const REPORTS: {
   rating: number;
@@ -156,11 +136,9 @@ function assertNotProduction(): void {
   if (process.env.NODE_ENV === 'production') {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
-  // This one *writes user rows*, which the trail seed does not. A stricter refusal than a
-  // queue primer deserves: made-up accounts in a live users table are not a tidy mistake.
-  //
-  // `postgres.database.azure.com` is production from the Neon→Azure migration onward; Neon
-  // stays in the list because it remains a live, populated rollback afterwards.
+  // Stricter than the trail seed because this *writes user rows*: made-up accounts in a live
+  // users table are not a tidy mistake. `postgres.database.azure.com` is production; neon.tech
+  // stays listed for as long as Neon remains the retained rollback.
   if (
     /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
     !process.env.SEED_ALLOW_REMOTE
@@ -197,9 +175,8 @@ async function reset(): Promise<void> {
     distinct: ['trailId'],
   });
 
-  // Reviews go with the user by cascade; the trail aggregates do not, so they are put back
-  // by hand. A reset that left `rating: 4.3` on a trail with no reviews would be worse than
-  // no reset at all.
+  // Reviews go with the user by cascade; the trail aggregates do not, so they are restored by
+  // hand. A reset leaving `rating: 4.3` on a trail with no reviews is worse than no reset.
   await prisma.user.deleteMany({ where: { id: { in: ids } } });
   await prisma.trail.updateMany({
     where: { id: { in: trails.map((row) => row.trailId) } },
@@ -233,13 +210,8 @@ async function main(): Promise<void> {
     ),
   );
 
-  /**
-   * The trails that are worth looking at.
-   *
-   * Ordered by what the ingest pipeline already found interesting — longest first among
-   * named routes — rather than by id, because a review section is being judged here and an
-   * unnamed forty-metre connector path is not a fair test of one.
-   */
+  // Longest named routes first, not by id: an unnamed forty-metre connector is not a fair test
+  // of a review section.
   const trails = await prisma.trail.findMany({
     where: { name: { not: '' } },
     orderBy: { lengthM: 'desc' },
@@ -256,12 +228,11 @@ async function main(): Promise<void> {
 
   for (const [index, trail] of trails.entries()) {
     const random = rng(index * 7919 + 13);
-    // Between three and every report, so the histograms differ trail to trail and the
-    // "one report" singular case actually appears somewhere in the set.
+    // Between three and every report, so histograms differ trail to trail and the "one report"
+    // singular case appears somewhere in the set.
     const howMany = 3 + Math.floor(random() * (REPORTS.length - 2));
 
-    // Each trail starts at a different offset in the report list, so trail two is not
-    // trail one with the tail cut off.
+    // Each trail starts at a different offset, so trail two is not trail one with the tail cut.
     const offset = Math.floor(random() * REPORTS.length);
 
     const counts = [0, 0, 0, 0, 0];
@@ -272,7 +243,6 @@ async function main(): Promise<void> {
       // One review per person per trail is a unique index, so a trail can never hold more
       // reports than there are seeded hikers.
       if (n >= hikers.length) break;
-
       await prisma.review.upsert({
         where: { trailId_userId: { trailId: trail.id, userId: hiker.id } },
         create: {
@@ -290,8 +260,7 @@ async function main(): Promise<void> {
       });
 
       // Indexed by rating − 1, the same convention the router's `ratingCounts` uses, so the
-      // seeded average and the recomputed one cannot disagree. Read through a default
-      // because a variable index into an array is `number | undefined` here.
+      // seeded average and the recomputed one cannot disagree.
       const bucket = report.rating - 1;
       counts[bucket] = (counts[bucket] ?? 0) + 1;
       written += 1;

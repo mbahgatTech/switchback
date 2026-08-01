@@ -1,25 +1,14 @@
 /**
  * Development seed — recorded activity, so the heatmap has something to aggregate.
  *
- * The third seed, and the same principle as the other two. `seed.ts` refuses to invent
- * trails, because a fake trail hides a broken ingest pipeline. `seed-reviews.ts` invents
- * people and what they wrote, because writing has no upstream source. This one invents
- * where those people hiked, for the same reason: a GPS track is produced by somebody
- * holding a phone on a hillside, and a local database therefore has none.
- *
- * That absence is not cosmetic here. The activity heatmap publishes a cell only once
- * `HEATMAP_MIN_HIKERS` separate accounts have hiked through it — the load-bearing privacy
- * control, and the one thing in the feature that must never be relaxed to make a screenshot
- * look better. A database with one hiker in it renders a correct, completely blank overlay,
- * and neither the populated state nor the "N cells hidden" state can be looked at. Seeding
- * hikers is the honest way to see the feature; lowering k is not.
+ * The heatmap publishes a cell only once `HEATMAP_MIN_HIKERS` separate accounts have hiked
+ * through it. Seeding hikers is how you see the populated state; lowering k is not.
  *
  *     npm run db:seed:tracks
  *     npm run db:seed:tracks -- --reset
  *
- * Tracks follow real ingested geometry rather than invented lines, so the wash lands on
- * ground that actually has paths on it. That is the only way to judge the thing this layer
- * exists to show: where the wash and the trail lines *disagree*.
+ * Tracks follow real ingested geometry, so the wash lands on ground that has paths on it —
+ * the only way to see where the wash and the trail lines disagree.
  */
 import { ActivityType, Visibility, prisma, writeActivityGeometry } from '@switchback/db';
 import { HEATMAP_MIN_HIKERS } from '@switchback/core';
@@ -51,25 +40,13 @@ const HIKERS: ReadonlyArray<readonly [username: string, name: string]> = [
 ];
 
 /**
- * Where to seed, rather than "the busiest trails in the database".
+ * Where to seed. The heatmap is read one viewport at a time, so a corpus spread over three
+ * continents would demonstrate nothing; these are the two areas ingest has actually filled,
+ * each about one screen wide at the zoom the layer is useful at.
  *
- * The heatmap is read one viewport at a time, so a corpus spread evenly over three
- * continents would put two or three recordings in every view and demonstrate nothing. These
- * are the two areas the ingest pipeline has actually filled: Snowdon, and the Mountain Loop,
- * which is where the trails people search for by name in this database happen to be.
- *
- * Neither is where the map opens any more, and this note used to say Snowdon was. The sheet
- * now opens on the reader's own place and falls back to Seattle (`apps/web/src/lib/place.ts`),
- * whose arrival view — `[-122.668, 47.412, -121.992, 47.807]` at 1400×900 — is disjoint from
- * both boxes below in longitude and in latitude. So "visible on arrival" is no longer a claim
- * this script can make for anybody: a reader who switches the layer on from the front page
- * gets an empty overlay unless they have already panned somewhere seeded. What it still buys
- * is a layer that is dense and legible at the two places a reader navigates *to* by name,
- * which is what the band ladder below is for. Closing the gap means seeding a third box inside
- * the fallback view — the I-90 corridor that `FALLBACK_AT`'s own note names as the alternative
- * lever — and that only works once the pipeline has filled it with trails to hang tracks on.
- *
- * The boxes are deliberately about one screen wide at the zoom the layer is useful at.
+ * Neither is inside the Seattle fallback view (`apps/web/src/lib/place.ts`), so a reader who
+ * switches the layer on from the front page sees an empty overlay until they pan. Closing that
+ * needs a third box in the I-90 corridor, once the pipeline has filled it with trails.
  */
 const AREAS: ReadonlyArray<{ name: string; bbox: readonly [number, number, number, number] }> = [
   { name: 'Snowdon', bbox: [-4.25, 52.95, -3.85, 53.2] },
@@ -77,31 +54,16 @@ const AREAS: ReadonlyArray<{ name: string; bbox: readonly [number, number, numbe
 ];
 
 /**
- * How many recordings each trail in an area gets, busiest first.
- *
- * A steep decay rather than a flat number, because the whole point of the layer is that
- * traffic is wildly uneven — a flat twenty per trail would paint every path the same shade
- * and show nothing a trail index does not already say. The ladder puts at least one trail in
- * each of the five bands (3, 10, 30, 100, 300), so the key can be checked against the map
- * band by band rather than taken on trust.
- *
- * It is also, roughly, true. On Snowdon the Llanberis Path carries an order of magnitude more
- * people than the Watkin, and the quarry tramways at the bottom of this list carry almost
- * nobody. A uniform seed would be both duller and less honest.
- *
- * Every entry clears `HEATMAP_MIN_HIKERS`; a trail seeded below k would vanish, and an
- * invisible trail in a seed reads as a bug rather than as the floor doing its job.
+ * Recordings per trail in an area, busiest first. Steep decay because real traffic is wildly
+ * uneven, and the ladder puts at least one trail in each of the five key bands so the legend
+ * can be checked band by band. Every entry clears `HEATMAP_MIN_HIKERS`, so nothing seeded vanishes.
  */
 const LADDER = [340, 155, 88, 52, 31, 19, 12, 8, 6, 4, 3, 3] as const;
 
 /**
- * The length band worth recording, in metres.
- *
- * The floor is set by the layer itself: the query drops the first and last
- * `HEATMAP_CLIP_M` (250 m) of every track before it aggregates, so a 600 m path contributes
- * one cell and a 400 m path contributes nothing. The ceiling is a cost guard — the Pacific
- * Crest Trail is in this database at 4,265 km, and three hundred recordings of it at one
- * sample per 120 m would be ten million rows to demonstrate a colour ramp.
+ * The length band worth recording, in metres. The floor follows the layer: the query drops the
+ * first and last `HEATMAP_CLIP_M` (250 m) of every track, so a 400 m path contributes nothing.
+ * The ceiling is a cost guard — the PCT is in this database at 4,265 km.
  */
 const MIN_TRAIL_M = 900;
 const MAX_TRAIL_M = 25_000;
@@ -113,12 +75,8 @@ const SAMPLE_SPACING_M = 120;
 const BASE_SPEED_MPS = 1.15;
 
 /**
- * How far a recorded track wanders from the mapped line, in metres.
- *
- * Consumer GPS under trees is good to about five metres and much worse in a gorge, and the
- * spread matters more than the magnitude: identical tracks would stack into one perfect
- * ribbon, and the aggregate would have no width — which is exactly what a heatmap of real
- * data does not look like.
+ * How far a recorded track wanders from the mapped line, in metres. The spread matters more
+ * than the magnitude: identical tracks would stack into one ribbon with no width.
  */
 const WANDER_M = 9;
 
@@ -130,12 +88,9 @@ function assertNotProduction(): void {
   if (process.env.NODE_ENV === 'production') {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
-  // The same refusal as the review seed, and it matters more here: these rows are *public*
-  // recordings attributed to named accounts, which is the one kind of seed data that would
-  // be visible to strangers if it ever reached a live database.
-  //
-  // `postgres.database.azure.com` is production from the Neon→Azure migration onward; Neon
-  // stays in the list because it remains a live, populated rollback afterwards.
+  // These rows are *public* recordings attributed to named accounts — the one kind of seed data
+  // strangers would see if it reached a live database. `postgres.database.azure.com` is
+  // production; neon.tech stays listed for as long as Neon remains the live rollback.
   if (
     /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u.test(url) &&
     !process.env.SEED_ALLOW_REMOTE
@@ -150,20 +105,15 @@ function assertNotProduction(): void {
 }
 
 /**
- * Move a point sideways off the line by `offsetM`, plus a little along-track slop.
- *
- * The lateral offset is taken perpendicular to the local heading rather than in a random
- * direction, because that is what GPS error on a path actually looks like: a track drifts off
- * the side of the trail and comes back, it does not teleport ahead of itself. The longitude
- * term divides by cos(lat) so a fixed offset in metres stays a fixed offset on the ground
- * rather than shrinking to nothing at the equator and exploding in Svalbard.
+ * Move a point sideways off the line by `offsetM`, plus a little along-track slop. The offset is
+ * perpendicular to the local heading because that is what GPS error on a path looks like. The
+ * longitude term divides by cos(lat) so a metre stays a metre at any latitude.
  */
 function nudge(point: LngLat, heading: LngLat, offsetM: number, jitterM: number): LngLat {
   const [lng, lat] = point;
   const mPerDegLat = 111_320;
   const mPerDegLng = Math.max(1, 111_320 * Math.cos((lat * Math.PI) / 180));
 
-  // Unit vector along the line, in metres.
   const dx = (heading[0] - lng) * mPerDegLng;
   const dy = (heading[1] - lat) * mPerDegLat;
   const len = Math.hypot(dx, dy) || 1;
@@ -199,9 +149,8 @@ type Elevation = (distM: number) => number | null;
 function elevationReader(points: ReadonlyArray<{ distM: number; eleM: number }>): Elevation {
   if (points.length === 0) return () => null;
   return (distM) => {
-    // The profile is resampled at a fixed interval, so the index is arithmetic rather than a
-    // search. Clamped at both ends because a wandered track is fractionally longer than the
-    // line it followed and would otherwise run off the end of the array.
+    // The profile is resampled at a fixed interval, so the index is arithmetic. Clamped because
+    // a wandered track is fractionally longer than the line it followed.
     const spacing =
       points.length > 1 ? (points.at(-1)!.distM - points[0]!.distM) / (points.length - 1) : 1;
     const index = Math.round((distM - points[0]!.distM) / (spacing || 1));
@@ -210,14 +159,9 @@ function elevationReader(points: ReadonlyArray<{ distM: number; eleM: number }>)
 }
 
 /**
- * One hiker's recording of one trail.
- *
- * Three things vary per recording, and each is there for a reason a screenshot would
- * otherwise expose. The **wander** gives the aggregate its width, as above. The **trim**
- * starts and ends the track a little way along the line, because real recordings begin in a
- * car park and end when somebody remembers to press stop — identical endpoints would make the
- * 250 m endpoint clip look like it was cutting a clean line rather than protecting one. The
- * **pace** varies so the derived times are not all the same number.
+ * One hiker's recording of one trail. Wander gives the aggregate its width; the trim starts and
+ * ends the track part-way along, so identical endpoints do not make the 250 m endpoint clip look
+ * like it is cutting a clean line; pace varies so derived times differ.
  */
 function buildTrack(line: readonly LngLat[], elevationAt: Elevation, random: () => number): Track {
   const total = lineLengthM(line);
@@ -228,9 +172,8 @@ function buildTrack(line: readonly LngLat[], elevationAt: Elevation, random: () 
   const along = cumulativeDistancesM(dense);
   const speed = BASE_SPEED_MPS * (0.78 + random() * 0.5);
 
-  // A slow sinusoid rather than per-point noise. A track that jitters independently at every
-  // sample has no shape, and the aggregate of many such tracks is a blur with a hole down the
-  // middle. A drift with a period of a few hundred metres is what a real one does.
+  // A slow sinusoid rather than per-point noise: independent jitter has no shape, and many such
+  // tracks aggregate to a blur with a hole down the middle.
   const phase = random() * Math.PI * 2;
   const period = 240 + random() * 400;
   const amplitude = WANDER_M * (0.4 + random() * 0.9);
@@ -252,8 +195,7 @@ function buildTrack(line: readonly LngLat[], elevationAt: Elevation, random: () 
 
     const t = Math.round(s / speed);
     // `t` is unique per activity by database constraint, and rounding can collide on a
-    // near-duplicate vertex. Stepping past the previous value costs one second of accuracy
-    // and removes the only way this script can fail on a real trail.
+    // near-duplicate vertex. Stepping past the previous value costs one second of accuracy.
     const stamped = t <= previousT ? previousT + 1 : t;
     previousT = stamped;
 
@@ -277,8 +219,8 @@ function buildTrack(line: readonly LngLat[], elevationAt: Elevation, random: () 
     gainM,
     lossM,
     movingS,
-    // Elapsed exceeds moving time by a rest fraction. The map does not care, but an activity
-    // page showing identical moving and elapsed times looks like a bug in the recorder.
+    // Elapsed exceeds moving time by a rest fraction: identical moving and elapsed times read
+    // as a bug in the recorder.
     elapsedS: Math.round(movingS * (1.04 + random() * 0.18)),
   };
 }
@@ -291,10 +233,8 @@ function startedAt(random: () => number): Date {
 }
 
 async function reset(): Promise<void> {
-  // Matched on the device stamp alone, not on the seeded accounts. `seed-reviews.ts` owns
-  // those users and owns deleting them; a reset here that took them with it would wipe every
-  // seeded review as collateral, and one that missed a track recorded under a real account
-  // during testing would leave it behind.
+  // Matched on the device stamp alone, never on the seeded accounts: `seed-reviews.ts` owns
+  // those users, and deleting them here would take every seeded review with them.
   const removed = await prisma.activity.deleteMany({ where: { device: DEVICE } });
   console.log(`removed ${removed.count} seeded recordings (their samples went with them)`);
 }
@@ -339,7 +279,7 @@ async function main(): Promise<void> {
         centroidLat: { gte: s, lte: n },
       },
       // Popularity first so the busiest ladder rung lands on a trail the rest of the product
-      // already calls busy, then length, so the order is total and the seed reproducible.
+      // already calls busy; the rest of the ordering makes it total, so the seed reproduces.
       orderBy: [{ popularity: 'desc' }, { lengthM: 'desc' }, { id: 'asc' }],
       take: LADDER.length,
       select: {
@@ -368,8 +308,7 @@ async function main(): Promise<void> {
       const wanted = LADDER[index] ?? HEATMAP_MIN_HIKERS;
 
       for (let nth = 0; nth < wanted; nth += 1) {
-        // Seeded off the area, the trail and the recording number, so re-running the script
-        // reproduces the identical corpus rather than layering a second one on top of it.
+        // Seeded off area, trail and recording number, so re-running reproduces the same corpus.
         const random = rng(areaIndex * 1_299_721 + index * 104_729 + nth * 7_919 + 17);
         const hiker = hikers[nth % hikers.length]!;
 
@@ -385,8 +324,7 @@ async function main(): Promise<void> {
             trailId: trail.id,
             name: trail.name,
             activityType: nth % 7 === 0 ? ActivityType.trail_running : ActivityType.hiking,
-            // Public, because a private recording is excluded from the aggregate by design —
-            // a seed of private tracks would produce the same blank map it is meant to fix.
+            // Private recordings are excluded from the aggregate by design.
             visibility: Visibility.public,
             startedAt: started,
             endedAt: ended,
@@ -400,8 +338,8 @@ async function main(): Promise<void> {
               type: 'LineString',
               coordinates: track.fixes.map((fix) => [fix.lng, fix.lat]),
             },
-            // The flag the heatmap filters on: an unsynced activity is a partial track and is
-            // excluded from every aggregate. Leaving it null would make this a silent no-op.
+            // The heatmap filters on this: an unsynced activity is a partial track and is
+            // excluded from every aggregate, so leaving it null makes the seed a no-op.
             syncedAt: new Date(ended.getTime() + 60_000),
             device: DEVICE,
           },
@@ -420,8 +358,7 @@ async function main(): Promise<void> {
           });
         }
 
-        // The heatmap reads `activities.geom` and never the samples, so this line is the one
-        // that makes the seed do anything at all.
+        // The heatmap reads `activities.geom`, never the samples — without this the seed does nothing.
         await writeActivityGeometry(prisma, activity.id, {
           type: 'LineString',
           coordinates: track.fixes.map((fix) => [fix.lng, fix.lat] as LngLat),

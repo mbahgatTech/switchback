@@ -1,35 +1,15 @@
 /**
- * Repair photo bookkeeping — heroes pointing at the wrong row, or at no row at all.
+ * Repair photo bookkeeping — heroes pointing at the wrong row, at a deleted row, or a
+ * `photoCount` nobody recomputed. Symptom: a trail page with no photograph, or somebody else's.
  *
- * Two causes, one symptom: a trail page with no photograph on it, or somebody else's.
+ * `Trail.primaryPhotoId` is `@unique`, so a hero misfiled onto another trail also blocks the
+ * owning trail's `enrich_trail` job with a unique violation. `ON DELETE SET NULL` accounts for
+ * the rest: removing a photo silently un-heroes whatever trail was flying it.
  *
- * **A hero belonging to somebody else.** `enrichTrailPhotos` once keyed photos on
- * `(source, sourceId)` alone. Commons geosearch is a radius query and neighbouring trails
- * share photographs, so the second trail to enrich did not create its own row — it
- * *re-parented* the first trail's, moving `Photo.trailId` across. The key now includes
- * `trailId` and the bug cannot recur, but nothing ever went back for the rows it moved.
- * `Trail.primaryPhotoId` still points at a row that now belongs to a different trail, which
- * is a photograph of somewhere else at the top of a trail page. It is also why enrichment
- * was failing: the column is `@unique` (Prisma requires it on the owning side of a
- * one-to-one), so the trail that actually *owns* that photo cannot claim it as its own hero,
- * and its `enrich_trail` job died on a unique violation before writing anything.
- *
- * **A hero that was deleted.** `primaryPhotoId` is `ON DELETE SET NULL`, so removing a photo
- * silently un-heroes whatever trail was flying it. That is the right behaviour — the
- * alternative is a dangling pointer — but it leaves a trail holding a dozen good photographs
- * and showing none of them, because the card reads the hero and not the album. Purging the
- * 18,047 satellite images out of the seed corpus nulled 2,604 heroes in one statement.
- *
- * **A `photoCount` nobody recomputed.** Either of the above leaves the stored count
- * describing a set of photos that no longer exists, so cards advertise pictures that are not
- * there.
- *
- * Prints what it would do and changes nothing unless told to:
+ * Prints what it would do and changes nothing unless told to. Idempotent; safe after any ingest.
  *
  *     npx tsx packages/db/scripts/repair-photo-heroes.ts
  *     npx tsx packages/db/scripts/repair-photo-heroes.ts --apply
- *
- * Idempotent — a second run finds nothing. Safe to re-run after any ingest.
  */
 import { prisma } from '@switchback/db';
 
@@ -49,13 +29,11 @@ interface Adoption {
 /**
  * Re-point every stolen hero at a photograph the trail actually owns.
  *
- * Sequential, over a live set of claimed ids, because the repairs interact: the id trail A
- * releases may be exactly the one trail B is entitled to take, and a pass that decided all
- * of them against one snapshot would hand the same photo to two trails and fail on the
- * second write. Ordered by trail id so two runs on the same data make the same choices.
- *
- * Returns the claim set as it stands afterwards, because the adoption pass has to keep
- * honouring it — `primaryPhotoId` is `@unique` across the whole table, not per trail.
+ * Sequential over a live claim set, because the repairs interact: the id trail A releases may be
+ * the one trail B is entitled to take, and deciding all of them against one snapshot would hand
+ * the same photo to two trails. Ordered by trail id so two runs make the same choices. Returns
+ * the claim set, which the adoption pass must keep honouring — `primaryPhotoId` is `@unique`
+ * across the whole table, not per trail.
  */
 async function repairHeroes(apply: boolean): Promise<{ repairs: Repair[]; claimed: Set<string> }> {
   const trails = await prisma.trail.findMany({
@@ -77,21 +55,17 @@ async function repairHeroes(apply: boolean): Promise<{ repairs: Repair[]; claime
   const repairs: Repair[] = [];
 
   for (const trail of trails) {
-    // `primaryPhoto` is null only if the row vanished without the FK firing, which it cannot;
-    // the narrowing is for the compiler, and a missing photo is a hero worth clearing anyway.
+    // The narrowing is for the compiler; a missing photo is a hero worth clearing anyway.
     if (trail.primaryPhotoId === null) continue;
     if (trail.primaryPhoto !== null && trail.primaryPhoto.trailId === trail.id) continue;
 
     claimed.delete(trail.primaryPhotoId);
 
     const own = await prisma.photo.findMany({
-      // A photograph a moderator took down is not a candidate for the hero slot. This
-      // script exists to repair heroes, and repairing one onto hidden content would be a
-      // maintenance pass quietly reversing a takedown.
+      // Never promote hidden content: repairing a hero onto it would quietly reverse a takedown.
       where: { trailId: trail.id, hiddenAt: null },
       select: { id: true },
-      // The order enrichment itself would have saved them in, so the repaired hero is the
-      // one the trail would have had if the photos had never moved.
+      // Enrichment's own save order, so the repaired hero is the one the trail would have had.
       orderBy: { id: 'asc' },
     });
     const replacement = own.find((photo) => !claimed.has(photo.id))?.id ?? null;
@@ -116,17 +90,11 @@ async function repairHeroes(apply: boolean): Promise<{ repairs: Repair[]; claime
 }
 
 /**
- * Give a hero to every trail that has photographs and is not flying one.
+ * Give a hero to every trail that has photographs and is not flying one. The `photos: { some: {} }`
+ * filter is what keeps this cheap — most heroless trails have no photographs either.
  *
- * The relation filter is what keeps this cheap: the great majority of trails with no hero
- * have no photographs either, and asking the database for `photos: { some: {} }` means they
- * are never loaded. Only the trails that are actually showing less than they hold come back.
- *
- * Eight candidates each rather than one, though one is almost always enough. A trail's own
- * photographs cannot be claimed by anybody else once the pass above has run — that pass
- * exists precisely to return misfiled claims — so the first is free. The extra seven cost a
- * few bytes and cover the dry run, where nothing was written and the claim set still
- * describes the database as it was found.
+ * Eight candidates each, though one is almost always enough: the extras cover the dry run, where
+ * nothing was written and the claim set still describes the database as it was found.
  */
 async function adoptHeroes(apply: boolean, claimed: Set<string>): Promise<Adoption[]> {
   const trails = await prisma.trail.findMany({
@@ -157,10 +125,8 @@ async function adoptHeroes(apply: boolean, claimed: Set<string>): Promise<Adopti
 }
 
 /**
- * Recompute `photoCount` from the photos that exist.
- *
- * One correlated statement rather than a row-at-a-time loop: it is a count over an indexed
- * column, and the `WHERE` means only the rows that actually drifted are written.
+ * Recompute `photoCount` from the photos that exist. One correlated statement, and the `WHERE`
+ * means only rows that actually drifted are written.
  */
 async function repairCounts(apply: boolean): Promise<number> {
   if (!apply) {
@@ -191,7 +157,7 @@ async function main(): Promise<void> {
     console.log(`  ${repair.slug.padEnd(40)} ${repair.from} ${outcome}`);
   }
 
-  // After the stolen ones are back, because a photo returned here may be the very one an
+  // Must run after the stolen ones are returned: a photo released there may be the very one an
   // un-heroed trail is about to adopt.
   const adoptions = await adoptHeroes(apply, claimed);
   for (const adoption of adoptions) {

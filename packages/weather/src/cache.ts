@@ -1,24 +1,13 @@
 /**
- * A one-hour memo in front of the forecast.
+ * A one-hour memo in front of the forecast. Open-Meteo's models publish hourly, so caching for
+ * an hour costs nothing in accuracy and keeps a busy trail page inside the free tier.
  *
- * The weather strip renders on every trail page view, so a trail on the front page would
- * otherwise spend one upstream call per visitor for data that does not change between them.
- * Open-Meteo's free tier is 10,000 calls a day and its models publish hourly; caching for an
- * hour costs nothing in accuracy and is the difference between this feature fitting in the
- * free tier and not.
+ * Two things beyond a plain `Map`: concurrent misses for one key share a single upstream call
+ * (a page going busy is when every miss happens at once), and a rejected fetch clears its slot,
+ * so an upstream blip does not become an hour of the same error for everyone.
  *
- * Two things this does beyond a plain `Map`:
- *
- * - **Single flight.** Ten concurrent requests for a cold trail share one upstream call.
- *   Without this the cache is useless in exactly the case it exists for — a page going busy
- *   is when every miss happens at once.
- * - **Failures are not cached.** A rejected fetch clears its slot, so an upstream blip does
- *   not become an hour of the same error for everyone.
- *
- * Deliberately in-memory. On Vercel each instance keeps its own copy, which means a modest
- * multiplier on cold calls rather than a shared cache — the right trade against introducing
- * a KV store for data that is worthless in sixty minutes. A shared cache is a drop-in later:
- * everything here goes through `fetch`.
+ * In-memory on purpose — on Vercel each instance keeps its own copy. A shared cache is a
+ * drop-in later; everything here goes through `fetch`.
  */
 
 import type { AlongRouteForecast } from '@switchback/core';
@@ -40,14 +29,7 @@ interface Entry<T> {
   expiresAtMs: number;
 }
 
-/**
- * Generic in its value so busyness can reuse it.
- *
- * The busyness forecast is a pure computation and needs no cache of its own — but it reads
- * a week of observation buckets and a daily outlook to produce one, and those are exactly
- * as worth memoising as a weather call. Defaulting the parameter keeps every existing
- * `new ForecastCache()` meaning what it meant.
- */
+/** Generic in its value so busyness can memoise its observation buckets and daily outlook too. */
 export class ForecastCache<T = AlongRouteForecast> {
   private readonly entries = new Map<string, Entry<T>>();
   private readonly inFlight = new Map<string, Promise<T>>();
@@ -72,7 +54,7 @@ export class ForecastCache<T = AlongRouteForecast> {
       this.entries.delete(key);
       return null;
     }
-    // Re-insert so iteration order is least-recently-used first, which is what `evict` hikes.
+    // Re-insert so iteration order is least-recently-used first, which is what `evict` walks.
     this.entries.delete(key);
     this.entries.set(key, entry);
     return entry.value;
@@ -119,17 +101,10 @@ export class ForecastCache<T = AlongRouteForecast> {
 }
 
 /**
- * The cache key.
- *
- * Start time is floored to the hour because the forecast behind it resolves to the hour:
- * 07:14 and 07:52 read the same model values, so keying on the minute would be a guaranteed
- * miss for an identical answer.
- *
- * An unspecified start becomes `auto` rather than the resolved default, since the default
- * cannot be computed before the response tells us the trail's UTC offset. That default rolls
- * over at 07:00 local, so an `auto` entry made just before the rollover can name yesterday's
- * plan for at most the rest of its hour. Bounded, and the alternative is not caching the
- * common case at all.
+ * The cache key. Start time is floored to the hour because the forecast behind it resolves to
+ * the hour. An unspecified start becomes `auto`, not the resolved default, which cannot be
+ * computed before the response gives the trail's UTC offset — so an `auto` entry made just
+ * before the 07:00 rollover can name yesterday's plan for at most the rest of its hour.
  */
 export function forecastCacheKey(input: AlongRouteInput): string {
   const startS = input.startAt ? Math.floor(Date.parse(input.startAt) / 1000) : null;

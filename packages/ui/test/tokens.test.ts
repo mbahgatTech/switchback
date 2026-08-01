@@ -72,8 +72,8 @@ const rem = (value: string): number => {
 const cssVar = (key: keyof SchemeColors): string =>
   `--color-${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
 
-// ── Relative luminance / contrast, per WCAG 2.1. Inlined rather than pulled from a
-// dependency because this package deliberately has none, and the formula is four lines.
+// Relative luminance / contrast, per WCAG 2.1. Inlined because this package deliberately has
+// no dependencies.
 const channel = (c: number): number => {
   const s = c / 255;
   return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
@@ -92,8 +92,8 @@ function contrast(a: string, b: string): number {
 }
 
 describe('theme.css tracks the TypeScript tokens', () => {
-  // The whole reason this file exists. `theme.css` is hand-written because packages here
-  // have no build step, so the only thing stopping it drifting from src/tokens is this.
+  // `theme.css` is hand-written because packages here have no build step, so this suite is the
+  // only thing stopping it drifting from src/tokens.
   it('declares the sheet scheme as the default', () => {
     for (const [key, value] of Object.entries(SCHEMES.sheet)) {
       expect(theme.get(cssVar(key as keyof SchemeColors))).toBe(value.toLowerCase());
@@ -104,8 +104,8 @@ describe('theme.css tracks the TypeScript tokens', () => {
     for (const [key, value] of Object.entries(SCHEMES.field)) {
       expect(fieldBlock.get(cssVar(key as keyof SchemeColors))).toBe(value.toLowerCase());
     }
-    // Not "at least these" — exactly these. A property overridden in one scheme and not
-    // the other is how a card ends up with dark text on a dark surface.
+    // Not "at least these" — exactly these. A property overridden in one scheme and not the
+    // other is how a card ends up with dark text on a dark surface.
     expect([...fieldBlock.keys()].sort()).toEqual(
       Object.keys(SCHEMES.field)
         .map((k) => cssVar(k as keyof SchemeColors))
@@ -114,11 +114,8 @@ describe('theme.css tracks the TypeScript tokens', () => {
   });
 
   it('restates the sheet scheme as an attribute, not just as the default', () => {
-    // The `@theme` defaults are not enough on their own. Custom properties inherit, so a
-    // light reading page nested inside `<html data-scheme="field">` has already inherited
-    // the dark values by the time it renders — and a block that declares nothing overrides
-    // nothing. Without this, `data-scheme="sheet"` is a no-op everywhere it is actually
-    // needed, which is precisely everywhere it is used.
+    // Custom properties inherit, so a sheet nested inside `<html data-scheme="field">` has
+    // already inherited the dark values; without this block `data-scheme="sheet"` is a no-op.
     for (const [key, value] of Object.entries(SCHEMES.sheet)) {
       expect(sheetBlock.get(cssVar(key as keyof SchemeColors))).toBe(value.toLowerCase());
     }
@@ -126,8 +123,8 @@ describe('theme.css tracks the TypeScript tokens', () => {
   });
 
   it('keeps the prefers-color-scheme fallback identical to the field block', () => {
-    // These two lists are duplicated in the stylesheet — CSS has no way to alias a block.
-    // Duplication is fine; silent divergence is not.
+    // The two lists are duplicated in the stylesheet — CSS cannot alias a block. Duplication
+    // is fine; silent divergence is not.
     expect([...prefersDark.entries()].sort()).toEqual([...fieldBlock.entries()].sort());
   });
 
@@ -138,29 +135,27 @@ describe('theme.css tracks the TypeScript tokens', () => {
     for (const [key, value] of Object.entries(PALETTES.dark.sheet)) {
       expect(sheetDark.get(cssVar(key as keyof SchemeColors))).toBe(value.toLowerCase());
     }
-    // The same completeness rule the schemes are held to, for the same reason: a mode that
-    // overrides `canvas` and forgets `ink` is how a light theme gets white text on paper.
+    // The same completeness rule, for the same reason: a mode that overrides `canvas` and
+    // forgets `ink` is how a light theme gets white text on paper.
     expect([...fieldLight.keys()].sort()).toEqual([...fieldBlock.keys()].sort());
     expect([...sheetDark.keys()].sort()).toEqual([...fieldBlock.keys()].sort());
   });
 
   it('resolves "system" in CSS, so the first paint is already right', () => {
-    // The server writes `data-mode` only for a reader who has chosen a side; left off, these
-    // media blocks decide it. That is what buys a flash-free default with no blocking inline
-    // script — and it only holds while they say exactly what the explicit blocks say.
+    // The server writes `data-mode` only for a reader who has chosen a side; otherwise these
+    // media blocks decide it, which is what buys a flash-free default with no blocking inline
+    // script — and only while they say exactly what the explicit blocks say.
     expect([...systemLight.entries()].sort()).toEqual([...fieldLight.entries()].sort());
     expect([...systemDark.entries()].sort()).toEqual([...sheetDark.entries()].sort());
   });
 
   it('keeps paper light, whatever the screen is doing', () => {
-    // Dark mode is a kindness on a screen because the screen emits the light. Paper does
-    // not: dark mode on paper is a cartridge spent inking the empty half of a map, handed to
-    // somebody who then cannot read the contours by head-torch. The print stylesheet sets
-    // `print-color-adjust: exact`, so the browser will do exactly that if asked.
+    // The print stylesheet sets `print-color-adjust: exact`, so a dark palette really would
+    // reach the paper.
     for (const [key, value] of Object.entries(SCHEMES.sheet)) {
-      // `!important` is asserted, not stripped. The sheet element carries `data-print-sheet`
+      // `!important` is asserted, not stripped: the sheet element carries `data-print-sheet`
       // and `data-scheme="sheet"` together, so without it this rule loses the cascade to
-      // `[data-mode='dark'][data-scheme='sheet']` and the block silently does nothing.
+      // `[data-mode='dark'][data-scheme='sheet']` and does nothing.
       expect(printSheet.get(cssVar(key as keyof SchemeColors))).toBe(
         `${value.toLowerCase()} !important`,
       );
@@ -169,11 +164,9 @@ describe('theme.css tracks the TypeScript tokens', () => {
   });
 
   it('tells the browser how bright the room is, in every palette block', () => {
-    // The half of a surface we do not draw: scrollbar tracks, the popup a `<select>` opens,
-    // the caret and selection in a text field, the spinner on a number input. Without
-    // `color-scheme` the browser paints all of it for a white page, so a dark map screen gets
-    // a white scrollbar down its edge and a white dropdown over it. Asserted per block rather
-    // than once, because the whole point is that it tracks the palette it sits with.
+    // Without `color-scheme` the browser paints scrollbars, `<select>` popups, carets and
+    // spinners for a white page. Asserted per block, because it must track the palette it
+    // sits with.
     const scheme = (fragment: string): string | undefined =>
       /color-scheme:\s*([^;]+);/.exec(fragment)?.[1]?.trim();
 
@@ -189,10 +182,8 @@ describe('theme.css tracks the TypeScript tokens', () => {
   });
 
   it('leaves the diagonal that already shipped alone', () => {
-    // `PALETTES` adds an axis; it must not move a colour. Dark-field and light-sheet are the
-    // pairing every map style, print sheet and native screen already reads out of `SCHEMES`,
-    // so they are aliased here rather than copied — and identity is the assertion that says
-    // so, because two objects with equal values would drift apart without failing.
+    // Dark-field and light-sheet are aliased out of `SCHEMES`, not copied. Identity is the
+    // assertion, because two objects with equal values would drift apart without failing.
     expect(PALETTES.dark.field).toBe(SCHEMES.field);
     expect(PALETTES.light.sheet).toBe(SCHEMES.sheet);
   });
@@ -246,9 +237,7 @@ describe('theme.css tracks the TypeScript tokens', () => {
     }
 
     // Tailwind builds `max-w-*` from `--container-*`, so the CSS name is not the TS key:
-    // `measureWide` is `--container-measure-wide`, and a page asks for `max-w-measure-wide`.
-    // These carry their units in the TypeScript, because `ch` and `px` mean different
-    // things here and a bare number would have to pick one.
+    // `measureWide` is `--container-measure-wide`.
     for (const [key, value] of Object.entries(LAYOUT)) {
       const name = key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
       expect(theme.get(`--container-${name}`), `--container-${name}`).toBe(value);
@@ -256,11 +245,8 @@ describe('theme.css tracks the TypeScript tokens', () => {
   });
 
   it('carries the control ladder for the CSS that cannot use a class', () => {
-    // In px, not rem, because that is what the ladder is: `CONTROL_HEIGHT` is documented in
-    // device-independent pixels and `controls.ts` spells it `min-h-[34px]`. A rem here would
-    // make the same rung two different heights depending on which file asked for it.
-    //
-    // Exactly these three, and no fourth — the rule the ladder is held to everywhere else.
+    // In px, not rem: `CONTROL_HEIGHT` is device-independent pixels and `controls.ts` spells it
+    // `min-h-[34px]`, so a rem here would make one rung two heights. Exactly these three.
     for (const [key, px] of Object.entries(CONTROL_HEIGHT)) {
       expect(controlBlock.get(`--control-${key}`), `--control-${key}`).toBe(`${px}px`);
     }
@@ -291,8 +277,7 @@ describe('the palette is measured, not eyeballed', () => {
   it.each(ALL)(
     '%s %s: keeps the five plates within a narrow band of each other',
     (mode, scheme) => {
-      // A legend where one entry is louder is a hierarchy pretending to be a legend. The
-      // four coloured plates must read as peers; `ink` is exempt because structure is
+      // The four coloured plates must read as peers; `ink` is exempt because structure is
       // allowed to outrank data.
       const c = PALETTES[mode][scheme];
       const ratios = (['contour', 'water', 'woodland', 'survey'] as const).map((k) =>
@@ -305,12 +290,8 @@ describe('the palette is measured, not eyeballed', () => {
   it.each(['light', 'dark'] as Mode[])(
     '%s: separates the field surfaces enough to see and little enough to stay instrument',
     (mode) => {
-      // On `field` the bezel hairline is the edge, not a shadow. If `surface` climbs much
-      // above this it stops being an instrument and starts being a dialog left open.
-      //
-      // Held in daylight too, and that constraint is what forces the light field panel to
-      // white: light luminances sit near the ceiling, so a canvas dark enough to sit behind
-      // a map leaves no room to raise a tinted panel clear of it.
+      // On `field` the bezel hairline is the edge, not a shadow. Held in daylight too, which is
+      // what forces the light field panel to white — see `FIELD_LIGHT`.
       const c = PALETTES[mode].field;
       const r = contrast(c.surface, c.canvas);
       expect(r).toBeGreaterThan(1.2);
@@ -328,8 +309,8 @@ describe('the palette is measured, not eyeballed', () => {
 
 describe('the grade ramp', () => {
   it('encodes severity twice — hue and hatch density', () => {
-    // The second encoding is the point: it survives any colour vision deficiency, and it
-    // only works if density is strictly monotonic.
+    // The second encoding survives any colour vision deficiency, but only if density is
+    // strictly monotonic.
     const hatches = GRADE_STEPS.map((s) => s.hatch);
     expect(hatches).toEqual([...hatches].sort((a, b) => b - a));
     const bounds = GRADE_STEPS.map((s) => s.from);
@@ -348,8 +329,7 @@ describe('the grade ramp', () => {
 
 describe('the React Native conversion', () => {
   it('turns line-height ratios into points', () => {
-    // Passing CSS's unitless 1.6 straight to React Native renders 1.6pt of line spacing,
-    // i.e. text on top of itself. This is the conversion that stops that.
+    // CSS's unitless 1.6 passed straight to React Native renders 1.6pt of line spacing.
     const body = nativeTextStyle('body');
     expect(body.fontSize).toBe(16);
     expect(body.lineHeight).toBe(Math.round(16 * LINE_HEIGHT.body));
@@ -372,8 +352,7 @@ describe('the React Native conversion', () => {
 
   it('carries weight in the family name and never as fontWeight', () => {
     // expo-font registers one family per file, so `Archivo` + `fontWeight: 600` resolves to
-    // nothing. Emitting fontWeight as well would make iOS synthesise a bold on top of the
-    // real one — the smeared, over-heavy text that gives a React Native app away.
+    // nothing, and emitting fontWeight too would make iOS synthesise a bold over the real one.
     const semibold = nativeTextStyle('h2', { weight: 'semibold' });
     expect(semibold.fontFamily).toBe('Archivo_600SemiBold');
     expect(semibold).not.toHaveProperty('fontWeight');
@@ -383,8 +362,6 @@ describe('the React Native conversion', () => {
   });
 
   it('names a fallback per role, so a failed load keeps the serif serif', () => {
-    // Not one system sans for everything: prose that silently loses its serif is a
-    // different design, and this is the frame before useFonts resolves on every cold start.
     for (const family of Object.keys(NATIVE_FONTS) as (keyof typeof NATIVE_FONTS)[]) {
       expect(NATIVE_FALLBACKS[family]).toBeTruthy();
     }

@@ -1,24 +1,11 @@
 /**
- * React Native shape of the same tokens.
+ * React Native shape of the same tokens. Imports nothing from `react-native`, because
+ * `packages/ui` is also consumed by the Next.js app.
  *
- * This file imports nothing from `react-native` on purpose — `packages/ui` is consumed by
- * the Next.js app as well, and a stray `react-native` import would break that bundle. What
- * it does instead is the unit conversion, which is the actual reason it exists.
- *
- * Three conversions that are easy to get wrong per-component and impossible to get wrong
- * here:
- *
- * - **lineHeight.** CSS takes a unitless multiplier; React Native takes points. A `1.6`
- *   passed straight through renders 1.6pt line spacing, i.e. overlapping text.
- * - **letterSpacing.** Our tracking is in em so it scales with size; React Native takes
- *   points. +0.14em on an 11px collar label is 1.54pt, and passing `0.14` gives you
- *   letterspacing you cannot see.
- * - **weight.** On the web, `font-family: Archivo` plus `font-weight: 600` picks an
- *   instance out of one variable font. React Native has no such indirection: `expo-font`
- *   registers each file under its own family name, so the weight *is* the family. These
- *   styles therefore carry `fontFamily: 'Archivo_600SemiBold'` and deliberately no
- *   `fontWeight` — leaving one in asks iOS to synthesise a fake bold on top of a real one,
- *   which is the smeared, slightly-too-heavy text that gives away a React Native app.
+ * It exists for three unit conversions: `lineHeight` (CSS multiplier → points), `letterSpacing`
+ * (em → points), and `weight` — `expo-font` registers each file under its own family name, so
+ * the weight *is* the family. These styles carry `fontFamily: 'Archivo_600SemiBold'` and
+ * deliberately no `fontWeight`; leaving one in makes iOS synthesise a fake bold over a real one.
  */
 
 import { FONT_SIZE, FONTS, LINE_HEIGHT, TRACKING } from './tokens/type';
@@ -28,22 +15,14 @@ import { SCHEMES } from './tokens/color';
 import type { Scheme, SchemeColors } from './tokens/color';
 
 /**
- * The faces the app loads, keyed by the role and weight a caller asks for.
+ * The faces the app loads. Values are `@expo-google-fonts/*` export names, written out rather
+ * than derived — that package produces both `SourceSerif4` and `IBMPlexMono`, and a transform
+ * covering both would be worse to debug than a table. `apps/mobile/app/_layout.tsx` registers
+ * exactly these keys; `NativeFontName` stops the two lists drifting.
  *
- * The values are `@expo-google-fonts/*` export names, written out rather than derived:
- * that package turns `Source Serif 4` into `SourceSerif4` and `IBM Plex Mono` into
- * `IBMPlexMono`, and a clever string transform that reproduces both would be a worse thing
- * to debug than a table. `apps/mobile/app/_layout.tsx` registers exactly these keys, and
- * the type below is what stops the two lists drifting apart silently.
- *
- * Only the weights actually used are here, and that is the point — every entry is a font
- * file downloaded over cellular before the first screen paints. `displayCondensed` has one
- * because the collar label is one treatment.
- *
- * Archivo Narrow rather than Archivo at `wdth: 78`: React Native cannot drive an OpenType
- * width axis, so the condensed cut has to be a separate file. Narrow is Archivo's own
- * companion family from the same foundry, drawn at very nearly that width, which is why
- * `tokens/type.ts` can describe a width axis for the web and this file a second family.
+ * Only the weights actually used, since each entry is a file downloaded before the first paint.
+ * Archivo Narrow rather than Archivo at `wdth: 78`: React Native cannot drive an OpenType width
+ * axis, so the condensed cut has to be a separate family.
  */
 export const NATIVE_FONTS = {
   display: {
@@ -75,10 +54,8 @@ export type NativeFontName =
   (typeof NATIVE_FONTS)[NativeFamily][keyof (typeof NATIVE_FONTS)[NativeFamily]];
 
 /**
- * Fallbacks for the frames before `useFonts` resolves, and for a device where it fails.
- *
- * Named per role so a failed load degrades to the right *kind* of face — the serif prose
- * stays serif — rather than dropping the whole app to one system sans.
+ * Fallbacks for the frames before `useFonts` resolves, and for a device where it fails. Named
+ * per role so a failed load degrades to the right *kind* of face.
  */
 export const NATIVE_FALLBACKS: Readonly<Record<NativeFamily, string>> = {
   display: 'System',
@@ -105,9 +82,8 @@ export function nativeTextStyle<F extends NativeFamily = 'display'>(
   const weight = (options.weight as string | undefined) ?? 'regular';
   const px = FONT_SIZE[size];
   return {
-    // `?? regular` is not a silent fallback: `displayCondensed` has no regular either, so
-    // the only way past the type check into this branch is a family whose sole face is
-    // named something else, and taking it is better than rendering an undefined family.
+    // Reachable only for a family whose sole face is not named `regular`; rendering its first
+    // face beats rendering an undefined family.
     fontFamily: faces[weight] ?? Object.values(faces)[0]!,
     fontSize: px,
     lineHeight: Math.round(px * LINE_HEIGHT[size]),
@@ -116,9 +92,8 @@ export function nativeTextStyle<F extends NativeFamily = 'display'>(
 }
 
 /**
- * The collar label, pre-built because it is one specific treatment rather than a range of
- * options: 11pt, condensed, uppercase, letterspaced. Everywhere a map sheet would print
- * marginalia and nowhere else.
+ * The collar label: 11pt, condensed, uppercase, letterspaced. Pre-built because it is one
+ * specific treatment — marginalia, and nowhere else.
  */
 export const collarLabel: NativeTextStyle & { textTransform: 'uppercase' } = {
   ...nativeTextStyle('micro', { family: 'displayCondensed', weight: 'bold' }),
@@ -130,12 +105,7 @@ export interface NativeTheme {
   color: Readonly<SchemeColors>;
   space: typeof SPACE;
   radius: typeof RADIUS;
-  /**
-   * One *device* pixel, not one point — thinner and correcter on a retina screen, which
-   * matters because on the field scheme this line is what separates surfaces rather than
-   * a shadow. The app substitutes `StyleSheet.hairlineWidth`; this is the fallback for
-   * anywhere that value is not reachable.
-   */
+  /** Fallback for where `StyleSheet.hairlineWidth` (one *device* pixel) is not reachable. */
   hairline: number;
   text: typeof nativeTextStyle;
   collarLabel: typeof collarLabel;

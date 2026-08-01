@@ -1,18 +1,11 @@
 /**
  * Choosing where along a trail to ask about the weather, and when you will be there.
  *
- * Two decisions live here, and both are what separate this from a trailhead forecast.
- *
- * **Where.** Evenly spaced points are not enough on their own. The high point is always
- * sampled, because it is the place where a forecast changes a decision — it is coldest,
- * windiest, most exposed, and the first to be above the freezing level. Losing it to an
- * unlucky spacing would defeat the feature on exactly the trails that need it.
- *
- * **When.** An out-and-back is not "the trail, twice". Descending the climb you just made
- * is materially faster, so the return leg is built as real geometry — the profile mirrored
- * back — and run through Tobler in its own right rather than having the outbound time
- * doubled. A five-hour ascent and a three-hour descent is the difference between finishing
- * comfortably before sunset and finishing in the dark, which is a flag this product raises.
+ * The high point is always sampled, whatever the spacing: it is the coldest, windiest, most
+ * exposed place and the first above the freezing level. An out-and-back's return leg is built
+ * as real geometry (the profile mirrored) and run through Tobler in its own right, because
+ * descending a climb is materially faster than making it — doubling the outbound time is the
+ * difference between finishing before sunset and finishing in the dark.
  */
 
 import type { ElevationPoint, RouteType, UnitSystem } from '@switchback/core';
@@ -37,14 +30,10 @@ export interface SamplePlan {
 }
 
 /**
- * The route as actually hiked, when the hiker asked for the return leg.
- *
- * The mirroring itself, and the question of whether the stored geometry is one leg or two,
- * both live in `hikedProfile` — the same function the section chart draws from, so a strip
- * that says "back at the car 14:05" and an axis that ends at 12.0 km are reading one
- * definition of the hike rather than two that agree by luck. All this adds is the hiker's
- * own choice: someone being collected at the far end is not walking back, whatever the
- * geometry says.
+ * The route as actually hiked, when the hiker asked for the return leg. The mirroring and the
+ * question of whether stored geometry is one leg or two both live in `hikedProfile` — the same
+ * function the section chart draws from, so the strip and the axis share one definition of the
+ * hike. All this adds is the hiker's own choice.
  */
 export function buildJourney(
   profile: readonly ElevationPoint[],
@@ -63,10 +52,8 @@ export interface SampleOptions {
 }
 
 /**
- * Pick the sample points and compute an arrival time for each.
- *
- * Returned sorted by position along the journey, which for a time-shifted forecast is also
- * chronological order — the strip reads left to right as the day does.
+ * Pick the sample points and compute an arrival time for each. Sorted by position along the
+ * journey, which for a time-shifted forecast is also chronological order.
  */
 export function planSamples(
   journey: readonly ElevationPoint[],
@@ -113,12 +100,9 @@ export function planSamples(
 }
 
 /**
- * Names, not coordinates.
- *
- * "Summit" is avoided in favour of "High point": we know the maximum of the elevation
- * profile, which on a valley hike is a slight rise beside a river. Calling that a summit
- * would be the interface overstating what it knows, and this is a product people make
- * safety decisions with.
+ * Names, not coordinates. "High point" rather than "Summit": we know the maximum of the
+ * elevation profile, which on a valley hike is a rise beside a river, and this is a product
+ * people make safety decisions with.
  */
 function labelFor(args: {
   index: number;

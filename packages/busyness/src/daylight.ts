@@ -1,23 +1,11 @@
 /**
- * When it is light, which is when people hike.
+ * When it is light, which is when people hike. The curve is anchored to sunrise and sunset
+ * rather than to fixed clock hours, so it moves with the season on its own.
  *
- * Busy times are usually drawn as fixed clock hours — a morning peak at 10:00, an afternoon
- * one at 14:00 — and that is wrong twice over. In Fort William in December the sun rises at
- * 08:50 and sets at 15:35; a "10:00 morning peak" is barely an hour after first light, and
- * an "afternoon peak" would sit in the dark. Anchoring the curve to sunrise and sunset
- * instead makes the model move with the season on its own, and it is what lets the
- * recommendation refuse to suggest a start that cannot finish before dark.
- *
- * The astronomy is the standard low-precision solar position: declination from the day of
- * the year, then the sunrise hour angle. Accurate to a few minutes, against a curve whose
- * resolution is one hour. Two deliberate omissions, both stated rather than hidden:
- *
- * - **No equation of time.** It shifts solar noon by at most ±16 minutes across the year.
- * - **No refraction or solar-disc correction.** Sunrise here is geometric — the centre of
- *   the sun crossing the horizon — which runs a few minutes later than the almanac's.
- *
- * Neither is visible at hourly resolution, and carrying them would imply a precision this
- * model does not have anywhere else.
+ * Standard low-precision solar position: declination from day of year, then the sunrise hour
+ * angle. Two deliberate omissions, neither visible at hourly resolution — no equation of time
+ * (±16 min across the year), and no refraction or solar-disc correction, so sunrise here is
+ * geometric and runs a few minutes later than an almanac's.
  */
 
 const DEG = Math.PI / 180;
@@ -38,11 +26,9 @@ export interface DaylightWindow {
 }
 
 /**
- * Solar declination for a day of the year, in degrees.
- *
- * Positive in the northern summer. Day 81 is the March equinox, where the sine is zero and
- * declination crosses through zero on its way north — which is why the phase is written
- * against 81 rather than against January.
+ * Solar declination for a day of the year, in degrees; positive in the northern summer. The
+ * phase is written against day 81 because that is the March equinox, where declination crosses
+ * zero heading north.
  */
 export function solarDeclinationDeg(dayOfYear: number): number {
   return OBLIQUITY_DEG * Math.sin(((2 * Math.PI) / 365.24) * (dayOfYear - 81));
@@ -52,19 +38,15 @@ export interface DaylightOptions {
   /** Longitude in degrees, for the offset between clock noon and solar noon. */
   lngDeg?: number;
   /**
-   * The trail's UTC offset in seconds, including DST. Supply it when known — the timezone
-   * a trail sits in is a political fact, not a geometric one, and guessing from longitude
-   * alone puts Vigo an hour out and most of China three.
+   * The trail's UTC offset in seconds, including DST. Supply it when known: a timezone is a
+   * political fact, and guessing from longitude puts Vigo an hour out and most of China three.
    */
   utcOffsetS?: number;
 }
 
 /**
- * Sunrise, sunset and solar noon in local clock hours.
- *
- * With no `utcOffsetS` the timezone is guessed from longitude, which is right for most of
- * the world and never worse than an hour or so — enough for a curve read in hour-wide bars,
- * and the caller can do better whenever it has been told the real offset.
+ * Sunrise, sunset and solar noon in local clock hours. With no `utcOffsetS` the timezone is
+ * guessed from longitude — never worse than an hour or so, which an hour-wide bar absorbs.
  */
 export function daylightWindow(
   latDeg: number,
@@ -74,15 +56,13 @@ export function daylightWindow(
   const lngDeg = options.lngDeg ?? 0;
   const offsetH = (options.utcOffsetS ?? Math.round(lngDeg / 15) * 3600) / 3600;
 
-  // Clock time runs ahead of local solar time by however far the trail sits east of its
-  // timezone's meridian.
+  // Clock time runs ahead of solar time by how far east of its meridian the trail sits.
   const solarNoonHour = clamp(12 - lngDeg / 15 + offsetH, 0, 24);
 
   const declination = solarDeclinationDeg(dayOfYear);
   const cosH = -Math.tan(latDeg * DEG) * Math.tan(declination * DEG);
 
-  // Inside the polar circles the sun does not cross the horizon at all, and `acos` would
-  // return NaN rather than saying so. Both cases are real places with real trails.
+  // Inside the polar circles the sun never crosses the horizon and `acos` would return NaN.
   if (cosH <= -1) {
     return {
       sunriseHour: 0,

@@ -1,28 +1,12 @@
 /**
- * The prior: what a week on this trail probably looks like before anyone has recorded one.
+ * The prior: a demand surface over (day of week, hour) built from OSM tags and latitude alone,
+ * for the trails — most of them — with no recorded activity yet.
  *
- * Every trail starts here, and most trails stay here — a new corpus has no recorded
- * activities at all, so the model has to say something defensible from OSM tags and a
- * latitude alone. What it says is a demand surface over (day of week, hour), built from
- * four factors that each answer a different question:
- *
- * | factor          | question                                          |
- * |-----------------|---------------------------------------------------|
- * | `dayAmplitude`  | how much busier is Saturday than Tuesday?          |
- * | `hourShape`     | when in the day do people set off?                 |
- * | `daylightGate`  | is it light enough to be out there?                |
- * | `saturation`    | does the car park fill up and cap the peak?        |
- *
- * **What deliberately is *not* a factor: anything that only scales the whole surface.**
- * The published score is normalised against the trail's own weekly peak, so a uniform
- * multiplier — season, popularity, absolute visitor count — divides straight back out and
- * changes nothing. This is the trap in a busy-times model: it is easy to write a hundred
- * lines of seasonal amplitude that provably cannot affect the output. Season enters through
- * daylight, which changes the *shape*. Popularity enters through weekday/weekend contrast,
- * which changes the *shape*. Parking capacity enters through saturation, which changes the
- * *shape*. How crowded the trail gets in absolute terms is a separate question with a
- * separate answer — `crowding` below, published as `peakLevel` rather than folded into the
- * curve where it would silently vanish.
+ * Only factors that change the *shape* of the week belong here: the published score is
+ * normalised against the trail's own weekly peak, so any uniform multiplier (season,
+ * popularity, absolute visitor count) divides straight back out and cannot affect the output.
+ * Season enters via daylight, popularity via weekday/weekend contrast, parking via saturation.
+ * Absolute crowding is published separately as `peakLevel` — see `crowdingFrom`.
  */
 
 import { daylightWindow, type DaylightWindow } from './daylight';
@@ -32,11 +16,8 @@ export const DAYS_PER_WEEK = 7;
 
 /**
  * Relative pull of each day before popularity is applied. 0 = Sunday, matching `Date#getDay`.
- *
- * Saturday leads, Sunday is close behind, Friday is lifted by afternoons off, and the
- * midweek trough sags towards Wednesday. These are the shape of every trailhead counter
- * study anyone publishes, and they are the part of this file most worth replacing with our
- * own aggregates once there are enough of them.
+ * Shaped after published trailhead counter studies; replace with our own aggregates once there
+ * are enough of them.
  */
 export const DAY_BASE: readonly number[] = [0.95, 0.4, 0.38, 0.38, 0.42, 0.58, 1.0];
 
@@ -48,19 +29,13 @@ export interface HourBump {
   weight: number;
 }
 
-/**
- * Weekend: two departures. The early one is the hike you planned; the later one is the
- * hike you decided on after breakfast, and it is nearly as large.
- */
+/** Weekend: two departures — the hike you planned, and the one decided on after breakfast. */
 export const WEEKEND_BUMPS: readonly HourBump[] = [
   { at: 0.3, width: 0.13, weight: 1.0 },
   { at: 0.56, width: 0.17, weight: 0.86 },
 ];
 
-/**
- * Weekday: one broad afternoon peak, because most people are at work until it, plus a small
- * dawn shoulder for the regulars who go before it.
- */
+/** Weekday: one broad afternoon peak, plus a small dawn shoulder for the regulars. */
 export const WEEKDAY_BUMPS: readonly HourBump[] = [
   { at: 0.14, width: 0.09, weight: 0.34 },
   { at: 0.63, width: 0.21, weight: 1.0 },
@@ -69,7 +44,7 @@ export const WEEKDAY_BUMPS: readonly HourBump[] = [
 /** Baseline traffic through the daylight hours, so the curve never reads as empty at noon. */
 export const DAYLIGHT_FLOOR = 0.06;
 
-/** Night is quiet, not empty. People do hike in the dark, and a hard zero would say they cannot. */
+/** Night is quiet, not empty — a hard zero would claim nobody hikes in the dark. */
 export const NIGHT_FLOOR = 0.015;
 
 /** Hours either side of sunrise/sunset over which the gate opens and closes. */
@@ -86,14 +61,10 @@ export interface TrailSignals {
 }
 
 /**
- * Evidence that people go here, on a scale where 0 means we have none.
- *
- * `photoCount` earns its weight: it is seeded from Wikimedia Commons and Mapillary during
- * ingest, so on a cold corpus it is the *only* signal that separates a honeypot from a
- * forestry track — forty photographs of a hill is forty people who thought it worth
- * photographing. `parkingCapacity` is demand evidence in the same way: nobody surfaces two
- * hundred spaces for a path nobody hikes. It is tagged on barely one trail in eighty, and
- * contributes nothing when absent rather than dragging the estimate to zero.
+ * Evidence that people go here, where 0 means we have none. `photoCount` carries weight because
+ * ingest seeds it from Commons and Mapillary, making it the only signal on a cold corpus that
+ * separates a honeypot from a forestry track. A missing `parkingCapacity` contributes nothing
+ * rather than dragging the estimate to zero.
  */
 export function demandEvidence(signals: TrailSignals): number {
   const popularity = Math.max(0, signals.popularity ?? 0);
@@ -107,12 +78,8 @@ export function demandEvidence(signals: TrailSignals): number {
 export const CROWDING_REFERENCE = 400;
 
 /**
- * 0–1: how crowded this trail gets at its weekly peak.
- *
- * Logarithmic because the difference between 0 and 20 pieces of evidence means far more
- * than the difference between 200 and 220 — visitor numbers across a corpus are roughly
- * log-normal, and a linear scale would put every trail in the bottom percent of the range
- * and call them all quiet.
+ * 0–1: how crowded this trail gets at its weekly peak. Logarithmic because visitor numbers
+ * across a corpus are roughly log-normal, and a linear scale would call every trail quiet.
  */
 export function crowdingFrom(signals: TrailSignals): number {
   const evidence = demandEvidence(signals);
@@ -121,12 +88,9 @@ export function crowdingFrom(signals: TrailSignals): number {
 }
 
 /**
- * Weekday-versus-weekend contrast, as an exponent on `DAY_BASE`.
- *
- * A trail nobody has heard of is a weekend trail almost exclusively; a famous one is busy
- * every day of the week. Since `DAY_BASE` is below 1 on weekdays and exactly 1 on Saturday,
- * raising it to a power greater than 1 deepens the midweek trough and leaves the peak alone
- * — one parameter, monotone, and it cannot accidentally reorder the days.
+ * Weekday-versus-weekend contrast, as an exponent on `DAY_BASE`. Since `DAY_BASE` is below 1 on
+ * weekdays and exactly 1 on Saturday, an exponent above 1 deepens the midweek trough and leaves
+ * the peak alone — monotone, so it cannot reorder the days.
  */
 export function contrastExponent(crowding: number): number {
   return 1.75 - 0.95 * clamp01(crowding);
@@ -149,11 +113,9 @@ export interface PriorSurface {
 }
 
 /**
- * The whole week, before observations and before weather.
- *
- * One daylight window for all seven days: a week moves sunset by about ten minutes, which
- * is invisible at hourly resolution and would otherwise make Monday and Sunday of the same
- * week disagree about when it gets dark.
+ * The whole week, before observations and before weather. One daylight window covers all seven
+ * days: a week moves sunset ~10 minutes, invisible at hourly resolution, and separate windows
+ * would make Monday and Sunday disagree about when it gets dark.
  */
 export function priorSurface(input: PriorInput): PriorSurface {
   const signals = input.signals ?? {};
@@ -190,19 +152,16 @@ export function priorSurface(input: PriorInput): PriorSurface {
 }
 
 /**
- * Sum of Gaussian bumps positioned by fraction of daylight, not by clock hour.
- *
- * This is what makes the curve seasonal for free: in June the two weekend peaks sit six
- * hours apart, in December they compress into a four-hour window around noon, and neither
- * case needed a rule of its own.
+ * Sum of Gaussian bumps positioned by fraction of daylight, not by clock hour — which is what
+ * makes the curve seasonal without a rule for it: in June the two weekend peaks sit six hours
+ * apart, in December they compress around noon.
  */
 export function hourShape(
   clockHour: number,
   daylight: DaylightWindow,
   bumps: readonly HourBump[],
 ): number {
-  // Polar night has no window to place anything in. A flat curve is the honest answer:
-  // whoever is out there in the dark is not following a daily rhythm we can model.
+  // Polar night has no window to place bumps in; a flat curve is the honest answer.
   if (daylight.daylightHours <= 0) return 0;
 
   const fraction = (clockHour - daylight.sunriseHour) / daylight.daylightHours;
@@ -215,11 +174,9 @@ export function hourShape(
 }
 
 /**
- * 0–1, ramping across twilight rather than switching at sunrise.
- *
- * A step would put a cliff between two adjacent bars of the chart at an hour when the real
- * change is gradual, and would make the 06:00 bar in midsummer swing wildly between days
- * that differ by four minutes of sunrise.
+ * 0–1, ramping across twilight rather than switching at sunrise. A step would put a cliff
+ * between adjacent bars of the chart, and swing the 06:00 midsummer bar between days that
+ * differ by four minutes of sunrise.
  */
 export function daylightGate(clockHour: number, daylight: DaylightWindow): number {
   if (daylight.polarDay) return 1;
@@ -230,27 +187,18 @@ export function daylightGate(clockHour: number, daylight: DaylightWindow): numbe
 }
 
 /**
- * Peak visitors per hour implied by the crowding score, for the saturation model.
- *
- * A stated assumption rather than a measurement, and the one number here that would most
- * benefit from being replaced by our own counts. It exists only to give the car park
- * something to be full *of*: saturation needs demand and capacity in the same units.
+ * Peak visitors per hour implied by the crowding score. A stated assumption, not a measurement:
+ * it exists only to put demand and parking capacity in the same units for `saturate`.
  */
 export function peakArrivalsPerHour(crowding: number): number {
   return 4 + 260 * clamp01(crowding) ** 2;
 }
 
 /**
- * A car park that fills flattens the peak it cannot serve.
- *
- * Once every space is taken, arrivals are limited by departures, so the curve stops rising
- * and spreads sideways — the well-known "get there before nine or don't bother" trailhead.
- * `capacity · (1 − e^(−demand/capacity))` is the smooth form of that: linear while there is
- * room, asymptotic to the capacity once there is not, with no discontinuity in between.
- *
- * With no `capacity` tag — which is all but a handful of trails — this returns the surface
- * untouched. That is the whole of its graceful degradation: a missing tag removes an effect
- * rather than introducing a wrong one.
+ * A car park that fills flattens the peak it cannot serve — the "get there before nine" effect.
+ * `capacity · (1 − e^(−demand/capacity))` is linear while there is room and asymptotic once
+ * there is not, with no discontinuity. With no `capacity` tag the surface is returned untouched,
+ * so a missing tag removes an effect rather than introducing a wrong one.
  */
 export function saturate(
   demand: readonly (readonly number[])[],

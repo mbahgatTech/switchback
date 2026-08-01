@@ -1,17 +1,9 @@
 /**
  * Assembling the published forecast: prior → observations → weather → 0–100 → advice.
  *
- * The output contract lives in `@switchback/core` and is deliberately relative: `score` is
- * normalised against *this trail's* weekly peak, so 100 means "as busy as this path gets",
- * not "as busy as anywhere gets". That is the right choice for a chart — a shape you can
- * read at a glance — but it has a consequence worth stating plainly: every trail's busiest
- * hour scores 100 and is therefore labelled `packed`, including a moorland path that sees
- * nine people on a good Saturday.
- *
- * Rather than quietly rescale and break the chart, the absolute question gets its own
- * answer: `peakLevel` reports how crowded the peak really is, from the same evidence the
- * prior's contrast is built on, and is `null` when there is no evidence at all. The chart
- * stays readable; the claim stays true.
+ * `score` is normalised against *this trail's* weekly peak, so 100 means "as busy as this path
+ * gets" — every trail's busiest hour is `packed`, moorland included. The absolute question gets
+ * its own answer in `peakLevel`, rather than rescaling and breaking the chart.
  */
 
 import {
@@ -49,11 +41,7 @@ export interface BusynessInput {
   nowMs: number;
   signals?: TrailSignals;
   buckets?: readonly ObservationBucket[];
-  /**
-   * The trail's own Tobler estimate, in seconds — the same number the detail page shows
-   * and the weather strip hikes. It is what lets the recommendation refuse a start that
-   * cannot finish before dark.
-   */
+  /** The trail's own Tobler estimate, in seconds. Lets the recommendation refuse a start that cannot finish before dark. */
   estimatedTimeS?: number | null;
   /** Per day-of-week weather, 0 = Sunday. Omit for an unadjusted curve. */
   weather?: ReadonlyMap<number, DayWeather> | null;
@@ -64,14 +52,9 @@ export interface BusynessInput {
 export type BusynessResult = BusynessForecast;
 
 /**
- * How much a bad forecast is allowed to cost a candidate hour, in score points.
- *
- * This constant is load-bearing, and the bug it prevents is the whole reason the search is
- * a cost function rather than an argmin. Rain *lowers* the busyness score — that is what
- * the weather factor is for — so "the quietest feasible hour" would faithfully recommend
- * the wettest day of the week, every time, for the exact reason that nobody wants to be
- * there. Adding the penalty back puts the two effects on the same axis: an hour is only
- * worth recommending if it is quiet for a reason other than being miserable.
+ * How much a bad forecast is allowed to cost a candidate hour, in score points — the reason the
+ * search is a cost function rather than an argmin. Rain *lowers* the busyness score, so "the
+ * quietest feasible hour" would recommend the wettest day of the week, every time.
  */
 export const WEATHER_PENALTY = 55;
 
@@ -140,11 +123,9 @@ export function normalise(
 }
 
 /**
- * The quietest hour anyone would actually consider.
- *
- * The literal minimum of the day is 03:00 on every trail on earth: true, and useless as a
- * "best time to go" callout. This restricts the search to hours with real daylight and
- * only falls back to the whole day when there is none — which happens, in a polar winter.
+ * The quietest hour anyone would actually consider. The literal daily minimum is 03:00 on every
+ * trail on earth, so the search is restricted to lit hours, falling back to the whole day only
+ * in a polar winter.
  */
 export function quietestDaylightHour(
   hours: readonly BusynessHour[],
@@ -162,11 +143,8 @@ export function quietestDaylightHour(
 }
 
 /**
- * The one line the summary shows: go then.
- *
- * Two constraints and one cost. It must be light enough to start, there must be enough
- * daylight left to finish, and among the hours that pass, the best is the one that is
- * quiet without being quiet *because* the weather is bad.
+ * The one line the summary shows: go then. Two constraints and one cost — light enough to start,
+ * enough daylight left to finish, and quiet without being quiet *because* the weather is bad.
  */
 export function recommend(
   week: readonly BusynessDay[],
@@ -179,8 +157,8 @@ export function recommend(
 
   const durationH = estimatedTimeS && estimatedTimeS > 0 ? estimatedTimeS / 3600 : 0;
   const strict = candidates(week, daylight, durationH, true);
-  // A short winter day may not fit a long hike at any start time. Saying nothing helps
-  // nobody, so the fallback drops the finish-before-dark rule — and the reason says so.
+  // A short winter day may not fit a long hike at any start time; the fallback drops the
+  // finish-before-dark rule, and `reasonFor` says so.
   const relaxed = strict.length > 0 ? strict : candidates(week, daylight, durationH, false);
   if (relaxed.length === 0) return null;
 
@@ -233,10 +211,8 @@ function candidates(
 }
 
 /**
- * Why this slot, in the interface's voice.
- *
- * The clauses are all comparative, because the score is comparative — "quieter than the
- * Saturday peak" is a claim this model can support, and "only twelve people" is not.
+ * Why this slot, in the interface's voice. The clauses are comparative because the score is:
+ * "quieter than the Saturday peak" is a claim this model supports, "only twelve people" is not.
  */
 export function reasonFor(
   best: Candidate,
@@ -286,22 +262,18 @@ function busiestSlot(week: readonly BusynessDay[]): Candidate | null {
 }
 
 /**
- * Absolute crowding at the peak, on the same four-step scale.
+ * Absolute crowding at the peak, on the same four-step scale. `null` rather than `quiet` when
+ * there is nothing to go on — a trail we know nothing about is not one we know to be empty.
  *
- * `null` rather than `quiet` when there is nothing at all to go on: a trail we know
- * nothing about is not a trail we know to be empty, and the UI needs to tell those apart.
- *
- * The exponent matters more than it looks. `crowding` is logarithmic, which is right for
- * the contrast exponent but far too generous read directly as a percentage — twenty pieces
- * of evidence would come out at 51 and be labelled `busy`. Squaring it back out spreads the
- * corpus across all four steps instead of piling it into the top two.
+ * The gamma is load-bearing: `crowding` is logarithmic, which is right for the contrast exponent
+ * but far too generous read as a percentage, so squaring it back out spreads the corpus across
+ * all four steps instead of piling it into the top two.
  */
 export const PEAK_LEVEL_GAMMA = 1.8;
 
 export function peakLevelFrom(crowding: number, observationCount: number): BusynessLevel | null {
   if (crowding <= 0 && observationCount <= 0) return null;
-  // Recorded starts are the most direct crowding evidence there is, so they get the same
-  // log scale the prior's evidence uses rather than a bonus bolted on the side.
+  // Recorded starts are direct crowding evidence, so they take the same log scale the prior uses.
   const observed =
     observationCount > 0 ? Math.log1p(observationCount) / Math.log1p(CROWDING_REFERENCE) : 0;
   const combined = Math.min(1, Math.max(crowding, observed));

@@ -18,12 +18,9 @@ import {
 import type { AirQualityNow, OpenMeteoClient } from '../src/open-meteo';
 
 /**
- * The lattice, tested for the two things that can quietly go wrong with it.
- *
- * One is *overclaiming*: drawing cells finer than the model that produced them, which turns
- * sixteen copies of one number into sixteen apparent readings. The other is *drift*: a
- * lattice whose cell boundaries depend on where the viewport happened to start, so the same
- * ground changes colour when the reader pans past it and back.
+ * The lattice, guarded against overclaiming (cells finer than the model that produced them) and
+ * drift (cell boundaries that depend on where the viewport started, so ground changes colour
+ * when the reader pans past it and back).
  */
 
 /** A reading with everything null but the fields a test names. */
