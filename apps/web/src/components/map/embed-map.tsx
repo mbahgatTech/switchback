@@ -38,20 +38,13 @@ import { TRACK_FIT_PADDING_PX, addTrackLayers, fitTrack, setTrack } from './trac
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * The map the iOS app is holding.
+ * The map the iOS app holds in a `WebView`. Same MapLibre, `buildStyle` and layers as
+ * `trail-map.tsx`; what differs is that there is no React parent to lift state to, so this
+ * owns the viewport, the query and the selection and reports them over the bridge. See
+ * `map-bridge` in `@switchback/core` for the protocol.
  *
- * Same MapLibre, same `buildStyle`, same layers as `trail-map.tsx` — the whole point of the
- * arrangement. What differs is everything around it: there is no React parent to lift state
- * to, so this component owns the viewport, the query and the selection, and reports them
- * over the `WebView` channel to a screen written in React Native. See `map-bridge` in
- * `@switchback/core` for the protocol and for why the fetch lives on this side of it.
- *
- * It also runs standalone in a browser, which is how it is developed: without a host nothing
- * ever sends it a `query`, so it opens on the default filters and behaves like a plain map.
- *
- * **No hover.** A finger has no hover state, and the halo the desktop map paints under the
- * pointer would fire on the tap that also selects — the same emphasis twice, a frame apart.
- * Selection carries the whole job here.
+ * It also runs standalone in a browser, which is how it is developed. No hover: a finger has
+ * none, and the halo would fire on the tap that also selects.
  */
 
 declare global {
@@ -59,13 +52,9 @@ declare global {
     /** Present only inside a `react-native-webview`. Absent in a browser. */
     ReactNativeWebView?: { postMessage: (data: string) => void };
     /**
-     * The way in.
-     *
-     * A named global called by `injectJavaScript` rather than the `message` event, because
-     * that event is delivered on `document` on iOS and on `window` on Android and on both in
-     * some versions — listening to both risks handling one message twice, listening to one
-     * risks missing it entirely. A function has exactly one delivery. The host is safe to
-     * call it because it waits for `ready`, which is posted after this is installed.
+     * The way in. A named global called by `injectJavaScript` rather than the `message` event,
+     * which iOS delivers on `document`, Android on `window`, and some versions on both — so
+     * listening to either risks a double handle or a miss. The host waits for `ready`.
      */
     __switchbackMapIn?: (raw: string) => void;
   }
@@ -88,21 +77,15 @@ export interface EmbedMapProps {
   initialBasemap: BasemapId;
   initialHillshade: boolean;
   /**
-   * Which system to label summit heights in, for the first frame.
-   *
-   * A parameter rather than `useUnits()` because this page is loaded by a `WebView` outside
-   * the app's own React tree — there is no `UnitsProvider` above it and no session cookie
-   * inside it, since the phone authenticates with a bearer token the page has never seen. So
-   * the host, which knows the answer, puts it in the URL, and updates it over the bridge.
+   * Which system to label summit heights in, for the first frame. A parameter rather than
+   * `useUnits()` because this page loads outside the app's React tree — no `UnitsProvider`
+   * above it and no session cookie inside it — so the host puts it in the URL.
    */
   initialUnits: UnitSystem;
   /**
-   * Whether to look for trails in the viewport.
-   *
-   * Off for the map on a finished hike, which has exactly one line to draw and gets it over
-   * the bridge. Leaving `browse` on there would fire a `trails.browse` on every settle, fill
-   * the canvas with every path near the hike, and make the recorded track one line among
-   * forty — for a screen that is not asking a question about trails at all.
+   * Whether to look for trails in the viewport. Off for the map on a finished hike, which has
+   * one line to draw and gets it over the bridge; leaving it on would bury the recorded track
+   * among every path near it.
    */
   browse?: boolean;
 }
@@ -122,13 +105,8 @@ export function EmbedMap(props: EmbedMapProps) {
   const [units, setUnits] = useState<UnitSystem>(initialUnits);
   const [failed, setFailed] = useState<string | null>(null);
 
-  /*
-   * The chrome the host is drawing over this map, and the trails currently on it.
-   *
-   * Refs rather than state: both are read inside camera moves and message handling, and
-   * neither should cause a render on its own — a sheet being dragged would otherwise
-   * re-render the map component on every frame of the drag.
-   */
+  // Refs rather than state: both are read inside camera moves and message handling, and a
+  // sheet being dragged would otherwise re-render the map on every frame.
   const padding = useRef({ top: 0, bottom: 0 });
   const trails = useRef<readonly TrailMapItem[]>([]);
   const selection = useRef<string | null>(null);
@@ -167,7 +145,7 @@ export function EmbedMap(props: EmbedMapProps) {
     }),
   );
 
-  // ── Create once ───────────────────────────────────────────────────────────────────
+  // Create once.
   useEffect(() => {
     if (!container.current || map.current) return;
 
@@ -248,12 +226,9 @@ export function EmbedMap(props: EmbedMapProps) {
   }, []);
 
   /**
-   * Take a selection, wherever it came from.
-   *
-   * Both the tap handler and the host's `select` message funnel through here, so a row in the
-   * sheet and a line on the canvas cannot get out of step. Guarded against re-entry: the host
-   * echoes what this map posts, and without the early return that echo would re-fit the
-   * camera on a trail the user is already looking at.
+   * Take a selection, wherever it came from — the tap handler and the host's `select` message
+   * both funnel through here. Guarded against re-entry: the host echoes what this map posts,
+   * and without the early return that echo would re-fit the camera.
    */
   const applySelection = useCallback(
     (trailId: string | null, announce: boolean) => {
@@ -283,7 +258,7 @@ export function EmbedMap(props: EmbedMapProps) {
     [post],
   );
 
-  // ── Tap ───────────────────────────────────────────────────────────────────────────
+  // Tap.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -334,10 +309,8 @@ export function EmbedMap(props: EmbedMapProps) {
     };
   }, [applySelection]);
 
-  // ── The way in ────────────────────────────────────────────────────────────────────
-  //
-  // The handler is rebuilt whenever what it closes over changes; the global is a stable
-  // trampoline into the current one, so the host never holds a stale function.
+  // The way in. The handler is rebuilt whenever what it closes over changes; the global is a
+  // stable trampoline into the current one, so the host never holds a stale function.
   const handler = useRef<(message: MapIn) => void>(() => undefined);
 
   handler.current = (message: MapIn) => {
@@ -410,7 +383,7 @@ export function EmbedMap(props: EmbedMapProps) {
     };
   }, []);
 
-  // ── Data out ──────────────────────────────────────────────────────────────────────
+  // Data out.
   useEffect(() => {
     const instance = map.current;
     const data = browse.data;
@@ -443,7 +416,7 @@ export function EmbedMap(props: EmbedMapProps) {
     if (message) post({ type: 'error', message });
   }, [failed, browse.error, post]);
 
-  // ── Base map ──────────────────────────────────────────────────────────────────────
+  // Base map.
   const firstBasemap = useRef(true);
   useEffect(() => {
     const instance = map.current;

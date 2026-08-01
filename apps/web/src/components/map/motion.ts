@@ -1,14 +1,7 @@
 /**
- * Whether the reader has asked their machine for less motion.
- *
- * A single predicate rather than one per component, because the two callers have to agree:
- * the map decides whether to animate and the control decides what to call the button, and a
- * button reading "Fly the route" over a map that will show a still is worse than either
- * behaviour on its own.
- *
- * Read at the moment it is needed rather than subscribed to. The setting is an operating
- * system preference that nobody changes mid-flight, and a `matchMedia` listener would mean
- * tearing down a running animation from inside a media query.
+ * Whether the reader has asked their machine for less motion. One predicate rather than one
+ * per component, so the map and the control that labels it cannot disagree. Read on demand
+ * rather than subscribed to — a `matchMedia` listener would tear down a running animation.
  */
 export function prefersReducedMotion(): boolean {
   return (

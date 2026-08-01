@@ -27,15 +27,9 @@ import { useUnits } from '../units';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * The map.
- *
- * It owns the viewport and nothing else: it reports the box it is looking at, draws the
- * trails it is handed, and says which one the pointer is on. Fetching, filtering and
- * ranking all live above it. That split is what lets the same component serve browse now
- * and navigation in Phase 4, where the trails come from a downloaded bundle instead.
- *
- * The sources and layers themselves are in `./trail-layers`, shared with `/embed/map` —
- * the page the iOS app loads into a `WebView`. One cartography, two clients.
+ * The explore map. It owns the viewport and nothing else: reports the box it is looking at,
+ * draws the trails it is handed, says which one the pointer is on. The sources and layers are
+ * in `./trail-layers`, shared with the `/embed/map` page the iOS app loads into a WebView.
  */
 
 export interface TrailMapProps {
@@ -50,31 +44,17 @@ export interface TrailMapProps {
   hillshade: boolean;
   /** Avalanche-convention slope shading over the DEM. Off by default; see `./slope`. */
   slope: boolean;
-  /**
-   * The European AQI over the current viewport, or `null` when the overlay is off.
-   *
-   * Passed as data rather than as a flag because the map has no business knowing how the
-   * grid was obtained — the query, its cache and its loading state belong to the page.
-   */
+  /** European AQI over the current viewport, or `null` when the overlay is off. */
   airQuality?: AirQualityGrid | null;
   /**
-   * Recorded activity aggregated to a lattice, or `null` when the overlay is off.
-   *
-   * Same contract as `airQuality`, and for the same reason. Worth stating once here: the
-   * k-anonymity floor that makes this publishable is applied in the query, so anything that
-   * reaches this prop is already safe to draw. The map never filters, and must not be the
-   * place anyone looks for the privacy control.
+   * Recorded activity aggregated to a lattice, or `null` when the overlay is off. The
+   * k-anonymity floor is applied in the query, so anything reaching this prop is safe to draw.
    */
   heatmap?: Heatmap | null;
   /**
-   * Where to open. Read exactly once, at construction, by the create-once effect below — so
-   * changing it later is inert, and adding it to that effect's dependencies would tear down
-   * and rebuild the whole MapLibre instance on every render. The lever for a move after mount
-   * is `frame`, with its nonce.
-   *
-   * The caller decides where "here" is, and the callers do not agree: explore and plan derive
-   * it from the reader (`lib/place.ts`), the embed takes it from query params handed over by
-   * the phone. This prop has no opinion.
+   * Where to open. Read once at construction; changing it later is inert, and adding it to
+   * that effect's dependencies would rebuild the whole MapLibre instance. Use `frame` to move
+   * after mount.
    */
   initialCenter: [number, number];
   initialZoom: number;
@@ -83,13 +63,8 @@ export interface TrailMapProps {
 }
 
 /**
- * A commanded viewport change.
- *
- * The `nonce` is not ceremony. Searching "Vesper Peak", panning away to look at the ridge
- * to the north, then picking Vesper Peak from the list again is an ordinary thing to do,
- * and with a bare bbox the second pick changes no prop and moves no map — the component
- * would be right to conclude nothing happened. A frame is an event, not a state, and the
- * nonce is what makes an identical event distinguishable from no event.
+ * A commanded viewport change. The `nonce` makes an identical event distinguishable from no
+ * event — picking the same search result twice must move the map both times.
  */
 export interface MapFrame {
   bbox: BBox;
@@ -97,11 +72,8 @@ export interface MapFrame {
 }
 
 /**
- * How long the viewport must sit still before we ask for its trails.
- *
- * A drag fires `move` continuously and `moveend` once, but a flick fires `moveend` several
- * times as it decelerates. Without this a single gesture across a cold region queues four
- * overlapping Overpass fetches for overlapping tiles.
+ * How long the viewport must sit still before we ask for its trails. A flick fires `moveend`
+ * several times as it decelerates, which without this queues overlapping Overpass fetches.
  */
 const SETTLE_MS = 320;
 
@@ -125,41 +97,36 @@ export function TrailMap(props: TrailMapProps) {
 
   const container = useRef<HTMLDivElement | null>(null);
   const map = useRef<MapLibreMap | null>(null);
-  /*
-   * The callbacks are re-created on every render of the parent, and re-registering
-   * MapLibre listeners each time would leak handlers and re-fire the viewport query. The
-   * listeners are registered once against these boxes, which always hold the current
-   * function.
-   */
+  // The callbacks are re-created on every parent render, and re-registering MapLibre
+  // listeners each time would leak handlers and re-fire the viewport query.
   const handlers = useRef({ onViewportChange, onSelect, onHover });
   handlers.current = { onViewportChange, onSelect, onHover };
 
   const previousHover = useRef<string | null>(null);
   const previousSelection = useRef<string | null>(null);
 
-  // ── Create once ───────────────────────────────────────────────────────────────────
+  // Create once.
   const scaleBar = useScaleBar(120);
   const units = useUnits();
 
   useEffect(() => {
     if (!container.current || map.current) return;
 
-    // PMTiles serves a whole archive over HTTP range requests, so MapLibre needs the
-    // protocol handler before any style referencing `pmtiles://` is loaded. Registered
-    // only when there is an archive to read, since it is global state on the library.
+    // PMTiles serves a whole archive over HTTP range requests, so MapLibre needs the protocol
+    // handler before any style referencing `pmtiles://` loads. Registered only when there is
+    // an archive to read, since it is global state on the library.
     let protocol: Protocol | null = null;
     if (pmtilesUrl()) {
       protocol = new Protocol();
       maplibregl.addProtocol('pmtiles', protocol.tile);
     }
 
-    // Unconditional, and never removed — the handler is cheap, and a `slope://` source in a
-    // style that arrives before the protocol does is a tile error rather than a retry.
+    // Unconditional and never removed: a `slope://` source in a style that arrives before the
+    // protocol does is a tile error rather than a retry.
     registerSlopeProtocol();
 
-    // Likewise global, likewise unconditional: a name in Arabic or Hebrew that arrives
-    // before the shaper does is drawn backwards and stays that way until the tile is
-    // re-laid out. See `./rtl`.
+    // Likewise: a name in Arabic or Hebrew that arrives before the shaper is drawn backwards
+    // and stays that way until the tile is re-laid out. See `./rtl`.
     registerRTLText();
 
     const instance = new maplibregl.Map({
@@ -167,13 +134,12 @@ export function TrailMap(props: TrailMapProps) {
       style: buildStyle(basemap, { hillshade, slope, units }),
       center: initialCenter,
       zoom: initialZoom,
-      // Nothing in this product is served in a projection where rotating helps, and a
-      // map that has quietly rotated is a map you cannot read a bearing off.
+      // Nothing here is served in a projection where rotating helps, and a map that has
+      // quietly rotated is a map you cannot read a bearing off.
       dragRotate: false,
       pitchWithRotate: false,
       attributionControl: false,
-      // Our own attribution bar renders in the page, where it is legible against the
-      // panel rather than fighting the imagery.
+      // Our own attribution bar renders in the page, where it is legible against the panel.
     });
     map.current = instance;
 
@@ -205,14 +171,14 @@ export function TrailMap(props: TrailMapProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scaleBar]);
 
-  // ── Interaction ───────────────────────────────────────────────────────────────────
+  // Interaction.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
 
     const enter = (event: maplibregl.MapLayerMouseEvent) => {
-      // MapLibre types feature properties as `any`, which is honest — they came off a tile.
-      // Narrowing through `unknown` is what keeps that `any` from spreading into our state.
+      // MapLibre types feature properties as `any`. Narrowing through `unknown` keeps that
+      // `any` from spreading into our state.
       const id: unknown = event.features?.[0]?.properties?.id;
       instance.getCanvas().style.cursor = 'pointer';
       handlers.current.onHover(typeof id === 'string' ? id : null);
@@ -227,12 +193,8 @@ export function TrailMap(props: TrailMapProps) {
     };
 
     /**
-     * Clicking a cluster opens it.
-     *
-     * A cluster that does nothing when clicked is a dead end — it tells you thirty trails
-     * are here and gives you no way in. `getClusterExpansionZoom` returns the zoom at which
-     * this particular group breaks apart, which is the only zoom worth flying to: one step
-     * closer and it is still one circle, several steps and you have overshot the range.
+     * Clicking a cluster opens it. `getClusterExpansionZoom` returns the zoom at which this
+     * particular group breaks apart, which is the only zoom worth flying to.
      */
     const clusterClick = (event: maplibregl.MapLayerMouseEvent) => {
       const feature = event.features?.[0];
@@ -266,11 +228,11 @@ export function TrailMap(props: TrailMapProps) {
       instance.getCanvas().style.cursor = 'pointer';
     };
 
-    // Clicking bare ground clears the selection — the same gesture as putting the sheet
-    // down. Registered on the map rather than the layer, and ordered after it.
+    // Clicking bare ground clears the selection. Registered on the map rather than the layer,
+    // and ordered after it.
     const clickAway = (event: maplibregl.MapMouseEvent) => {
-      // Only the layers actually present at this zoom, because `queryRenderedFeatures`
-      // throws on an unknown layer id rather than ignoring it.
+      // Only the layers actually present at this zoom: `queryRenderedFeatures` throws on an
+      // unknown layer id rather than ignoring it.
       const layers = [HIT_LAYER, POINT_LAYER, CLUSTER_LAYER].filter((id) => instance.getLayer(id));
       if (layers.length === 0) return;
       if (instance.queryRenderedFeatures(event.point, { layers }).length === 0) {
@@ -303,26 +265,15 @@ export function TrailMap(props: TrailMapProps) {
     };
   }, []);
 
-  // ── Data ──────────────────────────────────────────────────────────────────────────
+  // Data.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
 
     /**
-     * Land the trails, and keep trying until they land.
-     *
-     * The old shape of this was `push() ?? once('idle', push)`, and the fallback was the
-     * bug. `idle` is emitted at the *end* of a render pass, so it only ever arrives if the
-     * map is going to render again — and a map sitting still with its tiles already drawn
-     * is not. Every ordering where the query resolves into a resting map therefore parked
-     * the data on a listener that would not fire until the reader happened to pan, which
-     * is the complaint exactly: trails fetched, trails correct, map empty.
-     *
-     * So: try now, and if the sources are not there yet, retry on each of the three events
-     * that can create them — a style loading, a source being added, a render finishing —
-     * and unsubscribe the moment one works. Three listeners rather than one because none of
-     * them is guaranteed on its own, and an extra `setData` on a source that already holds
-     * this exact collection costs a diff MapLibre was going to do anyway.
+     * Land the trails, retrying until the sources exist. `idle` alone is not enough — it is
+     * emitted at the end of a render pass, so a map sitting still with its tiles already
+     * drawn never fires it, and the data parks on a listener until the reader pans.
      */
     if (setTrailData(instance, trails)) {
       reportLanded(container.current, trails.length);
@@ -346,7 +297,7 @@ export function TrailMap(props: TrailMapProps) {
     return off;
   }, [trails]);
 
-  // ── Air quality ───────────────────────────────────────────────────────────────────
+  // Air quality.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -359,7 +310,7 @@ export function TrailMap(props: TrailMapProps) {
     else void instance.once('idle', push);
   }, [airQuality]);
 
-  // ── Activity heatmap ──────────────────────────────────────────────────────────────
+  // Activity heatmap.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -370,20 +321,18 @@ export function TrailMap(props: TrailMapProps) {
     else void instance.once('idle', push);
   }, [heatmap]);
 
-  // ── Commanded framing ─────────────────────────────────────────────────────────────
+  // Commanded framing.
   useEffect(() => {
     const instance = map.current;
     if (!instance || !frame) return;
-    // Deliberately not `maxZoom: 15` like a trail selection. A search result may be a
-    // summit node widened to 1.6 km, and clamping that would leave the peak framed at
-    // street level with nothing around it. `frameOf` in the geocoder has already decided
-    // how much ground the result deserves; second-guessing it here would undo that.
+    // Deliberately not `maxZoom: 15` like a trail selection: `frameOf` in the geocoder has
+    // already decided how much ground the result deserves.
     fit(instance, frame.bbox, 17);
     // `frame.bbox` is read but is not a trigger — the nonce is the event. See `MapFrame`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frame?.nonce]);
 
-  // ── Base map ──────────────────────────────────────────────────────────────────────
+  // Base map.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -408,7 +357,7 @@ export function TrailMap(props: TrailMapProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [basemap, hillshade, slope, units]);
 
-  // ── Hover and selection ───────────────────────────────────────────────────────────
+  // Hover and selection.
   useEffect(() => {
     const instance = map.current;
     if (!instance) return;
@@ -437,29 +386,12 @@ export function TrailMap(props: TrailMapProps) {
     <div
       ref={container}
       // Sized, not positioned. MapLibre's own stylesheet sets `.maplibregl-map { position:
-      // relative }` — it needs the container to be the positioning context for its canvas
-      // and controls, all of which are absolute. That rule has the same specificity as
-      // Tailwind's `.absolute` and is imported from this module, so it loads after the
-      // utilities layer and wins on source order. An `absolute inset-0` container therefore
-      // silently becomes `relative`, `inset-0` stops sizing anything, and the box collapses
-      // to the height of its content — which is zero, because every child is absolute. The
-      // map renders perfectly into a canvas nobody can see. `h-full` asks the parent for the
-      // height instead, which works whichever way `position` resolves.
+      // relative }` and wins on source order, so an `absolute inset-0` container silently
+      // becomes relative, stops being sized, and collapses to zero height.
       className="h-full w-full"
-      // Named and reachable, not hidden.
-      //
-      // The tempting move is `aria-hidden` — the trail list beside this is the accessible
-      // equivalent, and announcing a canvas with hundreds of unnamed children helps nobody.
-      // But MapLibre puts `tabindex="0"` on its canvas so the map can be panned and zoomed
-      // from the keyboard, and `aria-hidden` over a focusable element is the worst of both:
-      // the control still takes a tab stop, and a screen reader now lands on something it
-      // has been told does not exist, with nothing to announce. That is a WCAG 4.1.2
-      // failure rather than a tidier tree.
-      //
-      // So it is labelled instead. `region` rather than `application` because the arrow
-      // keys here pan a view; they do not operate a widget with its own key semantics, and
-      // `application` would suppress the reading-mode shortcuts a user relies on to get
-      // back out to the list.
+      // Labelled, never `aria-hidden`: MapLibre puts `tabindex="0"` on its canvas, and
+      // hiding a focusable element is a WCAG 4.1.2 failure. `region` rather than
+      // `application`, which would suppress the reading-mode shortcuts back out to the list.
       role="region"
       aria-label="Map of trails in the current view"
     />
@@ -467,18 +399,9 @@ export function TrailMap(props: TrailMapProps) {
 }
 
 /**
- * Say on the container how many trails the map is actually holding.
- *
- * Deliberately not React state. State would make this a restatement of the props — "we
- * rendered with 20 trails" — and the props were never in doubt; what was in doubt is
- * whether those 20 lines reached the GeoJSON source behind the canvas. Written straight
- * onto the DOM node, the attribute can only be set on the path where `setTrailData`
- * returned true, so it is a claim about the map rather than about the render.
- *
- * That makes it the one honest handle on a WebGL canvas from outside: the browser test
- * waits on it, and anyone debugging an empty map can read it in devtools and immediately
- * know which half of the problem they have — no attribute means the data never landed,
- * `data-trails="0"` means it landed and there is nothing here.
+ * Say on the container how many trails reached the GeoJSON source. Deliberately not React
+ * state: written only where `setTrailData` returned true, it is a claim about the map rather
+ * than about the render, which makes it the one honest handle on a WebGL canvas from outside.
  */
 function reportLanded(node: HTMLElement | null, count: number): void {
   if (node) node.dataset.trails = String(count);

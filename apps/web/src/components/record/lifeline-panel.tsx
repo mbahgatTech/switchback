@@ -16,26 +16,13 @@ import { useTRPC } from '../../trpc/react';
 import { BUTTON, DANGER, HEIGHT, PRIMARY, SECONDARY, toggle } from '../controls';
 
 /**
- * Lifeline, from the hiker's side.
+ * Lifeline, from the hiker's side: setup is three taps — a name, a return time from presets,
+ * go. No date picker, because a duration has no time zone and cannot be a day out. The
+ * message box is optional by design, since it is the field people skip.
  *
- * The follow page is written for somebody worried in a kitchen. This is written for the
- * person on the hill, and it has a different problem: everything here happens in the two
- * minutes before setting off, in a car park, one-handed, and anything that takes longer than
- * that does not get used — which for a safety feature means it does not exist.
- *
- * So the whole setup is three taps. A name, a return time from a row of presets, go. The
- * message box is there and is genuinely useful to a searcher, and it is also the field people
- * skip, so nothing depends on it. No date picker: a duration has no time zone, no AM/PM, and
- * no way to be a day out by accident.
- *
- * **It is quiet until it is running.** Closed, it is one line of prose and one button, because
- * the instrument above it is what somebody opened this screen for. Open and live, it is the
- * link and the clock and nothing else — the two things a hiker checks.
- *
- * **The panel keeps the position current itself.** A ping is not a side effect of recording:
- * somebody who just wants their partner to see where they are should not have to record a
- * hike to get it, so the loop here runs on its own cadence and takes the recorder's fix when
- * there is a fresh one going spare. What it will not do is send an old fix — see `freshFix`.
+ * The panel keeps the position current on its own cadence rather than as a side effect of
+ * recording, taking the recorder's fix when a fresh one is going spare. It never sends an old
+ * one — see `freshFix`.
  */
 
 export interface LifelinePanelProps {
@@ -50,12 +37,9 @@ export interface LifelinePanelProps {
 }
 
 /**
- * What "push it back" offers, in minutes from now.
- *
- * Shorter than the starting presets on purpose. Somebody extending is already out and already
- * behind, and the honest answer to "how much longer?" from halfway up is usually under an
- * hour. Offering another eight hours would invite a hiker to silence the thing rather than
- * answer it.
+ * What "push it back" offers, in minutes from now. Shorter than the starting presets:
+ * somebody extending is already out, and offering another eight hours would invite them to
+ * silence the thing rather than answer it.
  */
 const EXTEND_MINUTES = [30, 60, 120, 240] as const;
 
@@ -108,8 +92,8 @@ export function LifelinePanel({
 
   const { lastPingAt, pingError } = usePings(session?.id ?? null, position, eleM);
 
-  // Coarse on purpose: everything shown here is rounded to the minute, so a per-second tick
-  // would redraw the same characters sixty times over and keep a phone's screen busy for it.
+  // Coarse on purpose: everything here is rounded to the minute, so a per-second tick would
+  // redraw the same characters sixty times over.
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
     if (!session) return;
@@ -122,9 +106,7 @@ export function LifelinePanel({
 
   if (active.isPending) return null;
 
-  // ---------------------------------------------------------------------------
-  // Running
-  // ---------------------------------------------------------------------------
+  // Running.
 
   if (session) {
     const late = session.status === 'overdue';
@@ -179,9 +161,8 @@ export function LifelinePanel({
           </div>
 
           {/*
-           * The one figure that says whether the link is doing anything. A Lifeline whose
-           * position stopped an hour ago still looks alive from the hiker's side unless the
-           * screen says otherwise, and the hiker is the only one who can fix it.
+           * The one figure that says whether the link is doing anything: a Lifeline whose
+           * position stopped an hour ago still looks alive from the hiker's side.
            */}
           <p className={`text-micro ${stale ? 'text-survey' : 'text-ink-muted'}`}>
             {heard
@@ -190,10 +171,8 @@ export function LifelinePanel({
             {stale && heard ? ' — they are seeing an old one' : null}
           </p>
           {/*
-           * On its own line rather than tacked onto the one above, which used to read
-           * "Position sent 1 min ago · No position to send" — two true clauses that
-           * contradict each other when set as one sentence. Separated, they are what they
-           * are: when the last one landed, and what is happening now.
+           * On its own line: appended to the one above it read "Position sent 1 min ago · No
+           * position to send", two true clauses that contradict each other as one sentence.
            */}
           {pingError ? <p className="text-micro text-ink-muted">{pingError}</p> : null}
 
@@ -266,9 +245,7 @@ export function LifelinePanel({
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Not running
-  // ---------------------------------------------------------------------------
+  // Not running.
 
   if (!open) {
     return (
@@ -379,10 +356,8 @@ export function LifelinePanel({
         ) : null}
 
         {/*
-         * Said here rather than discovered later. Somebody handing out a link that shows their
-         * position deserves to know exactly what it does and exactly when it stops — and the
-         * sentence about nobody being alerted is the one this product must never soften,
-         * because there is no mail or SMS transport behind it to make it untrue.
+         * The sentence about nobody being alerted must never be softened: there is no mail or
+         * SMS transport behind it to make it untrue.
          */}
         <p className="text-micro leading-relaxed text-ink-muted">
           The link shows your last position and your return time, and stops showing anything the
@@ -394,9 +369,7 @@ export function LifelinePanel({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Keeping the position current
-// ---------------------------------------------------------------------------
+// Keeping the position current.
 
 interface Fix {
   at: number;
@@ -406,15 +379,12 @@ interface Fix {
 }
 
 /**
- * The ping loop.
- *
- * Runs while a Lifeline is live and stops the instant it is not, which is what makes the
- * promise on the follow page mechanical rather than a matter of trust: the position is not
+ * The ping loop. Runs while a Lifeline is live and stops the instant it is not, which makes
+ * the follow page's promise mechanical rather than a matter of trust: the position is not
  * withheld after a hike ends, it stops being sent.
  *
- * One immediate ping on start, then every `LIFELINE_PING_INTERVAL_S`. The first one matters
- * more than the cadence — a hiker who sets off, hands over the link and loses signal for
- * forty minutes should still have given their contact a dot at the car park.
+ * One immediate ping on start, then every `LIFELINE_PING_INTERVAL_S` — the first matters more
+ * than the cadence, since a hiker who sets off and loses signal has still given a dot.
  */
 function usePings(
   sessionId: string | null,
@@ -463,9 +433,8 @@ function usePings(
         setLastPingAt(at);
         setPingError(null);
       } catch (error) {
-        // Never surfaced as an alarm. A failed ping is a phone in a valley, which is the
-        // normal state of affairs on a hike, and the follow page already says how old the
-        // last position is — which is the honest version of the same fact.
+        // Never surfaced as an alarm: a failed ping is a phone in a valley, and the follow
+        // page already reports how old the last position is.
         if (!cancelled) setPingError(error instanceof Error ? error.message : 'Could not send');
       }
     };
@@ -482,16 +451,10 @@ function usePings(
 }
 
 /**
- * A position worth sending, or nothing.
- *
- * The rule that makes this feature honest: **never ping with an old fix.** `lastPingAt` is
- * stamped server-side at the moment the ping lands, so sending a forty-minute-old position
- * would put "last heard: just now" under a dot on the wrong side of a mountain. Better by far
- * to send nothing and let the follow page report the position going stale, which is true.
- *
- * The recorder's fix is preferred when there is a fresh one, because it is already paid for —
- * the watch is running, the radio is warm, and asking the browser for a second fix would wake
- * the GPS a second time for the same answer.
+ * A position worth sending, or nothing. Never ping with an old fix: `lastPingAt` is stamped
+ * server-side when the ping lands, so a forty-minute-old position would put "last heard: just
+ * now" under a dot on the wrong side of a mountain. The recorder's fix is preferred when
+ * fresh, because the radio is already warm.
  */
 async function freshFix(recorded: Fix | null): Promise<Fix | null> {
   if (recorded && Date.now() - recorded.at < LIFELINE_PING_INTERVAL_S * 1000) return recorded;
@@ -508,9 +471,9 @@ function currentPosition(): Promise<Fix | null> {
           at: Date.now(),
           lng: pos.coords.longitude,
           lat: pos.coords.latitude,
-          // Dropped rather than clamped when it is outside anywhere a person can stand. A
+          // Dropped rather than clamped when it is outside anywhere a person can stand: a
           // barometric altimeter indoors can report a kilometre underground, and one absurd
-          // number must not cost the whole ping — the position is the part that matters.
+          // number must not cost the whole ping.
           eleM: alt != null && Number.isFinite(alt) && alt > -500 && alt < 9_500 ? alt : null,
         });
       },
@@ -525,11 +488,8 @@ interface BatteryLike {
 }
 
 /**
- * Battery percentage, where the browser will say.
- *
- * A follower's first question about a phone that has gone quiet is whether it died, and this
- * is the difference between an answer and an hour of imagining. Not available on Safari or
- * Firefox, which is why every consumer of it treats null as ordinary.
+ * Battery percentage, where the browser will say. Not available on Safari or Firefox, so
+ * every consumer treats null as ordinary.
  */
 async function batteryPct(): Promise<number | null> {
   if (typeof navigator === 'undefined') return null;
@@ -546,9 +506,7 @@ async function batteryPct(): Promise<number | null> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// The link
-// ---------------------------------------------------------------------------
+// The link.
 
 interface ShareLink {
   url: string;
@@ -577,8 +535,8 @@ function useShareLink(token: string | null): ShareLink {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2_000);
     } catch {
-      // Clipboard access can be refused outright, and on a phone that is usually a permission
-      // rather than a fault. The field is readable and selectable, so there is still a way.
+      // Clipboard access can be refused outright, usually as a permission rather than a
+      // fault. The field is readable and selectable, so there is still a way.
       setCopied(false);
     }
   }, [url]);
@@ -604,9 +562,7 @@ function useShareLink(token: string | null): ShareLink {
   return { url, copied, canShare, copy, share };
 }
 
-// ---------------------------------------------------------------------------
-// Clocks
-// ---------------------------------------------------------------------------
+// Clocks.
 
 function clock(at: Date): string {
   return at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });

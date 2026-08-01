@@ -13,32 +13,18 @@ import {
 import { EMPTY_HEATMAP, HEATMAP_LAYER, HEATMAP_SOURCE, heatmapFillColor } from './heatmap';
 
 /**
- * The trail layers, and everything that pushes data or state into them.
+ * The trail layers and everything that pushes data or state into them. Plain functions over a
+ * `Map` instance, so `trail-map.tsx` and the iOS WebView at `/embed/map` share one definition.
  *
- * Extracted from `trail-map.tsx` so the phone can draw the same map. The iOS explore screen
- * is MapLibre GL JS in a `WebView` pointed at `/embed/map`, and the whole argument for that
- * arrangement is that there is exactly one definition of what a trail looks like on a map.
- * Two implementations that "match" is a promise nobody can keep past the first change.
- *
- * Everything here is plain functions over a `Map` instance — no React, no state — because
- * the two callers hold their map differently and the layers do not care which.
- *
- * **On colour.** Every line is the woodland plate, whatever its difficulty. Colouring by
- * difficulty is the obvious move and it is wrong here: a third of any mountain viewport is
- * `hard`, so the map would be flooded with the survey plate — the one colour reserved for
- * the user and their safety, which on the phone is the position dot on this exact screen.
- * Selection is carried by weight and a halo instead, which is emphasis rather than a second
- * meaning, and leaves the legend intact.
+ * Every line is the woodland plate whatever its difficulty: survey is reserved product-wide
+ * for the user and their safety, and a third of any mountain viewport is `hard`. Selection is
+ * carried by weight and a halo instead.
  */
 
 /**
- * A trail as the layers need it, which is much less than a trail is.
- *
- * Every field here is drawn: the geometry is the line, the bbox is the clustered dot and the
- * frame a selection flies to, and the two scalars are feature properties. `TrailMapItem`
- * satisfies it structurally, so the callers pass what `browse` returned without a mapping
- * step; declaring the minimum instead of taking the whole row is what lets these functions
- * also serve a stored bundle, a planned route, or anything else with a line and a box.
+ * A trail as the layers need it. Declaring the minimum rather than taking the whole row is
+ * what lets these functions also serve a stored bundle or a planned route; `TrailMapItem`
+ * satisfies it structurally.
  */
 export interface MapTrail {
   id: string;
@@ -61,17 +47,9 @@ export const POINT_LAYER = 'trail-point';
 export const POINT_ACTIVE_LAYER = 'trail-point-active';
 
 /**
- * Where lines give way to counts.
- *
- * Below this, a viewport holds more trails than it has pixels to draw them in: a hundred
- * hairlines over a mountain range is a green smear that says nothing about how many trails
- * are there, and its eighteen-pixel hit target overlaps every neighbour, so pointing at one
- * is a lottery. A cluster answers the question that zoom level is actually asking — *is
- * there anything here, and how much* — and it answers it in a number.
- *
- * Eleven, because that is roughly where a z9 ingest tile stops being larger than the screen.
- * Above it you are looking at one valley and the lines are the point; below it you are
- * choosing which valley.
+ * Where lines give way to counts: below this a viewport holds more trails than it has pixels,
+ * and an 18px hit target overlaps every neighbour. Eleven is roughly where a z9 ingest tile
+ * stops being larger than the screen.
  */
 export const CLUSTER_ZOOM = 11;
 
@@ -88,12 +66,9 @@ export function toFeatureCollection(trails: readonly MapTrail[]): FeatureCollect
 }
 
 /**
- * The same trails as one point each, for the cluster source.
- *
- * The centre of the bounding box rather than a true centroid of the line. For a loop they
- * are the same point; for a switchbacking climb they differ by less than the cluster radius,
- * which is the only distance that matters at a zoom where the whole trail is a few pixels
- * long. It also costs nothing — the bbox is already on the row.
+ * The same trails as one point each, for the cluster source. The bbox centre rather than a
+ * true centroid: at a zoom where the whole trail is a few pixels the difference is under the
+ * cluster radius, and the bbox is already on the row.
  */
 export function toPointCollection(trails: readonly MapTrail[]): FeatureCollection {
   return {
@@ -115,18 +90,12 @@ export function boundsOf(map: MapLibreMap): BBox {
 }
 
 /**
- * Push both trail sources at once, and say whether it landed.
+ * Push both trail sources at once; false when the style has no sources yet.
  *
- * The boolean is the point of this function. `getSource` returns undefined for every moment
- * before the style's first load, and again for the window during a basemap swap when
- * `setStyle` has torn the layers down and they have not gone back on yet — so the two
- * `setData` calls quietly do nothing and the function returns as if it had worked. That
- * silence is the whole of the "trails never land" failure: a correct query, a correct
- * response, a caller that believes it delivered, and an empty map with nothing anywhere
- * saying why.
- *
- * Both sources are checked before either is written, so the line layer and the point layer
- * can never end up holding different sets of trails.
+ * `getSource` returns undefined before the style's first load and again during a basemap
+ * swap, so without the boolean `setData` silently does nothing and the caller believes it
+ * delivered. Both sources are checked before either is written, so the line layer and the
+ * point layer can never hold different sets of trails.
  */
 export function setTrailData(instance: MapLibreMap, trails: readonly MapTrail[]): boolean {
   const lines = instance.getSource<GeoJSONSource>(SOURCE_ID);
@@ -139,12 +108,8 @@ export function setTrailData(instance: MapLibreMap, trails: readonly MapTrail[])
 }
 
 /**
- * Move the camera to hold `bbox`.
- *
- * The padding is symmetric and generous because the panel that crowds this map is a sibling
- * in the grid, not an overlay — the map's own box is already the free space. What it does
- * buy is breathing room at the frame edge, so a trail that fills its bounding box does not
- * touch the canvas border on all four sides and read as clipped.
+ * Move the camera to hold `bbox`. The padding buys breathing room at the frame edge so a
+ * trail filling its bounding box does not touch the border and read as clipped.
  */
 export function fit(
   instance: MapLibreMap,
@@ -199,16 +164,9 @@ export function setSelectedLine(instance: MapLibreMap, trailId: string | null): 
 }
 
 /**
- * You, on the map.
- *
- * The only thing anywhere in this module drawn in the survey plate. That plate is reserved
- * product-wide for the user and their safety, and this is the one mark on a map that is
- * about the person holding it rather than the ground under them — which is exactly why the
- * trail lines stay woodland however hard they are. If everything urgent is red, nothing is.
- *
- * The ring is real, not decoration: it is the reported accuracy drawn at the scale of the
- * map, so a fix good to eight metres is a dot and a fix good to ninety is a circle you can
- * see. Somebody deciding whether they are on the path or beside it needs that difference.
+ * You, on the map — the only thing in this module drawn in the survey plate. The ring is the
+ * reported accuracy at map scale, so a fix good to eight metres is a dot and one good to
+ * ninety is a circle somebody can judge against the path.
  */
 export const LOCATE_SOURCE = 'locate';
 export const LOCATE_ACCURACY_LAYER = 'locate-accuracy';
@@ -288,14 +246,9 @@ export function setLocate(
     return;
   }
 
-  /*
-   * A radius in metres, expressed in the only unit `circle-radius` speaks.
-   *
-   * Web Mercator's scale depends on latitude, so the conversion is computed here against the
-   * fix's own latitude and handed to MapLibre as the zoom-0 radius; the exponential-base-2
-   * interpolation is then exactly the map's own scaling, which means the ring stays the same
-   * patch of ground through a pinch instead of swelling or shrinking against the terrain.
-   */
+  // Web Mercator's scale depends on latitude, so the metres-to-pixels conversion is computed
+  // against the fix's own latitude and handed over as a zoom-0 radius; the exponential-base-2
+  // interpolation is the map's own scaling, so the ring stays the same patch of ground.
   const atZeroPx = accuracyM / (EQUATOR_M_PER_PX * Math.cos((position[1] * Math.PI) / 180));
   instance.setPaintProperty(LOCATE_ACCURACY_LAYER, 'circle-radius', [
     'interpolate',
@@ -309,18 +262,9 @@ export function setLocate(
 }
 
 /**
- * The id of the basemap's lowest label layer, or `undefined` if it has none.
- *
- * Area overlays are inserted before it so that place names, summit heights and contour
- * labels stay on top of them. Without this every fill is appended to the end of the layer
- * list — above the basemap's own symbols — and a translucent wash quietly erases the
- * toponyms underneath. "Yr Wyddfa 1085 m" disappearing under a heatmap cell is not a
- * cosmetic loss: on a hill map the labels are how you know which hill you are looking at.
- *
- * Symbol layers are found by type rather than by name because the id scheme belongs to
- * whichever style is loaded — OpenFreeMap's, the satellite style's, or a future self-hosted
- * one — and a hardcoded id would silently return `undefined` the day one of them changes,
- * putting the wash back over the labels with no error anywhere.
+ * The id of the basemap's lowest label layer, or `undefined` if it has none. Area overlays are
+ * inserted before it so a translucent wash cannot erase the toponyms underneath. Found by type
+ * rather than by name because the id scheme belongs to whichever style is loaded.
  */
 function firstSymbolLayerId(instance: MapLibreMap): string | undefined {
   return instance.getStyle().layers?.find((layer) => layer.type === 'symbol')?.id;
@@ -329,15 +273,10 @@ function firstSymbolLayerId(instance: MapLibreMap): string | undefined {
 /**
  * Three layers per trail plus the cluster set, bottom to top.
  *
- * The casing is what makes a green line legible over both a green hillside and white snow —
- * a dark outline is the cartographic answer to "this has to work on any ground", and it is
- * why a single-layer line always looks wrong on satellite. The hit layer is invisible and
- * wide: a 2 px line is a 2 px pointer target, which is unusable, so the target is 18 px
- * while the drawn line stays hairline. On a phone that number is doing even more work — a
- * fingertip is tens of pixels across, and the hit layer is the only reason a tap lands.
- *
- * Above `CLUSTER_ZOOM` those three draw and the cluster set is hidden; below it, the reverse.
- * The two sets never overlap, so there is no zoom at which a trail is both a line and a dot.
+ * The casing is what makes a green line legible over both a green hillside and white snow.
+ * The hit layer is invisible and 18px wide while the drawn line stays hairline — on a phone
+ * it is the only reason a tap lands. Above `CLUSTER_ZOOM` the lines draw and the cluster set
+ * is hidden; below it, the reverse, so the two never overlap.
  */
 export function addTrailLayers(instance: MapLibreMap): void {
   const field = SCHEMES.field;
@@ -345,14 +284,8 @@ export function addTrailLayers(instance: MapLibreMap): void {
   // written here rather than both jumping ahead of whichever was inserted first.
   const labels = firstSymbolLayerId(instance);
 
-  /*
-   * Air quality goes on first, so every trail layer added below sits above it.
-   *
-   * That order is the whole argument for putting it here rather than in `buildStyle`: an
-   * overlay strong enough to be read at a glance is strong enough to swallow a 2 px green
-   * hairline, and the trails are what the map is for. Painted under them, a red cell reads
-   * as the air *around* a route rather than as something wrong with the route.
-   */
+  // Air quality first, so every trail layer sits above it: an overlay strong enough to read at
+  // a glance would otherwise swallow a 2px green hairline.
   if (!instance.getSource(AIR_QUALITY_SOURCE)) {
     instance.addSource(AIR_QUALITY_SOURCE, { type: 'geojson', data: EMPTY_AIR_QUALITY });
   }
@@ -374,14 +307,8 @@ export function addTrailLayers(instance: MapLibreMap): void {
     );
   }
 
-  /*
-   * The heatmap sits directly above air quality and still below every trail line.
-   *
-   * Between the two, rather than under both, because they answer different questions and a
-   * reader comparing them wants the human record on top of the atmospheric one. Under the
-   * trails for the same reason air quality is: the wash is at its most useful exactly where
-   * it disagrees with a green line, and it can only disagree visibly if the line survives it.
-   */
+  // The heatmap sits between air quality and the trail lines: a reader comparing the two
+  // wants the human record above the atmospheric one, and both below the lines.
   if (!instance.getSource(HEATMAP_SOURCE)) {
     instance.addSource(HEATMAP_SOURCE, { type: 'geojson', data: EMPTY_HEATMAP });
   }
@@ -418,8 +345,6 @@ export function addTrailLayers(instance: MapLibreMap): void {
       data: { type: 'FeatureCollection', features: [] },
       cluster: true,
       // One below the handover, so the last clustered zoom is the last zoom that shows dots.
-      // Leaving it at the handover would put single un-grouped dots on screen at a zoom
-      // where the lines have already taken over.
       clusterMaxZoom: CLUSTER_ZOOM - 1,
       // Roughly a thumb. Tighter and a range breaks into a dozen near-identical circles;
       // looser and two genuinely separate valleys merge into one misleading number.
@@ -461,7 +386,7 @@ export function addTrailLayers(instance: MapLibreMap): void {
       layout: { 'line-cap': 'round', 'line-join': 'round' },
       paint: {
         'line-color': field.woodland,
-        // Selected is brighter as well as wider. Width alone is ambiguous at a glance on a
+        // Selected is brighter as well as wider: width alone is ambiguous at a glance on a
         // map holding a hundred lines of varying length.
         'line-opacity': emphasis(0.85, 1, 1),
         'line-width': emphasis(2, 3, 4.5),
@@ -489,8 +414,7 @@ export function addTrailLayers(instance: MapLibreMap): void {
       paint: {
         'circle-color': field.woodland,
         // Area, not radius, should track the count — a circle twice as wide reads as four
-        // times as many. `sqrt` would be exact; three stops on a log-ish curve is close
-        // enough and keeps a thousand-trail cluster from swallowing the viewport.
+        // times as many. Three stops on a log-ish curve approximate `sqrt` closely enough.
         'circle-radius': ['step', ['get', 'point_count'], 15, 25, 20, 100, 26, 400, 33],
         'circle-opacity': 0.9,
         'circle-stroke-width': 1.5,
@@ -512,8 +436,8 @@ export function addTrailLayers(instance: MapLibreMap): void {
         'text-font': ['Noto Sans Regular'],
         'text-size': 12,
         'text-letter-spacing': 0.04,
-        // The number is not a label for something else on the map — it *is* the mark, so it
-        // must never be dropped for collision, and it must not steal a click from the circle.
+        // The number *is* the mark, so it must never be dropped for collision, and it must
+        // not steal a click from the circle.
         'text-allow-overlap': true,
         'text-ignore-placement': true,
       },
@@ -543,9 +467,8 @@ export function addTrailLayers(instance: MapLibreMap): void {
       type: 'circle',
       source: POINT_SOURCE_ID,
       maxzoom: CLUSTER_ZOOM,
-      // Matches nothing until the index says otherwise. A filter rather than `feature-state`
-      // because a clustered source re-keys its features on every zoom, so there is no id
-      // stable enough to hold state against — the trail id lives in the properties instead.
+      // A filter rather than `feature-state`: a clustered source re-keys its features on
+      // every zoom, so the trail id lives in the properties instead.
       filter: ['==', ['get', 'id'], ''],
       paint: {
         'circle-color': field.ink,
@@ -556,16 +479,9 @@ export function addTrailLayers(instance: MapLibreMap): void {
     });
   }
 
-  /*
-   * The open trail, drawn at every zoom.
-   *
-   * Without this pair, selecting a long trail hides it. `fit` zooms out far enough to hold
-   * the whole bounding box, and the Pacific Crest Trail's box is two thousand kilometres
-   * tall — well under `CLUSTER_ZOOM`, where the line layers above have already switched
-   * off. The map would fly to exactly the right place and show a dot. So the selection gets
-   * its own casing and line with no `minzoom`: one trail's worth of geometry is never the
-   * smear that the ceiling exists to prevent, and it is the one line you have asked to see.
-   */
+  // The open trail, drawn at every zoom and so with no `minzoom`. `fit` on a very long trail
+  // lands below `CLUSTER_ZOOM`, where the line layers above have already switched off — the
+  // map would fly to exactly the right place and show a dot.
   if (!instance.getLayer(SELECTED_CASING_LAYER)) {
     instance.addLayer({
       id: SELECTED_CASING_LAYER,

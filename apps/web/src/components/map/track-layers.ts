@@ -5,23 +5,12 @@ import { SCHEMES } from '@switchback/ui';
 import { CASING } from './basemap';
 
 /**
- * The hike, after the hike.
+ * A finished hike: one line and two marks, shared by the activity page and the same map inside
+ * the iOS `WebView`, so the phone and the browser cannot draw a hike differently.
  *
- * One line and two marks, shared by the two places a finished recording is drawn: its page on
- * the website, and the same map inside the iOS app's `WebView`. Extracted here so the phone
- * and the browser cannot end up drawing a hike differently — the same reason `trail-layers`
- * exists for the trail lines.
- *
- * **The track is contour**, the plate this product uses for distance covered, and it is the
- * only line drawn in it. A trail the hike was recorded against is deliberately absent: on the
- * recorder, two lines answer *am I on it*, which is a live question; afterwards they would
- * answer *did I stay on it*, which is better answered in words than as two nearly-coincident
- * lines that read as one thick one.
- *
- * Start and finish are drawn differently from each other rather than as a matched pair —
- * hollow for the start, filled for the finish. On an out-and-back the two sit within a few
- * metres and would otherwise be one indeterminate blob; a reader can still tell which way
- * round the hike went.
+ * The track is contour and is the only line — the trail it was recorded against is
+ * deliberately absent, since afterwards two nearly-coincident lines read as one thick one.
+ * Start is hollow and finish filled, so an out-and-back's two ends stay distinguishable.
  */
 
 export const TRACK_SOURCE = 'act-track';
@@ -41,10 +30,8 @@ export type TrackPoint = readonly [number, number] | readonly [number, number, n
 const EMPTY: FeatureCollection = { type: 'FeatureCollection', features: [] };
 
 /**
- * Add the source and the three layers, once per style.
- *
- * Idempotent, because a base-map change tears the style down and this is called again on the
- * far side of it — the same contract `addTrailLayers` keeps.
+ * Add the source and the three layers. Idempotent, because a base-map change tears the style
+ * down and this is called again on the far side of it.
  */
 export function addTrackLayers(instance: MapLibreMap): void {
   const field = SCHEMES.field;
@@ -62,8 +49,8 @@ export function addTrackLayers(instance: MapLibreMap): void {
       type: 'line',
       source: TRACK_SOURCE,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      // Near-black rather than a plate colour: this is a shadow that lifts the line off
-      // whatever it crosses, not a separation in its own right.
+      // Near-black rather than a plate colour: a shadow that lifts the line off whatever it
+      // crosses, not a separation in its own right.
       paint: { 'line-color': CASING, 'line-opacity': 0.7, 'line-width': 8 },
     });
   }
@@ -149,10 +136,8 @@ export function trackBounds(track: readonly TrackPoint[]): maplibregl.LngLatBoun
 }
 
 /**
- * Frame the camera on the track.
- *
- * Capped at z15 for the same reason the trail fit is: a hike recorded standing still is a
- * cluster of fixes a few metres across, and fitting to it would put the camera underground.
+ * Frame the camera on the track, capped at z15: a hike recorded standing still is a cluster of
+ * fixes a few metres across, and fitting to it would put the camera underground.
  */
 export function fitTrack(
   instance: MapLibreMap,
