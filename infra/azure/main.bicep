@@ -164,11 +164,18 @@ So a principal holding only Contributor — which is what the deployment service
 this subscription holds, and nothing more — cannot deploy this template with the lock enabled.
 It fails with `AuthorizationFailed` before anything else happens, which would take the
 README's "redeploy is a no-op" path with it, and that path is also the only documented way to
-reapply the *same* admin password. Set this to `false` in that situation, deploy, and have
-someone with Owner or User Access Administrator create the lock separately:
+reapply the *same* admin password. Export `DEPLOY_DELETE_LOCK=false` in that situation — see
+`main.bicepparam`, which is where this parameter is bound — deploy, and have someone with Owner
+or User Access Administrator create the lock separately:
 
   az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \\
     --resource-group rg-switchback-prod-northcentralus --notes "..."
+
+**That override does not expire when the lock is placed.** Preflight authorizes the *action*,
+so a template declaring this lock issues a PUT and needs `locks/write` on every run, existing
+lock or not. A Contributor keeps exporting `false` until the principal is granted a role that
+carries `Microsoft.Authorization/*/Write`. See `main.bicepparam` for the measured permission
+set behind that.
 
 Note the same `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` —
 also stops a Contributor **removing** the lock once an Owner has placed it. That asymmetry is

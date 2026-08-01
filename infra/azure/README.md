@@ -133,6 +133,7 @@ done again over the same path, plan for that; a runner does not have the problem
 | `main.bicep`       | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname. |
 | `postgres.bicep`   | The server: compute, storage, backups, firewall, server parameters, the database.              |
 | `monitoring.bicep` | Log Analytics workspace, the alert action group, and the workload budget.                      |
+| `lock.bicep`       | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.    |
 | `main.bicepparam`  | Every non-secret parameter. Committed. The password is **not** here and never may be.          |
 | `README.md`        | This file.                                                                                     |
 
@@ -390,6 +391,40 @@ az account set --subscription 5cb9e7c3-0e31-4388-94e9-b36eab4bf977
 az provider register --namespace Microsoft.DBforPostgreSQL --wait
 ```
 
+### Prerequisite: `DEPLOY_DELETE_LOCK=false` unless you can write locks
+
+`main.bicep` declares the resource group's `CanNotDelete` lock, and `deployDeleteLock` defaults
+to `true`. Creating a lock is `Microsoft.Authorization/locks/write`, which built-in
+**Contributor** does not have — it is excluded by the `Microsoft.Authorization/*/Write` entry in
+Contributor's `notActions`. The service principal that deploys this subscription holds
+Contributor at subscription scope and nothing else, so with the default left alone **both
+commands below fail**, `what-if` included:
+
+```
+ERROR: (AuthorizationFailed) The client '…' does not have authorization to perform action
+'Microsoft.Authorization/locks/write' over scope '…/providers/Microsoft.Authorization/locks/
+switchback-prod-no-delete' or the scope is invalid.
+```
+
+Export the override for the run and both work again:
+
+```bash
+export DEPLOY_DELETE_LOCK=false
+```
+
+**A failed run is genuinely a no-op — it does not rotate the admin password.** ARM authorizes
+the whole template at preflight, before any resource is touched, so the deployment is rejected
+rather than partially applied and `administratorLoginPassword` is never written. That is worth
+knowing before you retry, because the one thing that would make this expensive — a half-applied
+deployment leaving the live credential rotated to a value nobody wrote down — is not what
+happens.
+
+Leave the committed default at `true`. It is the honest intent: the lock should exist, and a
+`what-if` that reports it as a `Create` is reporting a real to-do rather than drift. An
+environment variable also leaves a trace in the shell, where a quiet edit to `main.bicepparam`
+would leave one nobody puts back. **The override is not temporary for a Contributor-only
+principal** — see "Placing the delete lock" below for why placing the lock does not retire it.
+
 ### Deploy
 
 The admin password never reaches `argv`, a committed file, or a log line. It is generated into
@@ -436,6 +471,12 @@ az deployment sub what-if \
   --template-file infra/azure/main.bicep \
   --parameters infra/azure/main.bicepparam
 ```
+
+`what-if` runs the same preflight authorization check as a real deployment, so it fails with the
+same `AuthorizationFailed` if `DEPLOY_DELETE_LOCK` is unset and you cannot write locks. It is a
+preview, not a lesser permission. With the override exported it previews everything except the
+lock; with the lock enabled and the role to match, it reports the lock as a `Create` until the
+lock actually exists.
 
 ### Set the three new repository secrets
 
@@ -552,13 +593,53 @@ site itself is unaffected: Vercel carries `sbapp`, whose password is separate an
 by this. That separation is the whole reason for the two-role design, and this is the day it
 pays for itself.
 
-Add a delete lock once you are happy with it. Deleting a Flexible Server deletes all of its
-backups, irrecoverably:
+Deleting a Flexible Server deletes all of its backups, irrecoverably, which is what the resource
+group's `CanNotDelete` lock exists to prevent. It is no longer something to remember to add: it
+is declared in `main.bicep` and a deployment places it. See the next section for who can do that
+and what to do when you cannot.
+
+### Placing the delete lock
+
+The `CanNotDelete` lock on `rg-switchback-prod-northcentralus` is declared in `main.bicep`
+(module `deleteLock`, in `lock.bicep`) with the name **`switchback-prod-no-delete`**. Deploying
+the template as a principal that can write locks places it; nothing else is needed.
 
 ```bash
-az lock create --name no-delete --lock-type CanNotDelete \
-  --resource-group rg-switchback-prod-northcentralus
+unset DEPLOY_DELETE_LOCK          # or export DEPLOY_DELETE_LOCK=true
+# …then deploy exactly as under "Deploy", passing the *same* admin password
 ```
+
+The password caveat under "Redeploying" applies in full: this is a deployment, so it writes
+`administratorLoginPassword` to whatever `PGADMIN_PASSWORD` holds. Placing the lock through the
+template and rotating the admin credential by accident is one command, not two.
+
+If the lock has to be placed by hand instead — by an Owner who is not running the deployment —
+the name must match the template **exactly**, or the next deployment adds a second lock beside
+the first and `what-if` reports `switchback-prod-no-delete` as a `Create` in perpetuity:
+
+```bash
+az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
+  --resource-group rg-switchback-prod-northcentralus \
+  --notes "Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and 19,157 trails, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it."
+```
+
+Copy the `--notes` text from `lockNotes` in `main.bicep` rather than writing your own. `what-if`
+compares declared properties, not just existence, so a lock whose notes differ from the template
+reads as a permanent `Modify` — the same never-converging diff as a wrong name, in a quieter
+costume.
+
+**Placing the lock does not retire `DEPLOY_DELETE_LOCK=false` for a Contributor.** ARM authorizes
+each declared operation at preflight against the _action_, not against whether the value would
+change, so a template that declares the lock issues a PUT and needs
+`Microsoft.Authorization/locks/write` on every run — existing lock or not. The override is
+permanent for this principal until it is granted a role carrying
+`Microsoft.Authorization/*/Write`. That last sentence is reasoning from the permission set — the
+RG-scope permissions API returns one entry, `actions: ["*"]` with `Microsoft.Authorization/*/Write`
+and `/Delete` in `notActions`, and `az role assignment list --assignee 3ac53469-… --all
+--include-inherited` returns exactly one row — rather than a measurement, because measuring it
+means running a deployment against production. Expect the override to stay; do not be surprised
+into thinking the template drifted. The reverse also holds and is the point of the design: the
+same `notActions` entry means a Contributor cannot _remove_ the lock either.
 
 ---
 

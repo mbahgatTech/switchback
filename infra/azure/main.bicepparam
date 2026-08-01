@@ -66,10 +66,31 @@ param serverNamePrefix = 'psql-switchback-prod'
 // missing is telling the truth. An operator who does not hold the role exports
 // `DEPLOY_DELETE_LOCK=false` for their run, which is enough to get what-if and a redeploy
 // working again, and it leaves a visible trace in the shell rather than a quiet edit to this
-// file that nobody puts back. Remove the override once an Owner has placed the lock with:
+// file that nobody puts back.
+//
+// **That override is permanent for this principal — placing the lock does not retire it.** An
+// earlier revision of this comment said to remove it "once an Owner has placed the lock", and
+// that is wrong. ARM authorizes each declared resource operation at preflight against the
+// *action*, not against whether the value would change: a template that declares the lock
+// issues a PUT, so every deployment needs `Microsoft.Authorization/locks/write` whether or not
+// an identical lock is already sitting there. There is no converged state in which a
+// Contributor deploys this template with `deployDeleteLock` true and succeeds. Only a role
+// carrying `Microsoft.Authorization/*/Write` changes that.
+//
+// Epistemic status: reasoned from the permission set, not measured — confirming it means
+// running a deployment against the production database, which is not a thing to do to settle a
+// comment. What *is* measured is the permission set itself. The RG-scope permissions API
+// returns exactly one entry for this principal — `actions: ["*"]`, with both
+// `Microsoft.Authorization/*/Write` and `Microsoft.Authorization/*/Delete` in `notActions` —
+// and `az role assignment list --assignee 3ac53469-d72f-4813-b5e8-4bbf937cc76d --all
+// --include-inherited` returns one row, Contributor at subscription scope, with nothing
+// compensating. The error quoted above is the same check failing for the same reason.
+//
+// An Owner placing the lock by hand needs the name to match this template exactly, or a later
+// deployment adds a second lock beside the first:
 //
 //   az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
-//     --resource-group rg-switchback-prod-northcentralus --notes "<see main.bicep>"
+//     --resource-group rg-switchback-prod-northcentralus --notes "<copy lockNotes from main.bicep>"
 //
 // Note the `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` — also
 // stops a Contributor removing the lock afterwards. The principal the lock defends against
