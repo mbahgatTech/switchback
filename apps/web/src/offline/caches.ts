@@ -39,7 +39,8 @@ export const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
 /**
  * The shell name every build before the split used, and nothing writes any more. Deliberately
  * absent from `OFFLINE_CACHES`, so the worker's `adoptLegacyShell` must rescue the downloaded
- * pages' chunks out of it before `activate` sweeps it.
+ * pages' chunks out of it before `activate` sweeps it. Keep both until every install has upgraded:
+ * dropping them strands the chunks of every pre-split download, silently and only visibly offline.
  */
 export const LEGACY_SHELL_CACHE = 'sb-shell-v1';
 

@@ -28,6 +28,8 @@ const SHELL_CACHE = `sb-shell-${BUILD_ID}`;
 /**
  * The flat shell name earlier builds used. Deliberately absent from `OFFLINE_CACHES` so `activate`
  * sweeps it — `adoptLegacyShell` must rescue downloaded pages' chunks out of it before that runs.
+ * Keep both until every install has upgraded: dropping them strands the chunks of every pre-split
+ * download, silently and only visibly offline.
  */
 const LEGACY_SHELL_CACHE = 'sb-shell-v1';
 const OFFLINE_CACHES = [TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE, SHELL_CACHE];
