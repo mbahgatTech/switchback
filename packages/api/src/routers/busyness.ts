@@ -1,22 +1,14 @@
 /**
- * Busy times.
+ * Busy times. The model in `@switchback/busyness` is a pure function; this gathers its three
+ * inputs — the trail's own signals, the starts our users recorded, and the week's weather.
  *
- * The model lives in `@switchback/busyness` and is a pure function; what happens here is
- * everything it cannot do for itself. Three inputs have to be gathered before it can run:
- * the trail's own signals, the starts our users have actually recorded, and the week's
- * weather — and each of those arrives from a different place with a different failure mode.
+ * **Weather is allowed to fail**: a busyness curve without it is still a curve, so the outlook
+ * is fetched inside a `try` and `weatherAdjusted: false` tells the client what it got.
  *
- * **Weather is allowed to fail.** A busyness curve without it is still a busyness curve;
- * a trail page that 503s because a secondary service is down is nothing at all. So the
- * outlook is fetched inside a `try`, and `weatherAdjusted: false` in the response tells the
- * client exactly what it got rather than leaving it to guess from the numbers.
- *
- * **The timezone is a real problem and is not hand-waved.** Hours in the response are local
- * to the trail, so the offset used to produce them has to be honest. When the outlook
- * answers it carries `utc_offset_seconds` from a proper timezone database, DST included.
- * When it does not, the offset is guessed from longitude — good to within an hour nearly
- * everywhere — and the `timezone` field says `UTC+01:00` rather than naming a zone we did
- * not look up.
+ * **The timezone is not hand-waved.** Hours in the response are local to the trail. When the
+ * outlook answers it carries `utc_offset_seconds` from a proper timezone database, DST
+ * included; when it does not, the offset is guessed from longitude and the `timezone` field
+ * says `UTC+01:00` rather than naming a zone we did not look up.
  */
 
 import { TRPCError } from '@trpc/server';
@@ -29,11 +21,8 @@ import { publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
 /**
- * Module-level, so it survives between requests on a warm instance.
- *
- * An hour is the right TTL for the same reason it is in the weather router: the outlook
- * behind it publishes hourly, and the observation buckets move far slower than that. A
- * trail on the front page costs one upstream call an hour however many people open it.
+ * Module-level, so it survives between requests on a warm instance. An hour matches the
+ * outlook's publishing cadence, and the observation buckets move far slower than that.
  */
 const defaultCache = new ForecastCache<BusynessForecast>();
 
@@ -41,9 +30,8 @@ const trailSelect = {
   id: true,
   centroidLat: true,
   centroidLng: true,
-  // The low point stands in for the trailhead. Busyness is decided in a car park at
-  // breakfast, not on the summit — using `maxEleM` here would forecast the weather for a
-  // place nobody is standing when they make the decision.
+  // The low point stands in for the trailhead: busyness is decided in a car park at breakfast,
+  // so `maxEleM` would forecast the weather for a place nobody is standing.
   minEleM: true,
   estimatedTimeS: true,
   parkingCapacity: true,
@@ -62,11 +50,8 @@ export interface BusynessDeps {
 }
 
 /**
- * The resolver, as a function.
- *
- * Split out from the procedure for the same reason the weather one is: a test can hand it
- * a stub database and a stub Open-Meteo client and assert on what actually reaches the
- * model. Through `createCaller` the only reachable path would go over a real network.
+ * The resolver, as a function — split out from the procedure so a test can hand it a stub
+ * database and a stub Open-Meteo client, as the weather one is.
  */
 export async function busynessFor(
   ctx: Pick<Context, 'db'>,
@@ -100,9 +85,9 @@ export async function busynessFor(
         photoCount: trail.photoCount,
         parkingCapacity: trail.parkingCapacity,
       },
-      // `modeled` is deliberately not read back. It is a cache of this same model from
-      // whenever it last ran, and preferring it to a fresh computation would pin every
-      // trail to whichever version of the prior happened to write that row.
+      // `modeled` is deliberately not read back: it is a cache of this same model from
+      // whenever it last ran, and preferring it would pin every trail to whichever version of
+      // the prior wrote that row.
       buckets: trail.busyness.map((bucket) => ({
         dayOfWeek: bucket.dayOfWeek,
         hour: bucket.hour,
@@ -119,11 +104,9 @@ export async function busynessFor(
 
 export const busynessRouter = router({
   /**
-   * When to go, and how much of that is an estimate.
-   *
-   * A full week of hourly scores normalised to this trail's own peak, plus one recommended
-   * slot with the reasoning in plain English, plus `confidence` and `observationCount` so
-   * the interface can say how much of this is measured and how much is modelled.
+   * When to go, and how much of that is an estimate: a full week of hourly scores normalised
+   * to this trail's own peak, one recommended slot with its reasoning, plus `confidence` and
+   * `observationCount` so the interface can say what is measured and what is modelled.
    */
   forWeek: publicProcedure
     .input(busynessRequestSchema)
@@ -131,11 +114,8 @@ export const busynessRouter = router({
 });
 
 /**
- * The week's weather, folded down to one entry per weekday.
- *
- * A seven-day outlook covers each weekday exactly once, so there is nothing to reconcile —
- * but the map is built forwards on purpose, so that if the horizon ever grows past a week
- * the nearer day wins. A forecast for next Saturday is worth less than one for tomorrow.
+ * The week's weather, folded down to one entry per weekday. A seven-day outlook covers each
+ * weekday once, but the map is built forwards so the nearer day wins if the horizon ever grows.
  */
 export function weatherByDay(outlook: DailyOutlook): Map<number, DayWeather> {
   const byDay = new Map<number, DayWeather>();
@@ -152,11 +132,8 @@ export function weatherByDay(outlook: DailyOutlook): Map<number, DayWeather> {
 }
 
 /**
- * The outlook, or nothing.
- *
- * Swallowing the error is the point. Every failure mode here — rate limit, timeout, a bad
- * gateway between us and Open-Meteo — costs the curve its weather adjustment and nothing
- * else, and the response says so in `weatherAdjusted`.
+ * The outlook, or nothing. Swallowing the error is the point: every failure mode here costs the
+ * curve its weather adjustment and nothing else, and the response says so in `weatherAdjusted`.
  */
 async function outlookFor(
   lat: number,
@@ -172,12 +149,9 @@ async function outlookFor(
 }
 
 /**
- * Cache key.
- *
- * Bucketed by wall-clock hour because the answer depends on the current hour even though
- * the request does not: `nowMs` fixes the season, and the outlook behind it is republished
- * hourly. `includeWeather` is in the key because it produces a materially different curve,
- * not just a different flag.
+ * Cache key, bucketed by wall-clock hour because the answer depends on the current hour even
+ * though the request does not. `includeWeather` is in the key because it produces a materially
+ * different curve, not just a different flag.
  */
 export function cacheKey(input: BusynessRequest, nowMs: number): string {
   const hour = Math.floor(nowMs / 1000 / HOUR_S);
@@ -188,7 +162,7 @@ export function cacheKey(input: BusynessRequest, nowMs: number): string {
 export function guessOffsetS(lngDeg: number): number {
   const offsetS = Math.round(lngDeg / 15) * 3600;
   // A trail just west of Greenwich rounds to -0: equal to 0 everywhere it is compared, and
-  // `-0` everywhere it is printed. Normalise it once, here, rather than in every reader.
+  // `-0` everywhere it is printed. Normalised once here rather than in every reader.
   return offsetS === 0 ? 0 : offsetS;
 }
 

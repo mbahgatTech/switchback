@@ -1,18 +1,9 @@
 /**
- * Request context.
- *
- * Built once per request and handed to every procedure. Two things are worth explaining.
- *
- * **Why `getWebSession` is injected rather than imported.** Auth.js is configured in
- * `apps/web/auth.ts`, because its config is bound to Next's cookie and redirect handling.
- * If this package imported it, `packages/api` would depend on `apps/web`, and the Expo
- * app — which imports the router *type* from here — would drag a Next.js module graph
- * behind it. So the web route handler passes its `auth` function in, and this package
- * stays a leaf.
- *
- * **Why there are two ways to be signed in.** The website sends a session cookie; the iOS
- * app sends `Authorization: Bearer`. Resolving both here means not a single procedure has
- * to care which client it is talking to.
+ * Request context, built once per request. `getWebSession` is injected rather than imported so
+ * this package stays a leaf: Auth.js is configured in `apps/web/auth.ts`, and importing it
+ * would drag a Next.js module graph behind the Expo app, which imports the router *type* here.
+ * Both auth methods — the website's session cookie and the app's bearer token — are resolved
+ * here, so no procedure has to care which client it is talking to.
  */
 import type { PrismaClient, User } from '@switchback/db';
 import { prisma } from '@switchback/db';
@@ -29,20 +20,16 @@ export interface CreateContextOptions {
   getWebSession?: () => Promise<WebSession | null>;
   db?: PrismaClient;
   /**
-   * Keeps work alive after the response has been sent. The web route passes Next's
-   * `after`; a test or a script passes nothing and the work simply falls to the cron.
-   *
-   * Injected for the same reason `getWebSession` is: `after` is a Next module, and this
-   * package must stay importable from Expo's bundler.
+   * Keeps work alive after the response has been sent — Next's `after` on the web route,
+   * nothing in a test or script, where the work falls to the cron. Injected for the same
+   * reason `getWebSession` is.
    */
   waitUntil?: (work: Promise<unknown>) => void;
 }
 
 /**
- * The signed-in user, or null.
- *
- * The whole row, not just an id: nearly every protected procedure needs `isPlus` or
- * `units`, and fetching it here is one query per request instead of one per procedure.
+ * The signed-in user is the whole row, not just an id: nearly every protected procedure needs
+ * `isPlus` or `units`, so one query per request beats one per procedure.
  */
 export interface Context {
   db: PrismaClient;
@@ -51,9 +38,9 @@ export interface Context {
   /** How the caller authenticated. Useful for logging and for rate limits later. */
   authMethod: 'session' | 'bearer' | null;
   /**
-   * Runs work after the response is sent, when the platform supports it. Absent means
-   * "no background work here" — every caller must still be correct without it, which is
-   * why the ingest queue is durable rather than relying on this.
+   * Runs work after the response is sent, when the platform supports it. Absent means "no
+   * background work here" — every caller must still be correct without it, which is why the
+   * ingest queue is durable rather than relying on this.
    */
   waitUntil?: (work: Promise<unknown>) => void;
 }
@@ -68,18 +55,13 @@ export async function createContext(opts: CreateContextOptions): Promise<Context
     if (claims) {
       const user = await db.user.findUnique({ where: { id: claims.userId } });
       /*
-       * A token whose user was deleted verifies fine but must not authenticate anyone — and
-       * neither must one minted before the account was signed out everywhere.
-       *
-       * That second check is what makes `signOutEverywhere` mean what it says. Revoking the
-       * refresh tokens and deleting the session rows leaves the access JWT alone, because
-       * nothing stores it; on the path the button exists for — a phone somebody else is now
-       * holding — that left the thief a full fifteen minutes of authenticated read and write
-       * after the owner had been told every session had ended.
+       * A token whose user was deleted verifies fine but must not authenticate anyone, and
+       * neither must one minted before the account was signed out everywhere — nothing stores
+       * the access JWT, so revoking refresh tokens and session rows leaves it alive for its
+       * full fifteen minutes, which is what `signOutEverywhere` promises to end.
        *
        * `iat` is whole seconds, so the comparison is `<=` rather than `<`: a token minted in
-       * the same second as the press would otherwise survive it, which is exactly the second
-       * an attacker refreshing on a timer lands in.
+       * the same second as the press would otherwise survive it.
        */
       if (user) {
         const revokedAt = user.sessionsRevokedAt;

@@ -1,28 +1,14 @@
 /**
- * Routes: planning a line of your own, and keeping it.
- *
- * The catalogue answers "where shall I hike". This answers "I want to hike *here*, and then
- * here, and then back to the car" — and it runs on a different cache for the reason
- * `core/routing.ts` sets out: trail assembly keeps named, curated lines and throws away the
- * 150 m unnamed connector, which is the exact piece that makes a loop possible.
+ * Routes: planning a line of your own, and keeping it. Runs on its own cached network rather
+ * than the trail catalogue — see `docs/architecture.md` and `core/routing.ts`.
  *
  * **The client sends points, never lines.** Every plan and every save is computed here from
- * the anchors alone. That is one trust surface removed — nobody can post a route through a
- * cliff face and have it served back under our name — and one payload removed, since the
- * anchors of a 30 km route are a few hundred bytes against a few hundred kilobytes of
- * geometry. It also means a route saved today and reopened next year replans against
- * whatever OSM knows by then, rather than preserving a line whose path has since moved.
+ * the anchors alone, so nobody can post a route through a cliff face and have it served back
+ * under our name, and a route reopened next year replans against whatever OSM knows by then.
  *
- * **Why `plan` is a mutation when it plainly reads.** tRPC puts a query's input in the URL,
- * and sixty anchors is several kilobytes of it — close enough to the header ceiling that a
- * long route would start failing in production and nowhere else. The cache a query would buy
- * is worth little here anyway: every drag of a waypoint is a fresh key, so the hit rate is
- * near zero, and the one case that does repeat — undo — is served better by the anchor stack
- * the editor already keeps.
- *
- * The on-demand pattern is `trails.ts`'s, unchanged: ask `ensureNetworkCoverage` what we
- * hold, queue what is missing, plan on what is ready, and say how many tiles are still
- * coming. It never blocks on Overpass.
+ * `plan` is a mutation despite plainly reading: tRPC puts a query's input in the URL, and
+ * sixty anchors is close enough to the header ceiling to fail in production and nowhere else.
+ * The on-demand coverage pattern is `trails.ts`'s, unchanged.
  */
 
 import { TRPCError } from '@trpc/server';
@@ -79,18 +65,11 @@ import type { IngestRefusal } from '@switchback/ingest';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /**
- * Profile spacing, and the vertex tolerance of the copy every client draws.
- *
- * Both restated from `pipeline.ts`, where they are module-private, because a planned route
- * and an ingested trail of the same shape must report the same numbers. Gain is measured
- * with a 10 m hysteresis threshold, so a profile sampled at 25 m and one sampled at 60 m do
- * not merely differ in resolution — they differ in *answer*. Two figures for one hike is the
- * kind of thing that reads as the product not knowing which of its own screens to believe.
+ * Profile spacing, and the vertex tolerance of the copy every client draws. Both must stay
+ * equal to the module-private values in `pipeline.ts`: gain is measured with a 10 m hysteresis
+ * threshold, so a profile sampled at 25 m and one at 60 m differ in *answer*, not resolution,
+ * and a planned route would report different numbers from an ingested trail of the same shape.
  */
 const PROFILE_SPACING_M = 25;
 const RENDER_SIMPLIFY_M = 5;
@@ -99,21 +78,14 @@ const RENDER_SIMPLIFY_M = 5;
 const MAX_PROFILE_POINTS = 6_000;
 
 /**
- * How finely a straight leg is cut before terrain is read along it.
- *
- * Coarser than the profile spacing on purpose. A freehand leg is a line the user drew across
- * ground we have no path for; sampling it at 25 m would double the terrain reads to add
- * detail to the one part of the route that is already an approximation.
+ * How finely a straight leg is cut before terrain is read along it. Coarser than the profile
+ * spacing on purpose: a freehand leg is already an approximation.
  */
 const FREEHAND_SAMPLE_M = 50;
 
 /**
- * Room around the anchors for the router to work in.
- *
- * A path between two points does not stay inside their bounding box — a switchback stack
- * climbing out of the corner of it is the ordinary case. A kilometre is enough for that and
- * small enough that it rarely pulls in another z12 tile, which at ~10 km across is the unit
- * this actually rounds to.
+ * Room around the anchors for the router to work in — a path between two points does not stay
+ * inside their bounding box. Small enough that it rarely pulls in another z12 tile.
  */
 const PLAN_PAD_M = 1_000;
 
@@ -121,16 +93,11 @@ const PLAN_PAD_M = 1_000;
 const MAX_INLINE_DRAIN = 3;
 
 /**
- * The built-graph cache.
- *
- * Dragging one waypoint replans the whole route, and rebuilding a nine-tile graph — a
- * database read of every segment plus node interning — on each frame would make the planner
- * feel like a batch job. The key is the ready quadkey set, so a tile landing mid-edit changes
- * the key and gets a fresh graph for free. The TTL only covers the other case: a tile
- * refreshed in place under an unchanged key.
- *
- * Three entries, because each one is tens of megabytes of typed arrays and this process also
- * has to serve everything else.
+ * The built-graph cache. Dragging one waypoint replans the whole route, and rebuilding a
+ * nine-tile graph each frame would make the planner feel like a batch job. The key is the
+ * ready quadkey set, so a tile landing mid-edit gets a fresh graph for free; the TTL only
+ * covers a tile refreshed in place under an unchanged key. Three entries, because each is tens
+ * of megabytes of typed arrays.
  */
 const GRAPH_CACHE_MAX = 3;
 const GRAPH_CACHE_TTL_MS = 5 * 60_000;
@@ -138,18 +105,7 @@ const GRAPH_CACHE_TTL_MS = 5 * 60_000;
 /** How many saved routes one hiker's index returns. */
 const MAX_ROUTES_LISTED = 200;
 
-// ---------------------------------------------------------------------------
-// Ingest kick
-// ---------------------------------------------------------------------------
-
-/**
- * One inline drain at a time, process-wide.
- *
- * The same guard `trails.ts` keeps, and for the same reason: a map that pans across cold
- * ground fires a request per frame, and without this each one would start its own drain and
- * they would all hit Overpass together. A routing tile is the larger fetch of the two, so the
- * limit here is lower.
- */
+/** One inline drain at a time, process-wide — the guard `trails.ts` keeps, same reason. */
 let inlineDrain: Promise<unknown> | null = null;
 
 function kickNetwork(ctx: Context, queued: readonly string[]): void {
@@ -168,10 +124,6 @@ function kickNetwork(ctx: Context, queued: readonly string[]): void {
   inlineDrain = work;
   ctx.waitUntil(work);
 }
-
-// ---------------------------------------------------------------------------
-// The graph
-// ---------------------------------------------------------------------------
 
 interface CachedGraph {
   key: string;
@@ -207,10 +159,6 @@ async function graphFor(db: PrismaClient, quadkeys: readonly string[]): Promise<
   return graph;
 }
 
-// ---------------------------------------------------------------------------
-// Planning
-// ---------------------------------------------------------------------------
-
 const EMPTY_STATS: TrailStats = {
   lengthM: 0,
   gainM: 0,
@@ -224,10 +172,9 @@ const EMPTY_STATS: TrailStats = {
 interface PlanOutcome {
   plan: RoutePlan;
   /**
-   * The full-fidelity line, which never goes on the wire.
-   *
-   * `plan.geometry` is simplified to 5 m for drawing; the bbox and the centroid a save writes
-   * are measured off this one, so a vertex the simplifier dropped cannot move either.
+   * The full-fidelity line, which never goes on the wire. `plan.geometry` is simplified to 5 m
+   * for drawing; the bbox and centroid a save writes are measured off this one, so a vertex
+   * the simplifier dropped cannot move either.
    */
   coords: LngLat[];
 }
@@ -268,12 +215,9 @@ interface LegWork {
 }
 
 /**
- * Ground elevation along a straight leg.
- *
- * Nulls rather than an exception on failure: terrain is a network call, and a leg the user
- * drew across country we have no path for is already an approximation. A plan that refuses to
- * return because a DEM tile timed out is a worse answer than one whose freehand stretch is
- * interpolated between the legs on either side, which is what `buildProfile` does with these.
+ * Ground elevation along a straight leg. Nulls rather than an exception on failure: a plan
+ * that refuses to return because a DEM tile timed out is worse than one whose freehand stretch
+ * `buildProfile` interpolates between the legs on either side.
  */
 async function freehandElevations(coords: readonly LngLat[]): Promise<Array<number | null>> {
   if (coords.length === 0) return [];
@@ -282,8 +226,8 @@ async function freehandElevations(coords: readonly LngLat[]): Promise<Array<numb
       spacingM: FREEHAND_SAMPLE_M,
       alongLengthM: lineLengthM(coords),
     });
-    // Every sample fell in a tile we could not load, so the "filled" values are zeroes.
-    // Sea level under an alpine traverse would wreck the gain figure; say nothing instead.
+    // Every sample fell in a tile we could not load, so the "filled" values are zeroes. Sea
+    // level under an alpine traverse would wreck the gain figure; say nothing instead.
     if (elevated.gapCount >= elevated.points.length) return coords.map(() => null);
     return elevated.points.map((point) => point.eleM);
   } catch {
@@ -292,16 +236,13 @@ async function freehandElevations(coords: readonly LngLat[]): Promise<Array<numb
 }
 
 /**
- * Elevation along the finished line, resampled to a fixed interval.
+ * Elevation along the finished line, resampled to a fixed interval. Interpolated from the
+ * dense profile rather than re-read from terrain: the resampled points lie on the line by
+ * construction.
  *
- * Interpolated from the dense profile rather than re-read from terrain, which is free and
- * exact: the resampled points lie on the line by construction, so there is nothing a fresh
- * DEM read would tell us that the dense profile does not already hold.
- *
- * Distances come from `lengthM · i / (n−1)`, not from measuring the resampled line.
- * `resampleLine` drops its points at even intervals *along* the source, so the straight hops
- * between them cut every corner in between — measuring those instead is how a Mexico-to-Canada
- * thru-hike came to be published as a 3,214 km hike.
+ * Distances come from `lengthM · i / (n−1)`, never from measuring the resampled line —
+ * `resampleLine` drops points at even intervals *along* the source, so the straight hops
+ * between them cut every corner, and measuring those published a thru-hike as 3,214 km.
  */
 function resampleProfile(
   dense: readonly ElevationPoint[],
@@ -335,21 +276,17 @@ function resampleProfile(
 }
 
 /**
- * Anchors in, route out.
+ * Anchors in, route out. Three passes, because leg geometry and anchor positions depend on
+ * each other:
  *
- * Three passes, because leg geometry and anchor positions each depend on the other and the
- * cycle has to be broken somewhere:
- *
- * 1. Resolve every leg — snapped and following the network, or a straight line and why. This
- *    is decided entirely from the snap results, so it needs no positions.
- * 2. Place every anchor. An anchor moves onto the network only if a leg touching it actually
- *    used the network; a route with no snapped legs keeps the user's exact points, which is
- *    what "freehand" has to mean or the word is a lie.
+ * 1. Resolve every leg — snapped and following the network, or straight and why. Decided from
+ *    the snap results alone, so it needs no positions.
+ * 2. Place every anchor. An anchor moves onto the network only if a leg touching it used the
+ *    network, so a fully freehand route keeps the user's exact points.
  * 3. Concatenate, sampling terrain along the straight legs as they are laid down.
  *
- * Each anchor is snapped once rather than once per leg. `snapToGraph` is deterministic, so
- * leg *i*'s start snap and leg *i−1*'s end snap are the same call — computing it twice halves
- * the throughput and opens the door to the two disagreeing.
+ * Each anchor is snapped once rather than once per leg: `snapToGraph` is deterministic, so
+ * leg *i*'s start snap and leg *i−1*'s end snap are the same call.
  */
 async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutcome> {
   const anchors = input.anchors;
@@ -358,20 +295,15 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
   const raw: LngLat[] = anchors.map((anchor) => [anchor.lng, anchor.lat]);
   const legCount = anchors.length - 1;
 
-  // A route drawn entirely by hand needs no network at all, so it should not be refused for
-  // covering more ground than the router can cache.
+  // A route drawn entirely by hand needs no network, so it must not be refused for covering
+  // more ground than the router can cache.
   const needsNetwork = anchors.some((anchor, index) => index > 0 && !anchor.freehand);
 
   let graph: RouteGraph | null = null;
   let pendingTiles = 0;
-  /*
-   * Whether the network under these anchors is arriving or was refused.
-   *
-   * Kept apart from `pendingTiles` deliberately. This used to be inferred from it — the leg
-   * reason was `pendingTiles > 0 ? 'network_pending' : 'off_network'` — and backpressure
-   * zeroed `pending` on refusal, so a refused fetch came out the far end as "no path near
-   * point 3": a claim about the ground, on a screen whose job is to be honest about ground.
-   */
+  // Kept apart from `pendingTiles` deliberately: backpressure zeroes `pending` on refusal, so
+  // inferring the leg reason from it reported a refused fetch as "no path near point 3" — a
+  // claim about the ground rather than about us.
   let networkPaused = false;
   let pausedReason: IngestRefusal | null = null;
 
@@ -408,14 +340,14 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     const from = snapAt[to - 1];
     const arrive = snapAt[to];
     if (!g || !from || !arrive) {
-      // A tile still downloading is the likelier explanation than genuinely open country,
-      // and it is the one the user can do something about by waiting.
+      // A tile still downloading is likelier than genuinely open country, and it is the one
+      // the user can do something about by waiting.
       work.push({ snapped: false, reason: unroutable('off_network'), coords: null, eleM: null });
       continue;
     }
 
     if (from.node === arrive.node) {
-      // Two clicks on the same junction. A real leg of zero length, not a failure.
+      // Two clicks on the same junction: a real leg of zero length, not a failure.
       work.push({
         snapped: true,
         reason: null,
@@ -452,7 +384,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     const last = coords[coords.length - 1];
     if (last && last[0] === point[0] && last[1] === point[1]) {
       // The same ground twice, where one leg ends and the next begins. Keep whichever
-      // elevation we actually know rather than letting a null overwrite a reading.
+      // elevation we know rather than letting a null overwrite a reading.
       if (ele[ele.length - 1] === null) ele[ele.length - 1] = eleM;
       return;
     }
@@ -477,7 +409,7 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
     }
 
     // The joining point was pushed by the previous leg with whatever it knew, which for the
-    // very first point of the route is nothing.
+    // route's very first point is nothing.
     if (ele.length > 0 && ele[ele.length - 1] === null) ele[ele.length - 1] = legEle[0] ?? null;
     for (let k = 1; k < legCoords.length; k += 1) push(legCoords[k]!, legEle[k] ?? null);
 
@@ -527,10 +459,6 @@ function plannable(outcome: PlanOutcome): LineString {
   return outcome.plan.geometry;
 }
 
-// ---------------------------------------------------------------------------
-// Row shapes
-// ---------------------------------------------------------------------------
-
 const summarySelect = {
   id: true,
   userId: true,
@@ -568,12 +496,9 @@ type SummaryRow = Prisma.PlannedRouteGetPayload<{ select: typeof summarySelect }
 type DetailRow = Prisma.PlannedRouteGetPayload<{ select: typeof detailSelect }>;
 
 /**
- * Parse the JSON columns rather than casting them.
- *
- * A cast asserts something about a column that a migration, a bad write, or a schema change
- * three months from now can quietly make false, and the failure then surfaces as an
- * unreadable client crash. Parsing turns the same fault into an empty array on a page that
- * still renders. Same treatment `trails.ts` gives `geometryJson`.
+ * Parse the JSON columns rather than casting them, so a bad write or a schema change surfaces
+ * as an empty array on a page that still renders. Same treatment `trails.ts` gives
+ * `geometryJson`.
  */
 const anchorsSchema = z.array(routeAnchorSchema);
 const profileSchema = z.array(elevationPointSchema);
@@ -594,16 +519,10 @@ function readGeometry(value: Prisma.JsonValue): LineString {
 }
 
 /**
- * The line an export should carry: the stored profile, or the drawn geometry if it is gone.
- *
- * The profile is the 25 m resample with ground under every point, which is what a device
- * needs — handed a 5 m-simplified line with no elevation, a watch guesses the ascent from
- * whatever DEM it ships with and shows a climb graph that is not this route's.
- *
- * The fallback matters more than it looks: a profile that failed to parse would otherwise
- * export as an empty file, which loads on a watch as a course with no course in it. A flat
- * line is a worse export and a much better failure. Shared by both exporters so the two
- * cannot disagree about what a route is.
+ * The line an export should carry: the stored 25 m profile, which has ground under every
+ * point, falling back to the drawn geometry at zero elevation. The fallback matters — a
+ * profile that failed to parse would otherwise export as a course with no course in it.
+ * Shared by both exporters so the two cannot disagree about what a route is.
  */
 function exportPoints(row: {
   profile: Prisma.JsonValue;
@@ -651,11 +570,8 @@ function toDetail(row: DetailRow, viewer: User | null): PlannedRouteDetail {
 }
 
 /**
- * A stranger sees a route only if it is public.
- *
- * `followers` resolves as private for everyone but the owner, exactly as it does for
- * activities — there is no follow graph yet, and the safe direction to be wrong in is the one
- * that does not hand a stranger a map of where somebody hikes.
+ * A stranger sees a route only if it is public. `followers` resolves as private for everyone
+ * but the owner, exactly as it does for activities, until a follow graph exists.
  */
 function canView(row: { userId: string; visibility: string }, viewer: User | null): boolean {
   return viewer?.id === row.userId || row.visibility === 'public';
@@ -748,12 +664,9 @@ function statColumns(outcome: PlanOutcome): {
 
 export const routesRouter = router({
   /**
-   * What the router can plan on, for this viewport.
-   *
-   * Called as the planner's map settles, before the user has clicked anything, so the first
-   * tile fetch is already running by the time they place their second point. Returns counts
-   * rather than quadkeys — the client has no use for the keys themselves, and a progress
-   * line reading "2 of 4 areas ready" is the whole of what it needs to say.
+   * What the router can plan on, for this viewport. Called as the planner's map settles, so
+   * the first tile fetch is running before the user places their second point. Returns counts
+   * rather than quadkeys — the client only needs "2 of 4 areas ready".
    */
   coverage: publicProcedure.input(z.object({ bbox: bboxSchema })).query(async ({ ctx, input }) => {
     const coverage = await ensureNetworkCoverage(input.bbox, { db: ctx.db });
@@ -761,10 +674,8 @@ export const routesRouter = router({
     return {
       ready: coverage.ready.length,
       pending: coverage.pending.length,
-      // True when backpressure refused the fetch, so `pending` is zero for a reason other
-      // than "we hold it all". Reported here for symmetry with `plan`, which is where the
-      // planner actually reads it — this procedure exists to warm tiles and its result is
-      // deliberately not rendered. See `backpressure.ts` in @switchback/ingest.
+      // True when backpressure refused the fetch, so `pending` is zero for a reason other than
+      // "we hold it all". Reported for symmetry with `plan`, which is where it is read.
       busy: coverage.busy,
       busyReason: coverage.busyReason,
       tooLarge: coverage.tooLarge,
@@ -793,11 +704,9 @@ export const routesRouter = router({
   }),
 
   /**
-   * One route, with the line and the anchors that made it.
-   *
-   * Public, because a public route is meant to open for someone without an account. The
-   * anchors ride along so the viewer can take it into the planner and change it — saving
-   * their own copy, since `editable` is false for anyone but the owner.
+   * One route, with the line and the anchors that made it. Public, so a public route opens for
+   * someone without an account; the anchors ride along so a viewer can take it into the
+   * planner and save their own copy, since `editable` is false for anyone but the owner.
    */
   detail: publicProcedure
     .input(z.object({ id: z.string().min(1).max(64) }))
@@ -838,12 +747,8 @@ export const routesRouter = router({
     }),
 
   /**
-   * Change a saved route.
-   *
-   * Anchors present means replan and rewrite the line; anchors absent means leave it exactly
-   * as it is. Renaming re-slugs, matching lists — a route whose URL still says
-   * `/mountain-loop` after being renamed to "Coast path" is a worse kind of stale than a link
-   * that has moved.
+   * Change a saved route. Anchors present means replan and rewrite the line; anchors absent
+   * means leave it exactly as it is. Renaming re-slugs, matching lists.
    */
   update: protectedProcedure
     .input(routeUpdateSchema)
@@ -901,15 +806,9 @@ export const routesRouter = router({
     }),
 
   /**
-   * The route as GPX, for a watch or a handheld.
-   *
-   * Built from the stored profile rather than the drawing geometry: the profile is the
-   * 25 m line with ground under every point, and a device handed a 5 m-simplified line with
-   * no elevation has to guess the ascent from whatever DEM it ships with.
-   *
-   * A query returning the document rather than a REST route serving it, matching
-   * `activities.gpx` — the iOS app has no download folder to point a browser at and wants
-   * the text to hand to the share sheet.
+   * The route as GPX, built from the stored profile rather than the drawing geometry — a
+   * device handed a 5 m-simplified line with no elevation guesses the ascent from its own DEM.
+   * A query returning the document, matching `activities.gpx`.
    */
   gpx: publicProcedure
     .input(z.object({ id: z.string().min(1).max(64) }))
@@ -942,15 +841,9 @@ export const routesRouter = router({
     }),
 
   /**
-   * The same route as a FIT course — the format that actually loads onto a watch.
-   *
-   * This is where the difference between the two exports shows. A GPX route sideloaded to a
-   * Fenix is a bare line: no climb graph before you start, no virtual partner, no summit
-   * marked. The course file carries all three, built from data the planner already computed
-   * — the 25 m profile for the ascent, and the Tobler estimate for the pace band.
-   *
-   * Returns base64 because FIT is binary and this is a JSON transport. `expo-file-system`
-   * writes base64 directly; the web costs one `atob`.
+   * The same route as a FIT course — the format that actually loads onto a watch, carrying the
+   * climb graph, virtual partner and summit marker a GPX route cannot. Base64 because FIT is
+   * binary and this is a JSON transport.
    */
   fit: publicProcedure
     .input(z.object({ id: z.string().min(1).max(64) }))
@@ -981,8 +874,7 @@ export const routesRouter = router({
             activityType: row.activityType,
             // A course has no real start time, so the file is stamped with the route's own
             // creation date. Deterministic on purpose: two downloads of an unchanged route
-            // produce identical bytes, which is what stops a watch treating the second one as
-            // a different course and stacking a duplicate beside the first.
+            // produce identical bytes, so a watch does not stack a duplicate course.
             createdAt: row.createdAt,
             estimatedTimeS: row.estimatedTimeS,
           }),

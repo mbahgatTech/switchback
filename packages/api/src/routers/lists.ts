@@ -1,25 +1,16 @@
 /**
  * Lists, favourites and completions.
  *
- * **One table backs three ideas, and one of them is a lie.** Favourites, Want to do and
- * every custom list are `TrailList` rows with `TrailListItem` children, and they behave
- * identically. The `completed` list is a `TrailList` row whose children are never written:
- * its contents are read from the `Completion` table on the way out.
+ * **One table backs three ideas, and one of them is derived.** Favourites, Want to do and every
+ * custom list are `TrailList` rows with `TrailListItem` children. The `completed` list is a
+ * `TrailList` row whose children are never written — its contents are read from the
+ * `Completion` table on the way out, because a completion is dated and repeatable and because
+ * `activities.finish` writes completions without going anywhere near this router. Holding its
+ * own rows would mean every one of those paths remembering to keep them in step.
  *
- * That asymmetry is deliberate and it is the most important thing in this file. A completion
- * is dated and repeatable — hike Tryfan three times and that is three facts, not one flag —
- * and Phase 4 will write completions from finished recordings without going anywhere near
- * this router. If the list held its own rows, every one of those paths would have to
- * remember to keep them in step, and the day one forgets, a user's completed tab and their
- * profile total disagree with no way to tell which is right. Deriving costs one join and
- * removes the entire class of bug.
- *
- * **`Trail.popularity` is maintained here.** The reviews router deliberately leaves it alone
- * because `packages/busyness/prior.ts` already counts reviews separately; completions are
- * the thing it *does* count, so recording one increments it and forgetting one gives it
- * back. Saves and favourites do not touch it — wanting to go somewhere is not evidence that
- * anyone was there, and a busyness model fed on aspiration would predict crowds on the most
- * bookmarked trail in the country on a Tuesday in February.
+ * **`Trail.popularity` is maintained here**, and only from completions: the reviews router
+ * leaves it alone because `packages/busyness/prior.ts` counts reviews separately, and saves and
+ * favourites do not touch it — wanting to go somewhere is not evidence that anyone was there.
  */
 
 import { TRPCError } from '@trpc/server';
@@ -52,12 +43,7 @@ import { ensureSystemLists } from '../provisioning';
 import { summarySelect, toSummary } from '../trail-shape';
 import { deliberateServerError, protectedProcedure, publicProcedure, router } from '../trpc';
 
-/**
- * A list, minus its items.
- *
- * `user` is selected alongside rather than joined in application code because a public list
- * is read by people who are not its owner, and they still need to see whose it is.
- */
+/** A list, minus its items. `user` rides along because a public list is read by non-owners. */
 const listSelect = {
   id: true,
   userId: true,
@@ -80,10 +66,6 @@ const SYSTEM_RANK: Readonly<Record<string, number>> = Object.fromEntries(
 
 const listKeyInput = z.object({ key: z.string().min(1).max(80) });
 const trailIdInput = z.object({ trailId: z.string().min(1).max(64) });
-
-// ---------------------------------------------------------------------------
-// Aggregates
-// ---------------------------------------------------------------------------
 
 /** What a list card shows without opening the list. */
 export interface ListAggregate {
@@ -113,27 +95,18 @@ interface AggregateRow {
 }
 
 /**
- * The upper bound of the `lengths` array slice, spliced into SQL rather than bound.
- *
- * A Postgres array subscript is not a value expression a parameter can fill, and this is a
- * compile-time constant from `@switchback/core`, so `Prisma.raw` on it is exactly as safe as
- * typing the number — with the advantage that the cap is stated once, next to the schema
- * field it bounds.
+ * The upper bound of the `lengths` array slice, spliced into SQL rather than bound: a Postgres
+ * array subscript is not a value expression a parameter can fill, and this is a compile-time
+ * constant, so `Prisma.raw` on it is exactly as safe as typing the number.
  */
 const TALLY_SLICE = Prisma.raw(String(LIST_TALLY_MAX));
 
 /**
- * Count, distance, ascent and a cover photo for every list at once.
- *
- * Raw SQL, and worth the departure. Prisma's `groupBy` cannot aggregate a column on the
- * joined table, so the alternative is loading every item of every list into Node and summing
- * there — which on an account with a hundred lists is a hundred thousand rows crossing the
- * wire to produce four numbers each. This is one query whose cost does not depend on how
- * much anyone has saved.
- *
- * The cover is the first photographed trail in list order: `array_agg` ordered by position
- * with the nulls stripped, then its head. Doing it inside the same aggregate avoids a
- * `DISTINCT ON` pass over the same join.
+ * Count, distance, ascent and a cover photo for every list at once. Raw SQL because Prisma's
+ * `groupBy` cannot aggregate a column on the joined table, so the alternative loads every item
+ * of every list into Node. The cover is the first photographed trail in list order —
+ * `array_agg` ordered by position with nulls stripped, then its head — computed inside the same
+ * aggregate to avoid a second pass over the join.
  */
 async function aggregateLists(
   db: PrismaClient,
@@ -172,10 +145,9 @@ async function aggregateLists(
 }
 
 /**
- * The same four numbers for the completed list, read from `Completion`.
- *
- * Every hike counts, not every trail: someone who has done the same 12 km loop forty times
- * has hiked 480 km, and a total that says 12 is describing the map rather than the person.
+ * The same four numbers for the completed list, read from `Completion`. Every hike counts, not
+ * every trail: forty laps of the same 12 km loop is 480 km, and a total saying 12 is describing
+ * the map rather than the person.
  */
 async function aggregateCompletions(db: PrismaClient, userId: string): Promise<ListAggregate> {
   const rows = await db.$queryRaw<Omit<AggregateRow, 'listId'>[]>`
@@ -202,10 +174,6 @@ async function aggregateCompletions(db: PrismaClient, userId: string): Promise<L
     lengths: row.lengths ?? [],
   };
 }
-
-// ---------------------------------------------------------------------------
-// Shaping
-// ---------------------------------------------------------------------------
 
 export function toSummaryShape(row: ListRow, aggregate: ListAggregate): ListSummary {
   return {
@@ -251,15 +219,11 @@ export function toDateString(value: Date): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the URL segment a list page was opened with.
- *
- * Two shapes reach here and both have to work. `/lists/favorites` is the caller's own system
- * list, addressed by the slug every account shares — a nicer URL than an opaque id, and the
- * one the app links to internally. `/lists/cmxyz…` is a specific list by id, which is what a
- * shared link looks like, because a slug is only unique within one account.
- *
- * Slugs are tried first and only for the signed-in caller, so a stranger's list called
- * "favorites" can never be reached by guessing a word.
+ * Resolve the URL segment a list page was opened with. `/lists/favorites` is the caller's own
+ * system list by the slug every account shares; `/lists/cmxyz…` is a specific list by id, which
+ * is what a shared link looks like, because a slug is only unique within one account. Slugs are
+ * tried first and only for the signed-in caller, so a stranger's "favorites" cannot be reached
+ * by guessing a word.
  */
 async function resolveList(
   db: PrismaClient,
@@ -295,11 +259,8 @@ async function ownListOrThrow(
 }
 
 /**
- * A slug for a new list that no other list of theirs already holds.
- *
- * Suffixed rather than rejected: two lists both called "Lakes" is a completely reasonable
- * thing to want, and refusing the second one because of a URL detail is the software's
- * problem showing through the interface.
+ * A slug for a new list that no other list of theirs already holds. Suffixed rather than
+ * rejected: two lists both called "Lakes" is a reasonable thing to want.
  */
 async function uniqueSlug(db: PrismaClient, userId: string, name: string): Promise<string> {
   const base = listSlug(name);
@@ -337,18 +298,11 @@ async function assertTrail(db: PrismaClient, trailId: string): Promise<void> {
   if (!trail) throw new TRPCError({ code: 'NOT_FOUND', message: 'No such trail.' });
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
 export const listsRouter = router({
   /**
-   * Every list the caller has.
-   *
-   * Provisioning runs first and is idempotent. It is normally done at account creation, but
-   * calling it here as well means an account made before system lists existed — or one whose
-   * creation hook failed — heals itself the first time someone opens the page, instead of
-   * showing an empty screen that no button can fix.
+   * Every list the caller has. Provisioning runs first and is idempotent, so an account made
+   * before system lists existed heals itself the first time someone opens the page instead of
+   * showing an empty screen no button can fix.
    */
   mine: protectedProcedure.query(async ({ ctx }): Promise<ListSummary[]> => {
     await ensureSystemLists(ctx.db, ctx.user.id);
@@ -373,11 +327,9 @@ export const listsRouter = router({
   }),
 
   /**
-   * One list and everything in it.
-   *
-   * Public, because a public list is meant to be openable by someone without an account —
-   * that is the entire point of the flag. A private list answers 404 rather than 403 to a
-   * stranger, for the same reason `ownListOrThrow` does.
+   * One list and everything in it. Public, because a public list is meant to be openable
+   * without an account. A private list answers 404 rather than 403 to a stranger, as
+   * `ownListOrThrow` does.
    */
   detail: publicProcedure.input(listKeyInput).query(async ({ ctx, input }): Promise<ListDetail> => {
     const row = await resolveList(ctx.db, input.key, ctx.user);
@@ -433,11 +385,9 @@ export const listsRouter = router({
   }),
 
   /**
-   * Every way one trail is attached to the caller, in a single round trip.
-   *
-   * Public and answers `EMPTY_SAVE_STATE` when signed out rather than UNAUTHORIZED. The save
-   * controls render on a page anyone can read, and a card that has to branch on an error
-   * code to decide whether to draw an empty heart is a card that flickers.
+   * Every way one trail is attached to the caller, in a single round trip. Public, answering
+   * `EMPTY_SAVE_STATE` when signed out: a card that branches on an error code to decide whether
+   * to draw an empty heart is a card that flickers.
    */
   saveState: publicProcedure
     .input(trailIdInput)
@@ -468,14 +418,9 @@ export const listsRouter = router({
     }),
 
   /**
-   * The same question as `saveState`, asked once for the whole index.
-   *
-   * Thirty cards each calling `saveState` is thirty queries answering one question, and they
-   * would arrive at thirty different moments — a column of hearts filling in one by one down
-   * the page. Two queries, one cache key, every card reads from it.
-   *
-   * Public and empty when signed out, for the reason `saveState` is: a card that has to
-   * branch on an error code to decide whether to draw an empty mark is a card that flickers.
+   * The same question as `saveState`, asked once for the whole index — thirty cards each
+   * calling `saveState` is thirty queries arriving at thirty different moments, filling a
+   * column of hearts in one by one. Public and empty when signed out, for the same reason.
    */
   savedIds: publicProcedure.query(async ({ ctx }): Promise<SavedTrailIds> => {
     const viewer = ctx.user;
@@ -533,11 +478,9 @@ export const listsRouter = router({
   }),
 
   /**
-   * Rename, describe, publish.
-   *
-   * A system list can be described and published but not renamed: "Favourites" is not a label
-   * the user chose, it is what the ring on every card puts things into, and letting it drift
-   * to something else makes that control point at a name nobody recognises.
+   * Rename, describe, publish. A system list can be described and published but not renamed:
+   * "Favourites" is what the ring on every card puts things into, and letting it drift makes
+   * that control point at a name nobody recognises.
    */
   update: protectedProcedure.input(listUpdateSchema).mutation(async ({ ctx, input }) => {
     const list = await ownListOrThrow(ctx.db, input.listId, ctx.user.id);
@@ -579,10 +522,8 @@ export const listsRouter = router({
     }),
 
   /**
-   * Put a trail in a list.
-   *
-   * Idempotent by way of the `(listId, trailId)` unique index — adding twice updates the note
-   * and leaves the position alone, so a double tap does not reorder anything.
+   * Put a trail in a list. Idempotent by way of the `(listId, trailId)` unique index — adding
+   * twice updates the note and leaves the position alone, so a double tap does not reorder.
    */
   addTrail: protectedProcedure
     .input(
@@ -637,11 +578,9 @@ export const listsRouter = router({
     }),
 
   /**
-   * The heart, and the one next to it.
-   *
-   * A single toggle rather than add/remove, because the control is a single tap and the
-   * client should not have to know the current state to know what to send. Returns where it
-   * landed so the button can settle on the truth rather than on its own optimistic guess.
+   * The heart, and the one next to it. A single toggle rather than add/remove, so the client
+   * need not know the current state to know what to send; returns where it landed so the button
+   * can settle on the truth rather than on its optimistic guess.
    */
   toggle: protectedProcedure
     .input(
@@ -687,11 +626,8 @@ export const listsRouter = router({
     }),
 
   /**
-   * Log a hike.
-   *
-   * Repeatable on purpose — the same trail on two dates is two rows, and both belong in the
-   * record. Same date twice is very likely a double submit rather than two hikes, so that one
-   * case is collapsed.
+   * Log a hike. Repeatable on purpose — the same trail on two dates is two rows — but the same
+   * date twice is very likely a double submit, so that one case is collapsed.
    */
   recordCompletion: protectedProcedure
     .input(completionWriteSchema)
@@ -720,10 +656,8 @@ export const listsRouter = router({
     }),
 
   /**
-   * Take a hike back out of the record.
-   *
-   * By id when correcting one entry of several, or by trail to clear the lot — which is what
-   * un-ticking "I've done this" means on a trail page that never showed the individual dates.
+   * Take a hike back out of the record: by id when correcting one entry of several, or by trail
+   * to clear the lot, which is what un-ticking "I've done this" means on a trail page.
    */
   forgetCompletion: protectedProcedure
     .input(

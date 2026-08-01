@@ -1,31 +1,14 @@
 /**
- * Where photograph bytes go.
+ * Where photograph bytes go. Two drivers behind one interface, chosen at startup by whether R2
+ * is configured: R2 in production (the browser uploads directly with a presigned URL — see
+ * `docs/architecture.md`), and a local filesystem in development that mimics the presigned-PUT
+ * contract exactly, so the client code has no branch in it.
  *
- * Two drivers behind one interface, chosen at startup by whether R2 is configured:
- *
- * - **R2** in production. Cloudflare's S3-compatible object store. The browser uploads
- *   *directly* to it with a presigned URL, so a 900 kB photograph never touches our function
- *   — which matters more than it sounds like: Vercel's request body limit is 4.5 MB, and a
- *   proxied upload would also mean paying for that bandwidth twice and holding a serverless
- *   invocation open for the duration of a phone's slow uplink.
- * - **A local filesystem** in development, because you cannot get R2 credentials without a
- *   Cloudflare account and the upload flow has to be buildable and testable before then. It
- *   mimics the presigned-PUT contract exactly — a signed, expiring, single-purpose URL that
- *   the client `PUT`s to — so the client code has no branch in it. The only difference is
- *   that the URL points back at our own API.
- *
- * **SigV4 is implemented here rather than pulled in.** `@aws-sdk/client-s3` plus the
- * presigner is around 1.5 MB of JavaScript in a serverless bundle to produce a string this
- * module makes in eighty lines, and the AWS SDK's modular v3 packaging still drags in a
- * credential-provider chain that will happily go looking for EC2 instance metadata. The
- * signing algorithm is public, fixed, and has published test vectors, which is exactly the
- * kind of thing worth owning.
+ * **SigV4 is implemented here rather than pulled in.** `@aws-sdk/client-s3` plus the presigner
+ * is ~1.5 MB of bundle to produce one string, and its credential-provider chain will go looking
+ * for EC2 instance metadata. The algorithm is public, fixed, and has published test vectors.
  */
 import { PHOTO_CONTENT_TYPES, type PhotoContentType } from '@switchback/core';
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 export interface R2Config {
   accountId: string;
@@ -38,15 +21,15 @@ export interface R2Config {
 
 /**
  * R2 signs against `auto`, not a real region. Its buckets have a location hint rather than a
- * region, and passing anything else produces a signature mismatch with no useful message.
+ * region, and anything else produces a signature mismatch with no useful message.
  */
 const R2_REGION = 'auto';
 const R2_SERVICE = 's3';
 const ALGORITHM = 'AWS4-HMAC-SHA256';
 
 /**
- * Presigned PUTs are signed without hashing the body, which is the only way this can work:
- * the signature has to exist before the browser has read the file.
+ * Presigned PUTs are signed without hashing the body — the signature has to exist before the
+ * browser has read the file.
  */
 const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
 
@@ -66,10 +49,6 @@ function readR2Config(): R2Config | null {
     publicUrl: publicUrl.replace(/\/+$/, ''),
   };
 }
-
-// ---------------------------------------------------------------------------
-// The interface
-// ---------------------------------------------------------------------------
 
 export interface SignedRequest {
   url: string;
@@ -98,23 +77,15 @@ export interface StorageDriver {
   /** Remove an object. Idempotent — deleting something absent is a success. */
   remove(key: string): Promise<void>;
   /**
-   * Objects under a prefix, oldest first, capped at `limit`.
-   *
-   * Only the orphan sweeper calls this, and only ever to answer "what is in the bucket that
-   * the database has never heard of". Objects come back in the store's own listing order —
-   * lexicographic for S3, directory order for the local driver — because neither store can
-   * sort by age without reading everything first, and the sweeper filters on `lastModified`
-   * itself. When the cap is reached the caller is told, rather than being handed a short list
-   * that looks complete.
+   * Objects under a prefix, capped at `limit`. Only the orphan sweeper calls this. Order is the
+   * store's own listing order — neither store can sort by age without reading everything — so
+   * the sweeper filters on `lastModified` itself. When the cap is reached the caller is told,
+   * rather than handed a short list that looks complete.
    */
   list(prefix: string, limit: number): Promise<ObjectEntry[]>;
   /** Where the world reads it from. Stored in `Photo.url`. */
   publicUrl(key: string): string;
 }
-
-// ---------------------------------------------------------------------------
-// Signing primitives
-// ---------------------------------------------------------------------------
 
 const encoder = new TextEncoder();
 
@@ -140,12 +111,9 @@ async function sha256Hex(data: string): Promise<string> {
 }
 
 /**
- * AWS's percent-encoding, which is *not* `encodeURIComponent`.
- *
- * The unreserved set is exactly `A-Za-z0-9-_.~`; everything else is percent-encoded with
- * uppercase hex. `encodeURIComponent` leaves `!*'()` alone, and those four characters are
- * the reason a hand-rolled signer works on every key you test with and then fails on the one
- * containing an apostrophe.
+ * AWS's percent-encoding, which is *not* `encodeURIComponent`. The unreserved set is exactly
+ * `A-Za-z0-9-_.~`, encoded with uppercase hex; `encodeURIComponent` leaves `!*'()` alone, and
+ * those four are why a hand-rolled signer works until it meets a key with an apostrophe.
  */
 export function uriEncode(value: string, encodeSlash = true): string {
   let out = '';
@@ -169,10 +137,8 @@ export function amzDate(now: Date): string {
 }
 
 /**
- * Sign a request as a URL — SigV4 "query string" authentication.
- *
- * Exported for the test suite, which runs it against AWS's published `aws4_request` vectors.
- * A signer with no test is a signer that works until the day the header set changes.
+ * Sign a request as a URL — SigV4 "query string" authentication. Exported for the test suite,
+ * which runs it against AWS's published `aws4_request` vectors.
  */
 export async function presignV4(
   config: R2Config,
@@ -191,22 +157,17 @@ export async function presignV4(
   const dateStamp = stamp.slice(0, 8);
   const scope = `${dateStamp}/${R2_REGION}/${R2_SERVICE}/aws4_request`;
 
-  // Path-style, `/<bucket>/<key>`. Virtual-hosted style would put the bucket in the hostname,
-  // which R2 supports only on custom domains — path-style works on the account endpoint always.
-  //
-  // An empty key addresses the bucket itself, which is how a listing is requested. It has to
-  // be `/<bucket>` and not `/<bucket>/`, because the trailing slash is a key: S3 reads it as
-  // a request for an object whose name is the empty string inside a folder.
+  // Path-style, `/<bucket>/<key>`: virtual-hosted style needs the bucket in the hostname, which
+  // R2 supports only on custom domains. An empty key addresses the bucket itself, which is how
+  // a listing is requested — and it must be `/<bucket>` without the trailing slash, because S3
+  // reads that slash as a request for an object named the empty string inside a folder.
   const canonicalUri = key
     ? `/${uriEncode(config.bucket, false)}/${uriEncode(key, false)}`
     : `/${uriEncode(config.bucket, false)}`;
 
-  /*
-   * Signing `content-type` is a security decision, not a formality. Without it the ticket
-   * authorises *any* content type at that key, so a leaked URL could park `text/html` in a
-   * bucket served from our own domain — stored XSS with a CDN in front of it. With it, the
-   * client must send precisely the type we approved or the store rejects the upload.
-   */
+  // Signing `content-type` is a security decision, not a formality: without it the ticket
+  // authorises *any* content type at that key, so a leaked URL could park `text/html` in a
+  // bucket served from our own domain — stored XSS with a CDN in front of it.
   const headers: Record<string, string> = { host };
   if (options.contentType) headers['content-type'] = options.contentType;
 
@@ -239,8 +200,7 @@ export async function presignV4(
   const stringToSign = [ALGORITHM, stamp, scope, await sha256Hex(canonicalRequest)].join('\n');
 
   // Annotated rather than inferred: `TextEncoder.encode` is typed as backed by a plain
-  // `ArrayBuffer` while `crypto.subtle.sign` returns the wider `ArrayBufferLike`, so the
-  // first reassignment inside the loop would not fit the type of the initialiser.
+  // `ArrayBuffer` while `crypto.subtle.sign` returns the wider `ArrayBufferLike`.
   let signing: Uint8Array = encoder.encode(`AWS4${config.secretAccessKey}`);
   for (const part of [dateStamp, R2_REGION, R2_SERVICE, 'aws4_request']) {
     signing = await hmac(signing, part);
@@ -258,12 +218,9 @@ export async function presignV4(
 // ---------------------------------------------------------------------------
 
 /**
- * The five XML entities, reversed.
- *
- * S3 escapes keys in a listing, so a photograph filed under `photos/u/a&b.jpg` comes back as
- * `a&amp;b.jpg` and a naive parser would then ask the store to delete a key that does not
- * exist. Our own keys are `[a-z0-9]` ids and cannot contain any of these — this is here so
- * that stays true of the *parser* and not just of today's key format.
+ * The five XML entities, reversed. S3 escapes keys in a listing, so `photos/u/a&b.jpg` comes
+ * back as `a&amp;b.jpg` and a naive parser would ask the store to delete a key that does not
+ * exist. Our own keys cannot contain any of these; this keeps that true of the *parser*.
  */
 function xmlDecode(value: string): string {
   return value
@@ -280,14 +237,9 @@ function tagText(xml: string, tag: string): string | null {
 }
 
 /**
- * Parse `ListObjectsV2` without an XML library.
- *
- * The response shape is fixed by the S3 API and consists of one repeating element with three
- * fields we read. A parser is 20 lines; `fast-xml-parser` is another dependency in a
- * serverless bundle for a document we control the shape of. Same reasoning as SigV4 above.
- *
- * Exported for the test suite. Everything this returns becomes a delete candidate, so a
- * mis-parse is not a display bug.
+ * Parse `ListObjectsV2` without an XML library — the shape is fixed by the S3 API and is one
+ * repeating element with three fields we read. Exported for the test suite: everything this
+ * returns becomes a delete candidate, so a mis-parse is not a display bug.
  */
 export function parseListing(xml: string): { entries: ObjectEntry[]; nextToken: string | null } {
   const entries: ObjectEntry[] = [];
@@ -369,14 +321,11 @@ function r2Driver(config: R2Config): StorageDriver {
 /**
  * Where the local driver writes. Gitignored; safe to delete at any time.
  *
- * A literal rather than an environment override, and that is load-bearing rather than a
- * simplification. Turbopack traces this module to decide which files the `/api/uploads`
- * function needs deployed alongside it, and a `path.resolve` whose argument it cannot bound
- * reads as "this could open anything under the repository" — so it traces the entire project
- * into that one serverless bundle. `next build` reports it, and on Vercel it costs a slower
- * cold start against a 250 MB ceiling. A literal segment resolved against the working
- * directory is the shape the tracer can scope, and `LOCAL_UPLOAD_DIR` was set by nothing:
- * not `.env.example`, not the test suite, not a script.
+ * **A literal rather than an environment override, deliberately.** Turbopack traces this module
+ * to decide which files `/api/uploads` needs deployed alongside it, and a `path.resolve` whose
+ * argument it cannot bound reads as "this could open anything under the repository" — so it
+ * traces the entire project into that one serverless bundle, against a 250 MB ceiling. A literal
+ * segment resolved against the working directory is the shape the tracer can scope.
  */
 export const LOCAL_UPLOAD_DIR = '.uploads';
 
@@ -384,9 +333,9 @@ export const LOCAL_UPLOAD_DIR = '.uploads';
 export const LOCAL_UPLOAD_PATH = '/api/uploads';
 
 /**
- * Keys are built by us, from a user id and a random id, so they cannot contain anything
- * exotic — but this is the check that turns "cannot" into "does not", and it is the only
- * thing standing between a signed URL and `../../../../etc/passwd`.
+ * Keys are built by us from a user id and a random id, so they cannot contain anything exotic —
+ * but this is what turns "cannot" into "does not", and the only thing standing between a signed
+ * URL and `../../../../etc/passwd`.
  */
 export function isSafeKey(key: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9/_.-]{0,200}$/u.test(key) && !key.includes('..');
@@ -401,12 +350,9 @@ function localSecret(): Uint8Array {
 }
 
 /**
- * The local driver's stand-in for a signature.
- *
- * Same shape of promise as SigV4 makes: this exact method, at this exact key, with this
- * exact content type, until this exact moment. Signed with `AUTH_SECRET` because the local
- * driver has no credentials of its own, and a development upload endpoint that accepts
- * unsigned writes is a directory anyone on your network can fill.
+ * The local driver's stand-in for a signature: the same promise SigV4 makes — this method, this
+ * key, this content type, until this moment. Signed with `AUTH_SECRET`, because a development
+ * upload endpoint that accepts unsigned writes is a directory anyone on your network can fill.
  */
 export async function localUploadSignature(
   method: string,
@@ -426,11 +372,9 @@ export function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /**
- * Resolve a key to a path inside the upload directory, or throw.
- *
- * Belt and braces over `isSafeKey`: the final resolved path is checked to be *under* the
- * root, which catches anything the pattern missed on a platform whose path separator rules
- * differ from the one this was written on.
+ * Resolve a key to a path inside the upload directory, or throw. Belt and braces over
+ * `isSafeKey`: the resolved path is checked to be *under* the root, catching anything the
+ * pattern missed on a platform whose separator rules differ.
  */
 export async function localPathFor(key: string): Promise<string> {
   const path = await import('node:path');
@@ -456,9 +400,8 @@ function localDriver(): StorageDriver {
         sig: signature,
       });
       return {
-        // Root-relative on purpose. An absolute `http://localhost:3000` would be baked into
-        // whatever the client does with it, and the port this thing runs on is not a fact
-        // worth persisting. `new URL(url, origin)` resolves it on the one client that needs to.
+        // Root-relative on purpose: an absolute `http://localhost:3000` would be baked into
+        // whatever the client does with it. `new URL(url, origin)` resolves it where needed.
         url: `${LOCAL_UPLOAD_PATH}/${key}?${query.toString()}`,
         method: 'PUT',
         headers: { 'Content-Type': contentType },
@@ -502,8 +445,8 @@ function localDriver(): StorageDriver {
             await walk(full);
             continue;
           }
-          // Back to a key: relative to the root, and always forward slashes, because that is
-          // what the database stored and what the R2 driver would have returned.
+          // Back to a key: relative to the root, always forward slashes, because that is what
+          // the database stored and what the R2 driver would have returned.
           const key = path.relative(root, full).split(path.sep).join('/');
           if (!key.startsWith(prefix)) continue;
           const stats = await fs.stat(full);
@@ -519,18 +462,12 @@ function localDriver(): StorageDriver {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Selection and key layout
-// ---------------------------------------------------------------------------
-
 let cached: StorageDriver | null = null;
 
 /**
- * The driver for this process.
- *
- * Memoised, and chosen by configuration rather than by `NODE_ENV`: pointing a local dev
- * server at a real R2 bucket by filling in four variables should just work, and a production
- * deploy that forgot them should fail loudly at the first upload rather than silently write
+ * The driver for this process. Memoised, and chosen by configuration rather than by `NODE_ENV`:
+ * pointing a dev server at a real bucket by filling in four variables should work, and a
+ * production deploy that forgot them should fail loudly at the first upload rather than write
  * to a serverless filesystem that evaporates.
  */
 export function storage(): StorageDriver {
@@ -551,16 +488,10 @@ export interface PhotoKeys {
 }
 
 /**
- * Where a user's photograph lives.
- *
- * The user id is in the path, which is what makes `commit` verifiable without a pending-
- * uploads table: the key is derived from the *authenticated* caller, so a client cannot ask
- * for a ticket to somebody else's prefix, and an object under `photos/alice/…` was put there
- * by a ticket issued to Alice.
- *
- * `_t` rather than a parallel `thumbs/` tree so the two renditions sort together in a bucket
- * listing — when you are staring at an object browser trying to work out why one photograph
- * is broken, having its thumbnail on the next line is worth more than a tidy hierarchy.
+ * Where a user's photograph lives. The user id is in the path, which is what makes `commit`
+ * verifiable without a pending-uploads table: the key is derived from the *authenticated*
+ * caller, so an object under `photos/alice/…` was put there by a ticket issued to Alice.
+ * `_t` rather than a parallel `thumbs/` tree so the two renditions sort together in a listing.
  */
 export function photoKeys(
   userId: string,
@@ -570,8 +501,8 @@ export function photoKeys(
   const extension = PHOTO_CONTENT_TYPES[contentType];
   return {
     full: `photos/${userId}/${uploadId}.${extension}`,
-    // Thumbnails are always JPEG: every browser can encode one from a canvas, and at 480 px
-    // the format difference is a few kilobytes against the certainty of it working everywhere.
+    // Thumbnails are always JPEG: every browser can encode one from a canvas, and at 480 px the
+    // format difference is a few kilobytes against the certainty of it working everywhere.
     thumb: `photos/${userId}/${uploadId}_t.jpg`,
   };
 }

@@ -1,28 +1,15 @@
 /**
- * Tokens for the native app.
+ * Tokens for the native app; the website uses an Auth.js session cookie and none of this
+ * applies to it. Two deliberate asymmetries:
  *
- * The website authenticates with an Auth.js session cookie and none of this applies to
- * it. iOS cannot use that cookie: the sign-in happens in a system browser sheet
- * (`expo-auth-session` / `expo-apple-authentication`), which hands the app an identity
- * token and then closes. So the app trades that identity token for a pair of ours —
- * a short-lived access JWT it sends on every request, and a long-lived opaque refresh
- * token it keeps in the Keychain.
- *
- * Two deliberate asymmetries:
- *
- * - **The access token is a JWT and is never stored.** Verifying it is a signature check
- *   with no database round trip, which is what makes it cheap enough to put on every
- *   call. The cost used to be that it could not be revoked at all, which is why it lives 15
- *   minutes. It now carries `iat`, and `createContext` refuses one issued at or before the
- *   account's `sessionsRevokedAt` — so "sign out everywhere" is immediate rather than
- *   eventual, and it costs nothing, because that request already loads the user row. The
- *   15-minute life still bounds everything else.
- * - **The refresh token is opaque and *is* stored, hashed.** It is a database lookup
- *   every time, but it is used once an hour at most, and being stored is what makes
- *   revocation and reuse detection possible at all. Hashed because a leaked backup of
- *   this table should not be a leaked set of live credentials — same reasoning as
- *   password storage, minus the need for a slow KDF, since these are 256 bits of
- *   entropy rather than something a human chose.
+ * - **The access token is a JWT and is never stored**, so verifying it is a signature check
+ *   with no round trip. It carries `iat`, and `createContext` refuses one issued at or before
+ *   the account's `sessionsRevokedAt`, which is what makes "sign out everywhere" immediate
+ *   rather than eventual. The 15-minute life bounds everything else.
+ * - **The refresh token is opaque and *is* stored, hashed.** Being stored is what makes
+ *   revocation and reuse detection possible; hashed so a leaked backup of this table is not a
+ *   leaked set of live credentials. No slow KDF — these are 256 bits of entropy, not a
+ *   password.
  */
 import { SignJWT, jwtVerify } from 'jose';
 import type { PrismaClient } from '@switchback/db';
@@ -74,11 +61,9 @@ export async function signAccessToken(userId: string): Promise<string> {
 }
 
 /**
- * A verified access token, reduced to the two things anything downstream needs.
- *
- * `issuedAt` is here so a revocation can be enforced against a token already in a client's
- * memory — see `sessionsRevokedAt` on `User` and the check in `createContext`. Seconds since
- * the epoch, which is what `iat` is.
+ * A verified access token, reduced to what anything downstream needs. `issuedAt` is here so a
+ * revocation can be enforced against a token already in a client's memory — see
+ * `sessionsRevokedAt` on `User` and the check in `createContext`.
  */
 export interface AccessTokenClaims {
   userId: string;
@@ -86,14 +71,10 @@ export interface AccessTokenClaims {
 }
 
 /**
- * Returns the claims, or null for anything wrong with the token.
+ * Returns the claims, or null for anything wrong with the token — null rather than throwing
+ * because the caller runs on every request including public ones.
  *
- * Null rather than throwing because the caller is the tRPC context, which runs on every
- * request including public ones: a stale token on a public procedure should degrade to
- * "not signed in", not 500.
- *
- * `iat` is required rather than defaulted. Every token we mint sets it, so a verified token
- * without one is not ours in a way the signature check cannot see, and treating a missing
+ * `iat` is required rather than defaulted: every token we mint sets it, and treating a missing
  * `iat` as "issued now" would make it the one shape that survives a revocation.
  */
 export async function verifyAccessToken(token: string): Promise<AccessTokenClaims | null> {
@@ -111,10 +92,8 @@ export async function verifyAccessToken(token: string): Promise<AccessTokenClaim
 }
 
 /**
- * 256 bits from the CSPRNG, base64url so it survives a header untouched.
- *
- * Exported for `mobile-auth.ts`, which mints one-time codes with the same properties and
- * should not be growing a second opinion about how to do it.
+ * 256 bits from the CSPRNG, base64url so it survives a header untouched. Exported for
+ * `mobile-auth.ts`, whose one-time codes need the same properties.
  */
 export function randomToken(): string {
   const bytes = new Uint8Array(32);
@@ -160,20 +139,14 @@ export async function issueTokenPair(
 }
 
 /**
- * Exchange a refresh token for a new pair, invalidating the old one.
+ * Exchange a refresh token for a new pair, invalidating the old one. Rotation on every use,
+ * with reuse detection: a token that has already been *rotated* coming back means two live
+ * copies exist and nothing here can say which caller is the thief, so every refresh token the
+ * user has is revoked.
  *
- * Rotation on every use, with reuse detection. If a token that has already been *rotated*
- * comes back, there are two live copies of it — ours and someone else's — and there is no
- * way to tell from here which caller is the thief. So we assume the worst and revoke every
- * refresh token the user has, signing out all their devices. That is a real cost to a
- * legitimate user who hit a network retry at exactly the wrong moment, and it is still the
- * right trade: the alternative is leaving an attacker with a valid session.
- *
- * "Rotated" and "revoked" are not the same thing, which is why `replacedBy` is what the
- * check reads rather than `revokedAt`. A token revoked by an explicit sign-out has no
- * successor, and a device replaying its last refresh after the user signed out is a stale
- * client, not a compromise — cascading there would let anyone sign a user out of every
- * device by signing out of one and retrying.
+ * "Rotated" and "revoked" are not the same, which is why the check reads `replacedBy` and not
+ * `revokedAt`. A token revoked by an explicit sign-out has no successor, and cascading there
+ * would let anyone sign a user out of every device by signing out of one and retrying.
  */
 export async function rotateRefreshToken(
   db: PrismaClient,
@@ -204,9 +177,8 @@ export async function rotateRefreshToken(
   const refreshExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_S * 1000);
 
   // Interactive transaction because the replacement's id is not known until it exists, and
-  // `replacedBy` has to land in the same atomic step as the revocation: a row that is
-  // revoked but not yet marked as replaced reads, for as long as that window is open, like
-  // an ordinary sign-out — which is precisely the case reuse detection must not miss.
+  // `replacedBy` has to land in the same atomic step as the revocation: a row revoked but not
+  // yet marked as replaced reads like an ordinary sign-out, which reuse detection must not miss.
   await db.$transaction(async (tx) => {
     const created = await tx.mobileRefreshToken.create({
       data: {
@@ -247,11 +219,9 @@ export async function revokeAllRefreshTokens(db: PrismaClient, userId: string): 
 }
 
 /**
- * Delete refresh tokens that expired more than a week ago.
- *
- * Not the same as revoking: revoked-but-unexpired rows have to stay, because they are
- * what reuse detection matches against. Once a token is past its own expiry it would be
- * rejected anyway, so the row stops carrying information. Drained by the cron.
+ * Delete refresh tokens that expired more than a week ago. Not the same as revoking:
+ * revoked-but-unexpired rows have to stay, because they are what reuse detection matches
+ * against. Drained by the cron.
  */
 export async function pruneExpiredRefreshTokens(db: PrismaClient): Promise<number> {
   const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);

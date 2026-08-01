@@ -3,15 +3,10 @@ import { UNBATCHED_PROCEDURES } from '@switchback/core';
 import { appRouter } from '../src/root';
 
 /**
- * The batching policy names procedures as strings, and strings do not survive a rename.
- *
- * That is the whole failure mode worth testing here. If `trails.browse` is ever renamed or
- * moved under another router, nothing breaks loudly: the split link simply stops matching,
- * the slow query rejoins the batch, and the place typeahead goes back to waiting half a
- * minute behind an Overpass fetch — the exact defect the list exists to prevent, returning
- * silently and by omission.
- *
- * So the list is checked against the router it describes rather than trusted.
+ * The batching policy names procedures as strings, and strings do not survive a rename: the
+ * split link would simply stop matching, the slow query would rejoin the batch, and the place
+ * typeahead would go back to waiting behind an Overpass fetch. So the list is checked against
+ * the router it describes rather than trusted.
  */
 describe('UNBATCHED_PROCEDURES', () => {
   const known = Object.keys(appRouter._def.procedures);
@@ -23,8 +18,8 @@ describe('UNBATCHED_PROCEDURES', () => {
   });
 
   it('still covers the two that reach a third party', () => {
-    // Named explicitly rather than counted. A test that only asserts "the list is not empty"
-    // passes just as happily when the wrong entry is the surviving one.
+    // Named explicitly rather than counted: "the list is not empty" passes just as happily
+    // when the wrong entry is the surviving one.
     expect(UNBATCHED_PROCEDURES).toContain('trails.browse');
     expect(UNBATCHED_PROCEDURES).toContain('places.search');
   });

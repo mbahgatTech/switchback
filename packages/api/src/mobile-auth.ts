@@ -1,61 +1,21 @@
 /**
- * Browser-assisted sign-in for the iOS app.
+ * Browser-assisted sign-in for the iOS app: the app borrows the website's sign-in because Expo
+ * Go hands out an `exp://192.168.x.x:8081` redirect no identity provider will accept. The
+ * sequence and the four properties holding it together are in `docs/architecture.md`.
  *
- * The direct approach — `expo-auth-session` opening Entra straight from the app — needs a
- * redirect URI registered with the provider, and Expo Go hands out `exp://192.168.x.x:8081`,
- * which changes with the Wi-Fi lease and which no identity provider will accept. So the app
- * borrows the website's sign-in instead:
- *
- * ```
- *  app                          our server                        provider
- *   │  verifier = random                                              │
- *   │  challenge = sha256(verifier)                                   │
- *   ├─ GET /start?redirect=&challenge= ─►  row created, 302 ──►       │
- *   │                                      /signin?callbackUrl=…      │
- *   │                                            └─ normal OIDC ─────►│
- *   │                                      session cookie ◄───────────┘
- *   │                                      GET /complete?request=
- *   │  ◄── 302 exp://…/--/signin?code=&state= ─┘
- *   ├─ POST /claim {request, code, verifier} ─►  code + verifier checked
- *   │  ◄── token pair ────────────────────────┘
- * ```
- *
- * The provider only ever sees our own already-registered `https://` redirect URI. The custom
- * scheme is a leg between us and the app, which is entirely ours to define — and it keeps
- * working unchanged after the Apple enrolment, when `switchback://` becomes available and the
- * `exp://` case can simply be dropped.
- *
- * Three properties hold this together, and each one is doing real work:
- *
- * - **The code is worthless alone.** It is delivered over a custom-scheme URL, and on iOS any
- *   app may claim a scheme it does not own. So the code is only half the credential: the
- *   claim must also present the verifier, which never left the device that started the flow.
- *   This is PKCE, applied to our own leg rather than the provider's.
- * - **Everything is single-use.** `codeHash` is unique and `claimedAt` is set inside the same
- *   transaction that reads it, so a replay finds the row already spent.
- * - **The redirect is allow-listed before it is stored**, not when it is used. An endpoint
- *   that will bounce a browser to an arbitrary URL after a successful sign-in is a phishing
- *   primitive on our own domain even when the code riding along with it is unredeemable.
- *
- * A fourth property was missing and is now here: **the row belongs to one browser.** PKCE
- * binds the row to the device that will *claim* it; nothing bound it to the browser that
- * *authorises* it, and those are two different halves of one credential. An attacker who runs
- * `/start` themselves holds the verifier, and could then navigate a victim's browser to
- * `/complete?request=<id>` — a top-level cross-site GET, on which `SameSite=Lax` sends the
- * session cookie by design — and end up holding a token pair on the victim's account. So
- * `/start` also mints a browser secret, keeps its digest in `browserHash`, and hands the value
- * to the browser in a `__Host-` cookie; `/complete` will not authorise a row whose secret it
- * cannot present. See {@link startAuthRequest} and {@link authorizeAuthRequest}.
+ * The properties, so nothing here is removed by accident: the code is worthless without the
+ * verifier that never left the device (PKCE applied to our own leg, because on iOS any app may
+ * claim a URL scheme); everything is single-use inside one transaction; the redirect is
+ * allow-listed when stored, not when used; and the row is bound to the authorising *browser* as
+ * well as the claiming device, so a cross-site GET to `/complete` — on which `SameSite=Lax`
+ * sends the session cookie by design — cannot mint a token pair on somebody else's account.
  */
 import type { PrismaClient } from '@switchback/db';
 import { type TokenPair, hashToken, issueTokenPair, randomToken } from './tokens';
 
 /**
- * How long the whole round trip has.
- *
- * Long enough for a password, an MFA prompt, and a consent screen on a phone in bad light;
- * short enough that an abandoned attempt is not a redeemable credential sitting in a table an
- * hour later. The code leg inside it takes seconds — the app claims on the deep link.
+ * How long the whole round trip has. Long enough for a password, an MFA prompt and a consent
+ * screen; short enough that an abandoned attempt is not a redeemable credential an hour later.
  */
 export const AUTH_REQUEST_TTL_MS = 15 * 60 * 1000;
 
@@ -83,16 +43,10 @@ export class MobileAuthError extends Error {
 }
 
 /**
- * Whether the server is willing to bounce a browser to this URL.
- *
- * `switchback:` is ours and always fine. The two development forms are not: `exp:` is Expo
- * Go, whose host is a LAN address that changes, and `http://localhost` is Expo on the web —
- * both are only reachable from a machine on the same network as the one running Metro, and
- * both are refused outright in production, where the app has its own scheme and no reason to
- * ask for either.
- *
- * Pure, and separated from the route for exactly that reason: this is the function whose
- * being wrong is worst, so it is the one that gets tested directly.
+ * Whether the server is willing to bounce a browser to this URL. `switchback:` is ours and
+ * always fine; the two development forms (`exp:` for Expo Go, `http://localhost` for Expo on
+ * the web) are refused outright in production. Pure, and separated from the route because this
+ * is the function whose being wrong is worst, so it is the one tested directly.
  */
 export function isAllowedRedirect(uri: string, allowDevelopmentSchemes: boolean): boolean {
   let url: URL;
@@ -109,11 +63,8 @@ export function isAllowedRedirect(uri: string, allowDevelopmentSchemes: boolean)
 }
 
 /**
- * Whether development redirect schemes are on.
- *
- * Read from the environment at call time rather than captured at import, so a test can set it
- * per case. `NODE_ENV` is what Next sets; a deployment that wants the LAN forms on a preview
- * build can say so explicitly.
+ * Whether development redirect schemes are on. Read from the environment at call time rather
+ * than captured at import, so a test can set it per case.
  */
 export function developmentSchemesAllowed(): boolean {
   if (process.env.AUTH_MOBILE_ALLOW_DEV_SCHEMES === 'true') return true;
@@ -130,10 +81,8 @@ export async function challengeFor(verifier: string): Promise<string> {
 }
 
 /**
- * What `/start` records, and the secret it must hand to the browser.
- *
- * `browserSecret` is returned rather than stored so the route can put it in a cookie; only
- * its digest is written down, on the same reasoning as the one-time code.
+ * What `/start` records. `browserSecret` is returned rather than stored so the route can put it
+ * in a cookie; only its digest is written down, as with the one-time code.
  */
 export interface StartedAuthRequest {
   id: string;
@@ -141,11 +90,10 @@ export interface StartedAuthRequest {
 }
 
 /**
- * Open a sign-in request. Returns the id the browser carries through OIDC, and the secret
- * that identifies the browser it was opened in.
- *
- * Nothing here is a credential yet — the row is an intent, and stays useless until a real
- * session comes back through {@link authorizeAuthRequest} *from the same browser*.
+ * Open a sign-in request. Returns the id the browser carries through OIDC, and the secret that
+ * identifies the browser it was opened in. Nothing here is a credential yet: the row stays
+ * useless until a real session comes back through {@link authorizeAuthRequest} *from the same
+ * browser*.
  */
 export async function startAuthRequest(
   db: PrismaClient,
@@ -155,7 +103,7 @@ export async function startAuthRequest(
     throw new MobileAuthError('invalid_redirect');
   }
   // 43 characters is the base64url length of a 256-bit digest, and the shortest thing worth
-  // accepting: a short challenge is a guessable one, which would undo the whole point of it.
+  // accepting: a short challenge is a guessable one.
   if (input.challenge.length < 43 || !/^[A-Za-z0-9_-]+$/u.test(input.challenge)) {
     throw new MobileAuthError('invalid_request', 'challenge must be base64url, 43+ chars');
   }
@@ -175,17 +123,13 @@ export async function startAuthRequest(
 }
 
 /**
- * The browser finished OIDC. Mint the one-time code and say where to send it.
+ * The browser finished OIDC. Mint the one-time code and say where to send it. The code is
+ * returned rather than stored in the clear, for the reason refresh tokens are.
  *
- * The code is returned rather than stored in the clear for the same reason refresh tokens
- * are: a dump of this table should not be a set of live credentials, even ones that expire in
- * minutes.
- *
- * `browserSecret` is the value `/start` put in this browser's cookie, and it is required. A
- * row whose `browserHash` is null — written by a build that predates the column — is treated
- * as a mismatch rather than as unchecked: those rows live at most fifteen minutes, so the
- * whole population is gone within a quarter of an hour of a deploy, and the alternative is a
- * permanent hole kept open for a handful of sign-ins that can simply be started again.
+ * `browserSecret` is the value `/start` put in this browser's cookie and it is **required**: a
+ * row whose `browserHash` is null, written by a build predating the column, is treated as a
+ * mismatch rather than as unchecked. Those rows live at most fifteen minutes; the alternative
+ * is a permanent hole.
  */
 export async function authorizeAuthRequest(
   db: PrismaClient,
@@ -216,11 +160,9 @@ export async function authorizeAuthRequest(
 }
 
 /**
- * Trade the one-time code plus the verifier for a token pair.
- *
- * Both halves are checked before anything is issued, and the row is spent in the same
- * transaction that reads it — two claims racing on one code produce one pair and one error,
- * not two pairs.
+ * Trade the one-time code plus the verifier for a token pair. Both halves are checked before
+ * anything is issued, and the row is spent in the same transaction that reads it — two claims
+ * racing on one code produce one pair and one error, not two pairs.
  */
 export async function claimAuthRequest(
   db: PrismaClient,
@@ -239,7 +181,7 @@ export async function claimAuthRequest(
     if (!request.userId || !request.codeHash) throw new MobileAuthError('not_authorized');
     // Constant-time comparison is not the concern it would be for a MAC: both sides are
     // SHA-256 digests of high-entropy inputs, so a timing oracle leaks a prefix of a hash the
-    // attacker cannot invert. The equality checks below are ordinary string compares.
+    // attacker cannot invert.
     if (request.codeHash !== codeHash) throw new MobileAuthError('invalid_request');
     if (request.challenge !== challenge) throw new MobileAuthError('invalid_request');
 
@@ -254,11 +196,9 @@ export async function claimAuthRequest(
 }
 
 /**
- * Drop requests that expired more than an hour ago.
- *
- * Unlike refresh tokens there is no reuse detection to preserve here — a spent or lapsed row
- * carries no information once it can no longer be claimed. The hour of slack only exists so a
- * support question about a sign-in that failed two minutes ago still has a row to look at.
+ * Drop requests that expired more than an hour ago. Unlike refresh tokens there is no reuse
+ * detection to preserve; the hour of slack exists so a support question about a sign-in that
+ * failed two minutes ago still has a row to look at.
  */
 export async function pruneExpiredAuthRequests(db: PrismaClient): Promise<number> {
   const cutoff = new Date(Date.now() - 60 * 60 * 1000);

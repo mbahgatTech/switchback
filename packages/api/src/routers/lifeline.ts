@@ -1,22 +1,16 @@
 /**
- * Lifeline — the note left at the pub, kept current by a phone.
+ * Lifeline — the note left at the pub, kept current by a phone. Read
+ * `packages/core/src/lifeline.ts` first; this file is the enforcement.
  *
- * Read `packages/core/src/lifeline.ts` first; the reasoning lives there. What this file adds
- * is the enforcement.
+ * **The token is the only credential on the follow route**, so it is 24 CSPRNG bytes rather
+ * than a cuid: cuids embed a timestamp and a counter and are guessable in bulk by design.
  *
- * **The token is the only credential on the follow route, so it is generated the way a
- * credential is.** 24 random bytes from the CSPRNG, base64url, not a cuid — cuids embed a
- * timestamp and a counter and are guessable in bulk by design, which is fine for a row id
- * and disqualifying for a link that discloses somebody's position.
+ * **`follow` is the only public procedure here** and returns a hand-built object rather than a
+ * row — no user id, no activity id, no track — and withholds the position entirely once the
+ * session is over, so the shape has nowhere to put a position for a finished hike.
  *
- * **`follow` is the only public procedure here and it is written defensively.** It returns a
- * hand-built object rather than a row: no user id, no activity id, no track. And it withholds
- * the position entirely once the session is over, which is the promise in the core module
- * made mechanical — the shape has nowhere to put a position for a finished hike.
- *
- * **Overdue is derived on every read.** The sweep in the drain cron persists it, but nothing
- * on the follow page depends on the sweep having run. A safety feature that only works when
- * a cron is healthy is a safety feature that fails silently.
+ * **Overdue is derived on every read.** The drain-cron sweep persists it, but nothing on the
+ * follow page depends on the sweep having run.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -34,10 +28,6 @@ import {
 import type { LifelineFollow, LifelineSession } from '@switchback/core';
 import type { Prisma } from '@switchback/db';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
-
-// ---------------------------------------------------------------------------
-// Shapes
-// ---------------------------------------------------------------------------
 
 const trailSelect = { id: true, slug: true, name: true, regionName: true } as const;
 
@@ -58,11 +48,9 @@ const sessionSelect = {
 type SessionRow = Prisma.LifelineSessionGetPayload<{ select: typeof sessionSelect }>;
 
 /**
- * The hiker's own view.
- *
- * `status` is corrected on the way out rather than trusted from the row, for the same reason
- * the follow view does it: a hiker who opens the app twenty minutes late should see that
- * they are late, whether or not a cron has run in the meantime.
+ * The hiker's own view. `status` is corrected on the way out rather than trusted from the row,
+ * so a hiker who opens the app twenty minutes late sees that they are late whether or not a
+ * cron has run.
  */
 function toSession(row: SessionRow, now: Date): LifelineSession {
   return {
@@ -92,18 +80,11 @@ function minutesFromNow(minutes: number, now: Date): Date {
   return new Date(now.getTime() + minutes * 60_000);
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
 export const lifelineRouter = router({
   /**
-   * Start telling somebody.
-   *
-   * Any Lifeline already running is called off first. One hiker is on one hike, and two live
-   * links to two different return times is a way to get somebody looked for on the wrong hill.
-   * Called off rather than replaced, so a contact holding the old link sees `Called off`
-   * rather than a page that quietly starts describing a different hike.
+   * Start telling somebody. Any Lifeline already running is called off first — two live links
+   * to two different return times is a way to get somebody looked for on the wrong hill.
+   * Called off rather than replaced, so a contact holding the old link sees "Called off".
    */
   create: protectedProcedure
     .input(
@@ -147,11 +128,8 @@ export const lifelineRouter = router({
           message: input.message ?? null,
           startedAt: now,
           expectedReturnAt: minutesFromNow(input.minutes, now),
-          /*
-           * `contactEmail` and `contactPhone` stay null. The row can hold them and the day a
-           * transport lands they will be collected; writing an address we cannot send to
-           * would tell the hiker somebody gets notified, which is not true today.
-           */
+          // `contactEmail` and `contactPhone` stay null: writing an address we cannot send to
+          // would tell the hiker somebody gets notified, which is not true today.
         },
         select: sessionSelect,
       });
@@ -170,13 +148,9 @@ export const lifelineRouter = router({
   }),
 
   /**
-   * Where they are now.
-   *
-   * Its own mutation rather than a field on `activities.append`, because a Lifeline does not
-   * require a recording — somebody who just wants their partner to be able to see where they
-   * are should not have to record a hike to get it. Accuracy is not stored: the follow page
-   * shows one dot and a time, and a radius on it would invite a precision the fix does not
-   * have.
+   * Where they are now. Its own mutation rather than a field on `activities.append`, because a
+   * Lifeline does not require a recording. Accuracy is not stored: the follow page shows one
+   * dot and a time, and a radius would invite a precision the fix does not have.
    */
   ping: protectedProcedure
     .input(
@@ -207,12 +181,8 @@ export const lifelineRouter = router({
     }),
 
   /**
-   * Push the return time back.
-   *
-   * Measured from now rather than from the original return time. A hiker who is already an
-   * hour late and asks for two more hours means two hours from this moment; adding to the
-   * old deadline would leave them overdue the instant they pressed the button.
-   *
+   * Push the return time back, measured from now rather than from the original return time: a
+   * hiker already an hour late who asks for two more hours means two hours from this moment.
    * An overdue session comes back to `active` and `overdueNotifiedAt` is cleared, so the next
    * overrun is a fresh event rather than one the sweep considers already reported.
    */
@@ -246,12 +216,9 @@ export const lifelineRouter = router({
     }),
 
   /**
-   * "I'm back."
-   *
-   * `completed` and `cancelled` both end a session and both stop the position being served;
-   * they differ only in what the follower is told. `cancelled` is for a hike that never
-   * happened — the weather turned in the car park — where "Back safely" would be a small lie
-   * in a place where lies are expensive.
+   * "I'm back." `completed` and `cancelled` both end a session and both stop the position being
+   * served; they differ only in what the follower is told. `cancelled` is for a hike that never
+   * happened, where "Back safely" would be a lie in a place where lies are expensive.
    */
   end: protectedProcedure
     .input(
@@ -287,11 +254,8 @@ export const lifelineRouter = router({
     }),
 
   /**
-   * What the link shows. The one public procedure in this router.
-   *
-   * A wrong token is `NOT_FOUND` with a message written for a worried person rather than for
-   * a developer, because the most likely reader of that error is somebody who mistyped a link
-   * they were sent, at the exact moment they least want to read the word "invalid".
+   * What the link shows. The one public procedure in this router. A wrong token is `NOT_FOUND`
+   * with a message written for a worried person rather than for a developer.
    */
   follow: publicProcedure
     .input(z.object({ token: z.string().min(16).max(64) }))
@@ -327,11 +291,8 @@ export const lifelineRouter = router({
           ? 'overdue'
           : row.status;
 
-      /*
-       * The rule, in one place: a position is served only while the hike is live. Once it is
-       * over — safely or not — the link keeps saying what happened and stops saying where
-       * anybody is. Both coordinates are required together; half a position is not one.
-       */
+      // The rule, in one place: a position is served only while the hike is live. Both
+      // coordinates are required together; half a position is not one.
       const live = isLive(status);
       const at: LifelineFollow['at'] =
         live && row.lastLng != null && row.lastLat != null ? [row.lastLng, row.lastLat] : null;
@@ -350,8 +311,7 @@ export const lifelineRouter = router({
         lastPingAt: live ? row.lastPingAt : null,
         batteryPct: at ? (row.lastBatteryPct ?? null) : null,
         overdueByS: overdueByS(row.expectedReturnAt, now),
-        // A finished hike has no current position, so it is never "current" — reporting it as
-        // fresh would be the one wrong answer here.
+        // A finished hike has no current position, so it is never "current".
         stale: live ? isStalePing(row.lastPingAt, now) : true,
       };
     }),

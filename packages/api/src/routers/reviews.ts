@@ -1,22 +1,12 @@
 /**
- * Reviews.
+ * Reviews. The write path is an upsert, not an append — `@@unique([trailId, userId])` holds one
+ * review per person per trail, which is why there is no `create` here.
  *
- * The write path is an **upsert, not an append** — the schema holds one review per person
- * per trail (`@@unique([trailId, userId])`), so revisiting a trail edits what you said
- * rather than stacking a second opinion beside the first. That is a product decision the
- * database is enforcing, and it is the reason there is no `create` here.
- *
- * **Two aggregates are maintained here and one deliberately is not.** `Trail.rating` and
- * `Trail.reviewCount` are recomputed inside the same transaction as every write, because a
- * card that shows a stale average is showing a number nobody ever said. `Trail.popularity`
- * is left completely alone: `packages/busyness/prior.ts` already counts reviews as their own
- * term in `demandEvidence` (`popularity + 2*photos + reviews + parking/3`), so folding them
- * into `popularity` as well would count every review twice in the busyness prior. Popularity
- * belongs to completions and recorded activities, which nothing else counts.
- *
- * **`helpfulCount` is read here and never written.** There is no `ReviewHelpful` join table,
- * so an increment endpoint would be a spam button rather than a vote. The column is real,
- * the sort works, and the vote arrives with the table that can make it mean something.
+ * `Trail.rating` and `Trail.reviewCount` are recomputed in the same transaction as every write.
+ * `Trail.popularity` is deliberately left alone: `packages/busyness/prior.ts` already counts
+ * reviews as their own term in `demandEvidence`, so folding them in here would count every
+ * review twice in the busyness prior. `helpfulCount` is read and never written — there is no
+ * `ReviewHelpful` join table, so an increment endpoint would be a spam button, not a vote.
  */
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
@@ -41,11 +31,8 @@ import { decodeCursor, encodeCursor } from '../cursor';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 
 /**
- * Everything a rendered review needs, and the author's public fields — never their email.
- *
- * `select` rather than `include` for exactly that reason: an `include: { user: true }` here
- * would put every column of the `users` table on the wire, which is how private fields leak
- * from products that grew quickly.
+ * Everything a rendered review needs, plus the author's public fields. `select` rather than
+ * `include`, so no `users` column ever reaches the wire that is not named here.
  */
 const reviewSelect = {
   id: true,
@@ -59,27 +46,15 @@ const reviewSelect = {
   helpfulCount: true,
   createdAt: true,
   updatedAt: true,
-  /*
-   * Read on every row so `toReview` can print a tombstone rather than a report. Only the
-   * timestamp: `hiddenReason` is the moderator's note and is answered on appeal, not
-   * published back to the page that the complaint was about.
-   */
+  // The timestamp only: `hiddenReason` is the moderator's note, answered on appeal rather than
+  // published back to the page the complaint was about.
   hiddenAt: true,
   user: { select: { id: true, username: true, name: true, image: true } },
-  /*
-   * The photographs filed with the report, oldest first and capped.
-   *
-   * A nested `select` rather than a second round trip keyed by review id: Prisma issues one
-   * extra query for the whole page either way, and doing it here means the shape cannot drift
-   * between the list and the caller's own copy. Ordered by `createdAt` so a set uploaded in
-   * one go stays in the order it was picked, which on a hike is the order it was hiked.
-   */
+  // Oldest first and capped. A nested `select` rather than a second round trip, so the shape
+  // cannot drift between the list and the caller's own copy.
   photos: {
-    /*
-     * A photograph a moderator has taken down must not come back attached to a report that
-     * was left up. The strip simply gets shorter — there is no tombstone here, because a
-     * gap in a row of thumbnails communicates nothing and a grey box communicates less.
-     */
+    // A photograph a moderator took down must not come back attached to a report left up. The
+    // strip just gets shorter — a gap in a row of thumbnails communicates nothing.
     where: { hiddenAt: null },
     select: {
       id: true,
@@ -98,11 +73,8 @@ const reviewSelect = {
 type ReviewRow = Prisma.ReviewGetPayload<{ select: typeof reviewSelect }>;
 
 /**
- * How many recent reports the conditions tally reads.
- *
- * A cap rather than a full scan: on a famous trail "the last sixty days" is thousands of
- * rows, and the tally is a rough shape — the two-hundredth report does not move it. Ordered
- * newest first so the cap drops the oldest reports rather than an arbitrary page.
+ * How many recent reports the conditions tally reads. A cap rather than a full scan; ordered
+ * newest first so it drops the oldest reports rather than an arbitrary page.
  */
 const CONDITIONS_SAMPLE_MAX = 500;
 
@@ -111,16 +83,10 @@ const RATINGS = [5, 4, 3, 2, 1] as const;
 
 const trailIdInput = z.object({ trailId: z.string().min(1).max(64) });
 
-// ---------------------------------------------------------------------------
-// Shaping
-// ---------------------------------------------------------------------------
-
 /**
- * A calendar date out of a `DateTime` column.
- *
- * Written at UTC midnight and read back by slicing the ISO string, so it survives the round
- * trip as the same three numbers a human typed. Formatting it in any local zone — including
- * the server's — is what turns "hiked it on the 3rd" into the 2nd for half the planet.
+ * A calendar date out of a `DateTime` column. Written at UTC midnight and read back by slicing
+ * the ISO string: formatting it in any local zone, including the server's, turns "hiked it on
+ * the 3rd" into the 2nd for half the planet.
  */
 export function toDateString(value: Date | null): string | null {
   return value === null ? null : value.toISOString().slice(0, 10);
@@ -138,40 +104,23 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
     id: row.id,
     trailId: row.trailId,
     /*
-     * **A hidden report is a tombstone, not a 404 and not a deletion.**
+     * A hidden report is a tombstone, not a 404 and not a deletion: the row survives so the
+     * page can print "removed by a moderator" where the report was, rather than letting it
+     * vanish silently on its author and on anyone who linked to it.
      *
-     * The row survives and the list still returns it, so the page prints "removed by a
-     * moderator" where the report was. Dropping it from the list instead was the obvious
-     * alternative and it is worse in both directions: to its author the report silently
-     * vanishes, which reads as a bug in the product rather than as a decision somebody
-     * made and can be argued with; and to anybody who linked to the page, a thread of
-     * replies loses its subject with no explanation.
-     *
-     * What is stripped is everything the moderator objected to — the prose, the
-     * photographs, the condition chips — and, since a review of this PR, every *number*
-     * the row carried as well. The rule the first pass got wrong is that a value which no
-     * renderer draws is still published: it ships in the JSON, and it can be read off the
-     * row's position in a sorted list even by somebody who never opens the network tab.
-     *
-     * `rating` used to survive here on the reasoning that both renderers decline to draw
-     * it. But `rating_desc` and `rating_asc` order on the database column, so a tombstone
-     * standing first under "Highest rated" and last under "Lowest rated" announced the
-     * withdrawn number without printing it — while `ratingCounts` excluded that same row
-     * from the average, so the page both refused the rating and leaked it. `helpfulCount`
-     * was worse than leaked, it was *drawn*: with `activityType` nulled the footer's
-     * condition collapsed to the count alone, and a removed report printed "3 found this
-     * useful" directly beneath its own tombstone — the page endorsing the report it had
-     * just withdrawn. Roughly eight in nine seeded reviews carry a non-zero count, so that
-     * was the ordinary case rather than an edge.
-     *
-     * What survives is that somebody reported on this trail and when. Nothing numeric.
+     * Everything the moderator objected to is stripped, and so is every *number* the row
+     * carried. A value no renderer draws is still published — it ships in the JSON, and it can
+     * be read off the row's position in a sorted list. `rating` leaked through `rating_desc`
+     * ordering while `ratingCounts` excluded it from the average, so the page both refused the
+     * rating and announced it; `helpfulCount` was actually drawn, printing "3 found this
+     * useful" under the tombstone once `activityType` was nulled. What survives is that
+     * somebody reported on this trail and when. Nothing numeric.
      */
     rating: hidden ? null : row.rating,
     body: hidden ? null : row.body,
     hikedOn: toDateString(row.hikedOn),
-    // Re-normalised on the way out as well as in. Rows predating this router, or written by
-    // a future admin path, have no guarantee of canonical order and the chips must not
-    // reshuffle between two reviews saying the same thing.
+    // Re-normalised on the way out as well as in: rows predating this router have no guarantee
+    // of canonical order, and the chips must not reshuffle between two identical reviews.
     conditions: hidden ? [] : normaliseConditions(row.conditions),
     activityType: hidden ? null : row.activityType,
     helpfulCount: hidden ? 0 : row.helpfulCount,
@@ -191,31 +140,20 @@ export function toReview(row: ReviewRow, viewerId: string | null): ReviewShape {
 
 /**
  * Tombstones last, as a block, in every sort whose key a tombstone no longer carries.
+ * `nulls: 'first'` puts the visible rows ahead of the removed ones.
  *
- * `nulls: 'first'` puts the visible rows (`hiddenAt IS NULL`) ahead of the removed ones, and
- * the removed ones then fall newest-takedown-first among themselves.
- *
- * This is the half of the leak that stripping the shape does not close. `toReview` runs after
- * Postgres has already sorted, so nulling `rating` on the way out changes what the row *says*
- * and nothing about where it *stands* — and under `rating_desc` a tombstone in position one
- * says "five stars" to anybody who can count, as loudly as printing it would. The fix has to
- * be in the query. Ordering the tombstones into one block at the end means their position
- * asserts only that they were removed, which is the one thing the page is already saying out
- * loud.
- *
- * Deliberately **not** applied to `recent`. That sort keys on `createdAt`, which the tombstone
- * still prints on its own face ("Written 15 March"), so there is nothing to leak — and holding
- * a removed report in its chronological place is the whole point of keeping the row at all.
+ * This closes the half of the leak that stripping the shape cannot: `toReview` runs after
+ * Postgres has sorted, so nulling `rating` changes what a row says and not where it stands,
+ * and under `rating_desc` a tombstone in position one says "five stars" to anyone who can
+ * count. Deliberately **not** applied to `recent`, which keys on `createdAt` — the tombstone
+ * prints that on its own face, and holding it in chronological place is the point of the row.
  */
 const TOMBSTONES_LAST = { hiddenAt: { sort: 'desc', nulls: 'first' } } as const;
 
 /**
- * Sort orders, each with a full tiebreak chain.
- *
- * The trailing `id` is not decoration. These pages are offset-based, and Postgres is free to
- * return equal rows in any order it likes between two queries — on a trail where forty
- * people all gave four stars, a sort that stops at `rating` can show the same review on page
- * one and page two and drop another entirely.
+ * Sort orders, each with a full tiebreak chain. The trailing `id` is not decoration: these
+ * pages are offset-based, and Postgres may return equal rows in any order between two queries,
+ * so a sort stopping at `rating` can show one review twice and drop another.
  */
 export const ORDER_BY: Readonly<Record<ReviewSort, Prisma.ReviewOrderByWithRelationInput[]>> = {
   recent: [{ createdAt: 'desc' }, { id: 'desc' }],
@@ -231,14 +169,10 @@ export const ORDER_BY: Readonly<Record<ReviewSort, Prisma.ReviewOrderByWithRelat
 type RatingCounts = [number, number, number, number, number];
 
 /**
- * Counts indexed by rating − 1, so `counts[0]` is the one-star bucket.
- *
- * **Hidden reports are not counted, anywhere.** A rating the page is not permitted to show
- * that is still inside the mean is a number on a card corresponding to nothing anybody
- * said, and it never self-corrects — nothing recomputes a trail's average until the next
- * person writes a review, so one moderated one-star can sit in the figure for months. The
- * filter belongs here rather than at each call site because this is the only function that
- * reads ratings, and a filter written once cannot be forgotten in one of three places.
+ * Counts indexed by rating − 1, so `counts[0]` is the one-star bucket. **Hidden reports are not
+ * counted, anywhere** — a rating the page may not show that is still inside the mean never
+ * self-corrects, since nothing recomputes a trail's average until the next review lands. The
+ * filter lives here because this is the only function that reads ratings.
  */
 async function ratingCounts(db: Prisma.TransactionClient, trailId: string): Promise<RatingCounts> {
   const buckets = await db.review.groupBy({
@@ -259,20 +193,14 @@ function total(counts: RatingCounts): number {
 }
 
 /**
- * Recompute the two denormalised columns from the reviews that actually exist.
+ * Recompute the two denormalised columns from the reviews that actually exist. Recomputed
+ * rather than incremented — an increment must know whether a write was a create or an edit and
+ * by how much the rating moved, and every branch is a way for the card to drift permanently.
+ * The average goes through `averageRating`, the same function the summary uses, so the title
+ * block and the histogram cannot round differently.
  *
- * Recomputed rather than incremented, and that is worth the extra query: an increment has to
- * know whether this write was a create or an edit and by how much the old rating differed,
- * and every one of those branches is a way for the average on a card to drift permanently
- * away from the reviews under it. A `GROUP BY` on an indexed column is cheap, and it is
- * self-healing — one run repairs a row that drifted for any other reason.
- *
- * The average goes through `averageRating`, the same function the summary endpoint uses, so
- * the number in the title block and the number over the histogram cannot round differently.
- *
- * Exported because `routers/moderation.ts` has to call it too: hiding a review changes the
- * mean exactly as much as deleting one does, and a takedown that skipped this would leave a
- * rating on the card that includes a report the page refuses to show.
+ * Exported because `routers/moderation.ts` must call it: hiding a review changes the mean
+ * exactly as much as deleting one.
  */
 export async function refreshRatingAggregates(
   db: Prisma.TransactionClient,
@@ -291,18 +219,8 @@ async function assertTrail(db: PrismaClient, trailId: string): Promise<void> {
   if (!trail) throw new TRPCError({ code: 'NOT_FOUND', message: 'No such trail.' });
 }
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
-
 export const reviewsRouter = router({
-  /**
-   * One page of reviews.
-   *
-   * Public: reading what people said about a public trail does not require an account, and
-   * putting a sign-in wall in front of it would make the page useless to the person deciding
-   * whether to sign up.
-   */
+  /** One page of reviews. Public: reading a public trail's reports needs no account. */
   list: publicProcedure
     .input(
       trailIdInput.extend({
@@ -335,10 +253,9 @@ export const reviewsRouter = router({
     }),
 
   /**
-   * The distribution and what people are reporting lately.
-   *
-   * Separate from `list` on purpose: it is the same answer for every page and every sort, so
-   * folding it into the list response would recompute a histogram every time someone scrolls.
+   * The distribution and what people are reporting lately. Separate from `list` because it is
+   * the same answer for every page and sort, and folding it in would recompute a histogram on
+   * every scroll.
    */
   summary: publicProcedure
     .input(trailIdInput)
@@ -350,13 +267,11 @@ export const reviewsRouter = router({
         ctx.db.review.findMany({
           where: {
             trailId: input.trailId,
-            // Same rule as the ratings: what a moderator took down is not evidence about
-            // the ground, and a chip tallied out of a removed report is a claim with no
-            // source a reader can go and check.
+            // Same rule as the ratings: what a moderator took down is not evidence about the
+            // ground.
             hiddenAt: null,
             // Dated by when they were *there*, falling back to when they wrote it. A report
-            // filed today about a hike last spring is not evidence about this week's ground,
-            // and treating it as such is the failure mode this window exists to avoid.
+            // filed today about a hike last spring is not evidence about this week's ground.
             OR: [{ hikedOn: { gte: since } }, { hikedOn: null, createdAt: { gte: since } }],
           },
           select: { conditions: true },
@@ -386,12 +301,7 @@ export const reviewsRouter = router({
       };
     }),
 
-  /**
-   * The caller's own review of a trail, or null.
-   *
-   * Its only job is to fill the form in. Null is the ordinary answer for someone who has not
-   * reviewed this trail, so it is not an error.
-   */
+  /** The caller's own review of a trail, or null — the form's initial value. */
   mine: protectedProcedure
     .input(trailIdInput)
     .query(async ({ ctx, input }): Promise<ReviewShape | null> => {
@@ -404,10 +314,8 @@ export const reviewsRouter = router({
 
   /**
    * Publish or amend. One review per person per trail, so this is the only write path.
-   *
    * Interactive rather than a batched `$transaction([...])` because the aggregate refresh has
-   * to read the rows the upsert just wrote. Two concurrent writes on the same trail serialise
-   * on the trail row's update, so the last one out still leaves a correct average.
+   * to read the rows the upsert just wrote.
    */
   upsert: protectedProcedure
     .input(reviewWriteSchema)
@@ -415,19 +323,12 @@ export const reviewsRouter = router({
       await assertTrail(ctx.db, input.trailId);
 
       /*
-       * **A report a moderator took down cannot be edited back into existence.**
-       *
-       * Without this the takedown lever is a suggestion: the write path here is an upsert
-       * keyed on `(trailId, userId)`, so the author of a hidden review re-submitting the
-       * form would update the same row — leaving `hiddenAt` set but replacing the body,
-       * and, on the day somebody adds an "unhide" to a queue, restoring exactly the text
-       * that was removed. Refusing the write is the only version of this that holds.
-       *
-       * **`remove` refuses a hidden review for the same reason**, and it has to, or this
-       * guard is two calls from useless: delete the tombstone and the next upsert finds no
-       * row, passes this check, and republishes the removed prose under a fresh id — with
-       * the `hiddenAt`/`hiddenById`/`hiddenReason` audit gone and every report filed against
-       * the old id now pointing at nothing.
+       * A report a moderator took down cannot be edited back into existence. The upsert is
+       * keyed on `(trailId, userId)`, so without this its author could re-submit the form and
+       * replace the body under the same `hiddenAt` — restoring the removed text the day
+       * somebody adds an "unhide". `remove` refuses a hidden review for the same reason, and
+       * has to: delete the tombstone and the next upsert finds no row, passes this check, and
+       * republishes the prose under a fresh id with the audit gone.
        */
       const existing = await ctx.db.review.findUnique({
         where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
@@ -442,8 +343,8 @@ export const reviewsRouter = router({
 
       const fields = {
         rating: input.rating,
-        // Trimmed to null rather than kept as "": an empty body and no body are the same
-        // thing to a reader, and only one of them should reach the renderer.
+        // Trimmed to null rather than kept as "": an empty body and no body are the same thing
+        // to a reader, and only one of them should reach the renderer.
         body: input.body?.trim() ? input.body.trim() : null,
         hikedOn: input.hikedOn == null ? null : toUtcMidnight(input.hikedOn),
         conditions: { set: input.conditions },
@@ -465,23 +366,13 @@ export const reviewsRouter = router({
     }),
 
   /**
-   * Withdraw your own review.
+   * Withdraw your own review. Keyed by trail rather than by review id, which makes deleting
+   * someone else's structurally impossible: the unique index is `(trailId, userId)` and
+   * `userId` is the caller's, never an input.
    *
-   * Keyed by trail rather than by review id, which makes it structurally impossible to
-   * delete someone else's: the unique index is `(trailId, userId)` and `userId` is the
-   * caller's, never an input.
-   *
-   * **A removed review cannot be withdrawn**, and that is not pedantry about a row. Delete
-   * was the hole in the upsert guard above: deleting the tombstone frees the `(trailId,
-   * userId)` key, so the next upsert creates a fresh row with the same prose and no
-   * `hiddenAt` — the takedown undone in two calls by the person it was made against, the
-   * audit trail gone with it, and every `ContentReport` filed against the old id now
-   * pointing at a subject that no longer exists.
-   *
-   * The tombstone is not a punishment. What it publishes is one line saying a report here
-   * was removed; the prose, the photographs and the condition chips left the page the moment
-   * the moderator pressed the button, and the rating left the trail's average with them.
-   * Somebody who wants it gone entirely writes to the address in the notice.
+   * **A removed review cannot be withdrawn** — deleting the tombstone frees the
+   * `(trailId, userId)` key, so the next upsert recreates the same prose with no `hiddenAt`,
+   * the audit trail gone and every `ContentReport` against the old id orphaned.
    */
   remove: protectedProcedure.input(trailIdInput).mutation(async ({ ctx, input }) => {
     return ctx.db.$transaction(async (tx) => {
@@ -489,9 +380,8 @@ export const reviewsRouter = router({
         where: { trailId: input.trailId, userId: ctx.user.id, hiddenAt: null },
       });
       if (count === 0) {
-        // Two reasons the delete matched nothing, and they are owed different answers. The
-        // second read only happens on the failure path, so the ordinary delete is still one
-        // statement.
+        // Two reasons the delete matched nothing, owed different answers. The second read only
+        // happens on the failure path, so the ordinary delete is still one statement.
         const existing = await tx.review.findUnique({
           where: { trailId_userId: { trailId: input.trailId, userId: ctx.user.id } },
           select: { hiddenAt: true },

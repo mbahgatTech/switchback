@@ -1,28 +1,15 @@
 /**
- * The other half of "nothing exists until commit".
+ * The other half of "nothing exists until commit": an upload that succeeds and is never
+ * committed leaves bytes in the bucket with nothing pointing at them, which nothing in the
+ * product can see and which we pay for forever. The drain cron sweeps them.
  *
- * `photos.presign` hands out a ticket, the browser `PUT`s straight to the bucket, and only
- * the subsequent `commit` writes a row. That ordering is what keeps every read query free of
- * half-finished uploads — see the header of `routers/photos.ts` — but it has a cost, and this
- * file is the cost: an upload that succeeds and is never committed leaves bytes in the bucket
- * with nothing pointing at them. A closed laptop lid between the PUT and the commit is enough.
+ * Two rules make this safe to run unattended, because the failure mode is deleting somebody's
+ * photograph. **A grace period far longer than any legitimate gap** — seconds between PUT and
+ * commit against a day of grace, so an upload in flight during a sweep cannot be caught. And
+ * **the database is asked, never inferred from**: a key is orphaned only if no row holds the URL
+ * it maps to. No parsing keys into ids, no "looks unreferenced" heuristic.
  *
- * Nothing in the product can see those bytes. We would simply pay for them, forever, at a
- * rate set by how often people abandon an upload. So the drain cron sweeps them.
- *
- * **Two rules make this safe to run unattended**, because the failure mode of a sweeper that
- * gets it wrong is deleting a photograph somebody took:
- *
- * 1. **A grace period far longer than any legitimate gap.** The window between a PUT landing
- *    and its row being written is seconds; the grace is a day. An object younger than that is
- *    not even looked at, so an upload in flight during a sweep cannot be caught by it.
- * 2. **The database is asked, never inferred from.** A key is orphaned only if no row holds
- *    the URL it maps to. There is no parsing of keys into ids, no assumption about which user
- *    a prefix belongs to, and no "looks unreferenced" heuristic.
- *
- * A cap bounds each run, and hitting it is reported rather than swallowed: a sweep that
- * silently examined the first two thousand of a million objects and announced success would
- * be worse than no sweep at all.
+ * A cap bounds each run and hitting it is reported rather than swallowed.
  */
 import type { PrismaClient } from '@switchback/db';
 import { storage } from './storage';
@@ -31,11 +18,9 @@ import { storage } from './storage';
 const PHOTO_PREFIX = 'photos/';
 
 /**
- * How old an object must be before it is a candidate.
- *
- * Twenty-four hours against a commit window measured in seconds. The margin is not caution
- * for its own sake — it also covers the case where the sweep and an upload run against
- * clocks that disagree, which on a distributed object store they can by minutes.
+ * How old an object must be before it is a candidate. Twenty-four hours against a commit window
+ * measured in seconds; the margin also covers a sweep and an upload running against clocks that
+ * disagree, which on a distributed object store they can by minutes.
  */
 const GRACE_MS = 24 * 60 * 60 * 1000;
 
@@ -69,13 +54,9 @@ export async function sweepOrphanedPhotos(
   const listed = await driver.list(PHOTO_PREFIX, SCAN_LIMIT);
   const candidates = listed.filter((entry) => entry.lastModified.getTime() < cutoff);
 
-  /*
-   * Both renditions of a photograph are checked independently, and that is deliberate. A
-   * commit writes `url` and `thumbUrl` together, so in practice they are referenced or
-   * orphaned as a pair — but `photos.remove` deletes the row first and the objects after,
-   * and if the second delete half-fails we are left with exactly one of the two. Treating
-   * them as a pair here would mean that one never gets collected.
-   */
+  // Both renditions are checked independently: `photos.remove` deletes the row first and the
+  // objects after, so a half-failed delete leaves exactly one of the two. Treating them as a
+  // pair here would mean that one never gets collected.
   const referenced = new Set<string>();
   const urls = candidates.map((entry) => driver.publicUrl(entry.key));
   for (let i = 0; i < urls.length; i += LOOKUP_CHUNK) {
@@ -98,8 +79,8 @@ export async function sweepOrphanedPhotos(
       await driver.remove(orphan.key);
       deleted += 1;
     } catch (error) {
-      // One unremovable object must not stop the rest. It will be a candidate again next run,
-      // and if it is permanent the count of orphans stops falling — which is the signal.
+      // One unremovable object must not stop the rest. It is a candidate again next run, and
+      // if it is permanent the count of orphans stops falling — which is the signal.
       console.warn(`orphan sweep: could not remove ${orphan.key}`, error);
     }
   }
