@@ -86,10 +86,14 @@ export const OFFLINE_FALLBACK_PATH = '/offline';
  * there — `repairShell` retries on every successful navigation, and `refreshShell` puts the
  * real page in the first time that reader opens `/record` with a session.
  *
- * The residual leak, named rather than hidden: on a shared device the stored `/record` carries
- * the last signed-in reader's units, default visibility, and the name and start time of any
- * recording they left open. Same class as the opening coordinate accepted for `/` above, and
- * scoped to one browser profile.
+ * What used to be named here as a residual leak — on a shared device the stored `/record`
+ * carries the last signed-in reader's units, default visibility, and the name and start time of
+ * any recording they left open — is no longer residual and no longer a leak. `offline/
+ * handover.ts` deletes the reader-specific entries of this cache, and every other `sb-` cache
+ * whole, the moment the account on the browser changes, so a stored page outlives its reader
+ * only until the next person signs in. The same argument covers `/` and its opening coordinate,
+ * and the downloaded trail pages, which carry the reader's own hikes on those trails. Which
+ * entries those are is `READER_SHELL_PAGES` below.
  */
 export const SHELL_PAGES = [
   OFFLINE_FALLBACK_PATH,
@@ -98,6 +102,30 @@ export const SHELL_PAGES = [
   '/explore',
   '/record',
 ] as const;
+
+/**
+ * The shell pages rendered for whoever was signed in, and so the only ones a handover removes.
+ *
+ * A subset of `SHELL_PAGES`, and the difference is the whole point. `/` and `/explore` carry
+ * the reader's own opening coordinate; `/record` is auth-gated and carries their units, their
+ * default visibility, and the name and start time of any recording they left open. Those three
+ * belong to the person who fetched them and go when that person does.
+ *
+ * `/offline` and `/downloads` take no server input at all — one stored copy is right for
+ * everybody, as the note above says — and `/_next/static/*` is content-hashed build output.
+ * `offline/handover.ts` used to delete `SHELL_CACHE` whole rather than these three entries,
+ * which took the fallback page and every harvested chunk with them. Nothing refills that
+ * promptly: `install` runs once per worker version, and `repairShell`/`refreshShell` only run
+ * from a *navigation*, which App Router client routing never performs. So a hiker who signed
+ * in at the trailhead and then lost signal got a plain-text 503 for `/`, `/downloads` and
+ * `/record` — the last of which exists to work with no network at all. Nothing in those
+ * entries was ever the departing reader's, so nothing was bought by deleting them.
+ *
+ * Not shared with the worker: the worker never runs a handover, so the two lists do not have
+ * to agree and `test/offline-caches.test.ts` only checks that these are pages the shell
+ * actually holds.
+ */
+export const READER_SHELL_PAGES = ['/', '/explore', '/record'] as const;
 
 /**
  * Every build asset a page references, as it appears in that page's HTML.

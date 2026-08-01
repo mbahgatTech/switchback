@@ -79,13 +79,17 @@ export interface RecorderProps {
 /**
  * What the screen has to say about the hike that just ended, when it does not navigate away.
  *
- * Two endings need one: a hike closed with no connection, which is safe on the device and is
- * now the drain's business; and a hike the server closed before this device had sent all of
- * it, whose tail no longer has anywhere to go. Both are the answer to "where did my hike go?",
- * so both are written into the same region at the top of the readout.
+ * Three endings need one: a hike closed with no connection, which is safe on the device and is
+ * now the drain's business; a hike finished on a browser that is acting as somebody else by
+ * then, which is safe on the device and waiting for its own author; and a hike the server
+ * closed before this device had sent all of it, whose tail no longer has anywhere to go. All
+ * three are the answer to "where did my hike go?", so all three are written into the same
+ * region at the top of the readout.
  */
 type Receipt =
   | { kind: 'offline' }
+  /** Finished while the browser was acting as somebody else. Held for the hiker who walked it. */
+  | { kind: 'held' }
   /** `activityId` is the saved hike, `lost` the fixes the server would not take. */
   | { kind: 'truncated'; activityId: string; lost: number };
 
@@ -284,6 +288,67 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       logCompletion: input.logCompletion,
     };
 
+    /**
+     * Write the finish onto the queued row and let go of the screen, leaving the hike on this
+     * device for a drain to publish.
+     *
+     * Two endings need exactly this — no connection, and no longer this browser's hike to post
+     * — and the order matters in both. `markFinished` is awaited and its failure is not
+     * swallowed: the receipt each caller then prints says the hike is safe on this device, and
+     * `handOff` throws away the in-memory buffer that is otherwise the last copy of it, so on a
+     * device whose storage has been refusing writes all day (quota, private mode, a locked
+     * profile) that sentence used to be printed over a hike it had just destroyed. Nothing is
+     * cleared until the write is known to have happened, which since `idb.run` resolves on
+     * commit is now what that means.
+     *
+     * `handOff` rather than `forget`, which would delete the only copy of the day.
+     *
+     * False when the device would not take it, having already said so and put the recorder back
+     * where the hiker can try again.
+     *
+     * An arrow rather than a declaration so that the `if (!id) return` above it still narrows
+     * `id` here; a hoisted declaration could in principle run before that check, and the
+     * compiler is right to say so.
+     */
+    const keepForTheDrain = async (): Promise<boolean> => {
+      try {
+        await markFinished(id, write);
+      } catch {
+        recorder.unstop();
+        setSaveError(
+          'This hike could not be saved on this device — its storage is full or blocked. ' +
+            'Keep this tab open and try again; the recording is still here.',
+        );
+        return false;
+      }
+      recorder.handOff();
+      setFinishing(false);
+      // The hike this belonged to has gone. See `onDiscard`.
+      setStartError(null);
+      return true;
+    };
+
+    /*
+     * Somebody else is signed in now, so this hike is not this browser's to publish.
+     *
+     * The last and most expensive place to be wrong on this screen. `finish` does not merely
+     * upload — it publishes a day, attaches it to whichever account the request carries and
+     * logs a completion against the trail under that name. It is also the request furthest in
+     * time from the press that decided the name: a hike is hours, the finish dialog is however
+     * long it takes somebody to write a note, and on a shared laptop a sign-in can land
+     * anywhere in that. Asked here rather than trusted from the flush above, because the flush
+     * may have stopped for exactly this reason and returned without a word — see `stillMine`.
+     *
+     * The hike is not lost and not blocked: the payload goes onto the row, the row keeps every
+     * fix, and `flushPendingActivities` sends the lot the moment its own author signs back in.
+     * `/downloads` counts it as held for another account in the meantime, and shows nothing of
+     * what it says.
+     */
+    if (!recorder.stillMine()) {
+      if (await keepForTheDrain()) setReceipt({ kind: 'held' });
+      return;
+    }
+
     try {
       const saved = await finish.mutateAsync(write);
       recorder.forget();
@@ -311,34 +376,12 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       if (isUnreachable(error)) {
         // The hike ends here as far as the hiker is concerned. The row keeps everything —
         // the fixes and now this payload — and the drain replays start, append and finish
-        // when there is a connection. `handOff` rather than `forget`, which would delete the
-        // only copy of the day. No `router.push`: `/activities/:id` does not exist yet, and
-        // is not a page that can be rendered with no network.
+        // when there is a connection. No `router.push`: `/activities/:id` does not exist yet,
+        // and is not a page that can be rendered with no network.
         //
         // Nothing is truncated on this branch however much is outstanding: the row still
         // holds every fix and the drain sends them all before it replays this payload.
-        //
-        // Awaited, and its failure is not swallowed. The receipt below says the hike is safe
-        // on this device, and `handOff` throws away the in-memory buffer that is otherwise
-        // the last copy of it — so on a device whose storage has been refusing writes all
-        // day (quota, private mode, a locked profile) the old order printed that sentence
-        // over a hike it had just destroyed. Nothing is cleared until the write is known to
-        // have happened, which since `idb.run` resolves on commit is now what that means.
-        try {
-          await markFinished(id, write);
-        } catch {
-          recorder.unstop();
-          setSaveError(
-            'This hike could not be saved on this device — its storage is full or blocked. ' +
-              'Keep this tab open and try again; the recording is still here.',
-          );
-          return;
-        }
-        recorder.handOff();
-        setFinishing(false);
-        // The hike this belonged to has gone. See `onDiscard`.
-        setStartError(null);
-        setReceipt({ kind: 'offline' });
+        if (await keepForTheDrain()) setReceipt({ kind: 'offline' });
         return;
       }
       // The server refused it. Leave `saving` so the dialog's buttons work again and the
@@ -918,6 +961,34 @@ function ReceiptBody({ receipt }: { receipt: Receipt }) {
         <p className="mt-hair text-caption text-ink">
           It will be added to your account when you have a connection. You can start another hike
           now.
+        </p>
+        <Link
+          href="/downloads"
+          className={`${HEIGHT.touch} mt-xs inline-flex items-center text-caption text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink`}
+        >
+          See what is waiting
+        </Link>
+      </>
+    );
+  }
+
+  if (receipt.kind === 'held') {
+    /*
+     * Ink, not water and not survey. Nothing about the network failed and nothing about this
+     * hiker's position or safety is at stake — a different account is signed in, which is a
+     * fact about who the browser is acting as, and structure is the plate for that. The same
+     * reasoning as the "Held for another account" block on `/downloads`, which this hike has
+     * just joined.
+     *
+     * "the hiker who recorded it" rather than "you": on the one screen where this sentence can
+     * appear, the person reading it is by definition not the person it is about.
+     */
+    return (
+      <>
+        <p className="collar text-ink">Kept on this device</p>
+        <p className="mt-hair text-caption text-ink">
+          Somebody else is signed in, so this hike was not added to an account. It goes to the hiker
+          who recorded it when they sign back in.
         </p>
         <Link
           href="/downloads"

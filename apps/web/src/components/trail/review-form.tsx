@@ -24,6 +24,7 @@ import {
   type PendingReview,
 } from '../../offline/queue';
 import { usePendingReview } from '../../offline/use-queue';
+import { writingReader } from '../../offline/identity';
 import { useTRPC } from '../../trpc/react';
 import { chipClass } from './reviews';
 import {
@@ -330,6 +331,11 @@ export function ReviewForm({
             // guess at when it finally goes out.
             write: { ...variables, conditions: variables.conditions ?? [] },
             at: Date.now(),
+            // Read here rather than taken from a prop, because this is the moment that
+            // decides whose report it is. A prop would carry whoever the page was *rendered*
+            // for, and a downloaded trail page can be days old and one sign-in stale. Null is
+            // possible and honest: it means the row is nobody's until somebody claims it.
+            userId: writingReader(),
           }),
         ).then(
           () => {

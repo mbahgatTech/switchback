@@ -372,6 +372,20 @@ function Home({ me }: { me: SelfProfile }) {
 function Devices() {
   const trpc = useTRPC();
   const devices = useQuery(trpc.me.devices.queryOptions());
+  /*
+   * Mobile refresh tokens only, on this branch — this browser's own session survives, so the
+   * offline queue's memory of who is here is still correct and must not be disturbed.
+   *
+   * **When this also ends the browser's session, it must call `forgetReaderNow()` from
+   * `@/offline/reader` before it navigates.** Revoking the session server-side is invisible to
+   * everything under `offline/`: `ReaderIdentity` keys on a prop from the root layout, and a
+   * client-side `router.push` re-renders the page's subtree and not the layout, so the handover
+   * never runs. `localStorage` would go on naming the departed reader, their cached `/record`
+   * and downloaded trail pages would stay on a shared machine, and `SyncQueuedWrites` would
+   * keep drilling a dead session on every return to the foreground until the next full document
+   * load. A `router.refresh()` beside the push happens to work; calling the handover directly
+   * is what makes it true whatever the navigation does. See the note on `forgetReaderNow`.
+   */
   const signOut = useMutation(
     trpc.me.signOutEverywhere.mutationOptions({ onSuccess: () => void devices.refetch() }),
   );

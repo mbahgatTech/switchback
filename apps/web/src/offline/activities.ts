@@ -44,9 +44,20 @@
  * `blocked`, automatic flushes skip blocked rows, only a person retries them — and the
  * sequential drain that breaks on the first unreachable error are followed identically, so the
  * two queues behave the same way on the storage manager.
+ *
+ * ---
+ *
+ * **Whose hike this is.** Every header carries the account that pressed start, and the drain
+ * sends only headers belonging to the reader the browser is currently acting as. See `ownedBy`
+ * in `identity.ts`. A day recorded by the person who has since gone home is kept and marked
+ * rather than uploaded to whoever signed in after them, and the recorder will not resume it
+ * either — `readOpenActivity` is scoped the same way. Because a hike is dozens of requests over
+ * minutes, "currently" is asked again before `start`, before every `append` batch and before
+ * `finish`, rather than once when the drain began; see `stillReader` on `FlushActivitiesOptions`.
  */
 
 import { SAMPLE_BATCH, type ActivityType, type TrackFix, type Visibility } from '@switchback/core';
+import { ownedBy, stillActingAs } from './identity';
 import { ACTIVITY_FIXES_STORE, PENDING_ACTIVITIES_STORE, run } from './idb';
 import { isUnauthorized, isUnreachable, serialise } from './queue';
 
@@ -66,6 +77,29 @@ export interface FinishWrite {
 export interface PendingActivity {
   /** The key: the id the device minted, which is also the id the server stores under. */
   activityId: string;
+  /**
+   * Whose hike this is, or null when the device cannot say.
+   *
+   * Stamped from `writingReader()` when the start button is pressed, not when the drain runs
+   * — a hike begun on a ridge and uploaded three days later belongs to whoever pressed start,
+   * and by the time it goes up the browser may be holding somebody else's session entirely.
+   * Null on a hike carried across from the pre-IndexedDB journal, and on one begun by a
+   * browser that had never been told who was signed in. A null is never resolved by guessing:
+   * see `identity.ts`.
+   *
+   * The activity id is a UUID and so cannot collide between two people the way the report
+   * queue's trail key could — so this is an attribute of the row rather than half its key.
+   */
+  userId: string | null;
+  /**
+   * Epoch ms when the reader who recorded this left the browser, or null.
+   *
+   * Set and cleared by `handover.ts`, and decides nothing: `ownedBy` alone says what may be
+   * sent. It is here so the storage manager can say when a hike was set aside. Marking rather
+   * than deleting is the policy, and a day's track is the strongest case for it in the
+   * product — it is the only record of where somebody walked, and no server has a copy.
+   */
+  heldAt: number | null;
   /** Epoch ms. Every fix's `t` is seconds after this. */
   startedAt: number;
   trailId: string | null;
@@ -135,12 +169,25 @@ function announce(): void {
   for (const listener of listeners) listener();
 }
 
+/**
+ * A header as it comes back off the disk.
+ *
+ * Rows written before the queue recorded authorship have no `userId` and no `heldAt`. There
+ * is no schema upgrade for them — the store's key path did not change, so there is nothing to
+ * carry across — and the defaults are applied on every read instead. `undefined` becomes
+ * `null`, which is "unattributed": never sent automatically, never adopted silently, shown to
+ * a person on `/downloads` and claimed or discarded by hand.
+ */
+function normalise(row: PendingActivity): PendingActivity {
+  return { ...row, userId: row.userId ?? null, heldAt: row.heldAt ?? null };
+}
+
 export function listPendingActivities(): Promise<PendingActivity[]> {
   return run<PendingActivity[]>(
     PENDING_ACTIVITIES_STORE,
     'readonly',
     (store) => store.getAll() as IDBRequest<PendingActivity[]>,
-  ).then((rows) => rows.sort((a, b) => a.queuedAt - b.queuedAt));
+  ).then((rows) => rows.map(normalise).sort((a, b) => a.queuedAt - b.queuedAt));
 }
 
 export function getPendingActivity(activityId: string): Promise<PendingActivity | null> {
@@ -148,7 +195,7 @@ export function getPendingActivity(activityId: string): Promise<PendingActivity 
     PENDING_ACTIVITIES_STORE,
     'readonly',
     (store) => store.get(activityId) as IDBRequest<PendingActivity | undefined>,
-  ).then((row) => row ?? null);
+  ).then((row) => (row ? normalise(row) : null));
 }
 
 export function putActivityHeader(row: PendingActivity): Promise<void> {
@@ -190,13 +237,19 @@ export function readFixes(activityId: string): Promise<TrackFix[]> {
  * A row that already carries a `finish` payload is not one of these. It is a finished hike
  * waiting on a connection, and restoring it into the recorder would put a hiker back inside a
  * day they have already ended.
+ *
+ * Scoped to the reader, and not as a nicety. Resuming somebody else's open recording is the
+ * whole defect in one screen: the fixes of a hike that person is still walking would be
+ * appended to by whoever sat down next, and the `finish` at the end would publish the pair of
+ * them as one day under the second name. An unattributed row is not resumed either — adopting
+ * a hike by continuing to walk it is exactly the silent guess this refuses to make.
  */
-export async function readOpenActivity(): Promise<{
+export async function readOpenActivity(readerId: string | null): Promise<{
   header: PendingActivity;
   fixes: TrackFix[];
 } | null> {
   const rows = await listPendingActivities();
-  const open = rows.filter((row) => row.finish === null);
+  const open = rows.filter((row) => row.finish === null && ownedBy(row, readerId));
   // Newest wins. There should only ever be one; if a delete failed, the current hike is the
   // one worth resuming and the older row still drains on its own.
   const header = open[open.length - 1];
@@ -237,9 +290,13 @@ export function pendingActivity(fields: {
   trailName: string | null;
   activityType: ActivityType;
   serverStarted: boolean;
+  /** Who pressed start. Null is honest and has consequences; see `identity.ts`. */
+  userId: string | null;
 }): PendingActivity {
   return {
     activityId: fields.activityId,
+    userId: fields.userId,
+    heldAt: null,
     startedAt: fields.startedAt,
     trailId: fields.trailId,
     trailName: fields.trailName,
@@ -254,6 +311,45 @@ export function pendingActivity(fields: {
     lastError: null,
     blocked: false,
   };
+}
+
+/**
+ * Set aside every hike belonging to a reader who has left, without losing one of them.
+ *
+ * Called from `handover.ts` on a change of account. Rows already held keep the date they were
+ * first set aside rather than having it move forward on every subsequent sign-in.
+ */
+export async function holdActivitiesFor(userId: string, at: number): Promise<void> {
+  const rows = await listPendingActivities();
+  for (const row of rows) {
+    if (row.userId === userId && row.heldAt === null) {
+      await putActivityHeader({ ...row, heldAt: at });
+    }
+  }
+}
+
+/** The reader is back. Their hikes are ordinary queued rows again. */
+export async function releaseActivitiesFor(userId: string): Promise<void> {
+  const rows = await listPendingActivities();
+  for (const row of rows) {
+    if (row.userId === userId && row.heldAt !== null) {
+      await putActivityHeader({ ...row, heldAt: null });
+    }
+  }
+}
+
+/**
+ * Claim an unattributed hike as your own, on purpose.
+ *
+ * The only path by which a hike's owner is written after the fact, and reachable only from a
+ * button somebody presses on `/downloads` having read the sentence beside it. Refuses a row
+ * that already has an owner: a hike belonging to a named account is that account's, and no
+ * press by anybody else changes that.
+ */
+export async function adoptPendingActivity(activityId: string, userId: string): Promise<void> {
+  const row = await getPendingActivity(activityId);
+  if (!row || row.userId !== null) return;
+  await putActivityHeader({ ...row, userId, heldAt: null, blocked: false, lastError: null });
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +453,31 @@ export interface FlushActivitiesResult {
 }
 
 export interface FlushActivitiesOptions {
+  /**
+   * Who the browser is acting as. Required, and there is no default.
+   *
+   * The only thing that decides whether a hike may leave this device. A drain running as
+   * `null` sends nothing, which is what has to happen in the gap between one person closing
+   * the laptop and the next signing in — the gap in which `SyncQueuedWrites` used to post a
+   * whole day's track to whichever account the browser was holding.
+   *
+   * Not optional, so that a new caller has to decide rather than inherit.
+   */
+  readerId: string | null;
+  /**
+   * Who the browser is acting as *now*, asked again before every one of the three calls.
+   *
+   * `readerId` is pinned when the flush starts, and a hike is the longest-running thing this
+   * product sends: `start`, then a batch of five hundred fixes at a time over the one bar at
+   * the trailhead, then `finish`. Tens of seconds to minutes. If somebody signs in during
+   * that, every remaining request carries their cookie while the header still names the person
+   * who walked — so the day is added to the wrong account, a completion is logged against the
+   * trail under the wrong name, and the header is deleted on the way out. Checking once per
+   * flush cannot see this; checking once per request can. See `stillActingAs` in `identity.ts`.
+   *
+   * Required, like `readerId`, so a new caller decides rather than inherits.
+   */
+  stillReader: () => string | null;
   /** Limit the run to one hike — what a Send button on the storage manager does. */
   activityId?: string;
   /** Include rows the server has already refused. Only ever set by a person retrying. */
@@ -424,6 +545,12 @@ export function isMissing(error: unknown): boolean {
  * deletes the row the outcome belonged to on the way. Kept here so the storage manager can
  * show it whenever the reader next opens `/downloads`, rather than only when they happened to
  * be looking at the page while it ran.
+ *
+ * It is the *page's* one sentence rather than this module's, which is why `use-queue.ts` also
+ * writes reports' outcomes into it. `/downloads` has a single permanent live region and there
+ * should be one voice in it: two regions, one per queue, would be two announcements racing on
+ * a screen where a single press can empty both lists. The seam is that this file owns the
+ * storage; the alternative — a third module holding one string — buys nothing but an import.
  */
 let drainNoticeText: string | null = null;
 
@@ -449,7 +576,7 @@ export function setDrainNotice(text: string | null): void {
  */
 export async function flushPendingActivities(
   post: ActivityPosters,
-  options: FlushActivitiesOptions = {},
+  options: FlushActivitiesOptions,
 ): Promise<FlushActivitiesResult> {
   return serialise(activityDrain, () => drainActivities(post, options));
 }
@@ -464,6 +591,9 @@ async function drainActivities(
   const all = await listPendingActivities();
   const queue = all.filter(
     (row) =>
+      // First and unconditionally. `force` overrides a refusal by the server; nothing
+      // overrides this, because it is not about the hike — it is about whose day it was.
+      ownedBy(row, options.readerId) &&
       (options.activityId === undefined || row.activityId === options.activityId) &&
       (options.force === true || !row.blocked) &&
       // The recorder is uploading this one itself. See `claimLive`.
@@ -473,8 +603,12 @@ async function drainActivities(
   let sent = 0;
   let truncated = 0;
   for (const row of queue) {
+    // Before every hike, and again before every request inside `sendOne`. The browser can
+    // change hands mid-drain; a hike is the longest window in the product for that to happen
+    // in. Break rather than mark — the hike is not at fault and nothing is owed a `blocked`.
+    if (!stillActingAs(options.readerId, options.stillReader)) break;
     try {
-      const outcome = await sendOne(post, row);
+      const outcome = await sendOne(post, row, options);
       if (outcome.truncated) truncated += 1;
       // Only a hike that is finished *and* acknowledged leaves the queue. One that is merely
       // caught up — the tab was closed mid-hike, so nothing ever pressed Finish — stays, and
@@ -529,18 +663,31 @@ async function saveProgress(next: PendingActivity): Promise<boolean> {
   return true;
 }
 
-/** One hike: start if it was never started, append what is outstanding, finish if it ended. */
+/**
+ * One hike: start if it was never started, append what is outstanding, finish if it ended.
+ *
+ * Every server call here is preceded by two questions, not one. `saveProgress` asks whether the
+ * row is still *wanted* — the reader may have pressed Discard while this was uploading. This
+ * asks whether the browser is still the *same person* — somebody may have signed in while it
+ * was uploading, which is the same overlap seen from the other side and a worse outcome: a
+ * discarded hike is one the reader threw away, a misattributed one is a day published under a
+ * name that did not walk it. Both are answered per request rather than per drain, because a
+ * six-hour hike is forty-odd requests and the window is the whole of it.
+ */
 async function sendOne(
   post: ActivityPosters,
   row: PendingActivity,
+  options: FlushActivitiesOptions,
 ): Promise<{ done: boolean; truncated: boolean }> {
   let state = row;
   const abandoned = { done: false, truncated: false };
+  const stillMine = (): boolean => stillActingAs(options.readerId, options.stillReader);
 
   // The queue was listed before this ran, so the row may already have been discarded.
   if (!(await getPendingActivity(state.activityId))) return abandoned;
 
   const announceToServer = async (): Promise<boolean> => {
+    if (!stillMine()) return false;
     await post.start({
       id: state.activityId,
       activityType: state.activityType,
@@ -559,6 +706,10 @@ async function sendOne(
   let reannounced = false;
 
   while (state.sent < fixes.length) {
+    // A multi-minute upload must not outlive the account it started under. What is left stays
+    // on the device with `sent` already written, so the next drain run as its own author picks
+    // up at exactly this batch.
+    if (!stillMine()) return { done: false, truncated };
     const batch = fixes.slice(state.sent, state.sent + SAMPLE_BATCH);
     try {
       await post.append({ id: state.activityId, fixes: batch });
@@ -609,6 +760,12 @@ async function sendOne(
   // popularity against the trail — and `usePendingActivities.discard` has told the server to
   // delete its own copy.
   if (!(await getPendingActivity(state.activityId))) return { done: false, truncated };
+
+  // The last and most expensive place to be wrong. `finish` is what publishes the hike, adds
+  // it to an account and logs a completion against the trail, and it is the request furthest
+  // in time from the moment `readerId` was pinned. A hike left here is whole, on the device,
+  // and finishes on the next drain that runs as the person who walked it.
+  if (!stillMine()) return { done: false, truncated };
 
   await post.finish(state.finish);
   // Only now. A delete before the finish is acknowledged would lose a hike to a dropped
