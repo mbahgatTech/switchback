@@ -1124,6 +1124,17 @@ function Empty({
       </View>
     );
   }
+  // Before the filter and the "no trails" branches, both of which describe the ground. The
+  // server refused to read this ground, so there is nothing true to say about what is on it.
+  if (coverage?.busy === true) {
+    const copy = busyCopy(coverage.busyReason);
+    return (
+      <View style={styles.empty}>
+        <Text style={styles.emptyTitle}>{copy.title}</Text>
+        <Text style={styles.emptyBody}>{copy.body}</Text>
+      </View>
+    );
+  }
   // Checked after the loading and coverage branches: while tiles are still landing, "nothing
   // matches" is a guess, and it is the one people act on by widening filters that were fine.
   if (filtered) {
@@ -1231,6 +1242,39 @@ function boxAround(lng: number, lat: number, half: number): BBox {
   return [lng - half, lat - half, lng + half, lat + half];
 }
 
+/**
+ * What a refused fetch says, in the three places this screen has room to say it.
+ *
+ * The server sends `busy` and `busyReason` and the bridge has always carried them
+ * (`embed-map.tsx` posts the whole coverage object), but nothing here read them: a refused
+ * cold viewport fell through to "No trails in view" with the body "Pan to somewhere with
+ * paths on it" — a claim about ground, and an instruction, on ground the server declined to
+ * look at. The web note got a whole branch of copy for this and the phone got none.
+ *
+ * Two reasons, two sentences, for the reason the web note gives at length: a deep queue
+ * drains on its own, so "try again in a few minutes" is a real thing to do; a full database
+ * does not drain, and telling somebody to wait for it is prescribing an action that cannot
+ * work. `status` is the sheet's one-line version, `title`/`body` the empty state's.
+ */
+function busyCopy(reason: TileCoverage['busyReason']): {
+  status: string;
+  title: string;
+  body: string;
+} {
+  if (reason === 'storage') {
+    return {
+      status: 'No room for new ground',
+      title: 'No room for new ground',
+      body: 'There is nowhere to store trails from ground we have not read yet. Everything already mapped still works.',
+    };
+  }
+  return {
+    status: 'Fetching paused',
+    title: 'Fetching paused',
+    body: 'The queue is full, so this ground has not been read from OpenStreetMap yet. Try again in a few minutes.',
+  };
+}
+
 function statusLine({
   loading,
   coverage,
@@ -1248,6 +1292,13 @@ function statusLine({
   if ((coverage !== null && coverage.pendingTiles.length > 0) || (area?.working ?? 0) > 0) {
     return 'Fetching this area…';
   }
+  // After the pending branch, because those two states can now coexist: a refusal covers the
+  // ground nobody has asked for yet, while tiles already on the queue keep landing. When
+  // something is arriving, saying so is the more useful line. When nothing is, this is the
+  // difference between a map that is finished and a map that was turned down — and without
+  // it a refused cold viewport falls through to "No trails in view", which is a claim about
+  // ground the server declined to look at.
+  if (coverage?.busy === true) return busyCopy(coverage.busyReason).status;
   if (loading && total === 0) return 'Searching…';
   if (total === 0) return filtered ? 'Nothing matches here' : 'No trails in view';
   const trails = `${total.toLocaleString()} ${total === 1 ? 'trail' : 'trails'}`;
@@ -1279,6 +1330,8 @@ function panelAction({
   if ((coverage !== null && coverage.pendingTiles.length > 0) || (area?.working ?? 0) > 0) {
     return 'Fetching this area…';
   }
+  // Same ordering, and the same reason, as `statusLine`.
+  if (coverage?.busy === true) return busyCopy(coverage.busyReason).status;
   if (loading) return 'Counting…';
   if (total === 0) return 'Nothing matches here';
   return `Show ${total.toLocaleString()} ${total === 1 ? 'trail' : 'trails'}`;

@@ -11,6 +11,7 @@ import {
   isReservedUsername,
   profileUpdateSchema,
   usernameSchema,
+  type ProfileUpdate,
   type SelfProfile,
   type HikerStats,
 } from '@switchback/core';
@@ -34,11 +35,56 @@ function toSelfProfile(user: User): SelfProfile {
     defaultActivityVisibility: user.defaultActivityVisibility,
     isPlus: user.isPlus,
     plusUntil: user.plusUntil,
+    /*
+     * Read from the row the context loaded, so the client can decide whether to draw a
+     * moderator's controls. It is not an authorisation — `moderatorProcedure` is, and it
+     * re-reads the same column server-side on every call.
+     */
+    role: user.role,
     home:
       user.homeLng !== null && user.homeLat !== null
         ? { at: [user.homeLng, user.homeLat], name: user.homeName }
         : null,
   };
+}
+
+/**
+ * The columns a profile edit is allowed to touch, and only those.
+ *
+ * **This is the allow-list that stops `me.update` being a privilege-escalation endpoint,
+ * and it is a named function so a test can hold it to that.** `User` carries a `role`
+ * column now; `data: { ...input }` here would let anybody who can POST a profile edit send
+ * `role: "admin"` and be one forgotten `.strict()` away from getting it. Zod already
+ * strips undeclared keys, so that would take two independent mistakes — and "two mistakes
+ * from total compromise" is not a margin worth keeping on the one table that decides who
+ * can delete other people's content.
+ *
+ * Built key by key rather than spread, which also solves the older problem it was written
+ * for: `undefined` and `null` mean different things across this boundary. Absent leaves the
+ * column alone; explicit null clears it. A spread turns "did not touch bio" into "erase
+ * bio".
+ *
+ * The rule for extending it: one named line per column, and if the field is an entitlement
+ * — `role`, `isPlus`, `plusUntil` — it does not belong in this procedure at all.
+ * `packages/api/test/moderation.test.ts` re-derives the key set from a deliberately
+ * polluted input and fails the build if any of those three ever appears.
+ */
+export function profileUpdateData(input: ProfileUpdate): Prisma.UserUpdateInput {
+  const data: Prisma.UserUpdateInput = {};
+  if (input.name !== undefined) data.name = input.name;
+  if (input.username !== undefined) data.username = input.username;
+  if (input.bio !== undefined) data.bio = input.bio;
+  if (input.units !== undefined) data.units = input.units;
+  if (input.theme !== undefined) data.theme = input.theme;
+  if (input.defaultActivityVisibility !== undefined) {
+    data.defaultActivityVisibility = input.defaultActivityVisibility;
+  }
+  if (input.home !== undefined) {
+    data.homeLng = input.home?.at[0] ?? null;
+    data.homeLat = input.home?.at[1] ?? null;
+    data.homeName = input.home?.name ?? null;
+  }
+  return data;
 }
 
 export const meRouter = router({
@@ -83,23 +129,7 @@ export const meRouter = router({
       throw new TRPCError({ code: 'CONFLICT', message: 'That username is reserved.' });
     }
 
-    // Built key by key because `undefined` and `null` mean different things across this
-    // boundary: absent leaves the column alone, explicit null clears it. Spreading the
-    // input wholesale would turn "did not touch bio" into "erase bio".
-    const data: Prisma.UserUpdateInput = {};
-    if (input.name !== undefined) data.name = input.name;
-    if (input.username !== undefined) data.username = input.username;
-    if (input.bio !== undefined) data.bio = input.bio;
-    if (input.units !== undefined) data.units = input.units;
-    if (input.theme !== undefined) data.theme = input.theme;
-    if (input.defaultActivityVisibility !== undefined) {
-      data.defaultActivityVisibility = input.defaultActivityVisibility;
-    }
-    if (input.home !== undefined) {
-      data.homeLng = input.home?.at[0] ?? null;
-      data.homeLat = input.home?.at[1] ?? null;
-      data.homeName = input.home?.name ?? null;
-    }
+    const data = profileUpdateData(input);
 
     try {
       const user = await ctx.db.user.update({ where: { id: ctx.user.id }, data });
@@ -115,16 +145,56 @@ export const meRouter = router({
   }),
 
   /**
-   * Ends every native session. The web session is a cookie Auth.js owns, so the caller
-   * still has to sign out there — the client does both, and this returns the count so it
-   * can say how many devices were affected rather than guessing.
+   * Ends every session this account has, everywhere: the native refresh tokens, the browser
+   * session rows, and the access tokens already handed out.
+   *
+   * The browsers used to be left out, which made the name a lie. `auth.ts` picks database
+   * sessions over JWT with the argument that "a session row can be deleted, so 'this account
+   * was compromised' is one query" — and nothing ever deleted one, so a stolen browser cookie
+   * survived the one button in the product for revoking access, for the whole thirty days it
+   * was good for. Reaching for this is reaching for the compromise button; the phones are not
+   * the only place an attacker could be.
+   *
+   * **The access tokens were the other half of the same lie.** They are JWTs and nothing
+   * stores them, so deleting rows could not touch one already in a client's memory: the copy
+   * on a stolen phone kept working for up to `ACCESS_TOKEN_TTL_S` — fifteen minutes of reading
+   * Lifeline positions and deleting activities — while the screen said every session had
+   * ended. `User.sessionsRevokedAt` is the stamp that closes it, and `createContext` refuses
+   * any bearer token issued at or before it. It is set *first*, so there is no instant in
+   * which the tokens are still honoured and the rows are already gone.
+   *
+   * **It signs out the caller's own browser too**, because that browser is one of the
+   * sessions and there is no way to tell it apart from the one being taken back. The client
+   * says so before the press and lands on the sign-in page after it — a page that still looks
+   * signed in while every request from it fails is worse than an extra sign-in.
+   *
+   * **Both counts are of things that were live**, not of rows that happened to exist. They are
+   * read before the delete, and they carry the same expiry filters as `devices` below, because
+   * they are read out on the receipt the person lands on: an expired-but-unpruned refresh token
+   * and a session row from a browser last used in March are not sessions that were ended, and
+   * counting them made the receipt claim a bigger number than the device list on the screen the
+   * reader had just left. Nothing prunes either kind — the drain cron takes refresh tokens and
+   * auth requests, and @auth/core only deletes an expired session when that browser comes back
+   * with its cookie, which a browser that never comes back never does. The deletes stay
+   * unfiltered: clearing dead rows is free and it is the honest thing to do with them.
    */
   signOutEverywhere: protectedProcedure.mutation(async ({ ctx }) => {
-    const before = await ctx.db.mobileRefreshToken.count({
-      where: { userId: ctx.user.id, revokedAt: null },
+    const now = new Date();
+    const [devices, browsers] = await Promise.all([
+      ctx.db.mobileRefreshToken.count({
+        where: { userId: ctx.user.id, revokedAt: null, expiresAt: { gt: now } },
+      }),
+      ctx.db.session.count({ where: { userId: ctx.user.id, expires: { gt: now } } }),
+    ]);
+    // Stamped after the counts rather than with the same clock reading. It only ever moves
+    // later, and later rejects strictly more tokens — the safe direction for this button.
+    await ctx.db.user.update({
+      where: { id: ctx.user.id },
+      data: { sessionsRevokedAt: new Date() },
     });
     await revokeAllRefreshTokens(ctx.db, ctx.user.id);
-    return { devicesSignedOut: before };
+    await ctx.db.session.deleteMany({ where: { userId: ctx.user.id } });
+    return { devicesSignedOut: devices, browsersSignedOut: browsers };
   }),
 
   devices: protectedProcedure.query(({ ctx }) =>

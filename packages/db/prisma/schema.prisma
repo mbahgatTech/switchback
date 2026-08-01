@@ -183,6 +183,57 @@ enum ThemePreference {
   dark
 }
 
+/// Who may take content down.
+///
+/// Three values rather than a boolean because the two privileged ones are not the same job.
+/// A `moderator` can hide and unhide a review or a photograph; an `admin` can do that *and*
+/// change somebody's role. Collapsed to one flag, granting the first inevitably grants the
+/// second, and the whole point of writing this column down is that handing someone the
+/// takedown lever must not hand them the ability to appoint themselves anything else.
+///
+/// `member` is the default and is what every account created by the Auth.js adapter gets:
+/// the adapter writes `name`, `email`, `image` and `emailVerified` and nothing else, so
+/// there is no sign-in path that can produce a privileged row. See
+/// `packages/api/test/moderation.test.ts` for the assertions that keep it that way.
+enum UserRole {
+  member
+  moderator
+  admin
+}
+
+/// What kind of thing a report is about. Reviews and photographs are the only two things
+/// on this product that a stranger can publish, so they are the only two things here.
+enum ReportSubject {
+  review
+  photo
+}
+
+/// Why somebody is complaining.
+///
+/// Deliberately short. A long taxonomy is a form nobody finishes and a queue nobody can
+/// sort; these are the categories that actually change what the operator has to do next —
+/// `copyright` needs a rights-holder reply, `personal_information` needs speed, `spam`
+/// needs neither. `other` exists because a list that does not have an escape hatch turns
+/// every unanticipated complaint into a miscategorised one.
+enum ReportReason {
+  spam
+  harassment
+  hate
+  sexual
+  violence
+  personal_information
+  copyright
+  misinformation
+  other
+}
+
+/// Where a report has got to. `open` is the only state that needs a human.
+enum ReportStatus {
+  open
+  upheld
+  dismissed
+}
+
 // ---------------------------------------------------------------------------
 // Auth — the four models Auth.js's Prisma adapter requires, plus our own columns
 // ---------------------------------------------------------------------------
@@ -199,6 +250,12 @@ model User {
   bio                       String?
   units                     UnitSystem @default(metric)
   theme                     ThemePreference @default(system)
+  /// Whether this account can take content down. **Never writable from client input.**
+  /// `me.update` builds its `data` object field by field precisely so that this one cannot
+  /// arrive in it, and the only procedure that writes it is `moderation.setRole`, which is
+  /// gated on the caller already being an `admin`. Changing it is a database operation or
+  /// an admin action, never a profile edit.
+  role                      UserRole   @default(member)
   /// Plus-tier entitlement. Every Plus feature checks this one flag, so the billing
   /// integration that eventually sets it has exactly one column to own.
   isPlus                    Boolean    @default(false)
@@ -213,6 +270,20 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  /// When "sign out everywhere" was last pressed on this account.
+  ///
+  /// The refresh tokens and the session rows can be deleted; the access JWT cannot, because
+  /// verifying it is a signature check with no database round trip and that is the whole
+  /// reason it is cheap enough to put on every request. So it lived for up to its full fifteen
+  /// minutes after the press — on the one path this button exists for, a stolen phone, the
+  /// thief kept full read/write API access while the owner read "every session on the account
+  /// has ended".
+  ///
+  /// This closes it without giving up the property: `createContext` already loads the user row
+  /// to authenticate a bearer caller, so rejecting a token issued at or before this costs no
+  /// extra query. Null means never pressed, which is almost every row.
+  sessionsRevokedAt DateTime?
+
   accounts    Account[]
   sessions    Session[]
   reviews     Review[]
@@ -224,6 +295,10 @@ model User {
   routes      PlannedRoute[]
 
   @@index([createdAt])
+  /// Finds the operators. A handful of rows out of every account we have, so it is worth
+  /// the index only because "who can currently take something down" is a question the
+  /// answer to which has to be cheap and exact during an incident.
+  @@index([role])
   @@map("users")
 }
 
@@ -306,6 +381,19 @@ model MobileAuthRequest {
   /// Where the browser is sent when OIDC finishes. Scheme allow-listed before this is stored.
   redirectUri String
   deviceName  String?
+
+  /// SHA-256 of the secret `/start` put in a `__Host-` cookie on the browser that opened it.
+  ///
+  /// This is what ties the row to one browser. Without it, an attacker could call `/start`
+  /// themselves — so that they hold the PKCE verifier — and then navigate a victim's browser
+  /// to `/complete?request=<id>`; the victim's session cookie rides along on a top-level
+  /// cross-site GET, because that is exactly what `SameSite=Lax` is for, and the attacker
+  /// claims a token pair on the victim's account. The verifier defends the deep-link leg and
+  /// says nothing at all about *whose* session authorised the row.
+  ///
+  /// Nullable only because the column arrived after the table did. A null is treated as a
+  /// mismatch, not as "unchecked" — see `authorizeAuthRequest`.
+  browserHash String?
 
   createdAt DateTime @default(now())
   expiresAt DateTime
@@ -668,6 +756,11 @@ model IngestJob {
 
   @@index([status, runAfter, priority])
   @@index([lockedAt])
+  /// What admission control counts. Leading with `kind` because the claim index above
+  /// starts at `status`, and the planner will not use it for a query filtered on both —
+  /// `admitIngest` planned as a sequential scan over every job ever recorded, on the hot
+  /// path behind `trails.browse`.
+  @@index([kind, status])
   @@map("ingest_jobs")
 }
 
@@ -692,6 +785,21 @@ model Review {
 
   helpfulCount Int @default(0)
 
+  /// Set when a moderator takes this report down. **Soft, not a delete**, for three
+  /// reasons: a takedown has to be reversible when it turns out to have been wrong, a
+  /// notice-and-takedown process has to be able to show what it removed and when, and the
+  /// row still has to exist so the page can say *this was removed* rather than quietly
+  /// losing a report its author can still see the URL of. Every aggregate — the average,
+  /// the count, the sixty-day conditions tally — filters on `hiddenAt: null`, because a
+  /// rating nobody is allowed to read must not still be counted in the number on the card.
+  hiddenAt     DateTime?
+  /// Who hid it. A plain id, not a relation: the audit line must survive the moderator's
+  /// own account being deleted.
+  hiddenById   String?
+  /// The moderator's note. Not shown to the reader — the tombstone says only that it was
+  /// removed — but it is what an appeal is answered from.
+  hiddenReason String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -704,6 +812,9 @@ model Review {
   @@unique([trailId, userId])
   @@index([trailId, createdAt])
   @@index([userId, createdAt])
+  /// The aggregate queries all carry `hiddenAt: null`, and on a trail with hundreds of
+  /// reports that predicate should not cost a scan.
+  @@index([trailId, hiddenAt])
   @@map("reviews")
 }
 
@@ -744,6 +855,29 @@ model Photo {
 
   createdAt DateTime @default(now())
 
+  /// Taken down by a moderator. See `Review.hiddenAt` for why this is soft.
+  ///
+  /// A hidden photograph is stronger than a hidden review: the review's tombstone still
+  /// renders in the list, but a hidden photograph is dropped from every public gallery
+  /// outright, and the API blanks its `url` on the way out. A tombstone in a thumbnail
+  /// strip is noise, and — the point of hiding an image being that the image must not
+  /// reach a browser — a row that still carries a live object URL has not been taken
+  /// down at all. The uploader still sees it, marked removed, on their own profile —
+  /// `photos.mine` is the one query that returns a hidden row, and the profile page is what
+  /// renders it. A moderator can also ask `trails.photos` for them, which is where the
+  /// control that puts one back lives.
+  ///
+  /// Set on this row directly when the photograph itself was reported, and set by cascade
+  /// when the trail report it was filed with was taken down — the cascade writes a sentinel
+  /// `hiddenReason` so that putting the report back does not also put back a photograph
+  /// that was hidden on its own merits. See `moderation.hide`.
+  ///
+  /// The bytes are deliberately left in the bucket. Hiding is reversible; deleting the
+  /// object is not, and the two decisions belong to different moments.
+  hiddenAt     DateTime?
+  hiddenById   String?
+  hiddenReason String?
+
   trail     Trail?    @relation("TrailPhotos", fields: [trailId], references: [id], onDelete: Cascade)
   primaryOf Trail?    @relation("TrailPrimaryPhoto")
   review    Review?   @relation(fields: [reviewId], references: [id], onDelete: Cascade)
@@ -755,7 +889,68 @@ model Photo {
   @@index([reviewId])
   @@index([activityId])
   @@index([userId, createdAt])
+  /// Every public gallery query and the hero pass carry `hiddenAt: null`; the moderator's
+  /// view of a trail's photographs is the one read that does not.
+  @@index([trailId, hiddenAt])
   @@map("photos")
+}
+
+// ---------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------
+
+/// A complaint about something somebody published.
+///
+/// **The subject is an id and a kind, not a foreign key**, and that is the one design
+/// decision here worth defending. A relation would give referential integrity and would
+/// take the report down with the content: `onDelete: Cascade` erases the complaint the
+/// moment the thing complained about goes, and `SetNull` keeps a row that no longer says
+/// what it was about. Neither is acceptable in a log whose entire job is to outlive the
+/// content — the question a takedown process has to be able to answer months later is
+/// "what did you receive, when, and what did you do about it", and the answer must not
+/// depend on the row still existing. So the subject is recorded the way an incident log
+/// records one: by identity, denormalised, permanent.
+///
+/// **`reporterId` is nullable on purpose.** Notice-and-takedown means being able to receive
+/// a complaint from someone who does not have an account and is not going to make one to
+/// tell us about a photograph of their house. `contactEmail` is how they get an answer, and
+/// it is optional too — an anonymous report is still a report.
+model ContentReport {
+  id String @id @default(cuid())
+
+  subject   ReportSubject
+  /// The `Review.id` or `Photo.id` this is about. Not a foreign key — see above.
+  subjectId String
+  /// The trail the content sits on, so the queue can be read by place without a join
+  /// through a row that may since have been deleted.
+  trailId   String?
+
+  reason ReportReason
+  /// What they actually said. The reason enum sorts the queue; this is what explains it.
+  detail String?
+
+  /// Null when filed by somebody who was not signed in.
+  reporterId   String?
+  /// Where to reply. Optional, and the only field on this table a stranger can put their
+  /// own contact details in — which is why nothing renders it back to anybody but an
+  /// operator.
+  contactEmail String?
+
+  status         ReportStatus @default(open)
+  resolvedAt     DateTime?
+  resolvedById   String?
+  resolutionNote String?
+
+  createdAt DateTime @default(now())
+
+  /// The queue: everything open, oldest first, because the oldest unanswered complaint is
+  /// the one that is costing the most.
+  @@index([status, createdAt])
+  /// "Has this already been reported?" — asked on every submit to dedupe, and asked again
+  /// by the operator looking at one item.
+  @@index([subject, subjectId])
+  @@index([reporterId, createdAt])
+  @@map("content_reports")
 }
 
 // ---------------------------------------------------------------------------

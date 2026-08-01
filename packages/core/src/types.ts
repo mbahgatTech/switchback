@@ -227,6 +227,26 @@ export const tileCoverageSchema = z.object({
   refreshingTiles: z.array(z.string()).default([]),
   /** True when the viewport is too large to cover; the client should zoom in. */
   tooLarge: z.boolean(),
+  /**
+   * True when ingest was refused, so the *new* ground this view is missing is not coming.
+   *
+   * Not the same as "nothing outstanding". The refused tiles are kept out of `pendingTiles`,
+   * because a non-empty `pendingTiles` makes the client poll and there would be nothing to
+   * poll for — but the reader is owed the difference between a view we hold entirely and one
+   * whose fetch was turned down, so the note says which. Tiles this viewport already had a
+   * job for are unaffected: they stay in `pendingTiles`, they are still coming, and the poll
+   * that watches them keeps running. Defaulted, so a cached response from before this field
+   * existed still parses.
+   */
+  busy: z.boolean().default(false),
+  /**
+   * Which refusal, when `busy`. Null otherwise.
+   *
+   * The two do not share a sentence. A deep queue drains and "try again in a few minutes" is
+   * a real instruction; a full database does not drain, an operator has to decide what to
+   * delete, and telling the reader to wait for it is prescribing something that cannot work.
+   */
+  busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
   /** How many tiles the viewport spans, and the most we will cover at once. */
   requiredTiles: z.number().int().nonnegative().default(0),
   maxTiles: z.number().int().positive().default(12),

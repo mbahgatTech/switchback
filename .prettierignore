@@ -30,3 +30,8 @@ tmp
 # straight back the next time either tool regenerates the file
 apps/web/next-env.d.ts
 apps/mobile/expo-env.d.ts
+
+# vendored third-party code, served verbatim from public/. Reformatting it would break the
+# only guarantee it has — that it is byte-identical to the published tarball whose digest
+# `src/components/map/rtl.ts` records.
+apps/web/public/vendor

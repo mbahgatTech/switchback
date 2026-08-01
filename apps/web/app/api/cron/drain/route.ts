@@ -1,4 +1,4 @@
-import { drainIngest } from '@switchback/ingest';
+import { drainIngest, pruneFinishedJobs } from '@switchback/ingest';
 import { pruneExpiredAuthRequests } from '@switchback/api/mobile-auth';
 import { pruneExpiredRefreshTokens } from '@switchback/api/tokens';
 import { type OverdueSweep, sweepOverdueLifelines } from '@switchback/api/lifeline';
@@ -41,6 +41,22 @@ export const runtime = 'nodejs';
  * next four.
  */
 const BATCH = 4;
+
+/**
+ * Derived jobs claimed alongside, which `BATCH` would never reach on its own.
+ *
+ * `claimJobs` orders by `priority DESC` and `enrich_trail`/`ingest_route` are enqueued at
+ * `-10`, so a plain batch takes one only when the rest of the table is empty. This is a
+ * separate, kind-scoped claim — see `drainJobs` — and six is what fits: an enrichment is a
+ * lookup and an image fetch rather than an Overpass query, so it costs a second or two
+ * against the twenty-odd seconds `BATCH` leaves spare.
+ *
+ * Six a day is not the drain rate and is not meant to be. On a schedule Hobby caps at daily,
+ * the rate that matters comes from the inline `waitUntil` kicks, which take their own share
+ * on every map request that finds new ground — the backlog falls with traffic, which is what
+ * it rises with. This is the backstop for a deploy nobody is looking at.
+ */
+const DERIVED_BATCH = 6;
 
 /** Vercel's cron scheduler will not wait longer than this, and neither should we. */
 export const maxDuration = 60;
@@ -136,6 +152,27 @@ async function sweepLifelines(): Promise<OverdueSweep | null> {
   }
 }
 
+/**
+ * Collect ingest jobs that finished long enough ago to be history.
+ *
+ * `ingest_jobs` had no prune at all, and it is not a table that can go without one: admission
+ * control counts it on the hot path behind `trails.browse`, so every row ever recorded was
+ * work done on every viewport that found new ground. The `@@index([kind, status])` makes that
+ * count index-only; this keeps the index from growing with lifetime job count.
+ *
+ * Hung off the drain for the same reason the other sweeps are — Hobby allows very few crons,
+ * and rows a week past their completion are in no hurry. Swallowed on failure: an uncollected
+ * row is a tidiness problem and must not stop trail ingest.
+ */
+async function sweepFinishedJobs(): Promise<{ done: number; failed: number } | null> {
+  try {
+    return await pruneFinishedJobs(prisma);
+  } catch (error) {
+    console.warn('finished-job sweep failed', error);
+    return null;
+  }
+}
+
 export async function GET(req: Request): Promise<Response> {
   if (!env.CRON_SECRET) {
     return Response.json({ error: 'CRON_SECRET is not configured' }, { status: 503 });
@@ -145,11 +182,12 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const started = Date.now();
-  const [result, swept, orphans, lifelines] = await Promise.all([
-    drainIngest({ limit: BATCH, workerId: 'cron' }),
+  const [result, swept, orphans, lifelines, jobs] = await Promise.all([
+    drainIngest({ limit: BATCH, derivedLimit: DERIVED_BATCH, workerId: 'cron' }),
     sweepCredentials(),
     sweepOrphans(),
     sweepLifelines(),
+    sweepFinishedJobs(),
   ]);
   const durationMs = Date.now() - started;
 
@@ -180,5 +218,5 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
-  return Response.json({ ...result, swept, orphans, lifelines, durationMs });
+  return Response.json({ ...result, swept, orphans, lifelines, jobs, durationMs });
 }

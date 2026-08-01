@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ActivityType, TrailCondition } from '@switchback/core';
+import type { ActivityType, ReviewSort, TrailCondition } from '@switchback/core';
 import { REVIEW_SORTS } from '@switchback/core';
 import { ORDER_BY, toDateString, toReview, toUtcMidnight } from '../src/routers/reviews';
 
@@ -31,6 +31,8 @@ const BASE = {
   helpfulCount: 3,
   createdAt: new Date('2026-03-15T09:04:00Z'),
   updatedAt: new Date('2026-03-15T09:04:00Z'),
+  /* Not hidden. The takedown path's own assertions live in `moderation.test.ts`. */
+  hiddenAt: null as Date | null,
   user: {
     id: 'usr_ivy',
     username: 'ivy' as string | null,
@@ -76,18 +78,41 @@ describe('ORDER_BY', () => {
     }
   });
 
-  it('leads with the field the reader chose', () => {
+  it('leads with the field the reader chose, past the tombstone term', () => {
+    /*
+     * The three sorts that key on a column a removed report no longer carries push the
+     * tombstones into one block first — see `TOMBSTONES_LAST` in the router for why position
+     * in a sorted list publishes a withdrawn number as surely as printing it does. So "the
+     * field the reader chose" is the first term that is not that one.
+     */
+    const chosen = (sort: ReviewSort) => {
+      const [first, second] = ORDER_BY[sort];
+      return 'hiddenAt' in first! ? second : first;
+    };
+
+    expect(chosen('recent')).toEqual({ createdAt: 'desc' });
+    expect(chosen('rating_desc')).toEqual({ rating: 'desc' });
+    expect(chosen('rating_asc')).toEqual({ rating: 'asc' });
+    expect(chosen('helpful')).toEqual({ helpfulCount: 'desc' });
+  });
+
+  it('sinks the tombstones rather than floating them', () => {
+    // `nulls: 'first'` puts the visible rows — `hiddenAt IS NULL` — ahead of the removed
+    // ones. The other way round would open every rating sort on a wall of takedowns.
+    for (const sort of ['rating_desc', 'rating_asc', 'helpful'] as const) {
+      expect(ORDER_BY[sort][0]).toEqual({ hiddenAt: { sort: 'desc', nulls: 'first' } });
+    }
+
+    // Not `recent`: it keys on a date the tombstone prints on its own face, so there is
+    // nothing to leak, and keeping a removed report in chronological place is the point.
     expect(ORDER_BY.recent[0]).toEqual({ createdAt: 'desc' });
-    expect(ORDER_BY.rating_desc[0]).toEqual({ rating: 'desc' });
-    expect(ORDER_BY.rating_asc[0]).toEqual({ rating: 'asc' });
-    expect(ORDER_BY.helpful[0]).toEqual({ helpfulCount: 'desc' });
   });
 
   it('keeps the newest first within a rating, both ways up the scale', () => {
     // Lowest-rated exists so the closed bridge and the washed-out ford are findable. A
     // three-year-old one-star at the top of that list is the wrong report to lead with.
-    expect(ORDER_BY.rating_asc[1]).toEqual({ createdAt: 'desc' });
-    expect(ORDER_BY.rating_desc[1]).toEqual({ createdAt: 'desc' });
+    expect(ORDER_BY.rating_asc[2]).toEqual({ createdAt: 'desc' });
+    expect(ORDER_BY.rating_desc[2]).toEqual({ createdAt: 'desc' });
   });
 });
 

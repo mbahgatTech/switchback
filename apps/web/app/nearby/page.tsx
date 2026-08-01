@@ -158,6 +158,12 @@ export default async function NearbyPage() {
           <Link href="/attribution" className="collar rounded-hair hover:text-ink">
             All sources
           </Link>
+          <Link href="/terms" className="collar rounded-hair hover:text-ink">
+            Terms
+          </Link>
+          <Link href="/report" className="collar rounded-hair hover:text-ink">
+            Report content
+          </Link>
         </div>
       </footer>
     </div>

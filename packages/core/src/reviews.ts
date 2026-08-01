@@ -217,12 +217,23 @@ export const REVIEW_PHOTOS_IN_LIST = 6;
 export const reviewSchema = z.object({
   id: z.string(),
   trailId: z.string(),
-  rating: z.number().int().min(1).max(5),
+  /**
+   * Null on a report a moderator took down, exactly as `body` is.
+   *
+   * It was non-null once, and both renderers simply declined to draw it on a hidden row —
+   * which left the number in every `reviews.list` response and, worse, left it ordering the
+   * list. `rating_desc` and `rating_asc` sort on the database column, so a tombstone sitting
+   * first under "Highest rated" told a reader the withdrawn rating was a five without
+   * printing it. A value the page refuses to show must not be readable off the row's
+   * position, and the only way to guarantee that is for the client not to have it.
+   */
+  rating: z.number().int().min(1).max(5).nullable(),
   body: z.string().nullable(),
   /** `YYYY-MM-DD`, the calendar day they hiked it. See this module's header. */
   hikedOn: z.string().nullable(),
   conditions: z.array(z.enum(TRAIL_CONDITIONS)),
   activityType: z.enum(ACTIVITY_TYPES).nullable(),
+  /** Zeroed on a removed report — see `rating` above and `toReview`. */
   helpfulCount: z.number().int().nonnegative(),
   createdAt: z.date(),
   /** Equal to `createdAt` until it is edited, which is how the UI knows to say "edited". */
@@ -235,6 +246,17 @@ export const reviewSchema = z.object({
   photos: z.array(reviewPhotoSchema),
   /** True when the signed-in caller wrote this one. Always false when signed out. */
   isMine: z.boolean(),
+  /**
+   * A moderator took this down.
+   *
+   * The row is still returned and still occupies its place in the list — see
+   * `toReview` in `packages/api/src/routers/reviews.ts` for why a tombstone beats both a
+   * 404 and a silent disappearance. When this is true the server has already stripped
+   * `rating`, `body`, `conditions`, `activityType`, `helpfulCount` and `photos`, so a
+   * renderer that forgets to branch on it shows an empty report rather than the text
+   * somebody complained about. The rating is not in the trail's average either way.
+   */
+  hidden: z.boolean(),
 });
 export type Review = z.infer<typeof reviewSchema>;
 

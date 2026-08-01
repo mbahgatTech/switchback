@@ -129,11 +129,27 @@ export async function verifyIdentityToken(
     providerAccountId: payload.sub,
     email,
     /**
-     * Apple states this explicitly. Entra does not emit `email_verified` at all, but an
-     * `email` claim from a work or school tenant is directory-owned and from a personal
-     * account is Microsoft-verified — in both cases the tenant, not the user, controls it.
+     * Apple states this explicitly, and is believed.
+     *
+     * **Entra is not, and this is the whole of the nOAuth defence.** Microsoft does not emit
+     * `email_verified` at all, and the `email` claim it does emit is a tenant-mutable
+     * directory attribute — Microsoft's own guidance says it is unsuitable for identifying a
+     * user. We sign against `/common`, so the tenant on the other end is whichever one the
+     * caller belongs to, including a free one they created this morning. Anybody can set a
+     * user's `mail` to somebody else's address there and hand us a perfectly valid,
+     * correctly-signed token asserting it.
+     *
+     * So `false`, unconditionally, which is what makes the `email_taken_unverified` guard in
+     * `app/api/auth/mobile/exchange/route.ts` reachable for the only provider production has
+     * switched on. Before this it read `email !== null` — true whenever an email existed —
+     * and the guard was dead code protecting nothing.
+     *
+     * The cost is real and is paid on purpose: somebody who made their account in a browser
+     * and then signs in on the phone with the same Microsoft account, but a *different*
+     * `sub`, is refused rather than merged. That is a rare case with a clear instruction; the
+     * alternative is a takeover with none.
      */
-    emailVerified: provider === 'apple' ? claimIsTrue(payload.email_verified) : email !== null,
+    emailVerified: provider === 'apple' ? claimIsTrue(payload.email_verified) : false,
     name: typeof payload.name === 'string' ? payload.name : null,
   };
 }

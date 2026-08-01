@@ -2,12 +2,19 @@ import { useMemo, useState } from 'react';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import type { RatingSummary, Review, ReviewSort } from '@switchback/core';
-import { REVIEW_SORTS, REVIEW_SORT_LABEL, formatDateLabel, plural } from '@switchback/core';
+import {
+  REMOVED_NOTICE,
+  REVIEW_SORTS,
+  REVIEW_SORT_LABEL,
+  formatDateLabel,
+  plural,
+} from '@switchback/core';
 import { nativeTheme } from '@switchback/ui';
 import { REVIEW_PAGE_SIZE } from '@/api/pages';
 import { useTRPC } from '@/api/trpc';
 import { Chip, ChipRail } from './chip';
 import { ConditionChip } from './condition-chip';
+import { ReportControl } from './report-control';
 import { ReportForm } from './report-form';
 
 /**
@@ -278,7 +285,16 @@ function Row({ review }: { review: Review }) {
   return (
     <View style={[styles.row, review.isMine ? styles.rowMine : null]}>
       <View style={styles.rowHead}>
-        <ScaleBar value={review.rating} />
+        {/*
+         * No scale bar on a removed report. The server has already dropped its rating out
+         * of the trail's average, so drawing the bar would put the one measurement on this
+         * screen that corresponds to nothing — and it would be a rating the page is
+         * asserting on behalf of a report it has just withdrawn.
+         *
+         * Keyed off `rating === null`, which is what the server sends on a removed row,
+         * rather than off `hidden`: one value decides, so the two cannot disagree.
+         */}
+        {review.rating === null ? null : <ScaleBar value={review.rating} />}
         <Text style={styles.rowName} numberOfLines={1}>
           {name}
         </Text>
@@ -289,8 +305,23 @@ function Row({ review }: { review: Review }) {
         {review.hikedOn !== null
           ? `Hiked ${formatDateLabel(review.hikedOn)}`
           : `Written ${formatDateLabel(review.createdAt.toISOString().slice(0, 10))}`}
-        {edited ? ' · edited' : ''}
+        {edited && !review.hidden ? ' · edited' : ''}
       </Text>
+
+      {/*
+       * The tombstone, matching the website's. The row stays rather than disappearing,
+       * because a report that silently vanishes reads to whoever wrote it as a bug in the
+       * app rather than as a decision somebody made — and they are exactly the person who
+       * has to be able to argue with it.
+       *
+       * The short notice on every row, including your own. The longer sentence with the
+       * address lives once per screen, in the form slot `ReportForm` renders above this
+       * list, which is where the author arrives to type and where the refusal has to be
+       * explained before they try. Printing it in both places put the identical sentence on
+       * screen twice within one scroll, styled two different ways, which reads as two
+       * decisions about one takedown.
+       */}
+      {review.hidden ? <Text style={styles.rowRemoved}>{REMOVED_NOTICE}</Text> : null}
 
       {review.body === null ? null : <Text style={styles.rowBody}>{review.body}</Text>}
 
@@ -312,6 +343,15 @@ function Row({ review }: { review: Review }) {
             .join(' · ')}
         </Text>
       ) : null}
+
+      {/*
+       * Somebody else's report, so it carries the way to complain about it. Not on your own
+       * — reporting yourself is not a thing anybody needs — and not on a removed one, which
+       * has already been acted on and has nothing left on screen to object to.
+       */}
+      {review.isMine || review.hidden ? null : (
+        <ReportControl subject="review" subjectId={review.id} what={`this report by ${name}`} />
+      )}
     </View>
   );
 }
@@ -409,6 +449,18 @@ const styles = StyleSheet.create({
   // on the screen a person wrote by hand, and setting it in the caption size the numbers use
   // would file it with the instrument readings.
   rowBody: { ...theme.text('body', { family: 'text' }), color: theme.color.ink },
+  /* A dashed hairline and muted ink — the same treatment as this screen's other absences. */
+  rowRemoved: {
+    ...theme.text('caption'),
+    color: theme.color.inkMuted,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: theme.color.bezel,
+    borderRadius: theme.radius.hair,
+    paddingHorizontal: theme.space.md,
+    paddingVertical: theme.space.sm,
+    marginTop: theme.space.sm,
+  },
   rowChips: { flexDirection: 'row', flexWrap: 'wrap', gap: theme.space.xs },
   rowFooter: { ...theme.collarLabel, color: theme.color.inkMuted },
 

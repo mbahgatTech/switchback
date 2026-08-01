@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
 import {
   LOCK_TIMEOUT_MS,
@@ -15,7 +15,10 @@ interface Recorded {
   updates: Array<{ id: string; data: Record<string, unknown> }>;
   updateManys: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>;
   upserts: Array<Record<string, unknown>>;
+  /** The last raw call's interpolated values. */
   rawValues: unknown[];
+  /** Every raw call's values, in order. `drainJobs` makes two — see the derived share. */
+  rawCalls: unknown[][];
 }
 
 /**
@@ -23,11 +26,20 @@ interface Recorded {
  * queue's decisions — reschedule vs bury, backoff, revival, ordering — without a database.
  */
 function fakeDb(claimable: ClaimedJob[] = []): { db: Db; recorded: Recorded } {
-  const recorded: Recorded = { updates: [], updateManys: [], upserts: [], rawValues: [] };
+  const recorded: Recorded = {
+    updates: [],
+    updateManys: [],
+    upserts: [],
+    rawValues: [],
+    rawCalls: [],
+  };
   const db = {
     $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
       recorded.rawValues = values;
-      return claimable;
+      recorded.rawCalls.push(values);
+      // Only the first claim yields work. The second is the derived share, and handing it
+      // the same rows would double-run them in every test that drains.
+      return recorded.rawCalls.length === 1 ? claimable : [];
     },
     ingestJob: {
       update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
@@ -83,6 +95,32 @@ function scopeFragment(values: unknown[]): SqlFragment {
 /** That fragment's SQL text, with its bound values left out. */
 function scopeSql(values: unknown[]): string {
   return scopeFragment(values).strings.join('?');
+}
+
+/** A value's fragment values, or nothing when it is not a fragment. */
+function fragmentValues(value: unknown): readonly unknown[] {
+  return typeof value === 'object' &&
+    value !== null &&
+    Array.isArray((value as SqlFragment).strings)
+    ? (value as SqlFragment).values
+    : [];
+}
+
+/**
+ * Every spliced fragment's SQL, joined.
+ *
+ * `claimJobs` splices two now — the `dedupeKey` scope and the kind scope — and `scopeFragment`
+ * above returns only the first, so a test asserting on the kind filter would otherwise be
+ * reading the wrong hole.
+ */
+function allScopeSql(values: unknown[]): string {
+  return values
+    .filter(
+      (v): v is SqlFragment =>
+        typeof v === 'object' && v !== null && Array.isArray((v as SqlFragment).strings),
+    )
+    .map((fragment) => fragment.strings.join('?'))
+    .join(' ');
 }
 
 function job(overrides: Partial<ClaimedJob> = {}): ClaimedJob {
@@ -224,6 +262,135 @@ describe('claimJobs', () => {
     expect(scopeSql(recorded.rawValues)).toContain('false');
     expect(scopeSql(recorded.rawValues)).not.toContain('dedupeKey');
   });
+
+  it('narrows the claim to specific kinds when asked', async () => {
+    const { db, recorded } = fakeDb();
+    await claimJobs(db, 'cron', 2, new Date(), undefined, [
+      JobKind.enrich_trail,
+      JobKind.ingest_route,
+    ]);
+
+    const sql = allScopeSql(recorded.rawValues);
+    expect(sql).toContain('kind = ANY(');
+    // The cast belongs on the parameter. On the column it would silently drop
+    // `@@index([kind, status])`, which is the index this queue's hot path depends on.
+    expect(sql).toContain('::"JobKind"[]');
+    expect(sql).not.toContain('kind::text');
+    expect(recorded.rawValues.flatMap(fragmentValues)).toEqual([
+      [JobKind.enrich_trail, JobKind.ingest_route],
+    ]);
+  });
+
+  it('claims nothing when the kind list is empty rather than everything', async () => {
+    // The same trap as the empty `dedupeKeys` list one line up, and the same answer.
+    const { db, recorded } = fakeDb();
+    await claimJobs(db, 'cron', 2, new Date(), undefined, []);
+
+    expect(allScopeSql(recorded.rawValues)).toContain('false');
+    expect(allScopeSql(recorded.rawValues)).not.toContain('kind = ANY(');
+  });
+});
+
+/**
+ * The starvation this share exists to break.
+ *
+ * `claimJobs` orders `priority DESC` and `pipeline.ts` enqueues `enrich_trail` and
+ * `ingest_route` at `-10`, below every requestable kind — so a plain claim reaches a derived
+ * job only when the whole rest of the table is empty, which on a live deploy is never. The
+ * inline kicks made it absolute: both scope to the tile keys they just queued, so they could
+ * not touch a derived row at all. Measured on this branch the derived backlog drained at four
+ * jobs a day in theory and zero in practice, against a fan-out of ~339 per tile. That is what
+ * made a ceiling on the derived queue a one-way latch, and it is a defect on its own terms
+ * whether or not there is a ceiling above it.
+ */
+describe('the derived share', () => {
+  it('claims derived work in a second, kind-scoped pass', async () => {
+    const { db, recorded } = fakeDb();
+
+    await drainJobs({}, { db, dedupeKeys: [tileJobKey('021231030')], derivedLimit: 2 });
+
+    expect(recorded.rawCalls).toHaveLength(2);
+    // The first claim is the caller's own work, scoped by key and unrestricted by kind.
+    expect(allScopeSql(recorded.rawCalls[0]!)).toContain('"dedupeKey" IN');
+    expect(allScopeSql(recorded.rawCalls[0]!)).not.toContain('kind = ANY(');
+    // The second is the reservation: kind-scoped, and deliberately *not* key-scoped, because
+    // reaching work nobody asked for by name is the entire point.
+    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind = ANY(');
+    expect(allScopeSql(recorded.rawCalls[1]!)).not.toContain('"dedupeKey" IN');
+    expect(recorded.rawCalls[1]!).toContain(2);
+  });
+
+  it('reaches derived work even when the caller scoped itself to nothing', async () => {
+    // A kick whose tiles were all refused still drains: the share does not ride on the
+    // primary claim finding anything.
+    const { db, recorded } = fakeDb();
+
+    await drainJobs({}, { db, dedupeKeys: [], derivedLimit: 2 });
+
+    expect(recorded.rawCalls).toHaveLength(2);
+    expect(allScopeSql(recorded.rawCalls[1]!)).toContain('kind = ANY(');
+  });
+
+  it('asks for nothing extra when the share is zero', async () => {
+    const { db, recorded } = fakeDb();
+
+    await drainJobs({}, { db, derivedLimit: 0 });
+
+    expect(recorded.rawCalls).toHaveLength(1);
+  });
+
+  it('reports how much of the batch came from the share', async () => {
+    const { db } = fakeDb([job()]);
+
+    const result = await drainJobs({ [JobKind.ingest_tile]: async () => {} }, { db });
+
+    // Zero here rather than absent: the fake yields rows on the first claim only, so this
+    // pins that the count reports the second claim's haul and not the batch's.
+    expect(result.derived).toBe(0);
+    expect(result.claimed).toBe(1);
+  });
+
+  it('drains the primary batch even when the derived claim fails', async () => {
+    /*
+     * Ordering is the whole argument. `claimJobs` is a claim, not a read: by the time the
+     * derived pass runs, the primary batch is already `running` with a lock stamped on it.
+     * Letting that rejection out of `drainJobs` would strand those rows until the lock
+     * expired ten minutes later — one failing fairness reservation costing the queue the
+     * work it had just taken, on every tick.
+     *
+     * The thrown message is the shape a bad `kind = ANY($1::"JobKind"[])` would actually
+     * take, which is the failure this guard was written for.
+     */
+    const { db, recorded } = fakeDb([job()]);
+    const raw = (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> })
+      .$queryRaw;
+    let calls = 0;
+    (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> }).$queryRaw = async (
+      ...args: unknown[]
+    ) => {
+      calls += 1;
+      if (calls === 2) throw new Error('operator does not exist: "JobKind" = text');
+      return raw(...args);
+    };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const ran: string[] = [];
+    const result = await drainJobs(
+      {
+        [JobKind.ingest_tile]: async (claimed: ClaimedJob) => {
+          ran.push(claimed.id);
+        },
+      },
+      { db, derivedLimit: 2 },
+    );
+
+    expect(ran).toEqual(['job-1']);
+    expect(result).toEqual({ claimed: 1, succeeded: 1, failed: 0, deferred: 0, derived: 0 });
+    // Completed, not left at `running` for the lock timeout to pick up.
+    expect(recorded.updates.at(-1)?.data.status).toBe(JobStatus.done);
+    // And loudly: a share that has silently stopped running is a backlog nobody is watching.
+    expect(errors).toHaveBeenCalled();
+  });
 });
 
 describe('failJob', () => {
@@ -279,7 +446,7 @@ describe('drainJobs', () => {
     );
 
     expect(handled).toEqual(['a', 'b']);
-    expect(result).toEqual({ claimed: 2, succeeded: 2, failed: 0, deferred: 0 });
+    expect(result).toEqual({ claimed: 2, succeeded: 2, failed: 0, deferred: 0, derived: 0 });
     expect(recorded.updates.map((u) => u.data.status)).toEqual([JobStatus.done, JobStatus.done]);
   });
 
@@ -317,7 +484,7 @@ describe('drainJobs', () => {
       { db },
     );
 
-    expect(result).toEqual({ claimed: 3, succeeded: 2, failed: 1, deferred: 0 });
+    expect(result).toEqual({ claimed: 3, succeeded: 2, failed: 1, deferred: 0, derived: 0 });
     expect(recorded.updates.map((u) => u.data.status)).toEqual([
       JobStatus.done,
       JobStatus.queued,
@@ -334,7 +501,7 @@ describe('drainJobs', () => {
 
     const result = await drainJobs({}, { db, now: () => new Date('2026-01-01T12:00:00Z') });
 
-    expect(result).toEqual({ claimed: 1, succeeded: 0, failed: 0, deferred: 1 });
+    expect(result).toEqual({ claimed: 1, succeeded: 0, failed: 0, deferred: 1, derived: 0 });
     const update = recorded.updates[0]!;
     expect(update.data.status).toBe(JobStatus.queued);
     expect(update.data.lastError).toMatch(/no handler registered/);
@@ -356,7 +523,7 @@ describe('drainJobs', () => {
   it('reports an empty drain without touching anything', async () => {
     const { db, recorded } = fakeDb([]);
     const result = await drainJobs({ [JobKind.ingest_tile]: async () => {} }, { db });
-    expect(result).toEqual({ claimed: 0, succeeded: 0, failed: 0, deferred: 0 });
+    expect(result).toEqual({ claimed: 0, succeeded: 0, failed: 0, deferred: 0, derived: 0 });
     expect(recorded.updates).toHaveLength(0);
   });
 });

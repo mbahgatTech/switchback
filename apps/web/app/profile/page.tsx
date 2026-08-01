@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation';
 import type { HikerProfile } from '@switchback/core';
 import { BRAND } from '@switchback/core';
 import { Hiker } from '@/components/profile/hiker';
+import { YourPhotographs } from '@/components/profile/photographs';
 import { SiteNav } from '@/components/site-nav';
 import { Wordmark } from '@/components/wordmark';
 import { caller } from '@/trpc/server';
@@ -32,7 +33,13 @@ export default async function ProfilePage() {
   if (!viewer) redirect(`/signin?callbackUrl=${encodeURIComponent('/profile')}`);
   if (viewer.username) redirect(`/u/${viewer.username}`);
 
-  const [stats, lists] = await Promise.all([caller.me.stats(), caller.lists.mine()]);
+  const [stats, lists, photographs] = await Promise.all([
+    caller.me.stats(),
+    caller.lists.mine(),
+    // Including any a moderator took down — this and your own `/u/<name>` are the two places
+    // the uploader is told. See `components/profile/photographs.tsx`.
+    caller.photos.mine({ limit: 24 }),
+  ]);
   const completed = lists.find((list) => list.kind === 'completed');
 
   const hiker: HikerProfile = {
@@ -85,6 +92,8 @@ export default async function ProfilePage() {
         </p>
 
         <Hiker hiker={hiker} units={viewer.units} now={new Date()} />
+
+        <YourPhotographs photographs={photographs} />
       </main>
     </div>
   );
