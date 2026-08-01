@@ -1,15 +1,9 @@
 /**
- * The seam a paid data source would slot into.
+ * The seam a paid data source (or our own recorded activities, once they outgrow the prior)
+ * would slot into, so the swap is one binding rather than a rewrite of every caller.
  *
- * The model in this package is an estimate and says so. If ground truth ever becomes
- * available — BestTime.app sells it, and our own recorded activities will eventually
- * outgrow the prior on popular trails — the swap should be one binding, not a rewrite of
- * every caller. Hence an interface with exactly one method, and a `provider` string on the
- * result so the UI can attribute whatever answered.
- *
- * The interface is async even though the model is synchronous. Anything worth swapping in
- * is a network call, and a provider that had to be introduced by changing every call site
- * from a value to a promise would not be much of a seam.
+ * Async even though the model is synchronous: anything worth swapping in is a network call, and
+ * a seam that had to change every call site from a value to a promise would not be one.
  */
 
 import type { BusynessForecast } from '@switchback/core';
@@ -23,18 +17,14 @@ export interface BusynessProvider {
 /** The default: our own model, from OSM tags and whatever our users have recorded. */
 export const modelProvider: BusynessProvider = {
   name: MODEL_PROVIDER,
-  // Synchronous underneath, and `Promise.resolve` says so more honestly than an `async`
-  // wrapper with nothing to await: there is no work here that could ever be deferred.
+  // Synchronous underneath; there is no work here that could be deferred.
   forecast: (input) => Promise.resolve(busynessForecast(input)),
 };
 
 /**
- * First provider that returns an answer, model last.
- *
- * A paid source is worth asking first and worth nothing when it is down, so a failure
- * falls through rather than propagating: busy times are a nice-to-have on a trail page,
- * and a 502 from a third party must not be what the page shows instead of a curve. The
- * `provider` field records which one actually answered.
+ * First provider that returns an answer, model last. A failure falls through rather than
+ * propagating — a 502 from a third party must not be what the page shows instead of a curve.
+ * The result's `provider` field records which one answered.
  */
 export function firstAvailable(...providers: readonly BusynessProvider[]): BusynessProvider {
   const chain = providers.length > 0 ? providers : [modelProvider];

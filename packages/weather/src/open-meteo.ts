@@ -1,26 +1,17 @@
 /**
  * Open-Meteo adapter.
  *
- * The reason along-trail weather is affordable at all: Open-Meteo accepts *lists* of
- * coordinates in one request and answers with one array of forecasts. Eight points along a
- * ridge is one HTTP call, not eight — which is what keeps a feature that fires on every
- * trail page inside a 10,000-request daily allowance.
+ * Three contract details this depends on:
+ * - One request takes *comma-separated lists* of coordinates and answers with one array of
+ *   forecasts, so eight points along a ridge cost one call, not eight.
+ * - `elevation` is sent, not inferred: passing our own DEM elevation triggers Open-Meteo's
+ *   statistical downscaling. Left to itself it uses the model cell's average, which over
+ *   mountains can sit hundreds of metres below a summit.
+ * - `timeformat=unixtime` makes every timestamp an epoch second, so matching an arrival time
+ *   to a forecast hour is integer comparison. `utc_offset_seconds` is applied once, at render.
  *
- * Two details do the real work here:
- *
- * - **`elevation` is sent, not inferred.** Left to itself Open-Meteo picks the elevation of
- *   the model cell, which over mountains is an average that can sit hundreds of metres
- *   below a summit. Passing our own DEM elevation triggers its statistical downscaling, and
- *   that is the difference between telling someone the summit is 8 °C and telling them it
- *   is 1 °C. Without this the whole feature is valley weather with extra steps.
- * - **`timeformat=unixtime`.** Every timestamp comes back as an epoch second in UTC, so
- *   matching an arrival time to a forecast hour is integer comparison rather than string
- *   parsing across a DST boundary. `utc_offset_seconds` comes back too, and rendering uses
- *   it once, at the end.
- *
- * Attribution is not optional: Open-Meteo is CC-BY 4.0 and the free tier is non-commercial.
- * `ATTRIBUTION.weather` in @switchback/core carries the credit and it is displayed wherever
- * this data is.
+ * Open-Meteo is CC-BY 4.0 and the free tier is non-commercial: `ATTRIBUTION.weather` in
+ * @switchback/core must be displayed wherever this data is.
  */
 
 import { HOUR_S } from './time';
@@ -30,10 +21,8 @@ export const OPEN_METEO_AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.co
 
 /**
  * Hourly variables requested, in the order the response object keys them.
- *
- * `freezing_level_height` is the one that would not appear on a consumer weather app and is
- * the single most useful number in the list: the altitude of the 0 °C isotherm, which is
- * how you know whether the top of the route is snow before you have driven to it.
+ * `freezing_level_height` is the altitude of the 0 °C isotherm — whether the top of the route
+ * is snow before you drive to it.
  */
 const HOURLY_VARS = [
   'temperature_2m',
@@ -53,13 +42,9 @@ const HOURLY_VARS = [
 const DAILY_VARS = ['sunrise', 'sunset'] as const;
 
 /**
- * Daily aggregates, for the question "which day this week".
- *
- * Deliberately a different shape from the hourly series above, because it answers a
- * different question. The along-route forecast asks what it will be like *at the summit at
- * 11:20*; busyness asks whether Saturday is a write-off. Rolling the hourly series up here
- * would work and would be worse: `precipitation_probability_max` is the model's own daily
- * maximum, not the max of the twenty-four values we happened to sample.
+ * Daily aggregates, for "which day this week". Not a rollup of the hourly series:
+ * `precipitation_probability_max` is the model's own daily maximum, not the max of the
+ * twenty-four values we happened to sample.
  */
 const DAILY_OUTLOOK_VARS = [
   'weather_code',
@@ -74,16 +59,10 @@ const DAILY_OUTLOOK_VARS = [
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 /**
- * The current European AQI and everything needed to explain it.
- *
- * `current` rather than `hourly`, which is the whole reason a viewport-wide grid is
- * affordable: three days of hourly series at fifty locations is a megabyte of JSON to
- * render six colours from, where one value per location is a few kilobytes. The along-route
- * forecast still asks for the series, because it reads each point at a different hour.
- *
- * The five sub-indices come along because the European AQI is the *worst* of them, so the
- * one that matches the overall figure names what is actually in the air. That single word
- * is the difference between a number and advice.
+ * The current European AQI and everything needed to explain it. `current` rather than `hourly`
+ * is what makes a viewport-wide grid affordable — kilobytes per location instead of a megabyte.
+ * The five sub-indices come along because the European AQI is the worst of them, so the matching
+ * one names what is actually in the air.
  */
 const AIR_QUALITY_CURRENT_VARS = [
   'european_aqi',
@@ -146,13 +125,8 @@ export interface AirQualitySeries {
 }
 
 /**
- * One location's air, right now.
- *
- * `lat`/`lng` are the coordinates *Open-Meteo answered with*, not the ones we sent. It
- * snaps every request to its own grid and says where it landed, which is the only
- * trustworthy statement of where a reading applies — and the thing that lets the overlay
- * draw a cell at the model's true footprint instead of pretending the number belongs to
- * the exact pixel someone happened to ask about.
+ * One location's air, right now. `lat`/`lng` are the coordinates *Open-Meteo answered with*:
+ * it snaps requests to its own grid, and the snapped position is where the reading applies.
  */
 export interface AirQualityNow extends GeoPoint {
   /** The hour these readings are for, epoch seconds UTC. */
@@ -232,11 +206,8 @@ export class OpenMeteoClient {
   }
 
   /**
-   * One request, every point.
-   *
-   * `past_days=1` is not about showing yesterday — it widens the returned window backwards
-   * so a hike that started at 06:00 and is being checked at 14:00 still resolves its early
-   * samples instead of falling off the front of the array.
+   * One request, every point. `past_days=1` widens the returned window backwards so a hike
+   * that started at 06:00 and is checked at 14:00 still resolves its early samples.
    */
   async forecast(points: readonly ForecastPoint[]): Promise<LocationForecast[]> {
     if (points.length === 0) return [];
@@ -260,11 +231,8 @@ export class OpenMeteoClient {
   }
 
   /**
-   * European AQI along the same points.
-   *
-   * Separate endpoint, separate call, and deliberately allowed to fail: air quality
-   * sharpens the advice but a forecast without it is still a forecast, whereas a page that
-   * 500s because a secondary service is down is nothing at all. The caller catches.
+   * European AQI along the same points. Separate endpoint and deliberately allowed to fail —
+   * the caller catches, because a forecast without air quality is still a forecast.
    */
   async airQuality(points: readonly ForecastPoint[]): Promise<AirQualitySeries[]> {
     if (points.length === 0) return [];
@@ -290,14 +258,9 @@ export class OpenMeteoClient {
   }
 
   /**
-   * The current European AQI at up to a few dozen points, in one call.
-   *
-   * The same list trick the forecast uses, and it matters more here: an overlay covering a
-   * viewport asks about every cell on screen at once, so without it this feature would be
-   * fifty requests per pan and would exhaust a day's allowance in an afternoon.
-   *
-   * Coordinates are sent at four decimals and come back snapped to the model grid. The
-   * caller keeps what came back — see `AirQualityNow`.
+   * The current European AQI at up to a few dozen points, in one call — the overlay asks about
+   * every cell on screen at once. Coordinates go out at four decimals and come back snapped to
+   * the model grid; the caller keeps what came back. See `AirQualityNow`.
    */
   async airQualityNow(points: readonly GeoPoint[]): Promise<AirQualityNow[]> {
     if (points.length === 0) return [];
@@ -316,9 +279,8 @@ export class OpenMeteoClient {
       const current = asRecord(record.current);
       const asked = points[index];
       return {
-        // Falling back to what we asked for rather than to zero: a missing coordinate here
-        // would otherwise put the cell in the Gulf of Guinea, which is a worse answer than
-        // an unsnapped one.
+        // Falling back to what we asked for rather than to zero: a missing coordinate would
+        // otherwise put the cell in the Gulf of Guinea.
         lat: typeof record.latitude === 'number' ? record.latitude : (asked?.lat ?? 0),
         lng: typeof record.longitude === 'number' ? record.longitude : (asked?.lng ?? 0),
         timeS: typeof current.time === 'number' ? current.time : 0,
@@ -334,17 +296,12 @@ export class OpenMeteoClient {
   }
 
   /**
-   * Seven days of daily aggregates at one point.
+   * Seven days of daily aggregates at the trail centroid — one coordinate, so one request per
+   * trail per hour.
    *
-   * One coordinate, not a list: busyness is a property of the trail, not of a place on it,
-   * and the centroid is the honest single answer. That keeps this to one request per trail
-   * per hour — an order of magnitude cheaper than the along-route call it sits beside.
-   *
-   * **The `timeformat=unixtime` trap.** Open-Meteo returns every timestamp in GMT+0 even
-   * when `timezone=auto` shifted the data, so a daily entry for local Saturday arrives as
-   * the epoch second of Saturday 00:00 *UTC-shifted back*. Adding `utc_offset_seconds`
-   * before reading the weekday is what stops a New Zealand trail's Saturday landing on
-   * Friday — silently, and only for trails a long way from Greenwich.
+   * Under `timeformat=unixtime` Open-Meteo returns daily timestamps in GMT+0 even when
+   * `timezone=auto` shifted the data, so `utc_offset_seconds` must be added before reading the
+   * weekday, or a New Zealand trail's Saturday lands on Friday.
    */
   async dailyOutlook(point: ForecastPoint): Promise<DailyOutlook> {
     const params = new URLSearchParams({
@@ -399,9 +356,8 @@ export class OpenMeteoClient {
 
         if (response.ok) return await response.json();
 
-        // Open-Meteo puts the actual complaint in `reason`, and it is usually specific
-        // enough to fix ("Data corrupted at path ''. Cannot initialize Timezone from
-        // invalid String value"). Surfacing the status alone would waste that.
+        // Open-Meteo puts the actual complaint in `reason`, and it is usually specific enough
+        // to fix; the status alone is not.
         const reason = await readReason(response);
         if (!RETRYABLE_STATUS.has(response.status)) {
           throw new OpenMeteoError(`Open-Meteo ${response.status}: ${reason}`, response.status);
@@ -448,13 +404,10 @@ function finite(value: unknown): number | null {
 }
 
 /**
- * Coerce one series to numbers, preserving null.
- *
- * Open-Meteo returns `null` for a variable it has no value for at that hour — UV overnight,
- * precipitation probability past the high-resolution horizon. Those nulls are meaningful
- * and are carried all the way to the client, where the UI shows a dash rather than a zero.
- * Coercing them to 0 here would turn "unknown" into "none", which for precipitation is a
- * lie in the dangerous direction.
+ * Coerce one series to numbers, preserving null. Open-Meteo returns `null` where it has no
+ * value for that hour (UV overnight, precipitation probability past the high-res horizon).
+ * Coercing to 0 would turn "unknown" into "none" — for precipitation, a lie in the dangerous
+ * direction. The nulls reach the client, which renders a dash.
  */
 function numberArray(value: unknown): (number | null)[] {
   if (!Array.isArray(value)) return [];

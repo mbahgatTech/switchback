@@ -1,13 +1,8 @@
 /**
- * A fake Open-Meteo, built so that every number it returns encodes *where* and *when* it
- * came from.
- *
- * That is the whole trick of these tests. Temperature is a pure function of the elevation we
- * asked about, and cloud cover is a pure function of the local hour of the slot. So a sample
- * that reports 16.2 °C and 44% cloud is proof — not inference — that the code read location 4
- * at 11:00 rather than location 0 at 07:00. A fixture of plausible-looking weather could not
- * tell those apart, and the bug this feature is most likely to grow is exactly that: reading
- * every sample off the trailhead's series.
+ * A fake Open-Meteo whose numbers encode *where* and *when* they came from: temperature is a
+ * pure function of the elevation asked about, cloud cover of the slot's local hour. So a sample
+ * reporting 16.2 °C and 44% cloud proves the code read location 4 at 11:00 — which is what
+ * catches the bug this feature is most likely to grow, reading every sample off the trailhead.
  */
 
 import type { ElevationPoint, RouteType } from '@switchback/core';
@@ -67,11 +62,9 @@ export function dayOfWeekOf(daySchemaS: number, offsetS: number): number {
 }
 
 /**
- * The daily aggregates, emitted only when the request asks for them.
- *
- * Kept in the same fake as the hourly body rather than split into a second one: there is a
- * single Open-Meteo forecast endpoint, and two fakes for it would eventually disagree about
- * something that matters, like the offset convention on `time`.
+ * The daily aggregates, emitted only when the request asks for them. Kept in the same fake as
+ * the hourly body because there is one Open-Meteo forecast endpoint, and two fakes would
+ * eventually disagree about something like the offset convention on `time`.
  */
 function makeOutlookDaily(
   daysS: readonly number[],
@@ -100,8 +93,8 @@ export function makeForecastBody(params: URLSearchParams, options: FixtureOption
   const eles = parseList(params, 'elevation');
   const offsetS = options.utcOffsetS ?? UTC_OFFSET_S;
 
-  // An outlook request asks for daily variables and no hourly ones, and unlike the
-  // along-route call it does not look backwards — so its week starts today, not yesterday.
+  // An outlook request asks for daily variables and no hourly ones, and unlike the along-route
+  // call it does not look backwards — so its week starts today, not yesterday.
   const wantsOutlook = (params.get('daily') ?? '').includes('temperature_2m_max');
   const midnightS = localMidnightS(NOW_S, offsetS);
   const startS = wantsOutlook ? midnightS : midnightS - DAY_S;
@@ -171,9 +164,8 @@ export function fakeUpstream(options: FixtureOptions = {}): FakeUpstream {
   const forecastCalls: string[] = [];
   const airQualityCalls: string[] = [];
 
-  // Narrower than `fetch` on purpose: the client only ever sends a URL string, so the fake
-  // only handles one, and the cast below is what says so. (`RequestInfo` is not available —
-  // this repo builds against lib ES2022 and @types/node, with no DOM.)
+  // Narrower than `fetch` on purpose: the client only ever sends a URL string, and the cast
+  // below says so. (`RequestInfo` is unavailable — this repo builds against ES2022 with no DOM.)
   const fetchImpl = (async (input: string | URL) => {
     const url = String(input);
     calls.push(url);

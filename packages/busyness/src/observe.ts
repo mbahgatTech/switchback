@@ -1,25 +1,16 @@
 /**
- * Pulling the curve toward what actually happened.
+ * Pulling the curve toward what actually happened, by empirical-Bayes shrinkage per bucket:
  *
- * Every activity our users record contributes a start time to one `(day, hour)` bucket.
- * Those counts are the only ground truth this model will ever have, and the whole problem
- * is that they arrive unevenly: a trail can have four hundred recorded Saturday mornings
- * and not one recorded Tuesday. Replacing the prior with the observations outright would
- * turn that trail's Tuesday into a flat zero and claim it as measurement.
- *
- * So the blend is per bucket and shrunk by that bucket's own sample count:
- *
- *     w = n / (n + K)          weight given to observation
+ *     w = n / (n + K)
  *     value = w·observed + (1−w)·prior
  *
- * Ten recordings in an hour move it a third of the way; a hundred move it four fifths;
- * an hour nobody has ever recorded keeps the prior exactly. This is the standard
- * empirical-Bayes shrinkage, and it is the difference between a model that improves with
- * data and one that lurches.
+ * Recorded starts arrive unevenly — four hundred Saturday mornings and no Tuesdays — so
+ * replacing the prior outright would publish that Tuesday as a measured zero. An hour nobody
+ * has recorded keeps the prior exactly.
  *
- * Both sides are normalised to their own weekly peak before blending. They have to be:
- * the prior is in arbitrary demand units and the observations are in recorded hikes, and
- * mixing those directly would let a unit change silently reweight the model.
+ * Both sides are normalised to their own weekly peak before blending: the prior is in arbitrary
+ * demand units and the observations in recorded hikes, so mixing directly would let a unit
+ * change silently reweight the model.
  */
 
 import { DAYS_PER_WEEK, HOURS_PER_DAY, maxOf } from './prior';
@@ -45,11 +36,8 @@ export interface BlendResult {
 }
 
 /**
- * Grid of `[day][hour]` filled from a sparse bucket list.
- *
- * Rows arrive from Postgres as whatever subset has been written, in whatever order, and
- * out-of-range indices are dropped rather than trusted — a `dayOfWeek` of 7 from a caller
- * that counted Monday-first would otherwise land on Sunday's row and be wrong quietly.
+ * Grid of `[day][hour]` filled from a sparse bucket list. Out-of-range indices are dropped, not
+ * trusted: a `dayOfWeek` of 7 from a Monday-first caller would otherwise land on Sunday's row.
  */
 export function toGrid(
   buckets: readonly ObservationBucket[],
@@ -77,14 +65,13 @@ export function blendObservations(
   const observedPeak = maxOf(observed);
   const priorPeak = maxOf(prior);
 
-  // No observations, or every one of them is zero. Either way there is nothing to blend
-  // toward, and the prior stands as it is.
+  // Nothing to blend toward; the prior stands as it is.
   if (observedPeak <= 0 || priorPeak <= 0) {
     return { surface: prior.map((day) => [...day]), observationCount };
   }
 
-  // Put the observations in the prior's units before mixing, so the result is comparable
-  // to a pure prior and one shared normalisation step downstream serves both.
+  // Put the observations in the prior's units before mixing, so one shared normalisation step
+  // downstream serves both.
   const scale = priorPeak / observedPeak;
 
   const surface = emptyGrid();

@@ -1,22 +1,15 @@
 /**
- * Along-trail, time-shifted weather — the feature this product is built around.
- *
- * The whole thing in one sentence: sample the route, ask the forecast about each sample at
+ * Along-trail, time-shifted weather: sample the route, ask the forecast about each sample at
  * *its own* predicted arrival hour, and say what that means.
  *
  *     Trailhead  07:00 · 11 °C, calm
- *     4.2 km     09:40 ·  6 °C, gusts 38 km/h
- *     High point 11:20 ·  1 °C, gusts 61 km/h, 30% rain      ← the row people came for
+ *     High point 11:20 ·  1 °C, gusts 61 km/h, 30% rain
  *     Back       14:05 ·  9 °C
  *
- * A trailhead-only forecast — which is what every competitor ships — describes the warmest,
- * most sheltered point on the hike, at an hour you are not there. The three moving parts
- * that fix it are `buildJourney` (the route as actually hiked, return leg included),
+ * Three moving parts: `buildJourney` (the route as actually hiked, return leg included),
  * `cumulativeTimeS` from @switchback/geo (when you reach each point), and Open-Meteo's
- * multi-location request with our own DEM elevations (what it is doing there, at that
- * altitude rather than the model cell's average).
- *
- * One upstream call per forecast, and one more for air quality, which is allowed to fail.
+ * multi-location request with our own DEM elevations. One upstream call per forecast, plus one
+ * for air quality, which is allowed to fail.
  */
 
 import type {
@@ -49,9 +42,8 @@ export interface AlongRouteInput {
   profile: readonly ElevationPoint[];
   routeType: RouteType;
   /**
-   * The trail's published length — the round trip, where the hike is one. Compared against
-   * the profile's own extent to tell an implied return leg from one that is already drawn;
-   * see `hikedProfile`.
+   * The trail's published length — the round trip, where the hike is one. Compared against the
+   * profile's own extent to tell an implied return leg from one already drawn; see `hikedProfile`.
    */
   lengthM: number;
   /** ISO 8601 with offset. Defaults to the next 07:00 local to the trail. */
@@ -98,11 +90,10 @@ export async function alongRouteForecast(
     routeType: input.routeType,
   };
 
-  // Two passes over the same pure function. The sample *positions* do not depend on the
-  // start time, but the default start time depends on the trail's UTC offset, which only
-  // the upstream response knows. So: plan once to learn where to ask, ask, then re-plan
-  // with the real start to learn when. No second network call — the first request already
-  // returned a week of hours.
+  // Two passes over the same pure function: sample *positions* do not depend on the start time,
+  // but the default start time depends on the trail's UTC offset, which only the response knows.
+  // Plan to learn where to ask, ask, then re-plan with the real start. No second network call —
+  // the first request already returned a week of hours.
   const provisional = planSamples(journey, nowS, planOptions);
   const points = provisional.map((s) => ({ lat: s.lat, lng: s.lng, eleM: s.eleM }));
   const { unique, indexOf } = dedupePoints(points);
@@ -153,20 +144,16 @@ export async function alongRouteForecast(
     sunriseAt: sunriseS === null ? null : isoWithOffset(sunriseS, utcOffsetS),
     sunsetAt: sunsetS === null ? null : isoWithOffset(sunsetS, utcOffsetS),
     fetchedAt: new Date(nowS * 1000).toISOString(),
-    // Open-Meteo's response names no model run, and inventing one would defeat the point of
-    // the field. `fetchedAt` is the freshness signal; this stays null until upstream gives
-    // us something true to put in it.
+    // Open-Meteo's response names no model run; `fetchedAt` is the freshness signal. This stays
+    // null until upstream gives us something true to put in it.
     model: null,
   } satisfies AlongRouteForecast);
 }
 
 /**
- * Read one sample's forecast at its own arrival hour.
- *
- * Every value is clamped into the range the schema declares before it is returned. Not
- * defensive theatre: a wind direction of 360.0000001 or a cloud cover of 100.4 from a
- * rounding step upstream would otherwise throw at the schema boundary and take down a trail
- * page over a value that is, for every purpose anyone has, correct.
+ * Read one sample's forecast at its own arrival hour. Values are clamped into the schema's
+ * declared range first: a wind direction of 360.0000001 from an upstream rounding step would
+ * otherwise throw at the schema boundary and take down a trail page.
  */
 function toSample(plan: SamplePlan, location: LocationForecast, utcOffsetS: number): WeatherSample {
   const hourly = location.hourly;
@@ -205,11 +192,8 @@ function clamp(value: number | null, lo: number, hi: number): number | null {
 }
 
 /**
- * Collapse repeated coordinates before asking upstream about them.
- *
- * An out-and-back samples the same ground twice at different hours — same place, different
- * question. One request covers both, so sending the coordinate twice would buy nothing and
- * cost a fifth of the payload on a service that gives us 10,000 calls a day for free.
+ * Collapse repeated coordinates before asking upstream. An out-and-back samples the same ground
+ * twice at different hours, and one request covers both.
  */
 function dedupePoints(points: readonly ForecastPoint[]): {
   unique: ForecastPoint[];
@@ -220,9 +204,8 @@ function dedupePoints(points: readonly ForecastPoint[]): {
   const indexOf: number[] = [];
 
   for (const point of points) {
-    // 4dp is ~11 m, well inside the resolution of any weather model, and the same precision
-    // the request is serialised at — so two points that round together here would have been
-    // sent as identical strings anyway.
+    // 4dp (~11 m) is the precision the request is serialised at, so points that round together
+    // here would have been sent as identical strings anyway.
     const key = `${point.lat.toFixed(4)},${point.lng.toFixed(4)},${Math.round(point.eleM)}`;
     const existing = seen.get(key);
     if (existing !== undefined) {

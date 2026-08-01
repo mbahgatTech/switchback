@@ -67,10 +67,8 @@ describe('priorSurface', () => {
   });
 
   it('compresses the day in winter without being told about seasons', () => {
-    // The whole seasonal argument in one assertion: nothing in this package knows what
-    // December is. Anchoring the bumps to sunrise and sunset is what makes the winter
-    // curve narrow, and it lands the peaks in the middle of a six-hour day rather than
-    // leaving a "14:00 afternoon peak" sitting in the dark.
+    // Nothing in this package knows what December is: anchoring the bumps to sunrise and sunset
+    // is what narrows the winter curve and keeps the peaks inside a six-hour day.
     const summer = surface(MIDSUMMER);
     const winter = surface(MIDWINTER);
 
@@ -90,9 +88,8 @@ describe('priorSurface', () => {
   });
 
   it('flattens the weekly contrast as a trail becomes well known', () => {
-    // An obscure trail is a weekend trail; a famous one is busy on a Tuesday too. This is
-    // the only channel popularity has, because a popularity *multiplier* would divide
-    // straight back out at normalisation and change nothing at all.
+    // The only channel popularity has: a popularity *multiplier* would divide straight back out
+    // at normalisation and change nothing.
     const obscure = surface(MIDSUMMER, { popularity: 0 });
     const famous = surface(MIDSUMMER, { popularity: 4000 });
 
