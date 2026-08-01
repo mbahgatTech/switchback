@@ -29,18 +29,9 @@ import {
 import { ACTIVITY_FIXES_STORE, PENDING_ACTIVITIES_STORE } from '../src/offline/idb';
 
 /**
- * A hike recorded with no signal exists in exactly one place until it drains.
- *
- * That makes the rules about when a row is kept, when its progress advances, and when it is
- * finally deleted worth testing directly — a green button on the storage manager proves
- * nothing about whether the same day would be uploaded twice, or half.
- *
- * `apps/web/test` runs in the node environment with no jsdom and no fake-indexeddb, so the
- * store is stood up here against the exact surface `idb.ts` uses. A near-copy of the fake in
- * `offline-queue.test.ts`, with one real difference — `put` reads the store's configured key
- * path rather than assuming `trailId`, because these two stores key on `activityId` and
- * `key`. Extracting a shared fake would be tidier; a local copy is chosen because it leaves
- * the reviews test byte-identical, which is the property most worth protecting here.
+ * `apps/web/test` runs in the node environment with no jsdom and no fake-indexeddb, so the store is
+ * stood up here against the exact surface `idb.ts` uses. A near-copy of the fake in
+ * `offline-queue.test.ts`, with one difference: `put` reads the store's configured key path.
  */
 
 interface FakeRequest<T> {
@@ -55,13 +46,9 @@ function createFakeIndexedDB(): {
   /** What goes on `globalThis.indexedDB`. */
   idb: unknown;
   /**
-   * Take a row out from under the code's feet, synchronously.
-   *
-   * Paired with `onceOnRead`. `sendOne` has exactly one window between checking that a hike is
-   * still wanted and posting `finish` for it — the `readFixes` round trip — and no member of
-   * `ActivityPosters` is called during it, so a discard staged from a poster can only ever
-   * reach the earlier checks. Staging it here reaches the later one, and it is the level the
-   * race actually lives at: two store operations interleaving, not two server calls.
+   * Takes a row out from under the code's feet, synchronously. `sendOne`'s one window between
+   * checking a hike is still wanted and posting `finish` is a store read, not a server call, so
+   * a discard staged from a poster can never reach it.
    */
   drop: (store: string, key: string) => void;
   /** Run `fn` once, from inside the next read of `store`. */
@@ -167,21 +154,12 @@ function createFakeIndexedDB(): {
 
 const ID = '6f8b1c2a-3d4e-4f50-9a1b-2c3d4e5f6071';
 
-/**
- * The hiker every case below belongs to, unless it says otherwise.
- *
- * A queued hike is now stamped with the account that recorded it, and the drain sends only
- * rows belonging to the reader the browser is acting as. Nearly every test here is about the
- * upload rules rather than about whose hike it is, so they all run as one person and the
- * ownership rules get their own block at the end.
- */
+/** The hiker every case below belongs to; the ownership rules get their own block at the end. */
 const HIKER = 'hiker-a';
 
 /**
- * `flushPendingActivities`, as the one hiker above. See `HIKER`.
- *
- * `stillReader` defaults to "the same person all the way through", which is every case except
- * the ones that deliberately change it mid-drain.
+ * `flushPendingActivities`, as the one hiker above. `stillReader` defaults to "the same person all
+ * the way through", which is every case except the ones that change it mid-drain.
  */
 function flush(
   post: ActivityPosters,
@@ -238,14 +216,9 @@ async function queueHike(
 }
 
 /**
- * Records what the server was asked to do, in order.
- *
- * An append is labelled with **how many** fixes it carried as well as which seconds, and the
- * count is not decoration. Labelled by first and last `t` alone, a batch carrying somebody
- * else's track was indistinguishable from a correct one: dropping the ownership filter in
- * `listChunks` made `readFixes` return both hikes in the multi-hike tests, but both start at
- * t=0 and end at t=9 and 20 fixes still fit in one `SAMPLE_BATCH`, so every assertion in this
- * file stayed green while every upload carried a different hike's day.
+ * Records what the server was asked to do, in order. An append carries its fix *count* as well as
+ * its seconds: labelled by first and last `t` alone, a batch carrying another hike's day was
+ * indistinguishable from a correct one and every assertion here stayed green.
  */
 function recorder(): { calls: string[]; posters: ActivityPosters } {
   const calls: string[] = [];
@@ -350,21 +323,16 @@ describe('the journal', () => {
   });
 
   it('refuses to finish a hike this device is not holding', async () => {
-    // The throw is the whole of what makes the offline receipt honest: `onFinish` reads a
-    // quiet return as success, clears the in-memory buffer and prints "Saved on this device"
-    // — which on a device whose writes have been failing all day is printed over a hike that
-    // has just been thrown away. A silent `return` here leaves every other test green.
+    // A quiet return would leave every other test green while `onFinish` reads it as success,
+    // clears the in-memory buffer and prints "Saved on this device" over a discarded hike.
     await expect(markFinished(ID, finishWrite(ID))).rejects.toThrow(
       'This hike is not stored on this device.',
     );
   });
 
   it('unblocks a hike that is finished after an earlier drain refused it', async () => {
-    // Reachable: a hike whose tab was closed mid-recording can be blocked by the background
-    // drain, handed back by `readOpenActivity` — which does not filter on `blocked` — resumed
-    // on `/record` and finished. Without the clear it is skipped by every automatic flush for
-    // ever and can only be sent from a button on `/downloads`, which is the failure this
-    // queue's session-expiry handling exists to avoid.
+    // Reachable: a hike blocked mid-recording is handed back by `readOpenActivity`, which does
+    // not filter on `blocked`, and finished on `/record`. Without the clear it is skipped for ever.
     await queueHike(ID, 10, {
       serverStarted: true,
       blocked: true,
@@ -591,9 +559,8 @@ describe('flushPendingActivities', () => {
   });
 
   it('says so when a recording was closed before this device had sent all of it', async () => {
-    // The shape that used to be silent: the router's stale sweep closes every earlier open
-    // recording the moment a new one starts, so a hike still draining is closed under it and
-    // every remaining fix is refused. Ten fixes queued, none acknowledged.
+    // The router's stale sweep closes every earlier open recording when a new one starts, so a
+    // hike still draining is closed under it. Ten fixes queued, none acknowledged.
     await queueHike(ID, 10, { serverStarted: true });
     await markFinished(ID, finishWrite(ID));
 
@@ -606,17 +573,15 @@ describe('flushPendingActivities', () => {
       },
     });
 
-    // What can be landed is landed. What was lost is counted and said out loud, rather than
-    // reported as a clean upload of a hike that is now two hours short.
+    // What can be landed is landed; what was lost is counted and said out loud.
     expect(calls).toEqual(['append:refused', `finish:${ID}`]);
     expect(result).toEqual({ sent: 1, kept: 0, truncated: 1 });
     expect(drainNotice()).toContain('closed before all of it had been sent');
   });
 
   it('does not leave an unfinished hike blocked for ever once the server has closed it', async () => {
-    // Recorded, navigated away from without pressing Finish, and closed by the next `start`.
-    // Nothing can ever be appended to it again, so a row that only offers "Add it now" is a
-    // permanent error with no working control on it.
+    // Recorded, navigated away from without pressing Finish, and closed by the next `start`:
+    // a row that only offers "Add it now" would be a permanent error with no working control.
     await queueHike(ID, 10, { serverStarted: true });
 
     const { calls, posters } = recorder();
@@ -729,10 +694,8 @@ describe('flushPendingActivities', () => {
   });
 
   it('does not publish a hike discarded while its fixes were being read back', async () => {
-    // Everything acknowledged, `finish` payload written, only the delete outstanding — so the
-    // append loop has nothing to do and the one await between "is this row still wanted?" and
-    // `post.finish` is the `readFixes` round trip. No poster is called during it, which is why
-    // the discard is staged in the store itself; see `drop` on the fake above.
+    // Everything acknowledged and only the delete outstanding, so the one await between "is
+    // this row still wanted?" and `post.finish` is a store read — see `drop` on the fake above.
     await queueHike(ID, 10, { serverStarted: true, sent: 10 });
     await markFinished(ID, finishWrite(ID));
     fake.onceOnRead(ACTIVITY_FIXES_STORE, () => fake.drop(PENDING_ACTIVITIES_STORE, ID));
@@ -740,8 +703,7 @@ describe('flushPendingActivities', () => {
     const { calls, posters } = recorder();
     const result = await flush(posters);
 
-    // A `finish` here would publish somebody's discarded day and log a completion and a point
-    // of popularity against the trail.
+    // A `finish` here would publish a discarded day and log a completion against the trail.
     expect(calls).toEqual([]);
     expect(result).toEqual({ sent: 0, kept: 0, truncated: 0 });
   });
@@ -1003,22 +965,9 @@ describe('a hike belongs to whoever recorded it', () => {
   });
 
   it('is picked up mid-upload where the recorder stopped, and finished by its own author', async () => {
-    /*
-     * What `useRecorder`'s own uploader hands over when somebody signs in during a hike.
-     *
-     * The recorder does not go through this drain while it is recording — `claimLive` keeps
-     * the drain off the row and the hook posts `start` and every `append` itself — so its
-     * ownership guard is the one on that path, and its promise is this one: it stops before a
-     * request rather than after it, writes nothing, blocks nothing, deletes nothing, and
-     * leaves `sent` at the last batch the server acknowledged. What that is worth depends
-     * entirely on the drain then picking the row up unchanged and re-sending nothing, which
-     * is what this pins.
-     *
-     * Set up as the recorder leaves it: one batch acknowledged, the hike announced, the
-     * finish payload written by the screen, and `releaseLive` because the tab has let go.
-     * The hook itself cannot be driven here — `apps/web/test` runs in the node environment
-     * with no DOM, so there is no way to render a React hook in this suite.
-     */
+    // Set up as `useRecorder`'s own uploader leaves it when somebody signs in mid-hike: one
+    // batch acknowledged, the hike announced, the finish payload written, and `releaseLive`
+    // because the tab has let go. The hook itself cannot be driven here — no DOM in this suite.
     await queueHike(ID, 1_500, { serverStarted: true, sent: 500 });
     await markFinished(ID, finishWrite(ID));
     releaseLive(ID);
@@ -1045,8 +994,6 @@ describe('a hike belongs to whoever recorded it', () => {
 });
 
 /**
- * Hikes the device cannot name a walker for.
- *
  * Rows carried over from the pre-IndexedDB journal, which never recorded whose hike it was.
  * Neither sending them nor deleting them is the device's decision to make.
  */

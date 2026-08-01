@@ -1,25 +1,6 @@
 /**
- * Taking a trail with you.
- *
- * The unit of download here is a **page**, not a data blob, and that is the design decision
- * everything else follows from. A trail page is server-rendered end to end — stats,
- * description, waypoints, access, provenance, and the route geometry the map island draws
- * from are all in the HTML by the time it reaches the browser. So the honest way to make it
- * work offline is to keep the HTML, keep the tiles the map will ask for, and keep the
- * photographs. Nothing has to be reassembled from parts, and nothing can be reassembled
- * *wrongly* — the offline page is byte-for-byte the page you were looking at when you
- * pressed the button.
- *
- * The tiles are the hard part and the valuable part. They come from a corridor along the
- * route rather than its bounding box (see `tileCorridor`), from every source the relief base
- * actually uses: terrain for the shading, vector for the names, glyphs to draw them with.
- * That is why this works without a self-hosted PMTiles archive — the sources are keyless
- * HTTP tiles, and a tile in a cache is a tile.
- *
- * Failures are per-URL and non-fatal. Terrain tiles legitimately 404 over ocean, a vector
- * tile can time out, and a download that aborts because one tile of four hundred was
- * missing would fail constantly for no reason a hiker could act on. What is fatal is the
- * page itself: without it there is nothing to open.
+ * Taking a trail with you. The unit of download is a server-rendered *page*, plus the tiles its map
+ * will ask for and its photographs — so the offline page is the one you pressed the button on.
  */
 
 import { MAX_CORRIDOR_TILES, TERRARIUM_URL_TEMPLATE, tileCorridor, tileUrl } from '@switchback/geo';
@@ -30,14 +11,8 @@ import { ASSET_CACHE, MEDIA_CACHE, PAGE_CACHE, staticAssets, TILE_CACHE } from '
 import { putOfflineTrail, type OfflineTrail } from './store';
 
 /**
- * The zoom range a downloaded trail is usable at.
- *
- * z10 is the "where in the country is this" view; z15 is close enough to tell which side of
- * the stream the path runs. Below 10 the trail is a dot on a region and the tiles are shared
- * with everything else you have downloaded anyway; above 15 the vector source has no more
- * detail to give — OpenMapTiles builds stop at 14 and overzoom from there — so the extra
- * tiles would be terrain only, at four times the count, for a sharper hillshade nobody
- * navigates by.
+ * The zoom range a downloaded trail is usable at. Above z15 the vector source has no more detail —
+ * OpenMapTiles builds stop at z14 — so the extra tiles would be terrain only, at four times the count.
  */
 export const OFFLINE_MIN_ZOOM = 10;
 export const OFFLINE_MAX_ZOOM = 15;
@@ -45,22 +20,12 @@ export const OFFLINE_MAX_ZOOM = 15;
 /** Vector tiles exist only to z14; MapLibre overzooms past that from the z14 tile. */
 const VECTOR_MAX_ZOOM = 14;
 
-/**
- * Simultaneous tile fetches.
- *
- * Six is the browser's own per-host connection limit, so asking for more just queues them in
- * a different place while making the abort button slower to take effect.
- */
+/** The browser's own per-host connection limit — more just queues elsewhere and slows aborting. */
 const CONCURRENCY = 6;
 
 /**
- * Character ranges to keep glyphs for.
- *
- * Latin, its supplement, and Latin Extended-A and B — the block a European or American
- * place name is drawn from. A viewport in Japan or Greece would want more, but glyph
- * ranges are 30–60 kB apiece and downloading the world's scripts to hike in Snowdonia is
- * not a trade worth making. The map falls back to unlabelled features for a range it has
- * not got, which degrades honestly.
+ * Latin, its supplement, and Latin Extended-A and B. Glyph ranges are 30-60 kB apiece; the map
+ * falls back to unlabelled features for a range it has not got, which degrades honestly.
  */
 const GLYPH_RANGES = ['0-255', '256-511', '512-767'] as const;
 
@@ -95,12 +60,8 @@ export class DownloadTooLargeError extends Error {
 }
 
 /**
- * The vector tile template, read from the source's TileJSON at download time.
- *
- * OpenFreeMap bakes a build stamp into the tile path — `…/planet/20260621_080001_pt/{z}/…` —
- * which changes whenever the planet is rebuilt. Hard-coding the template we happened to see
- * once would mean every download after the next rebuild caches URLs the map will never ask
- * for: a progress bar that fills, a manifest that looks right, and a blank map.
+ * The vector tile template, read from the source's TileJSON at download time. OpenFreeMap bakes a
+ * build stamp into the tile path, so a hard-coded template caches URLs the map will never ask for.
  */
 async function vectorTemplate(tileJsonUrl: string, signal?: AbortSignal): Promise<string | null> {
   try {
@@ -108,8 +69,7 @@ async function vectorTemplate(tileJsonUrl: string, signal?: AbortSignal): Promis
     if (!response.ok) return null;
     const body = (await response.json()) as { tiles?: readonly unknown[] } | null;
     const first: unknown = body?.tiles?.[0];
-    // The `{z}` test is what makes this a template rather than merely a string: anything
-    // without it cannot be filled in per tile, and caching it would be caching one file.
+    // The `{z}` test is what makes this a template rather than one file's URL.
     return typeof first === 'string' && first.includes('{z}') ? first : null;
   } catch {
     return null;
@@ -117,17 +77,12 @@ async function vectorTemplate(tileJsonUrl: string, signal?: AbortSignal): Promis
 }
 
 /**
- * Store one URL, and report what it cost.
- *
- * The body is read into memory before being put back into a `Response`, which is what makes
- * the size exact. `response.headers.get('content-length')` is absent on anything served
- * chunked and lies about anything served compressed, and a storage manager that reports
- * numbers a hiker can check against their phone's own settings screen has to be right.
+ * Stores one URL and reports what it cost. The body is read into memory before going back into a
+ * `Response` so the size is exact: `content-length` is absent when chunked and wrong when compressed.
  */
 async function store(cache: Cache, url: string, signal?: AbortSignal): Promise<number> {
   const response = await fetch(url, {
-    // Tiles and photographs are public, and sending credentials to a third-party tile host
-    // would be both pointless and a small privacy leak.
+    // Tiles and photographs are public; credentials to a third-party tile host are a privacy leak.
     credentials: url.startsWith('/') || url.startsWith(location.origin) ? 'same-origin' : 'omit',
     ...(signal ? { signal } : {}),
   });
@@ -141,12 +96,7 @@ async function store(cache: Cache, url: string, signal?: AbortSignal): Promise<n
   return body.byteLength;
 }
 
-/**
- * Store a page, and hand back its markup.
- *
- * Separate from `store` because a page's body is wanted twice — once as bytes to cache, once
- * as text to read the asset references out of. A tile has no second reading.
- */
+/** Stores a page and hands back its markup, which is wanted twice: as bytes, and as text to scan. */
 async function storeDocument(
   cache: Cache,
   url: string,
@@ -168,23 +118,10 @@ async function storeDocument(
 }
 
 /**
- * Cache the scripts and stylesheets a stored page names.
- *
- * Without this, a downloaded page can be present, matched, and served — and still show
- * "This page couldn't load", because React could not fetch a chunk and replaced the document
- * with its error boundary. The worker's `handleStatic` fills the shell cache from ordinary
- * browsing, but only for pages visited *while it was already in control*, which a hiker who
- * installed the app and immediately pressed download has not done.
- *
- * **Into `ASSET_CACHE`, not the shell, and that is the whole point of it existing.** The shell
- * is named after the build and swept by `activate` when the next one takes over. Writing a
- * download's chunks there meant a deploy deleted them while the page that names them sat in
- * `PAGE_CACHE` untouched — a download that survives and no longer renders. Nothing re-harvests
- * them either: this function is called from `downloadTrail` and nowhere else.
- *
- * Assets already held are skipped rather than re-fetched: they are content-hashed, so a URL
- * that resolved once resolves forever, and the second trail in a valley would otherwise pay
- * for the same forty files.
+ * Caches the scripts and stylesheets a stored page names — without them React replaces the
+ * downloaded document with its error boundary. Into `ASSET_CACHE` and not the shell, which
+ * `activate` sweeps per deploy: nothing else re-harvests these, so a sweep would strand the page.
+ * Assets already held are skipped, since content-hashed URLs that resolved once resolve forever.
  */
 async function storeShell(html: string, signal?: AbortSignal): Promise<void> {
   const cache = await caches.open(ASSET_CACHE);
@@ -200,11 +137,8 @@ async function storeShell(html: string, signal?: AbortSignal): Promise<void> {
 }
 
 /**
- * Run `work` over `items` with a fixed pool, collecting the URLs that succeeded.
- *
- * Errors are swallowed per item on purpose — see the note at the top of the file. The count
- * that reaches the progress callback is of items *attempted*, not stored, so the bar
- * advances at a constant rate rather than stalling over a patch of ocean.
+ * Runs `work` over `items` with a fixed pool. Errors are swallowed per item — terrain tiles
+ * legitimately 404 over ocean — and the progress count is of items *attempted*, so the bar moves.
  */
 async function pool(
   items: readonly string[],
@@ -235,24 +169,15 @@ function tileUrls(corridor: CorridorResult, vector: string | null): string[] {
   const urls: string[] = [];
   for (const tile of corridor.tiles) {
     urls.push(tileUrl(TERRARIUM_URL_TEMPLATE, tile));
-    // Past z14 the vector source has nothing new; MapLibre overzooms the z14 tile it
-    // already has, so asking for z15 would cache four 404s per tile of real coverage.
+    // Past z14 the vector source has nothing new; asking for z15 caches four 404s per tile.
     if (vector && tile.z <= VECTOR_MAX_ZOOM) urls.push(tileUrl(vector, tile));
   }
   return urls;
 }
 
 /**
- * Plan a download without performing it, so the button can say what it will cost.
- *
- * Rough by construction — the byte figures are averages, not measurements — and labelled as
- * such wherever it is shown. The tile count is exact.
- *
- * The averages come from measuring a completed download of a Cascades summit trail across
- * z10–z15 (`terrain 119 kB · vector 11 kB · glyph range 99 kB`) and are rounded *up*. An
- * estimate that comes in under what the download actually spends is a promise broken on a
- * metered connection, so where the numbers are uncertain they lean expensive: a hiker who
- * budgeted 9 MB and spent 8 has lost nothing.
+ * Plans a download without performing it, so the button can say what it will cost. The tile count
+ * is exact; the byte figures are averages, rounded *up* so an estimate never undershoots.
  */
 export function planDownload(trail: TrailDetail): {
   corridor: CorridorResult;
@@ -269,17 +194,14 @@ export function planDownload(trail: TrailDetail): {
   const estimatedBytes =
     corridor.tiles.length * 120_000 +
     vectorTiles * 11_000 +
-    // The glyph ranges are a flat cost per download, paid once however short the route —
-    // which is why a two-kilometre trail is never as cheap as its tile count suggests.
+    // A flat cost per download, paid once however short the route.
     GLYPH_RANGES.length * 100_000;
   return { corridor, tiles, estimatedBytes };
 }
 
 /**
- * Download a trail for offline use.
- *
- * Resolves to the manifest row, which is also written to IndexedDB before returning — so a
- * caller that forgets to persist the result cannot leave orphaned bytes in Cache Storage.
+ * Downloads a trail for offline use. Resolves to the manifest row, which is written to IndexedDB
+ * before returning, so a caller that forgets to persist it cannot leave orphaned bytes behind.
  */
 export async function downloadTrail(
   trail: TrailDetail,
@@ -320,20 +242,18 @@ export async function downloadTrail(
   const pageUrl = new URL(`/trails/${trail.slug}`, location.origin).toString();
   const total = 1 + tiles.length + photoUrls.length;
 
-  // ── The page. The only fatal step: without it there is nothing to open. ──────────────
+  // The page. The only fatal step: without it there is nothing to open.
   report('page', total);
   const pageCache = await caches.open(PAGE_CACHE);
   const page = await storeDocument(pageCache, pageUrl, signal);
   bytes += page.bytes;
   done += 1;
 
-  // The page's own build assets. Not counted against this trail's size and not listed in its
-  // manifest, both on purpose: they belong to the deployment rather than to the download,
-  // every trail page shares them, and evicting them with one trail would blank the others.
-  // They go into `ASSET_CACHE`, which no deploy sweeps — see `storeShell`.
+  // The page's build assets, deliberately not counted against this trail nor listed in its
+  // manifest: every trail page shares them, so evicting them with one trail would blank the rest.
+  // `evictTrails` owns their lifetime instead. See `storeShell`.
   await storeShell(page.html, signal);
 
-  // ── Tiles ────────────────────────────────────────────────────────────────────────────
   report('tiles', total);
   const tileCache = await caches.open(TILE_CACHE);
   const storedTiles: string[] = [];
@@ -349,7 +269,6 @@ export async function downloadTrail(
     signal,
   );
 
-  // ── Photographs ──────────────────────────────────────────────────────────────────────
   report('media', total);
   const mediaCache = await caches.open(MEDIA_CACHE);
   const storedMedia: string[] = [];

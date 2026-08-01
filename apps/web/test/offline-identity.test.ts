@@ -1,20 +1,9 @@
 /**
- * Who the browser is acting as, and what happens when that changes.
+ * The browser noticing it has changed hands. The other half of the rule — nothing is sent for
+ * anybody but the reader — lives on the drains and is exercised in the other two offline tests.
  *
- * The defect these are about needs no attacker and no unusual browser. One laptop, two people:
- * the first records a hike or writes a trail report with no signal and closes it; the second
- * opens it and signs in; the flusher mounted in the root layout runs on the second person's
- * first page and posts the first person's writes to the second person's account. The report is
- * an upsert keyed on trail and user, so it published on a public page under the wrong name,
- * and the device's only copy was deleted on the way.
- *
- * Two rules close it, and they are tested in two places. *Nothing is sent for anybody but the
- * reader* lives on the drains, and is exercised in `offline-queue.test.ts` and
- * `offline-activities.test.ts`. *The browser notices it has changed hands* lives here.
- *
- * Runs in the node environment with no jsdom, so `localStorage` and Cache Storage are stood up
- * as a few lines of Map each — enough for the exact surface these modules touch, and honest
- * about which calls they make.
+ * Runs in the node environment with no jsdom, so `localStorage` and Cache Storage are stood up as
+ * a few lines of Map each: the exact surface these modules touch, and honest about which calls.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -276,9 +265,7 @@ describe('the remembered reader', () => {
   });
 
   it('notices the key another tab moved, and a wholesale clear', () => {
-    // `storage` fires on every document of this origin except the one that wrote, and it is
-    // the only notice an open tab gets that somebody signed in elsewhere. A null key means
-    // another document called `clear()`, which takes the reader with it.
+    // A null key means another document called `clear()`, which takes the reader with it.
     expect(readerKeyChanged('sb-reader')).toBe(true);
     expect(readerKeyChanged(null)).toBe(true);
     expect(readerKeyChanged('sb-units')).toBe(false);
@@ -287,10 +274,8 @@ describe('the remembered reader', () => {
 
 describe('the reader a write is stamped with', () => {
   it('is read from storage at the moment of the write, not from a render', () => {
-    // The defect this closes needs no attacker: a second tab left open while somebody signs in
-    // on the first holds a render that says A, and its next request carries B's cookie. A
-    // drain that trusted the render would find `ownedBy(row, 'A')` true of A's report and post
-    // it as B. Reading here means the answer is whatever the browser says now.
+    // A second tab left open while somebody signs in on the first holds a render that says A
+    // while its next request carries B's cookie.
     rememberReader(A);
     expect(writingReader()).toBe(A);
 
@@ -308,9 +293,7 @@ describe('reconciling a change of reader', () => {
 
     const changed = await reconcileReader(A);
 
-    // Not a change of hands: a browser with no memory is one that has not loaded a page since
-    // this shipped, and taking every hiker's downloads away on that afternoon to guard
-    // against a handover that probably did not happen is the wrong trade.
+    // Not a change of hands: a browser with no memory has not loaded a page since this shipped.
     expect(changed).toBe(false);
     expect([...store]).toEqual([SHELL_CACHE, TILE_CACHE]);
     expect(rememberedReader()).toEqual({ id: A, known: true });
@@ -358,16 +341,9 @@ describe('reconciling a change of reader', () => {
 
     await reconcileReader(B);
 
-    // The trail pages and tiles were fetched with the first reader's cookie and go whole. This
-    // build's shell is not dropped by name: it also holds the offline fallback, the storage
-    // manager and the build assets every one of them needs to render, and nothing puts those
-    // back until a full-document navigation — so what goes is the three pages rendered for a
-    // person. The previous build's shell has no such claim on it. What it holds is `/`,
-    // `/explore` and `/record` as they rendered for the reader who is leaving, carrying their
-    // opening coordinate and the name and start time of any recording they left open, and the
-    // only thing the worker still reads out of it is `/_next/static/*`, which `adoptLegacyShell`
-    // has already carried across into `ASSET_CACHE` before `activate` collects it. So it goes
-    // whole, and the asset cache goes with the downloads whose lifetime it shares.
+    // This build's shell is not dropped by name — it also holds the offline fallback, the
+    // storage manager and the build assets those need — so only its per-reader pages go. The
+    // previous build's shell goes whole: `adoptLegacyShell` has already taken its chunks.
     expect([...store]).toEqual([SHELL_CACHE, 'somebody-elses-cache']);
     for (const path of READER_SHELL_PAGES) expect(shell.has(path)).toBe(false);
     expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
@@ -375,9 +351,7 @@ describe('reconciling a change of reader', () => {
 
   it('keeps the downloads of somebody signing in for the first time', async () => {
     // A download needs no account, so this is the ordinary order of events: acquire trails
-    // signed out, sign in afterwards. Nothing in those caches was fetched under a name, so
-    // deleting them protects nobody and costs the map for the hike being planned. The same
-    // branch fires on a thirty-day session lapse on a one-person phone.
+    // signed out, sign in afterwards. Nothing in those caches was fetched under a name.
     rememberReader(null);
     const { store, entries, api } = createFakeCaches([SHELL_CACHE, TILE_CACHE]);
     const shell = shellHolding(entries);
@@ -419,9 +393,7 @@ describe('reconciling a change of reader', () => {
     await putPendingReview(report('a', A));
     vi.stubGlobal('caches', { keys: () => Promise.reject(new Error('denied')) });
 
-    // A locked profile or a private window still has to be able to change hands. The queue
-    // guard is what prevents the defect; the sweep is the disclosure half, and failing it
-    // must not fail the sign-in.
+    // `ownedBy` is what prevents the defect; failing the disclosure half must not fail sign-in.
     await expect(reconcileReader(B)).resolves.toBe(true);
     expect((await getPendingReview(A, 'a'))?.heldAt).not.toBeNull();
     expect(rememberedReader()).toEqual({ id: B, known: true });
@@ -461,13 +433,9 @@ describe('clearReaderStorage', () => {
 
     await clearReaderStorage();
 
-    // The ledger rows survive an unreadable store; their bytes must survive with them, or
-    // `/downloads` lists a trail as available offline with a byte count and nothing behind it.
-    // `ASSET_CACHE` is part of those bytes rather than a cache of its own: a downloaded page in
-    // `PAGE_CACHE` names hashed URLs that no current build serves, and `handleStatic` finds them
-    // by looking in `ASSET_CACHE` second, so taking that cache while leaving the pages hands a
-    // hiker with no signal React's error boundary out of a cache that contains the page.
-    // The reader-specific pages still go — they are in no ledger and nothing lies about them.
+    // Ledger rows survive an unreadable store, so their bytes must survive with them — including
+    // `ASSET_CACHE`, which `handleStatic` looks in second for a downloaded page's hashed URLs.
+    // The reader-specific pages still go: they are in no ledger and nothing lies about them.
     expect([...store]).toEqual([SHELL_CACHE, TILE_CACHE, PAGE_CACHE, MEDIA_CACHE, ASSET_CACHE]);
     expect([...shell]).toEqual(['/offline', '/downloads', '/_next/static/chunks/main-9f2c.js']);
   });

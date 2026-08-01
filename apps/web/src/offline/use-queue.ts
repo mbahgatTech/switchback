@@ -1,43 +1,12 @@
 'use client';
 
 /**
- * The queue, as a component sees it.
+ * The queue, as a component sees it. Each hook splits what it finds three ways — yours, held for
+ * somebody else (a count only, never the words), and unattributed — and subscribes rather than polls.
  *
- * Three hooks over two stores, split the same way the download hooks are: the storage manager
- * wants everything queued, and a trail page wants only its own row. A page that shows one
- * trail should not re-render because a report for a different trail finally went out.
- *
- * All of them subscribe to their store rather than polling it, so the banner on a trail page
- * clears the moment the background flusher posts that trail's report — without either
- * component knowing the other exists.
- *
- * ---
- *
- * **Every one of them is scoped to the reader.** A queue is not a property of a browser, it is
- * a property of a person who used that browser, and on a shared computer those are different
- * things. So each hook splits what it finds three ways and hands the caller all three:
- *
- * - **yours** — written under the account signed in now. Ordinary rows, sent by the ordinary
- *   drain, shown in full.
- * - **held** — written under some other account. A count and nothing else: not the trail, not
- *   the date, and above all not the words. What is owed is visible so that a person who has
- *   filled their storage can see why; whose it is and what it says are not this reader's to
- *   read. They go out when that person signs back in, untouched.
- * - **unattributed** — written before the queue recorded authorship. Shown, named, and left
- *   for a person to claim or discard, because those two are the only honest options and the
- *   device cannot choose between them. See `handover.ts`.
- *
- * ---
- *
- * **Drawing reads the subscription; acting reads `localStorage`.** `useReaderId()` gives these
- * hooks the value to render — which list a row belongs in, whether to offer a claim button.
- * Every callback that *sends, adopts or deletes* calls `writingReader()` instead, at the
- * moment the button does its work. The two disagree exactly when it matters: a second tab
- * signs in, or this document comes back from the back/forward cache, and the render that drew
- * the button happened under an account that has since left while the request the button makes
- * carries the cookie of the account that arrived. Acting on the drawn value posts one hiker's
- * report under another's name; acting on the stored value posts nothing, which is correct.
- * See the note on `writingReader` in `identity.ts`.
+ * **Drawing reads the subscription; acting reads `localStorage`.** Every callback that sends,
+ * adopts or deletes calls `writingReader()`, because the render that drew the button may have
+ * happened under an account that has since left.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -70,12 +39,7 @@ import {
 } from './queue';
 import { useReaderId } from './reader';
 
-/**
- * Split what is on the device into what this reader may act on and what they may not.
- *
- * One function for both queues, because the rule is the same for a report and for a day's
- * track and writing it twice is how the two drift apart.
- */
+/** Splits rows into what this reader may act on and what they may not. One function for both queues. */
 function partition<T extends { userId: string | null }>(
   rows: readonly T[],
   readerId: string | null,
@@ -87,12 +51,7 @@ function partition<T extends { userId: string | null }>(
   };
 }
 
-/**
- * The one place the queue meets tRPC.
- *
- * `queue.ts` takes a poster rather than a client precisely so it can stay testable in a
- * plain node environment; this is the two-line adapter that pays for that.
- */
+/** The one place the review queue meets tRPC — `queue.ts` takes a poster so it stays testable. */
 function usePoster(): (write: ReviewWrite) => Promise<unknown> {
   const client = useTRPCClient();
   return useCallback((write: ReviewWrite) => client.reviews.upsert.mutate(write), [client]);
@@ -103,7 +62,7 @@ export interface PendingReviewsApi {
   reviews: PendingReview[];
   /** Reports written before the queue recorded authorship. Claimed or discarded by hand. */
   unattributed: PendingReview[];
-  /** How many belong to somebody else. A number, and nothing more; see the note at the top. */
+  /** How many belong to somebody else. A number, and nothing more — never the words. */
   held: number;
   loading: boolean;
   /** True while something is being sent, so a button can say so and refuse a second press. */
@@ -146,9 +105,8 @@ export function usePendingReviews(): PendingReviewsApi {
     async (options: { trailId?: string }) => {
       setBusy(true);
       try {
-        // `force` because both entry points here are somebody pressing a button. An automatic
-        // flush leaves refused rows alone; a person asking is a new fact about the world —
-        // they may have signed back in since.
+        // `force` because both entry points are somebody pressing a button, and a person asking
+        // is a new fact about the world — they may have signed back in since.
         return await flushPendingReviews(send, {
           ...options,
           readerId: writingReader(),
@@ -174,7 +132,7 @@ export function usePendingReviews(): PendingReviewsApi {
     discard: useCallback(
       async (trailId: string) => {
         // The reader as stored, not as drawn: the key is half owner, so a stale value here
-        // deletes the report of the person who left rather than the one this list belongs to.
+        // deletes the report of the person who left.
         await deletePendingReview(writingReader(), trailId);
         await refresh();
       },
@@ -182,33 +140,23 @@ export function usePendingReviews(): PendingReviewsApi {
     ),
     adopt: useCallback(
       async (trailId: string, adoptOptions: { replace?: boolean } = {}) => {
-        // Nobody is signed in, so there is no name to put on it. The control that calls this
-        // is not rendered in that state; the guard is here so the answer cannot depend on it.
+        // The control is not rendered when nobody is signed in; the guard is here so the answer
+        // cannot depend on that.
         const reader = writingReader();
         if (reader === null) return 'nothing-to-claim';
         setBusy(true);
         try {
           const outcome = await adoptPendingReview(trailId, reader, adoptOptions).catch(
             (error: unknown) => {
-              // The claim itself would not write — a device whose storage is full, blocked or
-              // locked. Nothing has moved, and the press must not pass in silence: the button
-              // is disabled while `busy` is true, so focus has already left it and the reader
-              // has no other way to learn that nothing happened.
+              // The button is disabled while `busy`, so focus has left it and nothing else on
+              // the page will change to show that the write was refused.
               setDrainNotice('That report could not be claimed. It is still on this device.');
               throw error;
             },
           );
-          // The claimer already has a report queued for this trail. Nothing has been written
-          // and nothing may be, until they say which of the two to keep — the caller draws
-          // that question. See `adoptPendingReview`.
-          //
-          // Said in the page's one live region as well as beside the button, because this is
-          // an *answer to a press* rather than a confirmation the reader opened. The press
-          // replaces the control that made it, which takes focus to `<body>`; the caller moves
-          // focus here instead, and a sentence that lives only in a `<span>` further down the
-          // row is announced to nobody when it arrives. Word for word the same as the visible
-          // sentence, on the rule the recorder's receipts follow: one wall, one wording,
-          // wherever a reader meets it.
+          // Every terminal outcome goes in the page's one live region, word for word the same
+          // as the visible sentence: a press replaces the control that made it, taking focus to
+          // `<body>`, so a sentence living only in a `<span>` is announced to nobody.
           if (outcome !== 'adopted') {
             setDrainNotice(
               outcome === 'would-replace-your-own'
@@ -223,10 +171,8 @@ export function usePendingReviews(): PendingReviewsApi {
             stillReader: writingReader,
             force: true,
           });
-          // Said out loud, on the same reasoning as the hikes below: settling the last
-          // unattributed row takes the button, the row and the whole section off the page, so
-          // silence on success and silence on failure look identical — and to somebody who
-          // cannot see the list disappear, both look like nothing happened.
+          // Settling the last unattributed row takes the button, the row and the section off the
+          // page, so silence on success and silence on failure look identical.
           setDrainNotice(
             result.sent > 0
               ? 'Posted under your account.'
@@ -261,12 +207,8 @@ export interface PendingReviewApi {
 }
 
 /**
- * One trail's queued report, for the form that wrote it.
- *
- * Keyed on the reader as well as the trail, which is what stops the form prefilling the last
- * person's draft into this person's textarea. A report queued by somebody else for this trail
- * is not returned, not counted, and not hinted at: the form behaves exactly as it does when
- * there is nothing queued, because from this reader's side of the screen there is not.
+ * One trail's queued report, for the form that wrote it. Keyed on the reader as well as the trail,
+ * which is what stops the form prefilling the last person's draft into this person's textarea.
  */
 export function usePendingReview(trailId: string): PendingReviewApi {
   const readerId = useReaderId();
@@ -314,18 +256,7 @@ export function usePendingReview(trailId: string): PendingReviewApi {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Hikes
-// ---------------------------------------------------------------------------
-
-/**
- * The one place the hike queue meets tRPC.
- *
- * Three mutations rather than one, because a hike is three server calls in a fixed order.
- * Same shape as the object `SyncQueuedWrites` builds, and for the same reason `usePoster`
- * exists above: `activities.ts` takes posters so it can be tested in a plain node
- * environment, and this is the adapter that pays for it.
- */
+/** The hike queue's tRPC adapter. Three mutations, because a hike is three calls in a fixed order. */
 function useActivityPosters(): ActivityPosters {
   const client = useTRPCClient();
   return useMemo<ActivityPosters>(
@@ -349,14 +280,8 @@ export interface PendingActivitiesApi {
   loading: boolean;
   busy: boolean;
   /**
-   * Something the last drain needs a person to know, or null.
-   *
-   * Not component state. The drain that most needs to say something is the background one in
-   * the layout, which runs while nobody is on this page and deletes the row the outcome
-   * belonged to on its way out, so the sentence is held in `activities.ts` and read here —
-   * and it is still there the next time `/downloads` is opened. Rendered from a live region
-   * that is mounted whether or not there is a queue, because the queue emptying is exactly
-   * what a successful drain does.
+   * Something the last drain needs a person to know. Not component state: the background drain in
+   * the layout runs while nobody is on this page, so the sentence is held in `activities.ts`.
    */
   notice: string | null;
   /** Send every queued hike of yours, including any the server previously refused. */
@@ -397,19 +322,16 @@ export function usePendingActivities(): PendingActivitiesApi {
     async (options: { activityId?: string }) => {
       setBusy(true);
       try {
-        // `force`, on the same reasoning written above for reports: an automatic flush leaves
-        // refused rows alone, and a person pressing a button is a new fact about the world.
+        // `force`, as for reports above: a person pressing a button is a new fact about the world.
         const result = await flushPendingActivities(post, {
           ...options,
           readerId: writingReader(),
           stillReader: writingReader,
           force: true,
         });
-        // Every terminal outcome is said, not only the one that lost something. A press that
-        // empties the list takes the button, the row and the heading off the page with it, so
-        // silence on success is indistinguishable from silence on failure — and to a reader
-        // who cannot see the list disappear, it is indistinguishable from nothing happening.
-        // The drain sets its own sentence for a truncation; that one wins.
+        // Every terminal outcome is said, not only the one that lost something: a press that
+        // empties the list takes the button and heading with it, so silence on success looks
+        // exactly like silence on failure. The drain's own truncation sentence wins.
         if (result.truncated === 0) {
           setDrainNotice(
             result.sent > 0
@@ -428,26 +350,13 @@ export function usePendingActivities(): PendingActivitiesApi {
 
   const throwAway = useCallback(
     async (activityId: string) => {
-      // The server's copy goes too, when there is one. A hike part-way through a drain has
-      // an open recording on the server, and leaving it there means the next `activities
-      // .start` sweep closes and publishes a hike the reader deliberately threw away.
-      // Swallowed: nothing to delete, or no connection to ask over, are both fine — the
-      // sweep's own rule deletes a recording with no samples, and `Recorder.onDiscard`
-      // makes the same judgement for the same reason.
-      //
-      // The button is deliberately *not* disabled while a drain is in flight, which was the
-      // other half of the suggestion this fixes. `busy` here is this hook's own state and
-      // cannot see the drain running in the root layout, so gating on it would refuse the
-      // press in a case it does not cover and allow it in the case it does; a global flag
-      // would disable the one destructive control on the page for a reason the reader has
-      // no way to see. The race is closed where it happens instead — `sendOne` re-reads the
-      // row before every write and before `finish`, and abandons it when it has gone.
+      // Read before the delete: a hike part-way through a drain has an open recording on the
+      // server, and leaving it means the next `activities.start` sweep publishes a hike the
+      // reader threw away. Swallowed — nothing to delete and no connection are both fine.
       const row = await getPendingActivity(activityId).catch(() => null);
       await deleteActivity(activityId);
-      // Only for a hike this reader could have started on the server. An unattributed row's
-      // server copy, if it has one, belongs to whoever recorded it — and `activities.remove`
-      // is scoped to the caller, so asking would fail anyway. Discarding here means "take it
-      // off this device", which is the only claim the person pressing it can make.
+      // Only for a hike this reader could have started: an unattributed row's server copy
+      // belongs to whoever recorded it, and `activities.remove` is scoped to the caller.
       if (row?.serverStarted && ownedBy(row, writingReader()) && post.remove) {
         await post.remove({ id: activityId }).catch(() => undefined);
       }
@@ -473,9 +382,8 @@ export function usePendingActivities(): PendingActivitiesApi {
         setBusy(true);
         try {
           await adoptPendingActivity(activityId, reader).catch((error: unknown) => {
-            // As on the report claim beside it: the write itself was refused, the button that
-            // asked for it is disabled and has lost focus, and nothing else on the page will
-            // change to show it.
+            // As on the report claim: the button is disabled and has lost focus, so nothing
+            // else on the page will show that the write was refused.
             setDrainNotice('That hike could not be claimed. It is still on this device.');
             throw error;
           });
@@ -485,11 +393,8 @@ export function usePendingActivities(): PendingActivitiesApi {
             stillReader: writingReader,
             force: true,
           });
-          // Claiming the last unattributed row removes the button, then the row, then the
-          // whole section — so without this the page answers a press by going quiet and
-          // shorter, which is what a failure looks like too. Same argument as `run` above,
-          // and it carries further here: this screen is about rows whose author is in doubt,
-          // and a claim that could not be sent re-lists the hike elsewhere on the page.
+          // Claiming the last unattributed row removes the button, the row and the section, so
+          // without this the page answers a press by going quiet — which is what failure does.
           if (result.truncated === 0) {
             setDrainNotice(
               result.sent > 0

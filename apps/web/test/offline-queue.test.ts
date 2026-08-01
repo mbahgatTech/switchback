@@ -16,16 +16,8 @@ import {
 } from '../src/offline/queue';
 
 /**
- * The queue is the one place in this product where losing a byte loses something irreplaceable.
- *
- * A tile can be fetched again, a page can be rendered again, a photograph is still in the
- * camera roll. A report written on a ridge exists in exactly one place until it posts, so the
- * rules about when a row is kept, when it is marked, and when it is deleted are worth testing
- * directly rather than inferring from a green download button.
- *
- * `apps/web/test` runs in the node environment with no jsdom and no fake-indexeddb, so the
- * store is stood up here: a few dozen lines against the exact surface `idb.ts` uses. That is
- * cheaper than a dependency and it keeps the test honest about which API calls the code makes.
+ * `apps/web/test` runs in the node environment with no jsdom and no fake-indexeddb, so the store is
+ * stood up here against the exact surface `idb.ts` uses — which keeps the test honest about that.
  */
 
 interface FakeRequest<T> {
@@ -37,19 +29,15 @@ interface FakeRequest<T> {
 }
 
 /**
- * A database that lives in a Map.
- *
- * Callbacks fire on a microtask because the real ones do, and because the code under test
- * assigns its handlers *after* the call that will invoke them — a fake that fired
- * synchronously would call a handler that is still null and hang every promise.
+ * A database that lives in a Map. Callbacks fire on a microtask because the code under test assigns
+ * its handlers *after* the call that will invoke them; a synchronous fake would hang every promise.
  */
 function createFakeIndexedDB(seed: Record<string, Array<Record<string, unknown>>> = {}): unknown {
   const stores = new Map<string, Map<string, unknown>>();
   const keyPaths = new Map<string, string>();
 
-  // Rows the browser already held before the version this test is exercising. Seeded with the
-  // key they were stored under, because a store that predates the upgrade predates its key
-  // path too — which is exactly what the upgrade has to cope with.
+  // Seeded with the key they were stored under: a store that predates the upgrade predates its
+  // key path too, which is exactly what the upgrade has to cope with.
   for (const [name, rows] of Object.entries(seed)) {
     stores.set(name, new Map(rows.map((row) => [String(row.trailId ?? row.key), row])));
   }
@@ -128,9 +116,8 @@ function createFakeIndexedDB(seed: Record<string, Array<Record<string, unknown>>
         onsuccess: null,
         onerror: null,
         onupgradeneeded: null,
-        // The version-change transaction, which the upgrade uses to carry the old review
-        // queue into the new one. A real one spans the whole upgrade; this one is a plain
-        // transaction over the same stores, which is all `carryReviewsForward` asks of it.
+        // A plain transaction over the same stores, which is all `carryReviewsForward` asks of
+        // the real version-change transaction.
         transaction: transaction('upgrade', 'versionchange'),
       };
       queueMicrotask(() => {
@@ -146,10 +133,8 @@ function createFakeIndexedDB(seed: Record<string, Array<Record<string, unknown>>
 const HIKER = 'hiker-a';
 
 /**
- * `flushPendingReviews`, as that hiker. Ownership gets its own block at the end.
- *
- * `stillReader` defaults to "the same person all the way through", which is every case except
- * the ones that deliberately change it mid-drain.
+ * `flushPendingReviews`, as that hiker. `stillReader` defaults to "the same person all the way
+ * through", which is every case except the ones that change it mid-drain.
  */
 function flush(
   post: (write: ReviewWrite) => Promise<unknown>,
@@ -234,13 +219,8 @@ describe('isUnreachable', () => {
 });
 
 describe('isUnauthorized', () => {
-  /*
-   * Two branches, and each is here for a shape the other does not cover: a tRPC envelope that
-   * carries `httpStatus`, and a shape-only error that crossed a module boundary carrying just
-   * the code. Every drain test builds an error satisfying both at once, so either half could
-   * be deleted with the whole suite green — which is half of the predicate this queue's
-   * session handling rests on going unexercised.
-   */
+  // Three shapes, because every drain test builds an error satisfying all of them at once:
+  // either half of the predicate could be deleted with the whole suite still green.
   it.each([
     ['a full tRPC envelope', { code: 'UNAUTHORIZED', httpStatus: 401 }],
     ['the code alone', { code: 'UNAUTHORIZED' }],
@@ -390,14 +370,8 @@ describe('flushPendingReviews', () => {
 });
 
 /**
- * Whose report is whose.
- *
- * The case these exist for is one browser and two people: somebody writes a report on a ridge
- * with no signal and closes the laptop, and the next person to sit down signs in. Before a row
- * carried an author, the drain that runs on every page load posted the first person's words to
- * the second person's account — under an upsert keyed on trail and user, so they published on
- * a public trail page under a name that was not theirs, and the only copy was consumed on the
- * way out.
+ * One browser, two people: a report written on a ridge with no signal, and somebody else signing in
+ * before it drains. Without an author on the row it published under the second person's name.
  */
 describe('a report belongs to whoever wrote it', () => {
   const OTHER = 'hiker-b';
@@ -536,12 +510,8 @@ describe('a report belongs to whoever wrote it', () => {
 });
 
 /**
- * Reports the device cannot name an author for.
- *
- * Every row queued before authorship was recorded, plus anything written by a browser that had
- * never been told who was signed in. The two tidy answers are both wrong — adopting them to
- * whoever is here now is the defect itself, and discarding them destroys somebody's only copy
- * — so nothing happens to one of these without a person saying so.
+ * Reports the device cannot name an author for. Adopting them to whoever is here now is the defect
+ * itself; discarding them destroys somebody's only copy. So nothing happens without a person.
  */
 describe('an unattributed report', () => {
   it('is neither sent nor discarded on its own', async () => {
@@ -624,13 +594,7 @@ describe('an unattributed report', () => {
   });
 });
 
-/**
- * What happens when the browser changes hands.
- *
- * Mark, never delete. A queued report is the only copy of something a person wrote standing in
- * the place they were writing about, and "somebody else has signed in" is not a reason to
- * destroy it. It is a reason to set it aside and say so.
- */
+/** What happens when the browser changes hands: mark, never delete. */
 describe('a change of account', () => {
   const AT = 1_760_000_000_000;
 
@@ -679,13 +643,8 @@ describe('a change of account', () => {
 });
 
 /**
- * Reports already queued on real devices when this shipped.
- *
- * The migration is the part of this change that could actually lose something. A row written
- * on a phone last week has no author on it, and the version bump has to decide what that
- * means. Adopting it to whoever opens the app next is the defect the rest of this file is
- * about; deleting it destroys the only copy of a report somebody wrote on a ridge. So it is
- * carried across as nobody's, and stays on the device until a person says which.
+ * Reports already queued on real devices when this shipped. A pre-authorship row is carried across
+ * as nobody's: adopting it is the defect, deleting it destroys the only copy.
  */
 describe('the upgrade from the trail-keyed queue', () => {
   it('carries an old row across as unattributed rather than adopting or dropping it', async () => {

@@ -1,18 +1,6 @@
 /**
- * The record of what has been downloaded.
- *
- * Cache Storage holds the bytes — tiles, pages, photographs — and this holds the ledger:
- * which download owns which URLs, when it was taken, and how big it turned out to be. The
- * split matters because tile corridors overlap. Two trails in the same valley share most of
- * their tiles, and deleting one download must not blank the other's map, so eviction is a
- * set difference against everything still held rather than a straight delete of a list.
- *
- * IndexedDB rather than `localStorage` because the detail payload for a long trail is
- * hundreds of kilobytes of coordinates, and because `localStorage` is synchronous — every
- * read of it blocks the frame that is trying to draw a map.
- *
- * The database itself — its name, its version, and the stores in it — is declared in `idb.ts`,
- * because the queue of unsent reports shares it. This file owns only what a download row is.
+ * The ledger of what has been downloaded: which download owns which URLs, and what it cost. Cache
+ * Storage holds the bytes; the database itself is declared in `idb.ts`, which the queue shares.
  */
 
 import type { TrailDetail } from '@switchback/core';
@@ -37,12 +25,8 @@ export interface OfflineTrail {
   pageUrls: string[];
   mediaUrls: string[];
   /**
-   * The full trail payload.
-   *
-   * Redundant with the cached HTML page, deliberately. The page is what a reader sees, and
-   * it is one `Cache.match` away from being served — but it is also HTML built by a
-   * particular deployment, and a redeploy invalidates every hashed asset it references. This
-   * is the durable copy: plain JSON that any future build can render.
+   * The full trail payload. Redundant with the cached HTML, deliberately: the page is built by one
+   * deployment and references its hashed assets, whereas this is JSON any future build can render.
    */
   detail: TrailDetail;
 }
@@ -72,10 +56,8 @@ export function deleteOfflineTrail(trailId: string): Promise<void> {
 }
 
 /**
- * Every URL still spoken for by a download other than the ones named.
- *
- * The input to eviction. Anything cached and *not* in this set is unreferenced and can go;
- * anything in it is load-bearing for a trail somebody still has.
+ * Every URL still spoken for by a download other than the ones named — the input to eviction.
+ * Anything cached and not in this set is unreferenced and can go.
  */
 export async function referencedUrls(exceptTrailIds: readonly string[]): Promise<Set<string>> {
   const excluded = new Set(exceptTrailIds);

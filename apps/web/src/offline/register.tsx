@@ -1,16 +1,8 @@
 'use client';
 
 /**
- * Installing the service worker.
- *
- * A component rather than a script tag, because registration has to happen after hydration
- * and only in a browser that has the API — Safari in private mode does not, and iOS did not
- * until 11.3. It renders nothing.
- *
- * Registration is deliberately unconditional in production and skipped in development. A
- * worker that caches `/_next/static` in front of a dev server that rebuilds those files on
- * every keystroke produces the worst debugging experience this stack can offer: edits that
- * appear to do nothing, intermittently.
+ * Installs the service worker after hydration. Skipped in development: a worker caching
+ * `/_next/static` in front of a dev server makes edits appear to do nothing, intermittently.
  */
 
 import { useEffect } from 'react';
@@ -21,21 +13,14 @@ export function RegisterServiceWorker() {
     if (process.env.NODE_ENV !== 'production') return;
     if (!('serviceWorker' in navigator)) return;
 
-    // After load, not during: registration competes with the page's own requests for the
-    // connection, and the page is what the user is waiting for.
+    // After load, not during: registration competes with the page's own requests.
     const register = () => {
-      /*
-       * The build id rides in the query string, and it is the only way to tell a file outside
-       * the module graph which build it belongs to — `sw.js` reads it back off
-       * `self.location`. It also guarantees an upgrade: a changed URL is a different worker
-       * as far as the browser is concerned, so a deploy installs rather than waiting on a
-       * byte comparison of a file that may not have changed.
-       */
+      // The build id rides in the query string — the only channel into a file outside the module
+      // graph, and a changed URL is a different worker, so a deploy installs rather than waits.
       navigator.serviceWorker
         .register(`/sw.js?v=${encodeURIComponent(BUILD_ID)}`, { scope: '/' })
         .catch((error: unknown) => {
-          // Worth surfacing to a developer console and nowhere else — the site works without
-          // it, minus the offline half, and there is nothing the reader can do about it.
+          // For a developer console and nowhere else: the site works without it, minus offline.
           console.error('Service worker registration failed', error);
         });
     };
