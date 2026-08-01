@@ -1,192 +1,112 @@
 # Switchback
 
-Trail discovery, planning, and navigation. A website and an iOS app, sharing one API and one
-design system.
+Trail discovery, planning and navigation: a Next.js website that is also a PWA, an Expo/React
+Native iOS app, and one tRPC API both consume. Its single job is to say what a trail will be like
+**at the hour you will be standing there** — Tobler's hiking function over the real elevation
+profile gives an arrival time at each point along the route, and each point's forecast is read at
+_its own_ arrival hour rather than the trailhead's.
 
-The product's single job: tell you what a trail will be like **at the hour you will be
-standing there**. Every other trail app forecasts the trailhead. This one walks the route —
-Tobler's hiking function over the real elevation profile gives an ETA at each sample point,
-and each point's forecast is read at _its own_ arrival hour.
+![Switchback's explore map on the dark surface: an index rail listing four trails with distance,
+ascent, walking time and difficulty, beside a shaded-relief map of the Vesper Peak area with the
+trail drawn as a pale green line.](docs/screenshots/product/explore-1400.png)
 
-> Trailhead 07:00 · 11 °C, calm → Ridge 09:40 · 6 °C, gusts 38 km/h → **Summit 11:20 · 1 °C,
-> gusts 61 km/h, 30 % precip** → back at the car 14:05 · 9 °C
+There is no seeded trail corpus and no region to pick. OpenStreetMap is read on demand, tile by
+tile, as people look at places: a viewport is covered with z9 quadkeys, whatever Postgres already
+holds returns immediately, and the rest is queued. Progress is **polled, not streamed** — the
+client re-asks `browse` every 2.5 s while tiles are pending.
 
----
+## Quick start
 
-## Run it
-
-Node ≥ 22.13 (the floor is React Native 0.86's; `.npmrc` sets `engine-strict=true`, so a
-mismatch fails the install with a readable message instead of crashing Metro three commands
-later). Docker for the local database.
+Node 20.19.4 or newer, and Docker for the local database. `.npmrc` sets `engine-strict=true`, so
+the `engines` range in `package.json` is what the install actually enforces, and a Node below the
+floor fails with a readable message instead of crashing Metro three commands later.
 
 ```bash
 npm install
-cp .env.example .env            # fill in DATABASE_URL and AUTH_SECRET; the rest is optional
-npm run db:up                   # Postgres 17 + PostGIS 3.5 on :5433
-npm run db:push                 # schema, then packages/db/prisma/spatial.sql
+cp .env.example .env   # DATABASE_URL and AUTH_SECRET are the only two required
+npm run db:up          # Postgres 17 + PostGIS 3.5 on :5433
+npm run db:push        # schema, then packages/db/prisma/spatial.sql
 npm run db:seed
-npm run dev                     # web on :3000
-npm run mobile                  # Expo — scan the QR with Expo Go
+npm run dev            # web on http://localhost:3000
+npm run mobile         # Expo — scan the QR with Expo Go
 ```
 
-`AUTH_SECRET` needs 32+ characters; `openssl rand -base64 32` will do. Everything after
-those two variables degrades gracefully rather than failing:
+`AUTH_SECRET` needs 32+ characters; `openssl rand -base64 32` will do. Everything after those two
+degrades rather than fails. Without `AUTH_MICROSOFT_ENTRA_ID_*` sign-in is unavailable and
+everything readable stays readable; without `R2_*` photo uploads go to local disk (set **all five
+or none** — `env.ts` rejects a half-configured bucket); without `NEXT_PUBLIC_PMTILES_URL` the
+basemap falls through to keyless OpenFreeMap; without `MAPILLARY_TOKEN` photo enrichment uses
+Wikimedia Commons alone. `scripts/setup-entra.ps1` registers the Entra app and writes the
+credentials into `.env` without echoing the secret.
 
-| Unset                       | What happens                                                                                                                                                                                                                   |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `AUTH_MICROSOFT_ENTRA_ID_*` | Sign-in is unavailable; everything readable stays readable. Required in production — `env.ts` refuses to boot without it.                                                                                                      |
-| `R2_*`                      | Photo uploads go to local disk via a filesystem driver. **All five or none** — a half-configured bucket silently writes user photographs into a serverless container that is discarded minutes later.                          |
-| `NEXT_PUBLIC_PMTILES_URL`   | Falls through to keyless OpenFreeMap. The `.env.example` placeholder is rejected as firmly as an empty string.                                                                                                                 |
-| `MAPILLARY_TOKEN`           | Photo enrichment uses Wikimedia Commons alone.                                                                                                                                                                                 |
-| `DATABASE_SIZE_LIMIT_BYTES` | The ingest storage guard is off and only the queue-depth ceiling applies. Set it to the storage quota of the plan the database is on — nothing can measure that, so an unset guard fails open on purpose rather than guessing. |
-| `AUTH_APPLE_ENABLED`        | Off. See [gated on an Apple account](#gated-on-an-apple-developer-account).                                                                                                                                                    |
+## Workspaces
 
-`scripts/setup-entra.ps1` registers the Entra app and writes the credentials straight into
-`.env` without echoing the secret.
+npm workspaces, all source-only — no build step and no `dist/`. The root tsconfig's `paths` point
+straight at `packages/*/src`, so a one-line change in `packages/core` is visible to both apps
+without a rebuild.
 
----
+| Path                | What it is                                                                     |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `apps/web`          | Next.js 16 App Router — the website, the PWA, and the API the router mounts on |
+| `apps/mobile`       | Expo SDK 57 / React Native — iOS, a pure client of that same API               |
+| `packages/core`     | Domain types, zod schemas, difficulty and unit formulas, the WebView protocol  |
+| `packages/api`      | tRPC routers, moderation, mobile token exchange, R2 signing                    |
+| `packages/db`       | Prisma schema, plus the PostGIS SQL Prisma cannot express                      |
+| `packages/geo`      | Quadkeys, terrarium decode, profile, Tobler, corridors, GPX/FIT, routing graph |
+| `packages/ingest`   | Overpass client, the tile pipeline, the job queue and its admission control    |
+| `packages/weather`  | Open-Meteo adapter and along-route time-shifted sampling                       |
+| `packages/busyness` | Forecast model and a pluggable provider                                        |
+| `packages/ui`       | One token source that Tailwind v4 and React Native StyleSheet both read        |
+| `infra`             | docker-compose for local Postgres + PostGIS; `infra/azure` is production Bicep |
 
-## Architecture
+The routers live in `packages/api` and are mounted at `apps/web/app/api/trpc/[trpc]/route.ts`. The
+iOS app imports the same router _type_, so changing a procedure type-checks against both clients
+at once — which is the whole reason it is Expo rather than SwiftUI.
 
-```
-apps/web        Next.js 16 App Router — website, PWA, and the API
-apps/mobile     Expo / React Native — iOS
-packages/core   domain types, zod schemas, difficulty and pace formulas
-packages/api    tRPC routers — consumed by both clients, end-to-end typed
-packages/db     Prisma schema, PostGIS
-packages/geo    GPX/GeoJSON, elevation profile, terrarium decode, Tobler, off-route, quadkeys
-packages/ingest Overpass client, route assembly, enrichment
-packages/weather Open-Meteo adapter, along-route time-shifted sampling
-packages/busyness forecast model + pluggable provider
-packages/ui     design tokens — Tailwind v4 and React Native StyleSheet read the same source
-infra           docker-compose for local Postgres + PostGIS
-```
-
-**One API, two clients.** The routers live in `packages/api` and are mounted at
-`apps/web/app/api/trpc/[trpc]/route.ts`. The Expo app imports the same router _type_, so
-changing a procedure type-checks against both clients immediately. That is the whole reason
-the iOS app is Expo rather than SwiftUI.
-
-The packages are source-only — no build step, no `dist/`. TypeScript project references
-resolve them directly, which is what keeps a one-line change in `packages/core` from needing
-a rebuild before either app sees it.
-
-### Trail data arrives on demand
-
-There is no seeded corpus and no region to pick. A viewport is covered with z9 quadkeys;
-tiles already in Postgres and fresher than 30 days serve instantly, and missing tiles are
-queued and streamed in over SSE as they land.
-
-```
-viewport ──► z9 quadkeys ──┬── READY & fresh ──► Postgres, instantly
-                           └── missing/stale ──► partial results now + { pending: [...] }
-                                                 waitUntil(processTile) + SSE
-```
-
-`processTile` is six idempotent steps: Overpass query → assemble relation members into
-ordered LineStrings → resample every 25 m and decode terrarium PNGs at z13 → derive length,
-gain/loss, grade histogram, route type, difficulty and Tobler time → enrich with Commons and
-Mapillary photographs and nearby parking → commit.
-
-**Overpass etiquette is a correctness requirement, not politeness** — public instances block
-abusive clients and would take this product down with them. The client enforces a descriptive
-`User-Agent` with a contact URL (a placeholder address is refused at construction), a
-serialized queue at two concurrent, jittered exponential backoff that honours `Retry-After`,
-mirror failover, and a circuit breaker that fails soft to cached data. `overpass.test.ts`
-asserts every one of those.
-
-Durability is a two-part answer: `waitUntil` kicks the job immediately for latency, and a
-Vercel Cron drains the `IngestJob` table to catch whatever a deploy or a timeout drops.
-That cron is scheduled daily rather than minutely, because Vercel's Hobby plan fails the
-_deployment_ on any expression that would run more often — one field in
-`apps/web/vercel.json` gets the minute-hand back on Pro, and any external scheduler pointed
-at the same URL with the same bearer token gets it back for free.
-
-**The ingest holds its own connection pool**, so each server process opens two. Sharing one
-was survivable until three code paths could start drains at once — two `waitUntil` kicks and
-the cron, each guarded against starting a second of its own kind and none aware of the
-others — at which point background commits took every connection and the query that lost was
-Auth.js's session lookup. The symptom was not a slow ingest; it was a signed-out header and
-an empty map. `packages/db/src/client.ts` sizes both pools and says why.
-
----
-
-## Data sources
-
-| Layer                                    | Source                            | Terms                                     |
-| ---------------------------------------- | --------------------------------- | ----------------------------------------- |
-| Trail geometry, names, tags              | OpenStreetMap via Overpass        | **ODbL — attribution and share-alike**    |
-| Elevation                                | AWS Terrain Tiles (terrarium PNG) | Public domain / CC-BY per tile source     |
-| Weather, air quality                     | Open-Meteo                        | CC-BY, 10k calls/day free, non-commercial |
-| Base map                                 | Protomaps PMTiles, self-hosted    | Open                                      |
-| Satellite                                | Esri World Imagery                | Free with attribution                     |
-| Photographs (seed)                       | Wikimedia Commons, Mapillary      | CC variants — license stored per photo    |
-| Photographs, reviews, conditions, tracks | Our users                         | Ours                                      |
-| Busy times                               | Our model + our activity data     | Ours, labelled **Estimated**              |
-
-OSM is ODbL: attribution is required and a derived database carries share-alike. It is baked
-into the map chrome and the `/attribution` page rather than bolted on, and
-`trail.spec.ts` fails the build if the credit disappears.
-
-**Busy times are modelled, not measured.** No API sells this — Google Places (New) exposes no
-`popularTimes` field in any SKU. A parametric weekly prior per trail archetype is pulled
-toward reality by an EWMA over start times from activities our own users record, and the UI
-says which it is showing ("modeled" → "based on 240 visits").
-
----
-
-## Testing
+## Gates
 
 ```bash
-npm run format:check            # prettier --check .
-npm run typecheck               # tsc across root, e2e, web, mobile
-npm run lint                    # eslint --max-warnings=0
-npm test                        # vitest — 1295 unit tests
-npm run test:e2e                # playwright, incl. 15 axe WCAG 2.1 A/AA audits
+npm run typecheck    # tsc across root, e2e, web and mobile
+npm run lint         # eslint --max-warnings=0
+npm test             # vitest
+npm run format:check # prettier --check .
 ```
 
-`.github/workflows/ci.yml` runs the first four on every push and pull request. The browser
-suite runs nightly and on demand instead, because filling an ingest tile means querying a
-public Overpass instance and doing that on every push is how a project gets blocked.
+`.github/workflows/ci.yml` runs all four on every push and every pull request, and `master` only
+deploys behind them. **The browser suite is not part of that tick.** `npm run test:e2e` — Playwright
+against a real browser, including axe WCAG 2.1 A/AA audits — runs nightly and on demand only, so a
+green PR does not mean Playwright passed. Filling an ingest tile means querying a public Overpass
+instance, and doing that on every push is how a project gets blocked. Run it locally, where the
+tile is already there.
 
-`npm test` prints a Prisma error mid-run. That is `packages/db/test/spatial.test.ts`
-deliberately asserting that `rating: 6` violates the `reviews_rating_range` constraint — the
-run is green.
+`npm test` prints a Prisma error mid-run: `packages/db/test/spatial.test.ts` deliberately asserts
+that `rating: 6` violates the `reviews_rating_range` constraint. The run is green.
 
-The unit tests cover the things that are wrong in ways nobody notices: terrarium decode
-against known survey elevations, gain/loss on a synthetic profile, Tobler pace against
-published tables, off-route distance, quadkey cover, route-type classification, difficulty
-boundaries, and every colour token's contrast ratio against every surface it is permitted on.
+## Data and attribution
 
-The Playwright suite walks the real product — search, trail detail, the weather strip, filing
-a report, downloading a trail, cutting the network, and confirming the trail still opens. It
-starts with a `warm` project that requests every page once, so the dev server's first-request
-compile is paid before any assertion's clock is running rather than inside whichever spec
-happened to ask for a page first.
+| Layer                       | Source                            | Terms                                  |
+| --------------------------- | --------------------------------- | -------------------------------------- |
+| Trail geometry, names, tags | OpenStreetMap via Overpass        | **ODbL — attribution and share-alike** |
+| Elevation                   | AWS Terrain Tiles (terrarium PNG) | Public domain / CC-BY per tile source  |
+| Weather, air quality        | Open-Meteo                        | CC-BY, free tier is non-commercial     |
+| Base map                    | Protomaps PMTiles, self-hosted    | Open                                   |
+| Satellite                   | Esri World Imagery                | Free with attribution                  |
+| Photographs (seed)          | Wikimedia Commons, Mapillary      | CC variants — licence stored per photo |
+| Busy times                  | Our model over our own activity   | Ours, labelled **Estimated**           |
 
----
+**OpenStreetMap is ODbL: crediting it is a licence obligation, not a courtesy, and a derived
+database carries share-alike.** The credit is built into the map chrome and the `/attribution`
+page, and `e2e/trail.spec.ts` fails the build if it disappears.
 
-## Design
+Busy times are modelled, never measured — no API sells this — and the UI says which it is showing.
 
-`docs/design.md` has the direction. The short version: a USGS quadrangle is printed from five
-colour separations and every hiker who reads maps already knows the code, so we borrow the
-separation and give each plate exactly one job. Contour is elevation, water is weather,
-woodland is the trail, **survey — red — is you and your safety and nothing else**, and culture
-is structure. Colour is a legend here, not decoration.
+## Where to read next
 
-`packages/ui/test/tokens.test.ts` asserts the contrast ratios, so an ink cannot be nudged
-without the measurement being re-made.
-
----
-
-## Gated on an Apple Developer account
-
-Sign in with Apple is implemented end to end — Services ID, the `.p8` → `client_secret` JWT
-generator, rotation script, and the native `expo-apple-authentication` path — and sits behind
-`AUTH_APPLE_ENABLED=false`. Setup is written up in `docs/auth-apple.md`; flip the flag on
-enrolment day. Until then Microsoft Entra ID is live and fully testable, and iOS runs in Expo
-Go and the simulator. TestFlight needs the $99/yr membership.
-
-Two other things are deliberately absent. **National Geographic maps** are licensed content
-and cannot be cloned. **Apple Watch** needs a native watchOS target, which Expo does not
-build; GPX and FIT export ship instead, so a Garmin works today.
+- [docs/architecture.md](docs/architecture.md) — the system in diagrams: lazy ingest, along-trail
+  weather, offline, auth, and the design decisions recorded once.
+- [docs/design.md](docs/design.md) — the five-plate USGS palette, the rules that follow from it,
+  and what every screen looks like.
+- [docs/mobile.md](docs/mobile.md) — the iOS app, and why its map is a WebView.
+- [docs/auth-apple.md](docs/auth-apple.md) — Sign in with Apple: implemented end to end, dark
+  behind `AUTH_APPLE_ENABLED=false` until there is an Apple Developer account.
+- [infra/azure/README.md](infra/azure/README.md) — the production Postgres, provisioned from Bicep.
