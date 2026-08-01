@@ -1,30 +1,20 @@
 /**
- * Requeue jobs that failed for a reason that has since been fixed.
- *
- * A `dead` job is not a job that can never succeed — it is a job that exhausted its
- * attempts against the code as it stood. When the defect that killed it is repaired, the
- * work is still owed, and the queue has no way to know that on its own. This is the
- * manual counterpart to the automatic backoff: an operator saying "the reason is gone."
+ * Requeue jobs that failed for a reason since fixed — a `dead` job is one that exhausted its
+ * attempts against the code as it stood, and the queue cannot know the reason is gone.
  *
  *   npx tsx scripts/requeue-jobs.ts --kind enrich_trail
  *   npx tsx scripts/requeue-jobs.ts --kind enrich_trail --match "primaryPhotoId"
  *
- * Resets `attempts` to 0 and `runAfter` to now, so a requeued job runs immediately with a
- * full budget rather than resuming a backoff it earned under the old bug, and clears the
- * `completedAt` the drainer stamped when it gave up — a queued job that claims to have
- * finished is a row every later query has to second-guess.
+ * Resets `attempts` and `runAfter` so a requeued job runs immediately with a full budget
+ * rather than resuming a backoff earned under the old bug, and clears the `completedAt` the
+ * drainer stamped when it gave up.
  */
 import { JobKind, prisma } from '@switchback/db';
 
 /**
- * Every kind the queue knows, read from the enum rather than listed by hand.
- *
- * The hand-written version went stale the moment route planning introduced a kind, and it
- * went stale in the worst possible direction: the kinds this refused to accept —
- * `ingest_route` and `ingest_network` — were precisely the two that had started dying. An
- * operator repair tool that cannot name the broken thing is worse than none, because it
- * reads as "nothing dead to requeue". Deriving it means a new kind is requeueable the day
- * the schema gains it.
+ * Read from the enum, not listed by hand: the hand-written version went stale in the worst
+ * direction — the kinds it refused were exactly the ones that had started dying, so it read
+ * as "nothing dead to requeue".
  */
 const KINDS: readonly string[] = Object.values(JobKind);
 
@@ -58,8 +48,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Grouped so the operator sees what they are reviving, not just a count. A dead job with
-  // an error nobody recognises is a reason to stop, not to retry harder.
+  // Grouped so the operator sees what they are reviving: a dead job with an error nobody
+  // recognises is a reason to stop, not to retry harder.
   const byError = new Map<string, number>();
   for (const job of doomed) {
     const key = (job.lastError ?? 'no error recorded').slice(0, 100);

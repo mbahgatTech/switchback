@@ -1,51 +1,20 @@
 /**
- * Which accounts were reached by linking on an email address, and which of those are a
- * suspected takeover.
- *
- * Context. `app/api/auth/mobile/exchange/route.ts` links a provider identity onto an existing
- * user when the email matches and the provider vouches for the address. Until now
- * `auth-native.ts` said Entra vouched for every address it sent, which was wrong — Entra's
- * `email` claim is a tenant-mutable directory attribute, we sign against `/common`, and a
- * free tenant is minutes of work. So the guard that was supposed to stop silent linking was
- * unreachable for the only provider production has enabled, and anybody could have been
- * merged onto anybody's account. That is closed: Entra is now never verified.
- *
- * **What this script is for, corrected.** It used to say that removing the branch would strand
- * the people it lists, and gate the removal on migrating them first. That was wrong, and the
- * route says so plainly: `prisma.account.create` sits after the inner if/else, inside the outer
- * `else`, so it runs on the *link* path as well as the create path. Every identity ever linked
- * by email therefore already has an `Account` row keyed on (provider, providerAccountId), and
- * its next sign-in resolves through the `existing` lookup at the top of the route and never
- * reaches the email branch again. Deleting `if (byEmail) { userId = byEmail.id }` cannot take
- * an account away from anybody. What it changes is only which *future* unknown-sub sign-ins are
- * allowed to link.
- *
- * So this is not a blocker count. It is a list of links that were already made, and the reason
- * to read it is that for one provider each of those links is the takeover the fix now prevents:
- *
- * - **`microsoft-entra-id`** — the link rested on a claim we now know is forgeable, from the
- *   provider the attack was written against. Every such row is a *suspected takeover* and
- *   wants reviewing and reversing, not cementing.
- * - **anything else** (`apple`) — the link rested on `email_verified` that Apple asserts and
- *   controls. Ordinary account linking, nothing to do.
+ * Lists accounts that were reached by linking on an email address, and flags which of those
+ * are a suspected takeover.
  *
  *   npx tsx --env-file-if-exists=.env scripts/report-email-linked-accounts.ts
  *
- * Read-only. It writes nothing and takes no flags.
+ * Read-only; writes nothing and takes no flags. A `microsoft-entra-id` link rested on a claim
+ * now known to be forgeable (a tenant-mutable directory attribute, signed against `/common`)
+ * and wants reviewing and reversing. Any other provider's link rested on an `email_verified`
+ * that provider asserts and controls — ordinary linking, nothing to do.
  *
- * **How a linked account is recognised.** There is no column that records it, so it is read
- * off the shape of the rows. The native exchange route creates its `Account` with four fields
- * and no tokens; the Auth.js Prisma adapter, which is the only other thing that writes this
- * table, always stores the provider's token set. So a `type = 'oidc'` account with every
- * token column null was written by the exchange route. Of those:
- *
- * - one sitting **beside another account on the same user** is a link. The user already
- *   existed under a different identity, and this row was bolted on by email.
- * - one that is **the user's only account** is an ordinary first sign-in: the same call that
- *   wrote it created the user.
- *
- * The heuristic errs toward calling a row a link, which is the safe direction for something
- * whose output is "look at this by hand".
+ * No column records that a link happened, so it is read off the shape of the rows: the native
+ * exchange route writes an `Account` with four fields and no tokens, while the Auth.js Prisma
+ * adapter — the only other writer of this table — always stores the provider's token set. A
+ * tokenless `type = 'oidc'` row sitting *beside another account on the same user* is a link;
+ * one that is the user's only account is an ordinary first sign-in. The heuristic errs toward
+ * calling a row a link, which is the safe direction for a "look at this by hand" report.
  */
 import { prisma } from '@switchback/db';
 
@@ -59,10 +28,8 @@ const NATIVE_ACCOUNT = {
 } as const;
 
 /**
- * The provider whose `email` claim was never worth trusting.
- *
- * `auth-native.ts` now sets `emailVerified: false` for it unconditionally, so no new row can
- * be created this way. The ones already here were.
+ * `auth-native.ts` now sets `emailVerified: false` for this provider unconditionally, so no
+ * new row can be created this way. The ones already here were.
  */
 const FORGEABLE_EMAIL_PROVIDER = 'microsoft-entra-id';
 
@@ -81,11 +48,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  /*
-   * One query for the sibling count rather than one per account: this table is small today
-   * and would still be small at a hundred times the size, but a per-row query here is the
-   * kind of thing that gets copied into somewhere it is not.
-   */
+  // One query for the sibling count rather than one per account.
   const userIds = [...new Set(native.map((account) => account.userId))];
   const siblings = await prisma.account.groupBy({
     by: ['userId'],
@@ -118,10 +81,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  /*
-   * The ids, not the addresses. This is a report an operator reads out of a terminal and may
-   * paste into an issue; a list of users' email addresses does not belong in either.
-   */
+  // Ids, not addresses: this report gets pasted into issues.
   if (suspect.length > 0) {
     console.log(`\nSUSPECTED TAKEOVER — ${suspect.length} link${plural(suspect.length)} on:`);
     for (const account of suspect) console.log(`  user ${account.userId}  account ${account.id}`);

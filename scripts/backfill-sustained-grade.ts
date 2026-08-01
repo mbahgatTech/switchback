@@ -1,31 +1,18 @@
 /**
- * Re-measure the steepest sustained grade over trails already in the database.
- *
- * `maxSustainedGrade` slid its window's tail forward to keep the run under 100 m, which on
- * any profile whose resampled step lands a hair *over* 25 m left a run of 75.6 m — below its
- * own tolerance, so the reading was skipped, and since the tail never moves back, every later
- * reading was skipped too. The function returned its initial 0. Profiles spaced a hair
- * *under* 25 m never tripped it, and that coin flip is the whole population split: of 55,842
- * stored profiles, 13,163 hold a literal 0, and 1,433 of those climb more than 200 m — the
- * Mist Trail among them, reporting a steepest grade of 0% under a stat block saying it gains
- * 748 m.
- *
- * Nothing about those rows changes when the measurement is fixed, so they will never learn
- * about it on their own. This re-runs it over the stored profile — no Overpass, no terrain
- * tiles, no network at all — and reclassifies difficulty with the answer, because grade sets
- * a floor there (25% is at least moderate, 35% at least hard) and a trail measured at 0 was
- * classified with that floor silently absent.
+ * Re-measure the steepest sustained grade over trails already in the database, and reclassify
+ * difficulty with the answer — grade sets a floor there (25% at least moderate, 35% at least
+ * hard), so a trail measured at 0 was classified with that floor silently absent.
  *
  *   npx tsx scripts/backfill-sustained-grade.ts            # report only, changes nothing
  *   npx tsx scripts/backfill-sustained-grade.ts --apply    # write the corrections
  *
- * Dry run is the default, and the report to read before applying is the count of trails
- * still reading 0% under real climb: that is the defect, and it should come out at zero.
+ * Dry run is the default. The report to read before applying is the count of trails still
+ * reading 0% under real climb: that is the defect, and it should come out at zero.
  *
- * Length, gain and loss are deliberately left alone. They are computed over the *mirrored*
- * profile for a trail with an implied return leg, and this script cannot tell from a row
- * whether that happened — but the grade is unaffected by mirroring, because a retraced leg
- * repeats the same pitches it just climbed.
+ * Re-runs over the stored profile — no Overpass, no terrain tiles, no network. Length, gain
+ * and loss are deliberately left alone: they are computed over the *mirrored* profile for a
+ * trail with an implied return leg and this script cannot tell from a row whether that
+ * happened, whereas grade is unaffected by mirroring.
  */
 import type { ElevationPoint } from '@switchback/core';
 import { classifyDifficulty } from '@switchback/core';

@@ -1,35 +1,23 @@
 /**
- * Re-derive stored elevation profiles through the spike filter, and correct the statistics
- * that were computed from the holes.
- *
- * `despike` is new. Every profile ingested before it went in was written straight from the
- * terrain tiles, so a tile that reads sea floor where it should read beach is still sitting in
- * the corpus — and `computeGainLoss` faithfully counts the descent into the hole and the climb
- * back out. Kalaloch Beaches, a flat walk along the Washington coast, publishes kilometres of
- * ascent it does not have.
- *
- * Nothing about those rows changes on its own, because nothing re-reads a profile once it is
- * stored. This runs the filter over the samples already in the database — no Overpass, no
- * terrain tiles, no network at all, because every elevation it needs is in the profile — and
- * rewrites the eight statistics derived from elevation.
+ * Re-derive stored elevation profiles through the spike filter and correct the eight
+ * statistics computed from the holes. Profiles ingested before `despike` were written straight
+ * from the terrain tiles, and `computeGainLoss` faithfully counts the descent into a bad tile
+ * and the climb back out.
  *
  *   npx dotenv -e .env -- npx tsx scripts/repair-dem-spikes.ts            # report only
  *   npx dotenv -e .env -- npx tsx scripts/repair-dem-spikes.ts --apply    # write it
  *
- * `despike` and `fillGaps` are run over the stored samples directly rather than through
- * `buildProfile`, and the difference is not a shortcut. `buildProfile` resamples distance from
- * the coordinates and rounds every reading to a tenth; the corpus predates that rounding, so
- * putting stored profiles back through it moves 38,651 of them by up to 5 cm a sample and
- * drifts the length of the longest by tens of metres. Running the two filters alone changes
- * exactly the samples the filter rejects and leaves every other number bit-identical.
+ * Runs over the samples already stored — no Overpass, no terrain tiles, no network.
+ *
+ * `despike` and `fillGaps` are applied directly rather than through `buildProfile`, and that
+ * is not a shortcut: `buildProfile` resamples distance from the coordinates and rounds every
+ * reading to a tenth, which the corpus predates, so round-tripping through it would move
+ * 38,651 profiles and drift the longest by tens of metres. The two filters alone change
+ * exactly the rejected samples and leave every other number bit-identical.
  *
  * `lengthM` is never written, for the same reason: despiking touches elevation and nothing
- * else, so a length that moved would mean this script had misread the geometry rather than
- * repaired it. The run reports any such trail and refuses to write it.
- *
- * Mirroring is rediscovered the way every reader has to rediscover it — `hikedProfile`
- * compares the stored geometry against `lengthM`, because the row does not record whether
- * ingest doubled the profile before measuring it. See the note on `derive.ts`.
+ * else, so a length that moved would mean this misread the geometry. Such a trail is reported
+ * and refused.
  */
 import type { ElevationPoint } from '@switchback/core';
 import { classifyDifficulty } from '@switchback/core';

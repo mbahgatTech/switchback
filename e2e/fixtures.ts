@@ -6,45 +6,17 @@ import {
   type Page,
 } from '@playwright/test';
 
-/**
- * Shared ground for the browser suite.
- *
- * Two things live here that every spec needs: a way to be signed in, and a way to talk to
- * the same map the browser is looking at.
- */
-
-// ---------------------------------------------------------------------------
-// The probe account
-// ---------------------------------------------------------------------------
+/** Shared ground for the browser suite: a way to be signed in, and a way to talk to the map. */
 
 /**
- * A database session row, not a sign-in flow.
- *
- * Driving Entra ID from a headless browser would test Microsoft's login page, which is not
- * ours and is not the thing under test; it would also make the suite depend on a live
- * tenant and a real credential. Auth.js keeps web sessions in the database, so a row with a
- * known token *is* a signed-in user by the same code path a real one takes — the cookie is
- * looked up, the session is loaded, `ctx.user` is populated. Everything downstream of the
- * identity provider is exercised for real; only the provider itself is skipped.
- *
- * Created by `seedProbeAccount` in `packages/db/scripts/seed.ts`, so `npm run db:seed` is
- * all a fresh clone needs. If it is missing the review spec fails at its first assertion
- * with "Sign in", which is the correct and legible failure.
+ * A database session row, not a sign-in flow — driving Entra ID headless would test
+ * Microsoft's login page and tie the suite to a live tenant. Auth.js reads web sessions from
+ * the database, so everything downstream of the identity provider still runs for real.
+ * Created by `seedProbeAccount`, so `npm run db:seed` is all a fresh clone needs.
  */
 export const PROBE_SESSION_TOKEN = 'probe-session-token-switchback';
 
-// ---------------------------------------------------------------------------
-// Where we look
-// ---------------------------------------------------------------------------
-
-/**
- * Vesper Peak, which is where this suite exists.
- *
- * The reader's report was "I search Vesper peak and get nothing… no map cant check
- * places", so the suite opens on the same mountain rather than on a synthetic fixture. At
- * z13 the sheet holds twenty-odd trails from a tile that is already ingested, so nothing
- * here waits on Overpass.
- */
+/** Vesper Peak: at z13 the sheet holds twenty-odd trails from an already-ingested tile. */
 export const VESPER = {
   slug: 'vesper-peak-summit-trail',
   name: 'Vesper Peak summit trail',
@@ -56,20 +28,13 @@ export const VESPER = {
 export const REPORT_TRAIL = { slug: 'greider-lakes-trail' } as const;
 
 /**
- * A trail long enough that the section's annotations fight for room.
- *
- * 3,404 km, with its high point roughly 240 km in — 7% of the way across the plot, which is
- * near enough to the trailhead that the two weather callouts were drawn on top of each other:
- * `TRAILHEAD 07:0HIGH POINT 09:54` on one line, two interleaved temperatures on the next. A
- * day hike puts its summit halfway along and proves nothing about this.
+ * A trail long enough that the section's annotations fight for room: 3,404 km with its high
+ * point 7% along, which is where the two weather callouts overprinted. A day hike puts its
+ * summit halfway and proves nothing about this.
  */
 export const LONG_TRAIL = { slug: 'appalachian-trail-dauphin-county' } as const;
 
 export const SHEET_AT_VESPER = `/?${VESPER.view}`;
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 interface Fixtures {
   /** A page whose context already carries the probe session cookie. */
@@ -79,9 +44,8 @@ interface Fixtures {
 export const test = base.extend<Fixtures>({
   signedInPage: async ({ browser, baseURL }, use) => {
     const origin = baseURL ?? 'http://localhost:3000';
-    // A context of its own rather than the shared `page`: a cookie added to the default
-    // context would leak into whichever spec ran next in the same worker, and "why is this
-    // signed in" is a miserable thing to debug.
+    // Its own context: a cookie on the default context leaks into whichever spec runs next
+    // in the same worker.
     const context = await browser.newContext({
       baseURL: origin,
       viewport: { width: 1400, height: 900 },
@@ -98,22 +62,14 @@ export const test = base.extend<Fixtures>({
 
 export { expect };
 
-// ---------------------------------------------------------------------------
-// The sheet
-// ---------------------------------------------------------------------------
-
 /** The map container, found the way a screen reader finds it. */
 export function sheetOf(page: Page): Locator {
   return page.getByRole('region', { name: 'Map of trails in the current view' });
 }
 
 /**
- * Open the sheet and hand back the map region.
- *
- * `domcontentloaded`, not the default `load`. A MapLibre canvas streams tiles for as long
- * as it is on screen, so `load` on this route resolves late or not at all — which is what
- * made an earlier attempt at this suite hang for half an hour rather than fail. Every wait
- * after this point is a wait on something specific.
+ * Open the sheet and hand back the map region. `domcontentloaded`, not `load`: a MapLibre
+ * canvas streams tiles for as long as it is on screen, so `load` here resolves late or never.
  */
 export async function openSheet(page: Page, search: string = SHEET_AT_VESPER): Promise<Locator> {
   await page.goto(search, { waitUntil: 'domcontentloaded' });
@@ -123,23 +79,14 @@ export async function openSheet(page: Page, search: string = SHEET_AT_VESPER): P
 }
 
 /**
- * Wait until trails are actually in the map's data source, and say how many.
- *
- * `data-trails` is written by `reportLanded` in `trail-map.tsx` on the one path where
- * `setTrailData` returned true, so it is a claim about the GeoJSON source rather than about
- * the React render. That distinction is the entire point: the bug this suite was written
- * for had a correct query, a correct response, a component that rendered with twenty trails
- * in its props — and an empty sheet, because the push landed on a listener that never fired.
- * Asserting on the props would have passed.
+ * Wait until trails are in the map's GeoJSON source, and say how many. `data-trails` is a
+ * claim about the source, not the React render: the bug this suite was written for rendered
+ * twenty trails in its props onto an empty sheet, so asserting on props would have passed.
  */
 export async function expectTrailsLanded(sheet: Locator): Promise<number> {
   await expect(sheet).toHaveAttribute('data-trails', /^[1-9]\d*$/, { timeout: 90_000 });
   return Number(await sheet.getAttribute('data-trails'));
 }
-
-// ---------------------------------------------------------------------------
-// Clicking a line on a canvas
-// ---------------------------------------------------------------------------
 
 export interface Camera {
   zoom: number;
@@ -148,12 +95,8 @@ export interface Camera {
 }
 
 /**
- * Read the camera back out of the address bar.
- *
- * The sheet writes `map=zoom/lat/lng` after every settled move, which makes the URL the one
- * published, non-private handle on where the map actually is. Reading it rather than
- * assuming the value we navigated with means a spec that clicks the canvas is projecting
- * against the real camera even if something moved it.
+ * Read the camera back out of the address bar. Reading it rather than assuming the value we
+ * navigated with means a spec projecting onto the canvas uses the real camera.
  */
 export function readCamera(url: string): Camera {
   const raw = new URL(url).searchParams.get('map');
@@ -178,13 +121,9 @@ function mercatorY(lat: number, world: number): number {
 }
 
 /**
- * Where a coordinate lands inside the map container, in CSS pixels.
- *
- * The same Web Mercator MapLibre uses, and exact for the sheet's camera because explore
- * never pitches or rotates it — a pitched map would need the full perspective matrix and
- * this would silently drift instead of failing. Clicking a trail line is the interaction
- * the reader described and the only one that cannot be reached through the DOM, so it is
- * worth the twelve lines of arithmetic.
+ * Where a coordinate lands inside the map container, in CSS pixels. Exact only because
+ * explore never pitches or rotates the camera; a pitched map needs the full perspective
+ * matrix and this would silently drift instead of failing.
  */
 export function project(
   camera: Camera,
@@ -198,18 +137,10 @@ export function project(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Talking to the API the app talks to
-// ---------------------------------------------------------------------------
-
 /**
- * Call a tRPC query over HTTP.
- *
- * Specs use this to learn what the sheet is *supposed* to be showing — the geometry to aim
- * a click at, the id of a trail to clean up afterwards — never to assert with. An assertion
- * that both fetches and checks the same value through the same layer proves nothing.
- *
- * The `{ json: … }` wrapper is superjson's envelope, which is how the real clients send it.
+ * Call a tRPC query over HTTP. Specs use this to learn what the sheet is *supposed* to show,
+ * never to assert with: a check that fetches and asserts through the same layer proves nothing.
+ * The `{ json: … }` wrapper is superjson's envelope, as the real clients send it.
  */
 export async function trpcQuery<T>(
   request: APIRequestContext,
