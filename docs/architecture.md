@@ -133,7 +133,7 @@ sequenceDiagram
   W-->>T: the strip, plus flags (dark, freezing, gusts, AQI)
 ```
 
-![A trail, its section, and the weather along it](screenshots/product/trail-detail-1400.png)
+![A trail, its section, and the weather along it](screenshots/product/trail-1400.png)
 
 Three details carry the feature. Elevation is **sent**, not inferred — left alone Open-Meteo uses the
 model cell's average, which over mountains can sit hundreds of metres below the summit; our own DEM
