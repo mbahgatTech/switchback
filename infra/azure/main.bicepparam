@@ -41,6 +41,42 @@ param location = 'northcentralus'
 param resourceGroupName = 'rg-switchback-prod-northcentralus'
 param serverNamePrefix = 'psql-switchback-prod'
 
+// `CanNotDelete` on the resource group — see the long note beside the lock in main.bicep for
+// what it protects and what it deliberately does not.
+//
+// **This needs a role the deployment service principal does not have.** Creating a lock is
+// `Microsoft.Authorization/locks/write`, and built-in Contributor lists
+// `Microsoft.Authorization/*/Write` in its `notActions`. Attempted 2026-08-01 against this
+// exact resource group with the subscription's deploying principal, which holds Contributor at
+// subscription scope and nothing else:
+//
+//   ERROR: (AuthorizationFailed) The client '3ac53469-d72f-4813-b5e8-4bbf937cc76d' with object
+//   id 'cf940ed6-1527-47be-9168-3406ef977827' does not have authorization to perform action
+//   'Microsoft.Authorization/locks/write' over scope '/subscriptions/5cb9e7c3-.../
+//   resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Authorization/locks/
+//   switchback-prod-no-delete' or the scope is invalid.
+//
+// The same error comes back with the lock scoped to the server instead, so it is the action
+// that is denied and not the scope. And it is not only `az deployment sub create` that stops:
+// `az deployment sub what-if` runs the same preflight authorization check and fails outright
+// with `InvalidTemplateDeployment`, so a Contributor cannot even *preview* a deployment while
+// this is on. That is why this is an environment override rather than a hard-coded `true`.
+//
+// The committed intent is `true` — the lock should exist, and a what-if that reports it as
+// missing is telling the truth. An operator who does not hold the role exports
+// `DEPLOY_DELETE_LOCK=false` for their run, which is enough to get what-if and a redeploy
+// working again, and it leaves a visible trace in the shell rather than a quiet edit to this
+// file that nobody puts back. Remove the override once an Owner has placed the lock with:
+//
+//   az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
+//     --resource-group rg-switchback-prod-northcentralus --notes "<see main.bicep>"
+//
+// Note the `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` — also
+// stops a Contributor removing the lock afterwards. The principal the lock defends against
+// cannot lift it, which is the entire point.
+param deployDeleteLock = bool(readEnvironmentVariable('DEPLOY_DELETE_LOCK', 'true'))
+
+
 // Burstable B2s: 2 vCore, 4 GiB, 414 user connections, ~38% of the monthly credit. The
 // General Purpose escalation — which is the only way to get the built-in PgBouncer — is
 // `tier = 'GeneralPurpose'` and `skuName = 'Standard_D2ds_v5'`; PgBouncer, the pooled port

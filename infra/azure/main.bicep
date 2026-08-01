@@ -16,11 +16,14 @@
 // existing server rather than provisioning beside it.
 //
 // **"No-op" is a claim someone will check, so here is what checking it actually shows.**
-// Measured with `az deployment sub what-if` against the live deployment: 18 changes, 11
-// `NoChange`, and a residue that never converges no matter how many times it is applied. All
-// of it is either a value ARM will not read back or a value ARM rewrites on read. Nothing in
-// the list changes behaviour, and the list is written down so nobody spends an afternoon on it
-// a second time.
+// Re-measured 2026-08-01 with `az deployment sub what-if` against the live deployment: 18
+// changes — 11 `NoChange`, 6 `Modify`, 1 `Create`. Most of it is residue that never converges,
+// because it is either a value ARM will not read back or a value ARM rewrites on read. Two
+// items are not residue: they are real, and they converge the moment this template is next
+// deployed. The list is written down so nobody spends an afternoon on it a second time, and
+// the two halves are kept apart so nobody dismisses the second half as more of the first.
+//
+// ---- Permanent residue. Nothing here changes behaviour. ----
 //
 // 1. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
 //    is passed is written. Pass the *same* value every time — a redeploy with a freshly
@@ -37,7 +40,9 @@
 //      Modify properties.source: "system-default" -> "user-override"
 //
 //    on each of them, forever. The *values* are correct and are what postgres.bicep intends —
-//    verified with `az postgres flexible-server parameter show`.
+//    re-verified 2026-08-01 with `az postgres flexible-server parameter list`, which reports
+//    `require_secure_transport = ON`, `ssl_min_protocol_version = TLSv1.2`,
+//    `connection_throttle.enable = on` and `azure.extensions = POSTGIS,PG_TRGM,BTREE_GIST`.
 //
 // 3. The server resource reports the deletion of five properties the template does not
 //    declare, because they are provider-assigned and only exist on read:
@@ -51,10 +56,35 @@
 //    and `metrics` arrays as changed. Same cause: `AzureDiagnostics` is the provider's default
 //    fill-in, and what-if compares arrays it cannot match by identity.
 //
-// The budget window used to be item 5, because `budgetStartDate` defaulted to `utcNow()`. It
-// is now a fixed timestamp passed from main.bicepparam with an explicit `endDate`, in the
-// exact form ARM stores (`2026-07-01T00:00:00Z`, not `2026-07-01` — the short form deploys
-// identically and then diffs forever), and it converges.
+// ---- Not residue. These two are real and this template is the correct side of them. ----
+//
+// 5. `switchback-database`, the resource-group-scoped budget in monitoring.bicep, reports as
+//    `Create` because **it does not exist**. Confirmed directly rather than inferred from the
+//    what-if:
+//
+//      az rest --method get --url ".../rg-switchback-prod-northcentralus/providers/
+//        Microsoft.Consumption/budgets?api-version=2023-05-01"   ->   { "value": [] }
+//
+//    monitoring.bicep argues at length for why this budget is the only one whose number is
+//    about Postgres. That argument has been true and undeployed since it was written.
+//
+// 6. `switchback-monthly-credit` reports `Modify`: the live budget still carries the old
+//    graded ramp — notifications `half` (50%), `threeQuarters` (75%), `nearlyOut` (90%) —
+//    while this file declares the two-notification design the long comment beside the budget
+//    below explains, `nearlyOut` (90%) and `overCredit` (100%). `az consumption budget list`
+//    reports `notifications: half,nearlyOut,threeQuarters`. So the reasoning below describes
+//    an intent, not the deployed state, until the next deployment.
+//
+// Both of 5 and 6 are fixed by deploying, not by editing this file. Neither was converged at
+// the time this note was written, because doing so means passing `administratorLoginPassword`
+// and item 1 makes that the one operation on this list that is worth being certain about
+// first — a redeploy carrying the wrong value rotates the production credential.
+//
+// The budget window used to be on this list, because `budgetStartDate` defaulted to
+// `utcNow()`. It is now a fixed timestamp passed from main.bicepparam with an explicit
+// `endDate`, in the exact form ARM stores (`2026-07-01T00:00:00Z`, not `2026-07-01` — the
+// short form deploys identically and then diffs forever), and it converges: the live budget
+// reads back `2026-07-01T00:00:00Z` / `2036-07-01T00:00:00Z` and neither appears above.
 //
 //   openssl rand -hex 32 > "$TMP/pgpw"
 //   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
@@ -114,6 +144,37 @@ param location string = 'northcentralus'
 
 @description('Resource group to create. Dedicated to this workload — see the file header.')
 param resourceGroupName string = 'rg-switchback-prod-northcentralus'
+
+@description('''
+Whether to place a `CanNotDelete` lock on the resource group. See the lock resource below for
+what it protects and what it does not.
+
+Default `true`, because a production database with no delete lock is the default this template
+should not have. It is a parameter rather than unconditional for one measured reason: creating
+a lock needs `Microsoft.Authorization/locks/write`, and the built-in **Contributor** role does
+not have it. Contributor's `notActions` — read back from this subscription with
+`az role definition list --name Contributor --query "[0].permissions[0].notActions"` — are:
+
+  Microsoft.Authorization/*/Delete
+  Microsoft.Authorization/*/Write        <-- covers locks/write
+  Microsoft.Authorization/elevateAccess/Action
+  ...
+
+So a principal holding only Contributor — which is what the deployment service principal on
+this subscription holds, and nothing more — cannot deploy this template with the lock enabled.
+It fails with `AuthorizationFailed` before anything else happens, which would take the
+README's "redeploy is a no-op" path with it, and that path is also the only documented way to
+reapply the *same* admin password. Set this to `false` in that situation, deploy, and have
+someone with Owner or User Access Administrator create the lock separately:
+
+  az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \\
+    --resource-group rg-switchback-prod-northcentralus --notes "..."
+
+Note the same `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` —
+also stops a Contributor **removing** the lock once an Owner has placed it. That asymmetry is
+the whole point: the principal the lock defends against cannot lift it.
+''')
+param deployDeleteLock bool = true
 
 @description('''
 Prefix for the server name. The deployed name is `<prefix>-<uniqueString(rg.id)>`.
@@ -311,6 +372,66 @@ resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: resourceGroupName
   location: location
   tags: tags
+}
+
+// ---------------------------------------------------------------------------------------
+// The delete lock.
+//
+// **What this is actually defending against, stated concretely.**
+//
+// Everything in this resource group can be rebuilt from this template in about fifteen
+// minutes — except the data, which cannot be rebuilt from anything in this repository. The
+// server holds every user account, every recorded GPS track, and 19,157 trails. Deleting a
+// Flexible Server takes its automated backups with it: there is no recycle bin, no soft
+// delete, and no "restore the server I deleted yesterday". The recovery story for a deleted
+// server is the Neon copy named in the `rollback` tag, and that copy stops being current the
+// moment cutover finishes.
+//
+// The realistic ways it goes:
+//
+//   - `az group delete -g rg-switchback-prod-northcentralus` typed against the wrong shell,
+//     or with the wrong subscription selected. `az account show` says `Visual Studio
+//     Enterprise Subscription` here and on the other workload in this subscription too.
+//   - Any principal with **Contributor** — which the deployment service principal has, at
+//     *subscription* scope, not scoped to this group — has `Microsoft.Resources/*/delete`.
+//     Contributor is the role people are given so they can deploy; deleting production is
+//     included in it for free, and nothing about the grant says so.
+//   - A cleanup script that enumerates resource groups and removes ones it does not
+//     recognise. `rg-switchback-prod-northcentralus` was created 2026-07-30 and is the newest
+//     group in the subscription.
+//
+// The lock is at **resource-group** scope rather than on the server, and that is a choice
+// worth defending. A server-scoped lock leaves `az group delete` blocked too — ARM refuses to
+// delete a group containing any locked resource — so the headline protection is the same. But
+// a group-scoped lock additionally covers the things that make an incident legible after the
+// fact: `log-switchback-prod`, which holds the `log_connections` audit trail postgres.bicep
+// exists to produce, and the two metric alerts and the action group, which are what would
+// notice the next problem. Losing those is not as bad as losing the database, and it is bad
+// enough to be worth the same one line of configuration.
+//
+// **What it does not do, so nobody mistakes it for more than it is.** `CanNotDelete` blocks
+// delete. It does not block `DROP TABLE`, it does not block a bad migration, and it does not
+// block writes of any kind — a lock is an ARM control-plane control and Postgres is a data
+// plane it has no visibility into. It also does not stop an Owner: removing it is one command,
+// which is correct, because the point is to make destruction deliberate rather than
+// impossible.
+//
+// **Status at the time this was committed: the lock is declared here and is NOT yet live.**
+// Creating it needs `Microsoft.Authorization/locks/write`, the service principal that deploys
+// this subscription holds only Contributor, and Contributor's `notActions` exclude exactly
+// that. The attempt and its verbatim error are in the pull request. Until someone with Owner
+// or User Access Administrator applies it, `az deployment sub what-if` will report this
+// resource as a `Create` — that is an accurate to-do item, not template drift. See
+// `deployDeleteLock` above for the escape hatch a Contributor-only deployment needs.
+// ---------------------------------------------------------------------------------------
+
+module deleteLock 'lock.bicep' = if (deployDeleteLock) {
+  name: 'switchback-lock'
+  scope: rg
+  params: {
+    lockName: 'switchback-prod-no-delete'
+    lockNotes: 'Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and 19,157 trails, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it.'
+  }
 }
 
 module monitoring 'monitoring.bicep' = {
