@@ -1,19 +1,11 @@
 /**
- * Trail difficulty.
- *
- * The base score is the Shenandoah National Park hiking-difficulty rating, which is
- * the most widely cited objective formula in US trail guides:
+ * Trail difficulty, from the Shenandoah National Park rating:
  *
  *     rating = sqrt(elevation_gain_ft * 2 * distance_mi)
+ *            = sqrt(SHENANDOAH_METRIC_CONSTANT * gain_m * distance_km)
  *
- * Expressed in metric inputs, the unit conversions fold into a single constant:
- *
- *     rating = sqrt(SHENANDOAH_METRIC_CONSTANT * gain_m * distance_km)
- *
- * That score alone is not enough, because it is blind to terrain. A 1.5 km scramble
- * with 300 m of gain scores 43 — "easy" — while actually requiring hands and a head
- * for exposure. So OSM's `sac_scale` acts as a floor, and sustained steepness bumps
- * the result up a band. Both adjustments only ever raise difficulty, never lower it.
+ * The score is blind to terrain, so `sac_scale` acts as a floor and sustained steepness bumps
+ * a band. Both adjustments only ever raise difficulty, never lower it.
  *
  * @see https://www.nps.gov/shen/planyourvisit/how-to-determine-hiking-difficulty.htm
  * @see https://wiki.openstreetmap.org/wiki/Key:sac_scale
@@ -22,14 +14,7 @@
 export const DIFFICULTIES = ['easy', 'moderate', 'hard'] as const;
 export type Difficulty = (typeof DIFFICULTIES)[number];
 
-/**
- * What a difficulty band is called on screen.
- *
- * Here rather than in each surface that prints one, because it had been written out three
- * times — the filter chips, the trail card and the selection panel — and a fourth was about
- * to be written for the route planner. Three copies of a display string is where a product
- * starts saying "Moderate" in one place and "Medium" in another.
- */
+/** What a difficulty band is called on screen. One source, so nothing says "Medium". */
 export const DIFFICULTY_LABELS: Record<Difficulty, string> = {
   easy: 'Easy',
   moderate: 'Moderate',
@@ -51,12 +36,10 @@ const BAND_MODERATE = 50;
 const BAND_HARD = 100;
 
 /**
- * Metric-input constant for the Shenandoah formula (see module docs).
- *
- * Derived from the international definitions — 1 ft = 0.3048 m and 1 mi = 1609.344 m, both
- * exact — rather than written as a rounded literal. Rounded conversion factors compound:
- * `3.28084 * 2 * 0.621371` gives 4.07742, which is off in the fifth digit and pulls our
- * ratings away from the published NPS numbers we validate against.
+ * Metric-input constant for the Shenandoah formula (see module docs). Keep it derived from the
+ * exact definitions (1 ft = 0.3048 m, 1 mi = 1609.344 m): a rounded literal such as
+ * `3.28084 * 2 * 0.621371` is off in the fifth digit and pulls ratings away from the NPS numbers
+ * the tests validate against.
  */
 export const SHENANDOAH_METRIC_CONSTANT = (1 / 0.3048) * 2 * (1000 / 1609.344);
 
@@ -79,10 +62,7 @@ export interface DifficultyInput {
   lengthM: number;
   /** OSM sac_scale, when the source data carries one. */
   sacScale?: SacScale | null;
-  /**
-   * Steepest sustained grade as a fraction (0.25 = 25%), measured over a window
-   * rather than between adjacent samples so DEM noise doesn't dominate.
-   */
+  /** Steepest sustained grade as a fraction (0.25 = 25%), measured over a window. */
   maxSustainedGrade?: number | null;
 }
 
@@ -144,36 +124,17 @@ export function classifyDifficulty(input: DifficultyInput): DifficultyResult {
 }
 
 /**
- * Ground too steep to hike up.
- *
- * "Hard" is the top band, and that is a problem the day the catalogue ingests something
- * like Mount Assiniboine — an OSM way tagged as a route, 6.9 km long, 1,981 m of ascent,
- * and a sustained grade of 147 %. Every one of those numbers is correct. Read together
- * under the word "Hard" they describe a long day out, and the thing they actually describe
- * is a technical alpine climb with a 55° face on it. A difficulty band cannot carry that,
- * because the scale it lives on ends before the terrain does.
- *
- * So this is a separate claim rather than a fourth band. Difficulty answers "how big a
- * day"; this answers "is this a hike at all", and the two are independent — a short steep
- * gully scores "easy" and still wants your hands.
- *
- * The thresholds are the ones the ground itself sets, not round numbers:
- *
- * - **70 % (35°)** is where a hiker starts using their hands on the way up. Below it a
- *   graded path can switchback; above it there is nowhere to put the switchback.
- * - **100 % (45°)** is where it stops being scrambling. Snow at this angle slides, rock at
- *   this angle is climbed rather than ascended, and no amount of fitness substitutes.
- *
- * Measured over `GRADE_WINDOW_M` — a hundred metres of ground, not one DEM sample — so a
- * single noisy pixel cannot trip it. What *can* still trip it honestly is a line that
- * crosses a cliff, which is exactly the case worth warning about.
+ * Ground too steep to hike up — a separate claim, not a fourth band. Difficulty answers "how big
+ * a day"; this answers "is this a hike at all", and a short steep gully scores easy on the first
+ * while still wanting your hands. Measured over `GRADE_WINDOW_M`, so one noisy DEM sample cannot
+ * trip it.
  */
 export const TERRAIN_CAUTIONS = ['scramble', 'climbing'] as const;
 export type TerrainCaution = (typeof TERRAIN_CAUTIONS)[number];
 
-/** 35° — hands come out of pockets. */
+/** 35° — hands come out of pockets; a graded path has nowhere to put a switchback. */
 const SCRAMBLE_GRADE = 0.7;
-/** 45° — it is a climb. */
+/** 45° — snow slides and rock is climbed rather than ascended. */
 const CLIMBING_GRADE = 1.0;
 
 export function terrainCaution(
@@ -185,14 +146,8 @@ export function terrainCaution(
   return null;
 }
 
-/**
- * What to say about it, in the product's own voice.
- *
- * Two sentences each: what the ground does, then where the figure came from. The second is
- * not a hedge — the grade is read off a 20 m elevation model, and on a cliff a model that
- * coarse is describing the cliff rather than the path across it. Someone standing at the
- * trailhead deciding whether to go up deserves to know which of those they are reading.
- */
+/** What to say about it. Each body names the ground and then the figure's provenance: the grade
+ * comes off a 20 m elevation model, which on a cliff describes the cliff, not the path across it. */
 export const TERRAIN_CAUTION_COPY: Record<TerrainCaution, { title: string; body: string }> = {
   scramble: {
     title: 'Steep enough to need your hands',

@@ -2,34 +2,13 @@ import { z } from 'zod';
 import { publicProfileSchema } from './profile';
 
 /**
- * What a hiker's record adds up to.
- *
- * The distinction this module keeps is between a *total* and a *record*. A total is the
- * sum of everything — how far, how much up, how many times out — and it only ever grows,
- * which makes it a poor thing to look at twice. A record is a single hike that was the
- * furthest, or the steepest, or the highest, and it is the part someone actually tells
- * people about. Both are here, and the UI is expected to give the records the room.
- *
- * Everything is derived from `Completion` joined to `Trail`, never stored. A denormalised
- * `user.totalDistanceM` would be one more column to keep true across a corrected date, a
- * deleted trail, and a re-ingested length, and the query below costs a single index scan
- * on `completions_userId_completedAt_idx`.
- *
- * **A hike is counted per completion, not per trail.** Somebody who has done the same
- * 12 km loop forty times has hiked 480 km. A figure that says 12 is describing the map.
+ * What a hiker's record adds up to: totals, standout hikes, and the cadence strip. Everything is
+ * derived from `Completion` joined to `Trail`, never stored — a denormalised total is one more
+ * column to keep true across a corrected date, a deleted trail and a re-ingested length. A hike
+ * is counted **per completion, not per trail**: the same 12 km loop done forty times is 480 km.
  */
 
-// ---------------------------------------------------------------------------
-// The shapes
-// ---------------------------------------------------------------------------
-
-/**
- * One hike that stands out — the longest, the biggest climb, the highest ground.
- *
- * Carries the trail's slug so the figure is a link. A record nobody can click through to
- * is trivia; a record that takes you back to the trail is the product remembering
- * something for you.
- */
+/** One hike that stands out. Carries the trail's slug so the figure can be a link. */
 export const hikeRecordSchema = z.object({
   trailId: z.string(),
   trailName: z.string(),
@@ -41,13 +20,8 @@ export const hikeRecordSchema = z.object({
 });
 export type HikeRecord = z.infer<typeof hikeRecordSchema>;
 
-/**
- * One month of the cadence strip.
- *
- * Months with no hiking are present with zeroes rather than omitted, because the gaps are
- * the information: a strip that skips December reads as a year of steady hiking, and a
- * strip with an empty December reads as a winter off.
- */
+/** One month of the cadence strip. Months with no hiking carry zeroes rather than being
+ * omitted — a strip that skips December reads as a year of steady hiking. */
 export const hikeMonthSchema = z.object({
   /** `YYYY-MM`, so it sorts as a string and needs no timezone to compare. */
   month: z.string().regex(/^\d{4}-\d{2}$/u),
@@ -73,10 +47,8 @@ export const hikerStatsSchema = z.object({
   trails: z.number().int().nonnegative(),
   lengthM: z.number().nonnegative(),
   gainM: z.number().nonnegative(),
-  /**
-   * Summed Tobler estimates, not measured time. Named for what it is so no UI is tempted
-   * to print it as though a stopwatch produced it — Phase 4's recordings are that number.
-   */
+  /** Summed Tobler estimates, not measured time. Named for what it is so no UI prints it as
+   * though a stopwatch produced it. */
   estimatedTimeS: z.number().nonnegative(),
 
   longest: hikeRecordSchema.nullable(),
@@ -115,14 +87,8 @@ export const EMPTY_HIKER_STATS: HikerStats = {
   photos: 0,
 };
 
-/**
- * A profile as anyone can read it.
- *
- * `hikesVisible` is the completed list's own `isPublic` flag, surfaced so the page can say
- * *why* a list of hikes is absent rather than rendering an unexplained hole. The stats
- * themselves are always public — an aggregate says how much someone hikes, and the thing
- * worth a privacy control is where and when, which is what the list holds.
- */
+/** A profile as anyone can read it. `hikesVisible` is the completed list's own `isPublic`, so
+ * the page can say *why* a list is absent. The stats themselves are always public. */
 export const hikerProfileSchema = z.object({
   profile: publicProfileSchema,
   stats: hikerStatsSchema,
@@ -140,12 +106,9 @@ export const hikerProfileSchema = z.object({
   ),
   hikesVisible: z.boolean(),
   /**
-   * What to put after `/lists/` to reach this hiker's completed list, or null if it is not
-   * readable by the caller.
-   *
-   * The key rather than the slug, because a list resolves by slug only for its owner — a
-   * stranger reaches it by id. Deciding that here, where the owner is known, is the
-   * difference between linking to someone's hikes and linking a reader to their own.
+   * What to put after `/lists/` to reach this hiker's completed list, or null when the caller
+   * cannot read it. The key, not the slug: a list resolves by slug only for its owner, so
+   * deciding it here stops a reader being linked to their own hikes.
    */
   completedKey: z.string().nullable(),
   /** True when the caller is looking at their own profile. */
@@ -153,39 +116,22 @@ export const hikerProfileSchema = z.object({
 });
 export type HikerProfile = z.infer<typeof hikerProfileSchema>;
 
-// ---------------------------------------------------------------------------
-// Limits
-// ---------------------------------------------------------------------------
-
 /**
- * How many months the cadence strip covers.
- *
- * Thirteen, not twelve. A twelve-month strip ending in July starts in August, so this
- * July sits at one end and last July is off the strip entirely — and "am I out more than
- * I was this time last year" is the one question a year of hiking is asked. Thirteen puts
- * both Julys on it, at opposite ends, which is exactly where a comparison wants them.
+ * How many months the cadence strip covers. Thirteen, not twelve: a twelve-month strip ending in
+ * July puts last July off the end, and that comparison is the question a year of hiking is asked.
  */
 export const CADENCE_MONTHS = 13;
 
 /** Regions listed on a profile before the tail is cut. */
 export const TOP_REGIONS = 6;
 
-// ---------------------------------------------------------------------------
-// Deriving
-// ---------------------------------------------------------------------------
-
 /** `YYYY-MM` for a date, in UTC — the same key the stats query groups by. */
 export function monthKey(date: Date): string {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
-/**
- * The last {@link CADENCE_MONTHS} month keys ending at `now`, oldest first.
- *
- * Built by hiking a UTC date backwards a month at a time rather than by subtracting from
- * the month number, because the naive version puts month 0 minus 1 in the wrong year and
- * nobody notices until January.
- */
+/** The last {@link CADENCE_MONTHS} month keys ending at `now`, oldest first. Steps a UTC date
+ * back a month at a time — subtracting from the month number puts 0 − 1 in the wrong year. */
 export function cadenceMonths(now: Date, count = CADENCE_MONTHS): string[] {
   const keys: string[] = [];
   const cursor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
@@ -196,12 +142,7 @@ export function cadenceMonths(now: Date, count = CADENCE_MONTHS): string[] {
   return keys.reverse();
 }
 
-/**
- * Fill a sparse month → totals map out to the full strip.
- *
- * The query returns only the months someone actually hiked in. This is what turns that
- * into a strip with holes in it, which is the thing worth drawing.
- */
+/** Fill a sparse month → totals map out to the full strip. The query returns only months hiked. */
 export function fillCadence(
   present: ReadonlyMap<string, Omit<HikeMonth, 'month'>>,
   now: Date,
@@ -215,12 +156,7 @@ export function fillCadence(
   }));
 }
 
-/**
- * A short month label for the cadence axis — `Jan`, and `Jan '25` when the year turns.
- *
- * The year is printed only where it changes, so a thirteen-month strip carries at most two
- * of them and the axis stays a row of three-letter marks instead of a table.
- */
+/** A short month label for the cadence axis. The year prints only where it changes. */
 export function monthLabel(month: string, previous?: string): string {
   const [year, index] = month.split('-');
   const at = Number(index) - 1;

@@ -1,14 +1,7 @@
 import { z } from 'zod';
 
-/**
- * Along-trail weather — the feature this product is built around.
- *
- * AllTrails forecasts one point: the trailhead. That is the least useful place on the
- * trail to know about, because it is the warmest, the most sheltered, and the one you
- * can see out the car window. What matters is what the ridge is doing at the hour you
- * will be standing on it. So we sample the line, elevation-correct each sample, and
- * shift each sample's forecast to that point's predicted arrival time.
- */
+/** Along-trail weather: the line is sampled, each sample elevation-corrected, and each sample's
+ * forecast read at that point's predicted arrival hour rather than at the trailhead. */
 
 export const WEATHER_SEVERITIES = ['info', 'caution', 'warning'] as const;
 export type WeatherSeverity = (typeof WEATHER_SEVERITIES)[number];
@@ -94,10 +87,7 @@ export const alongRouteRequestSchema = z.object({
   trailId: z.string(),
   /** Defaults to the next sensible start (tomorrow morning) when omitted. */
   startAt: z.string().datetime({ offset: true }).optional(),
-  /**
-   * Pace multiplier on Tobler's baseline. <1 is faster than average, >1 slower.
-   * Surfaced in the UI as Fast / Average / Relaxed rather than as a number.
-   */
+  /** Pace multiplier on Tobler's baseline. <1 is faster than average, >1 slower. */
   paceFactor: z.number().min(0.5).max(2.5).default(1),
   /** Include the return leg for out-and-back routes. */
   includeReturn: z.boolean().default(true),
@@ -105,17 +95,10 @@ export const alongRouteRequestSchema = z.object({
 export type AlongRouteRequest = z.infer<typeof alongRouteRequestSchema>;
 
 /**
- * Air quality — the European AQI, and only the European AQI.
- *
- * There are two scales on offer upstream and picking both would be the worst outcome: the
- * US AQI runs 0–500 on different breakpoints, so the same air is 65 on one scale and 91 on
- * the other, and a map that paints one while the safety flags below it quote the other is a
- * product arguing with itself. The flags were written against the European bands first
- * (`AQI_CAUTION = 60`, `AQI_WARNING = 80` are the "poor" and "very poor" boundaries), so
- * that is the scale everything speaks.
- *
- * The bands are the EEA's own, unaltered. Six of them, and the last is open-ended because
- * the index is: above 100 there is no ceiling, only worse.
+ * Air quality — the European AQI, and only the European AQI. The US AQI runs 0–500 on different
+ * breakpoints, so the same air reads 65 on one scale and 91 on the other; the safety flags
+ * (`AQI_CAUTION = 60`, `AQI_WARNING = 80`) are the EEA's "poor" and "very poor" boundaries, so
+ * everything must speak that scale. Bands unaltered; the last is open-ended as the index is.
  */
 export const AIR_QUALITY_BANDS = [
   { from: 0, to: 20, label: 'Good' },
@@ -131,8 +114,8 @@ export type AirQualityBand = (typeof AIR_QUALITY_BANDS)[number];
 /** Which band a reading falls in, or `null` when there is no reading. */
 export function europeanAqiBand(aqi: number | null | undefined): AirQualityBand | null {
   if (aqi === null || aqi === undefined || !Number.isFinite(aqi)) return null;
-  // Hiked from the top so the open-ended band catches anything above 100 without a
-  // special case, and so a value sitting exactly on a boundary reads as the band it opens.
+  // From the top, so the open-ended band needs no special case and a value on a boundary
+  // reads as the band it opens.
   for (let i = AIR_QUALITY_BANDS.length - 1; i >= 0; i--) {
     const band = AIR_QUALITY_BANDS[i]!;
     if (aqi >= band.from) return band;
@@ -140,14 +123,8 @@ export function europeanAqiBand(aqi: number | null | undefined): AirQualityBand 
   return AIR_QUALITY_BANDS[0];
 }
 
-/**
- * The five pollutants the European AQI is built from, with the sub-index each contributes.
- *
- * The overall index is the **worst** of the five, not a blend — which is what makes naming
- * the dominant one worth doing. "AQI 65" is a number; "65, driven by ozone" tells a hiker
- * that it will be worse on an exposed ridge in the afternoon sun than in the trees, and
- * that is a decision they can act on.
- */
+/** The five pollutants the European AQI is built from. The index is the **worst** of the five,
+ * not a blend, which is what makes naming the dominant one useful. */
 export const AIR_QUALITY_POLLUTANTS = ['pm2_5', 'pm10', 'no2', 'o3', 'so2'] as const;
 export type AirQualityPollutant = (typeof AIR_QUALITY_POLLUTANTS)[number];
 
@@ -196,11 +173,8 @@ export const airQualityReadingSchema = z.object({
   /** Whichever pollutant the index is currently worst on, or `null` when nothing is. */
   dominant: z.enum(AIR_QUALITY_POLLUTANTS).nullable(),
   model: z.string(),
-  /**
-   * The model's grid spacing in degrees, carried so a reader can be told how much ground
-   * this one number is claiming. A 0.4° cell is most of a county, and a page that prints
-   * "47" over a valley without saying so has overstated its own precision by two orders.
-   */
+  /** The model's grid spacing in degrees, so a reader can be told how much ground one number is
+   * claiming — a 0.4° cell is most of a county. */
   stepDeg: z.number().positive(),
   observedAt: z.string(),
 });
@@ -213,15 +187,9 @@ export const airQualityAtRequestSchema = z.object({
 export type AirQualityAtRequest = z.infer<typeof airQualityAtRequestSchema>;
 
 /**
- * WMO 4677 present-weather codes, as Open-Meteo emits them, in words.
- *
- * Kept here rather than in either client because the two of them must agree: a website
- * that says "Heavy rain" where the phone says "Rain, heavy" is two products. The wording
- * is deliberately short — these land in a table column beside a temperature and a wind
- * speed, and a phrase that wraps costs a row its scannability.
- *
- * Codes Open-Meteo never emits are absent rather than filled in with guesses; an unknown
- * code reads as an em dash, which is honest, instead of a wrong sky.
+ * WMO 4677 present-weather codes as Open-Meteo emits them, in words. Here rather than in either
+ * client so the two cannot word the same sky differently. Codes Open-Meteo never emits are
+ * absent rather than guessed — an unknown code reads as an em dash.
  */
 export const WEATHER_CODE_LABELS: Readonly<Record<number, string>> = {
   0: 'Clear',
@@ -280,11 +248,9 @@ const COMPASS_POINTS = [
 ] as const;
 
 /**
- * Wind direction as a compass point — the direction the wind blows *from*, which is the
- * meteorological convention Open-Meteo follows and the one a hiker facing into it means.
- *
- * Sixteen points rather than eight: on a ridge the difference between a westerly and a
- * north-westerly is the difference between shelter and none.
+ * Wind direction as a compass point — the direction the wind blows *from*, the meteorological
+ * convention Open-Meteo follows. Sixteen points: on a ridge a westerly and a north-westerly are
+ * the difference between shelter and none.
  */
 export function compassPoint(degrees: number | null | undefined): string | null {
   if (degrees === null || degrees === undefined || !Number.isFinite(degrees)) return null;

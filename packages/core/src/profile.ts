@@ -3,38 +3,23 @@ import { USER_ROLES } from './moderation';
 import { UNIT_SYSTEMS } from './units';
 import { lngLatSchema } from './types';
 
-/**
- * Profile shapes shared by both clients.
- *
- * These live in `core` rather than in the router so the web form and the iOS form apply
- * the same rules before a request is made. The server re-validates with the same schema —
- * client-side validation here is a courtesy to the user, never a control.
- */
+/** Profile shapes shared by both clients, so the web and iOS forms apply the same rules before a
+ * request is made. The server re-validates with the same schema — this is a courtesy, not a
+ * control. */
 
 /** Visibility of a user's own content. Mirrors the `Visibility` enum in the schema. */
 export const VISIBILITIES = ['private', 'followers', 'public'] as const;
 export type Visibility = (typeof VISIBILITIES)[number];
 
-/**
- * Light, dark, or whatever the device says. Mirrors the `ThemePreference` enum in the
- * schema.
- *
- * `system` is the default and is not a fourth palette — it is the absence of an answer,
- * which the stylesheet resolves with a `prefers-color-scheme` query. That is why it is
- * stored rather than collapsed to light or dark at write time: a reader who has never
- * chosen should keep following their device when they change its setting at dusk.
- *
- * Distinct from `Scheme` in `packages/ui`, which says what a surface is *for* — instrument
- * chrome beside a map, or paper to read — and is chosen by the page, never by the reader.
- */
+/** Light, dark, or whatever the device says. Mirrors the `ThemePreference` enum in the schema.
+ * `system` is stored rather than collapsed at write time, so a reader who has never chosen keeps
+ * following their device. Distinct from `Scheme` in `packages/ui`, which the page picks. */
 export const THEME_PREFERENCES = ['system', 'light', 'dark'] as const;
 export type ThemePreference = (typeof THEME_PREFERENCES)[number];
 
-/**
- * Handles appear in profile URLs, so the constraints are as much about routing as taste:
- * no slashes, no dots that could be read as a file extension, no leading or trailing
- * separators, and a floor of three characters so `/u/a` is not a namespace of its own.
- */
+/** Handles appear in profile URLs, so the constraints are as much about routing as taste: no
+ * slashes, no dots that read as a file extension, no leading or trailing separators, and a floor
+ * of three characters so `/u/a` is not a namespace of its own. */
 export const usernameSchema = z
   .string()
   .min(3, 'At least 3 characters.')
@@ -44,10 +29,8 @@ export const usernameSchema = z
     'Lowercase letters, numbers, hyphens and underscores; must start and end with a letter or number.',
   );
 
-/**
- * Handles the app itself needs, or that would be actively confusing to hand out. Checked
- * case-insensitively against the lowercased handle, which the schema already guarantees.
- */
+/** Handles the app itself needs, or that would be confusing to hand out. Checked
+ * case-insensitively against the lowercased handle, which the schema already guarantees. */
 export const RESERVED_USERNAMES = new Set([
   'about',
   'account',
@@ -98,11 +81,8 @@ export const profileUpdateSchema = z.object({
   units: z.enum(UNIT_SYSTEMS).optional(),
   theme: z.enum(THEME_PREFERENCES).optional(),
   defaultActivityVisibility: z.enum(VISIBILITIES).optional(),
-  /**
-   * Where "near me" points before location permission is granted. All three move
-   * together — a coordinate with no label is unrenderable, and a label with no
-   * coordinate is unsearchable — so this is one nested object rather than three fields.
-   */
+  /** Where "near me" points before location permission is granted. One nested object because all
+   * three move together: a coordinate with no label is unrenderable, the reverse unsearchable. */
   home: z.object({ at: lngLatSchema, name: z.string().trim().min(1).max(120) }).nullish(),
 });
 export type ProfileUpdate = z.infer<typeof profileUpdateSchema>;
@@ -127,14 +107,10 @@ export const selfProfileSchema = publicProfileSchema.extend({
   isPlus: z.boolean(),
   plusUntil: z.date().nullable(),
   /**
-   * Whether this account can take content down.
-   *
-   * On the *self* profile and deliberately not on `publicProfileSchema`: it decides whether
-   * the client draws a moderator's controls, and who the moderators are is not something a
-   * trail page needs to publish. It is read-only in every direction — `profileUpdateSchema`
-   * has no such field, `me.update` never writes one, and the server ignores it on the way
-   * in. A client that lies about it draws itself some buttons and gets FORBIDDEN from
-   * `moderatorProcedure` the moment it presses one.
+   * Whether this account can take content down. On the *self* profile only — who the moderators
+   * are is not something a trail page publishes. Read-only in every direction:
+   * `profileUpdateSchema` has no such field and the server ignores it inbound, so a client that
+   * lies about it only draws itself buttons that return FORBIDDEN.
    */
   role: z.enum(USER_ROLES),
   home: z.object({ at: lngLatSchema, name: z.string().nullable() }).nullable(),

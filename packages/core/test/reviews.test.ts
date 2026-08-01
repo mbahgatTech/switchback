@@ -9,14 +9,7 @@ import {
   reviewWriteSchema,
 } from '@switchback/core';
 
-/**
- * The review vocabulary and the two calculations that sit under it.
- *
- * Reviews are the one part of this product that cannot be recomputed from the map. A wrong
- * gain figure is fixed by re-running a pass; a review section that reorders someone's chips,
- * rounds their rating differently in two places, or rejects the date they actually hiked is
- * a misrepresentation of what a person said, and no later pass repairs it.
- */
+/** The review vocabulary and the two calculations that sit under it. */
 
 /** UTC today, shifted by whole days, as `YYYY-MM-DD` — the same arithmetic the schema uses. */
 function utcDay(days = 0): string {
@@ -25,9 +18,6 @@ function utcDay(days = 0): string {
 
 describe('normaliseConditions', () => {
   it('sorts into the vocabulary order rather than the order they were tapped', () => {
-    // The point of the whole function. Two reports saying the same three things must print
-    // the same three chips in the same three positions, so that reading down a column of
-    // reports looking for "icy" is scanning, not a word search.
     expect(normaliseConditions(['crowded', 'icy', 'dry'])).toEqual(['dry', 'icy', 'crowded']);
     expect(normaliseConditions(['dry', 'icy', 'crowded'])).toEqual(['dry', 'icy', 'crowded']);
   });
@@ -37,9 +27,8 @@ describe('normaliseConditions', () => {
   });
 
   it('drops anything outside the vocabulary', () => {
-    // This also runs over rows read back from the database, where a value retired from the
-    // enum — or written by some future admin path — would otherwise reach a label lookup
-    // that has no entry for it and render `undefined` on the page.
+    // Also runs over rows read back from the database, where a retired enum value would
+    // otherwise reach a label lookup with no entry for it and render `undefined`.
     expect(normaliseConditions(['muddy', 'sharks', ''])).toEqual(['muddy']);
   });
 
@@ -55,22 +44,16 @@ describe('normaliseConditions', () => {
 
 describe('averageRating', () => {
   it('is null, not zero, when nobody has reviewed it', () => {
-    // A trail nobody has hiked and a trail everybody hated are not the same trail, and a
-    // card that prints 0.0 for the first one is stating something no reviewer ever said.
     expect(averageRating([0, 0, 0, 0, 0])).toBeNull();
     expect(averageRating([])).toBeNull();
   });
 
   it('indexes counts by rating − 1', () => {
-    // counts[0] is the one-star bucket. Off by one here and every average on the site is
-    // wrong by a whole point in a way that still looks plausible.
     expect(averageRating([1, 0, 0, 0, 0])).toBe(1);
     expect(averageRating([0, 0, 0, 0, 1])).toBe(5);
   });
 
   it('rounds to one decimal', () => {
-    // 4.666… on three reviews. A second decimal would claim to separate 4.66 from 4.67 on a
-    // sample of three, which the sample cannot support.
     expect(averageRating([0, 0, 0, 1, 2])).toBe(4.7);
     expect(averageRating([0, 0, 1, 1, 1])).toBe(4);
   });
@@ -95,8 +78,7 @@ describe('isoDateSchema', () => {
   });
 
   it('insists on the padded form', () => {
-    // `2026-3-14` parses fine as a Date and sorts wrong as a string, which is the failure
-    // mode: it only shows up once there are enough rows for the ordering to matter.
+    // `2026-3-14` parses fine as a Date and sorts wrong as a string.
     expect(isoDateSchema.safeParse('2026-3-14').success).toBe(false);
     expect(isoDateSchema.safeParse('2026-03-14T00:00:00Z').success).toBe(false);
   });
@@ -108,9 +90,6 @@ describe('hikedOnSchema', () => {
   });
 
   it('gives a day of slack, so Auckland can file today', () => {
-    // "Today" in Auckland is tomorrow in UTC for most of the working day. Rejecting a
-    // hiker's own date because our clock is behind theirs is a bug only ever reported by
-    // the people furthest from us.
     expect(hikedOnSchema.safeParse(utcDay(0)).success).toBe(true);
     expect(hikedOnSchema.safeParse(utcDay(1)).success).toBe(true);
   });
@@ -121,8 +100,6 @@ describe('hikedOnSchema', () => {
   });
 
   it('refuses a year that is a typo rather than a date', () => {
-    // The regex is happy with `0202-07-14`; a mistyped year that sorts eighteen centuries
-    // early is worse than no date at all.
     expect(hikedOnSchema.safeParse('0202-07-14').success).toBe(false);
     expect(hikedOnSchema.safeParse('1969-12-31').success).toBe(false);
     expect(hikedOnSchema.safeParse('1970-01-01').success).toBe(true);
@@ -133,7 +110,6 @@ describe('reviewWriteSchema', () => {
   const MINIMAL = { trailId: 'trl_1', rating: 4 };
 
   it('takes a rating on its own', () => {
-    // A rating with no prose is a legitimate review. Requiring a body invents one.
     const parsed = reviewWriteSchema.parse(MINIMAL);
     expect(parsed.rating).toBe(4);
     expect(parsed.conditions).toEqual([]);
@@ -162,8 +138,8 @@ describe('reviewWriteSchema', () => {
   });
 
   it('canonicalises the conditions on the way in', () => {
-    // Same transform as the read path, so a chip rail cannot reshuffle between the review
-    // someone just wrote and the same review read back on the next page load.
+    // Same transform as the read path, so a chip rail cannot reshuffle between writing a
+    // review and reading it back.
     const parsed = reviewWriteSchema.parse({
       ...MINIMAL,
       conditions: ['crowded', 'muddy', 'muddy', 'icy'],
@@ -172,8 +148,8 @@ describe('reviewWriteSchema', () => {
   });
 
   it('refuses a condition outside the vocabulary rather than dropping it silently', () => {
-    // Read-side normalisation drops unknowns because old rows are not the writer's fault.
-    // A live client sending one is a bug, and a 400 is how it gets found.
+    // Read-side normalisation drops unknowns because old rows are not the writer's fault; a
+    // live client sending one is a bug, and a 400 is how it gets found.
     expect(reviewWriteSchema.safeParse({ ...MINIMAL, conditions: ['sharks'] }).success).toBe(false);
   });
 

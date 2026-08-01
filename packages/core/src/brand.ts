@@ -60,15 +60,9 @@ export interface AttributionSource {
 }
 
 /**
- * The credits page, as content rather than as markup.
- *
- * Here rather than in either client because both of them publish it and the two must not
- * drift. A licence statement that says one thing on the website and another in the app is
- * not a formatting inconsistency — under ODbL and CC-BY it is one of them being wrong, and
- * the wrong one would be whichever was edited second. One list, two renderings.
- *
- * Ordered by what the reader is looking at, from the trails down to the ground under them
- * and out to the weather over them, rather than by licence or by vendor.
+ * The credits page, as content rather than markup. Here because both clients publish it and a
+ * licence statement that says one thing on the web and another in the app is not a formatting
+ * inconsistency — under ODbL and CC-BY it is one of them being wrong.
  */
 export const ATTRIBUTION_SOURCES: readonly AttributionSource[] = [
   {
@@ -108,11 +102,8 @@ export const ATTRIBUTION_SOURCES: readonly AttributionSource[] = [
 ] as const;
 
 /**
- * The correction notice, shared for the same reason the sources are.
- *
- * Split into two because the clients set them differently — the web page gives the first a
- * paragraph of its own under a heading, the phone runs them together under one collar — but
- * the words are the obligation and the words are identical.
+ * The correction notice, shared for the same reason the sources are. Split in two because the
+ * clients set them differently, but the words are the obligation and are identical.
  */
 export const ATTRIBUTION_CORRECTIONS = {
   upstream:

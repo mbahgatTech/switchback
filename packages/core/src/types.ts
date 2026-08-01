@@ -1,14 +1,8 @@
 import { z } from 'zod';
 import { DIFFICULTIES, SAC_SCALES } from './difficulty';
 
-/**
- * Activities a trail supports. Mirrors OSM route/access tagging where possible.
- *
- * There is deliberately no separate "walking" type beside `hiking`. The two were separate
- * for a while and the separation never paid: every path that admitted one admitted the
- * other, so the pair arrived together on nearly every trail, took two lines in every filter,
- * and asked the reader to decide which word described the same afternoon. It is `hiking`.
- */
+/** Activities a trail supports. Mirrors OSM route/access tagging where possible. There is
+ * deliberately no "walking" beside `hiking` — the pair arrived together on nearly every trail. */
 export const ACTIVITY_TYPES = [
   'hiking',
   'trail_running',
@@ -62,10 +56,6 @@ export const TRAIL_CONDITIONS = [
 ] as const;
 export type TrailCondition = (typeof TRAIL_CONDITIONS)[number];
 
-// ---------------------------------------------------------------------------
-// Geometry
-// ---------------------------------------------------------------------------
-
 export const lngLatSchema = z.tuple([z.number().min(-180).max(180), z.number().min(-90).max(90)]);
 /** GeoJSON axis order: [longitude, latitude]. */
 export type LngLat = z.infer<typeof lngLatSchema>;
@@ -84,10 +74,7 @@ export const lineStringSchema = z.object({
 });
 export type LineString = z.infer<typeof lineStringSchema>;
 
-/**
- * One sample along the elevation profile. `distM` is cumulative distance from the
- * start, which is what both the chart x-axis and the ETA calculation key off.
- */
+/** One sample along the elevation profile. `distM` is cumulative distance from the start. */
 export const elevationPointSchema = z.object({
   distM: z.number().nonnegative(),
   eleM: z.number(),
@@ -95,10 +82,6 @@ export const elevationPointSchema = z.object({
   lat: z.number(),
 });
 export type ElevationPoint = z.infer<typeof elevationPointSchema>;
-
-// ---------------------------------------------------------------------------
-// Trails
-// ---------------------------------------------------------------------------
 
 export const trailStatsSchema = z.object({
   lengthM: z.number().nonnegative(),
@@ -161,22 +144,12 @@ export const trailDetailSchema = trailSummarySchema.extend({
 });
 export type TrailDetail = z.infer<typeof trailDetailSchema>;
 
-/**
- * A summary plus the simplified line.
- *
- * The map needs geometry for every result, not just the selected one — a viewport of
- * sixty trails draws sixty polylines. This is the shape `trails.browse` returns, and the
- * reason `Trail.geometryJson` is stored pre-simplified: at 5 m tolerance sixty lines are
- * a few hundred kilobytes, and at full resolution they are tens of megabytes.
- */
+/** A summary plus the simplified line — what `trails.browse` returns, because the map draws every
+ * result. `Trail.geometryJson` is stored pre-simplified at 5 m; full resolution is megabytes. */
 export const trailMapItemSchema = trailSummarySchema.extend({
   geometry: lineStringSchema,
 });
 export type TrailMapItem = z.infer<typeof trailMapItemSchema>;
-
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
 
 export const TRAIL_SORTS = [
   'relevance',
@@ -211,13 +184,8 @@ export const trailSearchSchema = z.object({
 });
 export type TrailSearch = z.infer<typeof trailSearchSchema>;
 
-/**
- * How much of what the caller asked for we actually hold.
- *
- * Every viewport-shaped response carries this. It is the visible half of the on-demand
- * design: the client renders `trails` immediately, shows that `pendingTiles` are still
- * arriving, and re-asks as they land.
- */
+/** How much of what the caller asked for we hold. The client renders `trails` now, shows
+ * `pendingTiles` arriving, and re-asks as they land. */
 export const tileCoverageSchema = z.object({
   /** Tiles already ingested and fresh. */
   readyTiles: z.array(z.string()),
@@ -229,23 +197,12 @@ export const tileCoverageSchema = z.object({
   tooLarge: z.boolean(),
   /**
    * True when ingest was refused, so the *new* ground this view is missing is not coming.
-   *
-   * Not the same as "nothing outstanding". The refused tiles are kept out of `pendingTiles`,
-   * because a non-empty `pendingTiles` makes the client poll and there would be nothing to
-   * poll for — but the reader is owed the difference between a view we hold entirely and one
-   * whose fetch was turned down, so the note says which. Tiles this viewport already had a
-   * job for are unaffected: they stay in `pendingTiles`, they are still coming, and the poll
-   * that watches them keeps running. Defaulted, so a cached response from before this field
-   * existed still parses.
+   * Refused tiles are deliberately kept out of `pendingTiles`, which would make the client poll
+   * for something that never arrives; tiles that already had a job stay there. Defaulted.
    */
   busy: z.boolean().default(false),
-  /**
-   * Which refusal, when `busy`. Null otherwise.
-   *
-   * The two do not share a sentence. A deep queue drains and "try again in a few minutes" is
-   * a real instruction; a full database does not drain, an operator has to decide what to
-   * delete, and telling the reader to wait for it is prescribing something that cannot work.
-   */
+  /** Which refusal, when `busy`. A deep queue drains and "try again in a few minutes" is a real
+   * instruction; a full database needs an operator, so it must not say that. */
   busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
   /** How many tiles the viewport spans, and the most we will cover at once. */
   requiredTiles: z.number().int().nonnegative().default(0),
@@ -254,13 +211,9 @@ export const tileCoverageSchema = z.object({
 export type TileCoverage = z.infer<typeof tileCoverageSchema>;
 
 /**
- * What a deliberate "fetch this area" would cost, and how far along one is.
- *
- * Counts rather than quadkey lists, and that is not laziness about the schema. Ninety-six
- * quadkeys is about 1.5 KB of strings on a response the client polls every 2.5 seconds, and
- * nothing in the UI can do anything with an individual key — it draws a number and a
- * progress bar. `TileCoverage` sends lists because the map genuinely needs them: it shades
- * pending tiles on the canvas. This does not.
+ * What a deliberate "fetch this area" would cost, and how far along one is. Counts rather than
+ * quadkey lists: the UI draws a number and a progress bar, and this is polled every 2.5 s.
+ * `TileCoverage` sends lists because the map shades pending tiles; this does not.
  */
 export const areaSummarySchema = z.object({
   /** Tiles this area covers — the capped set, not necessarily the whole box. */
@@ -278,11 +231,7 @@ export const areaSummarySchema = z.object({
 });
 export type AreaSummary = z.infer<typeof areaSummarySchema>;
 
-/**
- * Search results carry the ingest state alongside the rows. When a viewport covers
- * tiles we have never fetched, the client gets whatever we already hold plus the
- * list of pending tiles, and streams in the rest as those tiles land.
- */
+/** Search results carry the ingest state alongside the rows, so the client can stream in more. */
 export const trailSearchResultSchema = z.object({
   trails: z.array(trailSummarySchema),
   nextCursor: z.string().nullable(),
@@ -297,11 +246,8 @@ export const trailBrowseResultSchema = z.object({
   /** Trails matching the filters in view, before the `limit` was applied. */
   total: z.number().int().nonnegative(),
   coverage: tileCoverageSchema,
-  /**
-   * Present only when the viewport is wider than the automatic ingest ceiling — the one
-   * case where the map cannot fill itself and the user has to ask. Null at every ordinary
-   * zoom, where coverage above already says everything there is to say.
-   */
+  /** Present only when the viewport is wider than the automatic ingest ceiling — the one case
+   * where the map cannot fill itself and the user has to ask. Null at every ordinary zoom. */
   area: areaSummarySchema.nullable().default(null),
 });
 export type TrailBrowseResult = z.infer<typeof trailBrowseResultSchema>;

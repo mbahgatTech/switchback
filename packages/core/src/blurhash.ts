@@ -1,28 +1,15 @@
 /**
  * BlurHash — the twenty-odd characters that stand in for a photograph before it arrives.
  *
- * A trail gallery is a horizontal strip of large images over a slow mobile connection at a
- * trailhead, which is the worst case for the usual placeholder: a grey rectangle that holds
- * the layout and tells you nothing, replaced all at once by a photograph. The alternative
- * used to be a base64 thumbnail in the payload, but a 3 kB JPEG per photo across a
- * twelve-photo strip is 36 kB of *placeholder* — more than some of the photographs.
+ * Two entry points, deliberately different in cost: `blurhashAverageColor` reads only the DC term
+ * (one base-83 parse, no pixel loop) and is what a card uses for a CSS background;
+ * `decodeBlurhash` reconstructs pixels for a canvas.
  *
- * This is the same idea at 1% of the size. Twenty-eight characters of DCT coefficients
- * decode to a blurred impression of the picture: right colours, right composition, wrong
- * everything else. It goes in the row next to the URL, costs nothing to ship, and the strip
- * reads as a strip of photographs from the first paint.
+ * Encoding runs on the *client*, in the canvas pass that already produced the thumbnail. The
+ * server never decodes an image, which keeps `sharp` — a native dependency needing a build step
+ * on every platform we ship to — out of this repository entirely.
  *
- * Two entry points, deliberately different in cost. `blurhashAverageColor` reads only the
- * DC term — one base-83 parse, no pixel loop — and is what a card uses for a CSS background.
- * `decodeBlurhash` reconstructs pixels for a canvas, which is worth it for the gallery and
- * not for a list of forty rows.
- *
- * Encoding runs on the *client*, in the same canvas pass that already produced the thumbnail.
- * The server never decodes an image, which is what keeps `sharp` — a native dependency that
- * would need a build step on every platform we ship to — out of this repository entirely.
- *
- * Format per the BlurHash reference implementation (github.com/woltapp/blurhash, MIT), so
- * hashes we write are readable by any other implementation and vice versa.
+ * Format per the BlurHash reference implementation (github.com/woltapp/blurhash, MIT).
  */
 
 /** Base-83, chosen by the format for being URL-, HTML- and shell-safe all at once. */
@@ -60,13 +47,9 @@ function decode83(chars: string): number {
   return value;
 }
 
-/**
- * sRGB is stored gamma-encoded, and averaging gamma-encoded values is wrong.
- *
- * Not pedantry: the average of black and white in sRGB space is 128, which renders as a mid
- * grey noticeably darker than the 188 you get by averaging light. Every coefficient below is
- * an average of some kind, so all of them happen in linear light and convert back at the end.
- */
+/** sRGB is stored gamma-encoded, and averaging gamma-encoded values is wrong: black and white
+ * average to 128 rather than the 188 you get by averaging light. Every coefficient below is an
+ * average of some kind, so all of them happen in linear light and convert back at the end. */
 function srgbToLinear(value: number): number {
   const v = value / 255;
   return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
@@ -86,15 +69,9 @@ function signPow(value: number, exponent: number): number {
 
 type Coefficient = [number, number, number];
 
-/**
- * Encode RGBA pixels to a hash.
- *
- * Feed this a *small* image. The loop is `width * height * componentX * componentY`, so a
- * full-resolution photograph is tens of billions of operations for an answer that is
- * indistinguishable from the one a 32-pixel thumbnail gives — the whole output is four
- * horizontal bands of colour. The uploader downsamples to 32 px first for exactly this
- * reason, and that downsample is also what makes this cheap enough to run on the main thread.
- */
+/** Encode RGBA pixels to a hash. Feed this a *small* image: the loop is
+ * `width * height * componentX * componentY`, and a 32 px thumbnail gives an answer
+ * indistinguishable from a full-resolution one. The uploader downsamples first. */
 export function encodeBlurhash(
   pixels: Uint8ClampedArray | Uint8Array,
   width: number,
@@ -109,8 +86,8 @@ export function encodeBlurhash(
     throw new BlurhashError(`expected ${4 * width * height} RGBA bytes, got ${pixels.length}`);
   }
 
-  // Precomputed once per axis rather than per coefficient: the inner loop would otherwise
-  // call `Math.cos` `w*h*cx*cy` times for `w*cx + h*cy` distinct arguments.
+  // Precomputed per axis: the inner loop would otherwise call `Math.cos` `w*h*cx*cy` times
+  // for `w*cx + h*cy` distinct arguments.
   const cosX: number[][] = [];
   for (let fx = 0; fx < componentX; fx++) {
     const row: number[] = [];
@@ -124,9 +101,8 @@ export function encodeBlurhash(
     cosY.push(row);
   }
 
-  // Linearise once. The same pixel is read by every one of the twelve coefficients, and
-  // `srgbToLinear` is a `Math.pow` — doing it inside the coefficient loop is twelve times
-  // the transcendental work for an identical answer.
+  // Linearise once: the same pixel is read by every one of the twelve coefficients, and
+  // `srgbToLinear` is a `Math.pow`.
   const linear = new Float64Array(width * height * 3);
   for (let i = 0; i < width * height; i++) {
     linear[i * 3] = srgbToLinear(pixels[i * 4] ?? 0);
@@ -159,9 +135,8 @@ export function encodeBlurhash(
   const dc = factors[0] ?? [0, 0, 0];
   const ac = factors.slice(1);
 
-  // One shared scale for every AC coefficient, stored in the hash. A photograph of fog and
-  // a photograph of a striped awning need wildly different ranges, and a fixed scale would
-  // either clip the awning or quantise the fog to nothing.
+  // One shared scale for every AC coefficient, stored in the hash. A fixed scale would either
+  // clip a striped awning or quantise fog to nothing.
   let maximum = 0;
   for (const factor of ac) {
     maximum = Math.max(maximum, Math.abs(factor[0]), Math.abs(factor[1]), Math.abs(factor[2]));
@@ -231,14 +206,9 @@ function parseHash(hash: string): ParsedHash {
   return { componentX, componentY, maxValue, dc, ac };
 }
 
-/**
- * The DC term as a CSS hex colour — the cheap placeholder.
- *
- * This is the whole image averaged in linear light, which is exactly what a card wants
- * behind a thumbnail that has not loaded. No pixel loop, no canvas, no effect on layout.
- * Returns null rather than throwing for a malformed hash: a placeholder is decoration, and
- * a bad one should degrade to the default background rather than break a page of results.
- */
+/** The DC term as a CSS hex colour — the whole image averaged in linear light, with no pixel
+ * loop. Returns null rather than throwing on a malformed hash: a placeholder is decoration and
+ * should degrade to the default background rather than break a page of results. */
 export function blurhashAverageColor(hash: string | null | undefined): string | null {
   if (!hash) return null;
   try {
@@ -251,15 +221,10 @@ export function blurhashAverageColor(hash: string | null | undefined): string | 
 }
 
 /**
- * Reconstruct RGBA pixels at any size — for painting to a canvas.
- *
- * Decode small and let the browser scale it up. The output has no detail above the component
- * count by construction, so a 32×32 decode stretched to 400 px is pixel-identical to a 400×400
- * decode and roughly 150 times cheaper.
- *
- * `punch` multiplies the AC terms, raising contrast. The default of 1 is the picture as
- * encoded; the format's reference implementation offers this because the very low frequency
- * content of a photograph can look washed out next to the photograph itself.
+ * Reconstruct RGBA pixels at any size, for painting to a canvas. Decode small and let the browser
+ * scale up: the output has no detail above the component count by construction, so a 32×32 decode
+ * stretched to 400 px is pixel-identical and ~150 times cheaper. `punch` multiplies the AC terms,
+ * raising contrast; 1 is the picture as encoded.
  */
 export function decodeBlurhash(
   hash: string,
