@@ -14,20 +14,12 @@ import {
 import { SLOPE_BANDS, SLOPE_PROTOCOL } from './slope';
 
 /**
- * The slope overlay, computed in the browser from the elevation tiles already on the wire.
+ * The slope overlay, computed in the browser from the elevation tiles already on the wire —
+ * so it costs no serverless function and survives being taken offline with the terrain tiles.
  *
- * There is no server in this file and that is the design, not a shortcut. Slope is a pure
- * function of the DEM, the DEM is a public S3 bucket with no quota, and the alternative —
- * a route that fetches nine PNGs, shades one, and returns it — would put a serverless
- * function on the critical path of every pan for a result the client could have derived
- * from bytes its own map is downloading anyway. Doing it here also means the overlay
- * survives being taken offline alongside the terrain tiles it is made of.
- *
- * The cost is that each output tile needs its **eight neighbours** as well as itself, because
- * Horn's kernel reads a pixel's neighbours and the outermost row of a tile has none inside
- * it (see `slopeDegrees`). Naively that is nine fetches per tile; with the cache below it is
- * closer to one, since every tile is somebody else's neighbour and a pan reuses almost the
- * whole grid it just drew.
+ * Each output tile needs its eight neighbours as well as itself, because Horn's kernel reads
+ * a pixel's neighbours and the outermost row of a tile has none inside it (see `slopeDegrees`).
+ * The cache below is what keeps that closer to one fetch per tile than nine.
  */
 
 /** `slope://{z}/{x}/{y}`, with whatever MapLibre appends left alone. */
@@ -50,15 +42,10 @@ const OFFSETS: readonly (readonly [number, number])[] = [
 ];
 
 /**
- * Decoded elevation tiles, most-recently-used last.
- *
- * 64 tiles is 64 × 256² floats ≈ 17 MB, and it is sized against a viewport rather than a
- * budget: a 1440×900 map at these zooms asks for roughly 30 tiles, each of which wants a
- * ring around it, so anything much smaller would evict a neighbour before the tile beside
- * it came to borrow it and turn the amortised cost back into nine fetches apiece.
- *
- * `null` is a real cached value — a tile the bucket does not have is worth remembering as
- * absent, or every one of its eight neighbours will go and ask again.
+ * Decoded elevation tiles, most-recently-used last. 64 is sized against a viewport: a
+ * 1440×900 map at these zooms asks for ~30 tiles, each wanting a ring around it, so anything
+ * smaller evicts a neighbour before the tile beside it borrows it. `null` is a real cached
+ * value — a tile the bucket does not have is worth remembering as absent.
  */
 const CACHE_LIMIT = 64;
 const decoded = new Map<string, Float32Array | null>();
@@ -67,7 +54,7 @@ const inFlight = new Map<string, Promise<Float32Array | null>>();
 function recall(key: string): Float32Array | null | undefined {
   if (!decoded.has(key)) return undefined;
   const tile = decoded.get(key) ?? null;
-  // Re-insert to move it to the young end. Map iterates in insertion order, which is the
+  // Re-insert to move it to the young end: Map iterates in insertion order, which is the
   // whole reason this is a Map and not an object.
   decoded.delete(key);
   decoded.set(key, tile);
@@ -88,11 +75,9 @@ type Scratch =
   | { kind: 'dom'; canvas: HTMLCanvasElement; context: CanvasRenderingContext2D };
 
 /**
- * A canvas to decode into and encode out of.
- *
- * `willReadFrequently` matters here more than anywhere else in the app: without it the
- * browser keeps the surface on the GPU and every `getImageData` stalls the pipeline to read
- * it back, which on a pan of thirty tiles is the difference between a frame and a second.
+ * A canvas to decode into and encode out of. `willReadFrequently` matters here more than
+ * anywhere else in the app: without it the surface stays on the GPU and every `getImageData`
+ * stalls the pipeline reading it back — over thirty tiles, a frame versus a second.
  */
 function scratch(width: number, height: number): Scratch | null {
   if (typeof OffscreenCanvas === 'function') {
@@ -146,15 +131,10 @@ async function fetchAndDecode(z: number, x: number, y: number): Promise<Float32A
 }
 
 /**
- * A decoded tile, from the cache if it is there and from S3 at most once if it is not.
- *
- * The in-flight map is what makes the neighbourhood cheap: the nine tiles of one request and
- * the nine of the request beside it overlap by six, and without this each would start its
- * own fetch a few milliseconds apart and neither would find the other's result in the cache.
- *
- * Deliberately not given the requesting tile's abort signal. A shared fetch belongs to every
- * tile waiting on it, and cancelling it because one of them panned off screen would fail the
- * other eight. The signal is checked once, later, before the expensive part.
+ * A decoded tile, from the cache if it is there and from S3 at most once if it is not. The
+ * in-flight map is what makes the neighbourhood cheap — adjacent requests overlap by six
+ * tiles. Deliberately not given the requesting tile's abort signal: a shared fetch belongs to
+ * every tile waiting on it. The signal is checked later, before the expensive part.
  */
 async function elevationTile(z: number, x: number, y: number): Promise<Float32Array | null> {
   const span = 2 ** z;
@@ -182,12 +162,9 @@ async function elevationTile(z: number, x: number, y: number): Promise<Float32Ar
 }
 
 /**
- * One elevation, in tile-relative coordinates that may run one pixel outside the tile.
- *
- * Where the neighbour is genuinely absent — the poles, or a tile S3 declined — the edge
- * clamps to itself. That reintroduces the halved boundary gradient the padding exists to
- * avoid, but only along an edge that has no data on the far side of it anyway, and a faint
- * seam at the top of the world is a better failure than a stripe of fabricated cliff.
+ * One elevation, in tile-relative coordinates that may run one pixel outside the tile. Where
+ * the neighbour is genuinely absent — the poles, or a tile S3 declined — the edge clamps to
+ * itself: a faint seam at the top of the world beats a stripe of fabricated cliff.
  */
 function sample(
   tiles: readonly (Float32Array | null)[],
@@ -259,8 +236,7 @@ async function slopeTile(
   );
 
   // Checked here rather than around the fetches: by now nothing more will be requested, and
-  // what remains is a few million floating-point operations worth skipping for a tile the
-  // reader has already panned away from.
+  // what remains is a few million floating-point operations worth skipping.
   if (abort.signal.aborted) throw aborted();
 
   const centre = neighbourhood[4];
@@ -281,12 +257,8 @@ async function slopeTile(
 
 /**
  * Teach MapLibre the `slope://` scheme. Safe to call from every map that offers the layer.
- *
- * Registration is global to the maplibre module and is never torn down, unlike the pmtiles
- * protocol beside it. Two maps can be mounted at once — the browse sheet behind a trail
- * page, or two trail pages in two tabs of the same document — and a protocol removed when
- * the first of them unmounts would leave the second unable to load a tile. There is nothing
- * to reclaim: the handler is a function, and the tiles it caches are bounded above.
+ * Registration is global and never torn down, unlike the pmtiles protocol beside it: two maps
+ * can be mounted at once, and removing it on the first unmount would break the second.
  */
 let registered = false;
 

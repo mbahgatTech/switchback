@@ -2,26 +2,12 @@ import type { SlopeBand } from '@switchback/geo';
 import { SCHEMES } from '@switchback/ui';
 
 /**
- * Slope-angle shading.
+ * Slope-angle shading, in the survey plate: slope angle is what decides whether terrain
+ * releases, so it is one of the few things allowed the safety colour. The gentler two bands
+ * take contour, and the hue breaks at 35°.
  *
- * The overlay answers one question — *how steep is that* — and it answers it in the two
- * places a hiker asks it: choosing a line on the explore sheet, and reading the ground
- * either side of a route before committing to it.
- *
- * **The plate is survey, and that is the point.** The rule everywhere else in this product
- * is that red belongs to the reader and their safety and to nothing else, which is exactly
- * what slope angle is: not a property of the terrain worth admiring, a property of the
- * terrain that decides whether it releases. The gentler two bands take the contour plate,
- * because 27–35° is still terrain you read rather than terrain that has made a decision
- * about you. The hue changes at 35°, and that is the one threshold worth being able to see
- * without reading a number.
- *
- * Alpha rises monotonically across all five bands, independent of the hue break, so the ramp
- * still reads as "denser is steeper" for a reader who cannot separate the amber from the red.
- * On a safety layer that is not a nicety.
- *
- * Nothing below 27° is painted. Most of any map is gentle, and tinting all of it would make
- * this a filter over the sheet rather than a reading off it.
+ * Alpha rises monotonically across all five bands independent of the hue break, so the ramp
+ * still reads as "denser is steeper" without colour. Nothing below 27° is painted.
  */
 
 export interface SlopeLegendBand extends SlopeBand {
@@ -47,13 +33,9 @@ function band(fromDeg: number, range: string, hex: string, alpha: number): Slope
 const { contour, survey } = SCHEMES.field;
 
 /**
- * The avalanche convention, banded where the evidence actually steps.
- *
- * 27° is the shallowest angle at which a slab is commonly observed to release, and the
- * number most guidance uses for connected and runout terrain. 30° is the classic caution
- * line. 35–45° is where the large majority of slab avalanches start. Above 50° snow tends to
- * shed continuously rather than accumulate into a slab, which makes that ground safer from
- * avalanche and considerably worse to fall down.
+ * The avalanche convention, banded where the evidence steps: 27° is the shallowest angle a
+ * slab is commonly observed to release at, 30° the classic caution line, 35–45° where the
+ * large majority of slab avalanches start, and above 50° snow sheds rather than accumulates.
  */
 export const SLOPE_BANDS: readonly SlopeLegendBand[] = [
   band(27, '27–30', contour, 0.28),
@@ -70,45 +52,21 @@ export const SLOPE_LAYER = 'slope';
 export const SLOPE_TILE_URL = `${SLOPE_PROTOCOL}://{z}/{x}/{y}`;
 
 /**
- * The one zoom slope is ever computed at — and the reason there is only one.
+ * The one zoom slope is ever computed at. Slope angle is a property of the ground *and the
+ * baseline it is measured over*, and terrain is rough at every scale, so letting the tile
+ * pyramid pick the baseline makes the same mountainside amber at one zoom and red at the next.
+ * Tiles are generated at z12 only and MapLibre resamples them, so 35° means 35° everywhere.
  *
- * Slope angle is not a property of the ground. It is a property of the ground **and the
- * baseline you measure it over**, and terrain is rough at every scale, so a shorter baseline
- * always reads steeper. Measured over the same tile of the Snowdon massif:
- *
- * | DEM zoom | ground sample | median | ≥27° | ≥35° |
- * |---|---|---|---|---|
- * | z11 | 46 m | 13.4° | 11 % | 3 % |
- * | z12 | 23 m | 18.1° | 23 % | 9 % |
- * | z13 | 11.5 m | 26.2° | 47 % | 23 % |
- * | z14 | 5.7 m | 30.0° | 59 % | 33 % |
- *
- * Letting the tile pyramid pick the baseline — the obvious implementation, one slope tile per
- * requested zoom — therefore means the same mountainside is amber at one zoom and red at the
- * next, with nothing but the pinch gesture in between. On a decorative layer that is a
- * cosmetic wobble. On this one it is the layer contradicting itself about whether a slope is
- * in the range that slides, which is the only thing it was put on the map to say.
- *
- * So the baseline is pinned and the picture is scaled. Tiles are generated at **z12 only**;
- * MapLibre resamples them for every other zoom. 35° means 35° wherever you are looking from.
- *
- * z12 rather than z13 because Horn's kernel spans two samples, so z12's baseline is 39–55 m
- * across the world's alpine belt — closest of any pyramid level to the ~60 m that the 30 m
- * DEMs behind published avalanche guidance actually imply. z13 would read a good 8° steeper
- * than that guidance is calibrated for, out of a global model with nothing like the detail to
- * justify it. A layer that cries wolf is a layer that gets switched off.
- *
- * Zoomed in, the overlay goes visibly blocky, and it should: the blocks are the true
- * resolution of the measurement, and a reader who can see them will not believe the layer to
- * five metres.
+ * z12 rather than z13 because Horn's kernel spans two samples, putting the baseline at
+ * 39–55 m across the alpine belt — closest of any pyramid level to the ~60 m implied by the
+ * 30 m DEMs behind published avalanche guidance. The blockiness when zoomed in is honest.
  */
 export const SLOPE_TILE_ZOOM = 12;
 
 /**
- * The map zoom below which nothing paints, which follows from the line above rather than
- * being a separate decision: a 256 px raster source is requested one zoom deeper than the
- * map, so a z12-only source has its first renderable frame at map zoom 11. Named here so the
- * key can say *zoom in* instead of showing a reader an empty ramp.
+ * The map zoom below which nothing paints. A 256 px raster source is requested one zoom deeper
+ * than the map, so a z12-only source first renders at map zoom 11. Named so the key can say
+ * *zoom in* rather than showing an empty ramp.
  */
 export const SLOPE_MAP_MIN_ZOOM = SLOPE_TILE_ZOOM - 1;
 

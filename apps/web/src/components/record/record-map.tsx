@@ -12,19 +12,11 @@ import { useUnitsRef } from '../units';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 /**
- * The ground, while you are on it.
+ * The map on the recording screen. Separate from the browse and trail maps because this one
+ * follows a person: the camera is not the reader's by default and the subject moves.
  *
- * A third map component, and the third one deliberately. Browse owns a viewport and reports
- * it upward; the trail map is handed a route and shows it; this one **follows a person**. The
- * camera is not the reader's to control by default, the subject moves, and the layer that
- * matters most is a dot that did not exist a second ago. Folding that into either of the
- * others would mean a follow mode, a recording mode and a selection mode inside one file.
- *
- * **Two lines and a dot, in that order of permanence.** The planned route, if there is one,
- * is woodland and sits underneath — it is the trail, drawn the same colour it is drawn
- * everywhere else. The recorded track is contour, the plate this product uses for distance
- * covered. The dot is survey, because survey means you, and on this screen you are the only
- * thing that is a safety fact.
+ * Two lines and a dot: the planned route is woodland underneath, the recorded track is
+ * contour, and the position dot is survey.
  */
 
 export interface RecordMapProps {
@@ -46,27 +38,16 @@ const ROUTE_SOURCE = 'rec-route';
 const POSITION_SOURCE = 'rec-position';
 
 /**
- * Ground metres covered by one screen pixel at zoom 0, at 48° north.
- *
- * Web Mercator's scale depends on latitude, and a constant is a lie everywhere except the
- * line it was taken from — 48° is the Cascades, where this was built and tested. The error
- * is a few per cent across the temperate band and grows toward the poles, which is
- * acceptable for a circle whose whole job is to say "somewhere about here": an accuracy
- * halo drawn 5 % small is still an honest picture of a 12 m fix.
+ * Ground metres per screen pixel at zoom 0, taken at 48° north. Web Mercator's scale depends
+ * on latitude, so this is a few per cent out across the temperate band — acceptable for a
+ * circle whose job is to say "somewhere about here".
  */
 const METRES_PER_PIXEL_Z0 = 156_543 * Math.cos((48 * Math.PI) / 180);
 
 /**
- * Where the camera sits before the first fix arrives.
- *
- * A GPS lock outdoors takes seconds and indoors may never come, so this is the view for the
- * part of the hike that happens in a car park — and it has to be worth looking at, because a
- * screen that opens on nothing reads as a screen that is broken.
- *
- * In order of what the hiker can actually use: the position, if the browser has already
- * handed one over; then the trail they chose, framed whole, which answers "am I at the right
- * trailhead"; then a wide view of the region as a last resort. Never a continental zoom —
- * relief tiles at that scale are a grey smear with nothing to recognise in them.
+ * Where the camera sits before the first fix arrives, in order of usefulness: the position if
+ * the browser has one, then the chosen trail framed whole, then a wide regional view. Never a
+ * continental zoom — relief tiles at that scale have nothing recognisable in them.
  */
 function initialCamera(
   route: LineString | null,
@@ -113,9 +94,8 @@ function lineCollection(coords: ReadonlyArray<readonly [number, number]>): Featu
             {
               type: 'Feature',
               properties: {},
-              // Copied, not cast. GeoJSON's own types are mutable and MapLibre keeps the
-              // array it is handed, so passing the caller's readonly buffer through would
-              // be a lie about ownership as well as a type error.
+              // Copied, not cast: GeoJSON's own types are mutable and MapLibre keeps the
+              // array it is handed.
               geometry: { type: 'LineString', coordinates: coords.map(([lng, lat]) => [lng, lat]) },
             },
           ]
@@ -155,17 +135,9 @@ export function RecordMap({
   const onUserPanRef = useRef(onUserPan);
   onUserPanRef.current = onUserPan;
 
-  /*
-   * The current data, kept somewhere the `load` handler can reach it.
-   *
-   * The three effects below write to sources that do not exist until `load` fires, so each
-   * one guards on `ready` and returns early on the first pass. For `position` that is
-   * harmless — fixes keep arriving, and the next one lands after the map is up. For `route`
-   * it is fatal: the chosen trail is passed once and never changes identity again, so the
-   * effect that draws it runs exactly once, before there is anything to draw into, and the
-   * line is silently never added. Seeding from the load handler closes that window without
-   * making the effects re-run.
-   */
+  // The current data, kept where the `load` handler can reach it. `route` is passed once and
+  // never changes identity, so its effect runs before the sources exist and the line would
+  // otherwise never be added at all.
   const latest = useRef({ track, route, position, accuracyM });
   latest.current = { track, route, position, accuracyM };
 
@@ -179,9 +151,8 @@ export function RecordMap({
 
     const instance = new maplibregl.Map({
       container: container.current,
-      // Relief, always. The switcher belongs on a screen where you are choosing a hike; on
-      // this one the only question is where you are, and shaded ground answers it in the
-      // dark without a network round trip for imagery.
+      // Relief, always. On this screen the only question is where you are, and shaded ground
+      // answers it in the dark without a round trip for imagery.
       style: buildStyle('relief', { hillshade: true, units: units.current }),
       ...initialCamera(route, position),
       dragRotate: false,
@@ -205,8 +176,8 @@ export function RecordMap({
       ready.current = true;
       addRecordLayers(instance);
 
-      // Whatever arrived while the style was loading. Without this the trail line never
-      // draws at all — see the note on `latest` above.
+      // Whatever arrived while the style was loading — without this the trail line never
+      // draws at all. See `latest` above.
       const now = latest.current;
       instance.getSource<GeoJSONSource>(TRACK_SOURCE)?.setData(lineCollection(now.track));
       instance
@@ -263,24 +234,15 @@ export function RecordMap({
     <div
       ref={container}
       /*
-       * `h-full w-full` is set here rather than left to the caller, and it is not belt and
-       * braces. `maplibre-gl.css` declares `.maplibregl-map { position: relative }` at the
-       * same specificity as Tailwind's `.absolute` and is imported after it, so a container
-       * positioned with `absolute inset-0` quietly becomes `relative` with no height at all —
-       * a map that mounts, loads its style, fetches its tiles, reports a sane viewport to
-       * every effect here, and draws into a zero-height box. Nothing throws and nothing logs.
-       * Sizing the element itself is the only version of this that cannot be got wrong from
-       * outside, which matters more here than elsewhere: this is the map somebody is reading
-       * to find out where they are.
+       * `h-full w-full` is set here rather than left to the caller: `maplibre-gl.css` declares
+       * `.maplibregl-map { position: relative }` at the same specificity as Tailwind's
+       * `.absolute` and is imported after it, so an `absolute inset-0` container quietly
+       * becomes relative with no height, and the map draws into a zero-height box in silence.
        */
       className={`h-full w-full ${className ?? ''}`}
-      // Every number this canvas encodes is printed in the readout beside it, at a size that
-      // can be read at arm's length — but that is an argument for keeping this quiet, not for
-      // `aria-hidden`, which is what it used to be. Hiding an element does not un-focus it:
-      // MapLibre's canvas carries `tabindex="0"` and its zoom controls are real buttons, so
-      // the only thing that achieved was three tab stops that announced nothing. On this page
-      // of all of them — somebody mid-hike, working out where they are — that is the wrong
-      // failure to ship. Named region instead; the readout is still where the facts live.
+      // A named region, never `aria-hidden`: MapLibre's canvas carries `tabindex="0"` and its
+      // zoom controls are real buttons, so hiding it only makes three tab stops that announce
+      // nothing. The readout beside it is still where the facts live.
       role="region"
       aria-label="Map of your position and the hike so far"
     />
@@ -299,19 +261,9 @@ function addRecordLayers(instance: MapLibreMap): void {
     }
   }
 
-  /*
-   * The planned route gets a casing, the same as the track does.
-   *
-   * It used to be a bare 6 px woodland line at 0.55 opacity, on the reasoning that the plan
-   * should sit quieter than what you have actually hiked. Right instinct, wrong instrument:
-   * the relief basemap's ground tint is itself a green (`#4F6B3B`), so washing a green line
-   * out over it left the trail barely findable — and before the first fix arrives, that line
-   * is the *only* thing on this screen. It is what answers "am I at the right trailhead".
-   *
-   * So the hierarchy is carried by hue and width instead, which survive any background: the
-   * route is woodland and thin, the track is contour and reads hot against it. Both get the
-   * same dark casing, which is what makes either legible on ground of any colour.
-   */
+  // The route gets the same dark casing as the track: the relief basemap's ground tint is
+  // itself a green, so an unwashed woodland line over it is barely findable — and before the
+  // first fix it is the only thing on screen. Hierarchy is carried by hue and width instead.
   if (!instance.getLayer('rec-route-casing')) {
     instance.addLayer({
       id: 'rec-route-casing',
@@ -364,17 +316,11 @@ function addRecordLayers(instance: MapLibreMap): void {
       source: POSITION_SOURCE,
       paint: {
         /*
-         * Metres converted to screen pixels, so the circle means the same thing at every
-         * scale. A pixel is 156543·cos(lat)/2^z metres, so the radius doubles with each zoom
-         * level — which has to be written as `interpolate` with an exponential base of 2
-         * rather than as the arithmetic it plainly is. MapLibre only accepts `["zoom"]` as
-         * the direct input of a top-level `step` or `interpolate`; anything else throws
-         * inside `addLayer`, and because these layers are added in one pass, one bad
-         * expression takes the whole map down with it.
-         *
-         * The two stops are exact rather than approximate: interpolating exponentially from
-         * r to r·2²² across z0–z22 reproduces r·2^z at every level in between. The 4 px
-         * floor keeps a very good fix from vanishing under its own dot.
+         * Metres converted to screen pixels so the circle means the same thing at every scale.
+         * Written as `interpolate` with an exponential base of 2 rather than the arithmetic it
+         * plainly is, because MapLibre only accepts `["zoom"]` as the direct input of a
+         * top-level `step` or `interpolate` and anything else throws inside `addLayer` — which
+         * here takes the whole map down. The 4 px floor keeps a very good fix visible.
          */
         'circle-radius': [
           'interpolate',

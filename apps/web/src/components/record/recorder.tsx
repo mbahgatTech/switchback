@@ -32,31 +32,13 @@ import { RecordMap } from './record-map';
 import { useRecorder, type RecorderOptions, type RecorderPhase } from './use-recorder';
 
 /**
- * The recorder.
+ * The recording screen: a full-height instrument read at arm's length, a control ledge, and
+ * the finish dialog.
  *
- * Everything on this screen is read at arm's length, in daylight, by someone who is hiking.
- * That single fact settles most of the layout arguments: the numbers are enormous and set in
- * mono so they do not reflow as they tick, the controls are far enough apart that a gloved
- * thumb cannot hit the wrong one, and there is exactly one thing on the page that is red.
- *
- * **The instrument is the signature.** Distance sits alone above a hairline, at display size,
- * with a collar label over it — the face of a bezel-mounted gauge, which is what a person
- * glancing at their phone on a ridge actually wants. Everything else is a secondary dial
- * beneath it. It is the same graphic language as the elevation section on a trail page: a
- * measurement, labelled the way a sheet labels its margin, and nothing decorative near it.
- *
- * Survey red appears on this screen only where somebody's safety is the subject: the position
- * dot, the banner that says you have left the trail, an overdue Lifeline, and the two
- * confirmations that throw a hike away. Not on the record button, however much a record button
- * wants to be red — a control that shares a colour with a wrong-turn alert is a control that
- * makes the alert mean less.
- *
- * **Pressing start does not wait for the server.** The id is minted here, on the device, and
- * `activities.start` is sent afterwards as a confirmation rather than as a precondition — it
- * carries that same id, and the server adopts it. So a hike begins with no signal exactly as
- * it begins with five bars, the GPS watch starts on the press rather than a round trip later,
- * and the recording is already a queued row from its first second. `offline/activities.ts`
- * holds the idempotency argument that makes that safe to retry.
+ * Survey red appears only where someone's safety is the subject — the position dot, the
+ * off-route banner, an overdue Lifeline, the two confirmations that throw a hike away — and
+ * never on the record button. Pressing start does not wait for the server: the id is minted
+ * here and `activities.start` follows as a confirmation carrying that same id.
  */
 
 export interface RecorderTrail {
@@ -77,14 +59,9 @@ export interface RecorderProps {
 }
 
 /**
- * What the screen has to say about the hike that just ended, when it does not navigate away.
- *
- * Three endings need one: a hike closed with no connection, which is safe on the device and is
- * now the drain's business; a hike finished on a browser that is acting as somebody else by
- * then, which is safe on the device and waiting for its own author; and a hike the server
- * closed before this device had sent all of it, whose tail no longer has anywhere to go. All
- * three are the answer to "where did my hike go?", so all three are written into the same
- * region at the top of the readout.
+ * What the screen says about a hike that just ended without navigating away: closed with no
+ * connection, closed while the browser was acting as somebody else, or closed by the server
+ * before this device had sent all of it. All three answer "where did my hike go?".
  */
 type Receipt =
   | { kind: 'offline' }
@@ -107,31 +84,15 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   /**
    * The permanent live region the receipt is written into, and where focus goes with it.
    *
-   * Two things this element is doing, both of them because it is the answer to "where did my
-   * hike go?". It is mounted whether or not there is anything in it: assistive technology
-   * misses a `role="status"` region that arrives in the DOM together with its text, so the
-   * container is constant and only the sentence is swapped — the same rule, and the same
-   * mistake corrected, as the notice on `/downloads` (`downloads-manager.tsx`). And it is
-   * focusable, because the offline finish is the one ending that does not navigate: closing
-   * the dialog unmounts it while the control that opened it is being replaced on the ledge,
-   * which measurably drops focus to `<body>`. Focus lands where the outcome is written.
+   * Mounted whether or not it has text: assistive technology misses a `role="status"` region
+   * that arrives in the DOM together with its content. Focusable because the offline finish is
+   * the one ending that does not navigate, and closing the dialog drops focus to `<body>`.
    */
   const receiptRef = useRef<HTMLDivElement | null>(null);
   /**
-   * The scrollport that holds the readout. Driven, not just read.
-   *
-   * Everything the phase changes into view is inserted at the *top* of this box — the
-   * off-route banner, the receipt for a hike saved with no connection — and the box keeps
-   * whatever scroll position the hiker left it at. At 320×568 that position is rarely zero:
-   * five of the fourteen things on the recording screen are below the fold, so reading your
-   * GPS accuracy or reaching the Lifeline means scrolling, and nothing scrolls back. Measured
-   * with the readout where a hiker leaves it, the wrong-turn alert renders 430px above the
-   * top of its own scrollport: none of it on the glass, and it is the only wrong-turn warning
-   * the product has.
-   *
-   * So the two effects below put the top of the readout back on screen whenever something
-   * lands there. `overflow-y-auto` is what made the column reachable at all; this is what
-   * keeps "reachable" from meaning "reachable if you happen to scroll".
+   * The scrollport that holds the readout, driven rather than only read: everything the phase
+   * brings into view is inserted at its top, and the box keeps whatever scroll position the
+   * hiker left it at — which on a small phone can put the wrong-turn alert off the glass.
    */
   const readout = useRef<HTMLDivElement | null>(null);
   const wasIdle = useRef(true);
@@ -145,17 +106,14 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   const appendRef = useRef(append);
   appendRef.current = append;
 
-  /**
-   * Posts `activities.start`, for the recorder to call when the server has not heard of a
-   * hike it is about to upload. Assigned below, once the mutation exists.
-   */
+  /** Posts `activities.start` for the recorder's upload path. Assigned below, once it exists. */
   const startServerRef = useRef<RecorderOptions['onStart']>(() =>
     Promise.reject(new Error('The recorder is not ready.')),
   );
 
   const recorder = useRecorder({
     onFlush: (id, fixes) => appendRef.current.mutateAsync({ id, fixes }),
-    // Announcing the recording is the upload path's job, not the button's — see the note on
+    // Announcing the recording is the upload path's job, not the button's — see
     // `RecorderOptions.onStart`. Held in a ref because `start` is declared below this call.
     onStart: (input) => startServerRef.current(input),
     route,
@@ -166,14 +124,12 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     trpc.activities.start.mutationOptions({
       onSuccess: (activity) => {
         setStartError(null);
-        // The recording is already running under this id; all the server has added is that
-        // it now knows about it. Nothing on screen changes.
+        // The recording is already running under this id; nothing on screen changes.
         recorder.noteServerStarted(activity.id);
       },
       onError: (err) => {
-        // No signal is not an error here. The hike is recording, the row is queued, and the
-        // next flush posts this same `start` when the connection comes back — so there is
-        // nothing to tell the hiker and nothing for them to do about it.
+        // No signal is not an error here: the hike is recording, the row is queued, and the
+        // next flush posts this same `start` when the connection comes back.
         if (isUnreachable(err)) return;
         setStartError(err.message);
       },
@@ -200,26 +156,22 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     }
   }, [recorder.offRoute, recorder.alert, receipt]);
 
-  // And the receipt takes focus with it. The offline finish is the only ending that stays on
-  // this screen, and the dialog it closes is unmounted while the button that opened it is
-  // being replaced — which drops focus to `<body>` and leaves a keyboard reader at the top of
-  // the document with no idea the hike was saved.
+  // And the receipt takes focus with it: the dialog it closes is unmounted while the button
+  // that opened it is being replaced, which drops focus to `<body>`.
   useEffect(() => {
     if (receipt) receiptRef.current?.focus();
   }, [receipt]);
 
   // And on the way into a hike. Choosing anything but Hiking means scrolling the chooser into
-  // view, and Start is on the ledge — so the press that begins a hike is routinely made from
-  // a scrolled column, and the first second of the recording would otherwise open with the
-  // distance gauge, which this file calls the signature, entirely off the glass.
+  // view, so the press that begins a hike is routinely made from a scrolled column.
   useEffect(() => {
     if (wasIdle.current && recorder.phase !== 'idle') readout.current?.scrollTo({ top: 0 });
     wasIdle.current = recorder.phase === 'idle';
   }, [recorder.phase]);
 
   // The elapsed clock ticks off the wall, not off the fixes, so it keeps moving through a
-  // stretch with no signal. It is the same figure the server derives — `t` is measured from
-  // `startedAt` whatever happens in between, so a pause shows up in moving time and not here.
+  // stretch with no signal. `t` is measured from `startedAt` whatever happens in between, so a
+  // pause shows up in moving time and not here.
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!running) return;
@@ -264,17 +216,14 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     if (!id) return;
     setSaveError(null);
     recorder.stop();
-    // Everything still in the buffer goes up before the recording is closed, because
-    // `finish` computes the hike from what is stored and nothing else. `flush` joins a drain
-    // that is already running rather than returning past it — see its note in `use-recorder`;
-    // returning early here is what used to let `finish` land in the middle of a backlog and
-    // close the recording under the loop still uploading it.
+    // Everything still in the buffer goes up before the recording is closed, because `finish`
+    // computes the hike from what is stored. `flush` joins a drain already running rather than
+    // returning past it — returning early let `finish` close the row under an uploading loop.
     try {
       await recorder.flush();
     } catch {
-      // Reported by the recorder already. Closing anyway is the right call: the alternative
-      // is a hike that cannot be ended because the last minute will not upload. What it costs
-      // is counted below rather than swallowed.
+      // Reported by the recorder already. Closing anyway is right: the alternative is a hike
+      // that cannot be ended because the last minute will not upload. The cost is counted below.
     }
     // Read after the await, not off the render this closure was made in.
     const lost = recorder.outstanding();
@@ -290,25 +239,13 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
 
     /**
      * Write the finish onto the queued row and let go of the screen, leaving the hike on this
-     * device for a drain to publish.
+     * device for a drain to publish. Returns false when the device would not take the write.
      *
-     * Two endings need exactly this — no connection, and no longer this browser's hike to post
-     * — and the order matters in both. `markFinished` is awaited and its failure is not
-     * swallowed: the receipt each caller then prints says the hike is safe on this device, and
-     * `handOff` throws away the in-memory buffer that is otherwise the last copy of it, so on a
-     * device whose storage has been refusing writes all day (quota, private mode, a locked
-     * profile) that sentence used to be printed over a hike it had just destroyed. Nothing is
-     * cleared until the write is known to have happened, which since `idb.run` resolves on
-     * commit is now what that means.
-     *
-     * `handOff` rather than `forget`, which would delete the only copy of the day.
-     *
-     * False when the device would not take it, having already said so and put the recorder back
-     * where the hiker can try again.
-     *
-     * An arrow rather than a declaration so that the `if (!id) return` above it still narrows
-     * `id` here; a hoisted declaration could in principle run before that check, and the
-     * compiler is right to say so.
+     * `markFinished` is awaited and its failure is not swallowed: `handOff` throws away the
+     * in-memory buffer, so on a device whose storage refuses writes the receipt would
+     * otherwise be printed over a hike it had just destroyed. `handOff` rather than `forget`,
+     * which would delete the only copy of the day. An arrow, so `if (!id) return` still
+     * narrows `id` here.
      */
     const keepForTheDrain = async (): Promise<boolean> => {
       try {
@@ -329,20 +266,13 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     };
 
     /*
-     * Somebody else is signed in now, so this hike is not this browser's to publish.
+     * Somebody else is signed in now, so this hike is not this browser's to publish. `finish`
+     * publishes a day into whichever account the request carries, and it is the request
+     * furthest in time from the press that decided the name. Asked here rather than trusted
+     * from the flush above, which may have stopped for exactly this reason without a word.
      *
-     * The last and most expensive place to be wrong on this screen. `finish` does not merely
-     * upload — it publishes a day, attaches it to whichever account the request carries and
-     * logs a completion against the trail under that name. It is also the request furthest in
-     * time from the press that decided the name: a hike is hours, the finish dialog is however
-     * long it takes somebody to write a note, and on a shared laptop a sign-in can land
-     * anywhere in that. Asked here rather than trusted from the flush above, because the flush
-     * may have stopped for exactly this reason and returned without a word — see `stillMine`.
-     *
-     * The hike is not lost and not blocked: the payload goes onto the row, the row keeps every
-     * fix, and `flushPendingActivities` sends the lot the moment its own author signs back in.
-     * `/downloads` counts it as held for another account in the meantime, and shows nothing of
-     * what it says.
+     * Nothing is lost: the payload goes onto the row and `flushPendingActivities` sends the
+     * lot when its own author signs back in.
      */
     if (!recorder.stillMine()) {
       if (await keepForTheDrain()) setReceipt({ kind: 'held' });
@@ -354,18 +284,10 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       recorder.forget();
       setFinishing(false);
       /*
-       * Fixes that were still outstanding when the hike closed are gone, and saying so is
-       * this path's job.
-       *
-       * `finish` has just set `endedAt` and `syncedAt` on the server, and `append` refuses a
-       * row carrying both, permanently — so there is no later run of the drain that could
-       * land them, and `forget()` is right to delete chunks nothing will ever take. What was
-       * wrong was doing it in silence. The drain says exactly this sentence when it hits the
-       * same wall (`flushPendingActivities`, `truncated`), and it could never say it for this
-       * path because the row was deleted here before any drain saw it.
-       *
-       * Reported on this screen rather than navigated past: the hike is open in the account
-       * and one link away, and a notice on `/downloads` is a notice on a page nobody opens.
+       * Fixes still outstanding when the hike closed are gone: `finish` has set `endedAt` and
+       * `syncedAt`, and `append` refuses a row carrying both, permanently — so `forget()` is
+       * right to delete chunks nothing will take, and this is the only place the loss can be
+       * announced. Same sentence the drain prints for the same wall.
        */
       if (lost > 0) {
         setReceipt({ kind: 'truncated', activityId: saved.id, lost });
@@ -374,30 +296,22 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       router.push(`/activities/${saved.id}`);
     } catch (error) {
       if (isUnreachable(error)) {
-        // The hike ends here as far as the hiker is concerned. The row keeps everything —
-        // the fixes and now this payload — and the drain replays start, append and finish
-        // when there is a connection. No `router.push`: `/activities/:id` does not exist yet,
-        // and is not a page that can be rendered with no network.
-        //
-        // Nothing is truncated on this branch however much is outstanding: the row still
-        // holds every fix and the drain sends them all before it replays this payload.
+        // The hike ends here as far as the hiker is concerned. The row keeps the fixes and
+        // this payload, and the drain replays start, append and finish when there is a
+        // connection. No `router.push`: `/activities/:id` does not exist yet. Nothing is
+        // truncated on this branch however much is outstanding.
         if (await keepForTheDrain()) setReceipt({ kind: 'offline' });
         return;
       }
-      // The server refused it. Leave `saving` so the dialog's buttons work again and the
-      // hiker can read the reason, change something, and try — rather than being locked out
-      // of their own hike behind a modal that can neither be confirmed nor cancelled.
+      // The server refused it. Leave `saving` so the dialog's buttons work again and the hiker
+      // can read the reason and try, rather than being locked out behind a dead modal.
       recorder.unstop();
     }
   }
 
   /**
-   * The press.
-   *
-   * The id is minted here and the recording begins immediately; `start.mutate` carries that
-   * same id and is a confirmation, not a precondition. Lives on the Recorder rather than on
-   * the start panel because the button it belongs to now sits on the control ledge, which is
-   * a sibling of the panel rather than part of it.
+   * The press. The id is minted here and the recording begins immediately; `start.mutate`
+   * carries that same id and is a confirmation, not a precondition.
    */
   function onStartPress(): void {
     const id = newActivityId();
@@ -428,17 +342,15 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
         await remove.mutateAsync({ id });
       } catch (error) {
         // Nothing there to delete, in either of the two ways that happens: no connection to
-        // ask over, or a hike begun with no signal that the server has never been told about.
-        // Refusing to discard would leave a hiker unable to throw away a false start until
-        // they found signal, which is the worse of the two.
+        // ask over, or a hike begun with no signal the server was never told about. Refusing
+        // would leave a hiker unable to throw away a false start until they found signal.
         if (!isUnreachable(error) && !isMissing(error)) throw error;
       }
     }
     recorder.forget();
     setConfirmDiscard(false);
-    // The hike that error was about has just been thrown away. Left set, it is re-rendered by
-    // the ledge's `!live` branch — a fresh `role="alert"` node, so it is announced again,
-    // assertively — above a Start button, describing a recording that no longer exists.
+    // The hike that error was about has just been thrown away. Left set, the ledge's `!live`
+    // branch re-renders it as a fresh `role="alert"` above a Start button.
     setStartError(null);
     setSaveError(null);
   }
@@ -759,10 +671,6 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
   );
 }
 
-// ---------------------------------------------------------------------------
-// The instrument
-// ---------------------------------------------------------------------------
-
 interface InstrumentProps {
   units: UnitSystem;
   distanceM: number;
@@ -791,9 +699,8 @@ function Instrument({
         <p className="collar">Distance</p>
         <p
           className={`font-mono tabular-nums ${idle ? 'text-ink-muted' : 'text-ink'}`}
-          // The one place in the product that goes past h1. A gauge face is read from
-          // further away than a heading, and the leading is set explicitly because the
-          // mono face's own is far too generous at this size.
+          // The one place in the product that goes past h1: a gauge face is read from further
+          // away than a heading, and the mono face's own leading is far too generous here.
           style={{ fontSize: 'var(--text-display)', lineHeight: '1.02' }}
         >
           {value}
@@ -847,20 +754,13 @@ function Dial({
 }
 
 /**
- * Split "4.82 km" into the number and its unit so the unit can be set smaller.
- *
- * A units suffix at display size is as loud as the measurement, and the measurement is the
- * only thing being read. Falls back to the whole string as the value if there is no space,
- * which keeps a future format from silently losing its tail.
+ * Split "4.82 km" into the number and its unit so the unit can be set smaller. Falls back to
+ * the whole string as the value if there is no space.
  */
 function splitMeasurement(formatted: string): [string, string] {
   const at = formatted.lastIndexOf(' ');
   return at === -1 ? [formatted, ''] : [formatted.slice(0, at), formatted.slice(at + 1)];
 }
-
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
 
 function Status({
   phase,
@@ -897,9 +797,8 @@ function Status({
             ? `±${formatElevation(accuracyM, units)}`
             : 'Recording';
 
-  // The clock time of the last upload, not "2 minutes ago". A relative figure has to tick to
-  // stay true, and this line is not worth a second render loop; an absolute time is right
-  // the moment it is printed and stays right.
+  // The clock time of the last upload, not "2 minutes ago": a relative figure has to tick to
+  // stay true, and this line is not worth a second render loop.
   const sync = syncing
     ? 'Saving'
     : pending > 0
@@ -947,10 +846,8 @@ function Status({
 }
 
 /**
- * What the receipt says, once there is something to say.
- *
- * Split out only so the container above it can be permanent — the region has to exist before
- * it has any text, and that is easier to read when the text is somewhere else.
+ * What the receipt says, once there is something to say. Split out only so the container
+ * above it can stay mounted while it is empty.
  */
 function ReceiptBody({ receipt }: { receipt: Receipt }) {
   if (receipt.kind === 'offline') {
@@ -974,14 +871,10 @@ function ReceiptBody({ receipt }: { receipt: Receipt }) {
 
   if (receipt.kind === 'held') {
     /*
-     * Ink, not water and not survey. Nothing about the network failed and nothing about this
-     * hiker's position or safety is at stake — a different account is signed in, which is a
-     * fact about who the browser is acting as, and structure is the plate for that. The same
-     * reasoning as the "Held for another account" block on `/downloads`, which this hike has
-     * just joined.
-     *
-     * "the hiker who recorded it" rather than "you": on the one screen where this sentence can
-     * appear, the person reading it is by definition not the person it is about.
+     * Ink, not water and not survey: nothing about the network failed and nothing about this
+     * hiker's safety is at stake — a different account is signed in, and structure is the
+     * plate for that. "the hiker who recorded it" rather than "you", because the person
+     * reading this is by definition not the person it is about.
      */
     return (
       <>
@@ -1001,13 +894,9 @@ function ReceiptBody({ receipt }: { receipt: Receipt }) {
   }
 
   /*
-   * The tail the server would not take.
-   *
-   * Ink rather than survey: nothing here is about where the hiker is or whether they are safe,
-   * which is the only thing that plate means on this screen. The sentence is the one the drain
-   * prints for the same wall (`flushPendingActivities`), so a hiker who meets it in both places
-   * meets it in the same words. No apology and no instruction, because there is nothing to do —
-   * `append` refuses a finished recording permanently, so those fixes have nowhere left to go.
+   * The tail the server would not take. Ink rather than survey: nothing here is about where
+   * the hiker is or whether they are safe. The same sentence the drain prints for the same
+   * wall, and no instruction, because `append` refuses a finished recording permanently.
    */
   return (
     <>
@@ -1036,18 +925,10 @@ function OffRouteBanner({
   trailName: string;
 }) {
   /*
-   * The label is `text-ink`, not `text-survey`, and that is a contrast fix rather than a
-   * change of plate.
-   *
-   * `SchemeColors` in `packages/ui` states the rule this broke: a plate's own wash is a fill,
-   * not a text background. Measured in light mode, survey `#B4322A` on this banner's composited
-   * background `#DFD7D0` is **4.30:1** at 11px bold — under the 4.5:1 that non-large text
-   * needs, and axe agrees (`color-contrast[serious]`, 4.3). On bare canvas the same ink is
-   * 4.97:1; it is the wash underneath it that costs the 0.7. Dark mode was never affected.
-   *
-   * The plate assignment is untouched — the 2px survey border and the survey wash still carry
-   * it, which is what those are for. This is the one alert on the screen whose entire job is to
-   * interrupt somebody, so it is the last place to be relying on a ratio that does not hold.
+   * The label is `text-ink`, not `text-survey`: a plate's own wash is a fill, not a text
+   * background, and survey on this banner's composited light-mode background measures 4.30:1
+   * at 11px bold — under the 4.5:1 non-large text needs. The 2px survey border and the wash
+   * still carry the plate.
    */
   return (
     <div role="alert" className="rounded-hair border-2 border-survey bg-survey/10 px-md py-sm">
@@ -1059,17 +940,9 @@ function OffRouteBanner({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Starting
-// ---------------------------------------------------------------------------
-
 /**
- * What there is to decide before pressing start.
- *
- * The button itself is not here — it lives on the control ledge below the scrollport, so that
- * it is on the glass at every viewport rather than at the end of however much this panel
- * happens to be. What is left is the two things that change what the press does: a recording
- * the server still has open, and what kind of outing this is.
+ * What there is to decide before pressing start: a recording the server still has open, and
+ * what kind of outing this is. The button itself lives on the control ledge below.
  */
 function StartPanel({
   openRecording,
@@ -1142,10 +1015,6 @@ function StartPanel({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Finishing
-// ---------------------------------------------------------------------------
-
 function FinishDialog({
   units,
   defaultName,
@@ -1203,8 +1072,8 @@ function FinishDialog({
         onSubmit={(event) => {
           event.preventDefault();
           // `onConfirm` handles every outcome it knows how to handle and leaves the phase
-          // recoverable for the rest. A bare `void` here would surface anything it did not
-          // as an unhandled rejection, which is noise rather than information.
+          // recoverable for the rest; a bare `void` would surface the remainder as an
+          // unhandled rejection.
           void onConfirm({ name, notes, visibility, logCompletion }).catch(() => undefined);
         }}
         className="flex flex-col gap-md p-lg"

@@ -9,24 +9,13 @@ import { HEATMAP_LEGEND } from './heatmap';
 import { SLOPE_BANDS, SLOPE_BASELINE_M, SLOPE_MAP_MIN_ZOOM } from './slope';
 
 /**
- * The sheet selector.
+ * The sheet selector. A `<details>` rather than a popover: one element, opens on Enter, closes
+ * on Escape, no state, portal or outside-click handler.
  *
- * A `<details>` rather than a popover: it is one element, it opens on Enter, it closes on
- * Escape, and it needs no state, no portal and no outside-click handler. The summary shows
- * the sheet you are on, so the control still says something useful while closed — which is
- * most of the time.
- *
- * The keys sit *outside* the disclosure, and that is deliberate. A legend folded away inside
- * the control that switched the layer on is a legend nobody reads, and a wash of red over a
- * mountainside with no key is worse than no overlay at all.
- *
- * **Opaque, not tinted.** This and the three keys below were `bg-surface/95` with a backdrop
- * blur, which looked like the right amount of restraint for a control sitting on a map and
- * was in fact the bug: a translucent panel has no fixed backdrop, so the contrast of the
- * muted text on it is set by whatever basemap the reader chose. `ink-muted` here measured
- * 4.19:1 over the dark canvas and would have been worse over satellite. Opaque it is 4.83:1
- * on every sheet, and the blur went with the alpha because nothing shows through to blur.
- * See the note on `SCHEMES` in `packages/ui` for the arithmetic.
+ * The keys sit outside the disclosure — a legend folded inside the control that switched the
+ * layer on is a legend nobody reads. Panels here are opaque, never tinted: a translucent panel
+ * has no fixed backdrop, so muted text on it takes its contrast from whatever basemap the
+ * reader chose (measured 4.19:1 over the dark canvas, 4.83:1 opaque).
  */
 
 export interface LayerSwitchProps {
@@ -35,53 +24,40 @@ export interface LayerSwitchProps {
   hillshade: boolean;
   onHillshadeChange: (hillshade: boolean) => void;
   /**
-   * The ground as a mesh rather than a picture of one. Offered only where the map has room to
-   * be tilted — a 200-pixel-tall thumbnail pitched to 66° is a strip of sky.
+   * The ground as a mesh. Offered only where the map has room to be tilted — a 200px-tall
+   * thumbnail pitched to 66° is a strip of sky.
    */
   terrain?: boolean;
   onTerrainChange?: (terrain: boolean) => void;
   /**
-   * Omitted by any map that spends the survey plate on something else — the recorder and
-   * the Lifeline sheet both mark the reader's own position in it.
+   * Omitted by any map that spends the survey plate on something else — the recorder and the
+   * Lifeline sheet both mark the reader's own position in it.
    */
   slope?: boolean;
   onSlopeChange?: (slope: boolean) => void;
   /** Air quality over the viewport. Same rule as slope: omitted where red means the reader. */
   airQuality?: boolean;
   onAirQualityChange?: (airQuality: boolean) => void;
-  /**
-   * The grid currently painted, so the key can name the model that produced it and the hour
-   * it is for. A legend that cannot say whose numbers these are is decoration.
-   */
+  /** The grid currently painted, so the key can name the model and the hour it is for. */
   airQualityGrid?: AirQualityGrid | null;
   /** Recorded activity over the viewport. Same omission rule as slope and air quality. */
   heatmap?: boolean;
   onHeatmapChange?: (heatmap: boolean) => void;
-  /**
-   * The grid currently painted, so the key can print the k that was applied and how many
-   * cells it withheld. Both numbers are the point of the key, not a footnote to it.
-   */
+  /** The grid currently painted, so the key can print the k applied and the cells withheld. */
   heatmapGrid?: Heatmap | null;
   /**
    * The map's current zoom, when the caller tracks it. Slope is computed at one fixed zoom
-   * (see `SLOPE_TILE_ZOOM`), so below a floor there is nothing on the map to read — and a key
-   * at full strength over an unpainted mountainside reads as *this slope is gentle*. Passing
-   * the zoom lets the key say *zoom in* instead of lying by omission.
+   * (see `SLOPE_TILE_ZOOM`), so below a floor a key at full strength over unpainted ground
+   * would read as *this slope is gentle*; the zoom lets the key say *zoom in* instead.
    */
   zoom?: number;
 }
 
 /**
- * The width of the switcher's column, in px.
+ * The width of the switcher's column, in px. Exported because anything else pinned to the top
+ * of the same map has to stop short of it, and two numbers describing one edge diverge.
  *
- * Exported because it is not only this component's business: anything else pinned to the
- * top of the same map has to stop short of it, and the one place that does was carrying a
- * hand-converted `right-[16.5rem]` — 232 plus two gutters, worked out once by a person and
- * then frozen. Two numbers describing one edge is one number that will be wrong after the
- * next change here.
- *
- * 232 rather than a round 240 because the widest label the summary row has to hold on one
- * line is "Relief with contours", and 232 is where that stops wrapping at `text-caption`.
+ * 232 rather than 240: it is where "Relief with contours" stops wrapping at `text-caption`.
  */
 export const LAYER_COLUMN_PX = 232;
 
@@ -235,17 +211,13 @@ export function LayerSwitch({
 }
 
 /**
- * The key, as an instrument reads: a continuous ramp with the thresholds marked beneath it,
- * and the unit in the corner rather than repeated on every mark.
+ * The slope key: a continuous ramp with thresholds marked beneath it. Swatches are painted
+ * with the identical `rgba` the map uses, so the key is a sample of the layer rather than an
+ * illustration of it, and each mark sits at the left edge of the band it opens because the
+ * five equal segments do not stand for equal spans of angle.
  *
- * The swatches are painted with the identical `rgba` the map paints, so the key is a sample
- * of the layer and not an illustration of it. Five equal segments do not stand for equal
- * spans of angle — 35–45 is ten degrees where 27–30 is three — and the marks say so, since
- * each one sits at the left edge of the band it opens.
- *
- * Zoomed out past the floor the ramp is dimmed rather than hidden. Hiding it would leave the
- * reader who has just ticked the box with no evidence the tick did anything; dimming it says
- * *this exists, it is not drawn yet*, and the note says what to do about it.
+ * Below the zoom floor the ramp is dimmed rather than hidden, so a reader who has just ticked
+ * the box still sees that the tick did something.
  */
 function SlopeKey({ tooFarOut }: { tooFarOut: boolean }) {
   return (
@@ -299,17 +271,10 @@ function SlopeKey({ tooFarOut }: { tooFarOut: boolean }) {
 }
 
 /**
- * The air-quality key.
- *
- * Six bands, and the important thing about them is that the hue changes between the third
- * and the fourth. That break is not styling: 60 is where the European index enters "poor"
- * and where this product's own safety flags start firing, so the key, the map and the
- * warnings under a trail all step at the same number. Alpha still climbs across the break,
- * so the ramp reads as *worse* without relying on the hue.
- *
- * The footnote is the part that keeps this honest. A coloured square over a valley invites
- * the reader to believe it is about that valley; naming the model and the size of one cell
- * tells them how much ground the square is really claiming, which is often most of a county.
+ * The air-quality key. The hue changes between the third and fourth band because 60 is where
+ * the European index enters "poor" and this product's safety flags start firing, so key, map
+ * and trail warnings all step at the same number. The footnote names the model and the size
+ * of one cell, which is often most of a county.
  */
 function AirQualityKey({ grid }: { grid: AirQualityGrid | null }) {
   const empty = grid !== null && grid.cells.length === 0;
@@ -374,20 +339,13 @@ function cellKm(stepDeg: number): number {
 }
 
 /**
- * The heatmap key, and the one place the privacy floor is stated in words.
+ * The heatmap key, and the one place the privacy floor is stated in words. A discrete ladder
+ * rather than a continuous ramp, because 3/10/30/100/300 is roughly logarithmic and an even
+ * ramp would claim the layer resolves differences it does not.
  *
- * A discrete ladder rather than the continuous ramp the other two keys use, because the
- * scale is discrete: 3, 10, 30, 100, 300 is roughly logarithmic, and stretching it into an
- * even ramp would put the same width on "3 to 10" as on "300 and up" and quietly claim the
- * layer resolves differences it does not.
- *
- * **The suppression line is not a disclaimer.** An empty overlay over a mountain range reads
- * as *nobody hikes here*, which is usually false and always unearned — what it really means
- * is that the corpus is young. Printing how many cells were withheld turns a broken-looking
- * map into an accurate one, and it leaks nothing: a count across a whole viewport says how
- * much is hidden without saying where any of it is. The floor itself comes off the response
- * rather than out of a constant here, so the key can never disagree with the query that
- * produced the cells.
+ * The suppression line turns a broken-looking empty map into an accurate one, and leaks
+ * nothing: a count across a viewport says how much is hidden without saying where. The floor
+ * comes off the response rather than a constant here, so the key cannot disagree with the query.
  */
 function HeatmapKey({ grid }: { grid: Heatmap | null }) {
   const nothing = grid !== null && grid.cells.length === 0;
@@ -406,11 +364,9 @@ function HeatmapKey({ grid }: { grid: Heatmap | null }) {
         aria-hidden
       >
         {HEATMAP_LEGEND.map((band) => (
-          // Each swatch is the band's fill over the ground tint the map settles to, which is
-          // the only backdrop that makes the key predictive. Painted on the panel instead —
-          // or on the app canvas, which is near-black — the two lowest bands of a near-white
-          // wash are indistinguishable from each other and from the panel behind them, and a
-          // reader would conclude the scale starts at "well hiked".
+          // Each swatch is the band's fill over the ground tint the map settles to — the only
+          // backdrop that makes the key predictive. On the panel or the near-black canvas the
+          // two lowest bands of a near-white wash are indistinguishable.
           <span key={band.from} className="flex-1" style={{ backgroundColor: GROUND_TINT }}>
             <span className="block h-full w-full" style={{ backgroundColor: band.fill }} />
           </span>
@@ -454,12 +410,8 @@ function HeatmapKey({ grid }: { grid: Heatmap | null }) {
 }
 
 /**
- * A cell's size for the key, in whichever unit reads as a size rather than as a number.
- *
- * Metres up to a kilometre and kilometres above it. The figure is at the equator and shrinks
- * with latitude, which is why it is hedged as "about" — a second number for the true width at
- * this latitude would be more precise and less useful, since the reader is being told roughly
- * how much ground one square claims, not measuring with it.
+ * A cell's size for the key: metres up to a kilometre, kilometres above it. The figure is at
+ * the equator and shrinks with latitude, hence "about".
  */
 function heatCellSize(stepDeg: number): string {
   const m = heatmapCellMetres(stepDeg);

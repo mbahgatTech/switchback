@@ -4,25 +4,14 @@ import { SCHEMES } from '@switchback/ui';
 /**
  * Air quality, as a field you can see the edges of.
  *
- * **The plate changes at 60, and it changes there for the same reason the flags do.** Below
- * that the reading is a condition — the water plate, which is what weather wears everywhere
- * else in this product. At 60 the European AQI enters "poor", `AQI_CAUTION` fires, and the
- * layer switches to survey, because from that point it has stopped describing the day and
- * started describing what the day will do to the reader's lungs. Red is reserved for the
- * reader throughout this product; this is one of the few places outside slope angle that
- * earns it.
+ * The plate changes at 60, where the European AQI enters "poor" and `AQI_CAUTION` fires:
+ * water below (weather is a condition), survey above (it has started describing what the day
+ * will do to the reader). Alpha climbs monotonically across all six bands independent of the
+ * hue break, so the ramp reads as "denser is worse" without colour.
  *
- * Alpha climbs monotonically across all six bands, independent of the hue break, so the ramp
- * still reads as "denser is worse" without colour. Good is nearly transparent on purpose: on
- * most days over most ground the honest answer is "clean", and an overlay that shouts it
- * would be a tint over the sheet rather than a reading off it.
- *
- * **Cells are drawn, not blended.** Each one is a polygon at the model's own footprint with
- * its own outline, so a run of equal readings still shows its seams. A smooth gradient over
- * a 40 km grid would invent a hundred numbers nobody computed — the same argument the slope
- * layer makes for nearest-neighbour resampling, made here in vector rather than raster.
- *
- * A cell the model had no answer for is omitted entirely. A hole is honest; a zero is not.
+ * Cells are drawn at the model's own footprint with their own outlines, not blended — a
+ * gradient over a 40 km grid would invent numbers nobody computed. A cell the model had no
+ * answer for is omitted: a hole is honest, a zero is not.
  */
 
 export const AIR_QUALITY_SOURCE = 'air-quality';
@@ -65,10 +54,8 @@ export const AIR_QUALITY_LEGEND: readonly AirQualityLegendBand[] = AIR_QUALITY_B
 );
 
 /**
- * A `step` expression over the cell's own reading.
- *
- * `step` rather than `interpolate` is the whole design in one word: the bands are legal
- * definitions with hard edges, and 59 and 61 are different advice, not a gradient.
+ * A `step` expression over the cell's own reading. `step` rather than `interpolate` because
+ * the bands are legal definitions with hard edges: 59 and 61 are different advice.
  */
 function stepOver(pick: (band: AirQualityLegendBand) => string): unknown[] {
   const expression: unknown[] = ['step', ['coalesce', ['get', 'aqi'], 0], pick(first())];
@@ -137,10 +124,8 @@ export function airQualityFeatures(
 }
 
 /**
- * "Moderate — 47" for a headline, and the pollutant behind it for the sentence under it.
- *
- * Kept beside the colours because the two must agree: a swatch labelled Poor next to prose
- * calling the same number Moderate is the product arguing with itself.
+ * "Moderate — 47" for a headline. Kept beside the colours so a swatch and the prose under it
+ * can never call the same number by different names.
  */
 export function airQualityBandLabel(aqi: number | null | undefined): string | null {
   if (aqi === null || aqi === undefined) return null;
