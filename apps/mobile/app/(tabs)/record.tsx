@@ -26,22 +26,11 @@ import {
 } from '@/record/store';
 
 /**
- * Record.
+ * Record — the only screen in the product that is an instrument rather than a page: one figure
+ * readable at arm's length, three supporting readings, and controls big enough for a glove.
  *
- * `field`, and the only screen in the product that is an *instrument* rather than a page: one
- * figure large enough to read at arm's length on a windy col, three supporting readings under
- * it, and controls big enough to hit with a glove on. Nothing else. Everything a recorder
- * could also show — the map, the profile, the forecast — is a tap away on another tab and is
- * not what someone squinting at a phone in the rain is asking for.
- *
- * The state machine is not here. It is `@/record/store`, at module scope, because this screen
- * unmounts every time somebody looks at another tab and a recorder that lives in a screen's
- * state would end their hike when they did. This file only draws it.
- *
- * **Expo Go records in the foreground only.** Background location needs a native task
- * registration the Expo Go client does not carry, so the screen is held awake for the duration
- * and the caveat is printed rather than hidden. A development build lifts it without changing
- * a line of the engine.
+ * The state machine is `@/record/store`, at module scope; this file only draws it. Expo Go
+ * records in the foreground only, so the screen is held awake and the caveat is printed.
  */
 
 const theme = nativeTheme('field');
@@ -64,12 +53,8 @@ export default function RecordScreen() {
   const units: UnitSystem = me.data?.units ?? 'metric';
 
   /**
-   * The hike the server thinks is still open.
-   *
-   * Only asked when this device has nothing of its own. A phone that crashed mid-hike restores
-   * its journal and owns the recording; a phone that was reinstalled, or a second device,
-   * finds the recording stranded — open in the database, invisible everywhere — and this is
-   * the only thing that offers a way to close it.
+   * The hike the server thinks is still open, asked only when this device has nothing of its
+   * own. A reinstalled phone or a second device is the only way to close a stranded recording.
    */
   const open = useQuery({
     ...trpc.activities.open.queryOptions(),
@@ -77,18 +62,11 @@ export default function RecordScreen() {
   });
 
   /**
-   * The line this hike is following, when it is on a trail or on a route somebody drew.
+   * The line this hike is following. Resolved from the recording rather than handed in: a hike
+   * acquires a line four ways — a trail page, a planned route, an adopted server recording, a
+   * journal restored after a crash — and only the first two have the geometry in hand.
    *
-   * Resolved from the recording rather than handed in, because a recording acquires a line
-   * four different ways — started from a trail page, started from a planned route, adopted
-   * from the server above, restored from the journal after a crash — and only the first two
-   * have the geometry already in hand. Two queries, both keyed on the recorder's own ids,
-   * cover all four; the alternative is a route that works when you start a hike and quietly
-   * stops working when your battery dies halfway up, which is exactly when it matters.
-   *
-   * Never stale: neither a trail nor a saved route changes shape during a hike, and
-   * refetching one over a cellular link on a ridge is a cost with nothing on the other side
-   * of it.
+   * Never stale: neither a trail nor a saved route changes shape during a hike.
    */
   const followingTrail = useQuery({
     ...trpc.trails.byId.queryOptions({ id: recording.trailId ?? '' }),
@@ -103,13 +81,9 @@ export default function RecordScreen() {
   const followed = followingTrail.data ?? followingRoute.data ?? null;
 
   /**
-   * Hand the line to the recorder — and never take it away while it is still loading.
-   *
-   * The clear is conditioned on the ids rather than on the absence of data, because this
-   * screen unmounts whenever somebody looks at another tab. On the way back the query is warm
-   * but not instant, and clearing on `undefined` would reset the off-route watchdog every time
-   * — losing where along the route the hiker is, and re-arming an alert they already
-   * dismissed. Only a hike with no line at all has none.
+   * Hand the line to the recorder, and never take it away while it is still loading. The clear
+   * is conditioned on the ids, not on absent data: this screen unmounts on every tab switch,
+   * and clearing on `undefined` would reset the off-route watchdog each time back.
    */
   useEffect(() => {
     if (!recording.trailId && !recording.routeId) {
@@ -137,12 +111,9 @@ export default function RecordScreen() {
   }, [actions, activityType, start]);
 
   /**
-   * Finish, in the order that loses the least if a step fails.
-   *
-   * Flush first, so everything recorded is on the server before the recording is closed —
-   * `finish` derives its totals from the samples it can see, and closing before the last batch
-   * lands is how a hike comes back a kilometre short. If the flush fails the recorder stays
-   * put with its buffer intact and says so, rather than ending a hike it cannot save.
+   * Finish, in the order that loses the least if a step fails. Flush first: `finish` derives
+   * its totals from the samples it can see, so closing before the last batch lands is how a
+   * hike comes back a kilometre short. A failed flush leaves the buffer intact.
    */
   const onFinish = useCallback(() => {
     const id = recording.activityId;
@@ -418,11 +389,9 @@ function displayed(live: ActivityStats, saved: ActivityStats | null): ActivitySt
 }
 
 /**
- * The offer to adopt a hike this device did not start.
- *
- * A component rather than an inline `Pressable` so the activity is a narrowed parameter. The
- * recording it adopts keeps its server-side samples — `begin` starts a fresh local buffer and
- * `t` counts from the original `startedAt`, so the two halves meet without a gap.
+ * The offer to adopt a hike this device did not start. The recording keeps its server-side
+ * samples: `begin` starts a fresh local buffer and `t` counts from the original `startedAt`,
+ * so the two halves meet without a gap.
  */
 function CarryOn({
   activity,
@@ -458,12 +427,7 @@ function phaseLabel(phase: string, done: boolean): string {
   }
 }
 
-/**
- * Pace, or an honest dash.
- *
- * Derived from moving time rather than elapsed, because a pace that counts the twenty minutes
- * spent eating lunch on a summit describes nobody's hiking.
- */
+/** Pace, or an honest dash. From moving time, not elapsed — lunch on a summit is not hiking. */
 function pace(stats: ActivityStats, units: UnitSystem): string {
   if (stats.distanceM < 50 || stats.movingTimeS <= 0) return '—';
   const perUnit = units === 'metric' ? 1000 : 1609.344;
@@ -510,10 +474,8 @@ function Reading({ label, value, note }: { label: string; value: string; note?: 
 }
 
 /**
- * The one control that matters in whatever state the screen is in.
- *
- * Filled ink on canvas type, full width, 56pt tall — a target you can hit without looking,
- * which is the actual requirement for a button pressed at the start and end of a hike.
+ * The one control that matters in whatever state the screen is in. Full width and 56pt tall —
+ * a target you can hit without looking, which is what a hike's start and end button needs.
  */
 function Primary({
   label,

@@ -48,26 +48,8 @@ import { Mark } from '@/components/marks';
 import { Photograph } from '@/components/photograph';
 
 /**
- * Explore.
- *
- * A map with a sheet over it, which is the only shape this screen can take: "what is around
- * here" is a question answered by ground, and a list of names is what you read once the ground
- * has told you where to look. The map fills the screen; the sheet is dragged over as much of it
- * as you want.
- *
- * Three states, and only three, because a map screen with more than three is a map screen
- * nobody can predict:
- *
- * - **Browsing.** The sheet lists what is in view, ranked by popularity, and follows the
- *   viewport. There is no "search this area" button — the map re-asks when it stops moving,
- *   which is what the button would have done one tap later.
- * - **Selected.** A trail is picked, on the canvas and in the sheet at once, and the sheet
- *   becomes a card for it with a way through to its page. Tapping bare ground clears it.
- * - **Searching.** A full-screen overlay over both, listing places and trails by name. A place
- *   moves the camera; a trail moves the camera and then selects itself once it has landed.
- *
- * The map is `@/components/explore-map` — MapLibre in a `WebView` — and it owns its viewport
- * and its own `trails.browse` query. This screen is the chrome around it.
+ * Explore: a draggable sheet of results over the map, in three states — browsing, selected,
+ * searching. The map owns its own viewport and `trails.browse` query; this screen is the chrome.
  */
 
 const theme = nativeTheme('field');
@@ -82,13 +64,8 @@ const FLING = 140;
 const SEARCH_DEBOUNCE_MS = 320;
 
 /**
- * Snowdon, overridden by a last known fix.
- *
- * It used to match the website's opening view; the website now derives its centre from the
- * reader (cookie, then edge geo headers, then Seattle — `apps/web/src/lib/place.ts`), so this
- * constant is a floor for a first run rather than a shared default. Left alone on purpose: a
- * phone has a real GPS and a last known fix, so its right answer is `expo-location` and a
- * persisted camera, which is a larger piece of work than copying a web coordinate across.
+ * Snowdon — the first-run floor only, replaced by a last known fix as soon as one is readable.
+ * Deliberately not the website's reader-derived centre: a phone's right answer is its own GPS.
  */
 const INITIAL_CENTER: readonly [number, number] = [-4.05, 53.07];
 const INITIAL_ZOOM = 11;
@@ -109,12 +86,8 @@ const ROUTE_TYPE_LABEL = {
 } as const;
 
 /**
- * What the map is asked for, beyond the ground it is looking at.
- *
- * Held as the state of the controls rather than as a `MapQuery`, because the two are not the
- * same shape: "any length" is one chip being unselected here and an *absent* pair of bounds
- * over the bridge, and a `dogsAllowed: false` that meant "unset" in the UI would mean "only
- * trails that forbid dogs" on the server. `toQuery` is where one becomes the other.
+ * The state of the controls, which is not the shape of a `MapQuery` — an unpressed chip is an
+ * absent facet over the bridge, not `[]` or `false`. `toQuery` is where one becomes the other.
  */
 interface Filters {
   difficulty: readonly Difficulty[];
@@ -139,12 +112,7 @@ const NO_FILTERS: Filters = {
   sort: 'popularity',
 };
 
-/**
- * Three stops, not five.
- *
- * Nobody chooses between "3.5 and up" and "3.7 and up". Three is "not the bad ones", four is
- * "the good ones", four and a half is "the ones people came back to write about".
- */
+/** Three stops, not five: "not the bad ones", "the good ones", "the ones people came back for". */
 const RATINGS = [3, 4, 4.5] as const;
 
 const SORTS: readonly { id: MapQuery['sort']; label: string }[] = [
@@ -165,7 +133,7 @@ export default function ExploreScreen() {
 
   const mapRef = useRef<ExploreMapHandle | null>(null);
 
-  // ── What the map has told us ──────────────────────────────────────────────────────
+  // Pushed up by the map, which owns the viewport and the query.
   const [trails, setTrails] = useState<readonly TrailSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [coverage, setCoverage] = useState<TileCoverage | null>(null);
@@ -175,7 +143,7 @@ export default function ExploreScreen() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [viewBbox, setViewBbox] = useState<BBox | null>(null);
 
-  // ── What this screen decides ──────────────────────────────────────────────────────
+  // Owned by this screen.
   const [searching, setSearching] = useState(false);
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -187,21 +155,15 @@ export default function ExploreScreen() {
   const active = activeCount(filters);
 
   /**
-   * A trail chosen from search, waiting for the map to arrive over it.
-   *
-   * Selection is by id against what the map is currently holding, so selecting a trail the
-   * camera has not reached yet would find nothing. The frame is sent first and the id parked
-   * here until it turns up in a `results` message.
+   * A trail chosen from search, parked until the camera arrives. Selection matches by id
+   * against what the map is currently holding, so selecting before the frame lands finds nothing.
    */
   const pending = useRef<string | null>(null);
   const nonce = useRef(0);
 
   /**
-   * Where the sheet rests, as `translateY` from fully open.
-   *
-   * The sheet is one view of fixed height moved with a transform, never a view whose height is
-   * animated: `translateY` runs on the native driver, and a list re-laying itself out sixty
-   * times a second does not.
+   * Where the sheet rests, as `translateY` from fully open. One view of fixed height moved by
+   * transform, never an animated height: `translateY` runs on the native driver, a relayout does not.
    */
   const snaps = useMemo(() => {
     const height = Math.round(screenH * 0.86);
@@ -214,8 +176,8 @@ export default function ExploreScreen() {
   const snap = useRef<Snap>('peek');
   const chromeTop = useRef(0);
 
-  // The sheet's first resting place, set before the first paint rather than in an effect so
-  // it never appears fully open for one frame and then jumps down.
+  // Set before the first paint rather than in an effect, so the sheet never appears fully open
+  // for one frame and then jumps down.
   const placed = useRef(false);
   if (!placed.current) {
     placed.current = true;
@@ -254,15 +216,12 @@ export default function ExploreScreen() {
     [slideTo, tellPadding],
   );
 
-  // ── The sheet is dragged by its grabber, and only by its grabber ───────────────────
-  //
-  // Not by the list. Arbitrating "this drag scrolls the rows" against "this drag moves the
-  // sheet" needs cross-recogniser plumbing, and getting it wrong costs a list that will not
-  // scroll — the failure everyone has met in a map app. A grabber is a smaller target, but it
-  // always does exactly one thing.
+  // Dragged by the grabber and only by the grabber. Arbitrating "this drag scrolls the rows"
+  // against "this drag moves the sheet" needs cross-recogniser plumbing, and getting it wrong
+  // costs a list that will not scroll.
   const drag = useRef({ from: 0 });
   const release = useRef((_dy: number, _vy: number) => {
-    /* replaced below on every render, so it always sees the current `settle` */
+    /* replaced on every render, so it always closes over the current `settle` */
   });
 
   release.current = (dy, vy) => {
@@ -304,12 +263,10 @@ export default function ExploreScreen() {
     [y],
   );
 
-  // ── Selection ─────────────────────────────────────────────────────────────────────
   const select = useCallback(
     (trailId: string | null, fromMap: boolean) => {
       setSelectedId(trailId);
-      // A selection the map made is already drawn there; echoing it back would be a second
-      // render of the same decision.
+      // A selection the map made is already drawn there; echoing it back re-renders the decision.
       if (!fromMap) mapRef.current?.send({ type: 'select', trailId });
       if (trailId !== null) {
         void Haptics.selectionAsync();
@@ -358,11 +315,8 @@ export default function ExploreScreen() {
     [select, tellPadding],
   );
 
-  // ── Open where the user already is, if they have already said yes ──────────────────
-  //
-  // Checked rather than requested. A permission dialog on the first frame of the first launch
-  // asks for something before the app has shown what it is for. If the recorder has already
-  // been granted it, the last known fix is free and the map opens on home instead of on Wales.
+  // Checked, never requested: a permission dialog on the first frame of the first launch asks
+  // before the app has shown what it is for. Granted already, the last known fix is free.
   useEffect(() => {
     let live = true;
     void (async () => {
@@ -378,7 +332,7 @@ export default function ExploreScreen() {
           nonce: nonce.current,
         });
       } catch {
-        // No permission, no fix, no map move. None of that is worth an error message.
+        // No permission or no fix: the map simply stays where it opened.
       }
     })();
     return () => {
@@ -387,21 +341,15 @@ export default function ExploreScreen() {
   }, []);
 
   /**
-   * The filters, handed to the map to fetch with.
-   *
-   * The map owns the viewport and the query; this screen owns the controls, so the facets have
-   * to cross the bridge rather than be applied to `trails` after they arrive. Filtering the
-   * array here would leave the *lines on the map* unfiltered, and a list that disagrees with
-   * the ground it is drawn over is worse than no filter at all.
+   * The filters, handed to the map to fetch with. Filtering `trails` here instead would leave
+   * the lines on the map unfiltered, and a list that disagrees with its own ground is worse.
    */
   const query = useMemo(() => toQuery(filters, units), [filters, units]);
   const sentQuery = useRef<string | null>(null);
 
   useEffect(() => {
-    // Compared as the encoding rather than the object: unset facets vanish in `JSON.stringify`,
-    // so this asks "would the message change" rather than "did React rebuild it". Resolving the
-    // reader's units rebuilds `query` without touching a single control, and that must not cost
-    // a fetch of the same ground.
+    // Compared as the encoding, so this asks "would the message change" rather than "did React
+    // rebuild it" — resolving the reader's units must not cost a refetch of the same ground.
     const encoded = JSON.stringify(query);
     if (sentQuery.current === encoded) return;
     const opening = sentQuery.current === null;
@@ -448,12 +396,8 @@ export default function ExploreScreen() {
     mapRef.current?.send({ type: 'frame', bbox, nonce: nonce.current });
   }, []);
 
-  /*
-   * The rail rides the sheet's top edge. Visible sheet height is `height - y`, so an offset of
-   * `y - height` puts the rail exactly one gap above it at every position — and clamping the
-   * lift at the half snap means opening the sheet fully slides the rail behind it rather than
-   * driving it up into the search field.
-   */
+  // The rail rides the sheet's top edge. Clamping the lift at the half snap means opening the
+  // sheet fully slides the rail behind it rather than driving it up into the search field.
   const railLift = snaps.height - snaps.half;
   const railY = y.interpolate({
     inputRange: [snaps.full, snaps.half, snaps.peek],
@@ -471,7 +415,7 @@ export default function ExploreScreen() {
         onMessage={onMapMessage}
       />
 
-      {/* ── The field, floating over the map ────────────────────────────────────── */}
+      {/* The field, floating over the map. */}
       <View
         style={[styles.top, { paddingTop: insets.top + theme.space.sm }]}
         pointerEvents="box-none"
@@ -493,9 +437,8 @@ export default function ExploreScreen() {
           </Pressable>
 
           {/*
-           * Beside the field, not inside the sheet. A filter narrows the map as much as the
-           * list, and at the peek snap the sheet is one line of type — so a control kept down
-           * there would be out of reach exactly when somebody is reading the ground.
+           * Beside the field, not in the sheet: at the peek snap the sheet is one line of type,
+           * so a filter control down there is out of reach exactly when the map is being read.
            */}
           <Pressable
             onPress={() => setFiltersOpen(true)}
@@ -517,10 +460,8 @@ export default function ExploreScreen() {
           </Pressable>
         </View>
         {notice === null ? null : (
-          // The banner is the message and the dismiss both. It carries no height rung on
-          // purpose — full-bleed and two lines of caption, it is already far past the touch
-          // rung by area — but it does have to say what it is, or VoiceOver reads the notice
-          // text and gives no hint that touching it does anything.
+          // The banner is the message and the dismiss both, so the label has to say so — without
+          // it VoiceOver reads the notice and gives no hint that touching it does anything.
           <Pressable
             onPress={() => setNotice(null)}
             accessibilityRole="button"
@@ -532,7 +473,7 @@ export default function ExploreScreen() {
         )}
       </View>
 
-      {/* ── The rail ─────────────────────────────────────────────────────────────── */}
+      {/* The rail. */}
       <Animated.View
         style={[styles.rail, { transform: [{ translateY: railY }] }]}
         pointerEvents="box-none"
@@ -577,7 +518,7 @@ export default function ExploreScreen() {
         <RailButton shape="crosshair" label="Show my location" onPress={() => void locate()} />
       </Animated.View>
 
-      {/* ── The sheet ────────────────────────────────────────────────────────────── */}
+      {/* The sheet. */}
       <Animated.View
         style={[styles.sheet, { height: snaps.height, transform: [{ translateY: y }] }]}
       >
@@ -612,13 +553,8 @@ export default function ExploreScreen() {
               }
               ListFooterComponent={
                 trails.length > 0 ? (
-                  /*
-                   * The credit is the way to the credits. ODbL asks for attribution to be as
-                   * visible as the map it is under, and one line of grey six-point type is
-                   * the least an app can do — making it the tap target that opens the full
-                   * sources screen costs nothing and is the affordance a reader who noticed
-                   * the line was reaching for anyway.
-                   */
+                  /* ODbL asks for attribution as visible as the map it is under; making the
+                     line the tap target for the full sources screen costs nothing. */
                   <Pressable
                     onPress={() => router.push('/attribution')}
                     accessibilityRole="button"
@@ -665,12 +601,8 @@ export default function ExploreScreen() {
 }
 
 /**
- * The card a selection becomes.
- *
- * Everything on it answers "is this the one" — the shape of the hike, how far, how high, how
- * long, what people made of it — and then one control leaves for the page where the rest of it
- * lives. The whole card is that control, with the words printed as well: a card that is
- * tappable but does not say so is a card most people read and then close.
+ * The card a selection becomes: everything that answers "is this the one", and a way through
+ * to the page. The whole card is the control, with the words printed as well.
  */
 function SelectedCard({
   trail,
@@ -744,11 +676,8 @@ function SelectedCard({
 }
 
 /**
- * One trail in the sheet.
- *
- * Tapping selects rather than navigates. On a map screen the row and the line are the same
- * object seen twice, and a row that jumped straight to another page would make the map — the
- * reason this screen exists — something you pass through on the way somewhere else.
+ * One trail in the sheet. Tapping selects rather than navigates: the row and the line on the
+ * map are the same object seen twice, so jumping to another page would bypass the map.
  */
 function TrailRow({
   trail,
@@ -792,12 +721,8 @@ function TrailRow({
 }
 
 /**
- * Search, over everything.
- *
- * Two kinds of answer to one field. Places move the camera, and are how you reach ground the
- * app has never loaded — the corpus fills tile by tile on demand, so "Vesper Peak" is a place
- * long before it is ever a trail here. Trails move the camera *and* select, so the result you
- * tapped is the one highlighted when the map lands.
+ * Search over places and trails. Places only move the camera — the corpus fills tile by tile on
+ * demand, so a summit is a place long before it is a trail here; trails move the camera and select.
  */
 function SearchOverlay({
   near,
@@ -902,18 +827,11 @@ function SearchOverlay({
 }
 
 /**
- * The filters, over everything.
+ * The filters, over everything. A panel rather than a rail of chips: seven facets do not fit in
+ * a horizontal scroller that shows three at a time.
  *
- * A panel rather than a rail of chips floating over the map. Seven facets do not fit in a
- * horizontal scroller that shows three of them at a time — a control you have to swipe blind
- * to discover is a control most people never learn they have. Given a screen, each facet gets
- * a labelled row, and the whole set is readable at once.
- *
- * **Applied as you tap, not on a Done button.** The map is live behind this panel and re-runs
- * the query with every change, so the count on the footer is a real answer rather than a
- * promise: it is the number of trails that would be listed if the panel were closed now. That
- * is the whole argument for live application — a filter panel that has to be dismissed before
- * it says anything makes you guess, and then makes you come back.
+ * Applied as you tap, not on a Done button — the map is live behind the panel, so the count on
+ * the footer is the number of trails that would be listed if the panel were closed now.
  */
 function FilterPanel({
   filters,
@@ -966,8 +884,8 @@ function FilterPanel({
           ))}
         </ChipRail>
 
-        {/* One band at a time. Overlapping bands would let somebody ask for under 5 km and
-            over 16 km at once, which the bounds cannot express and nobody meant. */}
+        {/* One band at a time: overlapping bands would ask for under 5 km and over 16 km at
+            once, which the bounds cannot express. */}
         <ChipRail label="Length" scheme="field">
           {bands.map((band, index) => (
             <Chip
@@ -1019,8 +937,8 @@ function FilterPanel({
           />
         </ChipRail>
 
-        {/* All eleven, not the five the recorder offers. Somebody filtering a map for via
-            ferrata is looking for the thing that is rare, and a shortlist would hide it. */}
+        {/* All eleven, not the five the recorder offers: filtering for via ferrata is looking
+            for the thing that is rare, and a shortlist would hide it. */}
         <ChipRail label="Doing" scheme="field">
           {ACTIVITY_TYPES.map((activity) => (
             <Chip
@@ -1124,8 +1042,8 @@ function Empty({
       </View>
     );
   }
-  // Before the filter and the "no trails" branches, both of which describe the ground. The
-  // server refused to read this ground, so there is nothing true to say about what is on it.
+  // Before the filter and "no trails" branches, both of which describe the ground: the server
+  // refused to read this ground, so there is nothing true to say about what is on it.
   if (coverage?.busy === true) {
     const copy = busyCopy(coverage.busyReason);
     return (
@@ -1135,8 +1053,8 @@ function Empty({
       </View>
     );
   }
-  // Checked after the loading and coverage branches: while tiles are still landing, "nothing
-  // matches" is a guess, and it is the one people act on by widening filters that were fine.
+  // After the loading and coverage branches: while tiles are still landing, "nothing matches"
+  // is a guess, and it is the one people act on by widening filters that were fine.
   if (filtered) {
     return (
       <View style={styles.empty}>
@@ -1185,8 +1103,6 @@ function RailButton({
     </Pressable>
   );
 }
-
-// ── Plumbing ────────────────────────────────────────────────────────────────────────
 
 interface PickRow {
   key: string;
@@ -1243,18 +1159,9 @@ function boxAround(lng: number, lat: number, half: number): BBox {
 }
 
 /**
- * What a refused fetch says, in the three places this screen has room to say it.
- *
- * The server sends `busy` and `busyReason` and the bridge has always carried them
- * (`embed-map.tsx` posts the whole coverage object), but nothing here read them: a refused
- * cold viewport fell through to "No trails in view" with the body "Pan to somewhere with
- * paths on it" — a claim about ground, and an instruction, on ground the server declined to
- * look at. The web note got a whole branch of copy for this and the phone got none.
- *
- * Two reasons, two sentences, for the reason the web note gives at length: a deep queue
- * drains on its own, so "try again in a few minutes" is a real thing to do; a full database
- * does not drain, and telling somebody to wait for it is prescribing an action that cannot
- * work. `status` is the sheet's one-line version, `title`/`body` the empty state's.
+ * What a refused fetch says. Two reasons, because a deep queue drains on its own and "try again
+ * in a few minutes" is a real instruction, while a full database does not and it is not.
+ * `status` is the sheet's one-line version, `title`/`body` the empty state's.
  */
 function busyCopy(reason: TileCoverage['busyReason']): {
   status: string;
@@ -1292,28 +1199,21 @@ function statusLine({
   if ((coverage !== null && coverage.pendingTiles.length > 0) || (area?.working ?? 0) > 0) {
     return 'Fetching this area…';
   }
-  // After the pending branch, because those two states can now coexist: a refusal covers the
-  // ground nobody has asked for yet, while tiles already on the queue keep landing. When
-  // something is arriving, saying so is the more useful line. When nothing is, this is the
-  // difference between a map that is finished and a map that was turned down — and without
-  // it a refused cold viewport falls through to "No trails in view", which is a claim about
-  // ground the server declined to look at.
+  // After the pending branch: the two states coexist, and when something is arriving, saying so
+  // is the more useful line. Without this branch a refused cold viewport falls through to "No
+  // trails in view" — a claim about ground the server declined to look at.
   if (coverage?.busy === true) return busyCopy(coverage.busyReason).status;
   if (loading && total === 0) return 'Searching…';
   if (total === 0) return filtered ? 'Nothing matches here' : 'No trails in view';
   const trails = `${total.toLocaleString()} ${total === 1 ? 'trail' : 'trails'}`;
-  // "match" rather than "in view" when a filter is on, because at the peek snap this line is
-  // the whole sheet — and a count that quietly excluded half the ground would be a lie told in
-  // the one place there is no room to explain it.
+  // "match" rather than "in view" when a filter is on: at the peek snap this line is the whole
+  // sheet, and a count that quietly excluded half the ground would have no room to explain itself.
   return filtered ? `${trails} match` : `${trails} in view`;
 }
 
 /**
- * What the filter panel's own button says.
- *
- * Separate from `statusLine` because the panel is covering the map: the sentence has to work
- * as the label of a control that dismisses, so it names the outcome ("Show 26 trails") rather
- * than describing a state ("26 trails match").
+ * What the filter panel's own button says. Separate from `statusLine` because it labels a
+ * control that dismisses, so it names the outcome ("Show 26 trails"), not the state.
  */
 function panelAction({
   loading,
@@ -1344,15 +1244,8 @@ interface LengthBand {
 }
 
 /**
- * Bands, in round numbers of the reader's own units.
- *
- * Not a slider. A slider over a range with no known ceiling — the corpus holds the Pacific
- * Crest Trail — spends most of its travel on distances nobody hikes in a day, and reading a
- * value off one needs both hands. The four bands are the four answers people actually give:
- * an hour, a morning, a day, and more than a day.
- *
- * The imperial bounds are the mile figures converted, not the metric ones relabelled, so a
- * reader who asks for under three miles gets under three miles.
+ * Bands, in round numbers of the reader's own units: an hour, a morning, a day, more than a day.
+ * The imperial bounds are the mile figures converted, not the metric ones relabelled.
  */
 function lengthBands(units: UnitSystem): readonly LengthBand[] {
   return units === 'imperial'
@@ -1371,11 +1264,8 @@ function lengthBands(units: UnitSystem): readonly LengthBand[] {
 }
 
 /**
- * How many facets are narrowing the results.
- *
- * The sort is deliberately not counted. Ordering the same trails differently hides nothing,
- * and a badge that read "1" the moment somebody chose "Shortest" would send them hunting for
- * a filter they never set.
+ * How many facets are narrowing the results. The sort is deliberately not counted — ordering
+ * hides nothing, and a badge reading "1" for "Shortest" sends people hunting for a filter.
  */
 function activeCount(filters: Filters): number {
   return (
@@ -1390,11 +1280,8 @@ function activeCount(filters: Filters): number {
 }
 
 /**
- * Controls to a query.
- *
- * Every unset facet leaves as `undefined` rather than as an empty array or a `false`. An empty
- * `difficulty: []` would be read by the schema as a set of grades that nothing can be in, and
- * `dogsAllowed: false` means "trails that forbid dogs" — the opposite of an unpressed chip.
+ * Controls to a query. Every unset facet must leave as `undefined`: `difficulty: []` reads as a
+ * set nothing can be in, and `dogsAllowed: false` means "trails that forbid dogs".
  */
 function toQuery(filters: Filters, units: UnitSystem): MapQuery {
   const band = filters.band === null ? undefined : lengthBands(units)[filters.band];
@@ -1421,40 +1308,19 @@ function clamp(value: number, low: number, high: number): number {
 }
 
 /**
- * Every edge pinned.
- *
- * Spelled out rather than `StyleSheet.absoluteFillObject`, which React Native 0.86 removed —
- * `absoluteFill` survives but is a registered style id, so it cannot be spread into a style
- * that adds anything of its own.
+ * Every edge pinned. Spelled out because React Native 0.86 removed `absoluteFillObject`, and
+ * `absoluteFill` is a registered style id, so it cannot be spread into a style of its own.
  */
 const fill = { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 } as const;
 
 /*
- * There is no shadow here, and that is the whole of it.
- *
- * This screen used to carry one — pure black at 0.32, radius 10, offset down 3, spread into
- * the search bar, the filter button, the rail buttons and the layers panel, with a heavier
- * one under the sheet. It was reasoned about ("a sheet lying on a map, not a card floating
- * above it") and it was still the wrong call, because the product it belongs to has no
- * z-axis at all. The web app states that outright and enforces it: depth is plate colour and
- * hairline rules, so a drop shadow reads as a component from some other product pasted in.
- * The same explore screen on the web floats the same controls over the same map with
- * `rounded-hair border border-bezel bg-surface` and nothing else, and it is legible.
- *
- * Removing it cost nothing, which is the tell that it was never load-bearing: every element
- * that spread it already had `backgroundColor: surface`, a hairline `bezel` border and
- * `radius.panel`. Opacity is what separates a control from the map under it; the shadow was
- * decoration on top of a separation that already worked.
- *
- * It was also off-system twice over — pure black is not in the palette (ink is a very dark
- * green-grey), and those props are iOS-only, so on any other target the design was already
- * the one below. `test/conventions.test.ts` is what keeps it gone, and it reads this file,
- * which is why the properties are described here rather than spelled.
+ * There are no shadows in this app, and there must not be: depth is plate colour and hairline
+ * rules, so a drop shadow reads as a component from another product. `test/conventions.test.ts`
+ * is what keeps it gone, and it reads this file — hence the properties are named, not spelled.
  */
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: theme.color.canvas },
 
-  // ── Top ──
   top: {
     position: 'absolute',
     top: 0,
@@ -1480,8 +1346,8 @@ const styles = StyleSheet.create({
   searchGlyph: { ...theme.text('bodyLg'), color: theme.color.inkMuted },
   searchHint: { ...theme.text('body', { family: 'text' }), color: theme.color.inkMuted, flex: 1 },
 
-  // Square when it is only a glyph, and widened by the count when there is one — the badge is
-  // set beside the mark rather than floating on its corner, where at that size it would be a dot.
+  // Square when it is only a glyph, widened by the count when there is one — a badge on the
+  // corner would be a dot at this size.
   filterButton: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1506,7 +1372,6 @@ const styles = StyleSheet.create({
   },
   noticeText: { ...theme.text('caption', { family: 'text' }), color: theme.color.ink },
 
-  // ── Rail ──
   rail: {
     position: 'absolute',
     right: theme.space.lg,
@@ -1549,7 +1414,6 @@ const styles = StyleSheet.create({
     marginVertical: theme.space.xs,
   },
 
-  // ── Sheet ──
   sheet: {
     position: 'absolute',
     left: 0,
@@ -1620,7 +1484,6 @@ const styles = StyleSheet.create({
   },
   retryLabel: { ...theme.collarLabel, color: theme.color.ink },
 
-  // ── Card ──
   card: { flex: 1, paddingTop: theme.space.lg },
   cardClose: {
     position: 'absolute',
@@ -1660,7 +1523,6 @@ const styles = StyleSheet.create({
   cardGoPressed: { backgroundColor: theme.color.inkMuted },
   cardGoLabel: { ...theme.collarLabel, color: theme.color.canvas },
 
-  // ── Search overlay ──
   overlay: { ...fill, backgroundColor: theme.color.canvas },
   overlayBar: {
     flexDirection: 'row',
@@ -1704,7 +1566,6 @@ const styles = StyleSheet.create({
     paddingTop: theme.space['2xl'],
   },
 
-  // ── Filter panel ──
   panelHead: {
     flexDirection: 'row',
     alignItems: 'center',

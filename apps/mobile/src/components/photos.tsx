@@ -35,27 +35,15 @@ import { discard, preparePhoto } from '@/photos/prepare';
 import type { PreparedPhoto } from '@/photos/prepare';
 
 /**
- * The photographs on a trail, and the way to add one.
+ * The photographs on a trail, and the way to add one — a contact strip, as on the website,
+ * because the set is heterogeneous and a grid makes a thin one look like a gap.
  *
- * A contact strip, the same as the website's, and for the same reason: the set is
- * heterogeneous by nature — a few frames somebody shot last week beside whatever Commons
- * happens to hold — and a grid makes a thin set look like a gap where a full one should be.
- * On a phone the strip is what the hardware wants anyway; it is one thumb-flick wide.
+ * Each frame states where along the trail it was taken, from the file's own EXIF, kept only
+ * when it falls near this trail. The credit is not garnish: Commons and Mapillary frames
+ * arrive under CC variants that require attribution by name, so it prints on every frame.
  *
- * **Each frame states where along the trail it was taken.** That line is why the section
- * exists in this form. A picture of a summit block is worth more when it says *5.1 km in*,
- * because the section graphic is two blocks up the same screen and the reader can place it.
- * The coordinate comes out of the file's own EXIF, is kept only when it falls near this
- * trail, and simply does not print when it is absent — which is most of the seeded ones.
- *
- * **The credit is not garnish.** Commons and Mapillary photographs arrive under CC variants
- * that require attribution by name, so it prints under every frame whether or not anybody
- * wrote a caption.
- *
- * **The viewer is `field`, not `sheet`.** Everything else on this screen is a page of prose
- * and figures on paper. A photograph is the one thing here that is not a document, and paper
- * either side of it would be competing with it — a dark surround is what a lightbox has
- * always been, and it is the only place in the app where the scheme flips mid-screen.
+ * The viewer is `field` while the rest of the screen is `sheet` — the only place in the app
+ * where the scheme flips mid-screen, because a photograph is not a document.
  */
 
 const theme = nativeTheme('sheet');
@@ -112,12 +100,8 @@ export function Photos({ trailId, trailName, units = 'metric' }: PhotosProps) {
   const commit = useMutation(trpc.photos.commit.mutationOptions());
 
   /**
-   * Patch the cached list rather than refetch it.
-   *
-   * Six uploads would otherwise be six round trips for a list the client already knows the
-   * new contents of, on the connection that just carried the photographs. Prepended, because
-   * a picture somebody took an hour ago is the newest thing on the trail and watching it
-   * appear at the front is the confirmation that the upload worked.
+   * Patch the cached list rather than refetch it: six uploads would be six round trips for a
+   * list the client already knows. Prepended, so the new frame appearing confirms the upload.
    */
   const received = useCallback(
     (photo: TrailPhoto): void => {
@@ -148,15 +132,11 @@ export function Photos({ trailId, trailName, units = 'metric' }: PhotosProps) {
   );
 
   /**
-   * Pick, then upload one at a time.
+   * Pick, then upload one at a time. Sequential on purpose: six in parallel share the same
+   * uplink and finish together, so nothing moves until everything lands at once.
    *
-   * Sequential on purpose. Six photographs in parallel share the same uplink and finish at
-   * the same moment they would have finished in sequence — except that in parallel every one
-   * of them sits at nothing until they all land at once. Sequential gives a count that moves.
-   *
-   * A failure is per photograph, never per batch: five uploads and one refusal leaves five
-   * photographs on the trail and one row saying what went wrong, because re-picking six
-   * files to retry one is a punishment for the wrong mistake.
+   * A failure is per photograph, never per batch — re-picking six files to retry one is a
+   * punishment for the wrong mistake.
    */
   const add = useCallback(async (): Promise<void> => {
     setPicking(true);
@@ -414,9 +394,8 @@ function Frame({
           resizeMode="cover"
           fallback={
             /*
-             * And when it never arrives at all — a Commons file deleted since we cached the
-             * link, an R2 object that outlived its row — the plate holds the frame's measure
-             * so the credit and the licence beneath it stay where the eye left them.
+             * When it never arrives — a deleted Commons file, an R2 object that outlived its
+             * row — the plate holds the frame's measure so the credit beneath stays put.
              */
             <PhotographMissing style={styles.shotImage} />
           }
@@ -436,11 +415,8 @@ function Frame({
 }
 
 /**
- * One photograph, full bleed, on the dark scheme.
- *
- * The caption field is the only writable thing in the section apart from the upload itself,
- * and it appears only on your own frames — captioning somebody else's photograph is not an
- * edit, it is a caption on their work.
+ * One photograph, full bleed, on the dark scheme. The caption field appears only on your own
+ * frames — captioning somebody else's photograph is a caption on their work.
  */
 function Viewer({
   photo,
@@ -572,10 +548,9 @@ function Viewer({
                 </Pressable>
               ) : (
                 /*
-                 * Somebody else's frame, and the one place it is big enough to judge — the
-                 * strip's thumbnails deliberately carry no control of their own. Reporting
-                 * is public, so this works signed out, which is the case that matters most:
-                 * the person who finds their own house in a photograph has no account.
+                 * Somebody else's frame, and the one place it is big enough to judge.
+                 * Reporting is public, so this works signed out — the person who finds their
+                 * own house in a photograph has no account.
                  */
                 <Pressable
                   onPress={() => setReporting(true)}
@@ -644,15 +619,12 @@ function Viewer({
 }
 
 /**
- * Send one rendition.
+ * Send one rendition. `File.upload` streams from disk through the native networking stack, so
+ * the megabytes never enter the JavaScript heap.
  *
- * `File.upload` streams from disk through the native networking stack, so the megabytes never
- * enter the JavaScript heap — which is the difference between a picker that survives six
- * photographs on an old phone and one that does not.
- *
- * Two things it does not do for us. It resolves for *any* completed response, including a
- * refusal, so the status has to be read by hand; and it will not resolve a relative URL, which
- * is what the local development driver hands back when there is no bucket to sign against.
+ * Two gaps to cover by hand: it resolves for *any* completed response, refusals included, so
+ * the status must be read; and it will not resolve a relative URL, which is what the local
+ * development driver returns when there is no bucket to sign against.
  */
 async function put(ticket: UploadTicket, file: PreparedPhoto['full']): Promise<void> {
   const bytes = file.size;
@@ -676,12 +648,9 @@ async function put(ticket: UploadTicket, file: PreparedPhoto['full']): Promise<v
 }
 
 /**
- * Width over height, or a square.
- *
- * Both dimensions are nullable: they are measured by whichever client uploaded the picture,
- * and the seeded Commons and Mapillary rows predate that measurement entirely. A square is the
- * least-wrong guess — `resizeMode="contain"` letterboxes the real image inside whatever box we
- * reserve, so the cost of guessing is empty space, never a distorted photograph.
+ * Width over height, or a square. Both dimensions are nullable — the seeded Commons and
+ * Mapillary rows predate the measurement. `resizeMode="contain"` letterboxes inside whatever
+ * box is reserved, so a wrong guess costs empty space, never a distorted photograph.
  */
 function aspectOf(photo: TrailPhoto): number {
   const { width, height } = photo;

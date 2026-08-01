@@ -29,42 +29,24 @@ import { GRADE_STEPS, NATIVE_FONTS, SCHEMES, gradeStep } from '@switchback/ui';
 import type { Scheme } from '@switchback/ui';
 
 /**
- * The section, on a phone.
- *
- * The same graphic as the website's, from the same numbers: every scale, every band split
- * and every path `d` below comes out of `@switchback/geo`, which is also what
- * `apps/web/src/components/section.tsx` calls. Neither file re-derives a curve, so the two
+ * The section, on a phone. Every scale, band split and path `d` comes out of
+ * `@switchback/geo`, which `apps/web/src/components/section.tsx` also calls, so the two
  * renderings agree exactly rather than approximately.
  *
- * What is *not* shared is the sheet it is drawn on, and that is deliberate. The website
- * plots into a 1000-unit viewBox and lets the browser scale it; doing the same here would
- * letterbox a 1000pt drawing onto a 340pt screen and render 13pt axis labels at about 4pt.
- * So this component works in real points — the plot rectangle is the phone's own — and the
- * type sizes below are the sizes the reader actually sees.
+ * What is not shared is the sheet: the website plots into a 1000-unit viewBox, which here
+ * would render 13pt axis labels at about 4pt. This component works in real points instead.
  *
- * The other differences from the web version are all consequences of the screen:
- *
- * - **Coarser hatching.** The plot is roughly a third of the website's width, so the token
- *   spacings are scaled toward it and then floored. Below about 2.5pt the lines merge into
- *   a flat tone and the encoding stops encoding.
- * - **No draw-on.** The web reveal is a CSS clip animation with no client bundle behind it.
- *   Reproducing it here would mean an `Animated` value and a re-render per frame for a
- *   graphic that is already on screen by the time the push transition ends.
- * - **No callouts.** They are collar annotations that need horizontal room this width does
- *   not have. The weather readings they carry on the website get their own row on the
- *   phone rather than being crammed above the plot.
+ * Hatching is coarser (below about 2.5pt the lines merge into a flat tone and stop encoding
+ * anything), there is no draw-on animation, and the weather callouts get their own row —
+ * they need horizontal room this width does not have.
  */
 
 /** Fixed, not a ratio: the axis rows and the type in them do not scale with screen width. */
 export const SECTION_HEIGHT = 196;
 
 /**
- * The margins around the plot, in points.
- *
- * `left` is set by the widest thing that goes in it, which is a grouped five-figure
- * elevation at 10pt mono — `10,000` ft, the top rung of the imperial ladder — with room for
- * the collar glosses beneath the axis. `bottom` holds two rows of labels — distance, then
- * elapsed time — which is the whole feature.
+ * The margins around the plot, in points. `left` is set by a grouped five-figure elevation at
+ * 10pt mono (`10,000` ft); `bottom` holds two rows of labels, distance then elapsed time.
  */
 const PAD = { top: 12, right: 10, bottom: 36, left: 52 } as const;
 
@@ -98,11 +80,9 @@ export interface SectionProps {
 }
 
 /**
- * A touch x, in points from the left of the graphic, as a distance along the trail.
- *
- * Exported because the pan responder lives on the screen — it has to, or the section could
- * not be inside a `ScrollView` — and inverting the scale needs `PAD`. A second copy of
- * these numbers up there would put the cursor off the line the first time either changed.
+ * A touch x, in points from the left of the graphic, as a distance along the trail. Exported
+ * because the pan responder has to live on the screen for the section to sit in a `ScrollView`,
+ * and inverting the scale needs `PAD`.
  */
 export function distanceAtX(x: number, width: number, totalM: number): number {
   const span = Math.max(1, width - PAD.right - PAD.left);
@@ -336,11 +316,8 @@ export function Section({
 }
 
 /**
- * Grade → hatch index.
- *
- * Passed to the shared band splitter rather than imported by it: the ramp is a design
- * token, and `@switchback/geo` stays free of the palette. The web renderer hands the same
- * function to the same splitter, which is why the bands break in the same places.
+ * Grade → hatch index. Passed to the shared band splitter rather than imported by it, so
+ * `@switchback/geo` stays free of the palette; the web renderer passes the same function.
  */
 function gradeClass(grade: number): number {
   return GRADE_STEPS.indexOf(gradeStep(grade));

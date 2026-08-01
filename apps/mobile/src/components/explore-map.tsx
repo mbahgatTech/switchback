@@ -15,23 +15,13 @@ import { nativeTheme } from '@switchback/ui';
 import { apiBaseUrl } from '@/config';
 
 /**
- * The map, on the phone.
+ * The map: MapLibre GL JS inside a `WebView` loading `/embed/map` from our own server, so the
+ * cartography is one module shared with the website. Read `docs/mobile.md` and the `map-bridge`
+ * protocol in `@switchback/core` before changing either side of it.
  *
- * MapLibre GL JS inside a `WebView`, loading `/embed/map` from our own server. The native
- * binding — `@maplibre/maplibre-react-native` — needs a development build, which needs a
- * Mac, and would have meant a second copy of the cartography written in a second language
- * and kept in step by hand. This way `buildStyle` and the trail layers are one module and
- * the two clients cannot drift. See `map-bridge` in `@switchback/core` for the protocol.
- *
- * This component is only the wire. It holds no map state: the page inside owns the viewport,
- * runs the `trails.browse` query for itself, and reports what it found. Everything the screen
- * needs arrives through `onMessage`; everything the screen decides goes back through `send`.
- *
- * **Messages are queued until the page says `ready`.** A `WebView` reports "loaded" well
- * before MapLibre has a style, and a `select` posted into a page with no source in it is
- * silently dropped. The queue means a caller never has to know which of those two moments it
- * is in — and it matters on the very first frame, where the screen restores a camera before
- * the map has finished creating one.
+ * This component is only the wire — the page owns the viewport and runs its own `trails.browse`.
+ * Messages are queued until the page says `ready`: a `WebView` reports "loaded" long before
+ * MapLibre has a style, and a `select` posted into a page with no source is silently dropped.
  */
 
 const theme = nativeTheme('field');
@@ -48,20 +38,15 @@ export interface ExploreMapProps {
   initialZoom: number;
   onMessage: (message: MapOut) => void;
   /**
-   * Which system to label summit heights in.
-   *
-   * The page inside the `WebView` is outside the app's React tree and carries no session, so
-   * it cannot read this preference for itself. It travels twice: in the URL, which is what
-   * the first frame is drawn from, and thereafter as a message — because Settings is a
-   * different tab and changing it there leaves this map mounted behind it.
+   * Which system to label summit heights in. The page is outside the app's React tree and
+   * carries no session, so this travels twice: in the URL for the first frame, and thereafter
+   * as a message, because Settings is a different tab and leaves this map mounted behind it.
    */
   units: UnitSystem;
   /**
-   * Whether the page should search the viewport for trails.
-   *
-   * False on a finished hike, which is one line handed over the bridge and nothing else. The
-   * flag has to be in the URL rather than in a message because it decides whether a query
-   * fires on the very first settle, which happens before any host message can arrive.
+   * Whether the page should search the viewport for trails. False on a finished hike. It has to
+   * be in the URL rather than a message: it decides whether a query fires on the first settle,
+   * which happens before any host message can arrive.
    */
   browse?: boolean;
 }
@@ -75,17 +60,13 @@ export const ExploreMap = forwardRef<ExploreMapHandle, ExploreMapProps>(function
   const queue = useRef<string[]>([]);
   const [showing, setShowing] = useState(false);
 
-  /*
-   * The prop as a ref, so the message handler below never goes stale and the `source`
-   * object never has to be rebuilt to keep up with it.
-   */
+  // The prop as a ref, so the message handler never goes stale and `source` never rebuilds.
   const listener = useRef(onMessage);
   listener.current = onMessage;
 
   /*
-   * Built once. The URL carries only what has to be true before the first frame is drawn —
-   * everything after that is a message — and changing it would reload the page, which on a
-   * map means throwing away the tiles the user is looking at.
+   * Built once. The URL carries only what has to be true before the first frame — everything
+   * after that is a message — and changing it would reload the page, throwing away the tiles.
    */
   const source = useMemo(() => {
     const params = new URLSearchParams({
@@ -128,12 +109,8 @@ export const ExploreMap = forwardRef<ExploreMapHandle, ExploreMapProps>(function
   );
 
   /*
-   * Units, after the first frame.
-   *
-   * Skipped on mount because the URL already carried them — re-sending would restyle a map
-   * that was built with the right answer, throwing away every tile it just fetched. From then
-   * on it fires on every change, which is what makes a Settings edit land on a tab that was
-   * never unmounted.
+   * Units, after the first frame only. The URL already carried them on mount, and re-sending
+   * would restyle a map built with the right answer, discarding every tile it just fetched.
    */
   const firstUnits = useRef(true);
   useEffect(() => {
@@ -180,20 +157,17 @@ export const ExploreMap = forwardRef<ExploreMapHandle, ExploreMapProps>(function
           fail(`The map server answered ${String(event.nativeEvent.statusCode)}.`)
         }
         /*
-         * The `WebView`'s own scroll view has to be off. MapLibre handles touch itself, and
-         * with scrolling enabled a slow drag is claimed by WKWebView's pan recogniser first —
-         * the map jumps a few pixels and then stops following the finger.
+         * The `WebView`'s own scroll view has to be off: MapLibre handles touch itself, and
+         * with scrolling on, a slow drag is claimed by WKWebView's pan recogniser first.
          */
         scrollEnabled={false}
         bounces={false}
         overScrollMode="never"
         allowsBackForwardNavigationGestures={false}
         setSupportMultipleWindows={false}
-        // Nothing in this page plays media, and the default here suppresses the tap that
-        // would otherwise be needed before any inline element becomes interactive.
+        // Suppresses the tap iOS would otherwise need before an inline element is interactive.
         allowsInlineMediaPlayback
-        // Canvas, not white. A white flash between load and first paint reads as a broken
-        // screen on a dark app.
+        // Canvas, not white: a white flash before first paint reads as a broken screen.
         style={styles.web}
         containerStyle={styles.web}
       />
@@ -207,13 +181,9 @@ export const ExploreMap = forwardRef<ExploreMapHandle, ExploreMapProps>(function
 });
 
 /**
- * The JSON, as a JavaScript string literal.
- *
- * `JSON.stringify` escapes every quote, backslash and control character, which is everything
- * that could close the literal early. The two Unicode line separators it leaves alone were
- * illegal inside a JS string until ES2019 and are legal now — but a trail name genuinely can
- * contain one, and it is cheaper to escape them than to depend on which JavaScriptCore this
- * phone shipped with.
+ * The JSON, as a JavaScript string literal. The two Unicode line separators `JSON.stringify`
+ * leaves alone are legal in a JS string only since ES2019, and a trail name genuinely can hold
+ * one — cheaper to escape them than to depend on which JavaScriptCore this phone shipped with.
  */
 function literal(json: string): string {
   return JSON.stringify(json).replace(
@@ -223,11 +193,8 @@ function literal(json: string): string {
 }
 
 /**
- * Every edge pinned.
- *
- * Spelled out rather than `StyleSheet.absoluteFillObject`, which React Native 0.86 removed —
- * `absoluteFill` survives but is a registered style id, so it cannot be spread into a style
- * that adds anything of its own.
+ * Every edge pinned. Spelled out because React Native 0.86 removed `absoluteFillObject`, and
+ * `absoluteFill` is a registered style id, so it cannot be spread into a style of its own.
  */
 const fill = { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 } as const;
 

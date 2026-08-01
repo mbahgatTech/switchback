@@ -6,28 +6,17 @@ import { LIFELINE_PING_INTERVAL_S } from '@switchback/core';
 import { latestFix, type RecordedFix } from '@/record/store';
 
 /**
- * The Lifeline ping loop.
+ * The Lifeline ping loop, at module scope like `@/record/store`: a loop in the Record screen's
+ * `useEffect` would silently stop the moment somebody switched tabs, on a safety feature whose
+ * own screen would go on claiming it was running.
  *
- * A module rather than a hook, for the same reason `@/record/store` is one: this app has a tab
- * bar, and a loop living in the Record screen's `useEffect` would stop sending positions the
- * first time somebody tapped Explore to see where the path went. On a safety feature that is
- * not a degraded experience, it is the feature quietly not working — and the hiker would have
- * no way to tell, because their own screen would still say a Lifeline is running.
+ * A ping is not a side effect of recording. The loop keeps its own cadence
+ * (`LIFELINE_PING_INTERVAL_S`, slower than the recorder's upload tick) and takes the recorder's
+ * fix only when a fresh one is going spare — never an old one; see `freshFix`.
  *
- * So it runs here, driven from the app root, and the only thing that stops it is the Lifeline
- * ending.
- *
- * **A ping is not a side effect of recording.** Somebody who just wants their partner to see
- * where they are should not have to record a hike to get it. The loop keeps its own cadence —
- * `LIFELINE_PING_INTERVAL_S`, deliberately slower than the recorder's upload tick — and takes
- * the recorder's fix when there is a fresh one going spare. What it will not do is send an old
- * one; see `freshFix`.
- *
- * **What it cannot do in Expo Go, or on iOS at all.** Timers do not run while the app is
- * suspended, so pings stop when Switchback is not on screen. That is the same limitation the
- * recorder has and the panel says so in as many words rather than letting somebody believe a
- * pocketed phone is still reporting. The `AppState` listener below is the mitigation: coming
- * back to the app sends a position immediately instead of waiting out the rest of the interval.
+ * Timers do not run while the app is suspended, so pings stop when Switchback is off screen and
+ * the panel says so. The `AppState` listener is the mitigation: returning to the app sends a
+ * position immediately rather than waiting out the interval.
  */
 
 /** One position report. The shape `lifeline.ping` takes, minus the plumbing. */
@@ -50,11 +39,9 @@ export interface LifelinePingState {
 }
 
 /**
- * Accuracy for a fix asked for on the Lifeline's own account.
- *
- * `High` rather than `BestForNavigation`: this is one position every three minutes, not a
- * track, and the extra tens of metres are not worth what the top tier costs a battery that has
- * to last until dark. When a hike is recording, this path is not taken at all.
+ * Accuracy for a fix asked for on the Lifeline's own account. `High` rather than
+ * `BestForNavigation`: one position every three minutes is not a track, and the top tier costs
+ * a battery that has to last until dark. Not taken at all while a hike is recording.
  */
 const STANDALONE_ACCURACY = Location.Accuracy.High;
 
@@ -99,13 +86,9 @@ export function setPinger(next: Pinger | null): void {
 }
 
 /**
- * Follow this Lifeline, or none.
- *
- * Idempotent on the id, because the app root calls it from an effect that re-runs whenever the
- * `lifeline.active` query settles — which is often, and must not restart the interval each
- * time. Passing `null` stops the loop, which is what makes the promise on the follow page
- * mechanical rather than a matter of trust: the position is not withheld after a hike ends, it
- * stops being sent.
+ * Follow this Lifeline, or none. Idempotent on the id: the app root calls it from an effect
+ * that re-runs whenever `lifeline.active` settles, which must not restart the interval. Passing
+ * `null` stops the loop, which is what makes the follow page's promise mechanical.
  */
 export function watchLifeline(next: string | null): void {
   if (next === sessionId) return;
@@ -116,9 +99,8 @@ export function watchLifeline(next: string | null): void {
   emit();
   if (next === null) return;
 
-  // Immediately, then on the interval. The first one matters more than the cadence: a hiker
-  // who sets off, hands over the link and then loses signal for forty minutes should still
-  // have given their contact a dot at the car park.
+  // Immediately, then on the interval: a hiker who hands over the link and loses signal for
+  // forty minutes should still have given their contact a dot at the car park.
   void send();
   timer = setInterval(() => void send(), LIFELINE_PING_INTERVAL_S * 1000);
   resumed = AppState.addEventListener('change', (state) => {
@@ -136,11 +118,8 @@ function stopLoop(): void {
 }
 
 /**
- * One attempt.
- *
- * A failure is never surfaced as an alarm. A ping that does not land is a phone in a valley,
- * which is the normal state of affairs on a hike — and the follow page already reports how old
- * the last position is, which is the honest version of the same fact.
+ * One attempt. A failure is never surfaced as an alarm: a ping that does not land is a phone in
+ * a valley, and the follow page already reports how old the last position is.
  */
 async function send(): Promise<void> {
   const id = sessionId;
@@ -162,8 +141,8 @@ async function send(): Promise<void> {
       eleM: fix.eleM,
       batteryPct: await batteryPct(),
     });
-    // The Lifeline can end while a ping is in flight. Landing its result would put a stale
-    // "position sent just now" under a panel that has already gone back to its closed state.
+    // The Lifeline can end while a ping is in flight; landing its result would put a stale
+    // "position sent just now" under a panel that has already closed.
     if (sessionId !== id) return;
     lastPingAt = at;
     error = null;
@@ -178,12 +157,9 @@ async function send(): Promise<void> {
 }
 
 /**
- * A position worth sending, or nothing.
- *
- * The rule that makes this feature honest: **never ping with an old fix.** `lastPingAt` is
- * stamped server-side at the moment the ping lands, so sending a forty-minute-old position
- * would put "last heard: just now" under a dot on the wrong side of a mountain. Better by far
- * to send nothing and let the follow page report the position going stale, which is true.
+ * A position worth sending, or nothing. **Never ping with an old fix**: `lastPingAt` is stamped
+ * server-side as the ping lands, so a forty-minute-old position would put "last heard: just now"
+ * under a dot on the wrong side of a mountain.
  */
 async function freshFix(): Promise<RecordedFix | null> {
   const recorded = latestFix();
@@ -193,8 +169,7 @@ async function freshFix(): Promise<RecordedFix | null> {
 
 async function currentPosition(): Promise<RecordedFix | null> {
   try {
-    // Asked for rather than assumed. A Lifeline can be started without recording anything, so
-    // this may be the first time the app has wanted a position at all.
+    // Asked for rather than assumed: a Lifeline can be started without recording anything.
     const held = await Location.getForegroundPermissionsAsync();
     if (!held.granted) {
       const asked = await Location.requestForegroundPermissionsAsync();
@@ -206,9 +181,8 @@ async function currentPosition(): Promise<RecordedFix | null> {
       at: Date.now(),
       lng: reading.coords.longitude,
       lat: reading.coords.latitude,
-      // Dropped rather than clamped when it is outside anywhere a person can stand. A
-      // barometric altimeter indoors can report a kilometre underground, and one absurd number
-      // must not cost the whole ping — the position is the part that matters.
+      // Dropped rather than clamped when outside anywhere a person can stand: a barometric
+      // altimeter indoors can report a kilometre underground, and the position is what matters.
       eleM: alt != null && Number.isFinite(alt) && alt > -500 && alt < 9_500 ? alt : null,
     };
   } catch {
@@ -217,11 +191,9 @@ async function currentPosition(): Promise<RecordedFix | null> {
 }
 
 /**
- * Battery percentage, where the device will say.
- *
- * A follower's first question about a phone that has gone quiet is whether it died, and this is
- * the difference between an answer and an hour of imagining. `-1` on a simulator and on devices
- * that do not report it, which is why every consumer treats null as ordinary.
+ * Battery percentage, where the device will say — a follower's first question about a phone
+ * that has gone quiet. `-1` on a simulator and on devices that do not report it, so every
+ * consumer treats null as ordinary.
  */
 async function batteryPct(): Promise<number | null> {
   try {

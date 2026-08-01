@@ -18,35 +18,15 @@ import { ReportControl } from './report-control';
 import { ReportForm } from './report-form';
 
 /**
- * What people found when they got there.
+ * What people found when they got there — the website's three blocks in the website's order:
+ * recent ground conditions, then the standing, then what individual people wrote.
  *
- * The same three blocks the website publishes, in the same order, because the order is an
- * argument rather than a layout: what the ground was like lately, then how well the trail is
- * thought of, then what individual people actually wrote. A hiker checking this from the
- * car park wants the first block; a hiker choosing between two trails wants the second.
+ * This component fetches for itself, unlike `Conditions` and `BusyTimes`, which the screen
+ * hands data because they share a start time. Nothing here depends on a review.
  *
- * **This component fetches for itself**, unlike `Conditions` and `BusyTimes`, which are
- * handed their data by the screen. Those two are coupled — the start time a reader picks
- * from the busyness grid is the start time the forecast is drawn for — so the state has to
- * live above both. Nothing on this screen depends on a review, so lifting these queries into
- * the screen would buy nothing and put three more `useQuery`s in a component that already
- * has four.
- *
- * **Reading and writing, in that order.** The form to file a report sits at the very bottom,
- * behind one control, because a hiker who opened this section came to read what other people
- * found. An open form above the reports would make writing look like the point of the page
- * when reading is; a control that says which of the two things it will do — report, or edit
- * the one you already filed — is enough to be found by anyone who came to write.
- *
- * **The scale bar.** A rating prints as a map scale bar — one bar, five equal divisions,
- * ruled hairline, filled in the woodland plate — exactly as it does on the website. Not
- * stars. Stars are borrowed from a different kind of product and read as decoration beside a
- * contour section; a divided bar is what this map's own margin already contains, the
- * divisions are discrete because a rating is (nobody gave 4.3), and woodland is the plate
- * that already means *the trail itself, in good order*, which is the claim a rating makes.
- *
- * The bar appears on individual reports and deliberately **not** on the average, where
- * rounding 4.3 to four filled divisions would draw a measurement nobody made.
+ * A rating prints as a map scale bar — five equal divisions, hairline ruled, filled in the
+ * woodland plate — not stars, and deliberately **not** on the average, where rounding 4.3 to
+ * four filled divisions would draw a measurement nobody made.
  */
 
 const theme = nativeTheme('sheet');
@@ -156,13 +136,9 @@ export function Reviews({ trailId }: { trailId: string }) {
 }
 
 /**
- * The condition tally — the block this section exists for.
- *
- * Ordered by how many people said it, so the loudest ground truth is leftmost, and the
- * window is printed in the heading rather than implied. "12 reports" here is the honest
- * denominator: the tags are a proportion of the people who hiked it *recently*, not of
- * everyone who ever reviewed it, and quoting the all-time count beside a sixty-day tally
- * would misrepresent both numbers at once.
+ * The condition tally — the block this section exists for. Ordered by how many people said it,
+ * with the window printed in the heading: the count is the recent denominator, not the
+ * all-time one, which beside a sixty-day tally would misrepresent both numbers.
  */
 function Reported({ summary }: { summary: RatingSummary }) {
   if (summary.recentConditions.length === 0) {
@@ -192,14 +168,9 @@ function Reported({ summary }: { summary: RatingSummary }) {
 }
 
 /**
- * The average and what it is an average of.
- *
- * The bars are set against a ruled track rather than floating, so an empty bucket is still a
- * visible row: a distribution with a hole in it is information, and a row that collapses to
- * nothing hides it.
- *
- * Collapsed to one accessibility node with the reading in a sentence. Five labelled rows of
- * two numbers each is eleven stops on the rotor to hear what one sentence says.
+ * The average and what it is an average of. Bars sit against a ruled track rather than
+ * floating, so an empty bucket is still a visible row. Collapsed to one accessibility node:
+ * five labelled rows of two numbers is eleven rotor stops to hear what one sentence says.
  */
 function Ratings({ summary }: { summary: RatingSummary }) {
   const most = Math.max(...summary.histogram.map((bucket) => bucket.count), 1);
@@ -242,13 +213,10 @@ function Ratings({ summary }: { summary: RatingSummary }) {
 }
 
 /**
- * The rating, as a map scale bar. See this module's header for why it is not stars.
- *
- * The division rules change colour with the fill, which is what keeps it a scale bar: ruled
- * in woodland across the empty divisions and in canvas across the filled ones. Ruling them
- * all in woodland would make them invisible inside the fill, so a five would print as one
- * solid block — a bar with no divisions at all, which is the one reading this graphic must
- * never give. At the fill boundary no rule is drawn: the colour change is already the edge.
+ * The rating, as a map scale bar. The division rules change colour with the fill — woodland
+ * across the empty divisions, canvas across the filled ones — or a five prints as one solid
+ * block, the one reading this graphic must never give. No rule at the boundary: the colour
+ * change is already the edge.
  */
 export function ScaleBar({ value }: { value: number }) {
   return (
@@ -271,12 +239,9 @@ export function ScaleBar({ value }: { value: number }) {
 }
 
 /**
- * One report.
- *
- * The date on the right is when they *hiked* it, which is the fact that decides whether the
- * mud is still there. When nobody recorded a hike date it says when the report was written
- * instead, and says which it is — printing both as a bare date is asking to be misread on
- * exactly the reports where it matters most.
+ * One report. The date on the right is when they *hiked* it, falling back to when the report
+ * was written — and saying which, because a bare date would be misread on exactly the reports
+ * where it matters most.
  */
 function Row({ review }: { review: Review }) {
   const name = review.author.name ?? review.author.username ?? 'A hiker';

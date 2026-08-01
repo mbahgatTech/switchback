@@ -37,23 +37,14 @@ import { SECTION_HEIGHT, Section, distanceAtX } from '@/components/section';
 import { useRecorderActions, useRecording } from '@/record/store';
 
 /**
- * One route, read at the car park.
+ * One route, read at the car park — the same instrument as a hike page, deliberately.
  *
- * The same instrument as a hike page — map above, figures, section below — and the
- * repetition is the argument for it. A route you drew last Tuesday and a hike you finished
- * last Sunday are read in the same order for the same reasons: where does it go, how much
- * climbing, how long. Giving the one you planned a different shape would say it is a lesser
- * kind of thing.
+ * None of the planner is here: no anchors to drag, no undo, no coverage warming. Sixty points
+ * placed by thumb on a 390pt screen is not planning, so a route arrives finished and the way
+ * back to changing it is the website.
  *
- * What it does not have is everything the planner has. No anchors to drag, no undo, no
- * coverage warming. Sixty points placed by thumb on a 390pt screen is not planning, it is
- * an accident with a save button — so the route arrives here finished, and the way back to
- * changing it is the website.
- *
- * **The order of the page is an argument.** Map, then the numbers, then the section, and
- * only then the control that starts a hike. The line looks like a trail and is not one; the
- * reader should have seen the ascent and the time on foot before they are offered a way to
- * set off up it.
+ * The order of the page is an argument: map, numbers, section, and only then the control that
+ * starts a hike. The line looks like a trail and is not one.
  */
 
 const theme = nativeTheme('sheet');
@@ -63,11 +54,8 @@ const dark = nativeTheme('field');
 const MAP_HEIGHT = 260;
 
 /**
- * Simplification before the line goes over the bridge.
- *
- * The server already simplifies the drawing geometry to 5 m, so this is usually a no-op —
- * it is here for the long route whose stored line is still a few thousand points, because
- * every one of them becomes characters in a JavaScript literal injected into a `WebView`.
+ * Simplification before the line goes over the bridge. Usually a no-op; it exists for the long
+ * route whose points all become characters in a JavaScript literal injected into a `WebView`.
  */
 const BRIDGE_TOLERANCE_M = 5;
 
@@ -109,13 +97,10 @@ export default function RouteScreen() {
   const points = useMemo(() => toSectionPoints(detail?.profile ?? []), [detail]);
   const ticks = useMemo(() => elevationTicks(detail?.stats.maxEleM ?? 0, units), [detail, units]);
   /*
-   * No terrain factor, matching `apps/web/src/components/plan/route-view.tsx`. That
-   * multiplier comes from a trail's `sac_scale` and surface tags; a line somebody drew has
-   * neither, so the elapsed axis runs at Tobler's own pace unmodified. It is the honest
-   * reading — we know the shape of the ground and nothing about what it is made of.
-   *
-   * Four marks, not the website's six: the same ladder of round numbers chosen coarser for
-   * the width, rather than the same numbers set smaller until they collide.
+   * No terrain factor, matching `apps/web/src/components/plan/route-view.tsx`: that multiplier
+   * comes from a trail's `sac_scale` and surface tags, and a drawn line has neither, so the
+   * elapsed axis runs at Tobler's own pace. Four marks rather than the website's six, chosen
+   * coarser for the width rather than set smaller until they collide.
    */
   const stations = useMemo(
     () => toStations(detail?.profile ?? [], { system: units, maxMarks: 4 }),
@@ -184,10 +169,8 @@ export default function RouteScreen() {
   });
 
   /*
-   * The router optimises for distance across the path graph and never asks how steep the
-   * ground beneath it is, so two anchors either side of a crag get connected without comment.
-   * The disclaimer below says the line is unverified; this says the specific way it is worse
-   * than unverified.
+   * The router optimises for distance across the path graph and never asks how steep the ground
+   * is, so two anchors either side of a crag get connected without comment.
    */
   const caution = terrainCaution(detail.stats.maxSustainedGrade);
 
@@ -326,11 +309,8 @@ export default function RouteScreen() {
 // The map
 
 /**
- * The route, on a map.
- *
- * `browse={false}`, so the page inside runs no viewport search — the only thing on this
- * canvas is the line handed over the bridge. `ExploreMap` queues messages until the page
- * reports `ready`, so the send below is safe on the frame it mounts.
+ * The route, on a map. `browse={false}` so the page runs no viewport search — the only thing
+ * on this canvas is the line handed over the bridge, and `ExploreMap` queues until `ready`.
  */
 function RouteMap({
   line,
@@ -378,17 +358,12 @@ function RouteMap({
 // Hiking it
 
 /**
- * Start a hike that follows this line.
+ * Start a hike that follows this line. The server has no idea — `activities.start` takes a
+ * trail id and there is no route equivalent, so this saves as an ordinary hike on no trail.
+ * The route id is purely local: it arms the wrong-turn watchdog and the distance-to-finish.
  *
- * The server has no idea this happened — `activities.start` takes a trail id and there is
- * no route equivalent, so the recording is saved as an ordinary hike on no trail. What the
- * route id buys is entirely local and entirely the point: the recorder keeps it, hands the
- * geometry to the wrong-turn watchdog, and reports distance-to-finish against it. A plan
- * you cannot be alerted off is a picture of a hike.
- *
- * The line is handed over here as well as resolved on the Record screen, because the first
- * fix can land before that screen has mounted — and a watchdog that only arms once its own
- * screen is on is one that misses the turn out of the car park.
+ * The line is handed over here as well as on the Record screen, because the first fix can land
+ * before that screen has mounted.
  */
 function StartHike({ route }: { route: PlannedRouteDetail }) {
   const trpc = useTRPC();
@@ -542,11 +517,8 @@ function ExportRow({ id }: { id: string }) {
 }
 
 /**
- * The document, as a file the share sheet can carry.
- *
- * The cache directory rather than documents: this is a copy made to be handed to another
- * app, and iOS is free to reclaim it the moment it is no longer needed. `overwrite` because
- * sharing the same route twice must not fail on the second press.
+ * The document, as a file the share sheet can carry. The cache directory rather than documents,
+ * since iOS may reclaim it; `overwrite` because sharing the same route twice must not fail.
  */
 function write(filename: string, data: string, base64: boolean): File {
   const file = new File(Paths.cache, filename);
@@ -560,12 +532,8 @@ function write(filename: string, data: string, base64: boolean): File {
 // Owner controls
 
 /**
- * Throw the route away.
- *
- * The only owner control on this screen, and the only one that belongs on a phone: editing
- * a route means moving anchors, which is the desk job this screen deliberately does not
- * attempt — but tidying a list is something anyone does anywhere. Two steps, and drawn in
- * survey red, which in this product is reserved for controls that destroy data.
+ * Throw the route away — the only owner control on this screen, since editing means moving
+ * anchors. Two steps, in survey red, which is reserved for controls that destroy data.
  */
 function Remove({ id, name }: { id: string; name: string }) {
   const trpc = useTRPC();
@@ -681,10 +649,8 @@ function Chrome({
 }
 
 /**
- * Every edge pinned.
- *
- * Spelled out rather than `StyleSheet.absoluteFillObject`, which React Native 0.86 removed —
- * `absoluteFill` survives but is a registered style id, so it cannot be spread.
+ * Every edge pinned. Spelled out because React Native 0.86 removed `absoluteFillObject`, and
+ * `absoluteFill` is a registered style id, so it cannot be spread.
  */
 const fill = { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 } as const;
 

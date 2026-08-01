@@ -4,27 +4,12 @@ import path from 'node:path';
 import { expect, it } from 'vitest';
 
 /**
- * The conventions the phone has to keep too.
+ * The conventions the phone has to keep too — the mobile twin of
+ * `apps/web/test/conventions.test.ts`. Two clients sharing `packages/ui` are one product only
+ * while something checks they still agree, and a token set can offer but not enforce.
  *
- * `apps/web/test/conventions.test.ts` has guarded the website for a while; this side had
- * nothing, and the difference showed up exactly where you would expect. The explore screen
- * had grown a drop shadow — `shadowColor: '#000'` at 0.32, spread into the search bar, the
- * filter button, the rail buttons and the layers panel, with a heavier one under the sheet —
- * in a product whose whole design rests on there being no z-axis. It was not careless; it
- * carried a comment arguing for itself. It was simply never read next to the web app's rule
- * saying the opposite, because nothing here ever read the two together.
- *
- * That is the case for this file existing at all. Two clients sharing `packages/ui` are one
- * product only for as long as something checks that they still agree, and a token set cannot
- * check anything — it can only offer. A rule here is the offer made binding.
- *
- * **The same bar as the web file: a rule earns its place by having been broken.** Both below
- * are counts of real drift, not preferences. The heights and type sizes that also wanted
- * rules did not get them — the raw `height: 44` on the rating cell was a genuine slip, but
- * `height` on this platform is images and grabbers and photo tiles as often as it is
- * controls, and a rule that fires on a 64pt portrait to catch a 44pt button costs more
- * attention than it saves. That one is fixed and left to review, which is the honest place
- * for a thing a scan cannot tell apart.
+ * Same bar as the web file: **a rule earns its place by having been broken.** Both below are
+ * counts of real drift, not preferences.
  */
 
 const mobileRoot = fileURLToPath(new URL('..', import.meta.url));
@@ -51,11 +36,9 @@ function sources(): [string, string][] {
 const FILES = sources();
 
 /**
- * A gate that scans nothing passes everything.
- *
- * Both rules below assert an empty list, so a walk that quietly returned no files would
- * report a clean app while reading none of it. The floor is well under the current count and
- * is not a target; it only has to be high enough that an empty tree cannot clear it.
+ * A gate that scans nothing passes everything. Both rules below assert an empty list, so a walk
+ * that returned no files would report a clean app while reading none of it. The floor is not a
+ * target; it only has to be high enough that an empty tree cannot clear it.
  */
 it('reads the app', () => {
   expect(FILES.length).toBeGreaterThan(40);
@@ -78,20 +61,13 @@ function offenders(pattern: RegExp, exempt: (file: string) => boolean = () => fa
 
 it('casts no shadows', () => {
   /*
-   * The web app's rule, word for word, because it is the same product: a printed sheet has
-   * no z-axis, depth is carried by plate colour and hairline rules, and one drop shadow
-   * reads as a different product's component pasted in.
+   * The web app's rule, word for word, because it is the same product: a printed sheet has no
+   * z-axis, depth is carried by plate colour and hairline rules, and one drop shadow reads as
+   * a different product's component pasted in.
    *
-   * The six that were here all sat on elements that already had `backgroundColor: surface`,
-   * a hairline `bezel` border and `radius.panel` — the exact treatment the web uses to float
-   * the same controls over the same map. Removing them changed nothing about whether a
-   * control could be told apart from the terrain under it, which is the tell that the shadow
-   * was decoration on top of a separation that already worked.
-   *
-   * `elevation` and `boxShadow` are in the pattern although neither has ever appeared here.
-   * That is not a rule for a mistake nobody has made — it is the same mistake spelled the
-   * two other ways this platform accepts, and leaving them out would gate the iOS spelling
-   * of a decision while waving through the Android and New Architecture ones.
+   * `elevation` and `boxShadow` are in the pattern although neither has ever appeared here —
+   * they are the same mistake spelled the two other ways this platform accepts, and leaving
+   * them out would gate the iOS spelling of a decision while waving the others through.
    */
   const stray = offenders(
     /\b(?:shadowColor|shadowOpacity|shadowRadius|shadowOffset|elevation|boxShadow)\s*:/g,
@@ -101,13 +77,9 @@ it('casts no shadows', () => {
 
 it('takes every colour from the theme', () => {
   /*
-   * There is no hex in this app. Colour arrives as `theme.color.*` or `dark.color.*`, which
-   * is what lets a scheme change mean anything — a literal is a colour that cannot be dark,
-   * cannot be print, and cannot be one of the five plates.
-   *
-   * The two that were here were `shadowColor: '#000'`, and pure black is not in the palette
-   * at all: ink is #131819. A shadow was the one place a raw colour could hide, because it
-   * is the one property where nobody looks at the value and asks which plate it belongs to.
+   * There is no hex in this app: colour arrives as `theme.color.*` or `dark.color.*`, which is
+   * what lets a scheme change mean anything. A shadow was the one place a raw colour could
+   * hide, because it is the one property where nobody asks which plate the value belongs to.
    */
   const stray = offenders(/['"]#[0-9a-fA-F]{3,8}['"]/g);
   expect(stray, 'colour comes from the theme, so it can change with the scheme').toEqual([]);

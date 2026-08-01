@@ -19,29 +19,19 @@ import {
 /**
  * Saving one trail onto the phone.
  *
- * The website does this by caching its own server-rendered page plus a corridor of map
- * tiles, and none of that ports. The map on this phone is MapLibre GL JS inside a web view,
- * and under Expo Go there is no way to put ourselves between that web view and its tile
- * requests — so a download cannot include the basemap, and the control that starts one says
- * so in as many words rather than letting somebody find out on a col.
+ * **A download cannot include the basemap.** The map is MapLibre inside a web view, and under
+ * Expo Go there is no way to get between that web view and its tile requests — the control that
+ * starts a download says so.
  *
- * What it can include is everything the trail screen draws from data: the line, the
- * elevation pass, the waypoints, the description, the access facts, the reports, and the
- * frames — fetched with the same procedures and the same arguments the screen uses, so that
- * `@/offline/hydrate` can put them back under exactly the keys the screen looks in.
- *
- * **Frames are downloaded at both sizes.** The strip reads `thumbUrl` and the viewer reads
- * `url`, and a download that saved only one of them would give somebody a gallery that
- * opens into nothing. Both fields are rewritten to `file://` paths before the payload is
- * written, which is what makes the components work offline without knowing they are.
+ * What it does include is everything the trail screen draws from data, fetched with the same
+ * procedures and arguments the screen uses so `@/offline/hydrate` can put them back under
+ * exactly the keys it looks in. Frames are saved at both sizes — the strip reads `thumbUrl`,
+ * the viewer reads `url` — and both fields are rewritten to `file://` before the payload lands.
  */
 
 /**
- * Frames per download.
- *
- * Twelve rather than the gallery's twenty-four. A full frame is a 2,560 px edge and runs to
- * a megabyte or so; the difference between twelve and twenty-four is a dozen megabytes for
- * pictures nobody scrolls to on a phone, and storage is the resource this feature spends.
+ * Frames per download: twelve rather than the gallery's twenty-four. A full frame is a 2,560 px
+ * edge and about a megabyte, and storage is the resource this feature spends.
  */
 export const OFFLINE_PHOTO_LIMIT = 12;
 
@@ -74,10 +64,7 @@ type Client = ReturnType<typeof useTRPCClient>;
 
 /**
  * Fetch a trail and everything around it, write it to the phone, and return its index line.
- *
- * Throws only when the trail itself cannot be fetched. Reports and frames are best effort:
- * a trail saved without its photos is a trail somebody can still hike, and failing the
- * whole download over one 404 on a picture would be the wrong trade on a station platform.
+ * Throws only when the trail itself cannot be fetched; reports and frames are best effort.
  */
 export async function downloadTrail(
   client: Client,
@@ -114,10 +101,9 @@ export async function downloadTrail(
   stop();
 
   /*
-   * Everything above this line is network; everything below is disk. The directory is
-   * cleared here rather than at the top so that a download which never reaches the server —
-   * airplane mode, a dead trailhead — leaves whatever was already saved untouched. Somebody
-   * tapping "Update" out of signal range keeps the copy they had.
+   * Everything above this line is network; everything below is disk. The directory is cleared
+   * here rather than at the top so a download that never reaches the server leaves whatever was
+   * already saved untouched — "Update" out of signal keeps the copy you had.
    */
   resetTrailDirectory(trailId);
 
@@ -131,9 +117,8 @@ export async function downloadTrail(
     const photo = wanted[i];
     if (!photo) return;
     stop();
-    // A photograph a moderator took down comes back with no URL — the API blanks it rather
-    // than hand out a live object. Nothing to pull, so nothing is stored, and the bundle a
-    // hiker carries down a valley does not become the last place a removed image survives.
+    // A photograph a moderator took down comes back with no URL, so nothing is stored — a
+    // bundle carried down a valley must not become the last place a removed image survives.
     const [full, thumb] = await Promise.all([
       photo.url ? pull(photo.url, trailId, `${i}-full`) : Promise.resolve(null),
       photo.thumbUrl ? pull(photo.thumbUrl, trailId, `${i}-thumb`) : Promise.resolve(null),
@@ -148,8 +133,8 @@ export async function downloadTrail(
     const saved = local[i];
     return {
       ...photo,
-      // The thumb standing in for a full frame that would not come is a soft picture
-      // instead of a blank one — the same fallback the website's downloader makes.
+      // The thumb standing in for a full frame that would not come is a soft picture rather
+      // than a blank one — the same fallback the website's downloader makes.
       url: saved?.url ?? saved?.thumbUrl ?? photo.url,
       thumbUrl: saved?.thumbUrl ?? saved?.url ?? photo.thumbUrl,
     };
@@ -184,11 +169,8 @@ export async function downloadTrail(
 }
 
 /**
- * One frame onto the phone, or nothing.
- *
- * `downloadFileAsync` moves the file into place only after the transfer completes, so a
- * failure here leaves no half-written picture behind — which is what lets the caller treat
- * a missing frame as a missing frame rather than as a corrupt download.
+ * One frame onto the phone, or nothing. `downloadFileAsync` moves the file into place only
+ * after the transfer completes, so a failure leaves no half-written picture behind.
  */
 async function pull(url: string, trailId: string, name: string): Promise<string | null> {
   try {
@@ -200,12 +182,7 @@ async function pull(url: string, trailId: string, name: string): Promise<string 
   }
 }
 
-/**
- * The extension the URL claims, or a neutral one.
- *
- * Cosmetic — iOS reads an image by its bytes, not its name — but a downloads directory that
- * can be read in a file browser is worth the six lines.
- */
+/** The extension the URL claims, or a neutral one. Cosmetic — iOS reads an image by its bytes. */
 function extensionFor(url: string): string {
   const match = /\.(jpe?g|png|webp|heic|avif)(?:$|[?#])/i.exec(url);
   const found = match?.[1];
@@ -230,12 +207,9 @@ async function pool(
 }
 
 /**
- * Run a fetch whose failure is not worth losing the download over.
- *
- * A stopped download reaches here as an abort rather than as `DownloadCancelled`, and is
- * swallowed like any other failure — the `stop()` on the line after the fetches is what
- * actually ends the run, before anything is written. The explicit check is for the case
- * where our own cancellation is already in flight.
+ * Run a fetch whose failure is not worth losing the download over. A stopped download arrives
+ * here as an abort and is swallowed like any other failure — the `stop()` after the fetches is
+ * what actually ends the run, before anything is written.
  */
 async function optional<T>(run: () => Promise<T>, fallback: T): Promise<T> {
   try {
@@ -246,19 +220,10 @@ async function optional<T>(run: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Downloads in flight                                                         */
-/* -------------------------------------------------------------------------- */
-
 /**
- * Which saves are running, held in the module rather than in the screen that started one.
- *
- * A download that lived in component state would be a download that dies when somebody
- * backs out of the trail to check something — and worse, one that could be started twice,
- * because a remounted control has no memory of the save already writing into that
- * directory. Two `downloadTrail` calls for one trail would clear the ground under each
- * other. Keeping the controllers here makes a second press a no-op, which is the correct
- * behaviour and also the one people expect from a button that already says "Saving…".
+ * Which saves are running, held in the module rather than in the screen that started one: a
+ * download in component state dies when somebody backs out of the trail, and a remounted
+ * control could start a second `downloadTrail` that clears the ground under the first.
  */
 export interface DownloadState {
   /** Slug → how far along, for every save currently running. */
