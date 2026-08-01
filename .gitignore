@@ -102,3 +102,7 @@ yarn-error.log*
 # Holds project.json — the project and org ids the CLI links this checkout to. Not a
 # credential, but machine-local: a second clone gets its own on `vercel link`.
 .vercel
+
+# claude code
+# Agent worktrees land here, inside the repo root. Each is a whole extra copy of the monorepo.
+.claude

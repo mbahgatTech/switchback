@@ -29,6 +29,9 @@ export default tseslint.config(
       // the point of a vendored file is that it is byte-identical to the published one.
       // `components/map/rtl.ts` records the version and digest, which is the review it gets.
       'apps/web/public/vendor/**',
+      // Agent worktrees, which git puts inside the repo root. Each is a whole extra copy of the
+      // monorepo, so without this `npm run lint` reports failures from files CI never sees.
+      '.claude/**',
     ],
   },
   js.configs.recommended,
