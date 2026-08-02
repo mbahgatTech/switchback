@@ -91,12 +91,14 @@ on:
 # minutes after a merge killed that merge's `production schema` and `deploy production`, and left
 # production a commit behind master.
 #
-# `cancel-in-progress` stays on for branches, where a superseded push is just wasted minutes, and
-# off for master, where a cancelled run can abort `prisma db push` half-way through a schema change
-# against the live database. Two master runs queueing is cheaper than one torn migration.
+# `cancel-in-progress` stays on, and stays on for master especially: the note below on the deploy
+# hook explains that a hook ships the tip of its branch rather than the commit that called it, so a
+# superseded run polls `/api/version` for a SHA that no longer exists. Cancelling it is the point.
+# Adding the event to the key keeps that behaviour between two pushes while stopping a dispatch
+# from reaching a push at all.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   # A local throwaway database and a throwaway secret. Neither is a credential to anything.
