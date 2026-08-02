@@ -25,6 +25,10 @@
 generator client {
   provider        = "prisma-client-js"
   previewFeatures = ["postgresqlExtensions"]
+  // The second target is the Azure Functions Linux host the ingest worker runs on. Its zip is
+  // built on whatever CI runs, so without this the bundled query engine is the builder's and the
+  // worker cannot open a connection.
+  binaryTargets   = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {

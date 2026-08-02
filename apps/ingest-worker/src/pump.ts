@@ -25,6 +25,27 @@ export const PUMP_LOW_WATER = 4;
  */
 export const PUMP_DERIVED_SHARE = 2;
 
+export interface PumpBounds {
+  depth: number;
+  lowWater: number;
+}
+
+/**
+ * Bounds from `INGEST_PUMP_MAX_DEPTH` / `INGEST_PUMP_LOW_WATER`, which `ingest.bicep` sets. Read
+ * here rather than defaulted in place so changing either in the portal actually changes the pump;
+ * a non-numeric or absent value falls back to the constant above.
+ */
+export function pumpBounds(source: NodeJS.ProcessEnv = process.env): PumpBounds {
+  const read = (name: string, fallback: number): number => {
+    const value = Number(source[name]);
+    return Number.isFinite(value) && value >= 0 ? value : fallback;
+  };
+  return {
+    depth: read('INGEST_PUMP_MAX_DEPTH', PUMP_QUEUE_DEPTH),
+    lowWater: read('INGEST_PUMP_LOW_WATER', PUMP_LOW_WATER),
+  };
+}
+
 export interface PumpPlan {
   primary: number;
   derived: number;
@@ -63,9 +84,10 @@ export async function runPump(
   queue: SignalQueue,
   log: WorkerLog,
   now = new Date(),
+  bounds: PumpBounds = pumpBounds(),
 ): Promise<{ published: number }> {
   const active = await queue.activeCount();
-  const plan = planPump(active);
+  const plan = planPump(active, bounds.depth, bounds.lowWater);
   if (plan.primary === 0 && plan.derived === 0) return { published: 0 };
 
   const runnable = { status: JobStatus.queued, runAfter: { lte: now } };

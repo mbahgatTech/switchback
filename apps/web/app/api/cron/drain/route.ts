@@ -1,4 +1,5 @@
-import { drainIngest, pruneFinishedJobs } from '@switchback/ingest';
+import { drainIngest, pruneFinishedJobs, reclaimExpiredJobs } from '@switchback/ingest';
+import type { DrainResult } from '@switchback/ingest';
 import { pruneExpiredAuthRequests } from '@switchback/api/mobile-auth';
 import { pruneExpiredRefreshTokens } from '@switchback/api/tokens';
 import { type OverdueSweep, sweepOverdueLifelines } from '@switchback/api/lifeline';
@@ -107,6 +108,32 @@ async function sweepFinishedJobs(): Promise<{ done: number; failed: number } | n
   }
 }
 
+/**
+ * The drain half of this route, or its replacement when the worker owns ingest.
+ *
+ * On `servicebus` this must not call `drainIngest`: Vercel making Overpass requests alongside the
+ * worker is exactly what breaks the two-concurrent guarantee the Function App's scale limit buys.
+ * But reclaim only runs *inside* `drainJobs`, so skipping the drain would silently take lease
+ * recovery with it — the failure #163 was about. Hence the direct call: no Overpass, still swept.
+ */
+async function drainOrReclaim(): Promise<DrainResult> {
+  if (env.INGEST_QUEUE_DRIVER !== 'servicebus') {
+    return drainIngest({ limit: BATCH, derivedLimit: DERIVED_BATCH, workerId: 'cron' });
+  }
+
+  const { requeued, retired } = await reclaimExpiredJobs(prisma);
+  return {
+    claimed: 0,
+    succeeded: 0,
+    failed: 0,
+    deferred: 0,
+    lost: 0,
+    derived: 0,
+    requeued,
+    retired,
+  };
+}
+
 export async function GET(req: Request): Promise<Response> {
   if (!env.CRON_SECRET) {
     return Response.json({ error: 'CRON_SECRET is not configured' }, { status: 503 });
@@ -117,7 +144,7 @@ export async function GET(req: Request): Promise<Response> {
 
   const started = Date.now();
   const [result, swept, orphans, lifelines, jobs] = await Promise.all([
-    drainIngest({ limit: BATCH, derivedLimit: DERIVED_BATCH, workerId: 'cron' }),
+    drainOrReclaim(),
     sweepCredentials(),
     sweepOrphans(),
     sweepLifelines(),

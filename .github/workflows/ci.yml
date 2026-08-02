@@ -181,6 +181,50 @@ jobs:
       - run: npm run lint
       - run: npm test
 
+  worker:
+    name: ingest worker bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The bundle copies the generated client out of node_modules rather than regenerating it,
+      # so this is a prerequisite and not a convenience — `scripts/bundle.ts` throws by name
+      # without it. `binaryTargets` in the schema is what puts the Linux engine in that copy.
+      - run: npm run db:generate
+
+      - run: npm run build --workspace=@switchback/ingest-worker
+
+      # The zip root is `dist/`, and the Functions host resolves the three externals from a real
+      # node_modules beside the entry point. `--omit=dev` because nothing here builds at runtime.
+      - name: Install the bundle's runtime dependencies
+        working-directory: apps/ingest-worker/dist
+        run: npm install --omit=dev --no-package-lock
+
+      # Proves the artefact the deploy pushes actually loads: a missing external or a Prisma
+      # engine for the wrong platform fails here rather than on the Function App.
+      - name: Load the bundled entry point
+        working-directory: apps/ingest-worker/dist
+        run: node -e "require('./index.js'); console.log('worker entry point loaded')"
+
+      - name: Package
+        working-directory: apps/ingest-worker/dist
+        run: zip -qr "$RUNNER_TEMP/ingest-worker.zip" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ingest-worker
+          path: ${{ runner.temp }}/ingest-worker.zip
+          retention-days: 14
+
   browser:
     name: browser suite
     # Nightly and on demand only — see the note at the top of this file.
