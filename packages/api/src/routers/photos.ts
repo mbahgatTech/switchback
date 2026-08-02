@@ -557,7 +557,10 @@ export const photosRouter = router({
       });
       return rows.map((row) => ({
         ...toPhoto(row, ctx.user.id),
-        trail: row.trail === null ? null : { name: trailTitle(row.trail), slug: row.trail.slug },
+        // One resolved `title`, not a `name` that would be the OSM name here and the derived
+        // one on a `TrailSummary`: under that key the iOS gallery put a second `trailTitle` on
+        // top of this, and got away with it only because a second pass changes nothing.
+        trail: row.trail === null ? null : { title: trailTitle(row.trail), slug: row.trail.slug },
       }));
     }),
 });

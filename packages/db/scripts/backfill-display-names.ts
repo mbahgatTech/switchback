@@ -1,11 +1,12 @@
 /**
  * Backfill `trails.displayName`, and the search vector that carries it, for trails ingested
- * before it existed. Dry run by default: nothing is written without `--apply`, and writing to a
- * hosted database needs a second flag.
+ * before it existed. Dry run by default: nothing is written without `--apply`, and writing
+ * anywhere but a local database needs a second flag.
  */
-import { describeDisplayName } from '@switchback/core';
-import type { DisplayNameRule } from '@switchback/core';
+import { describeDisplayName, refuseDisplayName } from '@switchback/core';
+import type { DisplayNameRefusal, DisplayNameRule } from '@switchback/core';
 import { Prisma, prisma, refreshTrailSearchVector } from '@switchback/db';
+import { isLocalDatabase } from './local-database';
 
 /** Trails per page. Each carries its waypoints, so a larger page is a much larger response. */
 const PAGE_SIZE = 500;
@@ -13,11 +14,9 @@ const PAGE_SIZE = 500;
 /** How many examples to print, so a dry run reads as evidence rather than a dump. */
 const SAMPLE_LIMIT = 20;
 
-const HOSTED_DATABASE = /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/;
-
 interface Options {
   apply: boolean;
-  allowHosted: boolean;
+  allowRemote: boolean;
 }
 
 /**
@@ -29,13 +28,13 @@ interface Options {
 function assertWriteAllowed(options: Options): void {
   if (!options.apply) return;
   const url = process.env.DATABASE_URL ?? '';
-  if (!HOSTED_DATABASE.test(url)) return;
+  if (isLocalDatabase(url)) return;
 
   const redacted = url.replace(/:[^:@]*@/, ':***@');
-  if (!options.allowHosted) {
+  if (!options.allowRemote) {
     throw new Error(
-      `refusing to write to a hosted database (${redacted}).\n` +
-        'This is production: 24,671 real trails. Re-run with --apply --yes-production only ' +
+      `refusing to write to a database that is not local (${redacted}).\n` +
+        'This may be production: 24,671 real trails. Re-run with --apply --yes-production only ' +
         'after reading the dry run, and expect to answer for the names it printed.',
     );
   }
@@ -48,6 +47,8 @@ interface Tally {
   cleared: number;
   unchanged: number;
   byRule: Record<DisplayNameRule, number>;
+  /** Every trail's first refusal, named — the other half of a coverage number. */
+  byRefusal: Partial<Record<DisplayNameRefusal, number>>;
 }
 
 /**
@@ -55,23 +56,62 @@ interface Tally {
  * point is to be read before the schema ships, and selecting `displayName` on a database that
  * has not had it pushed fails the query outright — which is precisely the run you want to work.
  */
-async function columnExists(): Promise<boolean> {
+async function columnExists(column: string, table = 'trails'): Promise<boolean> {
   const rows = await prisma.$queryRaw<Array<{ one: number }>>(
     Prisma.sql`select 1 as one from information_schema.columns
-                where table_name = 'trails' and column_name = 'displayName'`,
+                where table_name = ${table} and column_name = ${column}`,
   );
   return rows.length > 0;
+}
+
+/** How many waypoints carry a peak height. Zero means the summit clause is running unverified. */
+async function countPeakElevations(): Promise<number> {
+  const rows = await prisma.$queryRaw<Array<{ n: bigint }>>(
+    Prisma.sql`select count(*) as n from waypoints where "osmEleM" is not null`,
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
+/**
+ * Along-line length of each stored geometry, in metres — the domain `waypoints.distM` is
+ * measured in, and not what `lengthM` holds: that is the *published* figure, doubled for a
+ * mirrored out-and-back and more than 2% adrift on 763 trails besides. A row whose `geom`
+ * write failed is simply absent, and the naming rules refuse on a line they cannot measure.
+ */
+async function storedLineLengths(ids: readonly string[]): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map();
+  const rows = await prisma.$queryRaw<Array<{ id: string; m: number }>>(
+    Prisma.sql`select id, ST_Length("geom"::geography) as m
+                 from trails
+                where id in (${Prisma.join([...ids])}) and "geom" is not null`,
+  );
+  return new Map(rows.map((row) => [row.id, Number(row.m)]));
+}
+
+/**
+ * Each waypoint's `osmEleM`, by waypoint id. Raw SQL rather than a `select`, because the
+ * column may not exist yet and Prisma rejects an unknown field even when it is asked for
+ * conditionally — and a dry run that only works after the schema ships is no use at all.
+ */
+async function peakElevations(trailIds: readonly string[]): Promise<Map<string, number>> {
+  if (trailIds.length === 0) return new Map();
+  const rows = await prisma.$queryRaw<Array<{ id: string; m: number }>>(
+    Prisma.sql`select id, "osmEleM" as m
+                 from waypoints
+                where "trailId" in (${Prisma.join([...trailIds])}) and "osmEleM" is not null`,
+  );
+  return new Map(rows.map((row) => [row.id, Number(row.m)]));
 }
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const options: Options = {
     apply: argv.includes('--apply'),
-    allowHosted: argv.includes('--yes-production'),
+    allowRemote: argv.includes('--yes-production'),
   };
   assertWriteAllowed(options);
 
-  const hasColumn = await columnExists();
+  const hasColumn = await columnExists('displayName');
   if (options.apply && !hasColumn) {
     throw new Error(
       'trails.displayName does not exist yet. Ship the schema first — CI runs `prisma db push` ' +
@@ -81,6 +121,22 @@ async function main(): Promise<void> {
   if (!hasColumn) {
     console.log('trails.displayName is not in this database yet; reporting what it would hold.\n');
   }
+  // The summit clause falls back to its weaker on-trail test wherever a waypoint has no peak
+  // height. Ask whether any row *holds* one, not whether the column exists: `prisma db push` on a
+  // master push creates it empty, and a check on existence alone goes quiet at exactly the moment
+  // the data is still entirely absent — which is the moment somebody runs `--apply`.
+  const hasPeakEle = await columnExists('osmEleM', 'waypoints');
+  const peakEleRows = hasPeakEle ? await countPeakElevations() : 0;
+  if (peakEleRows === 0) {
+    console.log(
+      hasPeakEle
+        ? 'waypoints.osmEleM exists but no row holds a peak height yet; summit titles are UNVERIFIED.\n' +
+            'Re-ingest before --apply, or the summit clause names peaks the trail never reaches.\n'
+        : 'waypoints.osmEleM is not in this database yet; summit titles are UNVERIFIED.\n',
+    );
+  } else {
+    console.log(`waypoints.osmEleM populated on ${peakEleRows} rows; summit titles verified.\n`);
+  }
 
   const tally: Tally = {
     scanned: 0,
@@ -88,6 +144,7 @@ async function main(): Promise<void> {
     cleared: 0,
     unchanged: 0,
     byRule: { summit: 0, destination: 0 },
+    byRefusal: {},
   };
   const samples: string[] = [];
   let cursor: string | undefined;
@@ -104,18 +161,35 @@ async function main(): Promise<void> {
         routeType: true,
         lengthM: true,
         gainM: true,
+        minEleM: true,
         maxEleM: true,
-        waypoints: { select: { kind: true, name: true, distM: true, eleM: true } },
+        waypoints: { select: { id: true, kind: true, name: true, distM: true, eleM: true } },
       },
     });
     if (trails.length === 0) break;
     cursor = trails[trails.length - 1]!.id;
 
+    const ids = trails.map((trail) => trail.id);
+    const lineLengths = await storedLineLengths(ids);
+    const peaks = hasPeakEle ? await peakElevations(ids) : new Map<string, number>();
+
     for (const trail of trails) {
       tally.scanned++;
-      const derived = describeDisplayName(trail);
+      // Zero for a row whose `geom` write failed: `atFarEnd` refuses on a line it cannot
+      // measure rather than falling back to `lengthM`, which is the bug this replaced.
+      const input = {
+        ...trail,
+        lineLengthM: lineLengths.get(trail.id) ?? 0,
+        waypoints: trail.waypoints.map((w) => ({ ...w, osmEleM: peaks.get(w.id) ?? null })),
+      };
+      const derived = describeDisplayName(input);
       const next = derived?.displayName ?? null;
       const current = hasColumn ? trail.displayName : null;
+
+      if (derived === null) {
+        const reason = refuseDisplayName(input);
+        tally.byRefusal[reason] = (tally.byRefusal[reason] ?? 0) + 1;
+      }
 
       if (next === current) {
         tally.unchanged++;
@@ -149,6 +223,11 @@ async function main(): Promise<void> {
   console.log(`    destination  ${tally.byRule.destination}`);
   console.log(`  cleared    ${tally.cleared}`);
   console.log(`  unchanged  ${tally.unchanged}`);
+
+  console.log('\nrefused, by first reason:');
+  for (const [reason, count] of Object.entries(tally.byRefusal).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${reason.padEnd(26)} ${count}`);
+  }
 
   // Spread across the run rather than the first twenty, which would all come from one region.
   if (samples.length > 0) {

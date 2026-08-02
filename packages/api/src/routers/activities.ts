@@ -29,6 +29,7 @@ import {
   heatmapRequestSchema,
   heatmapStepDeg,
   trackFixSchema,
+  trailTitle,
 } from '@switchback/core';
 import type {
   ActivityDetail,
@@ -298,15 +299,23 @@ export const activitiesRouter = router({
         await closeStale(ctx.db, row.id);
       }
 
+      // Both names, because the screens that start a recording read `trailTitle`: selecting
+      // only `name` stored the hike as "Headlee Pass Trail" while the button that began it
+      // said "Vesper Peak via Headlee Pass Trail", and its own page then showed the pair.
       const trail = input.trailId
-        ? await ctx.db.trail.findUnique({ where: { id: input.trailId }, select: { name: true } })
+        ? await ctx.db.trail.findUnique({
+            where: { id: input.trailId },
+            select: { name: true, displayName: true },
+          })
         : null;
 
       const data = {
         userId: ctx.user.id,
         activityType: input.activityType,
         trailId: trail ? input.trailId : null,
-        name: input.name ?? defaultActivityName(input.activityType, startedAt, trail?.name),
+        name:
+          input.name ??
+          defaultActivityName(input.activityType, startedAt, trail ? trailTitle(trail) : null),
         device: input.device ?? null,
         visibility: ctx.user.defaultActivityVisibility,
         startedAt,

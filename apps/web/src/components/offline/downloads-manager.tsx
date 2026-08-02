@@ -17,6 +17,7 @@ import Link from 'next/link';
 import { formatBytes, formatDistance, formatElevation, plural, trailTitle } from '@switchback/core';
 import { useUnits } from '@/components/units';
 import { useReaderId } from '@/offline/reader';
+import { titled } from '@/offline/store';
 import { useDownloads, useOnline } from '@/offline/use-offline';
 import {
   usePendingActivities,
@@ -656,7 +657,7 @@ function Downloads() {
               href={`/trails/${row.slug}`}
               className="rounded-hair font-text text-body-lg text-ink hover:text-woodland"
             >
-              {trailTitle(row)}
+              {trailTitle(titled(row))}
             </Link>
             <span className="collar">
               {row.regionName ? `${row.regionName} · ` : ''}

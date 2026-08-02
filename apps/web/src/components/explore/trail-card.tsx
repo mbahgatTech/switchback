@@ -126,11 +126,17 @@ export function TrailCard({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-sm">
             {/* A destination title is roughly twice the OSM name it stands in for, so this
-                heading has to give way rather than shove. `min-w-0` lets it shrink past its
-                longest word, which is what keeps `Open` and the mark on screen; `wrap-break-word`
-                then wraps that word instead of letting it be clipped mid-syllable. Both are
-                needed, and so is `min-w-0` on the column in `explore.tsx` — measured at 375 px. */}
-            <h3 className="min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
+                heading gives way rather than shoves. `min-w-0` lets it shrink past its longest
+                word and `wrap-break-word` wraps that word rather than clipping it mid-syllable;
+                the index column in `explore.tsx` takes `min-w-0` for the same reason and defers
+                here for it. Measured at 375 px with a 52-character name: without the pair the
+                column takes 630 px inside a 375 px cell, `overflow-x-clip` swallows the
+                difference, and `Open` and the save mark are clipped off the glass.
+
+                Three lines and no more: this column is 93 px at 320 px, where a 71-character
+                title runs to seven lines and a 210 px row nobody can scan. The eye loses the
+                tail, the ear does not — the overlay button and `Open` carry the whole title. */}
+            <h3 className="line-clamp-3 min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
               {title}
             </h3>
 

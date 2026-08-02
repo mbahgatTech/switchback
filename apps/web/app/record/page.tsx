@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
-import { BRAND } from '@switchback/core';
+import { BRAND, trailTitle } from '@switchback/core';
 import { OsmCredit, OsmCreditBeside } from '@/components/map/osm-credit';
 import { Recorder, type RecorderTrail } from '@/components/record/recorder';
 import { SiteNav } from '@/components/site-nav';
@@ -69,7 +69,9 @@ export default async function RecordPage({
        * the nav, and "Record a hike on Vesper Peak summit trail" confirms the right one came
        * through without having to go looking for it on the map.
        */}
-      <h1 className="sr-only">{trail ? `Record a hike on ${trail.name}` : 'Record a hike'}</h1>
+      <h1 className="sr-only">
+        {trail ? `Record a hike on ${trailTitle(trail)}` : 'Record a hike'}
+      </h1>
 
       <header className="flex h-3xl shrink-0 items-center justify-between gap-lg border-b border-bezel px-lg">
         <Wordmark />

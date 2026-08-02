@@ -80,8 +80,15 @@ export default function RecordScreen() {
     staleTime: Number.POSITIVE_INFINITY,
   });
   const followed = followingTrail.data ?? followingRoute.data ?? null;
-  // A planned route has only the name its author typed; a trail may have a derived title.
-  const followedName = followed === null ? null : trailTitle(followed);
+  // A trail carries `displayName` and titles through it; a planned route has only the name its
+  // author typed and no such key, so it is widened here rather than given a branch of its own.
+  const followedName =
+    followed === null
+      ? null
+      : trailTitle({
+          name: followed.name,
+          displayName: 'displayName' in followed ? followed.displayName : null,
+        });
 
   /**
    * Hand the line to the recorder, and never take it away while it is still loading. The clear

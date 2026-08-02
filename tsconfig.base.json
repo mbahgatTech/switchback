@@ -30,12 +30,19 @@
     "declaration": false,
     "sourceMap": true,
 
-    // Workspace packages resolve to their sources, not to the npm-workspace symlinks. The
-    // root, web and mobile configs each already did this for themselves; the per-package
-    // configs did not, and so resolved through `node_modules/@switchback/*` — which in a git
-    // worktree points at the *other* checkout, typechecking half the repo against a copy that
-    // does not have the branch's changes in it. Inherited rather than repeated: a config that
-    // declares its own `paths` overrides this wholesale, and both that do are complete.
+    // Workspace packages resolve to their sources rather than to the npm-workspace symlinks,
+    // for the per-package configs, which had no `paths` of their own. This buys nothing in CI
+    // — one checkout, so the symlink and the source are the same file — and changes no build:
+    // the root, web and mobile configs each declare complete `paths` already and override this
+    // wholesale, and mobile does not even extend this file. What it fixes is `npm run lint`
+    // inside a git worktree. ESLint's `projectService` resolves a file through its *nearest*
+    // tsconfig, so `packages/*/src/**` is read through `packages/*/tsconfig.json` rather than
+    // the root project, and `node_modules/@switchback/*` points at the other checkout: without
+    // this block, linting a worktree reports 21 errors in files the branch never touched.
+    //
+    // Mobile's own list is deliberately *incomplete* and must stay that way — `@switchback/db`
+    // and the value exports of `@switchback/api` are omitted so that importing one is a
+    // compile error rather than a Hermes crash on the phone. Nothing here reaches it.
     // Relative to this file, per TS 4.1+; no `baseUrl`, which TS 6 deprecates.
     "paths": {
       "@switchback/core": ["./packages/core/src/index.ts"],

@@ -551,6 +551,10 @@ model Waypoint {
   lng     Float
   lat     Float
   eleM    Float?
+  /// The feature's own OSM `ele` in metres — a peak's surveyed height, where `eleM` is the
+  /// trail's elevation beneath it. Kept apart because the section chart plots `distM`/`eleM`
+  /// and must stay on the line, while `deriveDisplayName` needs the peak to compare against.
+  osmEleM Float?
   /// Distance along the trail. Null for off-route features like a parking lot 200 m
   /// from the trailhead, which still belong to the trail but sit nowhere on its line.
   distM   Float?

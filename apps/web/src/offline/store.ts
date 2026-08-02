@@ -3,7 +3,7 @@
  * Storage holds the bytes; the database itself is declared in `idb.ts`, which the queue shares.
  */
 
-import type { TrailDetail } from '@switchback/core';
+import type { TitledTrail, TrailDetail } from '@switchback/core';
 import { TRAILS_STORE, run } from './idb';
 
 export interface OfflineTrail {
@@ -35,6 +35,15 @@ export interface OfflineTrail {
    * deployment and references its hashed assets, whereas this is JSON any future build can render.
    */
   detail: TrailDetail;
+}
+
+/**
+ * A stored row as something `trailTitle` will take. This store is the one place the key may be
+ * absent — an index written before the column existed — so the widening happens here rather than
+ * as a `?? null` repeated at every screen that lists a download.
+ */
+export function titled(row: OfflineTrail): TitledTrail {
+  return { name: row.name, displayName: row.displayName ?? null };
 }
 
 export function listOfflineTrails(): Promise<OfflineTrail[]> {

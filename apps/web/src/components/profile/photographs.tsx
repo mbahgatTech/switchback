@@ -33,7 +33,8 @@ export interface MyPhotograph {
   caption: string | null;
   hidden: boolean;
   createdAt: Date;
-  trail: { name: string; slug: string } | null;
+  /** Already resolved through `trailTitle` by the router — printed as it stands. */
+  trail: { title: string; slug: string } | null;
 }
 
 export function YourPhotographs({ photographs }: { photographs: MyPhotograph[] }) {
@@ -46,7 +47,7 @@ export function YourPhotographs({ photographs }: { photographs: MyPhotograph[] }
       <ul className="mt-md grid grid-cols-2 gap-md sm:grid-cols-3 lg:grid-cols-4">
         {photographs.map((photo) => {
           const wash = blurhashAverageColor(photo.blurhash);
-          const where = photo.trail?.name ?? 'A trail';
+          const where = photo.trail?.title ?? 'A trail';
 
           return (
             <li key={photo.id}>
@@ -78,7 +79,7 @@ export function YourPhotographs({ photographs }: { photographs: MyPhotograph[] }
                     href={`/trails/${photo.trail.slug}`}
                     className="rounded-hair hover:text-ink"
                   >
-                    {photo.trail.name}
+                    {photo.trail.title}
                   </Link>
                 ) : (
                   where

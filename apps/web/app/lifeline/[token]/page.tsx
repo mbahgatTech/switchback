@@ -105,7 +105,7 @@ export default async function LifelinePage({ params }: PageProps) {
                 href={`/trails/${follow.trail.slug}`}
                 className="rounded-hair underline decoration-bezel underline-offset-4 hover:decoration-ink"
               >
-                {follow.trail.name}
+                {follow.trail.title}
               </Link>
               {follow.trail.regionName ? `, ${follow.trail.regionName}` : null}
             </>
@@ -241,7 +241,7 @@ function Dispatch({ follow, now }: { follow: LifelineFollow; now: Date }) {
               label="Where"
               value={
                 follow.trail
-                  ? `${follow.trail.name}${follow.trail.regionName ? `, ${follow.trail.regionName}` : ''}`
+                  ? `${follow.trail.title}${follow.trail.regionName ? `, ${follow.trail.regionName}` : ''}`
                   : 'Trail not named'
               }
             />

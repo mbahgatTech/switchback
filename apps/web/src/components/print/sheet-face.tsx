@@ -3,6 +3,7 @@
 import { useEffect, useId, useMemo, useRef } from 'react';
 import maplibregl, { type Map as MapLibreMap } from 'maplibre-gl';
 import type { LngLat, Waypoint, WaypointKind } from '@switchback/core';
+import { DESTINATION_KINDS } from '@switchback/core';
 import { type SheetFrame, sheetGraticule, sheetPointMm, sheetZoom } from '@switchback/geo';
 import { SCHEMES } from '@switchback/ui';
 import { registerRTLText } from '../map/rtl';
@@ -59,8 +60,19 @@ export const WAYPOINT_INK: Record<WaypointKind, WaypointPlate> = {
   hazard: 'survey',
 };
 
-/** Labelled first when the sheet runs out of room, for the reasons a hiker would pick. */
-const NAMED_KINDS: readonly WaypointKind[] = ['summit', 'trailhead', 'hazard', 'shelter'];
+/**
+ * Labelled first when the sheet runs out of room, for the reasons a hiker would pick. The four
+ * `DESTINATION_KINDS` join them because a trail is now *titled* for its lake or pass on 130 of
+ * the 389 derived names: a sheet headed "Snow Lake via …" that labels everything but the lake
+ * makes the reader hunt for the one feature the title sent them to find.
+ */
+const NAMED_KINDS: readonly WaypointKind[] = [
+  'summit',
+  'trailhead',
+  'hazard',
+  'shelter',
+  ...DESTINATION_KINDS,
+];
 
 /** Millimetres. Closer than this and two labels are one illegible mark. */
 const LABEL_CLEARANCE_MM = 8;

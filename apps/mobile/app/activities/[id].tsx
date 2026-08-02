@@ -208,7 +208,12 @@ export default function ActivityScreen() {
             accessibilityRole="button"
             hitSlop={theme.space.sm}
           >
-            <Text style={styles.trailLink}>On {trailName} →</Text>
+            {/* Web's guard, which mobile lacked: a hike the recorder named after its trail
+                would otherwise print that name twice, once as the heading and once three
+                lines beneath it. */}
+            <Text style={styles.trailLink}>
+              {trailName === name ? 'Trail notes and conditions' : `On ${trailName}`} →
+            </Text>
           </Pressable>
         ) : null}
       </View>

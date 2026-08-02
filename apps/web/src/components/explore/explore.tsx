@@ -13,6 +13,7 @@ import { CoverageNote } from './coverage-note';
 import { EMPTY_FACETS, type Facets } from './facets';
 import { FetchArea } from './fetch-area';
 import { Filters } from './filters';
+import { liftCeiling } from './lift';
 import { SearchBox } from './search-box';
 import { SelectedTrail } from './selected-trail';
 import { TrailCard } from './trail-card';
@@ -278,9 +279,8 @@ export function Explore({
 
   /**
    * How much of the bottom of the sheet the pick card is standing on, so MapLibre's own
-   * corner chrome can step up out of its way — the scale bar and the ODbL attribution both
-   * live down there, and attribution is a licence condition. Measured rather than a constant:
-   * the card's height is whatever its trail's name wraps to.
+   * corner chrome can step up out of its way — the scale bar and the zoom pair both live down
+   * there. Measured rather than a constant: the card's height is whatever its title wraps to.
    */
   const sheetRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -296,14 +296,16 @@ export function Explore({
     }
 
     const measure = () => {
-      const room = sheet.getBoundingClientRect().bottom - card.getBoundingClientRect().top;
-      setCardLift(Math.max(0, Math.round(room)));
+      const pane = sheet.getBoundingClientRect();
+      const room = pane.bottom - card.getBoundingClientRect().top;
+      setCardLift(Math.min(Math.max(0, Math.round(room)), liftCeiling(pane.height)));
     };
 
-    // The card is bottom-anchored, so it moving with the sheet changes nothing — only its
-    // own height does, and that is what this watches.
+    // The card's own height is the usual reason to re-measure, but the ceiling is a fraction
+    // of the pane, so a pane that changes height moves it — both are watched.
     const observer = new ResizeObserver(measure);
     observer.observe(card);
+    observer.observe(sheet);
     return () => observer.disconnect();
   }, [picked]);
 
@@ -390,11 +392,9 @@ export function Explore({
         ) : null}
       </div>
 
-      {/* The collar. `min-w-0` because a grid item's min-width is its min-content width, and
-          the index's min-content is the longest unbreakable word any card holds. Measured at
-          375 px with a 52-character name: without it the column takes 630 px inside a 375 px
-          cell, `overflow-x-clip` swallows the difference, and `Open` and the save mark are
-          clipped off the glass rather than wrapped. */}
+      {/* The collar. `min-w-0` for the reason `trail-card.tsx` gives beside its heading: a
+          grid item's min-width is its min-content width, and the index's min-content is the
+          longest unbreakable word any card holds. */}
       <div className="flex min-h-0 min-w-0 flex-col border-bezel md:border-r">
         <div className="flex shrink-0 flex-col gap-md border-b border-bezel p-lg">
           <SearchBox

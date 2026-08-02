@@ -202,6 +202,11 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     [recorder.fixes],
   );
 
+  // Every place this screen names the trail, including the name the finished hike is stored
+  // under. Two of these used to read `trail.name` directly, so the off-route warning and the
+  // all-clear that answers it called one trail by two names.
+  const title = trail ? trailTitle(trail) : null;
+
   // The elevation of the last fix that was good enough to keep, for the Lifeline ping. Read
   // off the track rather than off `position`, which carries no altitude.
   const lastEleM = useMemo<number | null>(() => {
@@ -326,7 +331,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       id,
       startedAt,
       trailId: trail?.id ?? null,
-      trailName: trail ? trailTitle(trail) : null,
+      trailName: title,
       activityType,
       serverStarted: false,
     });
@@ -414,7 +419,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
             <OffRouteBanner
               distanceM={recorder.offRouteDistanceM}
               units={units}
-              trailName={trail ? trailTitle(trail) : 'the trail'}
+              trailName={title ?? 'the trail'}
             />
           ) : null}
 
@@ -423,7 +428,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
               className="rounded-hair border border-woodland px-md py-sm text-caption text-ink"
               role="status"
             >
-              Back on {trail?.name ?? 'the trail'}.
+              Back on {title ?? 'the trail'}.
             </p>
           ) : null}
 
@@ -569,7 +574,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           <LifelinePanel
             activityId={recorder.activityId}
             trailId={recorder.trailId ?? trail?.id ?? null}
-            trailName={trail ? trailTitle(trail) : null}
+            trailName={title}
             position={recorder.position}
             eleM={lastEleM}
           />
@@ -581,7 +586,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 href={`/trails/${trail.slug}`}
                 className="text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
               >
-                {trailTitle(trail)}
+                {title}
               </Link>
               . Wrong-turn alerts are on.
             </p>
@@ -645,11 +650,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 disabled={start.isPending}
                 className={`${BUTTON} ${PRIMARY} ${HEIGHT.field} w-full px-lg text-body-lg`}
               >
-                {start.isPending
-                  ? 'Starting'
-                  : trail
-                    ? `Record ${trailTitle(trail)}`
-                    : 'Start recording'}
+                {start.isPending ? 'Starting' : title ? `Record ${title}` : 'Start recording'}
               </button>
             </>
           )}
@@ -659,11 +660,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       {finishing ? (
         <FinishDialog
           units={units}
-          defaultName={defaultActivityName(
-            activityType,
-            recorder.startedAt ?? new Date(),
-            trail?.name ?? null,
-          )}
+          defaultName={defaultActivityName(activityType, recorder.startedAt ?? new Date(), title)}
           defaultVisibility={defaultVisibility}
           hasTrail={recorder.trailId !== null}
           distanceM={recorder.stats.distanceM}
@@ -970,7 +967,10 @@ function StartPanel({
         <div className="rounded-hair border border-contour px-md py-sm">
           <p className="collar text-contour">Already recording</p>
           <p className="mt-hair text-caption text-ink">
-            {openRecording.trail?.name ?? openRecording.name ?? 'A hike'}, started{' '}
+            {openRecording.trail
+              ? trailTitle(openRecording.trail)
+              : (openRecording.name ?? 'A hike')}
+            , started{' '}
             {openRecording.startedAt.toLocaleString(undefined, {
               weekday: 'short',
               hour: 'numeric',
