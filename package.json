@@ -22,6 +22,7 @@
     "db:seed": "npm run seed --workspace=@switchback/db",
     "db:seed:reviews": "npm run seed:reviews --workspace=@switchback/db",
     "db:seed:tracks": "npm run seed:tracks --workspace=@switchback/db",
+    "db:backfill:display-names": "npm run backfill:display-names --workspace=@switchback/db",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",
     "ingest:drain": "tsx --env-file-if-exists=.env scripts/ingest.ts drain",

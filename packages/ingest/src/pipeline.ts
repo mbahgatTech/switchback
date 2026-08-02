@@ -4,6 +4,7 @@
  */
 
 import type { BBox, LngLat, LineString } from '@switchback/core';
+import { deriveDisplayName } from '@switchback/core';
 import {
   BACKGROUND_POOL_SIZE,
   JobKind,
@@ -646,6 +647,21 @@ async function commitTrail(
   const waypoints = ctx.features.length ? attachWaypoints(oriented, ctx.features) : [];
   const trailhead = synthesiseTrailhead(oriented);
   const allWaypoints = trailhead ? [trailhead, ...waypoints] : waypoints;
+  // Elevations are resolved once here rather than inside the insert below, because the display
+  // name is derived from the same numbers and the two must not be allowed to disagree.
+  const placed = allWaypoints.map((waypoint) => ({
+    ...waypoint,
+    eleM: elevationAt(profile, waypoint),
+  }));
+
+  const displayName = deriveDisplayName({
+    name: trail.name,
+    routeType: derived.routeType,
+    lengthM: derived.stats.lengthM,
+    gainM: derived.stats.gainM,
+    maxEleM: derived.stats.maxEleM,
+    waypoints: placed,
+  });
 
   const geometry: LineString = { type: 'LineString', coordinates: [...oriented] };
   const rendered = renderGeometry(oriented);
@@ -658,6 +674,7 @@ async function commitTrail(
     const row = {
       slug,
       name: trail.name,
+      displayName,
       description: derived.description,
       regionName: ctx.region.regionName,
       countryCode: ctx.region.countryCode,
@@ -728,15 +745,15 @@ async function commitTrail(
     // Three statements for any number of waypoints — one `createMany`, then
     // `writeWaypointPoints` derives every PostGIS point from the `lng`/`lat` just written.
     await tx.waypoint.deleteMany({ where: { trailId: saved.id } });
-    if (allWaypoints.length > 0) {
+    if (placed.length > 0) {
       await tx.waypoint.createMany({
-        data: allWaypoints.map((waypoint) => ({
+        data: placed.map((waypoint) => ({
           trailId: saved.id,
           kind: waypoint.kind,
           name: waypoint.name,
           lng: waypoint.lng,
           lat: waypoint.lat,
-          eleM: elevationAt(profile, waypoint),
+          eleM: waypoint.eleM,
           distM: waypoint.distM,
           osmType: waypoint.osmId ? (waypoint.osmType as OsmElementType) : null,
           osmId: waypoint.osmId ? BigInt(waypoint.osmId) : null,

@@ -35,6 +35,9 @@ export const WAYPOINT_KINDS = [
   'gate',
   'ford',
   'hazard',
+  /** A col or mountain pass — the low point of a ridge, and often a hike's destination. */
+  'pass',
+  'glacier',
 ] as const;
 export type WaypointKind = (typeof WAYPOINT_KINDS)[number];
 

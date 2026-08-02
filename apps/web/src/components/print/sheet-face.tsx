@@ -43,6 +43,8 @@ export type WaypointPlate = 'survey' | 'water' | 'contour' | 'woodland' | 'ink';
 export const WAYPOINT_INK: Record<WaypointKind, WaypointPlate> = {
   trailhead: 'woodland',
   summit: 'contour',
+  pass: 'contour',
+  glacier: 'contour',
   viewpoint: 'contour',
   water: 'water',
   waterfall: 'water',

@@ -51,6 +51,19 @@ describe('classifyWaypoint', () => {
     expect(classifyWaypoint({ natural: 'spring', amenity: 'drinking_water' })).toBe('water');
   });
 
+  it('maps the destination tags the display name needs', () => {
+    expect(classifyWaypoint({ natural: 'hill' })).toBe('summit');
+    expect(classifyWaypoint({ natural: 'saddle' })).toBe('pass');
+    expect(classifyWaypoint({ mountain_pass: 'yes' })).toBe('pass');
+    expect(classifyWaypoint({ natural: 'glacier' })).toBe('glacier');
+  });
+
+  it('does not let the new rules steal from the ones above them', () => {
+    // Appended last, so a col that is also a signposted overlook keeps the older label.
+    expect(classifyWaypoint({ natural: 'saddle', tourism: 'viewpoint' })).toBe('viewpoint');
+    expect(classifyWaypoint({ natural: 'hill', amenity: 'parking' })).toBe('parking');
+  });
+
   it('does not call a river a lake', () => {
     expect(classifyWaypoint({ natural: 'water', water: 'river' })).toBeNull();
     expect(classifyWaypoint({ natural: 'water', water: 'lake' })).toBe('lake');

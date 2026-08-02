@@ -53,6 +53,12 @@ const WAYPOINT_RULES: Array<{ kind: WaypointKind; match: (t: Record<string, stri
     { kind: 'gate', match: (t) => t.barrier === 'gate' || t.barrier === 'stile' },
     { kind: 'junction', match: (t) => t.information === 'guidepost' },
     { kind: 'hazard', match: (t) => t.natural === 'cave_entrance' },
+    // Appended, not inserted: a rule above a narrower one steals from it, and `natural=saddle`
+    // carrying `tourism=viewpoint` is a viewpoint today and stays one. A named hill is a summit
+    // to a hiker and to `TERMINAL_DESTINATIONS`, which is the point of collecting it.
+    { kind: 'summit', match: (t) => t.natural === 'hill' },
+    { kind: 'pass', match: (t) => t.natural === 'saddle' || t.mountain_pass === 'yes' },
+    { kind: 'glacier', match: (t) => t.natural === 'glacier' },
   ];
 
 export function classifyWaypoint(tags: Record<string, string>): WaypointKind | null {
