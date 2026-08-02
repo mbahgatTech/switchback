@@ -141,6 +141,23 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
+  // A dead worker's jobs, taken back and either requeued or finally buried. Worth a line each
+  // time: `requeued` is how many function invocations died holding work, and a `retired` job is
+  // one that has now killed its worker repeatedly and will not be tried again.
+  if (result.requeued > 0 || result.retired > 0) {
+    console.warn(
+      `ingest drain: reclaimed ${result.requeued} expired lease(s), retired ${result.retired}`,
+    );
+  }
+
+  // The tuning signal for `LEASE_TIMEOUT_MS`: a lost lease is a worker that finished after its
+  // job had been given away, so the work was done twice and the lease is too short.
+  if (result.lost > 0) {
+    console.warn(
+      `ingest drain: ${result.lost} job(s) finished after their lease expired — raise LEASE_TIMEOUT_MS`,
+    );
+  }
+
   // The one thing about the sweep worth a log line: it ran out of room.
   if (orphans?.truncated) {
     console.warn(

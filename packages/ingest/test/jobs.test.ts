@@ -1,15 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
 import {
-  LOCK_TIMEOUT_MS,
+  LEASE_TIMEOUT_MS,
   claimJobs,
+  completeJob,
   drainJobs,
   enqueue,
   failJob,
+  reclaimExpiredJobs,
   tileJobKey,
   trailEnrichJobKey,
 } from '../src/jobs';
-import type { ClaimedJob, Db } from '../src/jobs';
+import type { ClaimedJob, Db, DrainResult } from '../src/jobs';
 
 interface Recorded {
   updates: Array<{ id: string; data: Record<string, unknown> }>;
@@ -17,29 +19,80 @@ interface Recorded {
   upserts: Array<Record<string, unknown>>;
   /** The last raw call's interpolated values. */
   rawValues: unknown[];
-  /** Every raw call's values, in order. `drainJobs` makes two — see the derived share. */
+  /** Every raw call's values, in order. */
   rawCalls: unknown[][];
+  /** Every raw call's SQL text, with its bound values left out. */
+  rawSql: string[];
+  /** What the lease sweep did to each `running` row it matched. */
+  reaped: Array<{ id: string; attempts: number; status: JobStatus }>;
+  /** The lease sweep's interpolated values. */
+  reapValues: unknown[];
+}
+
+/** A row sitting in `running`, for the lease sweep to judge. */
+interface RunningRow {
+  id: string;
+  lockedAt: Date;
+  attempts: number;
+  maxAttempts: number;
+}
+
+interface FakeOptions {
+  /** Rows in `running`. The sweep's own cutoff decides which of them it takes. */
+  running?: RunningRow[];
+  /** Rows a fenced outcome write matches. 0 stands for a lease already reclaimed. */
+  outcomeCount?: number;
 }
 
 /**
  * A Prisma stand-in covering exactly the calls this module makes. Enough to assert the
- * queue's decisions — reschedule vs bury, backoff, revival, ordering — without a database.
+ * queue's decisions — reschedule vs bury, backoff, revival, ordering, the lease — without a
+ * database.
  */
-function fakeDb(claimable: ClaimedJob[] = []): { db: Db; recorded: Recorded } {
+function fakeDb(
+  claimable: ClaimedJob[] = [],
+  options: FakeOptions = {},
+): { db: Db; recorded: Recorded } {
   const recorded: Recorded = {
     updates: [],
     updateManys: [],
     upserts: [],
     rawValues: [],
     rawCalls: [],
+    rawSql: [],
+    reaped: [],
+    reapValues: [],
   };
+  const running = options.running ?? [];
+  let claims = 0;
   const db = {
-    $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+    $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const sql = strings.join('?');
+      recorded.rawSql.push(sql);
+      /*
+       * The lease sweep, run out of its own interpolated parameters rather than a fixture: it
+       * binds `now` then `cutoff`, and applying that cutoff and that retirement rule here is
+       * what makes "expired is taken, fresh is not" an assertion about `reclaimExpiredJobs`
+       * and not about the fake. Kept out of `rawCalls`, which the claim assertions index into.
+       */
+      if (sql.includes('RETURNING status')) {
+        recorded.reapValues = values;
+        const [, cutoff] = values.filter((v): v is Date => v instanceof Date);
+        return running
+          .filter((row) => row.lockedAt.getTime() < cutoff!.getTime())
+          .map((row) => {
+            const attempts = row.attempts + 1;
+            const status = attempts >= row.maxAttempts ? JobStatus.dead : JobStatus.queued;
+            recorded.reaped.push({ id: row.id, attempts, status });
+            return { status };
+          });
+      }
       recorded.rawValues = values;
       recorded.rawCalls.push(values);
+      claims += 1;
       // Only the first claim yields work. The second is the derived share, and handing it
       // the same rows would double-run them in every test that drains.
-      return recorded.rawCalls.length === 1 ? claimable : [];
+      return claims === 1 ? claimable : [];
     },
     ingestJob: {
       update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
@@ -51,6 +104,12 @@ function fakeDb(claimable: ClaimedJob[] = []): { db: Db; recorded: Recorded } {
         data: Record<string, unknown>;
       }) => {
         recorded.updateManys.push({ where: args.where, data: args.data });
+        // A fenced outcome write is keyed on the job's id; `enqueue`'s revival is not.
+        if (typeof args.where.id === 'string') {
+          const count = options.outcomeCount ?? 1;
+          recorded.updates.push({ id: args.where.id, data: args.data });
+          return { count };
+        }
         return { count: 0 };
       },
       upsert: async (args: Record<string, unknown>) => {
@@ -121,6 +180,23 @@ function job(overrides: Partial<ClaimedJob> = {}): ClaimedJob {
     payload: { quadkey: '033311323' },
     attempts: 1,
     maxAttempts: 5,
+    lockedAt: new Date('2026-01-01T11:00:00Z'),
+    lockedBy: 'worker-a',
+    ...overrides,
+  };
+}
+
+/** A drain that did nothing, so each case names only the counts it is about. */
+function drained(overrides: Partial<DrainResult> = {}): DrainResult {
+  return {
+    claimed: 0,
+    succeeded: 0,
+    failed: 0,
+    deferred: 0,
+    lost: 0,
+    derived: 0,
+    requeued: 0,
+    retired: 0,
     ...overrides,
   };
 }
@@ -199,19 +275,28 @@ describe('enqueue', () => {
 });
 
 describe('claimJobs', () => {
-  it('treats a lock older than the timeout as abandoned', async () => {
+  it('claims only queued work that is due', async () => {
     const { db, recorded } = fakeDb();
     const now = new Date('2026-01-01T12:00:00Z');
     await claimJobs(db, 'worker-a', 4, now);
 
-    // now, workerId, now, lockCutoff, limit — the cutoff is what recovers a worker that
-    // died holding the lock.
-    const cutoff = recorded.rawValues.find(
-      (v): v is Date => v instanceof Date && v.getTime() !== now.getTime(),
-    );
-    expect(cutoff!.getTime()).toBe(now.getTime() - LOCK_TIMEOUT_MS);
     expect(recorded.rawValues).toContain('worker-a');
     expect(recorded.rawValues).toContain(4);
+    // Expired leases used to be a second arm of this predicate, and that put reclaiming a dead
+    // worker's job behind `ORDER BY priority DESC … LIMIT`. `reclaimExpiredJobs` owns it now.
+    const sql = recorded.rawSql.at(-1)!;
+    expect(sql).toContain("status = 'queued'");
+    expect(sql).not.toContain("status = 'running'");
+  });
+
+  it('hands the lease it stamped back to the worker', async () => {
+    // The fence every outcome is written under — see `writeOutcome`.
+    const { db, recorded } = fakeDb();
+    await claimJobs(db, 'worker-a', 4, new Date());
+
+    const sql = recorded.rawSql.at(-1)!;
+    expect(sql).toContain('"lockedAt"');
+    expect(sql).toContain('"lockedBy"');
   });
 
   it('claims from the whole table when no scope is given', async () => {
@@ -273,6 +358,114 @@ describe('claimJobs', () => {
 });
 
 /**
+ * The lease. Nineteen production jobs sat in `running` for seventy-five hours with `attempts=1`
+ * and no `lastError`, because the only thing that reclaimed an expired lock did so inside
+ * `claimJobs`' `ORDER BY priority DESC … LIMIT 4`, behind a five-figure backlog.
+ */
+describe('reclaimExpiredJobs', () => {
+  const now = new Date('2026-01-01T12:00:00Z');
+  const stale = new Date(now.getTime() - LEASE_TIMEOUT_MS - 60_000);
+  const fresh = new Date(now.getTime() - 60_000);
+
+  it('takes back a job locked beyond the timeout and spends an attempt on it', async () => {
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+
+    const result = await reclaimExpiredJobs(db, now);
+
+    expect(result).toEqual({ requeued: 1, retired: 0 });
+    // Back to `queued` with the attempt counted — a job that keeps killing its worker has to
+    // move towards its budget, or the sweep that recovers it is also the loop that repeats it.
+    expect(recorded.reaped).toEqual([{ id: 'stuck', attempts: 2, status: JobStatus.queued }]);
+  });
+
+  it('leaves a freshly locked job alone', async () => {
+    // The other half of the same decision: a lease that has not expired belongs to a worker
+    // that is still running, and taking it would run the tile twice.
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'working', lockedAt: fresh, attempts: 1, maxAttempts: 5 }],
+    });
+
+    const result = await reclaimExpiredJobs(db, now);
+
+    expect(result).toEqual({ requeued: 0, retired: 0 });
+    expect(recorded.reaped).toEqual([]);
+  });
+
+  it('retires a job that has run out of attempts rather than requeueing it forever', async () => {
+    // A job whose handler takes the worker down with it never reaches `failJob`, so without
+    // this the sweep would hand it back every half hour for as long as the table exists.
+    const { db, recorded } = fakeDb([], {
+      running: [
+        { id: 'poison', lockedAt: stale, attempts: 4, maxAttempts: 5 },
+        { id: 'ordinary', lockedAt: stale, attempts: 1, maxAttempts: 5 },
+      ],
+    });
+
+    const result = await reclaimExpiredJobs(db, now);
+
+    expect(result).toEqual({ requeued: 1, retired: 1 });
+    expect(recorded.reaped[0]).toEqual({ id: 'poison', attempts: 5, status: JobStatus.dead });
+  });
+
+  it('says why on the row, and does not push the schedule out', async () => {
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+
+    await reclaimExpiredJobs(db, now);
+
+    const sql = recorded.rawSql.at(-1)!;
+    // These rows carried a null `lastError` for three days and nothing on them said what
+    // happened; the lease itself has already spaced the retry, so `runAfter` stays put.
+    expect(recorded.reapValues).toContainEqual(
+      expect.stringContaining('lease expired after 30 min'),
+    );
+    expect(recorded.reapValues).toContainEqual(new Date(now.getTime() - LEASE_TIMEOUT_MS));
+    expect(sql).toContain('"lastError"');
+    expect(sql).not.toContain('"runAfter"');
+    expect(sql).toContain("status = 'running'");
+  });
+});
+
+/**
+ * The other half of the lease: a worker that overran its own and came back to write an outcome
+ * for a job somebody else now owns.
+ */
+describe('the outcome fence', () => {
+  it('records an outcome while the lease is held', async () => {
+    const { db, recorded } = fakeDb();
+
+    await expect(completeJob(db, job(), new Date())).resolves.toBe(true);
+
+    // Conditional on the lease, not on the id alone.
+    const fence = recorded.updateManys.at(-1)!.where;
+    expect(fence).toEqual({ id: 'job-1', lockedBy: 'worker-a', lockedAt: job().lockedAt });
+  });
+
+  it("drops a late worker's outcome rather than overwriting the new owner", async () => {
+    // `outcomeCount: 0` is the row no longer carrying this lease. `completeJob` would only
+    // write a duplicate `done`, but `failJob` would requeue finished work *and* null a lock a
+    // live worker is holding, which is how two workers end up on one job.
+    const { db } = fakeDb([], { outcomeCount: 0 });
+
+    await expect(completeJob(db, job(), new Date())).resolves.toBe(false);
+    await expect(failJob(db, job(), new Error('too late'), new Date())).resolves.toBe(false);
+  });
+
+  it('counts a lost lease apart from a success, so the timeout can be tuned', async () => {
+    const { db } = fakeDb([job()], { outcomeCount: 0 });
+
+    const result = await drainJobs({ [JobKind.ingest_tile]: async () => {} }, { db });
+
+    expect(result.succeeded).toBe(0);
+    expect(result.lost).toBe(1);
+    expect(result.claimed).toBe(1);
+  });
+});
+
+/**
  * The starvation this share exists to break: `claimJobs` orders `priority DESC` and derived
  * work sits at `-10`, while both inline kicks scope to the tile keys they just queued and so
  * cannot reach a derived row at all.
@@ -325,16 +518,18 @@ describe('the derived share', () => {
   it('drains the primary batch even when the derived claim fails', async () => {
     // Ordering is the argument: by the time the derived pass runs, the primary batch is
     // already `running` with a lock stamped, so letting the rejection out would strand it for
-    // `LOCK_TIMEOUT_MS`. The thrown message is the shape a bad enum cast would take.
+    // `LEASE_TIMEOUT_MS`. The thrown message is the shape a bad enum cast would take.
     const { db, recorded } = fakeDb([job()]);
     const raw = (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> })
       .$queryRaw;
-    let calls = 0;
+    let claims = 0;
     (db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> }).$queryRaw = async (
       ...args: unknown[]
     ) => {
-      calls += 1;
-      if (calls === 2) throw new Error('operator does not exist: "JobKind" = text');
+      // Counted over claims only — the lease sweep runs first and is not one of them.
+      const sql = (args[0] as TemplateStringsArray).join('?');
+      if (!sql.includes('RETURNING status')) claims += 1;
+      if (claims === 2) throw new Error('operator does not exist: "JobKind" = text');
       return raw(...args);
     };
     const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -350,7 +545,7 @@ describe('the derived share', () => {
     );
 
     expect(ran).toEqual(['job-1']);
-    expect(result).toEqual({ claimed: 1, succeeded: 1, failed: 0, deferred: 0, derived: 0 });
+    expect(result).toEqual(drained({ claimed: 1, succeeded: 1 }));
     // Completed, not left at `running` for the lock timeout to pick up.
     expect(recorded.updates.at(-1)?.data.status).toBe(JobStatus.done);
     // And loudly: a share that has silently stopped running is a backlog nobody is watching.
@@ -411,7 +606,7 @@ describe('drainJobs', () => {
     );
 
     expect(handled).toEqual(['a', 'b']);
-    expect(result).toEqual({ claimed: 2, succeeded: 2, failed: 0, deferred: 0, derived: 0 });
+    expect(result).toEqual(drained({ claimed: 2, succeeded: 2 }));
     expect(recorded.updates.map((u) => u.data.status)).toEqual([JobStatus.done, JobStatus.done]);
   });
 
@@ -449,7 +644,7 @@ describe('drainJobs', () => {
       { db },
     );
 
-    expect(result).toEqual({ claimed: 3, succeeded: 2, failed: 1, deferred: 0, derived: 0 });
+    expect(result).toEqual(drained({ claimed: 3, succeeded: 2, failed: 1 }));
     expect(recorded.updates.map((u) => u.data.status)).toEqual([
       JobStatus.done,
       JobStatus.queued,
@@ -466,7 +661,7 @@ describe('drainJobs', () => {
 
     const result = await drainJobs({}, { db, now: () => new Date('2026-01-01T12:00:00Z') });
 
-    expect(result).toEqual({ claimed: 1, succeeded: 0, failed: 0, deferred: 1, derived: 0 });
+    expect(result).toEqual(drained({ claimed: 1, deferred: 1 }));
     const update = recorded.updates[0]!;
     expect(update.data.status).toBe(JobStatus.queued);
     expect(update.data.lastError).toMatch(/no handler registered/);
@@ -488,7 +683,7 @@ describe('drainJobs', () => {
   it('reports an empty drain without touching anything', async () => {
     const { db, recorded } = fakeDb([]);
     const result = await drainJobs({ [JobKind.ingest_tile]: async () => {} }, { db });
-    expect(result).toEqual({ claimed: 0, succeeded: 0, failed: 0, deferred: 0, derived: 0 });
+    expect(result).toEqual(drained());
     expect(recorded.updates).toHaveLength(0);
   });
 });
