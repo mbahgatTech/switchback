@@ -1,10 +1,20 @@
+# Line endings are decided here, not by each clone's `core.autocrlf`.
+#
+# Every text file is LF in the index and LF in the working tree, on every platform. `text=auto`
+# leaves git's own binary detection in charge of what counts as text; `eol=lf` is what makes the
+# *checkout* LF too, which is the half `core.autocrlf` was overriding — prettier reads the working
+# tree, so without it `format:check` fails locally while CI, which checks out LF, passes.
+
+* text=auto eol=lf
+
 # Vendored third-party code, checked in byte-for-byte.
 #
-# `core.autocrlf=true` on Windows rewrites line endings on checkout, which would change these
-# files' digests — and a digest that no longer matches the published tarball is a vendored
-# file nobody can verify. `-text` tells git to leave them exactly as committed.
+# `-text` disables conversion in both directions, so these keep the exact bytes of the published
+# original and stay verifiable — `apps/web/src/components/map/rtl.ts` records the sha256 this file
+# is checked against, and that digest is the only review a vendored blob gets.
 #
-# Scoped to this one directory on purpose. The repository has no line-ending policy of its own
-# and this is not the commit to invent one in; every other path keeps whatever behaviour it
-# has today.
-apps/web/public/vendor/** -text
+# Must stay *below* the `*` rule: the last matching pattern wins, so moving it above would let the
+# global rule renormalise these and break the digest. `-eol` is redundant next to `-text`, which
+# already disables conversion, but it keeps `git check-attr` from reporting an inherited `eol: lf`
+# on a path that must never be converted.
+apps/web/public/vendor/** -text -eol
