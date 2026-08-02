@@ -85,8 +85,19 @@ on:
     - cron: '11 4 * * *'
   workflow_dispatch:
 
+# Keyed by event as well as ref, because the browser suite runs only on `schedule` or
+# `workflow_dispatch` (see the note at the top) — so the one action that verifies Playwright was
+# the one action that cancelled an in-flight deploy on the same ref. It happened: a dispatch two
+# minutes after a merge killed that merge's `production schema` and `deploy production`, and left
+# production a commit behind master.
+#
+# `cancel-in-progress` stays on, and stays on for master especially: the note below on the deploy
+# hook explains that a hook ships the tip of its branch rather than the commit that called it, so a
+# superseded run polls `/api/version` for a SHA that no longer exists. Cancelling it is the point.
+# Adding the event to the key keeps that behaviour between two pushes while stopping a dispatch
+# from reaching a push at all.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
