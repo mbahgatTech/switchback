@@ -13,6 +13,7 @@ import { CoverageNote } from './coverage-note';
 import { EMPTY_FACETS, type Facets } from './facets';
 import { FetchArea } from './fetch-area';
 import { Filters } from './filters';
+import { liftCeiling } from './lift';
 import { SearchBox } from './search-box';
 import { SelectedTrail } from './selected-trail';
 import { TrailCard } from './trail-card';
@@ -45,26 +46,6 @@ const POLL_MS = 2_500;
 
 /** Gap between the fetch-area control and the layer column, plus the switcher's own inset. */
 const LAYER_COLUMN_CLEARANCE_PX = 32;
-
-/**
- * The tallest of MapLibre's bottom corner columns, plus its own 10 px inset. Measured at
- * 320 px: the zoom pair is 80 px and the scale bar 32.
- */
-const MAP_CHROME_PX = 80;
-
-/** Pane left showing above the lifted chrome, so it sits on the map rather than on its edge. */
-const LIFT_HEADROOM_PX = 8;
-
-/**
- * The most the pick card may lift MapLibre's bottom chrome. The lift is a bottom margin on
- * containers anchored to `bottom: 0`, so past `pane.height - MAP_CHROME_PX` the taller column
- * leaves the pane: unclamped, a 71-character title made a 282 px card, a 306 px lift and a zoom
- * pair at y = −14 on a 320 px phone. Above the ceiling the card overlaps the chrome instead,
- * which is the right way round — the card can be dismissed, a control off the screen cannot.
- */
-function liftCeiling(paneHeight: number): number {
-  return Math.max(0, Math.round(paneHeight - MAP_CHROME_PX - LIFT_HEADROOM_PX));
-}
 
 /**
  * How long the URL waits behind the map. Longer than `moveend`, which a flick-and-correct fires

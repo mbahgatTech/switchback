@@ -64,6 +64,14 @@ async function columnExists(column: string, table = 'trails'): Promise<boolean> 
   return rows.length > 0;
 }
 
+/** How many waypoints carry a peak height. Zero means the summit clause is running unverified. */
+async function countPeakElevations(): Promise<number> {
+  const rows = await prisma.$queryRaw<Array<{ n: bigint }>>(
+    Prisma.sql`select count(*) as n from waypoints where "osmEleM" is not null`,
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
 /**
  * Along-line length of each stored geometry, in metres — the domain `waypoints.distM` is
  * measured in, and not what `lengthM` holds: that is the *published* figure, doubled for a
@@ -113,11 +121,21 @@ async function main(): Promise<void> {
   if (!hasColumn) {
     console.log('trails.displayName is not in this database yet; reporting what it would hold.\n');
   }
-  // Waypoints ingested before `osmEleM` existed have no peak height, and the summit clause
-  // falls back to its weaker test for those. Say so, so a coverage number is read for what it is.
+  // The summit clause falls back to its weaker on-trail test wherever a waypoint has no peak
+  // height. Ask whether any row *holds* one, not whether the column exists: `prisma db push` on a
+  // master push creates it empty, and a check on existence alone goes quiet at exactly the moment
+  // the data is still entirely absent — which is the moment somebody runs `--apply`.
   const hasPeakEle = await columnExists('osmEleM', 'waypoints');
-  if (!hasPeakEle) {
-    console.log('waypoints.osmEleM is not in this database yet; summit titles are unverified.\n');
+  const peakEleRows = hasPeakEle ? await countPeakElevations() : 0;
+  if (peakEleRows === 0) {
+    console.log(
+      hasPeakEle
+        ? 'waypoints.osmEleM exists but no row holds a peak height yet; summit titles are UNVERIFIED.\n' +
+            'Re-ingest before --apply, or the summit clause names peaks the trail never reaches.\n'
+        : 'waypoints.osmEleM is not in this database yet; summit titles are UNVERIFIED.\n',
+    );
+  } else {
+    console.log(`waypoints.osmEleM populated on ${peakEleRows} rows; summit titles verified.\n`);
   }
 
   const tally: Tally = {
