@@ -91,6 +91,8 @@ enum WaypointKind {
   gate
   ford
   hazard
+  pass
+  glacier
 }
 
 enum TrailCondition {
@@ -419,6 +421,11 @@ model Trail {
   id   String @id @default(cuid())
   slug String @unique
   name String
+  /// Where the trail goes — "Vesper Peak via Headlee Pass Trail" — derived from waypoints by
+  /// `deriveDisplayName` in @switchback/core. Nullable and recomputable: null whenever the data
+  /// does not support a name we would defend, and the reader sees `name` instead. Never feeds
+  /// `slug`, which is a public URL the service worker caches pages by.
+  displayName String?
 
   description String?
   regionName  String?
@@ -485,7 +492,7 @@ model Trail {
 
   primaryPhotoId String? @unique
 
-  /// tsvector over name, region, and description. Maintained at write time by ingest
+  /// tsvector over both names, region, and description. Maintained at write time by ingest
   /// rather than by a trigger or a generated column, both of which `prisma db push`
   /// would fight with. GIN index in spatial.sql.
   searchVector Unsupported("tsvector")?

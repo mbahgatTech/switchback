@@ -38,6 +38,7 @@ import {
   formatDistance,
   formatDuration,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 import { CONTROL_HEIGHT, DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
 import { useTRPC } from '@/api/trpc';
@@ -615,6 +616,7 @@ function SelectedCard({
 }) {
   const plate = theme.color[DIFFICULTY_PLATE[trail.difficulty]];
   const context = [trail.regionName, ROUTE_TYPE_LABEL[trail.routeType]].filter(Boolean).join(' · ');
+  const title = trailTitle(trail);
   const open = () => router.push({ pathname: '/trails/[slug]', params: { slug: trail.slug } });
 
   return (
@@ -632,7 +634,7 @@ function SelectedCard({
       <Pressable
         onPress={open}
         accessibilityRole="button"
-        accessibilityLabel={`Open ${trail.name}`}
+        accessibilityLabel={`Open ${title}`}
         style={({ pressed }) => [styles.cardBody, pressed ? styles.cardPressed : null]}
       >
         <Photograph
@@ -647,7 +649,7 @@ function SelectedCard({
             </Text>
           ) : null}
           <Text style={styles.cardName} numberOfLines={2}>
-            {trail.name}
+            {title}
           </Text>
           <View style={styles.cardPlate}>
             <View style={[styles.cardStripe, { backgroundColor: plate }]} />
@@ -690,12 +692,13 @@ function TrailRow({
 }) {
   const plate = theme.color[DIFFICULTY_PLATE[trail.difficulty]];
   const context = [trail.regionName, ROUTE_TYPE_LABEL[trail.routeType]].filter(Boolean).join(' · ');
+  const title = trailTitle(trail);
 
   return (
     <Pressable
       onPress={onPress}
       accessibilityRole="button"
-      accessibilityLabel={`${trail.name}, ${trail.difficulty}, ${formatDistance(
+      accessibilityLabel={`${title}, ${trail.difficulty}, ${formatDistance(
         trail.stats.lengthM,
         units,
       )}`}
@@ -709,7 +712,7 @@ function TrailRow({
           </Text>
         ) : null}
         <Text style={styles.rowName} numberOfLines={2}>
-          {trail.name}
+          {title}
         </Text>
         <Text style={styles.rowStats} numberOfLines={1}>
           {statsLine(trail, units)}
@@ -1135,7 +1138,7 @@ function asTrailRow(trail: TrailSummary, units: UnitSystem): PickRow {
   return {
     key: `trail:${trail.id}`,
     heading: 'Trails',
-    name: trail.name,
+    name: trailTitle(trail),
     context: [trail.regionName, formatDistance(trail.stats.lengthM, units)]
       .filter(Boolean)
       .join(' · '),

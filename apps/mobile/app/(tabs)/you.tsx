@@ -11,6 +11,7 @@ import {
   formatElevation,
   formatTimeOnFoot,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { nativeTheme } from '@switchback/ui';
 import { useTRPC } from '@/api/trpc';
@@ -317,7 +318,9 @@ export default function YouScreen() {
         <Block title="Removed">
           {removed.map((photo) => (
             <View key={photo.id} style={styles.removed}>
-              <Text style={styles.removedWhere}>{photo.trail?.name ?? 'A trail'}</Text>
+              <Text style={styles.removedWhere}>
+                {photo.trail ? trailTitle(photo.trail) : 'A trail'}
+              </Text>
               <Text style={styles.removedProse}>{REMOVED_NOTICE_OWN}</Text>
             </View>
           ))}

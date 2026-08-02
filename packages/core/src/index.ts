@@ -1,5 +1,6 @@
 export * from './brand';
 export * from './difficulty';
+export * from './destination-name';
 export * from './units';
 export * from './text';
 export * from './types';

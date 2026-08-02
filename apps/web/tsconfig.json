@@ -11,6 +11,11 @@
     // Mirrors the root tsconfig: point at the package sources rather than the symlinks so
     // typecheck behaves the same here, at the root, and in vitest. No `baseUrl` — TS 6
     // deprecates it, and `paths` already resolve relative to this file.
+    //
+    // Every workspace package this app can reach is listed, including the three it only
+    // reaches through `@switchback/api`. An unmapped one falls back to the node_modules
+    // symlink, which in a git worktree points at the *other* checkout — so a change to
+    // ingest and a change to db would be typechecked against different copies of the repo.
     "paths": {
       "@/*": ["./src/*"],
       "@switchback/core": ["../../packages/core/src/index.ts"],
@@ -21,6 +26,12 @@
       "@switchback/db/*": ["../../packages/db/src/*"],
       "@switchback/api": ["../../packages/api/src/index.ts"],
       "@switchback/api/*": ["../../packages/api/src/*"],
+      "@switchback/ingest": ["../../packages/ingest/src/index.ts"],
+      "@switchback/ingest/*": ["../../packages/ingest/src/*"],
+      "@switchback/weather": ["../../packages/weather/src/index.ts"],
+      "@switchback/weather/*": ["../../packages/weather/src/*"],
+      "@switchback/busyness": ["../../packages/busyness/src/index.ts"],
+      "@switchback/busyness/*": ["../../packages/busyness/src/*"],
       "@switchback/ui": ["../../packages/ui/src/index.ts"],
       "@switchback/ui/*": ["../../packages/ui/src/*"]
     }

@@ -35,6 +35,9 @@ export const WAYPOINT_KINDS = [
   'gate',
   'ford',
   'hazard',
+  /** A col or mountain pass — the low point of a ridge, and often a hike's destination. */
+  'pass',
+  'glacier',
 ] as const;
 export type WaypointKind = (typeof WAYPOINT_KINDS)[number];
 
@@ -100,7 +103,13 @@ export type TrailStats = z.infer<typeof trailStatsSchema>;
 export const trailSummarySchema = z.object({
   id: z.string(),
   slug: z.string(),
+  /** The OSM name. Immutable, and what `slug` was cut from. */
   name: z.string(),
+  /**
+   * Where the trail goes — "Vesper Peak via Headlee Pass Trail" — or null where the waypoints do
+   * not support one. Null on most trails, so title through `trailTitle` rather than reading it.
+   */
+  displayName: z.string().nullable(),
   difficulty: z.enum(DIFFICULTIES),
   routeType: z.enum(ROUTE_TYPES),
   activityTypes: z.array(z.enum(ACTIVITY_TYPES)),

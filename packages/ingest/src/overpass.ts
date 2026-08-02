@@ -557,6 +557,8 @@ out tags;`;
 /**
  * Waypoints and amenities in an assembled trail's buffer. Separate from the tile query so it
  * runs against a trail's bbox, and only after assembly has decided the trail is worth keeping.
+ * Glaciers are areas rather than nodes; `out center` gives one the point every other feature
+ * here already has, and the 150 m buffer drops the ones a trail merely skirts.
  */
 export function buildFeatureQuery(bbox: BBox, options: { timeoutS?: number } = {}): string {
   const [w, s, e, n] = bbox;
@@ -565,11 +567,13 @@ export function buildFeatureQuery(bbox: BBox, options: { timeoutS?: number } = {
 
   return `[out:json][timeout:${timeout}];
 (
-  node["natural"~"^(peak|saddle|spring|water|cave_entrance)$"](${box});
+  node["natural"~"^(peak|hill|saddle|spring|water|cave_entrance)$"](${box});
+  node["mountain_pass"="yes"](${box});
   node["tourism"="viewpoint"](${box});
   node["waterway"="waterfall"](${box});
   node["amenity"~"^(parking|toilets|shelter|drinking_water)$"](${box});
   way["amenity"="parking"](${box});
+  way["natural"="glacier"]["name"](${box});
   node["tourism"~"^(camp_site|alpine_hut|wilderness_hut)$"](${box});
   node["barrier"~"^(gate|stile)$"](${box});
   node["ford"="yes"](${box});

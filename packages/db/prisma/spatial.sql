@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS trails_search_vector_gin
 CREATE INDEX IF NOT EXISTS trails_name_trgm
   ON trails USING GIN ("name" gin_trgm_ops);
 
+-- The same, for the derived display name — "Vesper Peak via Headlee Pass Trail". A second index
+-- rather than one over both columns concatenated: `rankedTextIds` ORs two `%` predicates so that
+-- either name alone can match, and a GIN index on an expression cannot serve a predicate over
+-- one of its inputs. Only ~1.6% of rows are non-null, so it is a small index.
+CREATE INDEX IF NOT EXISTS trails_display_name_trgm
+  ON trails USING GIN ("displayName" gin_trgm_ops);
+
 -- ---------------------------------------------------------------------------
 -- Constraints
 -- ---------------------------------------------------------------------------

@@ -350,6 +350,14 @@ describe('query builders', () => {
     expect(buildFeatureQuery([0, 0, 1, 1])).toContain('out center tags;');
   });
 
+  it('fetches the destination features the display name is derived from', () => {
+    const ql = buildFeatureQuery([0, 0, 1, 1]);
+    expect(ql).toContain('peak|hill|saddle');
+    expect(ql).toContain('node["mountain_pass"="yes"]');
+    // Named only: an unnamed icefield can name no hike, and glaciers are large queries.
+    expect(ql).toContain('way["natural"="glacier"]["name"]');
+  });
+
   it('builds an is_in region query in lat,lng order', () => {
     expect(buildRegionQuery([-4.5, 56.8])).toContain('is_in(56.8,-4.5)');
   });

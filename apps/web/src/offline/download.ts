@@ -289,6 +289,7 @@ export async function downloadTrail(
     trailId: trail.id,
     slug: trail.slug,
     name: trail.name,
+    displayName: trail.displayName,
     regionName: trail.regionName,
     lengthM: trail.stats.lengthM,
     gainM: trail.stats.gainM,

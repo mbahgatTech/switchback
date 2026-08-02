@@ -27,6 +27,7 @@ import {
   isBlurhash,
   photoCommitSchema,
   photoContentTypeSchema,
+  trailTitle,
 } from '@switchback/core';
 import type { PhotoContentType, UploadGrant } from '@switchback/core';
 import { PhotoSource } from '@switchback/db';
@@ -549,11 +550,14 @@ export const photosRouter = router({
         where: { userId: ctx.user.id },
         orderBy: [{ hiddenAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
         take: input.limit,
-        select: { ...photoSelect, trail: { select: { name: true, slug: true } } },
+        select: {
+          ...photoSelect,
+          trail: { select: { name: true, displayName: true, slug: true } },
+        },
       });
       return rows.map((row) => ({
         ...toPhoto(row, ctx.user.id),
-        trail: row.trail === null ? null : { name: row.trail.name, slug: row.trail.slug },
+        trail: row.trail === null ? null : { name: trailTitle(row.trail), slug: row.trail.slug },
       }));
     }),
 });

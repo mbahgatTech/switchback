@@ -11,6 +11,7 @@ import {
   formatElevation,
   isSystemList,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
 import { useTRPC } from '@/api/trpc';
@@ -145,12 +146,13 @@ function Row({
   const subtitle = [trail.regionName, ROUTE_TYPE_LABEL[trail.routeType]]
     .filter(Boolean)
     .join(' · ');
+  const title = trailTitle(trail);
 
   return (
     <Pressable
       onPress={() => router.push({ pathname: '/trails/[slug]', params: { slug: trail.slug } })}
       accessibilityRole="button"
-      accessibilityLabel={`${trail.name}, ${formatDistance(trail.stats.lengthM, units)}`}
+      accessibilityLabel={`${title}, ${formatDistance(trail.stats.lengthM, units)}`}
       style={({ pressed }) => [styles.row, pressed ? styles.rowPressed : null]}
     >
       <View style={[styles.stripe, { backgroundColor: plate }]} />
@@ -161,7 +163,7 @@ function Row({
           </Text>
         ) : null}
         <Text style={styles.rowName} numberOfLines={2}>
-          {trail.name}
+          {title}
         </Text>
         <Text style={styles.rowStats} numberOfLines={1}>
           {formatDistance(trail.stats.lengthM, units)}

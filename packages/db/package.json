@@ -17,7 +17,8 @@
     "studio": "dotenv -e ../../.env -- prisma studio",
     "seed": "dotenv -e ../../.env -- tsx scripts/seed.ts",
     "seed:reviews": "dotenv -e ../../.env -- tsx scripts/seed-reviews.ts",
-    "seed:tracks": "dotenv -e ../../.env -- tsx scripts/seed-tracks.ts"
+    "seed:tracks": "dotenv -e ../../.env -- tsx scripts/seed-tracks.ts",
+    "backfill:display-names": "dotenv -e ../../.env -- tsx scripts/backfill-display-names.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.2.1",

@@ -11,6 +11,7 @@ import {
   formatDuration,
   formatElevation,
   terrainCaution,
+  trailTitle,
 } from '@switchback/core';
 import {
   type PaperId,
@@ -380,7 +381,7 @@ export function Sheet({ trail, units }: SheetProps) {
                     textOverflow: 'ellipsis',
                   }}
                 >
-                  {trail.name}
+                  {trailTitle(trail)}
                 </h1>
                 <p
                   style={{
@@ -894,7 +895,7 @@ function ControlBar({
           href={`/trails/${trail.slug}`}
           className="collar rounded-hair transition-colors duration-quick ease-standard hover:text-ink"
         >
-          ← {trail.name}
+          ← {trailTitle(trail)}
         </Link>
 
         <Field label="Paper">

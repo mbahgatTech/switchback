@@ -251,6 +251,11 @@ export function orderFor(sort: TrailSearch['sort']): Prisma.TrailOrderByWithRela
  * Text search: tsvector for meaning, trigram for typos. Neither replaces the other —
  * `websearch_to_tsquery` stems and handles phrases, similarity catches "yosimite", which
  * matches nothing under a tsquery. Ranks are summed so a trail satisfying both wins.
+ *
+ * Both names are searched. The tsvector already carries `displayName` (see
+ * `refreshTrailSearchVector`), so the trigram half has to as well or "Vesper Pk" reaches a
+ * trail that "Vesper Peak" does. `GREATEST` rather than a sum: a trail whose two names both
+ * resemble the query is not twice as relevant as one that matches on the title alone.
  */
 async function rankedTextIds(
   db: Context['db'],
@@ -267,10 +272,13 @@ async function rankedTextIds(
   const rows = await db.$queryRaw<Array<{ id: string }>>`
     SELECT id
       FROM trails
-     WHERE ("searchVector" @@ websearch_to_tsquery('english', ${q}) OR name % ${q})
+     WHERE ("searchVector" @@ websearch_to_tsquery('english', ${q})
+            OR name % ${q}
+            OR "displayName" % ${q})
        ${box}
      ORDER BY COALESCE(ts_rank("searchVector", websearch_to_tsquery('english', ${q})), 0)
-                + similarity(name, ${q}) DESC,
+                + GREATEST(similarity(name, ${q}),
+                           similarity(COALESCE("displayName", ''), ${q})) DESC,
               popularity DESC,
               id ASC
      LIMIT ${TEXT_CANDIDATE_CAP}

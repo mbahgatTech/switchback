@@ -7,6 +7,7 @@ import {
   formatDistance,
   formatDuration,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE } from '@switchback/ui';
 import { BUTTON, HEIGHT, PRIMARY } from '../controls';
@@ -75,7 +76,11 @@ export function SelectedTrail({ trail, onDismiss }: SelectedTrailProps) {
 
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-sm">
-            <h2 className="text-body font-medium leading-tight text-ink">{trail.name}</h2>
+            {/* Shrinks and wraps rather than pushing `Close` off the card — see the same pair
+                on the index card in `trail-card.tsx`. */}
+            <h2 className="min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
+              {trailTitle(trail)}
+            </h2>
             {/*
              * The hit area is the whole touch rung; the word is what you see of it. It used
              * to be an 15 px strip of text — fine with a mouse, a coin-toss with a thumb,

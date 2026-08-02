@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { TRPCError } from '@trpc/server';
 import type { TrailDetail } from '@switchback/core';
+import { trailTitle } from '@switchback/core';
 import { Sheet } from '@/components/print/sheet';
 import { viewerUnits } from '@/lib/units';
 import { caller } from '@/trpc/server';
@@ -28,7 +29,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   if (!trail) return { title: 'Not found' };
 
   return {
-    title: `${trail.name} — sheet`,
+    title: `${trailTitle(trail)} — sheet`,
     // Not a page anyone should land on from a search: it is a printer's view of a page that
     // already ranks, and indexing both splits the trail's own result.
     robots: { index: false, follow: true },

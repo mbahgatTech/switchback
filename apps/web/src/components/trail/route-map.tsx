@@ -70,6 +70,8 @@ const CURSOR_SOURCE = 'route-cursor';
 const WAYPOINT_PLATE: Record<WaypointKind, 'survey' | 'water' | 'contour' | 'woodland' | 'ink'> = {
   trailhead: 'woodland',
   summit: 'contour',
+  pass: 'contour',
+  glacier: 'contour',
   viewpoint: 'contour',
   water: 'water',
   waterfall: 'water',

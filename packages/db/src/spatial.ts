@@ -16,28 +16,43 @@ export interface TrailGeometryInput {
   /** Full-resolution line. The simplified copy is stored separately as `geometryJson`. */
   geometry: LineString;
   centroid: LngLat;
-  /** Trail name — weighted highest in the search vector. */
-  name: string;
-  regionName?: string | null;
-  description?: string | null;
 }
 
 /**
  * Write a trail's geometry, centroid, and search vector — together, in the same transaction as
  * `trail.create()`. A row with geometry but no search vector maps but never appears in search.
- * Search weights: name (A) beats region (B) beats description (C).
  */
 export async function writeTrailGeometry(db: Db, input: TrailGeometryInput): Promise<void> {
   const geojson = JSON.stringify(input.geometry);
   await db.$executeRaw`
     UPDATE trails SET
       "geom"     = ST_SetSRID(ST_GeomFromGeoJSON(${geojson}), 4326),
-      "centroid" = ST_SetSRID(ST_MakePoint(${input.centroid[0]}, ${input.centroid[1]}), 4326),
-      "searchVector" =
-          setweight(to_tsvector('english', ${input.name}), 'A')
-       || setweight(to_tsvector('english', ${input.regionName ?? ''}), 'B')
-       || setweight(to_tsvector('english', ${input.description ?? ''}), 'C')
+      "centroid" = ST_SetSRID(ST_MakePoint(${input.centroid[0]}, ${input.centroid[1]}), 4326)
     WHERE id = ${input.trailId}
+  `;
+  await refreshTrailSearchVector(db, input.trailId);
+}
+
+/**
+ * Rebuild a trail's search vector from the row's own columns — a projection of a row onto
+ * itself, like `writeWaypointPoints`, so the vector cannot disagree with what the columns say.
+ * The caller must have written the row first; inside ingest's transaction it has.
+ *
+ * Weights: the two names (A) beat region (B) beats description (C). `displayName` sits at the
+ * same weight as `name` rather than below it because it is the title the reader is shown —
+ * somebody typing "Vesper Peak" is naming the trail, not describing it. Concatenating the two
+ * rather than choosing between them keeps the OSM name findable: a reader matching a signpost
+ * still reaches the trail whichever of the two is on it.
+ */
+export async function refreshTrailSearchVector(db: Db, trailId: string): Promise<void> {
+  await db.$executeRaw`
+    UPDATE trails SET
+      "searchVector" =
+          setweight(to_tsvector('english', "name"), 'A')
+       || setweight(to_tsvector('english', COALESCE("displayName", '')), 'A')
+       || setweight(to_tsvector('english', COALESCE("regionName", '')), 'B')
+       || setweight(to_tsvector('english', COALESCE("description", '')), 'C')
+    WHERE id = ${trailId}
   `;
 }
 

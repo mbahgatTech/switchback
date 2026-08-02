@@ -10,6 +10,7 @@ import {
   formatDistance,
   formatElevation,
   formatPace,
+  trailTitle,
 } from '@switchback/core';
 import { CONTROL_HEIGHT, nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
@@ -79,6 +80,8 @@ export default function RecordScreen() {
     staleTime: Number.POSITIVE_INFINITY,
   });
   const followed = followingTrail.data ?? followingRoute.data ?? null;
+  // A planned route has only the name its author typed; a trail may have a derived title.
+  const followedName = followed === null ? null : trailTitle(followed);
 
   /**
    * Hand the line to the recorder, and never take it away while it is still loading. The clear
@@ -222,12 +225,12 @@ export default function RecordScreen() {
             router.push({ pathname: '/trails/[slug]', params: { slug: followed.slug } })
           }
           accessibilityRole="link"
-          accessibilityLabel={`Open ${followed.name}`}
+          accessibilityLabel={`Open ${followedName}`}
           style={styles.following}
         >
           <Text style={styles.followingLabel}>Following</Text>
           <Text style={styles.followingName} numberOfLines={1}>
-            {followed.name}
+            {followedName}
           </Text>
         </Pressable>
       ) : null}
@@ -359,7 +362,7 @@ export default function RecordScreen() {
         <LifelinePanel
           activityId={recording.activityId}
           trailId={recording.trailId}
-          trailName={followed?.name ?? null}
+          trailName={followedName}
         />
       ) : null}
 
