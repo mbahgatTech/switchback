@@ -44,6 +44,7 @@ import {
   toStations,
 } from '@switchback/geo';
 import { CONTROL_HEIGHT, DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
+import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { BusyTimes } from '@/components/busy-times';
@@ -328,6 +329,7 @@ export default function TrailScreen() {
 
   const sac = trail.sacScale === null ? null : SAC_LABEL[trail.sacScale];
   const caution = terrainCaution(stats.maxSustainedGrade);
+  const title = trailTitle(trail);
 
   return (
     <Chrome insets={insets}>
@@ -335,7 +337,7 @@ export default function TrailScreen() {
         <Text style={styles.collar} numberOfLines={1}>
           {[trail.regionName, ROUTE_TYPE_LABEL[trail.routeType]].filter(Boolean).join(' · ')}
         </Text>
-        <Text style={styles.name}>{trail.name}</Text>
+        <Text style={styles.name}>{title}</Text>
         <View style={styles.badges}>
           <View style={[styles.plate, { backgroundColor: plate }]}>
             <Text style={styles.plateLabel}>{DIFFICULTY_LABEL[trail.difficulty]}</Text>
@@ -514,7 +516,7 @@ export default function TrailScreen() {
       </Section_>
 
       {/* Photographs before reports: the pictures answer what the figures above cannot. */}
-      <Photos trailId={trail.id} trailName={trail.name} />
+      <Photos trailId={trail.id} trailName={title} />
 
       {/* Reports last: the one block written by someone who was standing on the trail. */}
       <Reviews trailId={trail.id} />

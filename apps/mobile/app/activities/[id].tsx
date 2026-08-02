@@ -41,6 +41,7 @@ import {
 import type { SectionPoint, SectionStation } from '@switchback/geo';
 import { nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
+import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { ExploreMap, type ExploreMapHandle } from '@/components/explore-map';
@@ -180,8 +181,8 @@ export default function ActivityScreen() {
     );
   }
 
-  const name =
-    detail.name ?? defaultActivityName(detail.activityType, detail.startedAt, detail.trail?.name);
+  const trailName = detail.trail ? trailTitle(detail.trail) : null;
+  const name = detail.name ?? defaultActivityName(detail.activityType, detail.startedAt, trailName);
 
   const cells: { label: string; value: string }[] = [
     { label: 'Distance', value: formatDistance(detail.distanceM, units) },
@@ -207,7 +208,7 @@ export default function ActivityScreen() {
             accessibilityRole="button"
             hitSlop={theme.space.sm}
           >
-            <Text style={styles.trailLink}>On {detail.trail.name} →</Text>
+            <Text style={styles.trailLink}>On {trailName} →</Text>
           </Pressable>
         ) : null}
       </View>

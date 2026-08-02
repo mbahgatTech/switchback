@@ -14,6 +14,7 @@ import {
   plural,
 } from '@switchback/core';
 import { nativeTheme } from '@switchback/ui';
+import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 
@@ -180,7 +181,11 @@ export default function ActivitiesScreen() {
 function Row({ activity, units }: { activity: ActivitySummary; units: UnitSystem }) {
   const name =
     activity.name ??
-    defaultActivityName(activity.activityType, activity.startedAt, activity.trail?.name);
+    defaultActivityName(
+      activity.activityType,
+      activity.startedAt,
+      activity.trail ? trailTitle(activity.trail) : null,
+    );
   const collar = `${dayLabel(activity.startedAt)} · ${ACTIVITY_TYPE_LABELS[activity.activityType]}`;
 
   return (
