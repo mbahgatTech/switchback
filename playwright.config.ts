@@ -9,6 +9,9 @@ import { defineConfig, devices } from '@playwright/test';
 
 const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:3000';
 
+/** Where `e2e/weather-stub.ts` listens. Overridable so two suites can run side by side. */
+const WEATHER_STUB_PORT = process.env.WEATHER_STUB_PORT ?? '4599';
+
 export default defineConfig({
   testDir: './e2e',
 
@@ -73,12 +76,32 @@ export default defineConfig({
 
   // Reuse whatever is already on :3000. This also lets the file run unchanged against a
   // deployment: set `E2E_BASE_URL` and no server is started at all.
-  webServer: {
-    command: 'npm run dev',
-    url: baseURL,
-    reuseExistingServer: !process.env.CI,
-    timeout: 240_000,
-    stdout: 'ignore',
-    stderr: 'pipe',
-  },
+  //
+  // The stub goes first because the app reads its URL at request time and Playwright starts these
+  // in order. It exists because the forecast is fetched by the *server*, not the browser, so
+  // `page.route` cannot reach it — see `e2e/weather-stub.ts`. Note `reuseExistingServer` means a
+  // dev server already running locally keeps its own upstream; the pinning that matters is in CI,
+  // where the server is started fresh and the flake lived.
+  webServer: [
+    {
+      command: 'npx tsx e2e/weather-stub.ts',
+      url: `http://127.0.0.1:${WEATHER_STUB_PORT}/health`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+      stdout: 'ignore',
+      stderr: 'pipe',
+    },
+    {
+      command: 'npm run dev',
+      url: baseURL,
+      reuseExistingServer: !process.env.CI,
+      timeout: 240_000,
+      stdout: 'ignore',
+      stderr: 'pipe',
+      env: {
+        OPEN_METEO_URL: `http://127.0.0.1:${WEATHER_STUB_PORT}/forecast`,
+        OPEN_METEO_AIR_QUALITY_URL: `http://127.0.0.1:${WEATHER_STUB_PORT}/air-quality`,
+      },
+    },
+  ],
 });

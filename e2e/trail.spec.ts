@@ -39,8 +39,24 @@ test.describe('Trail detail', () => {
     const strip = page.getByRole('region', { name: 'Forecast at each point along the route' });
     await expect(strip).toBeVisible({ timeout: 60_000 });
 
-    // A temperature at a sampled point, in the units the renderer converts to at the edge.
-    await expect(strip.getByText(/-?\d+\s*°C/).first()).toBeVisible();
+    /*
+     * The upstream is `e2e/weather-stub.ts`, pinned by `playwright.config.ts`. Before that this
+     * asserted only that some digits and a degree sign appeared, and went red in CI when the
+     * runner could not reach api.open-meteo.com — reporting a third party's downtime as a defect
+     * in this repository. A fixed forecast lets it assert the reading instead of its shape.
+     *
+     * The stub cools with altitude, so a summit sample differs from the trailhead. That is the
+     * property worth guarding: the strip is time- and place-shifted, not one reading repeated at
+     * eight points.
+     */
+    const readings = await strip.getByText(/-?\d+\s*°/).allInnerTexts();
+    expect(readings.length).toBeGreaterThanOrEqual(2);
+
+    const degrees = readings.map((t) => Number(/(-?\d+)/.exec(t)?.[1] ?? NaN));
+    expect(degrees.every((n) => Number.isFinite(n))).toBe(true);
+    // Trailhead is the warmest sample: every other point on this trail is higher.
+    expect(Math.max(...degrees)).toBeLessThanOrEqual(11);
+    expect(new Set(degrees).size).toBeGreaterThan(1);
 
     // The departure control is what makes the strip time-shifted rather than a trailhead
     // reading repeated eight times.
