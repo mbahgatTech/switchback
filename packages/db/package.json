@@ -18,15 +18,18 @@
     "seed": "dotenv -e ../../.env -- tsx scripts/seed.ts",
     "seed:reviews": "dotenv -e ../../.env -- tsx scripts/seed-reviews.ts",
     "seed:tracks": "dotenv -e ../../.env -- tsx scripts/seed-tracks.ts",
-    "backfill:display-names": "dotenv -e ../../.env -- tsx scripts/backfill-display-names.ts"
+    "backfill:display-names": "dotenv -e ../../.env -- tsx scripts/backfill-display-names.ts",
+    "backfill:peak-elevations": "dotenv -e ../../.env -- tsx scripts/backfill-peak-elevations.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.2.1",
     "@switchback/core": "*"
   },
   "//devDependencies": "@switchback/geo is used only by scripts/seed.ts, for quadkey maths. The runtime db package does not depend on geo and must not — geo already imports core, and db importing geo at runtime is the first half of a cycle.",
+  "//devDependencies-ingest": "@switchback/ingest is used only by scripts/backfill-peak-elevations.ts, for the Overpass client and parseEleM — reusing the queue, backoff, mirror failover and breaker the public instances require, rather than hand-rolling a second client that obeys none of them. It does close a loop, since ingest depends on db, but only through a script: nothing under packages/db/src imports it, npm links both as workspaces, and the alternative is a copy of the etiquette that drifts.",
   "devDependencies": {
     "@switchback/geo": "*",
+    "@switchback/ingest": "*",
     "dotenv-cli": "^8.0.0",
     "prisma": "^6.2.1"
   }
