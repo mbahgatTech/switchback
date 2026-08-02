@@ -52,6 +52,9 @@ apps/mobile/android/
 # and `*` matching the empty string leaves nothing to supply it.
 infra/azure/*.bicepparam
 !infra/azure/main.bicepparam
+# Non-secret like main.bicepparam: the Postgres connection string and the Mapillary token are
+# `@secure()` in ingest.bicep and read from the environment, never written here.
+!infra/azure/ingest.bicepparam
 infra/azure/*.parameters.json
 infra/azure/*.params.json
 infra/azure/parameters.json
