@@ -28,11 +28,23 @@ export const VESPER = {
 export const REPORT_TRAIL = { slug: 'greider-lakes-trail' } as const;
 
 /**
- * A trail long enough that the section's annotations fight for room: 3,404 km with its high
- * point 7% along, which is where the two weather callouts overprinted. A day hike puts its
- * summit halfway and proves nothing about this.
+ * The two trails below are on no single tile, and CI makes one Overpass query — so both are
+ * seeded offline instead, under reserved `fixture-` slugs that nothing ingested can collide with:
+ *
+ *     npx tsx --env-file-if-exists=.env packages/db/scripts/seed-e2e.ts
+ *
+ * Without that, both pages 404 and the two specs fail on the first thing they look for.
  */
-export const LONG_TRAIL = { slug: 'appalachian-trail-dauphin-county' } as const;
+
+/** Twelve photographs, every one a row with no file behind it. The gallery spec's whole subject. */
+export const PHOTOGRAPHED = { slug: 'fixture-photographed-trail' } as const;
+
+/**
+ * A long through-hike with its high point 7% along, which is where the two weather callouts
+ * overprinted — the fraction is what crowds them, since the collar is laid out in viewBox units.
+ * A day hike puts its summit halfway and proves nothing about this.
+ */
+export const LONG_TRAIL = { slug: 'fixture-early-high-point' } as const;
 
 export const SHEET_AT_VESPER = `/?${VESPER.view}`;
 
