@@ -175,6 +175,31 @@ use, and `hydrate.ts` seeds them into the React Query cache under the same keys 
 data. The basemap is not included and the control says so: under Expo Go nothing can sit between the
 map's WebView and its tile requests.
 
+## The activity heatmap
+
+Every public recording, aggregated onto a fixed lattice. Every control lives in the SQL rather than
+the renderer, because k-anonymity applied client-side is k-anonymity an attacker declines by reading
+the response. No row leaves with fewer than `HEATMAP_MIN_HIKERS` contributors, and no coordinate
+leaves at all — only lattice indices.
+
+```mermaid
+flowchart LR
+  A["tracks<br/>public, synced, overlapping the viewport"] --> B["trim<br/>ST_LineSubstring, 250 m off each end"]
+  B --> C["clip<br/>to the viewport"]
+  C --> D["densify<br/>ST_Segmentize, never finer than a cell"]
+  D --> E["group<br/>count DISTINCT people per cell"]
+  E --> F["keep<br/>3 hikers or more, busiest first"]
+```
+
+**Trimming runs before clipping, and the order is load-bearing.** `ST_LineSubstring` takes fractions
+of a line, so trimming the visible part rather than the whole track would move the censored zone as
+the reader pans, and uncensor a front door the moment it sits mid-screen. Clipping second is also
+what bounds the work, making cost track screen area rather than track length.
+
+`packages/core/src/heatmap.ts` carries the numbered list of controls beside the constants they
+justify, and records what was turned down: differential privacy, because noise sufficient to defeat
+snapshot-differencing invents traffic on ground nobody has hiked.
+
 ## Auth
 
 Auth.js with the Prisma adapter and a **database** session strategy: a session row can be deleted, so
@@ -248,3 +273,31 @@ somebody else's account.
 - **Viewport queries use indexed bbox columns, not `ST_Intersects`.** A plain Prisma `where` composes
   with facets and paginates properly; PostGIS would mean a capped candidate id list intersected with
   facets afterwards, silently dropping matches when the cap bites. False positives are the better bug.
+- **The route planner's profile constants must stay equal to ingest's.** `PROFILE_SPACING_M` and
+  `RENDER_SIMPLIFY_M` in `routers/routes.ts` are copies of module-private values in
+  `ingest/pipeline.ts`. Gain is measured under a 10 m hysteresis threshold (`GAIN_THRESHOLD_M`), so a
+  profile sampled at 25 m and one at 60 m differ in _answer_, not resolution — let the two drift and
+  a planned route reports different numbers from an ingested trail of the same shape.
+- **Mobile state lives at module scope, not in a hook.** The tab bar destroys screen-owned state, so
+  a recorder or a ping loop owned by the Record screen stops the first time somebody switches tabs —
+  silently, on a safety feature whose own panel would go on claiming it was running. `record/store.ts`
+  and `record/lifeline.ts` argue it from that; `offline/store.ts` from three screens needing one
+  index. React subscribes through `useSyncExternalStore`.
+- **Page sizes live in `apps/mobile/src/api/pages.ts`.** A page size is part of a React Query key and
+  the offline layer seeds those keys from disk, so a seeded key off by one number seeds nothing and
+  the screen shows its empty state on a phone holding the whole trail.
+- **The design has no z-axis.** Depth is plate colour and hairline rules, never a drop shadow. No
+  type can express that, so it is held by `apps/web/test/conventions.test.ts` and
+  `apps/mobile/test/conventions.test.ts` reading source for shadow utilities and React Native's
+  shadow props — which makes it, today, discoverable only by breaking it.
+- **Survey red means the reader or their safety, and nothing else.** [design.md](design.md) owns the
+  palette; what belongs here is where the colour stops. It is right on the position dot, an off-route
+  banner, an overdue Lifeline, and a confirmation throwing away the reader's own hike. It is wrong on
+  the record button, and wrong on a moderator's takedown in somebody else's row, where red reads as
+  an accusation against them.
+- **`admitIngest`'s ceiling is deliberately soft.** tRPC starts every call in a batch concurrently
+  and the depth check is a bare `groupBy` under no transaction and no advisory lock, so one request
+  can overshoot by `MAX_BATCH_SIZE` × `MAX_TILES_PER_REQUEST`. The obvious fix — an advisory lock
+  around the count and the enqueue loop — becomes a global mutex held across up to 96 tile upserts
+  and 96 job enqueues on the deliberate-area path, on a serverless deploy, past Prisma's interactive
+  transaction budget. A rate limiter in front is the prerequisite, and does not exist yet.
