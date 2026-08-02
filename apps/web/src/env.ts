@@ -51,6 +51,17 @@ const base = z.object({
   CRON_SECRET: z.string().min(16).optional(),
 
   /**
+   * Which queue drives ingest. `postgres` drains inline and on the cron; `servicebus` publishes
+   * a wake-up signal per queued tile and leaves the drain to the Function App. Read at the point
+   * of use by `@switchback/ingest`'s `ingestQueueDriver`, which treats anything unrecognised as
+   * `postgres` — the enum here is what turns a typo into a startup error instead.
+   */
+  INGEST_QUEUE_DRIVER: z.enum(['postgres', 'servicebus']).default('postgres'),
+  /** A queue-scoped, Send-only rule. Required once the driver is `servicebus` — see below. */
+  SERVICE_BUS_SEND_CONNECTION_STRING: z.string().min(1).optional(),
+  SERVICE_BUS_QUEUE: z.string().min(1).default('ingest-jobs'),
+
+  /**
    * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
    * so uploads work with no Cloudflare account. Filling in *some* of them is refused below.
    */
@@ -102,6 +113,20 @@ const schema = base.superRefine((env, ctx) => {
         });
       }
     }
+  }
+
+  /*
+   * The flag on its own publishes nowhere: `publishIngestSignals` would log and give up, every
+   * tile falling to the once-a-day cron with nothing on the map saying so. Naming the variable
+   * at startup is the difference between a misconfiguration and a slow leak.
+   */
+  if (env.INGEST_QUEUE_DRIVER === 'servicebus' && !env.SERVICE_BUS_SEND_CONNECTION_STRING) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['SERVICE_BUS_SEND_CONNECTION_STRING'],
+      message:
+        'SERVICE_BUS_SEND_CONNECTION_STRING is required when INGEST_QUEUE_DRIVER=servicebus — without it every queued tile is published nowhere.',
+    });
   }
 
   if (!env.AUTH_APPLE_ENABLED) return;

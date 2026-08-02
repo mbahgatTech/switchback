@@ -14,6 +14,7 @@ export * from './backpressure';
 export * from './pool';
 export * from './coverage';
 export * from './pipeline';
+export * from './publish';
 export * from './network';
 export * from './config';
 export * from './handlers';

@@ -28,6 +28,8 @@ import { encodeBase64, toFitCourse, toRouteGpx } from '@switchback/geo';
 import {
   drainIngest,
   ensureCoverage,
+  ingestQueueDriver,
+  publishIngestSignals,
   requestArea,
   surveyArea,
   tileJobKey,
@@ -402,9 +404,23 @@ const inlineDrain = createInlineDrain((keys) =>
  * `drainIngest` reserves a derived share on top; a tile-key list cannot reach an
  * `enrich_trail` row, so the fan-out these tiles produce had no drainer in the request path
  * at all. See `drainJobs` and `DERIVED_QUEUE_WARN_DEPTH`.
+ *
+ * Under `INGEST_QUEUE_DRIVER=servicebus` the kick is a published signal instead and this
+ * process makes no Overpass call at all — which is what lets the worker's clamp be the only
+ * ceiling that matters. The tiles are already on `ingest_jobs` either way: `ensureCoverage`
+ * wrote them before this ran, so a broker that refuses the signal costs the wake-up and
+ * nothing else.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil) return;
+  if (!ctx.waitUntil || queued.length === 0) return;
+
+  if (ingestQueueDriver() === 'servicebus') {
+    // Not gated on `inlineDrain`: that scheduler bounds this process's Overpass concurrency, and
+    // publishing has none to bound.
+    ctx.waitUntil(publishIngestSignals(queued.map(tileJobKey)));
+    return;
+  }
+
   const work = inlineDrain.request(queued.map(tileJobKey));
   if (work) ctx.waitUntil(work);
 }
