@@ -32,6 +32,7 @@ import {
   nextDateOn,
   splitLocalIso,
   terrainCaution,
+  trailTitle,
 } from '@switchback/core';
 import {
   cumulativeTimeS,
@@ -44,7 +45,6 @@ import {
   toStations,
 } from '@switchback/geo';
 import { CONTROL_HEIGHT, DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { BusyTimes } from '@/components/busy-times';

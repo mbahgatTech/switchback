@@ -11,9 +11,9 @@ import {
   formatElevation,
   formatTimeOnFoot,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { nativeTheme } from '@switchback/ui';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { Cadence } from '@/components/cadence';

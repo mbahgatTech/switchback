@@ -11,9 +11,9 @@ import {
   formatElevation,
   isSystemList,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { TallyRule } from '@/components/tally';
 

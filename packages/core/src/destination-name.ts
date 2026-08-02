@@ -86,13 +86,28 @@ export interface DisplayName {
 }
 
 /**
- * What a reader is shown: the derived name where there is one, the OSM name otherwise. Null is
- * the common answer from `deriveDisplayName`, so every title in both clients goes through here
- * rather than repeating a `??` that is easy to forget. `displayName` is optional so a record
- * stored before the column existed — an offline download — still resolves to its OSM name.
+ * The two fields titling needs. `displayName` is optional rather than `string | null` because a
+ * record stored before the column existed — an offline download on a phone — has no such key.
  */
-export function trailTitle(trail: { name: string; displayName?: string | null }): string {
-  return trail.displayName?.trim() || trail.name;
+export interface TitledTrail {
+  name: string;
+  displayName?: string | null;
+}
+
+/** The derived title where there is a usable one. Absent, null and blank all count as none. */
+export function displayNameOf(trail: TitledTrail): string | null {
+  const derived = trail.displayName?.trim();
+  return derived ? derived : null;
+}
+
+/**
+ * What a reader is shown: the derived name where there is one, the OSM name otherwise. Null is
+ * the common answer from `deriveDisplayName`, so every title in web and iOS alike goes through
+ * here rather than repeating a `??` that is easy to forget — or drifting apart, which is what
+ * two hand-written fallbacks did before this was one function.
+ */
+export function trailTitle(trail: TitledTrail): string {
+  return displayNameOf(trail) ?? trail.name;
 }
 
 /**

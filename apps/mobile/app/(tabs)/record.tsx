@@ -10,10 +10,10 @@ import {
   formatDistance,
   formatElevation,
   formatPace,
+  trailTitle,
 } from '@switchback/core';
 import { CONTROL_HEIGHT, nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { LifelinePanel } from '@/components/lifeline-panel';

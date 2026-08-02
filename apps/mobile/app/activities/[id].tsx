@@ -31,6 +31,7 @@ import {
   formatPace,
   paceFromSpeed,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import {
   cumulativeDistancesM,
@@ -41,7 +42,6 @@ import {
 import type { SectionPoint, SectionStation } from '@switchback/geo';
 import { nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { ExploreMap, type ExploreMapHandle } from '@/components/explore-map';

@@ -1,7 +1,7 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import { File } from 'expo-file-system';
+import { displayNameOf } from '@switchback/core';
 import { GALLERY_LIMIT, REVIEW_PAGE_SIZE } from '@/api/pages';
-import { displayNameOf } from '@/api/trail-title';
 import type { useTRPCClient } from '@/api/trpc';
 import {
   type OfflinePhotos,

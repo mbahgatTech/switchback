@@ -38,9 +38,9 @@ import {
   formatDistance,
   formatDuration,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 import { CONTROL_HEIGHT, DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
-import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { Chip, ChipRail } from '@/components/chip';
