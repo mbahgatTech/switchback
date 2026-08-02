@@ -6,10 +6,11 @@
 import type { RouteType, WaypointKind } from './types';
 
 /**
- * How far below the trail's own high point a summit may sit and still *be* that high point.
- * Waypoint elevations are read off the 25 m elevation profile at the summit's own position, so
- * a peak on the line lands within a sample or two of `maxEleM` — the median named summit is 7 m
- * below it. A peak the trail merely passes beneath is hundreds of metres down.
+ * How far above the trail's own high point a summit may stand and still be one the trail
+ * reaches. Read against the peak's own `ele` tag: a DEM sampled at 25 m under-reads a sharp
+ * top by a few metres, so exactness would refuse trails that plainly do summit. Where the tag
+ * is missing it falls back to the weaker on-trail test in `topsOutHere`, which asks a
+ * different question and cannot answer this one.
  */
 export const SUMMIT_TOP_TOLERANCE_M = 30;
 
@@ -20,6 +21,14 @@ export const SUMMIT_TOP_TOLERANCE_M = 30;
  * a top — Little Si is 377 m — and 20 m is a knoll beside a flat path.
  */
 export const MIN_SUMMIT_CLIMB_M = 150;
+
+/**
+ * How far the ground must rise from the trail's low point to its high point. `gainM` alone
+ * cannot carry the claim: for a mirrored out-and-back it is the round trip, `gain_out +
+ * loss_out`, so an undulating path banks 531 m of "gain" over 128 m of relief without ever
+ * climbing to anything. Relief is the one number that says the trail ends up somewhere high.
+ */
+export const MIN_SUMMIT_RELIEF_M = 150;
 
 /**
  * The longest walk out we will call the point of the hike. Past this the feature is something a
@@ -61,7 +70,10 @@ export interface DestinationCandidate {
   name: string | null;
   /** Distance along the stored line. Null for a feature near the trail but not on it. */
   distM: number | null;
+  /** The trail's elevation where it passes this feature — bounded above by `maxEleM`. */
   eleM: number | null;
+  /** The feature's own OSM `ele`, in metres. The peak's height. Null when untagged. */
+  osmEleM?: number | null;
 }
 
 export interface DisplayNameInput {
@@ -70,7 +82,13 @@ export interface DisplayNameInput {
   routeType: RouteType;
   /** Published length: the round trip for an out-and-back. */
   lengthM: number;
+  /**
+   * Along-line length of the stored geometry — the distances `waypoints[].distM` are measured
+   * in. Not `lengthM`: 763 trails store a line more than 2% longer than their published figure.
+   */
+  lineLengthM: number;
   gainM: number;
+  minEleM: number;
   maxEleM: number;
   waypoints: readonly DestinationCandidate[];
 }
@@ -131,32 +149,120 @@ export function describeDisplayName(input: DisplayNameInput): DisplayName | null
 }
 
 /**
- * Where the walk out ends, in the stored line's own distances. An out-and-back publishes the
- * round trip whether ingest mirrored one drawn leg or the mapper drew both, and either way the
- * far point sits at half the published length — measured at 0.499 across the corpus.
+ * Why nothing was published, most specific first. Ordered so that "the summit clause got
+ * furthest" beats "the destination clause never started", which is what a coverage report
+ * wants to know: `nothing_named_nearby` means there was nothing to work with, and every other
+ * value means there was and a named test rejected it.
  */
-export function turnaroundM(routeType: RouteType, lengthM: number): number {
-  return routeType === 'out_and_back' ? lengthM / 2 : lengthM;
+export type DisplayNameRefusal =
+  | 'named'
+  | 'nothing_named_nearby'
+  | 'gain_below_floor'
+  | 'relief_below_floor'
+  | 'peak_above_trail'
+  | 'not_the_trails_high_point'
+  | 'several_summits'
+  | 'summit_not_at_far_end'
+  | 'not_out_and_back'
+  | 'no_destination_at_far_end'
+  | 'several_destinations'
+  | 'unusable_name';
+
+/**
+ * The first test that refused, for a backfill's report. Walks the same clauses in the same
+ * order through the same predicates as `describeDisplayName`, so the reason it prints is the
+ * reason the name was withheld and not a second opinion that can drift from it.
+ */
+export function refuseDisplayName(input: DisplayNameInput): DisplayNameRefusal {
+  if (describeDisplayName(input)) return 'named';
+
+  const summits = input.waypoints.filter((w) => w.kind === 'summit' && isNamed(w));
+  if (summits.length > 0 && Number.isFinite(input.maxEleM)) {
+    return refuseSummit(summits, input);
+  }
+
+  const destinations = input.waypoints.filter((w) => DESTINATION_KINDS.includes(w.kind));
+  if (!destinations.some(isNamed)) return 'nothing_named_nearby';
+  if (input.routeType !== 'out_and_back') return 'not_out_and_back';
+
+  const candidates = destinations.filter((w) => isNamed(w) && atFarEnd(w, input));
+  if (candidates.length === 0) return 'no_destination_at_far_end';
+  const best = DESTINATION_KINDS.find((kind) => candidates.some((w) => w.kind === kind));
+  return candidates.filter((w) => w.kind === best).length > 1
+    ? 'several_destinations'
+    : 'unusable_name';
+}
+
+function refuseSummit(
+  summits: readonly DestinationCandidate[],
+  input: DisplayNameInput,
+): DisplayNameRefusal {
+  if (!(input.gainM >= MIN_SUMMIT_CLIMB_M)) return 'gain_below_floor';
+  if (!(input.maxEleM - input.minEleM >= MIN_SUMMIT_RELIEF_M)) return 'relief_below_floor';
+  if (!summits.some((w) => reachesTheTop(w, input))) return 'peak_above_trail';
+
+  const atTop = summits.filter((w) => reachesTheTop(w, input) && topsOutHere(w, input));
+  if (atTop.length === 0) return 'not_the_trails_high_point';
+  if (atTop.length > 1) return 'several_summits';
+  if (!atFarEnd(atTop[0]!, input)) return 'summit_not_at_far_end';
+  // Past every positional test, so the summit was found and `compose` is what threw it away.
+  return 'unusable_name';
 }
 
 /**
- * The named summit at the trail's high point, if exactly one is. More than one is a ridge — the
+ * Where the walk out ends, in the stored line's own distances — the domain `distM` is measured
+ * in. For an out-and-back that is either the whole line (ingest drew one leg and mirrored it,
+ * publishing double) or half of it (the mapper drew both legs). Which one is recoverable from
+ * the two lengths, and `hikedProfile` in @switchback/geo splits the same hair the same way.
+ */
+export function turnaroundM(routeType: RouteType, lengthM: number, lineLengthM: number): number {
+  if (routeType !== 'out_and_back') return lineLengthM;
+  // Without a published length there is no telling the two apart, and guessing picks between
+  // a walk and half of one. NaN propagates into `atFarEnd`, which refuses on it.
+  if (!Number.isFinite(lengthM)) return Number.NaN;
+  const mirrored = Math.abs(2 * lineLengthM - lengthM) < Math.abs(lineLengthM - lengthM);
+  return mirrored ? lineLengthM : lineLengthM / 2;
+}
+
+/**
+ * The named summit the trail climbs to, if exactly one is. More than one is a ridge — the
  * French Creek Trail passes Boulder Peak, French Creek Ridge and Byars Peak within 14 m of each
  * other — and nothing in the data says which of them the walk is for, so we say nothing.
  */
 function summitAtHighPoint(input: DisplayNameInput): string | null {
   if (!Number.isFinite(input.maxEleM) || !(input.gainM >= MIN_SUMMIT_CLIMB_M)) return null;
+  if (!(input.maxEleM - input.minEleM >= MIN_SUMMIT_RELIEF_M)) return null;
 
   const atTop = input.waypoints.filter(
-    (w) =>
-      w.kind === 'summit' &&
-      isNamed(w) &&
-      w.eleM !== null &&
-      Math.abs(input.maxEleM - w.eleM) <= SUMMIT_TOP_TOLERANCE_M,
+    (w) => w.kind === 'summit' && isNamed(w) && reachesTheTop(w, input) && topsOutHere(w, input),
   );
   if (atTop.length !== 1) return null;
 
   return atFarEnd(atTop[0]!, input) ? atTop[0]!.name : null;
+}
+
+/**
+ * Is the peak itself within reach of the trail's high point? The one test that compares the
+ * two mountains rather than the trail against itself: 20% of summit titles measured named a
+ * peak standing more than this far above anything their trail reaches. Untagged peaks — four
+ * in every two hundred — answer true and are left to `topsOutHere` alone, which is where this
+ * clause stood before and no worse than it was.
+ */
+function reachesTheTop(waypoint: DestinationCandidate, input: DisplayNameInput): boolean {
+  const peakEle = waypoint.osmEleM;
+  if (peakEle === null || peakEle === undefined || !Number.isFinite(peakEle)) return true;
+  return peakEle - input.maxEleM <= SUMMIT_TOP_TOLERANCE_M;
+}
+
+/**
+ * Does the trail top out where it passes this feature? `eleM` is the profile sample nearest the
+ * waypoint's along-track distance — the trail's own elevation, never the peak's — so this
+ * places the summit at the top of the *walk* and says nothing about the top of the mountain.
+ */
+function topsOutHere(waypoint: DestinationCandidate, input: DisplayNameInput): boolean {
+  return (
+    waypoint.eleM !== null && Math.abs(input.maxEleM - waypoint.eleM) <= SUMMIT_TOP_TOLERANCE_M
+  );
 }
 
 /**
@@ -179,15 +285,17 @@ function destinationAtFarEnd(input: DisplayNameInput): string | null {
 }
 
 /**
- * Is this feature at the end of the walk rather than beside it? A loop has no far end — its high
- * point is wherever the circuit tops out — so only the there-and-back shapes are position-tested,
- * and the length cap does the rest of the work for all three.
+ * Is this feature at the end of the walk rather than beside it? Loops are exempt, and not as a
+ * concession: a circuit's start is wherever the mapper began drawing, so a position along it
+ * carries no information about the hike — 22% round one loop and 90% round another say the same
+ * nothing. What holds a loop together is the summit clause's own evidence, which does not
+ * depend on position, plus the length cap below, which applies to all three shapes.
  */
 function atFarEnd(waypoint: DestinationCandidate, input: DisplayNameInput): boolean {
   const { distM } = waypoint;
   if (distM === null || !Number.isFinite(distM)) return false;
 
-  const end = turnaroundM(input.routeType, input.lengthM);
+  const end = turnaroundM(input.routeType, input.lengthM, input.lineLengthM);
   if (!Number.isFinite(end) || end <= 0 || end > MAX_APPROACH_M) return false;
 
   return input.routeType === 'loop' || distM >= FAR_END_FRACTION * end;

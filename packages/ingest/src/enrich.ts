@@ -25,47 +25,94 @@ export interface EnrichedWaypoint {
   distM: number | null;
   /** How far off the line the feature sits. Kept so the UI can say "200 m off-trail". */
   offsetM: number;
+  /** The feature's own `ele` tag in metres — the peak's height, not the trail's beneath it. */
+  osmEleM: number | null;
   osmType: 'node' | 'way';
   osmId: number;
   tags: Record<string, string>;
+}
+
+interface WaypointRule {
+  kind: WaypointKind;
+  match: (t: Record<string, string>) => boolean;
+  /**
+   * Whether a match at a line's endpoint is evidence about the *shape* of the hike. False for
+   * kinds that only name one: `hasImpliedReturnLeg` doubles a trail's published distance and
+   * ascent off this, so a rule joins the terminus vocabulary only on evidence it classifies well.
+   */
+  terminus?: false;
 }
 
 /**
  * OSM tag to our waypoint vocabulary. Ordered, first match wins: tags overlap, and a node
  * tagged `natural=spring` + `amenity=drinking_water` is better labelled "water" to a hiker.
  */
-const WAYPOINT_RULES: Array<{ kind: WaypointKind; match: (t: Record<string, string>) => boolean }> =
-  [
-    { kind: 'summit', match: (t) => t.natural === 'peak' },
-    { kind: 'viewpoint', match: (t) => t.tourism === 'viewpoint' },
-    { kind: 'waterfall', match: (t) => t.waterway === 'waterfall' },
-    { kind: 'lake', match: (t) => t.natural === 'water' && t.water !== 'river' },
-    { kind: 'water', match: (t) => t.natural === 'spring' || t.amenity === 'drinking_water' },
-    { kind: 'parking', match: (t) => t.amenity === 'parking' },
-    { kind: 'toilets', match: (t) => t.amenity === 'toilets' },
-    {
-      kind: 'shelter',
-      match: (t) =>
-        t.amenity === 'shelter' || t.tourism === 'alpine_hut' || t.tourism === 'wilderness_hut',
-    },
-    { kind: 'campsite', match: (t) => t.tourism === 'camp_site' },
-    { kind: 'ford', match: (t) => t.ford === 'yes' },
-    { kind: 'gate', match: (t) => t.barrier === 'gate' || t.barrier === 'stile' },
-    { kind: 'junction', match: (t) => t.information === 'guidepost' },
-    { kind: 'hazard', match: (t) => t.natural === 'cave_entrance' },
-    // Appended, not inserted: a rule above a narrower one steals from it, and `natural=saddle`
-    // carrying `tourism=viewpoint` is a viewpoint today and stays one. A named hill is a summit
-    // to a hiker and to `TERMINAL_DESTINATIONS`, which is the point of collecting it.
-    { kind: 'summit', match: (t) => t.natural === 'hill' },
-    { kind: 'pass', match: (t) => t.natural === 'saddle' || t.mountain_pass === 'yes' },
-    { kind: 'glacier', match: (t) => t.natural === 'glacier' },
-  ];
+const WAYPOINT_RULES: WaypointRule[] = [
+  { kind: 'summit', match: (t) => t.natural === 'peak' },
+  { kind: 'viewpoint', match: (t) => t.tourism === 'viewpoint' },
+  { kind: 'waterfall', match: (t) => t.waterway === 'waterfall' },
+  { kind: 'lake', match: (t) => t.natural === 'water' && t.water !== 'river' },
+  { kind: 'water', match: (t) => t.natural === 'spring' || t.amenity === 'drinking_water' },
+  { kind: 'parking', match: (t) => t.amenity === 'parking' },
+  { kind: 'toilets', match: (t) => t.amenity === 'toilets' },
+  {
+    kind: 'shelter',
+    match: (t) =>
+      t.amenity === 'shelter' || t.tourism === 'alpine_hut' || t.tourism === 'wilderness_hut',
+  },
+  { kind: 'campsite', match: (t) => t.tourism === 'camp_site' },
+  { kind: 'ford', match: (t) => t.ford === 'yes' },
+  { kind: 'gate', match: (t) => t.barrier === 'gate' || t.barrier === 'stile' },
+  { kind: 'junction', match: (t) => t.information === 'guidepost' },
+  { kind: 'hazard', match: (t) => t.natural === 'cave_entrance' },
+  // Appended, not inserted: a rule above a narrower one steals from it, and `natural=saddle`
+  // carrying `tourism=viewpoint` is a viewpoint today and stays one. All three are naming-only
+  // — a hill classifies as `summit`, which `TERMINAL_DESTINATIONS` holds, and the route-type
+  // classifier has never seen a hill node to be tuned against one.
+  { kind: 'summit', match: (t) => t.natural === 'hill', terminus: false },
+  {
+    kind: 'pass',
+    match: (t) => t.natural === 'saddle' || t.mountain_pass === 'yes',
+    terminus: false,
+  },
+  { kind: 'glacier', match: (t) => t.natural === 'glacier', terminus: false },
+];
 
+/** The kind a feature is shown and named as. Every rule participates. */
 export function classifyWaypoint(tags: Record<string, string>): WaypointKind | null {
+  return matchRule(tags)?.kind ?? null;
+}
+
+/**
+ * The kind a feature counts as *at an endpoint*, for the route-type classifier — null where
+ * `classifyWaypoint` would answer but the rule is naming-only. A separate vocabulary because
+ * the two questions have different costs: mislabelling a pin loses a hiker a label, and
+ * mislabelling a terminus publishes a 5 km hike as 10 km.
+ */
+export function classifyTerminus(tags: Record<string, string>): WaypointKind | null {
+  const rule = matchRule(tags);
+  return rule && rule.terminus !== false ? rule.kind : null;
+}
+
+function matchRule(tags: Record<string, string>): WaypointRule | null {
   for (const rule of WAYPOINT_RULES) {
-    if (rule.match(tags)) return rule.kind;
+    if (rule.match(tags)) return rule;
   }
   return null;
+}
+
+/**
+ * Metres from OSM's `ele`. Bare numbers only: the tag is defined as metres, and the handful
+ * that carry `ft`, a range or prose are rejected rather than guessed at, since the summit
+ * clause that reads this refuses when it is null and publishes a title when it is not.
+ */
+export function parseEleM(value: string | undefined): number | null {
+  if (!value) return null;
+  const match = /^(-?\d+(?:\.\d+)?)\s*(?:m|metres|meters)?$/i.exec(value.trim());
+  if (!match) return null;
+  const metres = Number(match[1]);
+  // The Dead Sea shore to a little above Everest. Outside that it is feet, a typo, or a fill value.
+  return Number.isFinite(metres) && metres >= -500 && metres <= 9000 ? metres : null;
 }
 
 /** `out center` gives ways a synthetic centre point; nodes have their own position. */
@@ -117,6 +164,7 @@ export function attachWaypoints(
       lat: position[1],
       distM: nearest.distM <= bufferM ? nearest.alongM : null,
       offsetM: Math.round(nearest.distM),
+      osmEleM: parseEleM(tags.ele),
       osmType: element.type,
       osmId: element.id,
       tags,
@@ -134,6 +182,8 @@ export function attachWaypoints(
  * *along* the trail, which puts a summit 40 m past the last vertex at the line's full length.
  * `terminusKinds` measures straight-line distance from the endpoint, which is the question.
  *
+ * Reads `classifyTerminus`, not `classifyWaypoint`: naming-only kinds are excluded here.
+ *
  * Runs on the stored, un-oriented geometry, which is safe: `hasImpliedReturnLeg` asks only
  * whether *exactly one* end is a destination, and does not care which end is which.
  */
@@ -145,7 +195,7 @@ export function terminusFeatures(
 
   for (const element of elements) {
     if (element.type !== 'node' && element.type !== 'way') continue;
-    const kind = classifyWaypoint(element.tags ?? {});
+    const kind = classifyTerminus(element.tags ?? {});
     if (!kind) continue;
     const at = positionOf(element);
     if (at) placed.push({ at, kind });
@@ -170,6 +220,7 @@ export function synthesiseTrailhead(coords: readonly LngLat[]): EnrichedWaypoint
     lat: start[1],
     distM: 0,
     offsetM: 0,
+    osmEleM: null,
     osmType: 'node',
     osmId: 0,
     tags: {},

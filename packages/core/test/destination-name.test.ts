@@ -4,11 +4,13 @@ import {
   MAX_APPROACH_M,
   MAX_DISPLAY_NAME_LENGTH,
   MIN_SUMMIT_CLIMB_M,
+  MIN_SUMMIT_RELIEF_M,
   SUMMIT_TOP_TOLERANCE_M,
   deriveDisplayName,
   describeDisplayName,
   distinctiveWords,
   namesTheDestination,
+  refuseDisplayName,
   trailTitle,
   turnaroundM,
 } from '@switchback/core';
@@ -22,7 +24,11 @@ function trail(over: Partial<DisplayNameInput> = {}): DisplayNameInput {
     name: 'Headlee Pass Trail',
     routeType: 'out_and_back',
     lengthM: 8000,
+    // One leg drawn and mirrored, which is how ingest publishes most out-and-backs: the
+    // stored line is half the figure on the card, and `distM` runs 0 to 4,000.
+    lineLengthM: 4000,
     gainM: 1200,
+    minEleM: 400,
     maxEleM: 1850,
     waypoints: [TRAILHEAD],
     ...over,
@@ -101,7 +107,9 @@ describe('deriveDisplayName — the name we would defend', () => {
       name: 'Mid Wilts Way',
       routeType: 'point_to_point',
       lengthM: 54_300,
+      lineLengthM: 54_300,
       gainM: 734,
+      minEleM: 84,
       maxEleM: 284,
       waypoints: [TRAILHEAD, summit({ name: 'Milk Hill', distM: 17_797, eleM: 276 })],
     });
@@ -113,7 +121,9 @@ describe('deriveDisplayName — the name we would defend', () => {
       name: 'Gunsight Trail',
       routeType: 'point_to_point',
       lengthM: 7978,
+      lineLengthM: 7978,
       gainM: 331,
+      minEleM: 1500,
       maxEleM: 1806,
       waypoints: [TRAILHEAD, summit({ name: 'Gunsight Butte', distM: 2366, eleM: 1806 })],
     });
@@ -126,7 +136,9 @@ describe('deriveDisplayName — the name we would defend', () => {
       name: 'French Creek Trail #3349',
       routeType: 'point_to_point',
       lengthM: 10_571,
+      lineLengthM: 10_571,
       gainM: 470,
+      minEleM: 1000,
       maxEleM: 1519,
       waypoints: [
         TRAILHEAD,
@@ -149,7 +161,9 @@ describe('deriveDisplayName — the name we would defend', () => {
       name: 'Iller Creek Loop',
       routeType: 'loop',
       lengthM: 7958,
+      lineLengthM: 7958,
       gainM: 362,
+      minEleM: 800,
       maxEleM: 1120,
       waypoints: [TRAILHEAD, summit({ name: 'Rocks of Sharon', distM: 2500, eleM: 1120 })],
     });
@@ -161,11 +175,63 @@ describe('deriveDisplayName — the name we would defend', () => {
       name: 'Buck Creek Trail',
       routeType: 'loop',
       lengthM: 2 * MAX_APPROACH_M,
+      lineLengthM: 2 * MAX_APPROACH_M,
       gainM: 1938,
+      minEleM: 900,
       maxEleM: 1900,
       waypoints: [TRAILHEAD, summit({ name: 'Monte Carlo', distM: 12_000, eleM: 1900 })],
     });
     expect(deriveDisplayName(input)).toBeNull();
+  });
+});
+
+describe('deriveDisplayName — the peak, not the trail beneath it', () => {
+  it('refuses a peak standing above anything the trail reaches', () => {
+    // The trail tops out at 1,850 m and the peak's own `ele` says 2,300 m: it goes past,
+    // not over. `eleM` cannot see this — it is the trail's elevation, capped by `maxEleM`.
+    const input = trail({ waypoints: [TRAILHEAD, summit({ osmEleM: 2300 })] });
+    expect(deriveDisplayName(input)).toBeNull();
+    expect(refuseDisplayName(input)).toBe('peak_above_trail');
+  });
+
+  it('accepts a peak the DEM under-reads by less than the tolerance', () => {
+    const at = (osmEleM: number) =>
+      deriveDisplayName(trail({ waypoints: [TRAILHEAD, summit({ osmEleM })] }));
+    expect(at(1850 + SUMMIT_TOP_TOLERANCE_M)).toBe('Vesper Peak via Headlee Pass Trail');
+    expect(at(1850 + SUMMIT_TOP_TOLERANCE_M + 1)).toBeNull();
+  });
+
+  it('accepts a peak the trail crosses at its own high point', () => {
+    const input = trail({ waypoints: [TRAILHEAD, summit({ osmEleM: 1847 })] });
+    expect(deriveDisplayName(input)).toBe('Vesper Peak via Headlee Pass Trail');
+  });
+
+  it('falls back to the on-trail test for the peaks OSM leaves untagged', () => {
+    const untagged = trail({ waypoints: [TRAILHEAD, summit({ osmEleM: null })] });
+    expect(deriveDisplayName(untagged)).toBe('Vesper Peak via Headlee Pass Trail');
+    // ...which still refuses a summit the trail does not top out at.
+    const below = trail({ waypoints: [TRAILHEAD, summit({ eleM: 1450, osmEleM: null })] });
+    expect(deriveDisplayName(below)).toBeNull();
+  });
+
+  it('refuses a flat path past a hillock, whose round-trip gain flatters it', () => {
+    // 531 m of "gain" over 128 m of relief: an undulating out-and-back banks every rise
+    // twice, once outward and once on the mirrored return, without climbing to anything.
+    const input = trail({
+      name: 'Ridgeline Trail',
+      gainM: 531,
+      minEleM: 1722,
+      maxEleM: 1850,
+      waypoints: [TRAILHEAD, summit()],
+    });
+    expect(deriveDisplayName(input)).toBeNull();
+    expect(refuseDisplayName(input)).toBe('relief_below_floor');
+    const taller = trail({
+      gainM: 531,
+      minEleM: 1850 - MIN_SUMMIT_RELIEF_M,
+      waypoints: [TRAILHEAD, summit()],
+    });
+    expect(deriveDisplayName(taller)).toBe('Vesper Peak via Headlee Pass Trail');
   });
 });
 
@@ -182,6 +248,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Rock Creek Trail',
       lengthM: 7000,
+      lineLengthM: 3500,
       gainM: 400,
       waypoints: [TRAILHEAD, lake()],
     });
@@ -196,6 +263,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Rock Creek Trail',
       lengthM: 7000,
+      lineLengthM: 3500,
       gainM: 400,
       waypoints: [TRAILHEAD, lake({ distM: 1100 })],
     });
@@ -206,6 +274,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Rock Creek Trail',
       lengthM: 7000,
+      lineLengthM: 3500,
       gainM: 400,
       waypoints: [
         TRAILHEAD,
@@ -220,6 +289,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Naturaland Trust Trail #14',
       lengthM: 8015,
+      lineLengthM: 4008,
       gainM: 580,
       waypoints: [
         TRAILHEAD,
@@ -235,6 +305,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
       name: 'Las Torres a Los Cuernos',
       routeType: 'point_to_point',
       lengthM: 10_233,
+      lineLengthM: 10_233,
       gainM: 374,
       waypoints: [
         TRAILHEAD,
@@ -248,6 +319,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Goldeneye',
       lengthM: 1231,
+      lineLengthM: 616,
       gainM: 41,
       waypoints: [TRAILHEAD, { kind: 'viewpoint', name: "Viewpoint 630'", distM: 615, eleM: 200 }],
     });
@@ -258,6 +330,7 @@ describe('deriveDisplayName — destinations that are not summits', () => {
     const input = trail({
       name: 'Pazagnou',
       lengthM: 2500,
+      lineLengthM: 1250,
       gainM: 400,
       waypoints: [TRAILHEAD, summit({ name: '(Les Otanes)', distM: 1240 })],
     });
@@ -328,21 +401,54 @@ describe('deriveDisplayName — refusals that are not about the destination', ()
   });
 });
 
-describe('turnaroundM', () => {
-  it('halves an out-and-back, because its published length is the round trip', () => {
-    expect(turnaroundM('out_and_back', 8000)).toBe(4000);
-    expect(turnaroundM('point_to_point', 8000)).toBe(8000);
-    expect(turnaroundM('loop', 8000)).toBe(8000);
+describe('turnaroundM — measured against the stored line, not the published length', () => {
+  it('reads one mirrored leg as the whole walk out', () => {
+    expect(turnaroundM('out_and_back', 8000, 4000)).toBe(4000);
+  });
+
+  it('halves a line that already holds both legs', () => {
+    expect(turnaroundM('out_and_back', 8000, 8000)).toBe(4000);
+  });
+
+  it('gives the other two shapes the whole line', () => {
+    expect(turnaroundM('point_to_point', 8000, 8200)).toBe(8200);
+    expect(turnaroundM('loop', 8000, 8200)).toBe(8200);
+  });
+
+  it('refuses rather than guess when the published length is missing', () => {
+    expect(turnaroundM('out_and_back', Number.NaN, 4000)).toBeNaN();
   });
 
   it('puts the far-end threshold three quarters of the way out', () => {
-    const end = turnaroundM('out_and_back', 8000);
+    const end = turnaroundM('out_and_back', 8000, 4000);
     const just = (distM: number) =>
       deriveDisplayName(
         trail({ name: 'Rock Creek Trail', waypoints: [TRAILHEAD, summit({ distM })] }),
       );
     expect(just(FAR_END_FRACTION * end)).toBe('Vesper Peak via Rock Creek Trail');
     expect(just(FAR_END_FRACTION * end - 1)).toBeNull();
+  });
+
+  it('does not let a line longer than its published length flatter a mid-walk feature', () => {
+    // 618 point-to-points and 145 loops store geometry more than 2% longer than `lengthM`,
+    // and `distM` is measured along the geometry. Against `lengthM` this peak clears 75% of
+    // the walk; against the line it actually sits on, at 73%, it does not.
+    const measured = trail({
+      name: 'Gothic Basin Trail',
+      routeType: 'point_to_point',
+      lengthM: 10_000,
+      lineLengthM: 10_600,
+      waypoints: [TRAILHEAD, summit({ distM: 7700 })],
+    });
+    expect(deriveDisplayName(measured)).toBeNull();
+    expect(deriveDisplayName({ ...measured, lineLengthM: 10_000 })).toBe(
+      'Vesper Peak via Gothic Basin Trail',
+    );
+  });
+
+  it('refuses a trail whose geometry could not be measured', () => {
+    const input = trail({ lineLengthM: 0, waypoints: [TRAILHEAD, summit()] });
+    expect(deriveDisplayName(input)).toBeNull();
   });
 });
 

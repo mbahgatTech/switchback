@@ -308,6 +308,51 @@ describe('deriveTrail', () => {
     expect(derived.stats.lengthM).toBe(5000);
   });
 
+  it('leaves the route type alone when a natural=hill sits at one end', () => {
+    // `classifyWaypoint` calls a hill a summit so it can *name* a trail, and
+    // `TERMINAL_DESTINATIONS` holds `summit`. Wire the two together and this 2.5 km path
+    // publishes as a 5 km one, on a feature class the classifier was never tuned against.
+    const oneLeg = ramp(101, 25, 0.15);
+    const top = oneLeg.coords[oneLeg.coords.length - 1]!;
+    const withKind = (natural: string) =>
+      deriveTrail({
+        coords: oneLeg.coords,
+        profile: oneLeg.profile,
+        bbox: [-4, 56.8, -4, 56.83],
+        tags: {},
+        termini: terminusFeatures(oneLeg.coords, [
+          { type: 'node', id: 1, lon: top[0], lat: top[1], tags: { natural } },
+        ]),
+      });
+
+    expect(withKind('hill').routeType).toBe('point_to_point');
+    expect(withKind('hill').stats.lengthM).toBe(2500);
+    // The same node tagged as a peak is evidence, and does imply the return leg.
+    expect(withKind('peak').routeType).toBe('out_and_back');
+    expect(withKind('peak').stats.lengthM).toBe(5000);
+  });
+
+  it('does not let a hill at the far end veto an out-and-back into half of one', () => {
+    // The inverse: two terminal destinations read as a traverse, which vetoes the climb
+    // test — so a summit spur that happens to start beside a hillock loses its return leg.
+    const oneLeg = ramp(101, 25, 0.2);
+    const top = oneLeg.coords[oneLeg.coords.length - 1]!;
+    const start = oneLeg.coords[0]!;
+    const derived = deriveTrail({
+      coords: oneLeg.coords,
+      profile: oneLeg.profile,
+      bbox: [-4, 56.8, -4, 56.83],
+      tags: {},
+      termini: terminusFeatures(oneLeg.coords, [
+        { type: 'node', id: 1, lon: top[0], lat: top[1], tags: { natural: 'peak' } },
+        { type: 'node', id: 2, lon: start[0], lat: start[1], tags: { natural: 'hill' } },
+      ]),
+    });
+
+    expect(derived.routeType).toBe('out_and_back');
+    expect(derived.stats.lengthM).toBe(5000);
+  });
+
   it('accounts for the return leg when a path climbs hard and stops, with nothing tagged', () => {
     // The Snowdon gap. The Pyg Track, the Miners' Track and the Watkin Path all stop where
     // they meet the Llanberis Path on the ridge — several hundred metres from the summit

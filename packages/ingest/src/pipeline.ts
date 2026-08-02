@@ -18,6 +18,7 @@ import {
 import type { Prisma, PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
+  lineLengthM,
   lngLatToTile,
   quadkeyToBBox,
   quadkeyToTile,
@@ -654,14 +655,21 @@ async function commitTrail(
     eleM: elevationAt(profile, waypoint),
   }));
 
-  const displayName = deriveDisplayName({
-    name: trail.name,
-    routeType: derived.routeType,
-    lengthM: derived.stats.lengthM,
-    gainM: derived.stats.gainM,
-    maxEleM: derived.stats.maxEleM,
-    waypoints: placed,
-  });
+  // Guarded like `waypoints` and `termini` above: a failed feature query is indistinguishable
+  // here from a trail with nothing near it, and deriving null from no evidence would write
+  // that null over a good title on re-ingest — dragging the search vector with it.
+  const displayName = ctx.features.length
+    ? deriveDisplayName({
+        name: trail.name,
+        routeType: derived.routeType,
+        lengthM: derived.stats.lengthM,
+        lineLengthM: lineLengthM(oriented),
+        gainM: derived.stats.gainM,
+        minEleM: derived.stats.minEleM,
+        maxEleM: derived.stats.maxEleM,
+        waypoints: placed,
+      })
+    : undefined;
 
   const geometry: LineString = { type: 'LineString', coordinates: [...oriented] };
   const rendered = renderGeometry(oriented);
@@ -751,6 +759,7 @@ async function commitTrail(
           lng: waypoint.lng,
           lat: waypoint.lat,
           eleM: waypoint.eleM,
+          osmEleM: waypoint.osmEleM,
           distM: waypoint.distM,
           osmType: waypoint.osmId ? (waypoint.osmType as OsmElementType) : null,
           osmId: waypoint.osmId ? BigInt(waypoint.osmId) : null,

@@ -3,6 +3,7 @@ import type { LngLat } from '@switchback/core';
 import {
   PARKING_BUFFER_M,
   attachWaypoints,
+  classifyTerminus,
   classifyWaypoint,
   featureSearchBBox,
   fetchCommonsPhotos,
@@ -10,6 +11,7 @@ import {
   fetchSeedPhotos,
   isOrbitalImagery,
   parkingCapacity,
+  parseEleM,
   synthesiseTrailhead,
 } from '../src/enrich';
 import type { EnrichedWaypoint } from '../src/enrich';
@@ -58,6 +60,18 @@ describe('classifyWaypoint', () => {
     expect(classifyWaypoint({ natural: 'glacier' })).toBe('glacier');
   });
 
+  it('keeps the naming-only kinds out of the terminus vocabulary', () => {
+    // `classifyTerminus` decides whether a line is doubled. A hill classifies as `summit`,
+    // which `TERMINAL_DESTINATIONS` holds, so answering here would republish 5 km as 10 km.
+    expect(classifyTerminus({ natural: 'peak' })).toBe('summit');
+    expect(classifyTerminus({ natural: 'hill' })).toBeNull();
+    expect(classifyTerminus({ natural: 'saddle' })).toBeNull();
+    expect(classifyTerminus({ natural: 'glacier' })).toBeNull();
+    // Everything else answers exactly as it always did.
+    expect(classifyTerminus({ amenity: 'parking' })).toBe('parking');
+    expect(classifyTerminus({ waterway: 'waterfall' })).toBe('waterfall');
+  });
+
   it('does not let the new rules steal from the ones above them', () => {
     // Appended last, so a col that is also a signposted overlook keeps the older label.
     expect(classifyWaypoint({ natural: 'saddle', tourism: 'viewpoint' })).toBe('viewpoint');
@@ -72,6 +86,24 @@ describe('classifyWaypoint', () => {
   it('returns null for a node with nothing we recognise', () => {
     expect(classifyWaypoint({ amenity: 'bench' })).toBeNull();
     expect(classifyWaypoint({})).toBeNull();
+  });
+});
+
+describe('parseEleM', () => {
+  it('reads the metres OSM writes', () => {
+    expect(parseEleM('1836')).toBe(1836);
+    expect(parseEleM('1836.4')).toBe(1836.4);
+    expect(parseEleM(' 1836 m')).toBe(1836);
+    expect(parseEleM('-12')).toBe(-12);
+  });
+
+  it('refuses anything it would have to guess at', () => {
+    // A wrong peak height publishes a title; an absent one falls back to the weaker test.
+    expect(parseEleM('6000 ft')).toBeNull();
+    expect(parseEleM('1,836')).toBeNull();
+    expect(parseEleM('approx 1800')).toBeNull();
+    expect(parseEleM('12000')).toBeNull();
+    expect(parseEleM(undefined)).toBeNull();
   });
 });
 
@@ -90,6 +122,16 @@ describe('attachWaypoints', () => {
   it('drops features beyond the buffer', () => {
     const far = node(2, [-4 + mLng(400), 56.81], { tourism: 'viewpoint' });
     expect(attachWaypoints(LINE, [far])).toHaveLength(0);
+  });
+
+  it("carries the peak's own height, which the trail's elevation cannot supply", () => {
+    const bare = node(5, [-4, 56.8 + m(1000)], { natural: 'peak', name: 'Beinn Dubh' });
+    const tagged = node(4, [-4, 56.8 + m(2000)], { natural: 'peak', name: 'Ben Vane', ele: '916' });
+    // Sorted along the trail, so the nearer peak comes first.
+    const [near, far] = attachWaypoints(LINE, [tagged, bare]);
+
+    expect(near!.osmEleM).toBeNull();
+    expect(far!.osmEleM).toBe(916);
   });
 
   it('gives parking a wider radius, because the car park is up an access road', () => {
@@ -171,6 +213,7 @@ describe('parkingCapacity', () => {
     lat: 56.8,
     distM: null,
     offsetM: 100,
+    osmEleM: null,
     osmType: 'node',
     osmId: 1,
     tags: capacity ? { amenity: 'parking', capacity } : { amenity: 'parking' },
