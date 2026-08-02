@@ -6,8 +6,17 @@
 import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 
-/** How long a claimed job may run before another worker may take it. */
-export const LOCK_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * How long a claim holds a job before `reclaimExpiredJobs` may take it back. Sized above the
+ * slowest honest run, because reclaiming live work runs it twice: `processTile` may spend the
+ * query's own `[timeout:180]` plus 90 s on features and 60 s on the region before it commits
+ * anything, and its commit loop measured 88 s over a 144-trail tile with each trail's
+ * transaction allowed 30 s. `processRoute` is worse — a continental relation is refetched as
+ * thousands of ways, 250 to a request, through a client capped at two concurrent. Ten minutes
+ * sat inside that envelope. Thirty is outside it and still bounds a dead worker to half an
+ * hour, against the seventy-five hours one managed in production.
+ */
+export const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -86,13 +95,21 @@ export interface ClaimedJob {
   payload: Record<string, unknown>;
   attempts: number;
   maxAttempts: number;
+  /** The lease this claim was granted. Every outcome is written under it — see `writeOutcome`. */
+  lockedAt: Date;
+  lockedBy: string;
 }
 
 /**
  * Atomically claim up to `limit` runnable jobs. One statement, because two workers reading
  * then writing would both claim the same row, and `FOR UPDATE SKIP LOCKED` in the subquery
- * makes the second skip rather than block. Runnable means queued and due, or running with an
- * expired lock — that second case recovers a worker that died mid-job.
+ * makes the second skip rather than block.
+ *
+ * Runnable means queued and due, and nothing else. Reclaiming an expired lease used to be a
+ * second arm of this predicate, which put it behind `ORDER BY priority DESC … LIMIT`: with a
+ * five-figure backlog ahead of them, nineteen jobs a dead worker was holding never once
+ * reached the top four in seventy-five hours. `reclaimExpiredJobs` owns that transition now,
+ * under no limit and no ordering, and it is the only way out of `running`.
  *
  * `dedupeKeys` narrows the claim to specific work: a request drain wants the tiles under the
  * map in front of somebody, and the global answer is usually not that, since every pending
@@ -110,7 +127,6 @@ export async function claimJobs(
   dedupeKeys?: readonly string[],
   kinds?: readonly JobKind[],
 ): Promise<ClaimedJob[]> {
-  const lockCutoff = new Date(now.getTime() - LOCK_TIMEOUT_MS);
   // An empty array is a caller with nothing to ask for, not a caller asking for anything, so
   // it must not become "no filter" — and `IN ()` is not valid SQL either way.
   const scope =
@@ -131,16 +147,7 @@ export async function claimJobs(
         ? Prisma.sql`AND false`
         : Prisma.sql`AND kind = ANY(${kinds.map(String)}::"JobKind"[])`;
 
-  const rows = await db.$queryRaw<
-    Array<{
-      id: string;
-      kind: JobKind;
-      dedupeKey: string;
-      payload: Record<string, unknown>;
-      attempts: number;
-      maxAttempts: number;
-    }>
-  >`
+  const rows = await db.$queryRaw<ClaimedJob[]>`
     UPDATE ingest_jobs SET
       status     = 'running',
       "lockedAt" = ${now},
@@ -148,30 +155,55 @@ export async function claimJobs(
       attempts   = attempts + 1
     WHERE id IN (
       SELECT id FROM ingest_jobs
-       WHERE ((status = 'queued'  AND "runAfter" <= ${now})
-           OR (status = 'running' AND "lockedAt" < ${lockCutoff}))
+       WHERE status = 'queued' AND "runAfter" <= ${now}
        ${scope}
        ${kindScope}
        ORDER BY priority DESC, "runAfter" ASC
        LIMIT ${limit}
        FOR UPDATE SKIP LOCKED
     )
-    RETURNING id, kind, "dedupeKey", payload, attempts, "maxAttempts"
+    RETURNING id, kind, "dedupeKey", payload, attempts, "maxAttempts", "lockedAt", "lockedBy"
   `;
 
   return rows;
 }
 
-export async function completeJob(db: Db, jobId: string, now = new Date()): Promise<void> {
-  await db.ingestJob.update({
-    where: { id: jobId },
-    data: {
-      status: JobStatus.done,
-      completedAt: now,
-      lockedAt: null,
-      lockedBy: null,
-      lastError: null,
-    },
+/** What a worker must still hold for its outcome to be believed. */
+type Lease = Pick<ClaimedJob, 'id' | 'lockedAt' | 'lockedBy'>;
+
+/**
+ * Write a job's outcome, but only if the worker still holds the lease it was granted — a fence,
+ * not an idempotent write. The handlers are idempotent (every commit is an upsert on a natural
+ * key), so a duplicate *run* is merely wasted; the bookkeeping is not, and that is what this
+ * guards. A late `failJob` would requeue work that has since finished and null a lock a live
+ * worker is holding, letting a third worker run the job alongside it.
+ *
+ * `(lockedBy, lockedAt)` names one lease. Every exit from `running` nulls both and every entry
+ * stamps a fresh pair, so a stale worker matches no row the moment anything else touches it —
+ * and `lockedBy` alone would not do, since `'cron'` and `'inline'` are fixed strings. The two
+ * timestamps cannot collide either: a re-claim can only follow a reclaim, which needs the first
+ * lease to be a whole `LEASE_TIMEOUT_MS` old.
+ */
+async function writeOutcome(
+  db: Db,
+  lease: Lease,
+  data: Prisma.IngestJobUpdateManyMutationInput,
+): Promise<boolean> {
+  const { count } = await db.ingestJob.updateMany({
+    where: { id: lease.id, lockedBy: lease.lockedBy, lockedAt: lease.lockedAt },
+    data,
+  });
+  return count > 0;
+}
+
+/** Mark a job done. False when the lease had already been reclaimed — see `writeOutcome`. */
+export async function completeJob(db: Db, job: Lease, now = new Date()): Promise<boolean> {
+  return writeOutcome(db, job, {
+    status: JobStatus.done,
+    completedAt: now,
+    lockedAt: null,
+    lockedBy: null,
+    lastError: null,
   });
 }
 
@@ -182,24 +214,21 @@ export async function completeJob(db: Db, jobId: string, now = new Date()): Prom
  */
 export async function failJob(
   db: Db,
-  job: Pick<ClaimedJob, 'id' | 'attempts' | 'maxAttempts'>,
+  job: Lease & Pick<ClaimedJob, 'attempts' | 'maxAttempts'>,
   error: unknown,
   now = new Date(),
-): Promise<void> {
+): Promise<boolean> {
   const message = error instanceof Error ? error.message : String(error);
   const exhausted = job.attempts >= job.maxAttempts;
   const delay = RETRY_DELAYS_MS[Math.min(job.attempts - 1, RETRY_DELAYS_MS.length - 1)]!;
 
-  await db.ingestJob.update({
-    where: { id: job.id },
-    data: {
-      status: exhausted ? JobStatus.dead : JobStatus.queued,
-      runAfter: exhausted ? undefined : new Date(now.getTime() + delay),
-      lockedAt: null,
-      lockedBy: null,
-      lastError: message.slice(0, 1000),
-      completedAt: exhausted ? now : undefined,
-    },
+  return writeOutcome(db, job, {
+    status: exhausted ? JobStatus.dead : JobStatus.queued,
+    runAfter: exhausted ? undefined : new Date(now.getTime() + delay),
+    lockedAt: null,
+    lockedBy: null,
+    lastError: message.slice(0, 1000),
+    completedAt: exhausted ? now : undefined,
   });
 }
 
@@ -212,26 +241,73 @@ export async function failJob(
  */
 export async function deferJob(
   db: Db,
-  job: Pick<ClaimedJob, 'id' | 'attempts'>,
+  job: Lease & Pick<ClaimedJob, 'attempts'>,
   reason: string,
   now = new Date(),
   delayMs = DEFER_DELAY_MS,
-): Promise<void> {
-  await db.ingestJob.update({
-    where: { id: job.id },
-    data: {
-      status: JobStatus.queued,
-      attempts: Math.max(job.attempts - 1, 0),
-      runAfter: new Date(now.getTime() + delayMs),
-      lockedAt: null,
-      lockedBy: null,
-      lastError: reason.slice(0, 1000),
-    },
+): Promise<boolean> {
+  return writeOutcome(db, job, {
+    status: JobStatus.queued,
+    attempts: Math.max(job.attempts - 1, 0),
+    runAfter: new Date(now.getTime() + delayMs),
+    lockedAt: null,
+    lockedBy: null,
+    lastError: reason.slice(0, 1000),
   });
 }
 
 /** How long a deferred job waits. Long enough that a rolling deploy finishes inside it. */
 export const DEFER_DELAY_MS = 5 * 60_000;
+
+export interface ReclaimResult {
+  /** Leases returned to the queue for another worker to take. */
+  requeued: number;
+  /** Leases whose job was out of attempts and is now `dead`. */
+  retired: number;
+}
+
+/**
+ * Take back every job whose lease has expired: the reaper, and the only route out of `running`
+ * for a worker that never came back. Unbounded and unordered on purpose — that is the whole
+ * difference from the arm of `claimJobs` this replaces, which could only ever recover a job
+ * that also happened to be in the top `limit` of `priority DESC, runAfter ASC`.
+ *
+ * The increment is what makes a job that kills its worker terminate: it costs an attempt per
+ * crash, on top of the one the claim spent, so `maxAttempts` retires a reliably fatal job in
+ * two crashes rather than five. `runAfter` is deliberately left where it is — a crash is not
+ * an upstream saying "slow down", and the lease itself has already spaced the retry by half an
+ * hour. `lastError` is set on both paths because these rows carried a null one for seventy-five
+ * hours and nothing on them said why.
+ */
+export async function reclaimExpiredJobs(
+  db: Db,
+  now = new Date(),
+  timeoutMs = LEASE_TIMEOUT_MS,
+): Promise<ReclaimResult> {
+  const cutoff = new Date(now.getTime() - timeoutMs);
+  const reason = `lease expired after ${Math.round(timeoutMs / 60_000)} min with no outcome`;
+
+  // One statement, so a job cannot be requeued and buried by two racing sweeps. Every
+  // `attempts + 1` here reads the *old* row — Postgres evaluates the whole SET against the row
+  // as it was — so the retirement test and the new count are the same number. `RETURNING`
+  // reports the new status, which is how the two dispositions are counted apart.
+  const rows = await db.$queryRaw<Array<{ status: JobStatus }>>`
+    UPDATE ingest_jobs SET
+      attempts      = attempts + 1,
+      status        = CASE WHEN attempts + 1 >= "maxAttempts"
+                           THEN 'dead'::"JobStatus" ELSE 'queued'::"JobStatus" END,
+      "completedAt" = CASE WHEN attempts + 1 >= "maxAttempts"
+                           THEN ${now} ELSE "completedAt" END,
+      "lockedAt"    = NULL,
+      "lockedBy"    = NULL,
+      "lastError"   = ${reason}
+    WHERE status = 'running' AND "lockedAt" < ${cutoff}
+    RETURNING status
+  `;
+
+  const retired = rows.filter((row) => row.status === JobStatus.dead).length;
+  return { requeued: rows.length - retired, retired };
+}
 
 export type JobHandler = (job: ClaimedJob) => Promise<void>;
 
@@ -241,8 +317,14 @@ export interface DrainResult {
   failed: number;
   /** Claimed but handed back untried — a kind this build has no handler for. */
   deferred: number;
+  /** Claimed, run, and the outcome dropped because the lease had expired — see `writeOutcome`. */
+  lost: number;
   /** How many of `claimed` came from the reserved derived share. */
   derived: number;
+  /** Expired leases this drain returned to the queue before claiming. */
+  requeued: number;
+  /** Expired leases this drain buried, out of attempts. */
+  retired: number;
 }
 
 /**
@@ -281,6 +363,23 @@ export async function drainJobs(
   const now = options.now ?? (() => new Date());
   const workerId = options.workerId ?? `drain-${now().toISOString()}`;
 
+  /*
+   * Before claiming, not after: a lease that expired a moment ago should be claimable in this
+   * same tick rather than the next one. Every path that claims comes through here, so "you can
+   * only claim what you have already swept" is an invariant rather than a schedule — which
+   * matters, because the drain that ships on this plan runs once a day.
+   *
+   * Its own try/catch for the same reason the derived claim below has one: bookkeeping must not
+   * be able to stop the drain.
+   */
+  let requeued = 0;
+  let retired = 0;
+  try {
+    ({ requeued, retired } = await reclaimExpiredJobs(db, now()));
+  } catch (error) {
+    console.error('[ingest] lease sweep failed; draining without it', error);
+  }
+
   const primary = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
 
   /*
@@ -290,7 +389,7 @@ export async function drainJobs(
    *
    * Its own try/catch, and the ordering is why: the primary statement has already flipped its
    * batch to `running`, so a rejection propagating out of `drainJobs` would leave that batch
-   * locked until `LOCK_TIMEOUT_MS` expires. A fairness optimisation is not worth ten minutes
+   * locked until `LEASE_TIMEOUT_MS` expires. A fairness optimisation is not worth half an hour
    * of the queue, so a failure degrades to "no derived work this tick".
    */
   const derivedLimit = options.derivedLimit ?? 0;
@@ -307,6 +406,7 @@ export async function drainJobs(
   let succeeded = 0;
   let failed = 0;
   let deferred = 0;
+  let lost = 0;
 
   for (const job of jobs) {
     const handler = handlers[job.kind];
@@ -314,21 +414,36 @@ export async function drainJobs(
       // An unhandled kind is a deploy-ordering problem, not a data problem: a newer client
       // enqueued work this build has no handler for. Counting it as a failure would bury it
       // before the deploy that can run it lands.
-      await deferJob(db, job, `no handler registered for job kind "${job.kind}"`, now());
-      deferred += 1;
+      const held = await deferJob(
+        db,
+        job,
+        `no handler registered for job kind "${job.kind}"`,
+        now(),
+      );
+      if (held) deferred += 1;
+      else lost += 1;
       continue;
     }
     try {
       await handler(job);
-      await completeJob(db, job.id, now());
-      succeeded += 1;
+      if (await completeJob(db, job, now())) succeeded += 1;
+      else lost += 1;
     } catch (error) {
-      await failJob(db, job, error, now());
-      failed += 1;
+      if (await failJob(db, job, error, now())) failed += 1;
+      else lost += 1;
     }
   }
 
-  return { claimed: jobs.length, succeeded, failed, deferred, derived: derived.length };
+  return {
+    claimed: jobs.length,
+    succeeded,
+    failed,
+    deferred,
+    lost,
+    derived: derived.length,
+    requeued,
+    retired,
+  };
 }
 
 /** The dedupe key for a tile ingest. Exported so the router can enqueue without importing the pipeline. */
