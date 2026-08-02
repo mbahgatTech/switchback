@@ -61,16 +61,26 @@ sequenceDiagram
   participant B as trails.browse
   participant V as ensureCoverage
   participant DB as Postgres
+  participant SB as Service Bus
+  participant W as Functions worker
   participant P as processTile
   participant O as Overpass
 
   C->>B: bbox
-  B->>V: cover with z9 quadkeys (12 max per request)
+  B->>V: cover with z9 quadkeys, 12 max per request
   V->>DB: read ingest_tiles, upsert missing + deduped ingest_jobs
   V-->>B: ready / refreshing / pending / queued
   B->>DB: trails whose bbox overlaps the viewport
   B-->>C: partial results now + the pending quadkeys
-  B->>P: waitUntil(drainIngest) — same handler the cron runs
+
+  alt INGEST_QUEUE_DRIVER is servicebus
+    B->>SB: waitUntil publish, one dedupeKey per queued tile
+    W->>SB: queue trigger, one message at a time
+    W->>P: drainIngest limit 1, scoped to that dedupeKey
+  else postgres, the default
+    B->>P: waitUntil drainIngest, the same handler the cron runs
+  end
+
   P->>O: one tile query, plus one tile-wide waypoint query
   O-->>P: ways and relations
   P->>DB: one transaction per trail, then tile status
@@ -111,6 +121,24 @@ follow-up claims only its four oldest jobs, so a late key is asked for in the ne
 within a few. The cost is that every poll landing mid-drain now holds its invocation open until the
 follow-up ends — 25 held invocations against 1 across a 60 s pass at the 2.5 s poll below — which is
 what buys the follow-up enough `after()` budget to finish.
+
+**Which queue drives it is `INGEST_QUEUE_DRIVER`**, read in `apps/web/src/env.ts` and branched on in
+`kickIngest` and the drain cron. Unset or `postgres` is the original path, unchanged. On `servicebus`
+the request publishes one `{dedupeKey}` message per queued tile and makes no Overpass call at all,
+and an Azure Functions worker drains one job per message. `ingest_jobs` stays the queue of record
+either way — a message names work, it never carries it, so a lost message costs a wait rather than a
+tile. A timer pump in the worker re-derives the runnable head of `ingest_jobs` every two minutes and
+tops the queue back up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker.
+The cron still runs on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining:
+lease recovery lives inside `drainJobs`, so skipping the drain would otherwise take it too.
+
+**Two concurrent Overpass requests, deployment-wide.** `packages/ingest/src/overpass.ts` serializes
+at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that directly.
+The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1` for one
+host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
+`OverpassClient` in that process, and `OVERPASS_MAX_CONCURRENT: 2` inside it — all declared in
+`infra/azure/ingest.bicep`. The queue sets `requiresSession: false` so session count is not a second
+multiplier. These are fair-use guarantees, not throughput knobs.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection

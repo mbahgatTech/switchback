@@ -384,6 +384,8 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
+var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+
 var optionalWorkerSettings = concat(
   empty(terrainTileUrl)
     ? []
@@ -479,7 +481,20 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         [
           {
             name: 'AzureWebJobsStorage'
-            value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+            value: storageConnectionString
+          }
+          // Consumption provisions the app onto an Azure Files share, and these two settings are
+          // what name it. Without them the host has no content root: the package blob downloads
+          // fine and `wwwroot` is still empty, so every start logs "0 functions found (Custom)"
+          // and the app idles at zero. Neither `what-if` nor a Bicep lint can see that — it only
+          // shows once something has to run.
+          {
+            name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
+            value: storageConnectionString
+          }
+          {
+            name: 'WEBSITE_CONTENTSHARE'
+            value: toLower(functionAppName)
           }
           {
             name: 'FUNCTIONS_EXTENSION_VERSION'
@@ -488,6 +503,14 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           {
             name: 'FUNCTIONS_WORKER_RUNTIME'
             value: 'node'
+          }
+          // The v4 Node programming model registers its triggers by running the entry point named
+          // in package.json `main`, not by shipping a function.json per function. Without this the
+          // host falls back to scanning for function.json directories, finds none, and reports
+          // "0 functions found" against a package that mounted perfectly.
+          {
+            name: 'AzureWebJobsFeatureFlags'
+            value: 'EnableWorkerIndexing'
           }
           {
             name: 'WEBSITE_NODE_DEFAULT_VERSION'
