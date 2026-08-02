@@ -1,5 +1,5 @@
 import { test as setup } from '@playwright/test';
-import { REPORT_TRAIL, VESPER } from './fixtures';
+import { LONG_TRAIL, PHOTOGRAPHED, REPORT_TRAIL, VESPER } from './fixtures';
 
 /**
  * Ask for every page once before anything is timed. The dev server compiles a route on first
@@ -8,7 +8,7 @@ import { REPORT_TRAIL, VESPER } from './fixtures';
  * it is then guaranteed to run after `webServer` has answered; it makes no assertions.
  */
 
-/** The pages the specs open, plus the two trails they open by slug. */
+/** The pages the specs open, plus the four trails they open by slug. */
 const PAGES = [
   '/',
   '/explore',
@@ -25,12 +25,14 @@ const PAGES = [
   '/signin',
   `/trails/${VESPER.slug}`,
   `/trails/${REPORT_TRAIL.slug}`,
-  // The gallery spec's trail — twelve Commons frames, and the only sheet with a full strip.
-  '/trails/boston-basin-trail',
+  // The two seeded fixtures. The second carries a few thousand profile samples, so it is the
+  // slowest page in the suite to compile and the one most worth asking for early.
+  `/trails/${PHOTOGRAPHED.slug}`,
+  `/trails/${LONG_TRAIL.slug}`,
 ];
 
 setup('compile the pages the suite opens', async ({ request }) => {
-  // Sixteen cold compiles in series; the default 120 s would not cover it.
+  // Seventeen cold compiles in series; the default 120 s would not cover it.
   setup.setTimeout(600_000);
 
   for (const path of PAGES) {

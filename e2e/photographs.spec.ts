@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures';
+import { PHOTOGRAPHED, expect, test } from './fixtures';
 import type { Page } from '@playwright/test';
 
 /**
@@ -7,9 +7,6 @@ import type { Page } from '@playwright/test';
  * Only `upload.wikimedia.org` is blocked — where the seeded photographs live — so MapLibre's
  * sprites and glyphs are untouched and a failure here is about photographs and nothing else.
  */
-
-/** A trail whose photographs all come from Commons. Twelve frames, one gallery. */
-const PHOTOGRAPHED = 'boston-basin-trail';
 
 /*
  * No service worker: `sw.js` falls through to `fetch(request)` for anything uncached, and a
@@ -46,7 +43,7 @@ async function brokenImages(page: Page): Promise<string[]> {
  */
 async function openGalleryWithNothingInIt(page: Page): Promise<void> {
   await deleteTheFiles(page);
-  await page.goto(`/trails/${PHOTOGRAPHED}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`/trails/${PHOTOGRAPHED.slug}`, { waitUntil: 'domcontentloaded' });
 
   // The failure under test is the file going missing, not the record. If this trail ever
   // loses its rows the spec should fail here rather than pass by having nothing to draw.
