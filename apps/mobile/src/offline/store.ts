@@ -32,6 +32,11 @@ export interface OfflineTrailSummary {
   trailId: string;
   slug: string;
   name: string;
+  /**
+   * The derived title, or nothing. Optional and un-versioned deliberately: an index written
+   * before this field still reads, and dropping every download to gain a title is a bad trade.
+   */
+  displayName?: string | null;
   regionName: string | null;
   lengthM: number;
   gainM: number;

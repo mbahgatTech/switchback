@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { UnitSystem } from '@switchback/core';
 import { formatBytes, formatDistance, formatElevation, plural } from '@switchback/core';
 import { CONTROL_HEIGHT, nativeTheme } from '@switchback/ui';
+import { trailTitle } from '@/api/trail-title';
 import { useTRPC } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { useDownloads } from '@/offline/download';
@@ -155,12 +156,15 @@ function Row({
   onCancel: () => void;
   onRemove: () => void;
 }) {
+  // A row saved before `displayName` existed has none, and reads as the name it was saved under.
+  const title = trailTitle(row);
+
   return (
     <View style={styles.entry}>
       <Pressable
         onPress={() => router.push({ pathname: '/trails/[slug]', params: { slug: row.slug } })}
         accessibilityRole="link"
-        accessibilityLabel={`Open ${row.name}`}
+        accessibilityLabel={`Open ${title}`}
         style={({ pressed }) => [styles.card, pressed ? styles.cardPressed : null]}
       >
         {row.regionName ? (
@@ -169,7 +173,7 @@ function Row({
           </Text>
         ) : null}
         <Text style={styles.rowName} numberOfLines={2}>
-          {row.name}
+          {title}
         </Text>
         <Text style={styles.rowFigures}>
           {formatDistance(row.lengthM, units)} ↑{formatElevation(row.gainM, units)} ·{' '}
@@ -202,7 +206,7 @@ function Row({
         <Pressable
           onPress={onConfirm}
           accessibilityRole="button"
-          accessibilityLabel={`Remove ${row.name}`}
+          accessibilityLabel={`Remove ${title}`}
           style={({ pressed }) => [styles.chip, pressed ? styles.chipPressed : null]}
         >
           <Text style={styles.chipLabel}>Remove</Text>

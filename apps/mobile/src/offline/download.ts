@@ -1,6 +1,7 @@
 import { useMemo, useSyncExternalStore } from 'react';
 import { File } from 'expo-file-system';
 import { GALLERY_LIMIT, REVIEW_PAGE_SIZE } from '@/api/pages';
+import { displayNameOf } from '@/api/trail-title';
 import type { useTRPCClient } from '@/api/trpc';
 import {
   type OfflinePhotos,
@@ -157,6 +158,9 @@ export async function downloadTrail(
     trailId,
     slug: detail.slug,
     name: detail.name,
+    // Both, not one resolved title: the index stays a record of what the server said, and the
+    // downloads screen falls back through `trailTitle` exactly as every other screen does.
+    displayName: displayNameOf(detail),
     regionName: detail.regionName ?? null,
     lengthM: detail.stats.lengthM,
     gainM: detail.stats.gainM,
