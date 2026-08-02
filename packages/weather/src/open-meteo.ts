@@ -20,6 +20,22 @@ export const OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast';
 export const OPEN_METEO_AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
 
 /**
+ * A URL from the environment, or null. Read lazily rather than at module load so a test can set
+ * the variable after importing, and guarded because a malformed value should fall back to the
+ * public endpoint rather than fail every forecast.
+ */
+function envUrl(name: string): string | null {
+  const raw = globalThis.process?.env?.[name]?.trim();
+  if (!raw) return null;
+  try {
+    new URL(raw);
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Hourly variables requested, in the order the response object keys them.
  * `freezing_level_height` is the altitude of the 0 °C isotherm — whether the top of the route
  * is snow before you drive to it.
@@ -195,8 +211,14 @@ export class OpenMeteoClient {
   private readonly timeoutMs: number;
 
   constructor(options: OpenMeteoOptions = {}) {
-    this.url = options.url?.trim() || OPEN_METEO_URL;
-    this.airQualityUrl = options.airQualityUrl?.trim() || OPEN_METEO_AIR_QUALITY_URL;
+    // `OPEN_METEO_URL` and `OPEN_METEO_AIR_QUALITY_URL` point this at a self-hosted instance or,
+    // in `e2e/`, at a stub — the four default construction sites take no options, so without the
+    // environment there is no way to redirect them and the spec depends on a third party being up.
+    this.url = options.url?.trim() || envUrl('OPEN_METEO_URL') || OPEN_METEO_URL;
+    this.airQualityUrl =
+      options.airQualityUrl?.trim() ||
+      envUrl('OPEN_METEO_AIR_QUALITY_URL') ||
+      OPEN_METEO_AIR_QUALITY_URL;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.sleepImpl = options.sleepImpl ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.randomImpl = options.randomImpl ?? Math.random;
