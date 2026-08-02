@@ -85,9 +85,18 @@ on:
     - cron: '11 4 * * *'
   workflow_dispatch:
 
+# Keyed by event as well as ref, because the browser suite runs only on `schedule` or
+# `workflow_dispatch` (see the note at the top) — so the one action that verifies Playwright was
+# the one action that cancelled an in-flight deploy on the same ref. It happened: a dispatch two
+# minutes after a merge killed that merge's `production schema` and `deploy production`, and left
+# production a commit behind master.
+#
+# `cancel-in-progress` stays on for branches, where a superseded push is just wasted minutes, and
+# off for master, where a cancelled run can abort `prisma db push` half-way through a schema change
+# against the live database. Two master runs queueing is cheaper than one torn migration.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   # A local throwaway database and a throwaway secret. Neither is a credential to anything.
