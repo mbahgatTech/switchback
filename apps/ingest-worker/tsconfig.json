@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    // Point at the package sources rather than the node_modules symlinks, for the reason
+    // apps/web/tsconfig.json gives: inside a git worktree the symlink resolves to the other
+    // checkout, so a change to ingest and a change to db would be typechecked against
+    // different copies of the repo. Only the four this workspace can reach are listed.
+    "paths": {
+      "@switchback/core": ["../../packages/core/src/index.ts"],
+      "@switchback/core/*": ["../../packages/core/src/*"],
+      "@switchback/geo": ["../../packages/geo/src/index.ts"],
+      "@switchback/geo/*": ["../../packages/geo/src/*"],
+      "@switchback/db": ["../../packages/db/src/index.ts"],
+      "@switchback/db/*": ["../../packages/db/src/*"],
+      "@switchback/ingest": ["../../packages/ingest/src/index.ts"],
+      "@switchback/ingest/*": ["../../packages/ingest/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -34,7 +34,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "typecheck": "tsc -p tsconfig.json && tsc -p e2e/tsconfig.json && npm run typecheck --workspace=@switchback/web && npm run typecheck --workspace=@switchback/mobile",
+    "typecheck": "tsc -p tsconfig.json && tsc -p e2e/tsconfig.json && npm run typecheck --workspace=@switchback/web && npm run typecheck --workspace=@switchback/mobile && npm run typecheck --workspace=@switchback/ingest-worker",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

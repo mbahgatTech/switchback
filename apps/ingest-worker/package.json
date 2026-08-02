@@ -1,0 +1,23 @@
+{
+  "name": "@switchback/ingest-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Azure Functions host for the ingest queue: a Service Bus trigger that drains one job per message.",
+  "//concurrency": "The Overpass ceiling is two concurrent requests and it is enforced here by `maxConcurrentCalls: 1` in host.json times the one `OverpassClient` singleton in packages/ingest/src/config.ts, which caps itself at 2. Both halves matter and README.md traces the whole chain, including the two app settings this workspace does not own.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsx scripts/bundle.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.16.2",
+    "@azure/identity": "^4.13.1",
+    "@azure/service-bus": "^7.9.5",
+    "@switchback/db": "*",
+    "@switchback/ingest": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}
