@@ -41,14 +41,14 @@ const trailSelect = {
 type TrailRow = Prisma.TrailGetPayload<{ select: typeof trailSelect }>;
 
 /**
- * The trail as both views name it. `name` carries the derived title so the person watching
- * from home reads the same words as the hiker's own screen; `displayName` is dropped rather
- * than sent, because nothing downstream would know which of the two to print.
+ * The trail as both views name it: one resolved `title`, so the person watching from home
+ * reads the same words as the hiker's own screen and no client has to choose between two
+ * names. Deliberately not called `name` — see `lifelineTrailSchema`.
  */
 function toLifelineTrail(row: TrailRow | null) {
   return row === null
     ? null
-    : { id: row.id, slug: row.slug, name: trailTitle(row), regionName: row.regionName };
+    : { id: row.id, slug: row.slug, title: trailTitle(row), regionName: row.regionName };
 }
 
 const sessionSelect = {

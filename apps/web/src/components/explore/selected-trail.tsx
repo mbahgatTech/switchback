@@ -76,9 +76,14 @@ export function SelectedTrail({ trail, onDismiss }: SelectedTrailProps) {
 
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-sm">
-            {/* Shrinks and wraps rather than pushing `Close` off the card — see the same pair
-                on the index card in `trail-card.tsx`. */}
-            <h2 className="min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
+            {/* Shrinks and wraps rather than pushing `Close` off the card — written out on
+                the index card in `trail-card.tsx`.
+
+                Two lines and no more, because this card lifts MapLibre's bottom chrome by its
+                own height: the heading column is 112 px at 320 px, where a 71-character title
+                wraps to five lines and a 282 px card that takes the zoom pair off the pane.
+                Clipped for the eye; `Open trail` beneath goes to the name in full. */}
+            <h2 className="line-clamp-2 min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
               {trailTitle(trail)}
             </h2>
             {/*

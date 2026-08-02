@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { displayNameOf, trailTitle } from '@switchback/core';
 import type { OfflineTrailSummary } from '../src/offline/store';
+import { titled } from '../src/offline/titled';
 
 /**
  * The offline half of titling. The fallback itself is core's and tested there; what only this
@@ -18,7 +19,7 @@ describe('an offline index written before displayName existed', () => {
 
   it('still titles from the OSM name rather than blank', () => {
     expect(saved.displayName).toBeUndefined();
-    expect(trailTitle(saved)).toBe('Headlee Pass Trail');
+    expect(trailTitle(titled(saved))).toBe('Headlee Pass Trail');
   });
 
   it('records nothing rather than a blank when a fresh download stores one', () => {

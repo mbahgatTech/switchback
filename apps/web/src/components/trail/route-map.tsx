@@ -5,6 +5,7 @@ import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from 'maplibr
 import type { FeatureCollection } from 'geojson';
 import { Protocol } from 'pmtiles';
 import type { BBox, LineString, Waypoint, WaypointKind } from '@switchback/core';
+import { DESTINATION_KINDS } from '@switchback/core';
 import {
   FLYOVER_PITCH,
   type FlyoverPlan,
@@ -86,8 +87,18 @@ const WAYPOINT_PLATE: Record<WaypointKind, 'survey' | 'water' | 'contour' | 'woo
   hazard: 'survey',
 };
 
-/** Kinds worth a label at any zoom. The rest label only when the map is already close in. */
-const NAMED_KINDS: readonly WaypointKind[] = ['summit', 'trailhead', 'hazard', 'shelter'];
+/**
+ * Kinds worth a label at any zoom; the rest label only when the map is already close in. The
+ * four `DESTINATION_KINDS` join them for the reason `print/sheet-face.tsx` gives: a trail
+ * titled for its lake or pass should not hide that feature until the reader zooms.
+ */
+const NAMED_KINDS: readonly WaypointKind[] = [
+  'summit',
+  'trailhead',
+  'hazard',
+  'shelter',
+  ...DESTINATION_KINDS,
+];
 
 function routeCollection(geometry: LineString): FeatureCollection {
   return {

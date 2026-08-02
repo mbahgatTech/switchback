@@ -14,6 +14,7 @@ import {
   formatPace,
   paceFromSpeed,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { cumulativeDistancesM, elevationTicks, toSectionPoints } from '@switchback/geo';
 import type { SectionPoint, SectionStation } from '@switchback/geo';
@@ -54,7 +55,11 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
 
   const title =
     activity.name ??
-    defaultActivityName(activity.activityType, activity.startedAt, activity.trail?.name);
+    defaultActivityName(
+      activity.activityType,
+      activity.startedAt,
+      activity.trail ? trailTitle(activity.trail) : null,
+    );
   const units = await viewerUnits();
 
   return {
@@ -70,9 +75,11 @@ export default async function ActivityPage({ params }: PageProps) {
   const [activity, units] = await Promise.all([loadActivity(id), viewerUnits()]);
   if (!activity) notFound();
 
+  // The trail as every other screen names it, and as the server named the row when it was
+  // stored — see `defaultActivityName` in `routers/activities.ts`.
+  const trailName = activity.trail ? trailTitle(activity.trail) : null;
   const title =
-    activity.name ??
-    defaultActivityName(activity.activityType, activity.startedAt, activity.trail?.name);
+    activity.name ?? defaultActivityName(activity.activityType, activity.startedAt, trailName);
   const owner = activity.owner;
   const section = buildSection(activity.track);
   const stations = buildStations(activity.splits, activity.distanceM);
@@ -106,7 +113,7 @@ export default async function ActivityPage({ params }: PageProps) {
 
         {activity.trail ? (
           <p className="mt-sm font-text text-body-lg text-ink-muted">
-            {activity.trail.name === title ? (
+            {trailName === title ? (
               /* The heading is already the trail's name, so this line keeps only what it does not
                * say: where this is, and the way through to the trail itself. */
               <>
@@ -125,7 +132,7 @@ export default async function ActivityPage({ params }: PageProps) {
                   href={`/trails/${activity.trail.slug}`}
                   className="rounded-hair underline decoration-bezel underline-offset-4 hover:decoration-ink"
                 >
-                  {activity.trail.name}
+                  {trailName}
                 </Link>
                 {activity.trail.regionName ? `, ${activity.trail.regionName}` : null}
               </>

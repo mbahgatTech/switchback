@@ -491,7 +491,13 @@ describe('trailTitle', () => {
 
   it('falls back to the OSM name, which is the ordinary case', () => {
     expect(trailTitle({ name: 'Mount Si Trail', displayName: null })).toBe('Mount Si Trail');
-    expect(trailTitle({ name: 'Mount Si Trail' })).toBe('Mount Si Trail');
+  });
+
+  it('takes an offline row that predates the column, once its call site widens the key', () => {
+    const stored: { name: string; displayName?: string | null } = { name: 'Mount Si Trail' };
+    expect(trailTitle({ ...stored, displayName: stored.displayName ?? null })).toBe(
+      'Mount Si Trail',
+    );
   });
 
   it('treats a blank derived name as no name — an offline row or a hand-edited column', () => {

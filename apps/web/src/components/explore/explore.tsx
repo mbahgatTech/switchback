@@ -47,6 +47,26 @@ const POLL_MS = 2_500;
 const LAYER_COLUMN_CLEARANCE_PX = 32;
 
 /**
+ * The tallest of MapLibre's bottom corner columns, plus its own 10 px inset. Measured at
+ * 320 px: the zoom pair is 80 px and the scale bar 32.
+ */
+const MAP_CHROME_PX = 80;
+
+/** Pane left showing above the lifted chrome, so it sits on the map rather than on its edge. */
+const LIFT_HEADROOM_PX = 8;
+
+/**
+ * The most the pick card may lift MapLibre's bottom chrome. The lift is a bottom margin on
+ * containers anchored to `bottom: 0`, so past `pane.height - MAP_CHROME_PX` the taller column
+ * leaves the pane: unclamped, a 71-character title made a 282 px card, a 306 px lift and a zoom
+ * pair at y = −14 on a 320 px phone. Above the ceiling the card overlaps the chrome instead,
+ * which is the right way round — the card can be dismissed, a control off the screen cannot.
+ */
+function liftCeiling(paneHeight: number): number {
+  return Math.max(0, Math.round(paneHeight - MAP_CHROME_PX - LIFT_HEADROOM_PX));
+}
+
+/**
  * How long the URL waits behind the map. Longer than `moveend`, which a flick-and-correct fires
  * three times a second: browsers throttle `replaceState` — Safari has historically thrown after
  * about a hundred calls in thirty seconds — so the debounce is a correctness guard.
@@ -278,9 +298,8 @@ export function Explore({
 
   /**
    * How much of the bottom of the sheet the pick card is standing on, so MapLibre's own
-   * corner chrome can step up out of its way — the scale bar and the ODbL attribution both
-   * live down there, and attribution is a licence condition. Measured rather than a constant:
-   * the card's height is whatever its trail's name wraps to.
+   * corner chrome can step up out of its way — the scale bar and the zoom pair both live down
+   * there. Measured rather than a constant: the card's height is whatever its title wraps to.
    */
   const sheetRef = useRef<HTMLDivElement>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -296,14 +315,16 @@ export function Explore({
     }
 
     const measure = () => {
-      const room = sheet.getBoundingClientRect().bottom - card.getBoundingClientRect().top;
-      setCardLift(Math.max(0, Math.round(room)));
+      const pane = sheet.getBoundingClientRect();
+      const room = pane.bottom - card.getBoundingClientRect().top;
+      setCardLift(Math.min(Math.max(0, Math.round(room)), liftCeiling(pane.height)));
     };
 
-    // The card is bottom-anchored, so it moving with the sheet changes nothing — only its
-    // own height does, and that is what this watches.
+    // The card's own height is the usual reason to re-measure, but the ceiling is a fraction
+    // of the pane, so a pane that changes height moves it — both are watched.
     const observer = new ResizeObserver(measure);
     observer.observe(card);
+    observer.observe(sheet);
     return () => observer.disconnect();
   }, [picked]);
 
@@ -390,11 +411,9 @@ export function Explore({
         ) : null}
       </div>
 
-      {/* The collar. `min-w-0` because a grid item's min-width is its min-content width, and
-          the index's min-content is the longest unbreakable word any card holds. Measured at
-          375 px with a 52-character name: without it the column takes 630 px inside a 375 px
-          cell, `overflow-x-clip` swallows the difference, and `Open` and the save mark are
-          clipped off the glass rather than wrapped. */}
+      {/* The collar. `min-w-0` for the reason `trail-card.tsx` gives beside its heading: a
+          grid item's min-width is its min-content width, and the index's min-content is the
+          longest unbreakable word any card holds. */}
       <div className="flex min-h-0 min-w-0 flex-col border-bezel md:border-r">
         <div className="flex shrink-0 flex-col gap-md border-b border-bezel p-lg">
           <SearchBox

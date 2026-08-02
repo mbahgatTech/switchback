@@ -6,6 +6,7 @@ import {
   formatClock,
   formatDistance,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 
 /**
@@ -42,14 +43,16 @@ export function ActivityRows({
   return (
     <ul className={`flex flex-col ${className ?? ''}`}>
       {activities.map((activity) => {
+        // The trail as every other screen names it, and as the server named the row when it
+        // was stored — see `defaultActivityName` in `routers/activities.ts`.
+        const trailName = activity.trail ? trailTitle(activity.trail) : null;
         const title =
           activity.name ??
-          defaultActivityName(activity.activityType, activity.startedAt, activity.trail?.name);
+          defaultActivityName(activity.activityType, activity.startedAt, trailName);
         // A hike named after the trail it is on — which is what the recorder proposes by
         // default — would otherwise print that name twice, once large and once in caps
         // directly beneath it.
-        const trailName =
-          showTrail && activity.trail && activity.trail.name !== title ? activity.trail.name : null;
+        const beneath = showTrail && trailName !== null && trailName !== title ? trailName : null;
         return (
           <li key={activity.id}>
             <Link
@@ -64,7 +67,7 @@ export function ActivityRows({
                 <span className="block truncate text-body text-ink">{title}</span>
                 <span className="collar mt-hair block">
                   {ACTIVITY_TYPE_LABELS[activity.activityType]}
-                  {trailName ? ` · ${trailName}` : ''}
+                  {beneath ? ` · ${beneath}` : ''}
                   {activity.visibility === 'private' ? ' · only you' : ''}
                 </span>
               </span>

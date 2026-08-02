@@ -104,12 +104,14 @@ export interface DisplayName {
 }
 
 /**
- * The two fields titling needs. `displayName` is optional rather than `string | null` because a
- * record stored before the column existed — an offline download on a phone — has no such key.
+ * The two fields titling needs. `displayName` is required — an optional one let `trailTitle`
+ * accept any object with a `name`, so a surface that had never heard of the derived title
+ * compiled clean and silently printed the OSM name. A caller that genuinely lacks the key, an
+ * offline record written before the column existed, passes `?? null` at its own call site.
  */
 export interface TitledTrail {
   name: string;
-  displayName?: string | null;
+  displayName: string | null;
 }
 
 /** The derived title where there is a usable one. Absent, null and blank all count as none. */

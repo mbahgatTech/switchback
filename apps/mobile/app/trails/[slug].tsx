@@ -524,7 +524,12 @@ export default function TrailScreen() {
       <View style={styles.provenance}>
         <Text style={styles.provenanceText}>
           Route and tags from OpenStreetMap
-          {trail.osmType && trail.osmId !== null ? ` (${trail.osmType} ${trail.osmId})` : ''}, ©
+          {trail.osmType && trail.osmId !== null ? ` (${trail.osmType} ${trail.osmId})` : ''}
+          {/* The path's own name, where the heading is not it — the web trail page carries the
+              same clause for the same reason. The title reads "<Destination> via <OSM name>",
+              and this is the app held at the trailhead: without this line the words actually
+              on the signpost appear nowhere on the screen. */}
+          {title === trail.name ? '' : `, where the path itself is named ${trail.name}`}, ©
           OpenStreetMap contributors, ODbL. Elevation sampled from AWS Terrain Tiles.
         </Text>
         {trail.sourceUpdatedAt ? (

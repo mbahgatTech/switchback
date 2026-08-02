@@ -16,6 +16,7 @@ import {
   forgetTrail,
   useOfflineIndex,
 } from '@/offline/store';
+import { titled } from '@/offline/titled';
 
 /**
  * What Switchback is keeping on this phone.
@@ -155,8 +156,8 @@ function Row({
   onCancel: () => void;
   onRemove: () => void;
 }) {
-  // A row saved before `displayName` existed has none, and reads as the name it was saved under.
-  const title = trailTitle(row);
+  // A row saved before `displayName` existed has none; `titled` widens it — see the store.
+  const title = trailTitle(titled(row));
 
   return (
     <View style={styles.entry}>

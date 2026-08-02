@@ -79,7 +79,13 @@ export const lifelineExtendSchema = z.object({
 const lifelineTrailSchema = z.object({
   id: z.string(),
   slug: z.string(),
-  name: z.string(),
+  /**
+   * The trail as `trailTitle` resolves it — already the derived name where there is one, so
+   * this is printed as it stands. Called `title` rather than `name` because it is not the OSM
+   * name a `TrailSummary.name` carries, and one key meaning two kinds of string is how a
+   * caller ends up applying `trailTitle` to a string that has already been through it.
+   */
+  title: z.string(),
   regionName: z.string().nullable(),
 });
 

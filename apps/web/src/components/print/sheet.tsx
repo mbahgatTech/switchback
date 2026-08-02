@@ -296,6 +296,10 @@ export function Sheet({ trail, units }: SheetProps) {
    */
   const caution = terrainCaution(trail.stats.maxSustainedGrade);
 
+  // The sheet's heading, and what the line beneath it compares against to decide whether the
+  // path's own name still needs printing.
+  const title = trailTitle(trail);
+
   return (
     <>
       {/*
@@ -379,9 +383,10 @@ export function Sheet({ trail, units }: SheetProps) {
                     whiteSpace: 'nowrap',
                     overflow: 'hidden',
                     textOverflow: 'ellipsis',
+                    minWidth: 0,
                   }}
                 >
-                  {trailTitle(trail)}
+                  {title}
                 </h1>
                 <p
                   style={{
@@ -389,8 +394,19 @@ export function Sheet({ trail, units }: SheetProps) {
                     fontSize: '2.6mm',
                     color: sheet.inkMuted,
                     whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    minWidth: 0,
                   }}
                 >
+                  {/*
+                    The path's own name, where the heading is not it. The title composes as
+                    "<Destination> via <OSM name>", so the ellipsis above eats the OSM name
+                    first — and this is the one artifact a hiker carries when there is no
+                    signal to look it up, with the trail named nowhere else on the page. Both
+                    lines now clip rather than overflow; the head is a fixed 14 mm.
+                  */}
+                  {title === trail.name ? null : `${trail.name} · `}
                   {trail.regionName ?? 'Unnamed district'}
                 </p>
               </div>
