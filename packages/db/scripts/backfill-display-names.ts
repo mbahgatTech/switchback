@@ -91,7 +91,9 @@ function loadPeaks(path: string): Map<string, number> {
 
 /** A trail as this script loads it: the naming input, plus what each waypoint points at in OSM. */
 type ProjectableInput = Omit<DisplayNameInput, 'waypoints'> & {
-  waypoints: ReadonlyArray<DestinationCandidate & { osmType: OsmType | null; osmId: bigint | null }>;
+  waypoints: ReadonlyArray<
+    DestinationCandidate & { osmType: OsmType | null; osmId: bigint | null }
+  >;
 };
 
 /**
