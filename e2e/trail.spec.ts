@@ -76,8 +76,14 @@ test.describe('The section collar', () => {
 
     const section = page.getByRole('img', { name: /Elevation profile/i }).first();
     await expect(section).toBeVisible();
-    // The callouts are the forecast, so they arrive with it rather than with the document.
-    await expect(section.locator('text.collar')).toHaveCount(2, { timeout: 60_000 });
+    // The callouts are the forecast, so they arrive with it rather than with the document. A lower
+    // bound, not an exact count: `.collar` is a typeface, and the freezing-level annotation wears it
+    // too while being drawn inside the plot — so the exact number depends on whether the forecast
+    // puts the freezing level below the summit, which is a function of hemisphere and season. The
+    // overprint check below reads the collar off the geometry instead, and is the real guard.
+    await expect
+      .poll(async () => section.locator('text.collar').count(), { timeout: 60_000 })
+      .toBeGreaterThanOrEqual(2);
 
     const boxes = await section.evaluate((svg) => {
       // The plot's top edge read off the graphic rather than hard-coded: every gridline spans
