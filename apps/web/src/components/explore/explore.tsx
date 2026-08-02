@@ -390,8 +390,12 @@ export function Explore({
         ) : null}
       </div>
 
-      {/* The collar. */}
-      <div className="flex min-h-0 flex-col border-bezel md:border-r">
+      {/* The collar. `min-w-0` because a grid item's min-width is its min-content width, and
+          the index's min-content is the longest unbreakable word any card holds. Measured at
+          375 px with a 52-character name: without it the column takes 630 px inside a 375 px
+          cell, `overflow-x-clip` swallows the difference, and `Open` and the save mark are
+          clipped off the glass rather than wrapped. */}
+      <div className="flex min-h-0 min-w-0 flex-col border-bezel md:border-r">
         <div className="flex shrink-0 flex-col gap-md border-b border-bezel p-lg">
           <SearchBox
             value={query}

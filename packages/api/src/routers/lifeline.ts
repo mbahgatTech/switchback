@@ -24,12 +24,32 @@ import {
   isLive,
   isStalePing,
   overdueByS,
+  trailTitle,
 } from '@switchback/core';
 import type { LifelineFollow, LifelineSession } from '@switchback/core';
 import type { Prisma } from '@switchback/db';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 
-const trailSelect = { id: true, slug: true, name: true, regionName: true } as const;
+const trailSelect = {
+  id: true,
+  slug: true,
+  name: true,
+  displayName: true,
+  regionName: true,
+} as const;
+
+type TrailRow = Prisma.TrailGetPayload<{ select: typeof trailSelect }>;
+
+/**
+ * The trail as both views name it. `name` carries the derived title so the person watching
+ * from home reads the same words as the hiker's own screen; `displayName` is dropped rather
+ * than sent, because nothing downstream would know which of the two to print.
+ */
+function toLifelineTrail(row: TrailRow | null) {
+  return row === null
+    ? null
+    : { id: row.id, slug: row.slug, name: trailTitle(row), regionName: row.regionName };
+}
 
 const sessionSelect = {
   id: true,
@@ -67,7 +87,7 @@ function toSession(row: SessionRow, now: Date): LifelineSession {
     endedAt: row.endedAt,
     lastPingAt: row.lastPingAt,
     activityId: row.activityId,
-    trail: row.trail,
+    trail: toLifelineTrail(row.trail),
   };
 }
 
@@ -305,7 +325,7 @@ export const lifelineRouter = router({
         startedAt: row.startedAt,
         expectedReturnAt: row.expectedReturnAt,
         endedAt: row.endedAt,
-        trail: row.trail,
+        trail: toLifelineTrail(row.trail),
         at,
         eleM: at ? (row.lastEleM ?? null) : null,
         lastPingAt: live ? row.lastPingAt : null,

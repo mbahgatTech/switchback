@@ -7,6 +7,7 @@ import {
   formatDistance,
   formatDuration,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE } from '@switchback/ui';
 import { Mark } from '../lists/marks';
@@ -69,6 +70,9 @@ export function TrailCard({
   const saved = useSaved(viewerId);
   const ringed = saved.favorites.includes(trail.id);
   const hiked = saved.completed.includes(trail.id);
+  // One string for the heading and for all four accessible names on this card. A card whose
+  // "Open X" differs from the heading beside it reads as two trails in a screen reader.
+  const title = trailTitle(trail);
 
   return (
     // The id is on the list item so the index can scroll to whatever the map selected.
@@ -95,7 +99,7 @@ export function TrailCard({
           onClick={() => onSelect(trail.id)}
           onFocus={() => onHover(trail.id)}
           onBlur={() => onHover(null)}
-          aria-label={`Show ${trail.name} on the map`}
+          aria-label={`Show ${title} on the map`}
           aria-current={selected ? 'true' : undefined}
           className="absolute inset-0 rounded-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
         />
@@ -121,7 +125,14 @@ export function TrailCard({
 
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-sm">
-            <h3 className="text-body font-medium leading-tight text-ink">{trail.name}</h3>
+            {/* A destination title is roughly twice the OSM name it stands in for, so this
+                heading has to give way rather than shove. `min-w-0` lets it shrink past its
+                longest word, which is what keeps `Open` and the mark on screen; `wrap-break-word`
+                then wraps that word instead of letting it be clipped mid-syllable. Both are
+                needed, and so is `min-w-0` on the column in `explore.tsx` — measured at 375 px. */}
+            <h3 className="min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
+              {title}
+            </h3>
 
             {/* `gap-md`, and the 12 px is measured rather than chosen. The mark beside this
                 link is 24 px of ring with an invisible 48 px target centred on it, so its
@@ -140,15 +151,10 @@ export function TrailCard({
               >
                 {/* Named once for the eye and once for the ear: a column of links all called
                     "Open" is unusable in a screen reader's link list. */}
-                <span className="sr-only">Open {trail.name}</span>
+                <span className="sr-only">Open {title}</span>
                 <span aria-hidden>Open</span>
               </Link>
-              <SaveMark
-                trailId={trail.id}
-                trailName={trail.name}
-                ringed={ringed}
-                viewerId={viewerId}
-              />
+              <SaveMark trailId={trail.id} trailName={title} ringed={ringed} viewerId={viewerId} />
             </div>
           </div>
 

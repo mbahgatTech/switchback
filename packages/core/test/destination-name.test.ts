@@ -9,6 +9,7 @@ import {
   describeDisplayName,
   distinctiveWords,
   namesTheDestination,
+  trailTitle,
   turnaroundM,
 } from '@switchback/core';
 import type { DestinationCandidate, DisplayNameInput } from '@switchback/core';
@@ -372,5 +373,22 @@ describe('distinctiveWords', () => {
 
   it('folds diacritics so a name compares the same either way it is typed', () => {
     expect(distinctiveWords('Åreskutan')).toEqual(distinctiveWords('Areskutan'));
+  });
+});
+
+describe('trailTitle', () => {
+  it('shows the derived name when there is one', () => {
+    expect(
+      trailTitle({ name: 'Headlee Pass Trail', displayName: 'Vesper Peak via Headlee Pass Trail' }),
+    ).toBe('Vesper Peak via Headlee Pass Trail');
+  });
+
+  it('falls back to the OSM name, which is the ordinary case', () => {
+    expect(trailTitle({ name: 'Mount Si Trail', displayName: null })).toBe('Mount Si Trail');
+    expect(trailTitle({ name: 'Mount Si Trail' })).toBe('Mount Si Trail');
+  });
+
+  it('treats a blank derived name as no name — an offline row or a hand-edited column', () => {
+    expect(trailTitle({ name: 'Mount Si Trail', displayName: '   ' })).toBe('Mount Si Trail');
   });
 });

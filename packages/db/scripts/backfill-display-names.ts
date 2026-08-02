@@ -1,10 +1,11 @@
 /**
- * Backfill `trails.displayName` for trails ingested before it existed. Dry run by default:
- * nothing is written without `--apply`, and writing to a hosted database needs a second flag.
+ * Backfill `trails.displayName`, and the search vector that carries it, for trails ingested
+ * before it existed. Dry run by default: nothing is written without `--apply`, and writing to a
+ * hosted database needs a second flag.
  */
 import { describeDisplayName } from '@switchback/core';
 import type { DisplayNameRule } from '@switchback/core';
-import { Prisma, prisma } from '@switchback/db';
+import { Prisma, prisma, refreshTrailSearchVector } from '@switchback/db';
 
 /** Trails per page. Each carries its waypoints, so a larger page is a much larger response. */
 const PAGE_SIZE = 500;
@@ -129,7 +130,12 @@ async function main(): Promise<void> {
       }
 
       if (options.apply) {
+        // The vector too, in the same breath. `displayName` is weighted into it, and a name
+        // nobody can search for is half a feature — ingest rebuilds both together for the same
+        // reason. Two statements rather than one because the vector is raw SQL over a column
+        // Prisma cannot type.
         await prisma.trail.update({ where: { id: trail.id }, data: { displayName: next } });
+        await refreshTrailSearchVector(prisma, trail.id);
       }
     }
 

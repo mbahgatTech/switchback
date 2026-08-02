@@ -5,6 +5,7 @@ import {
   formatDistance,
   formatDuration,
   formatElevation,
+  trailTitle,
 } from '@switchback/core';
 import { bearingDeg, compassPoint } from '@switchback/geo';
 import { DIFFICULTY_PLATE } from '@switchback/ui';
@@ -78,7 +79,7 @@ function Row({ trail, from, units }: { trail: NearbyTrail; from: LngLat; units: 
         </p>
 
         <div className="min-w-0 flex-1">
-          <h3 className="text-body font-medium leading-tight text-ink">
+          <h3 className="wrap-break-word text-body font-medium leading-tight text-ink">
             <Link
               href={`/trails/${trail.slug}`}
               // The name is the link and an overlay makes the row clickable — a row-shaped
@@ -86,7 +87,7 @@ function Row({ trail, from, units }: { trail: NearbyTrail; from: LngLat; units: 
               // enormous link name.
               className="rounded-hair after:absolute after:inset-0 after:content-[''] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
             >
-              {trail.name}
+              {trailTitle(trail)}
             </Link>
           </h3>
 

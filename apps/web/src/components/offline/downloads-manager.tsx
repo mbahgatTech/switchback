@@ -14,7 +14,7 @@
 
 import { useRef, useState } from 'react';
 import Link from 'next/link';
-import { formatBytes, formatDistance, formatElevation, plural } from '@switchback/core';
+import { formatBytes, formatDistance, formatElevation, plural, trailTitle } from '@switchback/core';
 import { useUnits } from '@/components/units';
 import { useReaderId } from '@/offline/reader';
 import { useDownloads, useOnline } from '@/offline/use-offline';
@@ -656,7 +656,7 @@ function Downloads() {
               href={`/trails/${row.slug}`}
               className="rounded-hair font-text text-body-lg text-ink hover:text-woodland"
             >
-              {row.name}
+              {trailTitle(row)}
             </Link>
             <span className="collar">
               {row.regionName ? `${row.regionName} · ` : ''}

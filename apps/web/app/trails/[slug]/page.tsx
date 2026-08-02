@@ -14,6 +14,7 @@ import {
   formatElevation,
   plural,
   terrainCaution,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE } from '@switchback/ui';
 import { ActivityRows } from '@/components/activity/activity-rows';
@@ -79,20 +80,24 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   // session and gets metric.
   const units = await viewerUnits();
 
+  // The tab title, the share card and the `h1` are one string: a page whose heading and title
+  // disagree is a page a screen-reader user cannot match to the tab they opened it in.
+  const title = trailTitle(trail);
+
   const summary = `${formatDistance(trail.stats.lengthM, units)} · ${formatElevation(
     trail.stats.gainM,
     units,
   )} of climb · ${formatDuration(trail.stats.estimatedTimeS)}`;
 
   return {
-    title: trail.name,
+    title,
     description: trail.description
       ? `${summary}. ${trail.description.slice(0, 150)}`
       : `${summary}. ${DIFFICULTY_LABEL[trail.difficulty]} ${ROUTE_TYPE_LABEL[
           trail.routeType
         ].toLowerCase()}${trail.regionName ? ` in ${trail.regionName}` : ''}.`,
     openGraph: {
-      title: `${trail.name} · ${BRAND.name}`,
+      title: `${title} · ${BRAND.name}`,
       description: summary,
       images: trail.primaryPhotoUrl ? [trail.primaryPhotoUrl] : undefined,
     },
@@ -132,6 +137,10 @@ export default async function TrailPage({ params }: PageProps) {
 
   const units = await viewerUnits();
 
+  // Every place this page names the trail. `displayName` is null on most trails, so this is
+  // usually the OSM name — the fallback is the ordinary case, not an error path.
+  const title = trailTitle(trail);
+
   const caution = terrainCaution(trail.stats.maxSustainedGrade);
 
   const others = nearby.filter((candidate) => candidate.id !== trail.id).slice(0, 6);
@@ -159,7 +168,7 @@ export default async function TrailPage({ params }: PageProps) {
           ) : null}
         </p>
 
-        <h1 className="mt-md text-h3 font-bold text-balance">{trail.name}</h1>
+        <h1 className="mt-md text-h3 font-bold text-balance">{title}</h1>
 
         <p className="mt-md flex flex-wrap items-center gap-x-md gap-y-xs text-caption text-ink-muted">
           <span className="flex items-center gap-xs text-ink">
@@ -332,7 +341,7 @@ export default async function TrailPage({ params }: PageProps) {
         {/* Above the photographs: the only block written by somebody who stood on the ground. */}
         <Reviews
           trailId={trail.id}
-          trailName={trail.name}
+          trailName={title}
           trailPath={`/trails/${trail.slug}`}
           viewerId={viewer?.id ?? null}
           viewerRole={viewer?.role ?? 'member'}
@@ -341,7 +350,7 @@ export default async function TrailPage({ params }: PageProps) {
         {/* A client island: an upload appears without a round trip, and captions need the lightbox. */}
         <PhotoGallery
           trailId={trail.id}
-          trailName={trail.name}
+          trailName={title}
           trailPath={`/trails/${trail.slug}`}
           initial={photos}
           isViewerKnown={viewer !== null}
@@ -359,7 +368,7 @@ export default async function TrailPage({ params }: PageProps) {
                     href={`/trails/${other.slug}`}
                     className="flex h-full flex-col justify-between gap-sm p-md transition-colors duration-quick ease-standard hover:bg-surface"
                   >
-                    <span className="text-body font-medium leading-tight">{other.name}</span>
+                    <span className="text-body font-medium leading-tight">{trailTitle(other)}</span>
                     <span className="font-mono text-micro text-ink-muted">
                       {formatDistance(other.stats.lengthM, units)} · ↑
                       {formatElevation(other.stats.gainM, units)} ·{' '}
@@ -395,6 +404,18 @@ export default async function TrailPage({ params }: PageProps) {
                 )
               </>
             ) : null}
+            {/*
+             * The path's own name, printed only where the heading is not it. The naming rule
+             * composes "<Destination> via <OSM name>", so the two almost always agree and this
+             * stays silent — but the title is what a reader carries to a trailhead, and where
+             * we have put a summit in front of it they need to know which words are on the
+             * signpost. Provenance is the honest place for that, next to the OSM link.
+             */}
+            {title === trail.name ? null : (
+              <>
+                , where the path itself is named <span className="text-ink">{trail.name}</span>
+              </>
+            )}
             , with elevation resampled every 25 m from terrain tiles. Something wrong? The fix
             belongs upstream in OpenStreetMap, where it reaches every map rather than just this one.
           </p>

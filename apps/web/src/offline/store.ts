@@ -10,6 +10,12 @@ export interface OfflineTrail {
   trailId: string;
   slug: string;
   name: string;
+  /**
+   * The derived title, denormalised beside `name` like everything else on this row. Optional
+   * rather than nullable because a download taken before the column existed simply has no such
+   * key — `trailTitle` reads both cases as "show the OSM name".
+   */
+  displayName?: string | null;
   regionName: string | null;
   lengthM: number;
   gainM: number;

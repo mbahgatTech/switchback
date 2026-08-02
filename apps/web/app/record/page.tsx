@@ -54,6 +54,7 @@ export default async function RecordPage({
       ? {
           id: found.id,
           name: found.name,
+          displayName: found.displayName,
           slug: found.slug,
           geometry: found.geometry,
           lengthM: found.stats.lengthM,

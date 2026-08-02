@@ -86,6 +86,16 @@ export interface DisplayName {
 }
 
 /**
+ * What a reader is shown: the derived name where there is one, the OSM name otherwise. Null is
+ * the common answer from `deriveDisplayName`, so every title in both clients goes through here
+ * rather than repeating a `??` that is easy to forget. `displayName` is optional so a record
+ * stored before the column existed — an offline download — still resolves to its OSM name.
+ */
+export function trailTitle(trail: { name: string; displayName?: string | null }): string {
+  return trail.displayName?.trim() || trail.name;
+}
+
+/**
  * The destination display name, or null to fall back to `name`. Null is the common answer and
  * the safe one: a plausible wrong title — "Ben Nevis via Some Farm Track" — is worse than the
  * farm track's own name, so every clause below refuses rather than guesses.

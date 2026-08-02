@@ -103,20 +103,24 @@ export async function hikerStats(
     `,
 
     // Ties break on the earlier hike, so a record keeps the date it was actually set on rather
-    // than jumping to the most recent repeat of the same trail.
+    // than jumping to the most recent repeat of the same trail. `trailName` is the derived
+    // title where there is one — the same `displayName ?? name` the card beside it prints.
     db.$queryRaw<RecordRow[]>`
-      (SELECT 'longest'::text AS "kind", t.id AS "trailId", t.name AS "trailName",
+      (SELECT 'longest'::text AS "kind", t.id AS "trailId",
+              COALESCE(t."displayName", t.name) AS "trailName",
               t.slug AS "trailSlug", c."completedAt", t."lengthM"::float8 AS "valueM"
          FROM completions c JOIN trails t ON t.id = c."trailId"
         WHERE c."userId" = ${userId}
         ORDER BY t."lengthM" DESC NULLS LAST, c."completedAt" ASC LIMIT 1)
       UNION ALL
-      (SELECT 'steepest'::text, t.id, t.name, t.slug, c."completedAt", t."gainM"::float8
+      (SELECT 'steepest'::text, t.id, COALESCE(t."displayName", t.name), t.slug, c."completedAt",
+              t."gainM"::float8
          FROM completions c JOIN trails t ON t.id = c."trailId"
         WHERE c."userId" = ${userId}
         ORDER BY t."gainM" DESC NULLS LAST, c."completedAt" ASC LIMIT 1)
       UNION ALL
-      (SELECT 'highest'::text, t.id, t.name, t.slug, c."completedAt", t."maxEleM"::float8
+      (SELECT 'highest'::text, t.id, COALESCE(t."displayName", t.name), t.slug, c."completedAt",
+              t."maxEleM"::float8
          FROM completions c JOIN trails t ON t.id = c."trailId"
         WHERE c."userId" = ${userId}
         ORDER BY t."maxEleM" DESC NULLS LAST, c."completedAt" ASC LIMIT 1)

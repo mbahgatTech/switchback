@@ -492,7 +492,7 @@ model Trail {
 
   primaryPhotoId String? @unique
 
-  /// tsvector over name, region, and description. Maintained at write time by ingest
+  /// tsvector over both names, region, and description. Maintained at write time by ingest
   /// rather than by a trigger or a generated column, both of which `prisma db push`
   /// would fight with. GIN index in spatial.sql.
   searchVector Unsupported("tsvector")?

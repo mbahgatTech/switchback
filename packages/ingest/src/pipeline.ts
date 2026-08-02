@@ -720,9 +720,6 @@ async function commitTrail(
       trailId: saved.id,
       geometry,
       centroid: derived.centroid,
-      name: trail.name,
-      regionName: ctx.region.regionName,
-      description: derived.description,
     });
 
     await tx.elevationProfile.upsert({

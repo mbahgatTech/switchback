@@ -16,6 +16,7 @@ import {
   formatDistance,
   formatElevation,
   paceFromSpeed,
+  trailTitle,
   type ActivitySummary,
   type ActivityType,
   type LineString,
@@ -44,6 +45,8 @@ import { useRecorder, type RecorderOptions, type RecorderPhase } from './use-rec
 export interface RecorderTrail {
   id: string;
   name: string;
+  /** Null on most trails; `trailTitle` falls back to `name`. */
+  displayName: string | null;
   slug: string;
   geometry: LineString;
   lengthM: number;
@@ -323,7 +326,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
       id,
       startedAt,
       trailId: trail?.id ?? null,
-      trailName: trail?.name ?? null,
+      trailName: trail ? trailTitle(trail) : null,
       activityType,
       serverStarted: false,
     });
@@ -411,7 +414,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
             <OffRouteBanner
               distanceM={recorder.offRouteDistanceM}
               units={units}
-              trailName={trail?.name ?? 'the trail'}
+              trailName={trail ? trailTitle(trail) : 'the trail'}
             />
           ) : null}
 
@@ -509,7 +512,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                   id: open.id,
                   startedAt: open.startedAt,
                   trailId: open.trail?.id ?? null,
-                  trailName: open.trail?.name ?? null,
+                  trailName: open.trail ? trailTitle(open.trail) : null,
                   activityType: open.activityType,
                   resumed: true,
                   serverStarted: true,
@@ -566,7 +569,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           <LifelinePanel
             activityId={recorder.activityId}
             trailId={recorder.trailId ?? trail?.id ?? null}
-            trailName={trail?.name ?? null}
+            trailName={trail ? trailTitle(trail) : null}
             position={recorder.position}
             eleM={lastEleM}
           />
@@ -578,7 +581,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 href={`/trails/${trail.slug}`}
                 className="text-ink underline decoration-bezel underline-offset-4 hover:decoration-ink"
               >
-                {trail.name}
+                {trailTitle(trail)}
               </Link>
               . Wrong-turn alerts are on.
             </p>
@@ -642,7 +645,11 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
                 disabled={start.isPending}
                 className={`${BUTTON} ${PRIMARY} ${HEIGHT.field} w-full px-lg text-body-lg`}
               >
-                {start.isPending ? 'Starting' : trail ? `Record ${trail.name}` : 'Start recording'}
+                {start.isPending
+                  ? 'Starting'
+                  : trail
+                    ? `Record ${trailTitle(trail)}`
+                    : 'Start recording'}
               </button>
             </>
           )}

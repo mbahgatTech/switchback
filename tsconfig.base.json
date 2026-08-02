@@ -28,7 +28,33 @@
 
     "noEmit": true,
     "declaration": false,
-    "sourceMap": true
+    "sourceMap": true,
+
+    // Workspace packages resolve to their sources, not to the npm-workspace symlinks. The
+    // root, web and mobile configs each already did this for themselves; the per-package
+    // configs did not, and so resolved through `node_modules/@switchback/*` — which in a git
+    // worktree points at the *other* checkout, typechecking half the repo against a copy that
+    // does not have the branch's changes in it. Inherited rather than repeated: a config that
+    // declares its own `paths` overrides this wholesale, and both that do are complete.
+    // Relative to this file, per TS 4.1+; no `baseUrl`, which TS 6 deprecates.
+    "paths": {
+      "@switchback/core": ["./packages/core/src/index.ts"],
+      "@switchback/core/*": ["./packages/core/src/*"],
+      "@switchback/geo": ["./packages/geo/src/index.ts"],
+      "@switchback/geo/*": ["./packages/geo/src/*"],
+      "@switchback/db": ["./packages/db/src/index.ts"],
+      "@switchback/db/*": ["./packages/db/src/*"],
+      "@switchback/ingest": ["./packages/ingest/src/index.ts"],
+      "@switchback/ingest/*": ["./packages/ingest/src/*"],
+      "@switchback/api": ["./packages/api/src/index.ts"],
+      "@switchback/api/*": ["./packages/api/src/*"],
+      "@switchback/ui": ["./packages/ui/src/index.ts"],
+      "@switchback/ui/*": ["./packages/ui/src/*"],
+      "@switchback/weather": ["./packages/weather/src/index.ts"],
+      "@switchback/weather/*": ["./packages/weather/src/*"],
+      "@switchback/busyness": ["./packages/busyness/src/index.ts"],
+      "@switchback/busyness/*": ["./packages/busyness/src/*"]
+    }
   },
   "exclude": ["node_modules", "dist", ".next", ".expo"]
 }

@@ -9,7 +9,7 @@
  */
 
 import Link from 'next/link';
-import { formatBytes, formatDistance, formatElevation } from '@switchback/core';
+import { formatBytes, formatDistance, formatElevation, trailTitle } from '@switchback/core';
 import { useUnits } from '@/components/units';
 import { useDownloads } from '@/offline/use-offline';
 
@@ -39,7 +39,7 @@ export function OfflineTrails() {
               href={`/trails/${row.slug}`}
               className="flex flex-wrap items-baseline gap-x-lg gap-y-xs rounded-hair py-md hover:text-woodland"
             >
-              <span className="font-text text-body-lg">{row.name}</span>
+              <span className="font-text text-body-lg">{trailTitle(row)}</span>
               <span className="collar">
                 {row.regionName ? `${row.regionName} · ` : ''}
                 {formatDistance(row.lengthM, units)} · ↑{formatElevation(row.gainM, units)}

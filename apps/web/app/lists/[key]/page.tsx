@@ -12,6 +12,7 @@ import {
   formatElevation,
   isSystemList,
   plural,
+  trailTitle,
 } from '@switchback/core';
 import { DIFFICULTY_PLATE } from '@switchback/ui';
 import { ListSettings } from '@/components/lists/list-settings';
@@ -189,12 +190,12 @@ export default async function ListPage({ params }: PageProps) {
 
                     <div className="min-w-0 flex-1">
                       <div className="flex items-start justify-between gap-sm">
-                        <h3 className="text-body font-medium leading-tight text-ink">
+                        <h3 className="min-w-0 wrap-break-word text-body font-medium leading-tight text-ink">
                           <Link
                             href={`/trails/${item.trail.slug}`}
                             className="rounded-hair after:absolute after:inset-0 after:content-[''] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
                           >
-                            {item.trail.name}
+                            {trailTitle(item.trail)}
                           </Link>
                         </h3>
                         {list.isMine ? (
@@ -202,7 +203,7 @@ export default async function ListPage({ params }: PageProps) {
                             listId={list.id}
                             trailId={item.trail.id}
                             completionId={item.completionId}
-                            trailName={item.trail.name}
+                            trailName={trailTitle(item.trail)}
                           />
                         ) : null}
                       </div>

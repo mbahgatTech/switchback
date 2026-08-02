@@ -7,6 +7,7 @@ import {
   measureTrailLengthM,
   prisma,
   readTrailGeometry,
+  refreshTrailSearchVector,
   trailIdsInBBox,
   trailIdsNear,
   writeTrailGeometry,
@@ -98,9 +99,6 @@ describe.skipIf(!IS_LOCAL).sequential('spatial helpers', () => {
       trailId,
       geometry: GEOMETRY,
       centroid: MIDPOINT,
-      name: trail.name,
-      regionName: trail.regionName,
-      description: trail.description,
     });
   });
 
@@ -211,6 +209,41 @@ describe.skipIf(!IS_LOCAL).sequential('spatial helpers', () => {
         FROM trails WHERE id = ${trailId}
     `;
     expect(rows[0]!.nameRank).toBeGreaterThan(rows[0]!.descRank);
+  });
+
+  it('carries the derived display name, and drops it again when the column is cleared', async () => {
+    // What makes "Vesper Peak" find a trail OpenStreetMap calls Headlee Pass Trail. Weight A
+    // rather than C, because somebody typing a summit is naming the walk, not describing it.
+    // The second half is the reason the vector is rebuilt from the row rather than appended
+    // to: clearing `displayName` has to take those lexemes back out.
+    const matches = async () => {
+      const rows = await prisma.$queryRaw<
+        Array<{ hit: boolean; displayRank: number; descRank: number }>
+      >`
+        SELECT "searchVector" @@ to_tsquery('english', 'vesper')         AS "hit",
+               ts_rank("searchVector", to_tsquery('english', 'vesper'))  AS "displayRank",
+               ts_rank("searchVector", to_tsquery('english', 'granite')) AS "descRank"
+          FROM trails WHERE id = ${trailId}
+      `;
+      return rows[0]!;
+    };
+
+    try {
+      await prisma.trail.update({
+        where: { id: trailId },
+        data: { displayName: 'Vesper Peak via Cathedral Spires Ridge' },
+      });
+      await refreshTrailSearchVector(prisma, trailId);
+
+      const named = await matches();
+      expect(named.hit).toBe(true);
+      expect(named.displayRank).toBeGreaterThan(named.descRank);
+    } finally {
+      await prisma.trail.update({ where: { id: trailId }, data: { displayName: null } });
+      await refreshTrailSearchVector(prisma, trailId);
+    }
+
+    expect((await matches()).hit).toBe(false);
   });
 
   it('rejects a rating outside 1–5 at the database, not just in zod', async () => {
