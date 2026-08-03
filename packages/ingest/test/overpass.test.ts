@@ -220,6 +220,42 @@ describe('OverpassClient backoff', () => {
     await expect(client.query('[out:json];')).rejects.toThrow();
     expect(calls).toBe(4);
   });
+
+  it('holds the abort open across the body, not only to the first byte', async () => {
+    // `fetch` resolves at the headers. Clearing the timeout there leaves the download with no
+    // ceiling and no live signal, and `buildRouteQuery` permits `[maxsize:1073741824]` — so a
+    // mirror answering instantly and then dribbling is unbounded wall clock on a host that
+    // kills the process at ten minutes. A regression here does not fail this assertion, it
+    // hangs: nothing would ever abort the read.
+    let abortedMidBody = false;
+
+    const client = new OverpassClient({
+      url: ONLY,
+      userAgent: UA,
+      maxAttempts: 1,
+      requestTimeoutMs: 50,
+      sleepImpl: async () => {},
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        const signal = init.signal;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              // A plausible beginning, and then nothing — as a stalled transfer looks.
+              controller.enqueue(new TextEncoder().encode('{"elements":['));
+              signal?.addEventListener('abort', () => {
+                abortedMidBody = true;
+                controller.error(new DOMException('aborted', 'AbortError'));
+              });
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(abortedMidBody).toBe(true);
+  }, 5_000);
 });
 
 describe('OverpassClient mirror failover', () => {

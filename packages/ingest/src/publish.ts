@@ -162,9 +162,9 @@ export function resetPublisherToken(): void {
 /**
  * Trade the deployment's Vercel OIDC token for an Entra access token, and keep it.
  *
- * This is the whole of the credential story: nothing long-lived exists to leak. Vercel signs a
- * token per deployment, Entra trusts it through a federated identity credential on the
- * publisher's managed identity, and what comes back is good for about an hour.
+ * This is the whole of the publisher's credential story: nothing long-lived exists on this path to
+ * leak. Vercel signs a token per deployment, Entra trusts it through a federated identity
+ * credential on the publisher's managed identity, and what comes back is good for about an hour.
  *
  * The cache is module state, so a warm lambda pays the exchange once rather than once a
  * request; a cold one pays a single extra round trip before the send. `TOKEN_SKEW_MS` is what

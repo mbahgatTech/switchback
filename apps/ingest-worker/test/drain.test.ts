@@ -3,9 +3,11 @@
  * back at the broker.
  */
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
-import { OverpassDeadlineError, withDeadline } from '@switchback/ingest';
+import { OVERPASS_MAX_TOTAL_MS, OverpassDeadlineError, withDeadline } from '@switchback/ingest';
 import { OVERPASS_DEADLINE_MS, runIngestSignal } from '../src/drain';
 import type { Drain } from '../src/drain';
 import type { WorkerLog } from '../src/log';
@@ -58,9 +60,6 @@ describe('runIngestSignal', () => {
   });
 
   it('hands the pipeline an Overpass view that closes before functionTimeout does', async () => {
-    // The reconciliation the host forces: 300 s to start a query plus 240 s for that query to
-    // finish is 540 s, inside the 600 s at which Consumption kills the invocation. Without it
-    // the client's own budget is six attempts of 190 s plus backoff — over twenty minutes.
     let clock = 0;
     const view = withDeadline(
       { query: async () => ({ elements: [] }) },
@@ -72,7 +71,6 @@ describe('runIngestSignal', () => {
 
     clock = OVERPASS_DEADLINE_MS;
     await expect(view.query('[out:json];')).rejects.toBeInstanceOf(OverpassDeadlineError);
-    expect(OVERPASS_DEADLINE_MS + 240_000).toBeLessThan(600_000);
   });
 
   it('completes a message whose job no longer needs doing', async () => {
@@ -134,5 +132,46 @@ describe('runIngestSignal', () => {
     ).rejects.toThrow('connection refused');
 
     expect(log.lines).toContainEqual(['error', expect.stringContaining('could not claim')]);
+  });
+});
+
+/**
+ * The reconciliation `src/drain.ts` documents, checked against the files that actually carry the
+ * numbers. Asserting `300_000 + 240_000 < 600_000` on literals proves only that the author can
+ * add: it stays green when a deployed value moves, which is the only way this can break.
+ */
+describe('the invocation budget the host enforces', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
+    functionTimeout: string;
+    extensions: { serviceBus: { maxConcurrentCalls: number } };
+  };
+
+  /** One `name:`/`value:` pair out of the template's `appSettings` array. */
+  function appSetting(name: string): number {
+    const found = new RegExp(`name: '${name}'\\s*\\r?\\n\\s*value: '([^']+)'`).exec(bicep);
+    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
+    return Number(found[1]);
+  }
+
+  const [hours = 0, minutes = 0, seconds = 0] = host.functionTimeout.split(':').map(Number);
+  const functionTimeoutMs = (hours * 3600 + minutes * 60 + seconds) * 1000;
+
+  it('deploys the two budgets the code falls back to', () => {
+    // Drift on either side is the failure. A template that stops setting them lands on these
+    // defaults; a template that sets something else is no longer the thing reasoned about.
+    expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBe(OVERPASS_DEADLINE_MS);
+    expect(appSetting('OVERPASS_MAX_TOTAL_MS')).toBe(OVERPASS_MAX_TOTAL_MS);
+  });
+
+  it('leaves the handler time to write the tile after Overpass is done', () => {
+    expect(functionTimeoutMs).toBe(600_000);
+    expect(OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
+  });
+
+  it('takes one message at a time, which is what makes the two budgets additive', () => {
+    // With two messages in one process a query can wait for a concurrency slot, and that wait
+    // is charged to neither budget — the sum above would stop bounding the invocation.
+    expect(host.extensions.serviceBus.maxConcurrentCalls).toBe(1);
   });
 });

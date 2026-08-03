@@ -149,11 +149,15 @@ az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=servicebus
                                                   # 3. the worker starts draining, seconds
 ```
 
-Between 1 and 3 nothing drains twice: Vercel has stopped and the worker has not started, so tiles
-wait for the next pump tick. Doing 3 first is the state this design exists to prevent — Vercel still
-draining `ingest_jobs` inline while the worker drains the same table — and it is worth naming that
-it happened here: the flag was set on the Function App while production Vercel still served a commit
-whose `kickIngest` drained unconditionally, and the first end-to-end run was collected in that state.
+Between 1 and 3 **nothing drains at all**, and it is worth being exact about that because the
+reassuring version is wrong: the tiles do not wait for a pump tick, because the pump is the worker's
+and returns early — `INGEST_QUEUE_DRIVER is not servicebus` — for as long as step 3 is outstanding.
+Vercel has stopped draining and the worker has not started, so `ingest_jobs` accumulates and the
+first thing to touch it is step 3. Rows are safe; the wait is however long step 3 takes. Doing 3
+first is the state this design exists to prevent — Vercel still draining `ingest_jobs` inline while
+the worker drains the same table — and it is worth naming that it happened here: the flag was set on
+the Function App while production Vercel still served a commit whose `kickIngest` drained
+unconditionally, and the first end-to-end run was collected in that state.
 
 **At 3am.** Two brakes, neither of which is a deploy, and **the order is not arbitrary**:
 
@@ -183,8 +187,9 @@ signals while the restarted trigger, in the same second, logged
 signal makes no Overpass request and the rows stay `queued` for Postgres — but it is why step 1
 exists and why "the worker stands down in seconds" is a statement about the drain, not the pump.
 
-Between steps 2 and 3, a queue message that arrives is dropped by the trigger and its `ingest_jobs`row simply waits for the Vercel cron; nothing is lost either way, because a message names work and
-never carries it.
+Between steps 2 and 3 nothing drains either, for the mirror-image reason: the trigger drops the
+message it receives and the Vercel cron does not drain until step 3's redeploy carries the new value
+into `drainOrReclaim`. A message that arrives is discarded and its `ingest_jobs` row waits for step 3. Nothing is lost either way, because a message names work and never carries it.
 
 **The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
 it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as

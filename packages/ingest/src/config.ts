@@ -12,25 +12,36 @@ import type { PipelineDeps } from './pipeline';
 let overpassClient: OverpassClient | null = null;
 let terrainSource: TerrainSource | null = null;
 
+/**
+ * Wall clock one `query()` may spend here when `OVERPASS_MAX_TOTAL_MS` does not say otherwise.
+ *
+ * The client's own default is no ceiling, which is the right default for a library and the wrong
+ * one for every process this repo deploys: on the retry ladder an unbounded query is ~24 minutes,
+ * longer than the Functions host will let an invocation live. It used to be supplied only by the
+ * `appSettings` array in `infra/azure/ingest.bicep`, and an ARM application-settings write replaces
+ * that collection whole — so dropping one entry silently restored the unbounded case. Paired with
+ * `OVERPASS_DEADLINE_MS` in `apps/ingest-worker/src/drain.ts`, which is where the two are added up.
+ */
+export const OVERPASS_MAX_TOTAL_MS = 240_000;
+
 export function getOverpass(): OverpassClient {
   if (!overpassClient) {
     overpassClient = new OverpassClient({
       url: splitList(process.env.OVERPASS_URL),
       userAgent: process.env.OVERPASS_USER_AGENT ?? '',
       maxConcurrent: Number(process.env.OVERPASS_MAX_CONCURRENT ?? 2),
-      ...positive('OVERPASS_MAX_TOTAL_MS', 'maxTotalMs'),
+      maxTotalMs: positive(process.env.OVERPASS_MAX_TOTAL_MS) ?? OVERPASS_MAX_TOTAL_MS,
     });
   }
   return overpassClient;
 }
 
-/**
- * One numeric option, present only when the variable holds a usable number — absent rather than
- * `NaN`, so a typo falls back to the client's own default instead of poisoning its arithmetic.
- */
-function positive<K extends string>(name: string, key: K): Partial<Record<K, number>> {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? ({ [key]: value } as Record<K, number>) : {};
+/** A variable's number, or `undefined` when it is absent, blank, mistyped or not positive. */
+function positive(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return value !== undefined && value.trim() !== '' && Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : undefined;
 }
 
 /**

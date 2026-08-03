@@ -199,6 +199,14 @@ function assertUsableUserAgent(userAgent: string): void {
   }
 }
 
+/** One exchange, already drained: `send` reads the body while its abort timer is still armed. */
+interface Answer {
+  ok: boolean;
+  status: number;
+  retryAfter: string | null;
+  text: string;
+}
+
 export class OverpassClient implements OverpassQuerier {
   private readonly endpoints: readonly string[];
   private readonly userAgent: string;
@@ -333,29 +341,28 @@ export class OverpassClient implements OverpassQuerier {
       };
 
       try {
-        const response = await this.send(ql, endpoint, Math.min(this.requestTimeoutMs, left));
+        const answer = await this.send(ql, endpoint, Math.min(this.requestTimeoutMs, left));
 
-        if (response.ok) {
+        if (answer.ok) {
           // Read as text, not `.json()`: a busy dispatcher answers 200 with an XHTML error
           // page, which `.json()` would surface as a parse error that reads like our bug.
-          const body = assertUsable(await response.text(), endpoint);
+          const body = assertUsable(answer.text, endpoint);
           this.recordSuccess();
           return body;
         }
 
-        if (!RETRYABLE_STATUS.has(response.status)) {
+        if (!RETRYABLE_STATUS.has(answer.status)) {
           // Almost always our own query being wrong, and every mirror runs the same
           // Overpass — retrying a broken query is exactly what gets a client blocked.
-          const text = await safeText(response);
           this.recordFailure();
           throw new OverpassFatalError(
-            `Overpass ${response.status} from ${endpoint}: ${explain(response.status)}${text.slice(0, 300)}`,
-            response.status,
+            `Overpass ${answer.status} from ${endpoint}: ${explain(answer.status)}${answer.text.slice(0, 300)}`,
+            answer.status,
           );
         }
 
-        lastError = new Error(`Overpass ${response.status} from ${endpoint}`);
-        retryAfter = response.headers.get('retry-after');
+        lastError = new Error(`Overpass ${answer.status} from ${endpoint}`);
+        retryAfter = answer.retryAfter;
         if (attempt < this.maxAttempts) await retry();
       } catch (error) {
         if (error instanceof OverpassFatalError) throw error;
@@ -370,11 +377,21 @@ export class OverpassClient implements OverpassQuerier {
     throw lastError instanceof Error ? lastError : new Error('Overpass request failed');
   }
 
-  private async send(ql: string, endpoint: string, timeoutMs: number): Promise<Response> {
+  /**
+   * One request, body included.
+   *
+   * The body read is inside the timer on purpose, and it is the whole reason this returns text
+   * rather than a `Response`. `fetch` resolves as soon as the *headers* arrive, so clearing the
+   * timeout there and reading the body afterwards leaves the download — which for a route query
+   * is the hundreds of megabytes `[maxsize:1073741824]` permits — with no ceiling and no live
+   * signal. That is not a hypothetical slow tail: it is the difference between `maxTotalMs`
+   * bounding a query and bounding only its time to first byte.
+   */
+  private async send(ql: string, endpoint: string, timeoutMs: number): Promise<Answer> {
     const controller = new AbortController();
     const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await this.fetchImpl(endpoint, {
+      const response = await this.fetchImpl(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -384,6 +401,14 @@ export class OverpassClient implements OverpassQuerier {
         body: new URLSearchParams({ data: ql }).toString(),
         signal: controller.signal,
       });
+      return {
+        ok: response.ok,
+        status: response.status,
+        retryAfter: response.headers.get('retry-after'),
+        // A failed body is not a failed request: on the error paths the status carries the
+        // meaning and the text is only ever quoted into a message.
+        text: response.ok ? await response.text() : await safeText(response),
+      };
     } finally {
       globalThis.clearTimeout(timer);
     }

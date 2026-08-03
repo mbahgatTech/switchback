@@ -150,11 +150,17 @@ Standard also leaves topics and sessions available if derived work ever wants it
 Basic is a legitimate downgrade if the credit tightens — the only change is the publisher dropping
 `messageId`, because correctness has never rested on broker dedupe.
 
-`disableLocalAuth: true` is the proof that no long-lived credential exists anywhere in this design.
-Both sides authenticate with an Entra identity — the worker with the Function App's system-assigned
-one, Vercel with the federated user-assigned one below — so with local auth off there is no SAS key
-that would work even if one leaked. Turning it back on is a one-line revert, and the flag rollback
-does not need it: `INGEST_QUEUE_DRIVER=postgres` bypasses the broker entirely.
+`disableLocalAuth: true` is what makes the **Service Bus path** keyless: both sides authenticate with
+an Entra identity — the worker with the Function App's system-assigned one, Vercel with the federated
+user-assigned one below — and with local auth off no SAS key would work even if one leaked. Turning
+it back on is a one-line revert, and the flag rollback does not need it: `INGEST_QUEUE_DRIVER=postgres`
+bypasses the broker entirely.
+
+It is not a claim about this file. Three long-lived credentials are deployed from it and a maintainer
+needs to know they are there to rotate: the storage account key, minted into `AzureWebJobsStorage` and
+`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` below; `DATABASE_URL`, passed in as a secure parameter and
+held as an application setting; and the ten-year blob SAS the zip push writes into
+`WEBSITE_RUN_FROM_PACKAGE`. What has no key is the queue.
 ''')
 resource namespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: namespaceName
@@ -217,8 +223,9 @@ resource queue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
 }
 
 @description('''
-The identity Vercel publishes as. **This replaces the queue-scoped SAS key**, and with it the last
-long-lived secret in the design.
+The identity Vercel publishes as. **This replaces the queue-scoped SAS key**, and with it the only
+long-lived secret the publisher path ever held — Vercel now stores three identifiers and nothing that
+authenticates on its own. It is not the last key in this file; see the note on the namespace above.
 
 A *user-assigned managed identity* rather than an app registration, for two reasons that both
 matter here. It is an ARM resource, so it and its federated credentials are declared in this file

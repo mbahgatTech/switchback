@@ -19,8 +19,14 @@ export type Drain = typeof drainIngest;
  * numbers have to be reconciled rather than merely both written down:
  *
  *     300 s  this deadline — the last moment a query may start
- *   + 240 s  OVERPASS_MAX_TOTAL_MS, the most that one query may then spend (ingest.bicep)
+ *   + 240 s  OVERPASS_MAX_TOTAL_MS, the most that one query may then spend
  *   = 540 s  worst case in Overpass, inside the host's 600 s, leaving 60 s to finish the write
+ *
+ * The addition is only sound because nothing sits between the two: `host.json` takes one message
+ * at a time, so a query never waits for a concurrency slot it is not being charged for, and
+ * `OverpassClient` clamps each attempt into what is left of the budget — including the body read,
+ * which it did not always. `test/drain.test.ts` asserts all three numbers against `host.json` and
+ * `infra/azure/ingest.bicep` rather than against themselves.
  *
  * Observed before this existed: `ingest_tile:120221221` ran 600008 ms and was killed mid-tile.
  */

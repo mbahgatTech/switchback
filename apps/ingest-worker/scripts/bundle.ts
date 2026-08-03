@@ -7,7 +7,7 @@
  */
 
 import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -82,11 +82,13 @@ await writeFile(
   )}\n`,
 );
 
-execFileSync(
-  process.platform === 'win32' ? 'npm.cmd' : 'npm',
-  ['install', '--omit=dev', '--no-package-lock', '--no-audit', '--no-fund'],
-  { cwd: dist, stdio: 'inherit' },
-);
+// `execSync` rather than `execFileSync`: npm on Windows is `npm.cmd`, and Node 22.12+ refuses to
+// spawn a `.cmd` without a shell (EINVAL), so the direct form builds on CI and dies on a
+// maintainer's machine. The command is a literal with nothing interpolated into it.
+execSync('npm install --omit=dev --no-package-lock --no-audit --no-fund', {
+  cwd: dist,
+  stdio: 'inherit',
+});
 
 /*
  * The generated Prisma client, copied rather than reinstalled: `npm install @prisma/client`
