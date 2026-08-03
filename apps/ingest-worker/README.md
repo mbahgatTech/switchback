@@ -77,27 +77,49 @@ weeks. It makes no Overpass request and so does not enter the arithmetic above.
 `INGEST_PUMP_ENABLED=false` stops it within seconds and needs no deploy — the fast brake, next to
 `az functionapp stop`. Messages already in flight still finish, because each one is idempotent.
 
+`INGEST_QUEUE_DRIVER=postgres` is the other brake and a different one: it stands the whole worker
+down, pump and trigger both, so a rollback that turns Vercel's inline drain back on does not leave
+two drainers claiming from `ingest_jobs` at once. The trigger drops the messages it reads rather
+than abandoning them — the row stays `queued` and Postgres runs the work — so nothing accumulates
+in the dead-letter queue while the flag is off.
+
 ## Configuration
 
 | Setting                                         | Default       | Read by                                        |
 | ----------------------------------------------- | ------------- | ---------------------------------------------- |
 | `ServiceBusConnection__fullyQualifiedNamespace` | —             | the trigger, and `src/service-bus.ts`          |
 | `SERVICE_BUS_QUEUE`                             | `ingest-jobs` | both                                           |
+| `SERVICE_BUS_QUEUE_RESOURCE_ID`                 | —             | the pump, to read queue depth through ARM      |
+| `INGEST_QUEUE_DRIVER`                           | `postgres`    | the pump and the trigger                       |
 | `INGEST_PUMP_ENABLED`                           | `true`        | the pump                                       |
 | `DATABASE_URL`                                  | —             | `backgroundPrisma`, as the web app connects    |
 | `OVERPASS_USER_AGENT`                           | —             | required — `OverpassClient` refuses without it |
 
-Managed identity carries the Service Bus connection. It does **not** carry Postgres: the server
-has `activeDirectoryAuth: Disabled`, and enabling it is a write to the server resource, which
-rotates the admin password. `infra/azure/README.md` records what doing that deliberately would
-take.
+Managed identity carries the Service Bus connection, and the grant is **Data Sender + Data
+Receiver** on the queue — not Data Owner. Reading the depth is why Data Owner looked necessary;
+`ServiceBusAdministrationClient` does need it, but both data roles already carry the control-plane
+`queues/read` action, so `src/service-bus.ts` asks ARM for `countDetails` instead. At queue scope
+Data Owner would also have allowed rewriting or deleting the queue.
+
+Identity does **not** carry Postgres: the server has `activeDirectoryAuth: Disabled`, and enabling
+it is a write to the server resource, which rotates the admin password. `infra/azure/README.md`
+records what doing that deliberately would take.
 
 ## Building
 
 `npm run build --workspace=@switchback/ingest-worker` writes `dist/`, which is the zip root:
-`index.js`, `host.json`, a `package.json` naming only the runtime externals, and the generated
-Prisma client copied out of `node_modules`. `npm run db:generate` must have run first. The deploy
-step installs the three `@azure/*` externals into `dist/` and zips it.
+`index.js`, `host.json`, a `package.json` naming only the runtime externals, `node_modules` from an
+`--omit=dev` install, and the generated Prisma client copied out of the workspace's `node_modules`.
+`npm run db:generate` must have run first.
+
+**The install happens inside the build script, before the Prisma copy, and the order is not
+cosmetic.** `--omit=dev` prunes anything `dist/package.json` does not declare; `@prisma/client`
+cannot be declared, because npm would then fetch the published package over the generated one. Run
+the install afterwards and npm deletes it — which is exactly what shipped once: the artefact carried
+an empty `node_modules/@prisma/` (npm leaves `.prisma/` alone, being a dot-directory) and the host
+logged `Cannot find module '@prisma/client'` then `0 functions found`. CI proves the fix against an
+extracted copy of the real zip, in a directory with no `node_modules` above it, because the earlier
+guard ran inside the monorepo and resolved every external from the workspace root.
 
 ## Not covered by the tests
 

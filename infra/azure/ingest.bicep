@@ -65,21 +65,26 @@ param terrainTileUrl string = ''
 param mapillaryToken string = ''
 
 @description('''
-Whether to create the role assignment that lets the worker reach Service Bus with its managed
-identity.
+Whether ingest runs through this queue. Written to the Function App as `INGEST_QUEUE_DRIVER` and
+read by both functions here, exactly as Vercel reads it.
 
-Same shape and same reason as `deployDeleteLock` in main.bicep. Writing a role assignment needs
-`Microsoft.Authorization/roleAssignments/write`, which built-in **Contributor** does not have — the
-existing deploying service principal holds Contributor at subscription scope and nothing more, so
-for it this must be `false` or the whole deployment fails on one resource. Set it from the
-environment in `ingest.bicepparam` (`DEPLOY_ROLE_ASSIGNMENTS`). CI deploys with an identity that
-also holds Role Based Access Control Administrator on this group, so there it is `true` and the
-assignment is real.
-
-With it `false`, everything else still deploys and the worker cannot authenticate to the queue
-until an Owner runs the one `az role assignment create` recorded in README.md.
+That is what makes the flag a rollback: set both sides to `postgres` and the Vercel cron drains
+`ingest_jobs` again while the pump stops publishing and the trigger drops what is left. Set only
+one and the two drain the same table at once, which is worse than either alone. At 3am the faster
+brake is `az functionapp config appsettings set` on this one setting, which restarts the app and
+takes effect in seconds; the next deployment of this template puts the parameter's value back.
 ''')
-param deployRoleAssignments bool = true
+@allowed([
+  'postgres'
+  'servicebus'
+])
+param ingestQueueDriver string = 'servicebus'
+
+@description('Vercel team slug. Half of the OIDC issuer and subject the publisher credential trusts.')
+param vercelTeamSlug string = 'mbahgattechs-projects'
+
+@description('Vercel project name. The other half of the subject; a project rename invalidates it.')
+param vercelProjectName string = 'switchback'
 
 @description('Tags, matching main.bicep with a component so this deployment is separable in cost views.')
 param tags object = {
@@ -101,10 +106,20 @@ var functionAppName = '${functionAppPrefix}-${uniqueString(resourceGroup().id)}'
 // Storage account names are 3-24 characters, lowercase alphanumeric, and globally unique.
 var storageAccountName = 'stsbingest${uniqueString(resourceGroup().id)}'
 
-// Azure Service Bus Data Owner. Data *Owner* rather than Sender + Receiver because the pump calls
-// `getQueueRuntimeProperties()` to read the queue depth before it publishes, and that is an
-// administration operation the two data roles do not carry.
-var serviceBusDataOwnerRoleId = '090c5cfd-751d-490a-894a-3ce6f1109419'
+// Every role assignment here is one of these two, queue-scoped, and nothing holds Data *Owner*.
+//
+// Data Owner was the earlier choice, on the argument that reading the queue depth is an
+// administration operation the data roles do not carry. That is true of
+// `ServiceBusAdministrationClient`, which talks the data-plane management protocol — but not of
+// the question. Both roles below already carry the control-plane action `queues/read`, and the
+// ARM representation of a queue exposes `countDetails.activeMessageCount`, so the pump reads the
+// depth through ARM instead (`apps/ingest-worker/src/service-bus.ts`) and the role goes away.
+//
+// What that buys, concretely: Data Owner at queue scope is a wildcard over `Microsoft.ServiceBus`
+// in both `actions` and `dataActions`, so it would let the worker rewrite `lockDuration` or delete
+// the very queue it drains. Sender and Receiver cannot.
+var serviceBusDataSenderRoleId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
+var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
@@ -129,9 +144,11 @@ Standard also leaves topics and sessions available if derived work ever wants it
 Basic is a legitimate downgrade if the credit tightens — the only change is the publisher dropping
 `messageId`, because correctness has never rested on broker dedupe.
 
-`disableLocalAuth` stays `false` deliberately. The worker authenticates with its managed identity
-and holds no key, but Vercel has no Azure identity at all, so the publisher uses the queue-scoped
-SAS rule below. Turning local auth off would take the publisher out with it.
+`disableLocalAuth: true` is the proof that no long-lived credential exists anywhere in this design.
+Both sides authenticate with an Entra identity — the worker with the Function App's system-assigned
+one, Vercel with the federated user-assigned one below — so with local auth off there is no SAS key
+that would work even if one leaked. Turning it back on is a one-line revert, and the flag rollback
+does not need it: `INGEST_QUEUE_DRIVER=postgres` bypasses the broker entirely.
 ''')
 resource namespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: namespaceName
@@ -144,7 +161,7 @@ resource namespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   properties: {
     minimumTlsVersion: '1.2'
     publicNetworkAccess: 'Enabled'
-    disableLocalAuth: false
+    disableLocalAuth: true
     zoneRedundant: false
   }
 }
@@ -194,27 +211,84 @@ resource queue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
 }
 
 @description('''
-Send-only, queue-scoped, for the Vercel publisher.
+The identity Vercel publishes as. **This replaces the queue-scoped SAS key**, and with it the last
+long-lived secret in the design.
 
-Vercel has no Azure identity, so this is the one place a key is unavoidable. Scoped to the queue
-rather than the namespace and `Send` rather than `Manage` so the credential that lives in a
-third-party dashboard can enqueue and nothing else — it cannot read a message, cannot drain the
-queue, cannot create an entity.
+A *user-assigned managed identity* rather than an app registration, for two reasons that both
+matter here. It is an ARM resource, so it and its federated credentials are declared in this file
+and deployed by the same run as everything else — an app registration lives in Microsoft Graph,
+which Bicep can only reach through a preview extension and a directory permission the deploying
+service principal does not hold, and creating one by hand is exactly the portal click this work is
+meant to remove. And Vercel's own Azure guide documents the managed-identity path.
 
-**The key is not an output of this template.** Read it once, out of band, and paste it into Vercel:
-
-  az servicebus queue authorization-rule keys list \
-    -g rg-switchback-prod-northcentralus --namespace-name <namespace> \
-    --queue-name ingest-jobs -n vercel-send --query primaryConnectionString -o tsv
+The exchange, end to end: Vercel signs a short-lived OIDC token per deployment and puts it on every
+function request as `x-vercel-oidc-token`; the publisher posts it to Entra as a `client_assertion`
+in a `client_credentials` grant; Entra checks it against the credentials below and returns an access
+token for `https://servicebus.azure.net`, which is what the send actually carries. Nothing durable
+is stored on either side. See `packages/ingest/src/publish.ts`.
 ''')
-resource sendRule 'Microsoft.ServiceBus/namespaces/queues/authorizationRules@2024-01-01' = {
-  parent: queue
-  name: 'vercel-send'
+resource publisher 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'id-switchback-vercel-publisher'
+  location: location
+  tags: tags
+}
+
+@description('''
+Production deployments of this Vercel project, and nothing else.
+
+Every field is matched by Entra **exactly and case-sensitively**; wildcards are not supported in any
+of them, which is why preview needs its own credential below rather than a pattern covering both.
+The limit is 20 federated credentials per identity, so two is not close to a constraint.
+
+`subject` is Vercel's `sub` claim verbatim — `owner:<team>:project:<project>:environment:<env>` —
+and it is worth saying out loud that **renaming the Vercel team or project silently breaks this**:
+the claim follows the new name, the credential does not, and the exchange then fails with no error
+anywhere except the publisher's own log line.
+
+`audiences` is the token's default `aud`, `https://vercel.com/<team>`, deliberately rather than the
+`api://AzureADTokenExchange` Azure suggests. Both are accepted; the difference is that the default
+is the token already on the request, while a custom audience makes the function call Vercel to mint
+a second token before it can call Entra at all — a third network round trip on the path behind the
+map, on every cold start, to gain nothing this deployment can point at. The credential is pinned to
+one issuer and one subject either way.
+''')
+resource publisherProduction 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: publisher
+  name: 'vercel-switchback-production'
   properties: {
-    rights: [
-      'Send'
+    issuer: 'https://oidc.vercel.com/${vercelTeamSlug}'
+    subject: 'owner:${vercelTeamSlug}:project:${vercelProjectName}:environment:production'
+    audiences: [
+      'https://vercel.com/${vercelTeamSlug}'
     ]
   }
+}
+
+@description('''
+Preview deployments. Separate because `sub` differs only in its last segment and no wildcard is
+allowed there.
+
+It is granted the same Send on the same queue on purpose: a preview publishes signals for tiles it
+has already written to the same `ingest_jobs`, so refusing it would leave preview deployments
+enqueueing work nothing wakes. Send is the whole grant — a preview cannot read, drain or alter the
+queue.
+
+`dependsOn` is not decorative. Federated credentials under one identity are created sequentially or
+ARM's concurrency detection fails the deployment with a 409.
+''')
+resource publisherPreview 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: publisher
+  name: 'vercel-switchback-preview'
+  properties: {
+    issuer: 'https://oidc.vercel.com/${vercelTeamSlug}'
+    subject: 'owner:${vercelTeamSlug}:project:${vercelProjectName}:environment:preview'
+    audiences: [
+      'https://vercel.com/${vercelTeamSlug}'
+    ]
+  }
+  dependsOn: [
+    publisherProduction
+  ]
 }
 
 @description('''
@@ -435,7 +509,11 @@ is visible in the portal alongside the scale limit. **Raising either of these br
 guarantee.** They are not throughput knobs.
 
 Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes the
-claim deployment-wide rather than per-host.
+claim deployment-wide rather than per-host. Three call sites reach Overpass from a Vercel process
+and all three are gated on that flag: the cron route's `drainOrReclaim`, `trails.ts`'s `kickIngest`,
+and `routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network` inline from
+a public procedure the planner fires on every viewport settle, which the pump also publishes, so
+that kind had two drainers and the deployment-wide claim was false while this comment asserted it.
 
 ---
 
@@ -539,6 +617,18 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'SERVICE_BUS_QUEUE'
             value: queueName
           }
+          // The queue's ARM id, which is how the pump reads its depth. See the note beside the
+          // role ids: `countDetails` through the control plane is what lets the worker hold
+          // Sender + Receiver instead of Data Owner.
+          {
+            name: 'SERVICE_BUS_QUEUE_RESOURCE_ID'
+            value: queue.id
+          }
+          // The same flag Vercel reads, so a rollback stops both drainers rather than one.
+          {
+            name: 'INGEST_QUEUE_DRIVER'
+            value: ingestQueueDriver
+          }
           // The instant brake. Setting this to false stops the pump publishing in seconds with no
           // deploy anywhere, which is a faster stop than the Vercel-side INGEST_QUEUE_DRIVER flag
           // (that one needs a redeploy to take effect).
@@ -582,34 +672,79 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
 }
 
 @description('''
-Azure Service Bus Data Owner for the worker's identity, **scoped to the queue** rather than the
-namespace — this app can send, receive and read runtime properties on `ingest-jobs` and has no
-standing on any entity created later.
+**Every role assignment this design needs is here, and none of them is a runbook step.**
 
-Skipped when `deployRoleAssignments` is false; see that parameter for who can and cannot write this.
+They used to be conditional on `deployRoleAssignments`, and there was a real reason: writing a role
+assignment needs `Microsoft.Authorization/roleAssignments/write`, which built-in Contributor puts in
+its `notActions`, and the deploying service principal held nothing else. That is no longer true. The
+principal `cf940ed6-1527-47be-9168-3406ef977827` was granted **Role Based Access Control
+Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, scoped to this resource
+group, on 2026-08-03. So the parameter, the fallback and the `az role assignment create` in
+README.md are all gone: the template is the only thing that grants anything.
+
+Three assignments, all **scoped to the queue** rather than the namespace, so nothing here has
+standing on an entity created later:
+
+  worker    Data Sender    the pump publishes a wake-up signal per runnable row
+  worker    Data Receiver  the trigger receives, completes, and dead-letters
+  publisher Data Sender    Vercel publishes, and can do nothing else
+
+The worker's pair replaces a single Data Owner; see the note beside the role ids above for what
+that was buying and why it is not needed.
 ''')
-resource queueDataOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployRoleAssignments) {
+resource workerSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: queue
-  name: guid(queue.id, functionApp.id, serviceBusDataOwnerRoleId)
+  name: guid(queue.id, functionApp.id, serviceBusDataSenderRoleId)
   properties: {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      serviceBusDataOwnerRoleId
+      serviceBusDataSenderRoleId
     )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
+resource workerReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: queue
+  name: guid(queue.id, functionApp.id, serviceBusDataReceiverRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      serviceBusDataReceiverRoleId
+    )
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: queue
+  name: guid(queue.id, publisher.id, serviceBusDataSenderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      serviceBusDataSenderRoleId
+    )
+    principalId: publisher.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ---------------------------------------------------------------------------------------
-// Outputs. No keys and no connection strings — the Vercel SAS key is read out of band, see
-// `sendRule` above.
+// Outputs. No keys and no connection strings, because there are none: the three values Vercel
+// needs are a hostname, a tenant id and a client id, and none of them authenticates anything on
+// its own.
 // ---------------------------------------------------------------------------------------
 
 output serviceBusNamespace string = namespace.name
 output serviceBusFullyQualifiedNamespace string = '${namespace.name}.servicebus.windows.net'
 output serviceBusQueue string = queue.name
-output sendAuthorizationRuleName string = sendRule.name
 output functionAppName string = functionApp.name
 output functionAppPrincipalId string = functionApp.identity.principalId
 output applicationInsightsName string = appInsights.name
+
+@description('Set on Vercel as AZURE_CLIENT_ID. The identity clientId, not its principalId.')
+output publisherClientId string = publisher.properties.clientId
+output publisherPrincipalId string = publisher.properties.principalId
+output publisherTenantId string = publisher.properties.tenantId

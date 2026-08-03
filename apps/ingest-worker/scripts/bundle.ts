@@ -7,6 +7,7 @@
  */
 
 import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -49,6 +50,21 @@ await build({
 
 await cp(path.join(root, 'host.json'), path.join(dist, 'host.json'));
 
+/*
+ * `npm install` runs **here**, inside this script, and **before** the Prisma client is copied
+ * in. Both halves of that are load-bearing and the artefact silently fails to load without them.
+ *
+ * Inside the script, because the zip root is only a valid Node package once its dependencies
+ * are beside the entry point, and a build step that leaves that to its caller is a build step
+ * whose output cannot be checked.
+ *
+ * Before the copy, because `--omit=dev` prunes anything `dist/package.json` does not declare.
+ * `@prisma/client` cannot be declared — npm would fetch the published package over the
+ * generated one, which is the whole reason it is copied — so if it is already on disk when npm
+ * runs, npm deletes it. It did: the deployed zip carried an empty `node_modules/@prisma/`
+ * (`.prisma/` survived only because npm leaves dot-directories alone) and every start logged
+ * `Cannot find module '@prisma/client'` followed by `0 functions found`.
+ */
 await writeFile(
   path.join(dist, 'package.json'),
   `${JSON.stringify(
@@ -64,6 +80,12 @@ await writeFile(
     null,
     2,
   )}\n`,
+);
+
+execFileSync(
+  process.platform === 'win32' ? 'npm.cmd' : 'npm',
+  ['install', '--omit=dev', '--no-package-lock', '--no-audit', '--no-fund'],
+  { cwd: dist, stdio: 'inherit' },
 );
 
 /*

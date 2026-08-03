@@ -15,8 +15,11 @@ const BASE: NodeJS.ProcessEnv = {
   AUTH_SECRET: 'a'.repeat(32),
 };
 
-const CONNECTION =
-  'Endpoint=sb://sb-example.servicebus.windows.net/;SharedAccessKeyName=vercel-send;SharedAccessKey=a2V5;EntityPath=ingest-jobs';
+const PUBLISHER: Record<string, string> = {
+  SERVICE_BUS_NAMESPACE: 'sb-example.servicebus.windows.net',
+  AZURE_TENANT_ID: 'f0f92920-ce90-42c9-b87f-3ea8644bccd8',
+  AZURE_CLIENT_ID: '11111111-2222-3333-4444-555555555555',
+};
 
 async function load(overrides: Record<string, string>) {
   vi.resetModules();
@@ -41,17 +44,14 @@ describe('INGEST_QUEUE_DRIVER', () => {
     );
   });
 
-  it('refuses servicebus with no connection string, naming the variable', async () => {
+  it('refuses servicebus with no publisher identity, naming every missing variable', async () => {
     await expect(load({ INGEST_QUEUE_DRIVER: 'servicebus' })).rejects.toThrow(
-      /SERVICE_BUS_SEND_CONNECTION_STRING/u,
+      /SERVICE_BUS_NAMESPACE[\s\S]*AZURE_TENANT_ID[\s\S]*AZURE_CLIENT_ID/u,
     );
   });
 
-  it('accepts servicebus once the send credential is present', async () => {
-    const { env } = await load({
-      INGEST_QUEUE_DRIVER: 'servicebus',
-      SERVICE_BUS_SEND_CONNECTION_STRING: CONNECTION,
-    });
+  it('accepts servicebus once the federated publisher identity is named', async () => {
+    const { env } = await load({ INGEST_QUEUE_DRIVER: 'servicebus', ...PUBLISHER });
     expect(env.INGEST_QUEUE_DRIVER).toBe('servicebus');
   });
 });
@@ -67,10 +67,18 @@ describe('.env.example', () => {
   it('documents every Service Bus variable the allowlist declares', () => {
     for (const key of [
       'INGEST_QUEUE_DRIVER',
-      'SERVICE_BUS_SEND_CONNECTION_STRING',
+      'SERVICE_BUS_NAMESPACE',
       'SERVICE_BUS_QUEUE',
+      'AZURE_TENANT_ID',
+      'AZURE_CLIENT_ID',
     ]) {
       expect(EXAMPLE).toContain(`${key}=`);
     }
+  });
+
+  // The SAS path is gone, not merely unused: a connection string in the environment must not
+  // quietly become a second way in.
+  it('no longer documents a Service Bus connection string', () => {
+    expect(EXAMPLE).not.toContain('SERVICE_BUS_SEND_CONNECTION_STRING');
   });
 });

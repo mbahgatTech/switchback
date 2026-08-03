@@ -33,6 +33,7 @@ import {
   requestArea,
   surveyArea,
   tileJobKey,
+  VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
 import { decodeCursor, encodeCursor } from '../cursor';
@@ -417,7 +418,11 @@ function kickIngest(ctx: Context, queued: readonly string[]): void {
   if (ingestQueueDriver() === 'servicebus') {
     // Not gated on `inlineDrain`: that scheduler bounds this process's Overpass concurrency, and
     // publishing has none to bound.
-    ctx.waitUntil(publishIngestSignals(queued.map(tileJobKey)));
+    ctx.waitUntil(
+      publishIngestSignals(queued.map(tileJobKey), {
+        oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
+      }),
+    );
     return;
   }
 

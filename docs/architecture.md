@@ -123,14 +123,51 @@ follow-up ends — 25 held invocations against 1 across a 60 s pass at the 2.5 s
 what buys the follow-up enough `after()` budget to finish.
 
 **Which queue drives it is `INGEST_QUEUE_DRIVER`**, read in `apps/web/src/env.ts` and branched on in
-`kickIngest` and the drain cron. Unset or `postgres` is the original path, unchanged. On `servicebus`
-the request publishes one `{dedupeKey}` message per queued tile and makes no Overpass call at all,
-and an Azure Functions worker drains one job per message. `ingest_jobs` stays the queue of record
-either way — a message names work, it never carries it, so a lost message costs a wait rather than a
-tile. A timer pump in the worker re-derives the runnable head of `ingest_jobs` every two minutes and
-tops the queue back up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker.
-The cron still runs on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining:
-lease recovery lives inside `drainJobs`, so skipping the drain would otherwise take it too.
+`kickIngest`, `kickNetwork` and the drain cron — **and, on the Azure side, by the worker's own timer
+pump and queue trigger.** That last part is what makes the flag a rollback rather than a fan-out:
+set it to `postgres` on both sides and Vercel drains `ingest_jobs` again while the pump stops
+publishing and the trigger drops whatever is still in flight. Setting one side only leaves two
+drainers on the same table, which is worse than either alone.
+
+Unset or `postgres` is the original path, unchanged. On `servicebus` the request publishes one
+`{dedupeKey}` message per queued tile and makes no Overpass call at all, and an Azure Functions
+worker drains one job per message. `ingest_jobs` stays the queue of record either way — a message
+names work, it never carries it, so a lost message costs a wait rather than a tile. A timer pump in
+the worker re-derives the runnable head of `ingest_jobs` every two minutes and tops the queue back
+up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker. The cron still runs
+on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining: lease recovery lives
+inside `drainJobs`, so skipping the drain would otherwise take it too.
+
+**At 3am.** Two brakes, neither of which is a deploy:
+
+```
+az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
+  -n <function app> --settings INGEST_PUMP_ENABLED=false        # stop new work reaching the queue
+vercel env rm INGEST_QUEUE_DRIVER production && vercel env add INGEST_QUEUE_DRIVER production
+                                                                # then redeploy: Vercel drains again
+az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=postgres   # and the worker stands down
+```
+
+The first is instant and reversible and stops the queue filling. The second is the actual rollback
+and needs both halves; a Vercel environment variable only takes effect on a redeploy, which is why
+the worker's own setting is the faster of the two.
+
+**The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
+it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as
+a `client_assertion` and gets back an access token for Service Bus. What makes Entra accept it is a
+federated identity credential on a user-assigned managed identity, declared in `ingest.bicep`,
+pinned to issuer `https://oidc.vercel.com/<team>` and subject
+`owner:<team>:project:<project>:environment:production` — a second credential covers `preview`,
+because Entra matches those fields exactly and allows no wildcard. The namespace has
+`disableLocalAuth: true`, so no SAS key would work even if one existed. The three variables Vercel
+holds — namespace host, tenant id, client id — are identifiers, not secrets.
+
+The access token is cached in module scope, so a warm lambda pays one exchange rather than one per
+request and a cold one pays a single extra round trip before the send. When the exchange fails the
+publisher logs and returns a failure count; it never throws. That is deliberate and load-bearing:
+the `ingest_jobs` rows were written before the publish, so an Entra or Service Bus incident costs the
+wake-up and the pump re-derives the same rows within two minutes. A broker outage must not empty the
+map, and it cannot.
 
 **Two concurrent Overpass requests, deployment-wide.** `packages/ingest/src/overpass.ts` serializes
 at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that directly.
@@ -138,7 +175,19 @@ The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCA
 host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
 `OverpassClient` in that process, and `OVERPASS_MAX_CONCURRENT: 2` inside it — all declared in
 `infra/azure/ingest.bicep`. The queue sets `requiresSession: false` so session count is not a second
-multiplier. These are fair-use guarantees, not throughput knobs.
+multiplier. The other half of the claim is that Vercel fetches nothing: **three** call sites reach
+Overpass from a Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` — and
+all three are gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline
+from a public procedure the planner fires on every viewport settle, and since the pump publishes that
+kind too, it had two drainers. These are fair-use guarantees, not throughput knobs.
+
+**Least privilege on the queue.** Three role assignments, all queue-scoped, all in the template: the
+worker holds Data Sender and Data Receiver, the publisher holds Data Sender. Data Owner was the
+earlier choice because reading the queue depth looked like an administration operation — it is, for
+`ServiceBusAdministrationClient`, but both data roles already carry the control-plane `queues/read`
+action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth through ARM
+and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite or delete
+the queue it drains.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection

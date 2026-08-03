@@ -201,23 +201,45 @@ jobs:
       # without it. `binaryTargets` in the schema is what puts the Linux engine in that copy.
       - run: npm run db:generate
 
+      # Produces `dist/` complete: bundle, `dist/package.json`, `npm install --omit=dev`, and
+      # only then the generated Prisma client. That order is the fix for the artefact that
+      # mounted perfectly and reported "0 functions found"; see the note in scripts/bundle.ts.
       - run: npm run build --workspace=@switchback/ingest-worker
-
-      # The zip root is `dist/`, and the Functions host resolves the three externals from a real
-      # node_modules beside the entry point. `--omit=dev` because nothing here builds at runtime.
-      - name: Install the bundle's runtime dependencies
-        working-directory: apps/ingest-worker/dist
-        run: npm install --omit=dev --no-package-lock
-
-      # Proves the artefact the deploy pushes actually loads: a missing external or a Prisma
-      # engine for the wrong platform fails here rather than on the Function App.
-      - name: Load the bundled entry point
-        working-directory: apps/ingest-worker/dist
-        run: node -e "require('./index.js'); console.log('worker entry point loaded')"
 
       - name: Package
         working-directory: apps/ingest-worker/dist
         run: zip -qr "$RUNNER_TEMP/ingest-worker.zip" .
+
+      # **Loaded from an extracted copy of the zip, outside the repository.** The previous
+      # version of this step ran `require('./index.js')` in `apps/ingest-worker/dist`, which is
+      # inside the monorepo — so Node walked up to the workspace root's `node_modules` and
+      # resolved every external from there. It passed against an artefact whose
+      # `node_modules/@prisma/` was an empty directory. Nothing up the tree from `$RUNNER_TEMP`
+      # holds a `node_modules`, which the loop below asserts rather than assumes, so this can
+      # only resolve what the zip actually contains.
+      - name: Load the packaged entry point from outside the monorepo
+        run: |
+          rm -rf "$RUNNER_TEMP/verify"
+          mkdir -p "$RUNNER_TEMP/verify"
+          unzip -q "$RUNNER_TEMP/ingest-worker.zip" -d "$RUNNER_TEMP/verify"
+
+          dir="$RUNNER_TEMP/verify"
+          while [ "$dir" != "/" ]; do
+            parent=$(dirname "$dir")
+            if [ -d "$parent/node_modules" ]; then
+              echo "::error::$parent/node_modules could rescue a missing dependency — this check would prove nothing."
+              exit 1
+            fi
+            dir="$parent"
+          done
+
+          test -f "$RUNNER_TEMP/verify/node_modules/@prisma/client/package.json" || {
+            echo "::error::the zip has no @prisma/client — the bundle pruned it again."
+            exit 1
+          }
+
+          cd "$RUNNER_TEMP/verify"
+          node -e "require('./index.js'); console.log('worker entry point loaded from the zip')"
 
       - uses: actions/upload-artifact@v4
         with:

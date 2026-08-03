@@ -1089,11 +1089,12 @@ no lock resource here either: the group's existing `CanNotDelete` does not block
 
 | Resource        | Value                                                                                  |
 | --------------- | -------------------------------------------------------------------------------------- |
-| Namespace       | `sb-switchback-prod-37ywppu5p7fri`, **Standard** — server-side duplicate detection     |
+| Namespace       | `sb-switchback-prod-37ywppu5p7fri`, **Standard**, `disableLocalAuth: true` — no SAS    |
 | Queue           | `ingest-jobs`, `lockDuration PT5M`, `maxDeliveryCount 5`, TTL `PT1H`, no sessions      |
-| Publisher creds | `vercel-send`, queue-scoped SAS, `Send` only — Vercel has no Azure identity            |
+| Publisher       | `id-switchback-vercel-publisher`, user-assigned, two Vercel federated credentials      |
+| Publisher creds | Vercel OIDC token exchanged for an Entra token — **no key anywhere**                   |
 | Worker          | `func-switchback-ingest-37ywppu5p7fri`, Linux Consumption (Y1), Node 22                |
-| Worker creds    | System-assigned identity, **Azure Service Bus Data Owner scoped to the queue**         |
+| Worker creds    | System-assigned identity, **Data Sender + Data Receiver scoped to the queue**          |
 | Plan            | `plan-switchback-ingest`, Y1 Dynamic, `functionAppScaleLimit: 1`                       |
 | Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
 | Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
@@ -1118,7 +1119,9 @@ multiplies that by the instance's core count. The load-bearing property is that 
 host instance for the whole app, so every invocation shares one Node process and one client.
 
 Vercel makes **zero** Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes
-this deployment-wide rather than per-host. Raising any row above is not a throughput knob.
+this deployment-wide rather than per-host. Three call sites in a Vercel process can reach Overpass —
+`/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — and all three branch on the flag.
+Raising any row above is not a throughput knob.
 
 ### Deploying it
 
@@ -1127,7 +1130,6 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="switchback-ingest/… (contact address)"
-export DEPLOY_ROLE_ASSIGNMENTS=false                 # unless the principal can write RBAC — below
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1147,53 +1149,54 @@ deployment: worker environment belongs in the template.
 `what-if` is safe and is the check worth running before any deploy — nothing under
 `Microsoft.DBforPostgreSQL` may appear as a create or a modify.
 
-### The four things Bicep cannot express
+**Role assignments are in the template now.** They used to be conditional on
+`DEPLOY_ROLE_ASSIGNMENTS`, with an `az role assignment create` in this file for an Owner to run,
+because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`. The
+deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
+Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
+group, on 2026-08-03. The parameter, the flag and the runbook step are all gone: the three queue
+role assignments are ordinary resources in `ingest.bicep` and nothing grants access by hand.
+
+### The two things Bicep cannot express
 
 Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
 template, and a reader would otherwise conclude the template is the whole story.
 
-1. **`DEPLOY_ROLE_ASSIGNMENTS=false` unless the principal can write RBAC.** Same shape as
-   `DEPLOY_DELETE_LOCK`: `Microsoft.Authorization/roleAssignments/write` is excluded by Contributor's
-   `notActions`. With it false everything else deploys and the worker cannot authenticate to the
-   queue until an Owner runs the assignment once:
-
-   ```bash
-   az role assignment create --role "Azure Service Bus Data Owner" \
-     --assignee-object-id "$(az functionapp identity show \
-        -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
-        --query principalId -o tsv)" \
-     --assignee-principal-type ServicePrincipal \
-     --scope "$(az servicebus queue show -g rg-switchback-prod-northcentralus \
-        --namespace-name sb-switchback-prod-37ywppu5p7fri -n ingest-jobs --query id -o tsv)"
-   ```
-
-   Data _Owner_ rather than Sender + Receiver because the pump reads queue depth with
-   `getQueueRuntimeProperties()`, which is an administration operation.
-
-2. **The publisher's key, read once and pasted into Vercel.** It is deliberately not a template
-   output.
-
-   ```bash
-   az servicebus queue authorization-rule keys list \
-     -g rg-switchback-prod-northcentralus --namespace-name sb-switchback-prod-37ywppu5p7fri \
-     --queue-name ingest-jobs -n vercel-send --query primaryConnectionString -o tsv
-   ```
-
-3. **CI's deployment identity.** Entra app registrations and federated credentials are Microsoft
-   Graph objects, not ARM, and Bicep cannot declare them. One time, as an Owner: `az ad app create`
-   / `az ad sp create`, an `az ad app federated-credential create` scoped to
+1. **CI's deployment identity.** Entra app registrations and federated credentials on an *app* are
+   Microsoft Graph objects, not ARM, and Bicep cannot declare them. One time, as an Owner:
+   `az ad app create` / `az ad sp create`, an `az ad app federated-credential create` scoped to
    `repo:mbahgatTech/switchback:ref:refs/heads/master`, `Contributor` **and** `Role Based Access
 Control Administrator` on this resource group, then `gh secret set AZURE_CLIENT_ID` /
    `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`. No long-lived secret is stored.
 
-4. **Managed identity to Postgres is not done, deliberately.** The worker connects with
+   The Vercel publisher deliberately does **not** work this way. A federated credential on a
+   *user-assigned managed identity* is an ARM resource, so it is in `ingest.bicep` with everything
+   else — see `publisherProduction` and `publisherPreview` there.
+
+2. **Managed identity to Postgres is not done, deliberately.** The worker connects with
    `DATABASE_URL` the way the web app already does. Measured on the server: `activeDirectoryAuth:
 Disabled`, `passwordAuth: Enabled`, `tenantId: null`. Turning it on means setting
    `authConfig.activeDirectoryAuth` and `tenantId`, creating an Entra administrator, running
    `pgaadauth_create_principal` for the worker's principal, and swapping the driver to token auth —
    and the first two are writes to the server resource, which is the password hazard at the top of
-   this section. Service Bus needs no server change, so the worker's Service Bus connection is
-   keyless today and its database connection is not.
+   this section. Service Bus needs no server change, so both Service Bus connections are keyless
+   today and the database connection is not.
+
+### Vercel's three variables
+
+None of these is a secret; the credential is the per-deployment OIDC token, which is minted by
+Vercel and never stored. Read them off the deployment outputs:
+
+```bash
+az deployment group show -g rg-switchback-prod-northcentralus -n switchback-ingest \
+  --query "properties.outputs.{namespace:serviceBusFullyQualifiedNamespace.value,\
+client:publisherClientId.value,tenant:publisherTenantId.value}" -o json
+```
+
+→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` on the Vercel project, plus
+`INGEST_QUEUE_DRIVER=servicebus`. The exchange fails silently at Entra if the Vercel **team or
+project is renamed** — the `sub` claim follows the new name and the federated credential does not.
+Fixing that is a one-parameter redeploy of this template.
 
 ---
 
