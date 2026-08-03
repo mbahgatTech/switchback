@@ -138,12 +138,17 @@ export class TerrainSource {
       return;
     }
     await new Promise<void>((resolve) => this.waiting.push(resolve));
-    this.active += 1;
   }
 
+  // The slot goes straight to the next waiter rather than being freed and the waiter woken, so
+  // `active` never dips below the cap between the two — see the same shape in `overpass.ts`.
   private release(): void {
+    const next = this.waiting.shift();
+    if (next) {
+      next();
+      return;
+    }
     this.active -= 1;
-    this.waiting.shift()?.();
   }
 
   /** Load every tile a coordinate list needs, keyed the way `sampleElevations` expects. */

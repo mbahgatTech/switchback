@@ -138,6 +138,23 @@ up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker
 on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining: lease recovery lives
 inside `drainJobs`, so skipping the drain would otherwise take it too.
 
+**Turning it on. The order is the mirror of the rollback below, and it matters for the same
+reason.** Vercel first, worker last:
+
+```
+vercel env add INGEST_QUEUE_DRIVER servicebus     # 1. plus the three identifiers beside it
+                                                  #    then redeploy — minutes
+curl -s https://<deployment>/api/version          # 2. confirm the deploy carrying the flag is live
+az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=servicebus
+                                                  # 3. the worker starts draining, seconds
+```
+
+Between 1 and 3 nothing drains twice: Vercel has stopped and the worker has not started, so tiles
+wait for the next pump tick. Doing 3 first is the state this design exists to prevent — Vercel still
+draining `ingest_jobs` inline while the worker drains the same table — and it is worth naming that
+it happened here: the flag was set on the Function App while production Vercel still served a commit
+whose `kickIngest` drained unconditionally, and the first end-to-end run was collected in that state.
+
 **At 3am.** Two brakes, neither of which is a deploy, and **the order is not arbitrary**:
 
 ```
@@ -190,6 +207,25 @@ Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` 
 gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline from a public
 procedure the planner fires on every viewport settle, and since the pump publishes that kind too, it
 had two drainers.
+
+**"Vercel fetches nothing" is per Vercel environment, not per deployment.** Production and Preview
+hold `INGEST_QUEUE_DRIVER` independently, and both point at the production database, so an
+environment left on `postgres` is a second drainer against the same `ingest_jobs` — with its own
+`OverpassClient` on every warm lambda. Both environments carry `servicebus` now. The residue is
+branches cut before this flag existed: their code has no `ingestQueueDriver` call to make, so their
+previews drain inline whatever the environment says, until they rebase onto master.
+
+**The client's retry budget has to fit inside `functionTimeout`.** Consumption ends an invocation at
+ten minutes and will not raise it; `OverpassClient`'s own worst case on the defaults is six attempts
+of 190 s plus backoff — about 24 minutes for one query, and `processTile` makes several. That is not
+theoretical: `ingest_tile:120221221` ran 600008 ms on 2026-08-03 and the host killed the worker
+mid-tile. Two numbers reconcile it, both set in `ingest.bicep`: `INGEST_OVERPASS_DEADLINE_MS` (300 s)
+is the last moment the worker will _start_ a query, and `OVERPASS_MAX_TOTAL_MS` (240 s) is the most
+one query may then spend across every retry — 540 s worst case inside 600 s. Past the deadline the
+Overpass view throws, `drainJobs` catches it per job, writes `lastError` and releases the lease,
+which is a far cheaper failure than the host killing the process. And the pump now calls
+`reclaimExpiredJobs` on its two-minute tick, so a lease that _is_ stranded comes back in minutes
+rather than waiting for the daily cron.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

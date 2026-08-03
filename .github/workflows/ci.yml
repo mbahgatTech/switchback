@@ -238,8 +238,35 @@ jobs:
             exit 1
           }
 
+          ls "$RUNNER_TEMP"/verify/node_modules/.prisma/client/libquery_engine-*.so.node >/dev/null || {
+            echo "::error::the zip has no Linux query engine — @prisma/client is present but cannot run."
+            exit 1
+          }
+
           cd "$RUNNER_TEMP/verify"
           node -e "require('./index.js'); console.log('worker entry point loaded from the zip')"
+
+          # `require` alone never asks Prisma for its engine, so a bundle carrying the wrong
+          # platform's binary would pass the line above and die on the worker's first query.
+          # `$connect` against a closed port loads the engine and then fails on the network,
+          # which is the one failure this step accepts.
+          node -e "
+            const { PrismaClient } = require('@prisma/client');
+            new PrismaClient({ datasources: { db: { url: 'postgresql://u:p@127.0.0.1:1/none' } } })
+              .\$connect()
+              .then(
+                () => { console.error('unexpected: connected to a closed port'); process.exit(1); },
+                (error) => {
+                  const message = String(error && error.message);
+                  if (/engine|\.so\.node|platform/i.test(message)) {
+                    console.error('::error::Prisma could not load its query engine from the zip');
+                    console.error(message);
+                    process.exit(1);
+                  }
+                  console.log('PrismaClient loaded its query engine from the zip');
+                },
+              );
+          "
 
       - uses: actions/upload-artifact@v4
         with:

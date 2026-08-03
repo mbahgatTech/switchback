@@ -28,11 +28,13 @@ interface FindManyArgs {
 
 const silent: WorkerLog = { info: () => {}, warn: () => {}, error: () => {} };
 
-function fakeDb(rows: { primary?: string[]; derived?: string[] } = {}): {
+function fakeDb(rows: { primary?: string[]; derived?: string[]; reclaimed?: JobStatus[] } = {}): {
   db: Db;
   calls: FindManyArgs[];
+  sweeps: number;
 } {
   const calls: FindManyArgs[] = [];
+  const state = { sweeps: 0 };
   const db = {
     ingestJob: {
       findMany: async (args: FindManyArgs) => {
@@ -41,8 +43,19 @@ function fakeDb(rows: { primary?: string[]; derived?: string[] } = {}): {
         return pool.slice(0, args.take).map((dedupeKey) => ({ dedupeKey }));
       },
     },
+    // What `reclaimExpiredJobs` runs: one statement returning the new status per row.
+    $queryRaw: async () => {
+      state.sweeps += 1;
+      return (rows.reclaimed ?? []).map((status) => ({ status }));
+    },
   };
-  return { db: db as unknown as Db, calls };
+  return {
+    db: db as unknown as Db,
+    calls,
+    get sweeps() {
+      return state.sweeps;
+    },
+  };
 }
 
 function fakeQueue(active: number): SignalQueue & { published: string[]; counted: number } {
@@ -104,13 +117,26 @@ describe('runPump', () => {
     expect(derived?.take).toBe(PUMP_DERIVED_SHARE);
   });
 
-  it('leaves a busy queue alone without touching the database', async () => {
-    const { db, calls } = fakeDb({ primary: ['ingest_tile:a'] });
+  it('publishes no new signals while the worker still has messages to chew on', async () => {
+    const fake = fakeDb({ primary: ['ingest_tile:a'] });
     const queue = fakeQueue(PUMP_LOW_WATER);
 
-    expect(await runPump(db, queue, silent)).toEqual({ published: 0 });
-    expect(calls).toEqual([]);
+    expect(await runPump(fake.db, queue, silent)).toEqual({ published: 0 });
+    expect(fake.calls).toEqual([]);
     expect(queue.published).toEqual([]);
+  });
+
+  it('reclaims expired leases even on the ticks when it publishes nothing', async () => {
+    // The lease of an invocation the host killed at `functionTimeout` is recovered here, not
+    // only by the daily cron — and a busy queue is exactly when a stuck lease is likeliest,
+    // so an early return before the sweep would strand the tile for a day.
+    const busy = fakeDb({ primary: ['ingest_tile:a'], reclaimed: [JobStatus.queued] });
+    await runPump(busy.db, fakeQueue(PUMP_LOW_WATER), silent);
+    expect(busy.sweeps).toBe(1);
+
+    const idle = fakeDb();
+    await runPump(idle.db, fakeQueue(0), silent);
+    expect(idle.sweeps).toBe(1);
   });
 
   it('publishes nothing when there is no runnable work', async () => {

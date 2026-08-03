@@ -3,13 +3,33 @@
  * result means to the broker, which is where the two systems have to agree.
  */
 
-import { drainIngest } from '@switchback/ingest';
-import type { DrainResult } from '@switchback/ingest';
+import { drainIngest, getOverpass, withDeadline } from '@switchback/ingest';
+import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 import type { IngestSignal } from './message';
 
 /** The seam tests replace. Production always passes `drainIngest`. */
 export type Drain = typeof drainIngest;
+
+/**
+ * How long into an invocation this worker will still *start* an Overpass request.
+ *
+ * `host.json` sets `functionTimeout` to ten minutes and Consumption will not raise it — the host
+ * kills the process, which strands the `ingest_jobs` lease and redelivers the message. So the
+ * numbers have to be reconciled rather than merely both written down:
+ *
+ *     300 s  this deadline — the last moment a query may start
+ *   + 240 s  OVERPASS_MAX_TOTAL_MS, the most that one query may then spend (ingest.bicep)
+ *   = 540 s  worst case in Overpass, inside the host's 600 s, leaving 60 s to finish the write
+ *
+ * Observed before this existed: `ingest_tile:120221221` ran 600008 ms and was killed mid-tile.
+ */
+export const OVERPASS_DEADLINE_MS = 300_000;
+
+function deadlineMs(source: NodeJS.ProcessEnv = process.env): number {
+  const value = Number(source.INGEST_OVERPASS_DEADLINE_MS);
+  return Number.isFinite(value) && value > 0 ? value : OVERPASS_DEADLINE_MS;
+}
 
 /**
  * Claim and run the one job a message names.
@@ -25,9 +45,12 @@ export type Drain = typeof drainIngest;
 export async function runIngestSignal(
   signal: IngestSignal,
   log: WorkerLog,
-  options: { workerId: string; drain?: Drain },
+  options: { workerId: string; drain?: Drain; overpass?: OverpassQuerier },
 ): Promise<DrainResult> {
   const drain = options.drain ?? drainIngest;
+  // A view of the shared client, not a second one: the queue and the breaker stay the
+  // singleton's, so the concurrency ceiling is unchanged.
+  const overpass = options.overpass ?? withDeadline(getOverpass(), Date.now() + deadlineMs());
 
   let result: DrainResult;
   try {
@@ -36,6 +59,7 @@ export async function runIngestSignal(
       derivedLimit: 0,
       dedupeKeys: [signal.dedupeKey],
       workerId: options.workerId,
+      deps: { overpass },
     });
   } catch (error) {
     /*

@@ -5,10 +5,17 @@
 export const BRAND = {
   name: 'Switchback',
   tagline: 'Know the trail before you hike it.',
-  domain: 'switchback.app',
+  /*
+   * The origin this product is actually served from. It was `switchback.app` until that turned
+   * out to be registered to somebody else and serving an unrelated site — and this file feeds
+   * the Overpass and Nominatim contact URL, where naming a host you cannot be reached at is
+   * what gets a client blocked. Change these three together, and only to something you own.
+   */
+  domain: 'switchback-three.vercel.app',
   /** Sent as the User-Agent contact on every outbound OSM/Overpass request. */
-  contactUrl: 'https://switchback.app/attribution',
-  supportEmail: 'support@switchback.app',
+  contactUrl: 'https://switchback-three.vercel.app/attribution',
+  /** A takedown notice has to reach a person; there is no mailbox on the domain above yet. */
+  supportEmail: 'mazenbahgat@outlook.com',
 } as const;
 
 /**

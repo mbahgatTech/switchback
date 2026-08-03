@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "description": "Azure Functions host for the ingest queue: a Service Bus trigger that drains one job per message.",
-  "//concurrency": "The Overpass ceiling is two concurrent requests and it is enforced here by `maxConcurrentCalls: 1` in host.json times the one `OverpassClient` singleton in packages/ingest/src/config.ts, which caps itself at 2. Both halves matter and README.md traces the whole chain, including the two app settings this workspace does not own.",
+  "//concurrency": "Two concurrent Overpass requests per host instance, one instance except across a recycle. The ceiling rests on the scale limit in ingest.bicep times the one OverpassClient singleton in packages/ingest/src/config.ts, which caps itself at 2 — not on host.json's maxConcurrentCalls, which the host multiplies by the instance's core count. README.md traces the whole chain, including the app settings this workspace does not own.",
+  "//timeout": "host.json's functionTimeout is 10 minutes and Consumption will not raise it. OVERPASS_MAX_TOTAL_MS, set in ingest.bicep, is what keeps one query's retry budget under that; see the reconciliation in infra/azure/ingest.bicep.",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsx scripts/bundle.ts",

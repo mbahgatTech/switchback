@@ -4,7 +4,7 @@
  */
 
 import { JobStatus } from '@switchback/db';
-import { DERIVED_JOB_KINDS } from '@switchback/ingest';
+import { DERIVED_JOB_KINDS, reclaimExpiredJobs } from '@switchback/ingest';
 import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 
@@ -86,6 +86,20 @@ export async function runPump(
   now = new Date(),
   bounds: PumpBounds = pumpBounds(),
 ): Promise<{ published: number }> {
+  /*
+   * Before publishing, not after: a job whose worker the host killed mid-drain still holds its
+   * lease, and the pump would otherwise keep re-signalling a row no worker can claim. Recovery
+   * used to belong to the daily Vercel cron alone, which meant an invocation that outran
+   * `functionTimeout` stranded its tile for up to a day. Cheap — one UPDATE over an indexed
+   * predicate — and it runs on the same two-minute tick.
+   */
+  const reclaimed = await reclaimExpiredJobs(db, now);
+  if (reclaimed.requeued > 0 || reclaimed.retired > 0) {
+    log.warn(
+      `ingest pump: reclaimed ${reclaimed.requeued} expired lease(s), retired ${reclaimed.retired}`,
+    );
+  }
+
   const active = await queue.activeCount();
   const plan = planPump(active, bounds.depth, bounds.lowWater);
   if (plan.primary === 0 && plan.derived === 0) return { published: 0 };

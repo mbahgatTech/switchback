@@ -4,7 +4,13 @@ import { useEffect, useId, useMemo, useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import type { SelfProfile, ThemePreference, UnitSystem, Visibility } from '@switchback/core';
-import { THEME_PREFERENCES, UNIT_SYSTEMS, VISIBILITIES, usernameSchema } from '@switchback/core';
+import {
+  BRAND,
+  THEME_PREFERENCES,
+  UNIT_SYSTEMS,
+  VISIBILITIES,
+  usernameSchema,
+} from '@switchback/core';
 import { rememberTheme } from '../../lib/theme-action';
 import { forgetReaderNow } from '../../offline/reader';
 import { useTRPC } from '../../trpc/react';
@@ -140,7 +146,7 @@ function Identity({ me }: { me: SelfProfile }) {
           label="Username"
           hint={
             trimmed
-              ? `switchback.app/u/${trimmed}`
+              ? `${BRAND.domain}/u/${trimmed}`
               : 'Choose one and your profile gets a public address.'
           }
         >

@@ -1136,7 +1136,7 @@ branch on the flag. Raising any row above is not a throughput knob.
 az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered by default
 
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
-export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app)"
+export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
 
 az deployment group create \
@@ -1148,9 +1148,13 @@ unset INGEST_DATABASE_URL
 ```
 
 Both exported strings are load-bearing and both have bitten. `INGEST_OVERPASS_USER_AGENT` must carry
-an `http(s)://` contact URL and must not contain `example.com` — `assertUsableUserAgent` in
-`packages/ingest/src/overpass.ts` throws on either, inside the handler, so the worker dead-letters
-every tile after five deliveries with a message that names the database rather than the user agent.
+an `http(s)://` contact URL that reaches _this_ project — `assertUsableUserAgent` in
+`packages/ingest/src/overpass.ts` throws inside the handler on a placeholder or on a host it knows is
+not ours, so the worker dead-letters every tile after five deliveries with a message that names the
+database rather than the user agent. `switchback.app` is on that rejected list by name: it reads like
+ours, is registered to somebody else, and was what the Function App actually sent on every Overpass
+request until 2026-08-03. Only the shape can be checked in code — that a URL reaches you is the one
+thing the operator has to get right.
 `INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
 with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
 Postgres/Service Bus fan-out that an operator had just rolled back.
@@ -1208,10 +1212,16 @@ az rest --method PUT    --url "https://management.azure.com$LOCK?api-version=202
 ```
 
 Done on 2026-08-03T18:10Z, along with the dead `vercel-send` SAS rule on the queue, which
-`disableLocalAuth: true` had already made unusable but which the template also does not declare. The
-lock body is the one `main.bicep` declares, so putting it back restores the template's own state
-rather than inventing one. `az role assignment list` and `az role assignment delete` both fail here
-with a spurious `MissingSubscription`; ARM REST is the working path.
+`disableLocalAuth: true` had already made unusable but which the template also does not declare.
+`az role assignment list` and `az role assignment delete` both fail here with a spurious
+`MissingSubscription`; ARM REST is the working path.
+
+That first re-PUT put back a 178-character paraphrase, not `main.bicep`'s body — so for eight hours
+the only text an operator met when the lock blocked them was missing the sentence demanding a pull
+request, and production drifted from the template in the one resource guarding irreversible data
+loss. Re-PUT verbatim at 2026-08-03T20:07Z from `lockNotes` in `main.bicep`, now 445 characters and
+byte-identical; `az rest --method GET .../locks` is how to check. Read `lock.json` out of the
+template rather than typing it, which is what went wrong the first time.
 
 **A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
 gets exactly the three assignments the template declares. This step existed only to converge the

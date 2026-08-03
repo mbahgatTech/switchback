@@ -4,6 +4,8 @@
  *
  * - A serialized queue at `maxConcurrent` (default 2) — slots are allotted per client IP.
  * - Backoff with jitter that honours `Retry-After`, 429 and 504 over its own schedule.
+ * - An optional `maxTotalMs` budget per query, because a host that kills the process at ten
+ *   minutes is not bounded by an attempt count multiplied by a per-request timeout.
  * - Mirror failover: `url` is a list, because an IP block arrives as a reset with no status.
  * - A circuit breaker after `failureThreshold` consecutive failures across every mirror;
  *   callers fail soft to cached data.
@@ -59,6 +61,14 @@ export interface OverpassRelation {
 
 export type OverpassElement = OverpassNode | OverpassWay | OverpassRelation | OverpassArea;
 
+/**
+ * What the pipeline needs from Overpass. Narrow on purpose: it is what lets a caller with a
+ * wall-clock ceiling wrap the shared client without owning a second queue — see `withDeadline`.
+ */
+export interface OverpassQuerier {
+  query(ql: string): Promise<OverpassResponse>;
+}
+
 export interface OverpassResponse {
   version?: number;
   generator?: string;
@@ -90,6 +100,12 @@ export interface OverpassOptions {
   openMs?: number;
   /** Per-request timeout. Overpass's own `[timeout:]` is separate and set in the query. */
   requestTimeoutMs?: number;
+  /**
+   * Wall clock one `query()` may spend, retries and backoff included. Unset means the only
+   * ceiling is `maxAttempts x requestTimeoutMs` plus backoff, which on the defaults is ~24
+   * minutes — longer than the Function App host will let an invocation live. See `attempt`.
+   */
+  maxTotalMs?: number;
   fetchImpl?: typeof fetch;
   /** Injected in tests so backoff is instant rather than actually waiting 30 s. */
   sleepImpl?: (ms: number) => Promise<unknown>;
@@ -142,35 +158,48 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 const REMARK_FAILURE = /error|timed out|too busy|out of memory|please try again/i;
 
 /**
- * Hosts that mean "I never filled this in". Overpass's front end answers a User-Agent
- * containing one with `406 Not Acceptable` from Apache, before the query runs at all.
- * Checked in the constructor: a bad UA is never transient and never worth a retry.
+ * Hosts a contact URL must not name. The RFC 2606 four and `localhost` mean "I never filled this
+ * in", and Overpass's front end answers a User-Agent carrying one with `406 Not Acceptable` from
+ * Apache before the query runs at all.
+ *
+ * `switchback.app` is here for the opposite reason and is the entry a maintainer would delete as
+ * obviously wrong: it reads like ours and is not. It belongs to somebody else and serves an
+ * unrelated site, so an Overpass operator following it to complain about this client reaches a
+ * stranger — which is the condition they block for. It was deployed once. Only shape can be
+ * checked here; that a URL reaches *this* project is a fact no constructor can verify.
  */
-const PLACEHOLDER_HOSTS = ['example.com', 'example.org', 'example.net', 'localhost', 'yourdomain'];
+const UNREACHABLE_HOSTS = [
+  'example.com',
+  'example.org',
+  'example.net',
+  'localhost',
+  'yourdomain',
+  'switchback.app',
+];
 
 /**
  * Reject a User-Agent a public instance will refuse, while it can still be fixed by editing
- * `.env`. Two rules, both learned from a real 406: a contact URL, and not a placeholder.
+ * `.env`. Two rules, both learned from a real 406: a contact URL, and one that reaches us.
  */
 function assertUsableUserAgent(userAgent: string): void {
   const hint =
-    'e.g. OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback.app)". ' +
+    'e.g. OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)". ' +
     'It must carry a URL or address that reaches a human — Overpass operators block clients they cannot contact.';
 
   if (!/https?:\/\/\S/.test(userAgent)) {
     throw new Error(`OVERPASS_USER_AGENT must include a contact URL. ${hint}`);
   }
 
-  const placeholder = PLACEHOLDER_HOSTS.find((host) => userAgent.toLowerCase().includes(host));
-  if (placeholder) {
+  const unreachable = UNREACHABLE_HOSTS.find((host) => userAgent.toLowerCase().includes(host));
+  if (unreachable) {
     throw new Error(
-      `OVERPASS_USER_AGENT contains the placeholder "${placeholder}", which overpass-api.de rejects ` +
-        `with 406 Not Acceptable before running the query. Replace it with a real contact — ${hint}`,
+      `OVERPASS_USER_AGENT names "${unreachable}", which does not reach this project — a mirror ` +
+        `answers such a client 406 Not Acceptable, or blocks it. Replace it with a real contact — ${hint}`,
     );
   }
 }
 
-export class OverpassClient {
+export class OverpassClient implements OverpassQuerier {
   private readonly endpoints: readonly string[];
   private readonly userAgent: string;
   private readonly maxConcurrent: number;
@@ -180,6 +209,7 @@ export class OverpassClient {
   private readonly failureThreshold: number;
   private readonly openMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly maxTotalMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<unknown>;
   private readonly now: () => number;
@@ -215,6 +245,7 @@ export class OverpassClient {
     this.failureThreshold = options.failureThreshold ?? 5;
     this.openMs = options.openMs ?? 60_000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 190_000;
+    this.maxTotalMs = options.maxTotalMs ?? Number.POSITIVE_INFINITY;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.sleepImpl = options.sleepImpl ?? ((ms) => sleep(ms));
     this.now = options.now ?? (() => Date.now());
@@ -270,8 +301,21 @@ export class OverpassClient {
     // Rotating onto a fresh mirror is free, so the backoff sleep is charged only once the
     // rotation wraps back onto a host we have already annoyed.
     const tried = new Set<string>();
+    const startedAt = this.now();
+    const remaining = (): number => this.maxTotalMs - (this.now() - startedAt);
 
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      /*
+       * The budget is checked here rather than raced against the whole call, so a request that
+       * is already in flight is allowed to finish: an answer arriving at the deadline is worth
+       * more than a clean abort. What it forbids is *starting* work that cannot finish in time.
+       */
+      const left = remaining();
+      if (attempt > 1 && left <= 0) {
+        lastError ??= new Error(`Overpass gave up after ${this.maxTotalMs} ms`);
+        break;
+      }
+
       const endpoint = this.endpoints[this.cursor % this.endpoints.length] ?? DEFAULT_ENDPOINTS[0];
       tried.add(endpoint);
 
@@ -281,11 +325,15 @@ export class OverpassClient {
       const retry = async (): Promise<void> => {
         this.cursor = (this.cursor + 1) % this.endpoints.length;
         const next = this.endpoints[this.cursor] ?? endpoint;
-        if (tried.has(next)) await this.sleepImpl(this.backoffMs(attempt, retryAfter));
+        if (tried.has(next)) {
+          await this.sleepImpl(
+            Math.min(this.backoffMs(attempt, retryAfter), Math.max(remaining(), 0)),
+          );
+        }
       };
 
       try {
-        const response = await this.send(ql, endpoint);
+        const response = await this.send(ql, endpoint, Math.min(this.requestTimeoutMs, left));
 
         if (response.ok) {
           // Read as text, not `.json()`: a busy dispatcher answers 200 with an XHTML error
@@ -322,9 +370,9 @@ export class OverpassClient {
     throw lastError instanceof Error ? lastError : new Error('Overpass request failed');
   }
 
-  private async send(ql: string, endpoint: string): Promise<Response> {
+  private async send(ql: string, endpoint: string, timeoutMs: number): Promise<Response> {
     const controller = new AbortController();
-    const timer = globalThis.setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const timer = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await this.fetchImpl(endpoint, {
         method: 'POST',
@@ -386,6 +434,42 @@ export class OverpassClient {
     }
     this.active -= 1;
   }
+}
+
+/** Thrown by a `withDeadline` view once its window has closed. */
+export class OverpassDeadlineError extends Error {
+  constructor(overrunMs: number) {
+    super(`Overpass deadline for this invocation passed ${Math.round(overrunMs / 1000)}s ago`);
+    this.name = 'OverpassDeadlineError';
+  }
+}
+
+/**
+ * The same client, but refusing to *start* a query after `at`.
+ *
+ * For a host that kills the process on a wall clock — Azure Functions Consumption ends an
+ * invocation at ten minutes, no extension available. A handler makes several queries in
+ * sequence, so bounding each one is not enough to bound the handler; this bounds the handler,
+ * and `maxTotalMs` bounds how far past the deadline the one query already running can carry it.
+ * A view rather than a second client: the queue, the breaker and the mirror cursor are the
+ * shared instance's, which is the property the whole concurrency argument rests on.
+ *
+ * Failing here is the good outcome. The alternative is the host killing the worker mid-tile,
+ * which strands the `ingest_jobs` lease and redelivers the message; a throw is caught per job,
+ * writes `lastError`, releases the lease and schedules a retry.
+ */
+export function withDeadline(
+  client: OverpassQuerier,
+  at: number,
+  now: () => number = () => Date.now(),
+): OverpassQuerier {
+  return {
+    query(ql: string): Promise<OverpassResponse> {
+      const overrun = now() - at;
+      if (overrun >= 0) return Promise.reject(new OverpassDeadlineError(overrun));
+      return client.query(ql);
+    },
+  };
 }
 
 async function safeText(response: Response): Promise<string> {

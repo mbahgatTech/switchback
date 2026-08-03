@@ -49,7 +49,7 @@ import {
   buildTileQuery,
   buildWayGeometryQuery,
 } from './overpass';
-import type { OverpassClient, OverpassElement, OverpassRelation } from './overpass';
+import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
 import { Gate, forEachConcurrent } from './pool';
 
@@ -116,7 +116,8 @@ export const TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface PipelineDeps {
   db?: PrismaClient;
-  overpass: OverpassClient;
+  /** The shared client, or a `withDeadline` view of it — never a second client. */
+  overpass: OverpassQuerier;
   terrain?: TerrainSource;
   now?: () => Date;
   mapillaryToken?: string;

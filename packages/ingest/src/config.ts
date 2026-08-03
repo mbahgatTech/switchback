@@ -18,9 +18,19 @@ export function getOverpass(): OverpassClient {
       url: splitList(process.env.OVERPASS_URL),
       userAgent: process.env.OVERPASS_USER_AGENT ?? '',
       maxConcurrent: Number(process.env.OVERPASS_MAX_CONCURRENT ?? 2),
+      ...positive('OVERPASS_MAX_TOTAL_MS', 'maxTotalMs'),
     });
   }
   return overpassClient;
+}
+
+/**
+ * One numeric option, present only when the variable holds a usable number — absent rather than
+ * `NaN`, so a typo falls back to the client's own default instead of poisoning its arithmetic.
+ */
+function positive<K extends string>(name: string, key: K): Partial<Record<K, number>> {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? ({ [key]: value } as Record<K, number>) : {};
 }
 
 /**

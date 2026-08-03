@@ -7,7 +7,7 @@
 // shell that runs `az deployment`:
 //
 //   export INGEST_DATABASE_URL="$(...)"          # the application login, same string Vercel holds
-//   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app)"
+//   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 //   export INGEST_QUEUE_DRIVER=postgres          # or servicebus; there is no default, state it
 //   az deployment group create \
 //     --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \

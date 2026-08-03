@@ -13,7 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { SelfProfile, UnitSystem, Visibility } from '@switchback/core';
-import { UNIT_SYSTEMS, VISIBILITIES, plural, usernameSchema } from '@switchback/core';
+import { BRAND, UNIT_SYSTEMS, VISIBILITIES, plural, usernameSchema } from '@switchback/core';
 import { CONTROL_HEIGHT, nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
 import { useTRPC } from '@/api/trpc';
@@ -263,7 +263,7 @@ function Identity({ me }: { me: SelfProfile }) {
 
       <Field
         label="Username"
-        hint={trimmed ? `switchback.app/u/${trimmed}` : 'gives you a public address'}
+        hint={trimmed ? `${BRAND.domain}/u/${trimmed}` : 'gives you a public address'}
       >
         {/*
          * Lowercased as it is typed, not on submit: the schema only takes lowercase and the

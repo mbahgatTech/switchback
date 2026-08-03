@@ -530,12 +530,22 @@ lease from the first attempt, so the handler logs "nothing claimable" and the ti
 is visible in the portal alongside the scale limit. **Raising either of these breaks the fair-use
 guarantee.** They are not throughput knobs.
 
-Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes this
-a whole-deployment statement rather than a per-host one. Three call sites reach Overpass from a
-Vercel process and all three are gated on that flag: the cron route's `drainOrReclaim`, `trails.ts`'s
-`kickIngest`, and `routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network`
-inline from a public procedure the planner fires on every viewport settle, which the pump also
-publishes, so that kind had two drainers while this comment asserted it had one.
+Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus` — but that is a property
+of *a Vercel environment*, not of the deployment. Production and Preview each carry the flag, or do
+not, independently, and a branch deployed before the flag existed drains inline whatever the
+environment says because its code has no `ingestQueueDriver` call to make. Three call sites reach
+Overpass from a Vercel process and all three are gated on the flag: the cron route's
+`drainOrReclaim`, `trails.ts`'s `kickIngest`, and `routes.ts`'s `kickNetwork`. The last was missed
+once — it drained `ingest_network` inline from a public procedure the planner fires on every
+viewport settle, which the pump also publishes, so that kind had two drainers while this comment
+asserted it had one.
+
+**The host's 10-minute `functionTimeout` bounds the handler, so the client has to be bounded too.**
+`OverpassClient`'s own worst case on the defaults is `maxAttempts` 6 x `requestTimeoutMs` 190 s plus
+backoff — roughly 24 minutes for *one* query, and `processTile` issues several. Left alone the host
+wins that race: it kills the process mid-tile, which strands the `ingest_jobs` lease and redelivers
+the message. `INGEST_OVERPASS_DEADLINE_MS` and `OVERPASS_MAX_TOTAL_MS` below are the two numbers
+that make it fit; the arithmetic is beside them.
 
 ---
 
@@ -685,6 +695,20 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           {
             name: 'OVERPASS_MAX_CONCURRENT'
             value: '2'
+          }
+          // The two halves of the reconciliation with `functionTimeout`, which Consumption fixes
+          // at 10 minutes and will not raise. 300 s is the last moment the worker will *start* an
+          // Overpass query; 240 s is the most that one query may then spend across every retry.
+          // 540 s worst case, inside 600 s, leaving a minute to write the tile. Before these, one
+          // query's own budget was six attempts of 190 s plus backoff — about 24 minutes — and
+          // `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
+          {
+            name: 'INGEST_OVERPASS_DEADLINE_MS'
+            value: '300000'
+          }
+          {
+            name: 'OVERPASS_MAX_TOTAL_MS'
+            value: '240000'
           }
           {
             name: 'NODE_ENV'
