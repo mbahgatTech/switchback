@@ -70,6 +70,16 @@ it.
 genuinely retryable failure, and the reason a dead-lettered message means either that or a body
 nobody can read. Both want a person.
 
+**The tile is bigger than `functionTimeout`** — the host kills the invocation at ten minutes and
+the message redelivers. Seen in production on 2026-08-03: `ingest_tile:120221221` ran to
+`Duration=600008ms`, preceded by Prisma `Transaction already closed` errors as individual trail
+transactions expired under the load. The redelivery finds the `ingest_jobs` row still under the
+lease the killed invocation took, logs "nothing claimable", and the tile waits for the lease sweep
+— which is the same recovery path as an instance recycle. It self-heals, but slowly, and a tile
+that _always_ exceeds ten minutes dead-letters on the fifth delivery and fires
+`switchback-ingest-deadletter`. That alert is the intended signal: the fix is to split the tile,
+not to raise the timeout.
+
 Nothing is passed over: `failed`, `deferred`, `lost`, `requeued` and `retired` each get their own
 line, because `lost` — work that finished after its lease was given away — is recorded nowhere
 else at all.
