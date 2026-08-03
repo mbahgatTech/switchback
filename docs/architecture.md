@@ -175,8 +175,15 @@ and still finishing in-flight messages — the two-drainer state this flag exist
 by following the runbook. Doing the worker first means the interval has neither side draining, which
 costs a wait and nothing else.
 
-Between steps 2 and 3, a queue message that arrives is dropped by the trigger and its `ingest_jobs`
-row simply waits for the Vercel cron; nothing is lost either way, because a message names work and
+**"Seconds" means the queue trigger, not the timer.** An app-settings write restarts the host, but a
+timer tick already scheduled on the outgoing process can still run once holding the old value.
+Observed standing the worker down at 21:21:56Z on 2026-08-03: the 21:24:00 pump published seven more
+signals while the restarted trigger, in the same second, logged
+`INGEST_QUEUE_DRIVER is not servicebus — dropping the signal` for each. Harmless — a published
+signal makes no Overpass request and the rows stay `queued` for Postgres — but it is why step 1
+exists and why "the worker stands down in seconds" is a statement about the drain, not the pump.
+
+Between steps 2 and 3, a queue message that arrives is dropped by the trigger and its `ingest_jobs`row simply waits for the Vercel cron; nothing is lost either way, because a message names work and
 never carries it.
 
 **The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
