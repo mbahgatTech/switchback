@@ -1155,12 +1155,27 @@ every tile after five deliveries with a message that names the database rather t
 with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
 Postgres/Service Bus fan-out that an operator had just rolled back.
 
-**The template deploy and the zip push always run together, template first.** Linux Consumption runs
-the code from a package URL that `az functionapp deployment source config-zip` writes into the same
-application-settings collection an ARM deployment replaces wholesale. `ingest.bicep` therefore does
-not declare `WEBSITE_RUN_FROM_PACKAGE` — and a Bicep deployment on its own leaves the app codeless
-until the next zip. For the same reason, a setting added by hand in the portal is erased by the next
-deployment: worker environment belongs in the template.
+**The template deploy and the zip push always run together, template first — and then a trigger
+sync.** Linux Consumption runs the code from a package URL that
+`az functionapp deployment source config-zip` writes into the same application-settings collection an
+ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
+— and a Bicep deployment on its own leaves the app codeless until the next zip. For the same reason,
+a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
+the template.
+
+The third step is not optional and cost half an hour to find. After an ARM deployment has removed
+`WEBSITE_RUN_FROM_PACKAGE` and the zip push has put it back, the host comes up reporting
+`0 functions loaded` / "No functions were found", `az functionapp function list` returns `[]`, and
+nothing ever wakes it — a Consumption app with no registered triggers has nothing to scale on, so it
+sits there indefinitely and a restart does not help. The scale controller's trigger cache has to be
+told:
+
+```bash
+az rest --method POST --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Web/sites/func-switchback-ingest-37ywppu5p7fri/syncfunctiontriggers?api-version=2023-12-01"
+```
+
+Within a minute `az functionapp function list` shows `ingestDrain` and `ingestPump`. Verified
+2026-08-03T18:47Z.
 
 `what-if` is safe and is the check worth running before any deploy — nothing under
 `Microsoft.DBforPostgreSQL` may appear as a create or a modify.

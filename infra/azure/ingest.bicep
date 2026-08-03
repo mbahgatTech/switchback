@@ -554,8 +554,12 @@ Linux Consumption runs the code from a package URL that `az functionapp deployme
 writes into this same collection — and an ARM application-settings write replaces the collection
 whole. Declaring it here would fight the zip deploy; omitting it means a Bicep deployment on its own
 leaves the app codeless until the next zip. So the template deploy and the zip push always run
-together, template first. Anything the worker needs from the environment belongs in this list for the
-same reason: a setting added by hand in the portal is erased by the next deployment.
+together, template first, **and a `syncfunctiontriggers` POST after** — otherwise the host comes back
+with `0 functions loaded`, `az functionapp function list` returns nothing, and a Consumption app with
+no registered triggers has nothing to scale on, so it never runs again and a restart does not fix it.
+See infra/azure/README.md for the command. Anything the worker needs from the environment belongs in
+this list for the same reason: a setting added by hand in the portal is erased by the next
+deployment.
 ''')
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: functionAppName

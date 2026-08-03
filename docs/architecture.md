@@ -149,7 +149,7 @@ vercel env rm INGEST_QUEUE_DRIVER production && vercel env add INGEST_QUEUE_DRIV
                                                                 # 3. redeploy: Vercel drains again
 ```
 
-Step 1 is instant and reversible and stops the queue filling — but it stops *new* publishes, not the
+Step 1 is instant and reversible and stops the queue filling — but it stops _new_ publishes, not the
 up-to-eight messages already on the queue, which the trigger keeps working. So the worker has to be
 the side that stands down first. Its setting is an app-settings write that restarts the host in
 seconds; Vercel's needs a redeploy of the project, minutes. Doing Vercel first means the interval
@@ -192,7 +192,7 @@ procedure the planner fires on every viewport settle, and since the pump publish
 had two drainers.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
-instances the scale controller adds; it does not stop Consumption *replacing* an instance, and for a
+instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a
 few seconds around a recycle two host instances of the same app are alive. Telemetry from
 2026-08-03T17:32 shows exactly that: `0--f7e39076-13` took sequence 1 at 17:32:00.884, `0--3f3e4037-7d`
 logged "Starting Host" at 17:32:13.797 and took sequence 2 at 17:32:15.175. Nothing in the telemetry

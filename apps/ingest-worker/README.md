@@ -25,6 +25,13 @@ both live in `infra/azure/ingest.bicep`, alongside
 `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1`. Changing either breaks the arithmetic, which is
 why they are written down here next to the setting that assumes them.
 
+Row one says "1" because `functionAppScaleLimit` stops the scale controller adding an instance for
+load. It does not stop Consumption **replacing** one, and around a replacement two hosts run at
+once with a client each — observed at 2026-08-03T17:32, where `0--f7e39076-13` took sequence 1 and
+`0--3f3e4037-7d` started 13 s later and took sequence 2. So the number to quote is 2 sustained, up
+to 4 for the seconds of a recycle. Overpass fair use is about sustained load, but a review that
+reads "2, always" from this table would be reading something the configuration does not say.
+
 The last two rows are the ones that actually hold. `maxConcurrentCalls` is documented as being
 multiplied by the instance's core count, so a guarantee resting on it alone would rest on "a
 Consumption instance is typically one CPU" — and it does not need to, because however many
