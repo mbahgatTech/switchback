@@ -5,6 +5,7 @@
 
 import { PNG } from 'pngjs';
 import type { ElevationPoint, LngLat } from '@switchback/core';
+import { IngestDeadlineError, assertBefore, requestBudgetMs } from './deadline';
 import {
   NO_DATA_ELEVATION,
   TERRARIUM_ZOOM,
@@ -22,11 +23,19 @@ import type { TerrariumTile } from '@switchback/geo';
  */
 const DEFAULT_CACHE_SIZE = 256;
 
+/**
+ * Per-request ceiling on one terrarium tile. A tile is ~64 KB from a CDN; twenty seconds is a
+ * dead connection, not a slow one. Without it a stalled socket has no timeout at all — Node's
+ * `fetch` does not impose one — which is how an invocation outran the host's ten minutes.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
 export interface TerrainSourceOptions {
   urlTemplate?: string;
   cacheSize?: number;
   maxConcurrent?: number;
   maxAttempts?: number;
+  requestTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<unknown>;
 }
@@ -40,6 +49,7 @@ export class TerrainSource {
   private readonly cacheSize: number;
   private readonly maxConcurrent: number;
   private readonly maxAttempts: number;
+  private readonly requestTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<unknown>;
 
@@ -54,6 +64,7 @@ export class TerrainSource {
     this.cacheSize = options.cacheSize ?? DEFAULT_CACHE_SIZE;
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? 6);
     this.maxAttempts = options.maxAttempts ?? 3;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.sleepImpl =
       options.sleepImpl ?? ((ms) => new Promise((r) => globalThis.setTimeout(r, ms)));
@@ -74,8 +85,12 @@ export class TerrainSource {
   /**
    * One tile, from cache or the network. `null` for a tile that does not exist — the bucket
    * 404s over open ocean and outside the DEM's coverage, and that is data, not an error.
+   *
+   * `deadlineAt` is the invocation's wall clock, not this request's: past it, `load` throws
+   * rather than starting or continuing. A cache hit is always served, deadline or not — it
+   * costs nothing and refusing it would fail a trail the source could already answer for.
    */
-  async tile(z: number, x: number, y: number): Promise<TerrariumTile | null> {
+  async tile(z: number, x: number, y: number, deadlineAt?: number): Promise<TerrariumTile | null> {
     const key = tileKey(z, x, y);
 
     if (this.cache.has(key)) {
@@ -88,7 +103,7 @@ export class TerrainSource {
     const existing = this.inflight.get(key);
     if (existing) return existing;
 
-    const request = this.load(z, x, y)
+    const request = this.load(z, x, y, deadlineAt)
       .then((tile) => {
         this.remember(key, tile);
         return tile;
@@ -110,20 +125,37 @@ export class TerrainSource {
     }
   }
 
-  private async load(z: number, x: number, y: number): Promise<TerrariumTile | null> {
+  private async load(
+    z: number,
+    x: number,
+    y: number,
+    deadlineAt?: number,
+  ): Promise<TerrariumTile | null> {
+    // Before the queue, not after: waiting for a slot is time too, and a caller that has
+    // already run out of clock should not take one from a caller that has not.
+    assertBefore(deadlineAt, 'terrain');
     await this.acquire();
     try {
+      assertBefore(deadlineAt, 'terrain');
       let lastError: unknown;
       for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
         try {
-          const response = await this.fetchImpl(this.url(z, x, y));
+          const response = await this.fetchImpl(this.url(z, x, y), {
+            signal: AbortSignal.timeout(requestBudgetMs(this.requestTimeoutMs, deadlineAt)),
+          });
           if (response.status === 404 || response.status === 403) return null;
           if (!response.ok) throw new Error(`terrain tile ${z}/${x}/${y}: ${response.status}`);
           const buffer = Buffer.from(await response.arrayBuffer());
           return decodeTerrarium(buffer, z, x, y);
         } catch (error) {
+          // A deadline is not a transient fault and retrying it cannot help — the next
+          // attempt would fail the same assertion, three backoffs later.
+          if (error instanceof IngestDeadlineError) throw error;
           lastError = error;
-          if (attempt < this.maxAttempts) await this.sleepImpl(250 * 2 ** (attempt - 1));
+          if (attempt < this.maxAttempts) {
+            await this.sleepImpl(250 * 2 ** (attempt - 1));
+            assertBefore(deadlineAt, 'terrain');
+          }
         }
       }
       throw lastError instanceof Error ? lastError : new Error('terrain tile fetch failed');
@@ -155,12 +187,13 @@ export class TerrainSource {
   async tilesFor(
     coords: ReadonlyArray<readonly [number, number]>,
     z = TERRARIUM_ZOOM,
+    deadlineAt?: number,
   ): Promise<Map<string, TerrariumTile>> {
     const needed = requiredTiles(coords, z);
     const loaded = new Map<string, TerrariumTile>();
     await Promise.all(
       needed.map(async (t) => {
-        const tile = await this.tile(t.z, t.x, t.y);
+        const tile = await this.tile(t.z, t.x, t.y, deadlineAt);
         if (tile) loaded.set(tileKey(t.z, t.x, t.y), tile);
       }),
     );
@@ -196,6 +229,8 @@ export interface ElevateOptions {
    * evenly along the source, so sample `i` of `n` is at `length·i/(n−1)`.
    */
   alongLengthM?: number;
+  /** The invocation's wall clock, passed to the terrain source — see `TerrainSource.tile`. */
+  deadlineAt?: number;
 }
 
 export interface ElevatedProfile {
@@ -217,7 +252,7 @@ export async function elevateLine(
   const spacingM = options.spacingM ?? 25;
   const zoom = options.zoom ?? TERRARIUM_ZOOM;
 
-  const tiles = await source.tilesFor(coords, zoom);
+  const tiles = await source.tilesFor(coords, zoom, options.deadlineAt);
   const raw = sampleElevations(coords, tiles, zoom);
   const { filled, gapCount } = fillGaps(raw);
   const distances = alongDistancesM(coords, options.alongLengthM);

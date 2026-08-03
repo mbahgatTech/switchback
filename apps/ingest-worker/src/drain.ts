@@ -27,25 +27,41 @@ export type Drain = typeof drainIngest;
  * clamps each attempt into what is left of the budget — including the body read, which it did not
  * always. `test/drain.test.ts` asserts all three numbers against `host.json` and `ingest.bicep`.
  *
- * **This does not bound the invocation, and measurement says so.** Overpass is not the handler's
- * only wall clock: `TerrainSource` fetches a terrarium tile per DEM sample with no per-request
- * timeout and no budget of any kind (`packages/ingest/src/elevate.ts`), and the per-trail writes
- * are their own time. Run on 2026-08-03 with the flag on, five tiles: 021212220 at 205 s,
- * 031313102 at 415 s, 031313120 at 491 s — then 120221230 and 120221203, both dense alpine tiles,
- * killed at 612,947 ms and 615,938 ms. So 540 s is a bound on Overpass, not on `runIngestSignal`,
- * and a tile heavy enough still dies the way `ingest_tile:120221221` did.
+ * **Overpass is not the only wall clock in the handler, so this alone never bounded the
+ * invocation.** Measured on 2026-08-03 with the flag on: 021212220 at 205 s, 031313102 at 415 s,
+ * 031313120 at 491 s — then 120221230 and 120221203, both dense alpine tiles, killed at
+ * 612,947 ms and 615,938 ms with Overpass inside its budget throughout. Elevation was unbounded
+ * (`TerrainSource` had no per-request timeout and no budget) and so were the per-trail commits.
+ * The same window has `[HostMonitor] Host CPU threshold exceeded (99 >= 80)` repeating from 22:24
+ * to 23:04 with `ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so contention
+ * on one saturated Consumption instance is a second, independent term — and one the
+ * `maxConcurrentCalls: 1` argument above does not cover, because the timer trigger is not a
+ * queue message and runs alongside the drain regardless.
  *
- * Worse, it dies quietly. The redelivery finds the row still leased, logs "nothing claimable" and
- * *completes* the message in ~165 ms — so `DeliveryCount` never climbs, nothing dead-letters, and
- * `switchback-ingest-deadletter` does not fire. The tile loops on the lease sweep instead, at a
- * killed ten-minute invocation per attempt. See apps/ingest-worker/README.md, which describes the
- * dead-letter path this failure mode does not actually take.
+ * `INGEST_DEADLINE_MS` is the answer to both: a single wall clock handed to every phase through
+ * `PipelineDeps.deadlineAt`, so terrain and commits refuse to start past it just as Overpass
+ * does. Overpass keeps its own earlier deadline because it may then spend 240 s more.
  */
 export const OVERPASS_DEADLINE_MS = 300_000;
+
+/**
+ * The whole handler's wall clock, measured from the moment the message arrives.
+ *
+ * 540 s leaves 60 s of the host's 600 s for the phase that was already running when the clock
+ * ran out — one terrain fetch (20 s cap), one trail's transaction — plus the job bookkeeping.
+ * It is deliberately the same number as the Overpass worst case: past 540 s no phase may
+ * *begin*, whichever phase it is.
+ */
+export const HANDLER_DEADLINE_MS = 540_000;
 
 function deadlineMs(source: NodeJS.ProcessEnv = process.env): number {
   const value = Number(source.INGEST_OVERPASS_DEADLINE_MS);
   return Number.isFinite(value) && value > 0 ? value : OVERPASS_DEADLINE_MS;
+}
+
+function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
+  const value = Number(source.INGEST_DEADLINE_MS);
+  return Number.isFinite(value) && value > 0 ? value : HANDLER_DEADLINE_MS;
 }
 
 /**
@@ -65,9 +81,10 @@ export async function runIngestSignal(
   options: { workerId: string; drain?: Drain; overpass?: OverpassQuerier },
 ): Promise<DrainResult> {
   const drain = options.drain ?? drainIngest;
+  const startedAt = Date.now();
   // A view of the shared client, not a second one: the queue and the breaker stay the
   // singleton's, so the concurrency ceiling is unchanged.
-  const overpass = options.overpass ?? withDeadline(getOverpass(), Date.now() + deadlineMs());
+  const overpass = options.overpass ?? withDeadline(getOverpass(), startedAt + deadlineMs());
 
   let result: DrainResult;
   try {
@@ -76,7 +93,7 @@ export async function runIngestSignal(
       derivedLimit: 0,
       dedupeKeys: [signal.dedupeKey],
       workerId: options.workerId,
-      deps: { overpass },
+      deps: { overpass, deadlineAt: startedAt + handlerDeadlineMs() },
     });
   } catch (error) {
     /*

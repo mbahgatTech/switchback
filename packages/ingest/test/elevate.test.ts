@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { PNG } from 'pngjs';
 import { NO_DATA_ELEVATION, lineLengthM, resampleLine } from '@switchback/geo';
 import { TerrainSource, decodeTerrarium, elevateLine, fillGaps } from '../src/elevate';
+import { IngestDeadlineError } from '../src/deadline';
 
 /**
  * A terrarium tile where every pixel encodes the same elevation.
@@ -136,6 +137,62 @@ describe('TerrainSource', () => {
 
     await Promise.all(Array.from({ length: 20 }, (_, i) => source.tile(13, i, i)));
     expect(peak).toBeLessThanOrEqual(3);
+  });
+
+  it('gives every request a timeout, so a stalled socket cannot outlive the invocation', async () => {
+    let signal: AbortSignal | undefined;
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      requestTimeoutMs: 50,
+      fetchImpl: ((_url: string, init: RequestInit) => {
+        signal = init.signal ?? undefined;
+        return Promise.resolve(pngResponse(flatTile(500, 8)));
+      }) as unknown as typeof fetch,
+    });
+
+    await source.tile(13, 1, 1);
+    // Node's `fetch` imposes none of its own: without this the handler had no upper bound at
+    // all on a tile fetch, which is how an invocation reached 615,938 ms.
+    expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('refuses to start a fetch past the deadline, and does not retry it', async () => {
+    let requests = 0;
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      fetchImpl: (async () => {
+        requests += 1;
+        return pngResponse(flatTile(500, 8));
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(source.tile(13, 1, 1, Date.now() - 1)).rejects.toBeInstanceOf(IngestDeadlineError);
+    // Not once, and not three times on the retry ladder — a deadline is not a transient fault.
+    expect(requests).toBe(0);
+  });
+
+  it('still answers from cache once the deadline has passed', async () => {
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+    });
+
+    await source.tile(13, 1, 1);
+    // Free, and refusing it would fail a trail over terrain already in hand.
+    await expect(source.tile(13, 1, 1, Date.now() - 1)).resolves.not.toBeNull();
+  });
+
+  it('releases its concurrency slot when the deadline strikes mid-queue', async () => {
+    // The slot is taken before the second check and has to come back, or one expired caller
+    // would shrink the semaphore for every caller after it.
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      maxConcurrent: 1,
+      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+    });
+
+    await expect(source.tile(13, 9, 9, Date.now() - 1)).rejects.toBeInstanceOf(IngestDeadlineError);
+    await expect(source.tile(13, 1, 1)).resolves.not.toBeNull();
   });
 });
 

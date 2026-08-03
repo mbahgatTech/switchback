@@ -142,12 +142,19 @@ inside `drainJobs`, so skipping the drain would otherwise take it too.
 reason.** Vercel first, worker last:
 
 ```
-vercel env add INGEST_QUEUE_DRIVER servicebus     # 1. plus the three identifiers beside it
-                                                  #    then redeploy — minutes
+vercel env add INGEST_QUEUE_DRIVER servicebus     # 1. production AND preview, plus the three
+                                                  #    identifiers beside it; then redeploy — minutes
 curl -s https://<deployment>/api/version          # 2. confirm the deploy carrying the flag is live
 az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=servicebus
                                                   # 3. the worker starts draining, seconds
 ```
+
+**Both** Vercel environments, in step 1. The flag is per environment and Preview's `DATABASE_URL`
+resolves to `psql-switchback-prod-37ywppu5p7fri` — the production server — so a Preview left on
+`postgres` (or, as it was until this branch, left unset, which resolves to `postgres`) is a second
+drainer against the same `ingest_jobs` with its own `OverpassClient` on every warm preview lambda.
+`vercel env ls preview` is the check; the absence of the variable is the failure mode, and it does
+not look like one.
 
 Between 1 and 3 **nothing drains at all**, and it is worth being exact about that because the
 reassuring version is wrong: the tiles do not wait for a pump tick, because the pump is the worker's
@@ -168,6 +175,8 @@ az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=postgres
                                                                 # 2. the worker stands down, seconds
 vercel env rm INGEST_QUEUE_DRIVER production && vercel env add INGEST_QUEUE_DRIVER production
                                                                 # 3. redeploy: Vercel drains again
+                                                                #    do preview too, or it stays a
+                                                                #    publisher with nothing draining
 ```
 
 Step 1 is instant and reversible and stops the queue filling — but it stops _new_ publishes, not the
@@ -190,6 +199,14 @@ exists and why "the worker stands down in seconds" is a statement about the drai
 Between steps 2 and 3 nothing drains either, for the mirror-image reason: the trigger drops the
 message it receives and the Vercel cron does not drain until step 3's redeploy carries the new value
 into `drainOrReclaim`. A message that arrives is discarded and its `ingest_jobs` row waits for step 3. Nothing is lost either way, because a message names work and never carries it.
+
+**Do not re-flip to `servicebus` within ten minutes of rolling back.** The queue carries
+`duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
+`messageId`. Every signal dropped during the rollback was published under a `messageId` the broker
+still remembers, so a re-flip inside that window has those republished signals silently discarded —
+the rows are safe and the two-minute pump picks them up on the next tick, but the first tick after
+the re-flip does nothing and looks like a broken worker. Wait out the window, or expect one dead
+tick.
 
 **The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
 it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as
@@ -223,9 +240,14 @@ had two drainers.
 **"Vercel fetches nothing" is per Vercel environment, not per deployment.** Production and Preview
 hold `INGEST_QUEUE_DRIVER` independently, and both point at the production database, so an
 environment left on `postgres` is a second drainer against the same `ingest_jobs` — with its own
-`OverpassClient` on every warm lambda. Both environments carry `servicebus` now. The residue is
-branches cut before this flag existed: their code has no `ingestQueueDriver` call to make, so their
-previews drain inline whatever the environment says, until they rebase onto master.
+`OverpassClient` on every warm lambda. That is not a hypothetical: measured at 2026-08-03T23:26Z,
+Production read `postgres` and Preview had no `INGEST_QUEUE_DRIVER` at all (17 variables, and it
+was not among them), which `ingestQueueDriver()` resolves to `postgres` — so the flag-on ceiling at
+that moment was 2 from Azure **plus 2 per warm Vercel lambda in each environment**, not 2. Both are
+now set explicitly, to `servicebus`, and `vercel env ls <environment>` is how you check rather than
+assume. The residue is branches cut before this flag existed: their code has no `ingestQueueDriver`
+call to make, so their previews drain inline whatever the environment says, until they rebase onto
+master.
 
 **The client's retry budget has to fit inside `functionTimeout` — and fitting it is not enough.**
 Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
@@ -239,21 +261,35 @@ catches it per job, writes `lastError` and releases the lease, which is a far ch
 the host killing the process. And the pump calls `reclaimExpiredJobs` on its two-minute tick, so a
 lease that _is_ stranded comes back in minutes rather than waiting for the daily cron.
 
-**But 540 s bounds Overpass, not the invocation, and a dense tile still dies.** Overpass is not the
-handler's only wall clock. `TerrainSource` fetches a terrarium tile per DEM sample with no
-per-request timeout and no budget of any kind (`packages/ingest/src/elevate.ts`), and the per-trail
-writes are their own time; neither is inside the 540 s. Measured on 2026-08-03 with the flag on,
-five tiles through the worker: 021212220 at 205 s, 031313102 at 415 s, 031313120 at 491 s — then
-120221230 and 120221203, both dense alpine tiles, killed at 612,947 ms and 615,938 ms.
+**540 s bounds Overpass. `INGEST_DEADLINE_MS` bounds the invocation, and it had to.** Overpass was
+never the handler's only wall clock. `TerrainSource` fetched a terrarium tile per DEM sample with a
+bare `fetch` — no signal, no per-request timeout, no budget — and the per-trail writes are their own
+time; neither was inside the 540 s. Measured on 2026-08-03 with the flag on, five tiles through the
+worker: 021212220 at 205 s, 031313102 at 415 s, 031313120 at 491 s — then 120221230 and 120221203,
+both dense alpine tiles, killed at 612,947 ms and 615,938 ms. The same window has
+`[HostMonitor] Host CPU threshold exceeded (99 >= 80)` repeating from 22:24 to 23:04 and
+`ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so a saturated single instance
+with the timer contending against the queue trigger is a second, independent term — and one
+`maxConcurrentCalls: 1` does not cover, because the pump is not a queue message.
 
-**And it dies without alerting.** `apps/ingest-worker/README.md` says a tile that always exceeds ten
-minutes dead-letters on the fifth delivery and fires `switchback-ingest-deadletter`. It does not.
-The redelivery finds the row still under the killed invocation's lease, logs "nothing claimable" and
-_completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2, nothing dead-letters and the
-alert never fires. The tile comes back on the lease sweep and is killed again — an indefinite loop
-at one wasted ten-minute Consumption invocation per turn, visible only as `requests | where success
-== false` in Application Insights. **Bounding the whole handler, not just its Overpass share, is
-outstanding work and is why the flag is still off.**
+So there is now one wall clock rather than one per subsystem: `INGEST_DEADLINE_MS` (540 s) is passed
+to every phase as `PipelineDeps.deadlineAt`. Past it terrain refuses to start a fetch, the commit
+loop refuses to start a trail, and `processTile` marks the tile `failed` and throws — the same
+cheap, caught, lease-releasing failure the Overpass deadline already produced, 60 s before the host
+would kill the process. Each terrarium request also carries its own 20 s `AbortSignal.timeout`,
+because Node's `fetch` imposes none and a stalled socket is how you reach 615,938 ms without any
+phase ever _starting_ late.
+
+**And it now alerts.** It did not, and the reason is worth keeping: a killed invocation does not
+dead-letter. The redelivery finds the row still under the killed invocation's lease, logs "nothing
+claimable" and _completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2 and
+`switchback-ingest-deadletter` — which fires on `DeadletteredMessages` — structurally cannot see it.
+`deadLetterMessageCount` was 0 for the whole run while this happened twice. The tile came back on
+the lease sweep and was killed again, indefinitely, at one wasted ten-minute Consumption invocation
+per turn, visible only to somebody who thought to run `requests | where success == false`.
+`switchback-ingest-drain-failed` in `ingest.bicep` is that query as a scheduled query rule on
+`appi-switchback-ingest`, severity 2, onto the same action group, `autoMitigate: false`. Keep it
+even though the deadline closes the loop: a deadline that stops working has exactly this symptom.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

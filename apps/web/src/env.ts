@@ -69,6 +69,17 @@ const base = z.object({
   SERVICE_BUS_QUEUE: z.string().min(1).default('ingest-jobs'),
 
   /**
+   * Overpass etiquette, read from `process.env` by `@switchback/ingest`'s own singleton rather
+   * than from here — so these two entries buy nothing but the startup error, which is the whole
+   * point. `getOverpass` falls back to a sane default on a mistyped value, and a fail-safe
+   * default is not the same as being told: `OVERPASS_MAX_CONCURRENT=two` silently halves nothing
+   * and doubles nothing, it just is not what the operator typed. Both are hand-set in the Vercel
+   * dashboard and the Azure portal, which is where typos come from.
+   */
+  OVERPASS_MAX_CONCURRENT: z.coerce.number().int().positive().optional(),
+  OVERPASS_MAX_TOTAL_MS: z.coerce.number().int().positive().optional(),
+
+  /**
    * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
    * so uploads work with no Cloudflare account. Filling in *some* of them is refused below.
    */

@@ -13,12 +13,15 @@ is what the public Overpass instances allow.**
 
 The full chain, so it can be checked rather than believed:
 
-| Factor                        | Value | Where                                              |
-| ----------------------------- | ----- | -------------------------------------------------- |
-| host instances                | 1     | `siteConfig.functionAppScaleLimit`                 |
-| Node processes per instance   | 1     | `FUNCTIONS_WORKER_PROCESS_COUNT`                   |
-| `OverpassClient`s per process | 1     | `getOverpass()` in `packages/ingest/src/config.ts` |
-| requests per client           | 2     | `OVERPASS_MAX_CONCURRENT`, unset means 2           |
+| Factor                        | Value | Where                                                |
+| ----------------------------- | ----- | ---------------------------------------------------- |
+| host instances                | 1     | `siteConfig.functionAppScaleLimit`                   |
+| Node processes per instance   | 1     | `FUNCTIONS_WORKER_PROCESS_COUNT`                     |
+| `OverpassClient`s per process | 1     | `getOverpass()` in `packages/ingest/src/config.ts`   |
+| requests per client           | 2     | `OVERPASS_MAX_CONCURRENT`, unset or mistyped means 2 |
+
+`test/drain.test.ts` reads all four out of `infra/azure/ingest.bicep` and asserts them, so the table
+is checked rather than believed — the failure of any row costs the egress IP, not one invocation.
 
 The first two rows are a template property and an app setting that this workspace does not own —
 both live in `infra/azure/ingest.bicep`, alongside
@@ -70,23 +73,36 @@ it.
 genuinely retryable failure, and the reason a dead-lettered message means either that or a body
 nobody can read. Both want a person.
 
-**The tile is bigger than `functionTimeout`** — the host kills the invocation at ten minutes and
+**The tile is bigger than the deadline** — `INGEST_DEADLINE_MS` (540 s) strikes first and the tile
+fails cleanly: terrain refuses to start a fetch, the commit loop refuses to start a trail,
+`processTile` writes `failed` with the reason and throws, `drainJobs` records `lastError` and
+releases the lease, and the message completes with the retry already scheduled. Sixty seconds of the
+host's ten minutes are left over for whichever phase was mid-flight when it struck.
+
+**The tile is bigger than `functionTimeout`** — what happened before that deadline existed, and the
+failure it is for. The host kills the invocation at ten minutes and
 the message redelivers. Seen in production on 2026-08-03: `ingest_tile:120221221` ran to
 `Duration=600008ms`, preceded by Prisma `Transaction already closed` errors as individual trail
-transactions expired under the load. The redelivery finds the `ingest_jobs` row still under the
+transactions expired under the load; then `120221230` at 612,947 ms and `120221203` at 615,938 ms,
+with Overpass inside its own budget throughout — elevation had no per-request timeout and no budget,
+and the instance was pinned at 99-100% CPU (`[HostMonitor] Host CPU threshold exceeded`) from 22:24
+to 23:04 with `ingestPump` ticks of 19,901 ms and 57,939 ms competing in the same process. The
+redelivery finds the `ingest_jobs` row still under the
 lease the killed invocation took, logs "nothing claimable", and the tile waits for the lease sweep
 — which is the same recovery path as an instance recycle.
 
-**This one does not alert, and that is the part to know at 3am.** The redelivery _completes_ the
+**A host kill does not dead-letter, which is why it has an alert of its own.** The redelivery
+_completes_ the
 message (~165 ms), so `DeliveryCount` never climbs, nothing reaches `maxDeliveryCount`, and
-`switchback-ingest-deadletter` never fires. The tile comes back on the lease sweep and is killed
-again — an indefinite loop costing one wasted ten-minute invocation per turn. The only signal is
-`requests | where name == "ingestDrain" and success == false` in Application Insights; two of five
-tiles did this on 2026-08-03 (`120221230` at 612,947 ms, `120221203` at 615,938 ms) with a silent
-dead-letter queue throughout. `INGEST_OVERPASS_DEADLINE_MS` and `OVERPASS_MAX_TOTAL_MS` do not
-prevent it: they bound the Overpass share of the handler, and elevation sampling — `TerrainSource`,
-no timeout, no budget — is outside them. The fix is to bound the whole handler or to split the tile;
-raising the timeout is not available on Consumption.
+`switchback-ingest-deadletter` — a `DeadletteredMessages` metric alert — structurally cannot fire
+for it. The tile comes back on the lease sweep and is killed
+again — an indefinite loop costing one wasted ten-minute invocation per turn. Two of five
+tiles did this on 2026-08-03 with `deadLetterMessageCount` at 0 throughout, and the only signal was
+`requests | where name == "ingestDrain" and success == false` in Application Insights, which nobody
+was running. `switchback-ingest-drain-failed` in `infra/azure/ingest.bicep` is that query as a
+scheduled query rule on `appi-switchback-ingest`: severity 2, same action group,
+`autoMitigate: false`. `INGEST_DEADLINE_MS` should mean it never fires — which is the reason to keep
+it, because a deadline that stops working looks exactly like this and nothing else would say so.
 
 Nothing is passed over: `failed`, `deferred`, `lost`, `requeued` and `retired` each get their own
 line, because `lost` — work that finished after its lease was given away — is recorded nowhere
@@ -108,6 +124,15 @@ two drainers claiming from `ingest_jobs` at once. The trigger drops the messages
 than abandoning them — the row stays `queued` and Postgres runs the work — so nothing accumulates
 in the dead-letter queue while the flag is off.
 
+Two instances can disagree across the host restart, and the observed cutover did: the drain rejected
+the flag from 23:04:52 (`INGEST_QUEUE_DRIVER is not servicebus - dropping the signal`) while a
+surviving instance's pump published seven more signals at 23:06:08, about 74 s later. The drops are
+safe. What is not free is re-flipping to `servicebus` inside ten minutes: the queue carries
+`duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
+`messageId`, so those republished signals are silently swallowed and the first tick after the
+re-flip does nothing. The rows are still there and the next tick picks them up — but it looks like a
+dead worker, so wait the window out or expect one empty tick.
+
 ## Configuration
 
 | Setting                                         | Default       | Read by                                        |
@@ -118,6 +143,10 @@ in the dead-letter queue while the flag is off.
 | `INGEST_QUEUE_DRIVER`                           | `postgres`    | the pump and the trigger                       |
 | `INGEST_PUMP_ENABLED`                           | `true`        | the pump                                       |
 | `DATABASE_URL`                                  | —             | `backgroundPrisma`, as the web app connects    |
+| `INGEST_DEADLINE_MS`                            | `540000`      | `runIngestSignal`, and every phase under it    |
+| `INGEST_OVERPASS_DEADLINE_MS`                   | `300000`      | `runIngestSignal`, for the Overpass view only  |
+| `OVERPASS_MAX_TOTAL_MS`                         | `240000`      | `getOverpass`, per query                       |
+| `OVERPASS_MAX_CONCURRENT`                       | `2`           | `getOverpass`, per client                      |
 | `OVERPASS_USER_AGENT`                           | —             | required — `OverpassClient` refuses without it |
 
 Managed identity carries the Service Bus connection, and the grant is **Data Sender + Data

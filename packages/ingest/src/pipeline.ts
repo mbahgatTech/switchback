@@ -39,6 +39,7 @@ import {
 } from './enrich';
 import type { EnrichedWaypoint } from './enrich';
 import { TerrainSource, elevateLine } from './elevate';
+import { IngestDeadlineError, assertBefore } from './deadline';
 import {
   OverpassUnavailableError,
   buildFeatureQuery,
@@ -119,6 +120,13 @@ export interface PipelineDeps {
   /** The shared client, or a `withDeadline` view of it — never a second client. */
   overpass: OverpassQuerier;
   terrain?: TerrainSource;
+  /**
+   * Epoch milliseconds after which this handler stops doing work. Overpass has its own budget
+   * (`withDeadline`); this is the outer bound covering terrain and the per-trail commits, so
+   * the invocation ends on a caught error rather than on the host killing the process. Unset
+   * on the Vercel path, where the platform's own timeout is the bound.
+   */
+  deadlineAt?: number;
   now?: () => Date;
   mapillaryToken?: string;
   userAgent?: string;
@@ -251,6 +259,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   // throws must cost its tile one row, not the rest of the tile.
   await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
     try {
+      assertBefore(deps.deadlineAt, 'commit');
       const outcome = await commitGate.run(() =>
         commitTrail(db, trail, {
           quadkey,
@@ -258,6 +267,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           region,
           terrain,
           now: now(),
+          deadlineAt: deps.deadlineAt,
         }),
       );
       if (outcome === 'committed') committed += 1;
@@ -271,6 +281,22 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       });
     }
   });
+
+  /*
+   * The per-trail catch above is what keeps one bad trail from costing its tile, and it
+   * swallows the deadline too — so re-check it here and fail the tile deliberately. A tile
+   * whose remaining trails were never attempted must not be written `ready`: it would be
+   * served short and never refetched until the TTL. `drainJobs` catches this, writes
+   * `lastError` and releases the lease, which is what the retry needs.
+   */
+  if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) {
+    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt);
+    await db.ingestTile.update({
+      where: { quadkey },
+      data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
+    });
+    throw error;
+  }
 
   const fetchMs = Date.now() - startedAt;
   await db.ingestTile.update({
@@ -580,6 +606,7 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
     region,
     terrain,
     now: now(),
+    deadlineAt: deps.deadlineAt,
   });
 
   const fetchMs = Date.now() - startedAt;
@@ -599,6 +626,7 @@ interface CommitContext {
   region: RegionInfo;
   terrain: TerrainSource;
   now: Date;
+  deadlineAt?: number;
 }
 
 /**
@@ -624,6 +652,7 @@ async function commitTrail(
   const { points, gapCount } = await elevateLine(resampled, ctx.terrain, {
     spacingM,
     alongLengthM: trail.lengthM,
+    deadlineAt: ctx.deadlineAt,
   });
 
   // An all-gap profile means every terrain tile under this line failed or does not exist.

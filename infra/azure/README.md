@@ -1125,10 +1125,26 @@ starting 13 s later and taking sequence 2, with no evidence the first had stoppe
 sustained, up to 4 across a recycle. Fair use is about sustained load, so that is the honest number to
 quote rather than an unqualified deployment-wide 2.
 
-Vercel makes **zero** Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes
-this a whole-deployment statement rather than a per-host one. Three call sites in a Vercel process can
-reach Overpass — `/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — and all three
-branch on the flag. Raising any row above is not a throughput knob.
+Vercel makes **zero** Overpass requests in an environment where `INGEST_QUEUE_DRIVER=servicebus`.
+Three call sites in a Vercel process can reach Overpass — `/api/cron/drain`, `trails.kickIngest` and
+`routes.kickNetwork` — and all three branch on the flag.
+
+**That is per Vercel environment, not per deployment, and the difference is the whole number.** The
+flag is an environment variable and Production and Preview hold it independently, while both resolve
+`DATABASE_URL` to `psql-switchback-prod-37ywppu5p7fri` — the production server. So an environment on
+`postgres`, or with the variable simply absent (`ingestQueueDriver()` reads anything unrecognised as
+`postgres`), is a second drainer against the same `ingest_jobs`, with its own `OverpassClient` at 2
+on every warm lambda. At 2026-08-03T23:26Z Production read `postgres` and Preview had no
+`INGEST_QUEUE_DRIVER` at all, so the flag-on ceiling then was 2 + 2N, not 2. Check it, do not assume
+it:
+
+```bash
+vercel env ls production | grep INGEST_QUEUE_DRIVER
+vercel env ls preview    | grep INGEST_QUEUE_DRIVER   # absent is the failure mode, and looks like nothing
+```
+
+With both environments on `servicebus` the deployment-wide figure is the Azure one: 2 sustained, up
+to 4 across a recycle. Raising any row in the table above is not a throughput knob.
 
 ### Deploying it
 

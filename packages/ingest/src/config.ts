@@ -24,12 +24,23 @@ let terrainSource: TerrainSource | null = null;
  */
 export const OVERPASS_MAX_TOTAL_MS = 240_000;
 
+/**
+ * Requests one `OverpassClient` will have in flight when `OVERPASS_MAX_CONCURRENT` does not say
+ * otherwise. Overpass allots slots per client IP and two is the documented-safe figure.
+ *
+ * It goes through `positive()` for the same reason `maxTotalMs` does, but the failure is worse:
+ * `Math.max(1, NaN)` is `NaN`, `active < NaN` is always false, so every caller parks in the
+ * semaphore's wait list and nothing ever releases. Not a leaked IP — a silent, untimed stall of
+ * the whole worker, and the variable is hand-settable in both the Azure portal and Vercel.
+ */
+export const OVERPASS_MAX_CONCURRENT = 2;
+
 export function getOverpass(): OverpassClient {
   if (!overpassClient) {
     overpassClient = new OverpassClient({
       url: splitList(process.env.OVERPASS_URL),
       userAgent: process.env.OVERPASS_USER_AGENT ?? '',
-      maxConcurrent: Number(process.env.OVERPASS_MAX_CONCURRENT ?? 2),
+      maxConcurrent: positive(process.env.OVERPASS_MAX_CONCURRENT) ?? OVERPASS_MAX_CONCURRENT,
       maxTotalMs: positive(process.env.OVERPASS_MAX_TOTAL_MS) ?? OVERPASS_MAX_TOTAL_MS,
     });
   }

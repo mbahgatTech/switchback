@@ -708,12 +708,6 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // 540 s worst case, inside the 600 s Consumption fixes `functionTimeout` at. Before
           // these, one query's own budget was six attempts of 190 s plus backoff — about 24
           // minutes — and `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
-          //
-          // They bound Overpass, not the invocation, and that distinction is load-bearing: the
-          // handler also samples elevation through `TerrainSource`, which has no timeout and no
-          // budget, so a dense tile still reaches the kill. Measured 2026-08-03 with the flag on:
-          // 120221230 and 120221203 killed at 612,947 ms and 615,938 ms, while 021212220,
-          // 031313102 and 031313120 finished at 205 s, 415 s and 491 s. See drain.ts.
           {
             name: 'INGEST_OVERPASS_DEADLINE_MS'
             value: '300000'
@@ -721,6 +715,17 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           {
             name: 'OVERPASS_MAX_TOTAL_MS'
             value: '240000'
+          }
+          // The outer wall clock, covering every phase rather than only Overpass — terrain and
+          // the per-trail commits included, through `PipelineDeps.deadlineAt`. Past 540 s no
+          // phase may begin, which leaves 60 s of the host's 600 s for whichever phase was
+          // already running. Bounding only Overpass was not enough and measurement said so:
+          // with the flag on 2026-08-03, 120221230 and 120221203 were killed at 612,947 ms and
+          // 615,938 ms while Overpass stayed inside its budget the whole time, because
+          // `TerrainSource` had neither a per-request timeout nor a budget. See drain.ts.
+          {
+            name: 'INGEST_DEADLINE_MS'
+            value: '540000'
           }
           {
             name: 'NODE_ENV'
@@ -790,6 +795,62 @@ resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
     )
     principalId: publisher.properties.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+
+@description('''
+**A failed drain has to page somebody, because the dead-letter alert structurally cannot see it.**
+
+`switchback-ingest-deadletter` fires on `DeadletteredMessages`, and a drain that the host kills
+never dead-letters: the redelivery finds the `ingest_jobs` row still under the dead invocation's
+lease, logs "nothing claimable" and *completes* the message in ~165 ms, so `DeliveryCount` never
+reaches 2. On 2026-08-03 that happened twice in one hour with `deadLetterMessageCount` at 0 the
+whole time — an indefinite loop at one wasted ten-minute Consumption invocation per lease sweep,
+visible only to somebody who thought to run `requests | where success == false`.
+
+`INGEST_DEADLINE_MS` is the fix for the loop; this is the fix for the silence, and it is worth
+keeping even now that the handler is bounded — a deadline that stops working is exactly the thing
+whose only symptom is a failed request nobody reads.
+
+The query is `requests`, not `exceptions`: a host kill produces no exception, only a request row
+with `success == false`. `Count`/`GreaterThan 0` over fifteen minutes, so a single failure is
+enough. `autoMitigate` is off — the condition is "this happened", not "this is happening", and an
+alert that resolves itself the moment the tile stops being retried is an alert nobody reads.
+''')
+resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-drain-failed'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-drain-failed'
+    description: 'An ingestDrain invocation failed or was killed by the host. This does not dead-letter, so this rule is the only signal.'
+    severity: 2
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'requests | where name == "ingestDrain" | where success == false'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: false
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
   }
 }
 

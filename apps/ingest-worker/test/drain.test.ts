@@ -7,8 +7,13 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
-import { OVERPASS_MAX_TOTAL_MS, OverpassDeadlineError, withDeadline } from '@switchback/ingest';
-import { OVERPASS_DEADLINE_MS, runIngestSignal } from '../src/drain';
+import {
+  OVERPASS_MAX_CONCURRENT,
+  OVERPASS_MAX_TOTAL_MS,
+  OverpassDeadlineError,
+  withDeadline,
+} from '@switchback/ingest';
+import { HANDLER_DEADLINE_MS, OVERPASS_DEADLINE_MS, runIngestSignal } from '../src/drain';
 import type { Drain } from '../src/drain';
 import type { WorkerLog } from '../src/log';
 
@@ -47,6 +52,7 @@ function drainReturning(result: DrainResult): Drain {
 describe('runIngestSignal', () => {
   it('claims exactly the job the message names, and no derived share', async () => {
     const drain = drainReturning(outcome({ claimed: 1, succeeded: 1 }));
+    const before = Date.now();
 
     await runIngestSignal({ dedupeKey: KEY }, fakeLog(), { workerId: 'sb-1', drain, overpass });
 
@@ -55,8 +61,16 @@ describe('runIngestSignal', () => {
       derivedLimit: 0,
       dedupeKeys: [KEY],
       workerId: 'sb-1',
-      deps: { overpass },
+      deps: { overpass, deadlineAt: expect.any(Number) as number },
     });
+
+    // Every phase gets the same wall clock, not only Overpass — that is the whole point of
+    // `deadlineAt`, and passing `undefined` would silently restore the unbounded handler.
+    const { deadlineAt } = (
+      drain as unknown as { mock: { calls: [{ deps: { deadlineAt: number } }][] } }
+    ).mock.calls[0]![0].deps;
+    expect(deadlineAt).toBeGreaterThanOrEqual(before + HANDLER_DEADLINE_MS);
+    expect(deadlineAt).toBeLessThanOrEqual(Date.now() + HANDLER_DEADLINE_MS);
   });
 
   it('hands the pipeline an Overpass view that closes before functionTimeout does', async () => {
@@ -162,6 +176,7 @@ describe('the invocation budget the host enforces', () => {
     // defaults; a template that sets something else is no longer the thing reasoned about.
     expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBe(OVERPASS_DEADLINE_MS);
     expect(appSetting('OVERPASS_MAX_TOTAL_MS')).toBe(OVERPASS_MAX_TOTAL_MS);
+    expect(appSetting('INGEST_DEADLINE_MS')).toBe(HANDLER_DEADLINE_MS);
   });
 
   it('leaves the handler time to write the tile after Overpass is done', () => {
@@ -169,9 +184,48 @@ describe('the invocation budget the host enforces', () => {
     expect(OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
   });
 
+  it('stops every phase, not only Overpass, before the host stops the process', () => {
+    // The outer bound has to cover the Overpass worst case, or a query could start inside its
+    // own deadline and finish outside the handler's — and it has to leave the host room for
+    // whichever phase was mid-flight when it struck.
+    expect(HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(
+      OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS,
+    );
+    expect(functionTimeoutMs - HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(60_000);
+  });
+
   it('takes one message at a time, which is what makes the two budgets additive', () => {
     // With two messages in one process a query can wait for a concurrency slot, and that wait
     // is charged to neither budget — the sum above would stop bounding the invocation.
     expect(host.extensions.serviceBus.maxConcurrentCalls).toBe(1);
+  });
+});
+
+/**
+ * The four rows both READMEs present as "checkable rather than believed". Their failure costs
+ * the egress IP rather than one invocation, and until now nothing asserted any of them: the
+ * chain is one host instance, one Node process in it, one `OverpassClient` in that process (a
+ * module singleton, so not a number to assert here) and two requests inside the client.
+ */
+describe('the Overpass concurrency clamp, from the template', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+
+  function appSetting(name: string): string {
+    const found = new RegExp(`name: '${name}'\\s*\\r?\\n\\s*value: '([^']+)'`).exec(bicep);
+    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
+    return found[1]!;
+  }
+
+  it('caps the app at one host instance', () => {
+    expect(/functionAppScaleLimit:\s*1\b/.test(bicep)).toBe(true);
+    expect(appSetting('WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT')).toBe('1');
+  });
+
+  it('runs one Node process in that instance', () => {
+    expect(appSetting('FUNCTIONS_WORKER_PROCESS_COUNT')).toBe('1');
+  });
+
+  it('lets the one client hold two requests', () => {
+    expect(Number(appSetting('OVERPASS_MAX_CONCURRENT'))).toBe(OVERPASS_MAX_CONCURRENT);
   });
 });

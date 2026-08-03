@@ -4,6 +4,7 @@
  */
 
 export * from './overpass';
+export * from './deadline';
 export * from './assemble';
 export * from './elevate';
 export * from './derive';
