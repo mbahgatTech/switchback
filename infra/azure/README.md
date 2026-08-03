@@ -1162,7 +1162,7 @@ role assignments are ordinary resources in `ingest.bicep` and nothing grants acc
 Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
 template, and a reader would otherwise conclude the template is the whole story.
 
-1. **CI's deployment identity.** Entra app registrations and federated credentials on an *app* are
+1. **CI's deployment identity.** Entra app registrations and federated credentials on an _app_ are
    Microsoft Graph objects, not ARM, and Bicep cannot declare them. One time, as an Owner:
    `az ad app create` / `az ad sp create`, an `az ad app federated-credential create` scoped to
    `repo:mbahgatTech/switchback:ref:refs/heads/master`, `Contributor` **and** `Role Based Access
@@ -1170,7 +1170,7 @@ Control Administrator` on this resource group, then `gh secret set AZURE_CLIENT_
    `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`. No long-lived secret is stored.
 
    The Vercel publisher deliberately does **not** work this way. A federated credential on a
-   *user-assigned managed identity* is an ARM resource, so it is in `ingest.bicep` with everything
+   _user-assigned managed identity_ is an ARM resource, so it is in `ingest.bicep` with everything
    else — see `publisherProduction` and `publisherPreview` there.
 
 2. **Managed identity to Postgres is not done, deliberately.** The worker connects with
