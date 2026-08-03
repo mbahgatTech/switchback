@@ -7,7 +7,8 @@
 // shell that runs `az deployment`:
 //
 //   export INGEST_DATABASE_URL="$(...)"          # the application login, same string Vercel holds
-//   export INGEST_OVERPASS_USER_AGENT="switchback-ingest/1.0 (contact@example.com)"
+//   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app)"
+//   export INGEST_QUEUE_DRIVER=postgres          # or servicebus; there is no default, state it
 //   az deployment group create \
 //     --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
 //     --template-file infra/azure/ingest.bicep \
@@ -32,7 +33,11 @@ param alertActionGroupName = 'ag-switchback-prod'
 
 // Which queue drives ingest, on this side. Vercel's own INGEST_QUEUE_DRIVER must agree: set only
 // one and the Postgres drain and the worker both claim from `ingest_jobs` at once.
-param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER', 'servicebus')
+//
+// No fallback default. A deployment overwrites the Function App's INGEST_QUEUE_DRIVER with
+// whatever this resolves to, so a default would let a routine deploy re-arm the fan-out an
+// operator had just rolled back. Stating it is one word; guessing it wrong is an outage.
+param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 
 // The two halves of the Vercel OIDC subject the publisher credential trusts. Renaming either on
 // Vercel breaks the token exchange silently — the claim follows the new name and the credential

@@ -373,13 +373,18 @@ export class OverpassClient {
       return;
     }
     await new Promise<void>((resolve) => this.waiting.push(resolve));
-    this.active += 1;
   }
 
+  // Hands the slot straight to the next waiter rather than freeing it and waking them, so
+  // `active` never dips below the cap between the two. Decrementing first opens a window in
+  // which a caller already queued ahead of the wake-up sees a free slot and barges past it.
   private release(): void {
-    this.active -= 1;
     const next = this.waiting.shift();
-    if (next) next();
+    if (next) {
+      next();
+      return;
+    }
+    this.active -= 1;
   }
 }
 

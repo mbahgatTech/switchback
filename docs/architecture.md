@@ -138,19 +138,29 @@ up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker
 on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining: lease recovery lives
 inside `drainJobs`, so skipping the drain would otherwise take it too.
 
-**At 3am.** Two brakes, neither of which is a deploy:
+**At 3am.** Two brakes, neither of which is a deploy, and **the order is not arbitrary**:
 
 ```
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
-  -n <function app> --settings INGEST_PUMP_ENABLED=false        # stop new work reaching the queue
+  -n <function app> --settings INGEST_PUMP_ENABLED=false        # 1. stop new work reaching the queue
+az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=postgres
+                                                                # 2. the worker stands down, seconds
 vercel env rm INGEST_QUEUE_DRIVER production && vercel env add INGEST_QUEUE_DRIVER production
-                                                                # then redeploy: Vercel drains again
-az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=postgres   # and the worker stands down
+                                                                # 3. redeploy: Vercel drains again
 ```
 
-The first is instant and reversible and stops the queue filling. The second is the actual rollback
-and needs both halves; a Vercel environment variable only takes effect on a redeploy, which is why
-the worker's own setting is the faster of the two.
+Step 1 is instant and reversible and stops the queue filling — but it stops *new* publishes, not the
+up-to-eight messages already on the queue, which the trigger keeps working. So the worker has to be
+the side that stands down first. Its setting is an app-settings write that restarts the host in
+seconds; Vercel's needs a redeploy of the project, minutes. Doing Vercel first means the interval
+between the two has Vercel draining `ingest_jobs` inline while the worker is still on `servicebus`
+and still finishing in-flight messages — the two-drainer state this flag exists to prevent, entered
+by following the runbook. Doing the worker first means the interval has neither side draining, which
+costs a wait and nothing else.
+
+Between steps 2 and 3, a queue message that arrives is dropped by the trigger and its `ingest_jobs`
+row simply waits for the Vercel cron; nothing is lost either way, because a message names work and
+never carries it.
 
 **The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
 it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as
@@ -169,17 +179,34 @@ the `ingest_jobs` rows were written before the publish, so an Entra or Service B
 wake-up and the pump re-derives the same rows within two minutes. A broker outage must not empty the
 map, and it cannot.
 
-**Two concurrent Overpass requests, deployment-wide.** `packages/ingest/src/overpass.ts` serializes
-at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that directly.
-The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1` for one
-host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
+**Two concurrent Overpass requests per host instance, and no scale-out.** `packages/ingest/src/overpass.ts`
+serializes at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that
+directly. The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1`
+for one host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
 `OverpassClient` in that process, and `OVERPASS_MAX_CONCURRENT: 2` inside it — all declared in
 `infra/azure/ingest.bicep`. The queue sets `requiresSession: false` so session count is not a second
-multiplier. The other half of the claim is that Vercel fetches nothing: **three** call sites reach
-Overpass from a Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` — and
-all three are gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline
-from a public procedure the planner fires on every viewport settle, and since the pump publishes that
-kind too, it had two drainers. These are fair-use guarantees, not throughput knobs.
+multiplier. The other half is that Vercel fetches nothing: **three** call sites reach Overpass from a
+Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` — and all three are
+gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline from a public
+procedure the planner fires on every viewport settle, and since the pump publishes that kind too, it
+had two drainers.
+
+**Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
+instances the scale controller adds; it does not stop Consumption *replacing* an instance, and for a
+few seconds around a recycle two host instances of the same app are alive. Telemetry from
+2026-08-03T17:32 shows exactly that: `0--f7e39076-13` took sequence 1 at 17:32:00.884, `0--3f3e4037-7d`
+logged "Starting Host" at 17:32:13.797 and took sequence 2 at 17:32:15.175. Nothing in the telemetry
+proves the first instance's Overpass client had quiesced, so the honest ceiling during a recycle
+window is 4, not 2. It is brief, it is not sustained, and Overpass's fair-use limit is about sustained
+load — but the number to put in a review is "2 per instance, one instance except across a recycle".
+
+The same trace exposes the cost of a mid-drain recycle, which is worth knowing before you see it: the
+evicted instance never releases its message lock, so the message sits invisible for the full `PT5M`
+`lockDuration` and then redelivers with `DeliveryCount 2` — and the `ingest_jobs` row it names is
+still under the dead lease it took on the first attempt, so the redelivery logs "nothing claimable"
+and the tile waits for `reclaimExpiredJobs`. That is a slower path than #172 promised, and it is the
+argument for keeping the cron's `reclaimExpiredJobs` call on the `servicebus` branch rather than
+skipping the cron entirely.
 
 **Least privilege on the queue.** Three role assignments, all queue-scoped, all in the template: the
 worker holds Data Sender and Data Receiver, the publisher holds Data Sender. Data Owner was the

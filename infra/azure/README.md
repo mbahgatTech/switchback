@@ -1112,16 +1112,23 @@ that directly. Every link in the chain that stops it is readable from configurat
 | Node processes       | `FUNCTIONS_WORKER_PROCESS_COUNT`                                                   | 1     |
 | `OverpassClient`s    | module singleton, `packages/ingest/src/config.ts`                                  | 1     |
 | Requests per client  | `OVERPASS_MAX_CONCURRENT`                                                          | 2     |
-| **In flight, total** |                                                                                    | **2** |
+| **In flight, total** | per host instance                                                                  | **2** |
 
 `host.json`'s `maxConcurrentCalls: 1` is set too, but the argument does not rest on it — the host
 multiplies that by the instance's core count. The load-bearing property is that Consumption runs one
 host instance for the whole app, so every invocation shares one Node process and one client.
 
+**`functionAppScaleLimit` caps scale-out, not instance count.** Consumption still replaces instances,
+and for a few seconds around a replacement two hosts of this app run at once with a client each — the
+17:32 trace on 2026-08-03 has instance `0--f7e39076-13` taking sequence 1 and `0--3f3e4037-7d`
+starting 13 s later and taking sequence 2, with no evidence the first had stopped fetching. So: 2
+sustained, up to 4 across a recycle. Fair use is about sustained load, so that is the honest number to
+quote rather than an unqualified deployment-wide 2.
+
 Vercel makes **zero** Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes
-this deployment-wide rather than per-host. Three call sites in a Vercel process can reach Overpass —
-`/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — and all three branch on the flag.
-Raising any row above is not a throughput knob.
+this a whole-deployment statement rather than a per-host one. Three call sites in a Vercel process can
+reach Overpass — `/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — and all three
+branch on the flag. Raising any row above is not a throughput knob.
 
 ### Deploying it
 
@@ -1129,7 +1136,8 @@ Raising any row above is not a throughput knob.
 az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered by default
 
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
-export INGEST_OVERPASS_USER_AGENT="switchback-ingest/… (contact address)"
+export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app)"
+export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1138,6 +1146,14 @@ az deployment group create \
 
 unset INGEST_DATABASE_URL
 ```
+
+Both exported strings are load-bearing and both have bitten. `INGEST_OVERPASS_USER_AGENT` must carry
+an `http(s)://` contact URL and must not contain `example.com` — `assertUsableUserAgent` in
+`packages/ingest/src/overpass.ts` throws on either, inside the handler, so the worker dead-letters
+every tile after five deliveries with a message that names the database rather than the user agent.
+`INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
+with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
+Postgres/Service Bus fan-out that an operator had just rolled back.
 
 **The template deploy and the zip push always run together, template first.** Linux Consumption runs
 the code from a package URL that `az functionapp deployment source config-zip` writes into the same
@@ -1154,8 +1170,43 @@ deployment: worker environment belongs in the template.
 because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`. The
 deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
 Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
-group, on 2026-08-03. The parameter, the flag and the runbook step are all gone: the three queue
-role assignments are ordinary resources in `ingest.bicep` and nothing grants access by hand.
+group, on 2026-08-03 (assignment `8baf9393-029a-4226-a882-992a8146d775`). The parameter, the flag and
+the runbook step are all gone: the three queue role assignments are ordinary resources in
+`ingest.bicep` and nothing grants access by hand.
+
+**Deleting a `roleAssignment` from Bicep is not a revocation.** Resource-group deployments are
+Incremental — ARM never removes a resource merely because the template stopped declaring it, and
+`what-if` shows nothing, because from ARM's point of view nothing changed. An earlier revision of
+`ingest.bicep` granted the worker **Azure Service Bus Data Owner**; that resource was deleted from
+the file and the assignment stayed live for a day, which is a wildcard over `Microsoft.ServiceBus` in
+`actions` as well as `dataActions` on the queue the worker drains. Removing it took an explicit
+delete, and the resource-group `CanNotDelete` lock refuses one at any scope inside the group, so it
+took three steps as an Owner:
+
+```bash
+LOCK=/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Authorization/locks/switchback-prod-no-delete
+QUEUE=/subscriptions/$SUB/resourcegroups/rg-switchback-prod-northcentralus/providers/Microsoft.ServiceBus/namespaces/sb-switchback-prod-37ywppu5p7fri/queues/ingest-jobs
+
+az rest --method DELETE --url "https://management.azure.com$LOCK?api-version=2020-05-01"
+az rest --method DELETE --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments/74ca4647-7b88-50e2-b472-8f3daa7c7a42?api-version=2022-04-01"
+az rest --method PUT    --url "https://management.azure.com$LOCK?api-version=2020-05-01" --body @lock.json
+```
+
+Done on 2026-08-03T18:10Z, along with the dead `vercel-send` SAS rule on the queue, which
+`disableLocalAuth: true` had already made unusable but which the template also does not declare. The
+lock body is the one `main.bicep` declares, so putting it back restores the template's own state
+rather than inventing one. `az role assignment list` and `az role assignment delete` both fail here
+with a spurious `MissingSubscription`; ARM REST is the working path.
+
+**A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
+gets exactly the three assignments the template declares. This step existed only to converge the
+environment that had already run the older template. To check any environment:
+
+```bash
+az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=atScope()"
+```
+
+Three rows, and `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner) must not be one of them.
 
 ### The two things Bicep cannot express
 

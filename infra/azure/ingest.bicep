@@ -72,13 +72,19 @@ That is what makes the flag a rollback: set both sides to `postgres` and the Ver
 `ingest_jobs` again while the pump stops publishing and the trigger drops what is left. Set only
 one and the two drain the same table at once, which is worse than either alone. At 3am the faster
 brake is `az functionapp config appsettings set` on this one setting, which restarts the app and
-takes effect in seconds; the next deployment of this template puts the parameter's value back.
+takes effect in seconds.
+
+**No default, on purpose.** A template deployment overwrites this setting with whatever the
+parameter says, so a default would let a routine deploy silently undo an operator's rollback —
+and the unsafe direction (`servicebus`) is exactly the one a forgotten `export` would have
+restored. Every deployment must state the driver; `ingest.bicepparam` reads it from
+`INGEST_QUEUE_DRIVER` in the deploying shell and the build fails if it is unset.
 ''')
 @allowed([
   'postgres'
   'servicebus'
 ])
-param ingestQueueDriver string = 'servicebus'
+param ingestQueueDriver string
 
 @description('Vercel team slug. Half of the OIDC issuer and subject the publisher credential trusts.')
 param vercelTeamSlug string = 'mbahgattechs-projects'
@@ -496,7 +502,7 @@ instances, each with its own client at 2. The chain that stops it, every link tr
     x 1  Node worker process    FUNCTIONS_WORKER_PROCESS_COUNT = 1  (below)
     x 1  OverpassClient         module singleton, packages/ingest/src/config.ts getOverpass()
     x 2  requests per client    OVERPASS_MAX_CONCURRENT = 2  (below)
-    = 2  concurrent Overpass requests, deployment-wide
+    = 2  concurrent Overpass requests per host instance
 
 The first two lines are the ones doing the work, and the fourth is why: however many invocations the
 host starts, they run in one Node process and share one `OverpassClient`, whose own queue is the
@@ -504,16 +510,32 @@ ceiling. `host.json`'s `maxConcurrentCalls: 1` is set too, but the argument deli
 on it — the host multiplies that value by the instance's core count, and "a Consumption instance is
 typically one core" is not a sentence to build a correctness claim on.
 
+**Read the first line precisely: `functionAppScaleLimit` caps scale-*out*, not instance count.** It
+stops the scale controller adding a second instance for load. It does not stop Consumption replacing
+an instance, and around a replacement two host instances of this app are alive at once, each with its
+own `OverpassClient`. Observed, not theorised: at 2026-08-03T17:32 instance `0--f7e39076-13` took
+sequence 1 at :00.884, instance `0--3f3e4037-7d` logged "Starting Host" at :13.797 and took sequence
+2 at :15.175, and the first instance never emitted a result — its lock expired unreleased and
+sequence 1 redelivered at 17:37:28 with `DeliveryCount 2`. So the ceiling is 2 sustained and up to 4
+for the seconds of a recycle. Overpass's fair use is about sustained load, so that is acceptable; a
+claim of "2, deployment-wide, always" would not have been true.
+
+That trace also shows what a mid-drain recycle costs: the evicted instance strands its message for
+the full `PT5M` `lockDuration`, and when it redelivers, the `ingest_jobs` row is still under the dead
+lease from the first attempt, so the handler logs "nothing claimable" and the tile waits for
+`reclaimExpiredJobs`. That is why the Vercel cron still calls `reclaimExpiredJobs` on the
+`servicebus` branch instead of being switched off.
+
 `OVERPASS_MAX_CONCURRENT` is set explicitly to `2` rather than left to the code default so the number
 is visible in the portal alongside the scale limit. **Raising either of these breaks the fair-use
 guarantee.** They are not throughput knobs.
 
-Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes the
-claim deployment-wide rather than per-host. Three call sites reach Overpass from a Vercel process
-and all three are gated on that flag: the cron route's `drainOrReclaim`, `trails.ts`'s `kickIngest`,
-and `routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network` inline from
-a public procedure the planner fires on every viewport settle, which the pump also publishes, so
-that kind had two drainers and the deployment-wide claim was false while this comment asserted it.
+Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus`, which is what makes this
+a whole-deployment statement rather than a per-host one. Three call sites reach Overpass from a
+Vercel process and all three are gated on that flag: the cron route's `drainOrReclaim`, `trails.ts`'s
+`kickIngest`, and `routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network`
+inline from a public procedure the planner fires on every viewport settle, which the pump also
+publishes, so that kind had two drainers while this comment asserted it had one.
 
 ---
 
@@ -549,7 +571,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
     clientAffinityEnabled: false
     siteConfig: {
       linuxFxVersion: 'Node|22'
-      // The clamp. One instance, deployment-wide.
+      // The clamp. No scale-out; see the note above for why that is not the same as "one instance".
       functionAppScaleLimit: 1
       minTlsVersion: '1.2'
       ftpsState: 'Disabled'
