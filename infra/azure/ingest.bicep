@@ -703,12 +703,17 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'OVERPASS_MAX_CONCURRENT'
             value: '2'
           }
-          // The two halves of the reconciliation with `functionTimeout`, which Consumption fixes
-          // at 10 minutes and will not raise. 300 s is the last moment the worker will *start* an
-          // Overpass query; 240 s is the most that one query may then spend across every retry.
-          // 540 s worst case, inside 600 s, leaving a minute to write the tile. Before these, one
-          // query's own budget was six attempts of 190 s plus backoff — about 24 minutes — and
-          // `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
+          // The two halves of the Overpass budget. 300 s is the last moment the worker will
+          // *start* a query; 240 s is the most that one query may then spend across every retry.
+          // 540 s worst case, inside the 600 s Consumption fixes `functionTimeout` at. Before
+          // these, one query's own budget was six attempts of 190 s plus backoff — about 24
+          // minutes — and `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
+          //
+          // They bound Overpass, not the invocation, and that distinction is load-bearing: the
+          // handler also samples elevation through `TerrainSource`, which has no timeout and no
+          // budget, so a dense tile still reaches the kill. Measured 2026-08-03 with the flag on:
+          // 120221230 and 120221203 killed at 612,947 ms and 615,938 ms, while 021212220,
+          // 031313102 and 031313120 finished at 205 s, 415 s and 491 s. See drain.ts.
           {
             name: 'INGEST_OVERPASS_DEADLINE_MS'
             value: '300000'

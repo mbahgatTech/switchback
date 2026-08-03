@@ -75,10 +75,18 @@ the message redelivers. Seen in production on 2026-08-03: `ingest_tile:120221221
 `Duration=600008ms`, preceded by Prisma `Transaction already closed` errors as individual trail
 transactions expired under the load. The redelivery finds the `ingest_jobs` row still under the
 lease the killed invocation took, logs "nothing claimable", and the tile waits for the lease sweep
-— which is the same recovery path as an instance recycle. It self-heals, but slowly, and a tile
-that _always_ exceeds ten minutes dead-letters on the fifth delivery and fires
-`switchback-ingest-deadletter`. That alert is the intended signal: the fix is to split the tile,
-not to raise the timeout.
+— which is the same recovery path as an instance recycle.
+
+**This one does not alert, and that is the part to know at 3am.** The redelivery _completes_ the
+message (~165 ms), so `DeliveryCount` never climbs, nothing reaches `maxDeliveryCount`, and
+`switchback-ingest-deadletter` never fires. The tile comes back on the lease sweep and is killed
+again — an indefinite loop costing one wasted ten-minute invocation per turn. The only signal is
+`requests | where name == "ingestDrain" and success == false` in Application Insights; two of five
+tiles did this on 2026-08-03 (`120221230` at 612,947 ms, `120221203` at 615,938 ms) with a silent
+dead-letter queue throughout. `INGEST_OVERPASS_DEADLINE_MS` and `OVERPASS_MAX_TOTAL_MS` do not
+prevent it: they bound the Overpass share of the handler, and elevation sampling — `TerrainSource`,
+no timeout, no budget — is outside them. The fix is to bound the whole handler or to split the tile;
+raising the timeout is not available on Consumption.
 
 Nothing is passed over: `failed`, `deferred`, `lost`, `requeued` and `retired` each get their own
 line, because `lost` — work that finished after its lease was given away — is recorded nowhere

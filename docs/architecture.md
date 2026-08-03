@@ -227,17 +227,33 @@ environment left on `postgres` is a second drainer against the same `ingest_jobs
 branches cut before this flag existed: their code has no `ingestQueueDriver` call to make, so their
 previews drain inline whatever the environment says, until they rebase onto master.
 
-**The client's retry budget has to fit inside `functionTimeout`.** Consumption ends an invocation at
-ten minutes and will not raise it; `OverpassClient`'s own worst case on the defaults is six attempts
-of 190 s plus backoff — about 24 minutes for one query, and `processTile` makes several. That is not
-theoretical: `ingest_tile:120221221` ran 600008 ms on 2026-08-03 and the host killed the worker
-mid-tile. Two numbers reconcile it, both set in `ingest.bicep`: `INGEST_OVERPASS_DEADLINE_MS` (300 s)
-is the last moment the worker will _start_ a query, and `OVERPASS_MAX_TOTAL_MS` (240 s) is the most
-one query may then spend across every retry — 540 s worst case inside 600 s. Past the deadline the
-Overpass view throws, `drainJobs` catches it per job, writes `lastError` and releases the lease,
-which is a far cheaper failure than the host killing the process. And the pump now calls
-`reclaimExpiredJobs` on its two-minute tick, so a lease that _is_ stranded comes back in minutes
-rather than waiting for the daily cron.
+**The client's retry budget has to fit inside `functionTimeout` — and fitting it is not enough.**
+Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
+case on the defaults is six attempts of 190 s plus backoff — about 24 minutes for one query, and
+`processTile` makes several. That is not theoretical: `ingest_tile:120221221` ran 600008 ms on
+2026-08-03 and the host killed the worker mid-tile. Two numbers bound the Overpass part of it, both
+set in `ingest.bicep`: `INGEST_OVERPASS_DEADLINE_MS` (300 s) is the last moment the worker will
+_start_ a query, and `OVERPASS_MAX_TOTAL_MS` (240 s) is the most one query may then spend across
+every retry — 540 s worst case inside 600 s. Past the deadline the Overpass view throws, `drainJobs`
+catches it per job, writes `lastError` and releases the lease, which is a far cheaper failure than
+the host killing the process. And the pump calls `reclaimExpiredJobs` on its two-minute tick, so a
+lease that _is_ stranded comes back in minutes rather than waiting for the daily cron.
+
+**But 540 s bounds Overpass, not the invocation, and a dense tile still dies.** Overpass is not the
+handler's only wall clock. `TerrainSource` fetches a terrarium tile per DEM sample with no
+per-request timeout and no budget of any kind (`packages/ingest/src/elevate.ts`), and the per-trail
+writes are their own time; neither is inside the 540 s. Measured on 2026-08-03 with the flag on,
+five tiles through the worker: 021212220 at 205 s, 031313102 at 415 s, 031313120 at 491 s — then
+120221230 and 120221203, both dense alpine tiles, killed at 612,947 ms and 615,938 ms.
+
+**And it dies without alerting.** `apps/ingest-worker/README.md` says a tile that always exceeds ten
+minutes dead-letters on the fifth delivery and fires `switchback-ingest-deadletter`. It does not.
+The redelivery finds the row still under the killed invocation's lease, logs "nothing claimable" and
+_completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2, nothing dead-letters and the
+alert never fires. The tile comes back on the lease sweep and is killed again — an indefinite loop
+at one wasted ten-minute Consumption invocation per turn, visible only as `requests | where success
+== false` in Application Insights. **Bounding the whole handler, not just its Overpass share, is
+outstanding work and is why the flag is still off.**
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

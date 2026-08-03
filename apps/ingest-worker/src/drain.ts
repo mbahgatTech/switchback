@@ -15,20 +15,31 @@ export type Drain = typeof drainIngest;
  * How long into an invocation this worker will still *start* an Overpass request.
  *
  * `host.json` sets `functionTimeout` to ten minutes and Consumption will not raise it — the host
- * kills the process, which strands the `ingest_jobs` lease and redelivers the message. So the
- * numbers have to be reconciled rather than merely both written down:
+ * kills the process, which strands the `ingest_jobs` lease and redelivers the message. Against
+ * that, two numbers bound the Overpass portion of a handler:
  *
  *     300 s  this deadline — the last moment a query may start
  *   + 240 s  OVERPASS_MAX_TOTAL_MS, the most that one query may then spend
- *   = 540 s  worst case in Overpass, inside the host's 600 s, leaving 60 s to finish the write
+ *   = 540 s  worst case in Overpass, inside the host's 600 s
  *
- * The addition is only sound because nothing sits between the two: `host.json` takes one message
- * at a time, so a query never waits for a concurrency slot it is not being charged for, and
- * `OverpassClient` clamps each attempt into what is left of the budget — including the body read,
- * which it did not always. `test/drain.test.ts` asserts all three numbers against `host.json` and
- * `infra/azure/ingest.bicep` rather than against themselves.
+ * The addition is sound because nothing sits between the two: `host.json` takes one message at a
+ * time, so a query never waits for a concurrency slot it is not charged for, and `OverpassClient`
+ * clamps each attempt into what is left of the budget — including the body read, which it did not
+ * always. `test/drain.test.ts` asserts all three numbers against `host.json` and `ingest.bicep`.
  *
- * Observed before this existed: `ingest_tile:120221221` ran 600008 ms and was killed mid-tile.
+ * **This does not bound the invocation, and measurement says so.** Overpass is not the handler's
+ * only wall clock: `TerrainSource` fetches a terrarium tile per DEM sample with no per-request
+ * timeout and no budget of any kind (`packages/ingest/src/elevate.ts`), and the per-trail writes
+ * are their own time. Run on 2026-08-03 with the flag on, five tiles: 021212220 at 205 s,
+ * 031313102 at 415 s, 031313120 at 491 s — then 120221230 and 120221203, both dense alpine tiles,
+ * killed at 612,947 ms and 615,938 ms. So 540 s is a bound on Overpass, not on `runIngestSignal`,
+ * and a tile heavy enough still dies the way `ingest_tile:120221221` did.
+ *
+ * Worse, it dies quietly. The redelivery finds the row still leased, logs "nothing claimable" and
+ * *completes* the message in ~165 ms — so `DeliveryCount` never climbs, nothing dead-letters, and
+ * `switchback-ingest-deadletter` does not fire. The tile loops on the lease sweep instead, at a
+ * killed ten-minute invocation per attempt. See apps/ingest-worker/README.md, which describes the
+ * dead-letter path this failure mode does not actually take.
  */
 export const OVERPASS_DEADLINE_MS = 300_000;
 
