@@ -142,12 +142,22 @@ inside `drainJobs`, so skipping the drain would otherwise take it too.
 reason.** Vercel first, worker last:
 
 ```
-vercel env add INGEST_QUEUE_DRIVER servicebus     # 1. production AND preview, plus the three
-                                                  #    identifiers beside it; then redeploy — minutes
+vercel env add INGEST_QUEUE_DRIVER production --value servicebus --no-sensitive --yes
+vercel env add INGEST_QUEUE_DRIVER preview "" --value servicebus --no-sensitive --yes
+                                                  # 1. both environments, plus the three
+                                                  #    identifiers beside them; then redeploy — minutes
 curl -s https://<deployment>/api/version          # 2. confirm the deploy carrying the flag is live
 az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=servicebus
                                                   # 3. the worker starts draining, seconds
 ```
+
+**Two things about those two commands, both learned the hard way.** `--no-sensitive` is not
+cosmetic: `vercel env add` marks Production and Preview values sensitive by default, and a sensitive
+variable reads back from `vercel env pull` as `INGEST_QUEUE_DRIVER=""` — indistinguishable from
+unset, which is the exact failure this runbook is trying to make visible. And the empty `""`
+positional in the Preview line is the git-branch argument: without it the CLI answers
+`git_branch_required` and suggests the command you just ran, in a loop. Passing the value on stdin
+instead of `--value` sets it to the empty string silently.
 
 **Both** Vercel environments, in step 1. The flag is per environment and Preview's `DATABASE_URL`
 resolves to `psql-switchback-prod-37ywppu5p7fri` — the production server — so a Preview left on
@@ -290,6 +300,25 @@ per turn, visible only to somebody who thought to run `requests | where success 
 `switchback-ingest-drain-failed` in `ingest.bicep` is that query as a scheduled query rule on
 `appi-switchback-ingest`, severity 2, onto the same action group, `autoMitigate: false`. Keep it
 even though the deadline closes the loop: a deadline that stops working has exactly this symptom.
+
+**What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
+plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
+543,653.9 ms against a 600,000 ms `functionTimeout`, where the previous run's longest was
+615,938 ms and `FAILED`. Five of the ten were alpine z9 tiles (`120221203`, `120221212`,
+`120221213`, `120221223`, `120213322`); every one of them spent its whole 540 s and ended on
+`IngestDeadlineError`, written to `lastError`, lease released, retry scheduled off the backoff
+ladder — and one job reached the end of that ladder and was `retired`. Two tiles finished:
+`120221232` at 448,188.0 ms and `031313103` at 347,561.9 ms. The Consumption instance was over its
+CPU threshold for the entire window (75 `[HostMonitor] Host CPU threshold exceeded` lines,
+00:17:37Z to 01:22:19Z) with `ingestPump` ticks up to 30,941 ms in the same process, so the drain
+was never running alone.
+
+So the honest statement is: a z9 tile in dense alpine terrain does not fit in one Consumption
+invocation, and no bound on the handler can change that — the bound only decides whether the
+failure is clean and visible or a silent ten-minute kill loop. **Splitting dense tiles is the
+remaining work**; `INGEST_ZOOM` is the knob and it is a data-shape change, not a timeout change.
+Until then those tiles retire after their attempts and stay un-ingested, which is what they did
+before, minus the wasted invocations and plus an alert.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

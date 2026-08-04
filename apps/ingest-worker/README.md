@@ -79,6 +79,14 @@ fails cleanly: terrain refuses to start a fetch, the commit loop refuses to star
 releases the lease, and the message completes with the retry already scheduled. Sixty seconds of the
 host's ten minutes are left over for whichever phase was mid-flight when it struck.
 
+This is where a dense z9 tile ends up, and it ends up there every time. Flag on 2026-08-04T00:14Z
+to 01:23Z, ten invocations, none killed, longest 543,653.9 ms against `functionTimeout` 600,000 ms:
+five alpine tiles (`120221203`, `120221212`, `120221213`, `120221223`, `120213322`) each spent the
+whole budget and failed, one of them exhausting the backoff ladder and being `retired`;
+`120221232` and `031313103` finished at 448,188.0 ms and 347,561.9 ms. **The deadline decides
+whether the failure is clean and audible, not whether the tile fits.** Making it fit means splitting
+the tile — `INGEST_ZOOM` — and that is a data-shape change, not a timeout.
+
 **The tile is bigger than `functionTimeout`** — what happened before that deadline existed, and the
 failure it is for. The host kills the invocation at ten minutes and
 the message redelivers. Seen in production on 2026-08-03: `ingest_tile:120221221` ran to
