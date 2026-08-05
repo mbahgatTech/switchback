@@ -468,25 +468,31 @@ the code path, and reading it as evidence is the same mistake round 5 made with
 drains to `console` — and the events carry `switchback-ingest-tile-split` and
 `switchback-ingest-subtree-stuck` so a query matches a token rather than a sentence.
 
-What the telemetry actually supports, measured 2026-08-05:
+What the telemetry actually supports, measured 2026-08-05 over the full 30-day window (pass
+`--offset 30d` to `az monitor app-insights query`; it defaults to the last hour, which is its own
+way of producing a confident wrong answer):
 
-- **No child has ever run.** `traces | where message has 'ingest_tile:'`, keyed by quadkey length
-  over the whole retained window, returns z9 only — 8 keys, none longer. Whatever else happened, no
-  z10 job was ever delivered to the worker.
+- **No child has ever run.** `traces | where message has 'ingest_tile:'`, keyed by quadkey length,
+  returns z9 and nothing else — 208 mentions across 66 distinct keys, zero at z10 or z11. Whatever
+  else happened, no child job has ever been delivered to the worker.
+- **Eleven invocations have exceeded the 540 s deadline**, not zero: four on 2026-08-03 (before the
+  deadline existed — those are host kills, to 615,938 ms), five on 2026-08-04 (to 543,654 ms) and
+  two on 2026-08-05 (540,311 ms and 545,210 ms). The claim that no tile reached the wall is wrong,
+  and the run table printed beside it said so.
 - **`120221231` is `pending` in production** with 17 trails inside its box (`trails.browse`,
-  2026-08-05). Consistent with a split, and equally consistent with a plain partial failure. The
-  two are indistinguishable from outside the database, which is the point above.
-- **The retained record is incomplete, and provably so.** Retention is 90 days and nothing has aged
-  out, yet the component holds telemetry for 2026-08-05 alone — the 2026-08-04 run this work exists
-  for is simply absent. Within what is held, `traces` is 1,585 rows representing 2,275 items and
-  `requests` 20 rows representing 27: adaptive sampling dropped 30% of traces and 26% of requests.
-  The drain-failure alert reads `traces`. `host.json` now sets `excludedTypes: "Exception;Trace"`,
-  so the stream both alert arms depend on is no longer sampled.
+  2026-08-05). Consistent with a split, and equally consistent with a partial failure. From outside
+  the database the two are indistinguishable, which is the point above.
+- **Sampling can drop the line an alert depends on.** Over the same window `traces` is 17,602 rows
+  representing 18,354 items and `requests` 1,626 representing 1,633 — 4.1% of traces and 0.4% of
+  requests were dropped. Small, and irrelevant to a rate; fatal to a rule that fires on a single
+  occurrence of one token. `host.json` now sets `excludedTypes: "Exception;Trace"`.
 
 So subdivision remains **built, tested and deployed, but not observed**. Neither "it never fired"
-nor "it fired twice" is supported by evidence anybody can reach today. The bar is unchanged and now
-reachable: a `switchback-ingest-tile-split` trace, four child `done` traces beside it, and a z9 that
-`trails.browse` calls ready with `pendingTiles` empty.
+nor "it fired twice" is supported by evidence anybody can reach today: a `traces` search for
+`tile split`, `split tile`, `split into` and `subdivide` over the whole window returns zero rows,
+and always would have. The bar is unchanged and now reachable: a `switchback-ingest-tile-split`
+trace, four child `done` traces beside it, and a z9 that `trails.browse` calls ready with
+`pendingTiles` empty.
 
 **Two things block that proof, and both are outside this branch.** The six tiles this exists for
 exhausted their retry ladders in rounds 4 and 5, so reviving one means `ensureCoverage` — and
