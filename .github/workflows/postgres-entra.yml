@@ -50,7 +50,6 @@ env:
   PGUSER: id-switchback-postgres-ci
   AZURE_CLIENT_ID: 81c76484-bea1-4a75-8e86-2ccb3093e753
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
-  AZURE_SUBSCRIPTION_ID: 5cb9e7c3-0e31-4388-94e9-b36eab4bf977
   # Object ids of the two application identities. Not secrets — they are in the Bicep outputs
   # and the portal — and they are what the database roles are matched against.
   FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
@@ -268,10 +267,16 @@ jobs:
         # and its subject uses GitHub's immutable `owner@id/repo@id` form because that is what
         # this repository's OIDC tokens actually carry. A credential written `owner/repo` fails
         # here with AADSTS700213 and a subject string that appears in no template.
+        #
+        # `allow-no-subscriptions` because this identity deliberately holds no Azure RBAC at
+        # all. Its entire authority is the Postgres administrator grant in main.bicepparam, so
+        # a leak of it cannot touch the resource group, the Service Bus namespace or the
+        # billing. Without the flag `az login` fails with `No subscriptions found` — which
+        # reads like a broken credential and is in fact the least-privilege working.
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
 
       # `oss-rdbms` is the alias for https://ossrdbms-aad.database.windows.net. The token is a
       # bearer credential with the same blast radius as the password it replaces, so it lands
@@ -279,7 +284,7 @@ jobs:
       - name: Mint a database access token
         run: |
           set -euo pipefail
-          token="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+          token="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
           echo "::add-mask::$token"
           umask 077
           printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
@@ -392,12 +397,12 @@ jobs:
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          allow-no-subscriptions: true
 
       - name: Mint a database access token
         run: |
           set -euo pipefail
-          token="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+          token="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
           echo "::add-mask::$token"
           umask 077
           printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
