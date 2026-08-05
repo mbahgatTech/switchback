@@ -101,6 +101,8 @@
 
 targetScope = 'subscription'
 
+import { entraAdministrator } from './postgres.bicep'
+
 // ---------------------------------------------------------------------------------------
 // Location
 // ---------------------------------------------------------------------------------------
@@ -247,6 +249,18 @@ CREATE DATABASE, so a change here means recreating the database rather than rede
 ''')
 param databaseCollation string = 'C.UTF-8'
 
+@description('''
+Declare the database itself. True on a from-scratch build; false against a server that already
+has it.
+
+Charset and collation are fixed by `CREATE DATABASE`, so ARM has no update to perform — and
+the provider rejects a PUT that merely restates them, including the exact string it reads back
+(`Invalid value given for parameter collation`, measured 2026-08-05). A redeploy with this
+true fails after the server has already been written. Export `DEPLOY_DATABASE=false` for any
+run against the live server; see infra/azure/README.md.
+''')
+param deployDatabase bool = true
+
 @description('Administrator login. Not `postgres`, `admin`, or `azure_superuser` — reserved.')
 param administratorLogin string = 'sbadmin'
 
@@ -302,22 +316,34 @@ once that output says 1.3, with evidence rather than optimism.
 param minTlsVersion string = 'TLSv1.2'
 
 @description('''
-Object id of the Microsoft Entra principal to make a database administrator.
+Turn Microsoft Entra authentication on without yet declaring who administers it.
 
-Optional. Empty (the default) leaves Entra authentication off entirely and password
-authentication as the only path, which is what the app needs and all it needs. Supplying one
-adds an Entra admin *alongside* the password login, so a human or `az` can connect without
-sharing the application credential.
+**This exists because the two cannot be deployed together.** ARM refuses an
+`administrators` child on a server whose `activeDirectoryAuth` is still Disabled, and it
+refuses it at *preview* time too — `what-if` returns BadRequest on the administrator rather
+than showing the change list, so the one deployment that restarts the production database
+would have to be run blind. Setting this true with `entraAdministrators` empty makes the
+restart its own reviewable deployment; the administrators go in the next one.
+
+Declaring an administrator turns the feature on regardless, so leaving this false afterwards
+does not turn it back off.
+''')
+param entraAuthEnabled bool = false
+
+@description('''
+Microsoft Entra principals that may administer the database.
+
+Empty (the default) leaves nobody declared. A non-empty list turns Entra authentication on
+alongside the password login, which is the state this deployment holds while consumers are
+moved across one at a time.
+
+**Filling this in on a server whose Entra authentication is still off restarts it** — Azure
+installs the `pgaadauth` extension. Use `entraAuthEnabled` to take that restart separately.
 
   az ad signed-in-user show --query id -o tsv
-
-Password authentication stays enabled either way. Prisma has no Entra token flow; disabling
-it breaks the application.
+  az identity show -g <rg> -n <name> --query principalId -o tsv
 ''')
-param entraAdminObjectId string = ''
-
-@description('UPN or display name of the Entra admin. Required when `entraAdminObjectId` is set.')
-param entraAdminPrincipalName string = ''
+param entraAdministrators entraAdministrator[] = []
 
 // ---------------------------------------------------------------------------------------
 // Budget and alerting
@@ -449,7 +475,7 @@ module monitoring 'monitoring.bicep' = {
     tags: tags
     alertEmailAddress: alertEmailAddress
     workloadBudgetUsd: workloadBudgetUsd
-    budgetStartDate: budgetStartDate
+    workloadBudgetStartDate: workloadBudgetStartDate
     budgetEndDate: budgetEndDate
   }
 }
@@ -468,12 +494,13 @@ module postgres 'postgres.bicep' = {
     postgresVersion: postgresVersion
     databaseName: databaseName
     databaseCollation: databaseCollation
+    deployDatabase: deployDatabase
     administratorLogin: administratorLogin
     applicationLogin: applicationLogin
     administratorLoginPassword: administratorLoginPassword
     minTlsVersion: minTlsVersion
-    entraAdminObjectId: entraAdminObjectId
-    entraAdminPrincipalName: entraAdminPrincipalName
+    entraAuthEnabled: entraAuthEnabled
+    entraAdministrators: entraAdministrators
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
     alertActionGroupId: monitoring.outputs.actionGroupId
     tags: tags
@@ -577,6 +604,20 @@ permanent diff the paragraph above exists to prevent. Default and parameter file
 character for character, so the two cannot disagree.
 ''')
 param budgetStartDate string = '2026-07-01T00:00:00Z'
+
+@description('''
+First day of the *resource group* budget's window, UTC, same full ISO-8601 form.
+
+Separate from `budgetStartDate`, and the reason is a rule that only bites on creation: ARM
+rejects a new monthly budget whose start date is before the current month —
+`Start date for monthly time grain should not be prior to current month` — while an existing
+budget keeps whatever date it was created with and can be updated freely. The subscription
+budget was created in July 2026 and the resource-group one in August, so a single shared value
+cannot deploy both. The paragraph above predicted a stale date would fail a redeploy on the
+operation that is riskiest to improvise; this is that failure, and splitting the parameter is
+the fix rather than moving the live subscription window.
+''')
+param workloadBudgetStartDate string = '2026-08-01T00:00:00Z'
 
 @description('''
 Last day of the budget window, UTC, in the same full ISO-8601 form as `budgetStartDate`.

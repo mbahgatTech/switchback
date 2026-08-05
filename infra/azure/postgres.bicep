@@ -23,6 +23,7 @@ param backupRetentionDays int
 param postgresVersion string
 param databaseName string
 param databaseCollation string
+param deployDatabase bool
 param administratorLogin string
 param applicationLogin string
 
@@ -30,11 +31,23 @@ param applicationLogin string
 param administratorLoginPassword string
 
 param minTlsVersion string
-param entraAdminObjectId string
-param entraAdminPrincipalName string
+param entraAuthEnabled bool
+param entraAdministrators entraAdministrator[]
 param logAnalyticsWorkspaceId string
 param alertActionGroupId string
 param tags object
+
+@export()
+@description('One Microsoft Entra principal that may administer the database.')
+type entraAdministrator = {
+  @description('Entra object id. Becomes the ARM resource name of the administrator.')
+  objectId: string
+
+  @description('UPN for a user, display name for a group, service principal or managed identity.')
+  principalName: string
+
+  principalType: 'User' | 'Group' | 'ServicePrincipal'
+}
 
 // ---------------------------------------------------------------------------------------
 
@@ -52,7 +65,10 @@ var serverName = '${serverNamePrefix}-${uniqueString(resourceGroup().id)}'
 var pgBouncerEnabled = tier != 'Burstable'
 var pooledPort = pgBouncerEnabled ? 6432 : 5432
 
-var entraAdminConfigured = !empty(entraAdminObjectId)
+// Declaring an administrator implies the feature, so the two cannot disagree in the direction
+// that matters. The flag exists for the other direction — on, with nobody declared yet — which
+// is the only way to sequence this safely. See the parameter's description in main.bicep.
+var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators)
 
 // ---------------------------------------------------------------------------------------
 // The server.
@@ -227,11 +243,12 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     }
 
     authConfig: {
-      // Password authentication must stay enabled whatever else happens here: Prisma has no
-      // Microsoft Entra token flow, so disabling it breaks the application outright.
+      // Both, until every consumer has been moved. Turning `passwordAuth` off while anything
+      // still holds a connection string locks the database against its own application, and
+      // there is no way back in that does not involve a restore.
       passwordAuth: 'Enabled'
-      activeDirectoryAuth: entraAdminConfigured ? 'Enabled' : 'Disabled'
-      tenantId: entraAdminConfigured ? subscription().tenantId : null
+      activeDirectoryAuth: entraAuthOn ? 'Enabled' : 'Disabled'
+      tenantId: entraAuthOn ? subscription().tenantId : null
     }
 
     // A named window rather than "system managed", so a maintenance restart never lands on
@@ -550,7 +567,16 @@ resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@
 // list and the partial unique index on `trail_lists` is built under different rules. The
 // migration workflow reads Neon's `datcollate` and refuses to run on a mismatch rather than
 // discovering it later.
-resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-01' = {
+//
+// **Create-only, hence the flag — and that is Azure's constraint, not a preference.** Charset
+// and collation are fixed by `CREATE DATABASE` and cannot be altered afterwards, so there is
+// no update for ARM to perform. Worse, the provider does not treat re-declaring them as a
+// no-op: a PUT carrying the value the server itself reads back is rejected with
+// `Invalid value given for parameter collation` (measured 2026-08-05 against this database,
+// which reports `collation: "C.UTF-8"` — the exact string being sent). Leaving this true on a
+// redeploy therefore fails the whole deployment, and it fails it *after* the server has been
+// written, which is the worst place to stop.
+resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-01' = if (deployDatabase) {
   parent: server
   name: databaseName
   properties: {
@@ -560,18 +586,28 @@ resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-0
   dependsOn: [allowInternet]
 }
 
-// Optional. Lets a human and `az` connect without sharing the application's password.
-// Password authentication is unaffected — see `authConfig` above.
-resource entraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = if (entraAdminConfigured) {
-  parent: server
-  name: entraAdminObjectId
-  properties: {
-    principalName: entraAdminPrincipalName
-    principalType: 'User'
-    tenantId: subscription().tenantId
+// Declaring one of these is what flips `activeDirectoryAuth` above, and **that flip restarts
+// the server** — Azure installs the `pgaadauth` extension and bounces it. Adding or removing
+// an administrator afterwards does not.
+//
+// An administrator here is an ARM-level grant only. It carries the rights of the original
+// PostgreSQL administrator and can create the Entra-mapped roles the application uses, but
+// those roles are SQL objects that no template can declare: see `infra/postgres-identity/`.
+// `@batchSize(1)` for the same reason the configurations above are chained: each of these is
+// a long-running write against one server object, and ARM would otherwise issue them at once.
+@batchSize(1)
+resource entraAdmins 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = [
+  for admin in entraAdministrators: {
+    parent: server
+    name: admin.objectId
+    properties: {
+      principalName: admin.principalName
+      principalType: admin.principalType
+      tenantId: subscription().tenantId
+    }
+    dependsOn: [database]
   }
-  dependsOn: [database]
-}
+]
 
 // ---------------------------------------------------------------------------------------
 // Outputs. No credential appears here or may ever be added — deployment outputs are stored
