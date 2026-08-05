@@ -15,12 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'survey — read-only: secret shapes, server auth config, sbapp privileges'
+        description: 'What to run'
         required: true
         default: survey
         type: choice
         options:
           - survey
+          - provision
+          - soak
   # Temporary, and removed before this branch merges: `workflow_dispatch` only offers
   # workflows that already exist on the default branch, and this one does not yet.
   push:
@@ -33,6 +35,26 @@ on:
 
 permissions:
   contents: read
+  # The whole point: `azure/login` exchanges this for an Azure access token against the
+  # federated credential on `id-switchback-postgres-ci`. Nothing here reads a stored password.
+  id-token: write
+
+env:
+  PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+  PGPORT: '5432'
+  PGDATABASE: switchback
+  PGSSLMODE: verify-full
+  PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
+  # The Postgres role Azure creates for an ARM-declared Entra administrator is named after the
+  # principal, so the CI identity's resource name is also its database username.
+  PGUSER: id-switchback-postgres-ci
+  AZURE_CLIENT_ID: 81c76484-bea1-4a75-8e86-2ccb3093e753
+  AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
+  AZURE_SUBSCRIPTION_ID: 5cb9e7c3-0e31-4388-94e9-b36eab4bf977
+  # Object ids of the two application identities. Not secrets — they are in the Bicep outputs
+  # and the portal — and they are what the database roles are matched against.
+  FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
+  VERCEL_OID: c9bfba39-4191-4695-996d-a588b7154e58
 
 # One at a time. These run against the 2-vCore Burstable server that serves the live site.
 concurrency:
@@ -42,7 +64,7 @@ concurrency:
 jobs:
   survey:
     name: survey
-    if: github.event_name == 'push' || inputs.action == 'survey'
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'survey'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -214,3 +236,185 @@ jobs:
           SELECT 'dbacl|' || datname || '|' || coalesce(array_to_string(datacl, ','), '-')
             FROM pg_database WHERE datname = current_database();
           SQL
+
+  # ---------------------------------------------------------------------------------------
+  # The first credential-free path. Nothing in this job reads a password: `azure/login`
+  # exchanges the runner's OIDC token for an Azure one against the federated credential on
+  # `id-switchback-postgres-ci`, that identity is an ARM-declared Entra administrator of the
+  # server, and the access token is handed to Postgres as the password.
+  # ---------------------------------------------------------------------------------------
+  provision:
+    name: create the Entra-mapped roles
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'provision')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # `oss-rdbms` is the alias for https://ossrdbms-aad.database.windows.net. The token is a
+      # bearer credential with the same blast radius as the password it replaces, so it lands
+      # in a 0600 passfile under the runner temp directory and is masked in the log.
+      - name: Mint a database access token
+        run: |
+          set -euo pipefail
+          token="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
+          echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
+
+      - name: Connect with the token and nothing else
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'current_user|' || current_user;
+          SELECT 'is_admin|' || pg_has_role(current_user, 'azure_pg_admin', 'member')::text;
+          SELECT 'ssl|' || version || '|' || cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+          SQL
+
+      - name: Create the roles
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 -d postgres \
+            -v func_oid="$FUNC_OID" -v vercel_oid="$VERCEL_OID" \
+            -f infra/postgres-identity/roles.sql
+          psql -X -tAq -v ON_ERROR_STOP=1 -f infra/postgres-identity/grants.sql
+          echo "roles.sql and grants.sql applied"
+
+      # The assertion that the least-privilege claim is true rather than intended. Each new
+      # role must hold exactly `sbapp`'s privileges — by membership, so this compares the
+      # inherited set — and must be refused DDL.
+      - name: Prove the new roles can do what sbapp does and no more
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'attrs|' || rolname || '|super=' || rolsuper::text || '|createdb=' || rolcreatedb::text
+                 || '|createrole=' || rolcreaterole::text || '|bypassrls=' || rolbypassrls::text
+                 || '|login=' || rolcanlogin::text
+            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
+
+          -- The comparison that matters: for every table in public, does each new role have
+          -- exactly the privileges sbapp has? Any row here is a mismatch.
+          SELECT 'MISMATCH|' || r.role || '|' || t.relname || '|' || p.priv
+            FROM pg_class t
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
+           CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+                              ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) AS p(priv)
+           WHERE n.nspname = 'public' AND t.relkind = 'r'
+             AND has_table_privilege(r.role, t.oid, p.priv)
+                 <> has_table_privilege('sbapp', t.oid, p.priv);
+
+          SELECT 'create_on_public|' || rolname || '|'
+                 || has_schema_privilege(rolname, 'public', 'CREATE')::text
+            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
+          SQL
+
+      - name: List what Azure thinks is Entra-mapped
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          SELECT 'entra|' || rolename || '|' || principalType || '|' || objectId
+            FROM pg_catalog.pgaadauth_list_principals(false) ORDER BY rolename;
+          SQL
+
+      # A privilege check that reads well is not the same as a privilege that is enforced.
+      # This asks the server, as the role, and expects to be refused.
+      - name: Refuse DDL, out loud
+        run: |
+          set -euo pipefail
+          if psql -X -q -v ON_ERROR_STOP=1 \
+               -c "SET ROLE sbapp_func" \
+               -c "CREATE TABLE ddl_probe_should_fail (id int)" 2> "$RUNNER_TEMP/ddl.err"; then
+            echo "::error::sbapp_func created a table. It is not least-privilege."
+            psql -X -q -c "DROP TABLE IF EXISTS ddl_probe_should_fail"
+            exit 1
+          fi
+          grep -q 'permission denied' "$RUNNER_TEMP/ddl.err" \
+            || { echo "::error::CREATE TABLE failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
+          sed 's/^/refused: /' "$RUNNER_TEMP/ddl.err"
+
+  # ---------------------------------------------------------------------------------------
+  # Does an established session die when its token expires?
+  #
+  # Nobody should answer this from memory, and a five-minute smoke test answers it wrongly.
+  # One connection is opened with a token, held, and asked the time every five minutes for
+  # eighty — past the hour the documentation quotes — printing `pg_backend_pid()` each round so
+  # a silent reconnect cannot be mistaken for survival. psql runs a whole script in one
+  # session, so a constant backend pid means the connection is the original one.
+  #
+  # The answer decides the design. If a live session survives, per-connection token acquisition
+  # plus a bounded connection lifetime is sufficient and nothing ever needs restarting. If it
+  # does not, no amount of pooling discipline is enough and the application has to survive a
+  # backend disappearing mid-query.
+  # ---------------------------------------------------------------------------------------
+  soak:
+    name: hold a connection past token expiry
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'soak')
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+
+    steps:
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Mint a database access token
+        run: |
+          set -euo pipefail
+          token="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
+          echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
+          # The `exp` claim, read rather than assumed. Base64url, so the alphabet is translated
+          # before decoding.
+          node -e '
+            const part = process.argv[1].split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+            const claims = JSON.parse(Buffer.from(part, "base64").toString());
+            const left = claims.exp - Math.floor(Date.now() / 1000);
+            console.log(`exp=${new Date(claims.exp * 1000).toISOString()} lifetime=${Math.round(left / 60)}min aud=${claims.aud}`);
+          ' "$token"
+
+      - name: One session, eighty minutes
+        run: |
+          set -euo pipefail
+          {
+            echo "SELECT 'start|' || now()::text || '|pid=' || pg_backend_pid()::text;"
+            for i in $(seq 1 16); do
+              echo "SELECT pg_sleep(300);"
+              echo "SELECT 'probe|$i|' || now()::text || '|pid=' || pg_backend_pid()::text || '|user=' || current_user;"
+            done
+          } > "$RUNNER_TEMP/soak.sql"
+          psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$'

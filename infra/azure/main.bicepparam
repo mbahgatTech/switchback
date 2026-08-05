@@ -221,6 +221,11 @@ param minTlsVersion = 'TLSv1.2'
 // it; see infra/azure/README.md.
 param entraAuthEnabled = true
 
+// One federated credential per branch. `master` is the steady state — `ci.yml`'s schema push
+// runs there and nowhere else. The second is temporary, for proving this migration from its
+// own branch, and comes out before merge.
+param ciIdentityBranches = ['master', 'worktree-wf_189485a3-0e7-2']
+
 // The owner is here as break-glass: a human who can reach the database with a token and no
 // password at all, which is what stops "the admin password is not recorded anywhere" from
 // being an outage a second time. The Entra-mapped roles the *applications* use are not

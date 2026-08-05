@@ -315,6 +315,18 @@ once that output says 1.3, with evidence rather than optimism.
 ])
 param minTlsVersion string = 'TLSv1.2'
 
+@description('Name of the user-assigned managed identity CI reaches Postgres with.')
+param ciIdentityName string = 'id-switchback-postgres-ci'
+
+@description('owner/repo whose GitHub Actions OIDC tokens the CI identity trusts.')
+param repository string = 'mbahgatTech/switchback'
+
+@description('''
+Branches whose workflow runs may assume the CI identity. One federated credential each —
+GitHub puts the ref in the OIDC subject and Entra matches subjects exactly, with no wildcard.
+''')
+param ciIdentityBranches string[] = ['master']
+
 @description('''
 Turn Microsoft Entra authentication on without yet declaring who administers it.
 
@@ -480,6 +492,18 @@ module monitoring 'monitoring.bicep' = {
   }
 }
 
+module ciIdentity 'ci-identity.bicep' = {
+  name: 'switchback-ci-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: ciIdentityName
+    repository: repository
+    branches: ciIdentityBranches
+    tags: tags
+  }
+}
+
 module postgres 'postgres.bicep' = {
   name: 'switchback-postgres'
   scope: rg
@@ -500,7 +524,17 @@ module postgres 'postgres.bicep' = {
     administratorLoginPassword: administratorLoginPassword
     minTlsVersion: minTlsVersion
     entraAuthEnabled: entraAuthEnabled
-    entraAdministrators: entraAdministrators
+    // The CI identity is an administrator because `prisma db push` needs DDL over tables
+    // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
+    // Appended here rather than listed in the parameter file because its object id does not
+    // exist until the identity above is deployed.
+    entraAdministrators: union(entraAdministrators, [
+      {
+        objectId: ciIdentity.outputs.principalId
+        principalName: ciIdentityName
+        principalType: 'ServicePrincipal'
+      }
+    ])
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
     alertActionGroupId: monitoring.outputs.actionGroupId
     tags: tags
