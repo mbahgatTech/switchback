@@ -10,6 +10,7 @@ import {
   processTile,
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
+import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
 const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
@@ -225,6 +226,37 @@ describe('processTile, out of clock', () => {
 
     expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.failed);
     expect(recorded.jobs).toEqual([]);
+  });
+
+  it('splits when Overpass runs out of clock on the tile query itself', async () => {
+    // The other half of "this box is too big": a tile whose own query cannot be served inside
+    // the budget never reaches the commit loop, so the deadline check after it never fires.
+    const { db, recorded } = fakeDb();
+    const overpass = {
+      query: () => Promise.reject(new OverpassDeadlineError(1_000)),
+    } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, { db, overpass, deadlineAt: Date.now() + 60_000 });
+
+    expect(result.children).toHaveLength(4);
+    expect(recorded.jobs).toEqual(result.children.map((key) => `ingest_tile:${key}`));
+    expect(recorded.updates.some((update) => update.data.status === TileStatus.failed)).toBe(false);
+  });
+
+  it('fails rather than splitting when Overpass is merely unavailable', async () => {
+    // Subdividing on a breaker that is open would quadruple the load on a service already
+    // refusing, and the tile is not the problem.
+    const { db, recorded } = fakeDb();
+    const overpass = {
+      query: () => Promise.reject(new OverpassUnavailableError(30_000)),
+    } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, { db, overpass, deadlineAt: Date.now() + 60_000 }),
+    ).rejects.toThrow(/circuit breaker/);
+
+    expect(recorded.jobs).toEqual([]);
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.failed);
   });
 
   it('never re-fetches a tile that has already been split', async () => {

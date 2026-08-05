@@ -42,6 +42,7 @@ import type { EnrichedWaypoint } from './enrich';
 import { TerrainSource, elevateLine } from './elevate';
 import { IngestDeadlineError, assertBefore } from './deadline';
 import {
+  OverpassDeadlineError,
   OverpassUnavailableError,
   buildFeatureQuery,
   buildParentRouteQuery,
@@ -206,6 +207,28 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     const response = await deps.overpass.query(buildTileQuery(bbox));
     elements = response.elements ?? [];
   } catch (error) {
+    /*
+     * Running out of clock on the tile query is the same verdict as running out of it in the
+     * commit loop — the box is too big to serve — so it splits rather than fails. The two are
+     * kept apart from every other Overpass error deliberately: a breaker that is open, a mirror
+     * answering 504, a malformed query are all "come back later", and subdividing on those would
+     * quadruple the load on a service that is already refusing.
+     */
+    if (error instanceof OverpassDeadlineError && canSubdivide(tile.z)) {
+      const fetchMs = Date.now() - startedAt;
+      const split = await splitTile(db, quadkey, { fetchMs });
+      log('tile split', { quadkey, phase: 'tile query', children: split, fetchMs });
+      return {
+        quadkey,
+        status: TileStatus.pending,
+        trailCount: 0,
+        skipped: 0,
+        failed: 0,
+        fetchMs,
+        children: split,
+      };
+    }
+
     const message = error instanceof Error ? error.message : String(error);
     await db.ingestTile.update({
       where: { quadkey },
