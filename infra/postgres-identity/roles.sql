@@ -29,11 +29,24 @@ SELECT pg_catalog.pgaadauth_create_principal_with_oid('sbapp_func', :'func_oid',
 SELECT pg_catalog.pgaadauth_create_principal_with_oid('sbapp_vercel', :'vercel_oid', 'service', false, false)
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sbapp_vercel');
 
--- Whatever the branch above did, these two must now exist and be mapped to the right objects.
-SELECT CASE
-         WHEN count(*) = 2 THEN 'roles mapped: ' || string_agg(rolename || '=' || objectId, ', ' ORDER BY rolename)
-         ELSE NULL
-       END
-  FROM pg_catalog.pgaadauth_list_principals(false)
- WHERE rolename IN ('sbapp_func', 'sbapp_vercel')
-   AND objectId IN (:'func_oid', :'vercel_oid');
+-- Whatever the branch above did, these two must now exist and be Entra-mapped. The whole row
+-- is printed as JSON rather than picking columns out of it: the documented result column is
+-- `rolename` and the server's is `rolname`, so naming them is a way to fail on a typo instead
+-- of on the fact being checked.
+SELECT 'principal|' || row_to_json(p)::text
+  FROM pg_catalog.pgaadauth_list_principals(false) p
+ WHERE p.rolname IN ('sbapp_func', 'sbapp_vercel')
+ ORDER BY 1;
+
+DO $$
+DECLARE
+  found int;
+BEGIN
+  SELECT count(*) INTO found
+    FROM pg_catalog.pgaadauth_list_principals(false) p
+   WHERE p.rolname IN ('sbapp_func', 'sbapp_vercel');
+  IF found <> 2 THEN
+    RAISE EXCEPTION 'expected two Entra-mapped application roles, found %', found;
+  END IF;
+END
+$$;

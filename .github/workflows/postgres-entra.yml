@@ -347,8 +347,8 @@ jobs:
         run: |
           set -euo pipefail
           psql -X -tAq -v ON_ERROR_STOP=1 -d postgres <<'SQL'
-          SELECT 'entra|' || rolename || '|' || principalType || '|' || objectId
-            FROM pg_catalog.pgaadauth_list_principals(false) ORDER BY rolename;
+          SELECT 'entra|' || row_to_json(p)::text
+            FROM pg_catalog.pgaadauth_list_principals(false) p ORDER BY 1;
           SQL
 
       # A privilege check that reads well is not the same as a privilege that is enforced.
