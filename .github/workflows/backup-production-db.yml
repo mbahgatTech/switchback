@@ -1,0 +1,454 @@
+# A backup of production that has been restored before anyone needs it to be.
+#
+# Azure's point-in-time restore is the floor and it costs nothing: 14 days of locally
+# redundant backups, restorable to any second inside the window. What it cannot do is leave
+# Azure. It restores into a *new Flexible Server in the same subscription* — so it is no help
+# if the subscription is what failed, if the credit ran out and the spending limit deallocated
+# everything (see infra/azure/README.md), or if anyone wants to read the data without
+# provisioning $57/month of compute first. This workflow produces the portable half.
+#
+# It runs here rather than on a workstation because the machine this repository is developed
+# on cannot reach 5432 — a VPN adapter holds the default route and the TLS handshake dies
+# without the server ever seeing the attempt. A runner has a clean path.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **The dump is verified by restoring it, in the same run.** A dump nobody has loaded is a
+# hope. So the job stands up a throwaway Postgres+PostGIS container, restores into it, and
+# runs the same census file against production and against the copy. The census is designed
+# so that two databases holding the same data produce byte-identical output, which makes the
+# comparison a `diff` — row counts, per-table content digests, every index and constraint
+# definition, table ownership and grants, and the PostGIS facts a lost SRID would move.
+#
+# **Custom format, not plain SQL.** `-Fc` restores selectively (`pg_restore -l` then `-L`),
+# restores in parallel, restores section by section — which is what makes the spatial_ref_sys
+# handling below possible at all — and compresses. The one thing it is not is greppable, so a
+# plain-SQL *schema-only* dump ships alongside it. That is the half anyone actually reads, and
+# it carries no rows, so it lives in the evidence artifact rather than the restricted one.
+#
+# **spatial_ref_sys is not backed up, and that is correct.** PostGIS registers it with
+# `pg_extension_config_dump` under a filter several hundred SRID ranges long, so pg_dump
+# carries only the rows *outside* the catalogue PostGIS ships and `CREATE EXTENSION postgis`
+# supplies the rest. Two things follow, both of which this workflow acts on. A restore target
+# must have PostGIS installed before the archive is loaded, or every geography cast fails on a
+# missing SRID 4326. And a comparison that diffs the whole table is comparing two PostGIS
+# builds' shipped catalogues, not the backup — production runs 3.6.1 and the rehearsal
+# container 3.5. So the census asserts that every SRID the data uses is *present*, and that
+# every SRID somebody added by hand is present and byte-identical, which is the half a backup
+# is actually responsible for.
+#
+# The gap worth naming: an override of a *shipped* SRID — editing 3857's definition in place —
+# falls inside PostGIS's filter and is therefore not in this dump. Nothing in this repository
+# does that, and this is the note that would make it noticeable if something ever did.
+#
+# ---------------------------------------------------------------------------------------
+#
+# **Where the dump goes, and who can read it.** A GitHub Actions artifact on this private
+# repository: every collaborator, and every workflow that runs with `actions: read`. It holds
+# every account's email address and every recorded GPS track, so the retention is days rather
+# than the 90-day default, and it is not encrypted — a passphrase generated here and stored
+# only in a repository secret would recreate exactly the failure this repository already has
+# with the database admin password, which is a credential nobody can read back. If this dump
+# is wanted as a durable rollback rather than as proof the backup works, it belongs in a
+# private Azure Storage container in the locked resource group, not here.
+name: Backup production database
+
+on:
+  workflow_dispatch:
+    inputs:
+      dump_retention_days:
+        description: 'Days the dump artifact survives. It holds every account email and every recorded GPS track.'
+        required: false
+        default: '3'
+
+permissions:
+  contents: read
+
+# Two of these at once would put two concurrent full scans on a 2-vCore Burstable server that
+# serves the live site. `cancel-in-progress` is off: a cancelled run leaves a half-written
+# artifact and no verdict, which reads like a failure and is not one.
+concurrency:
+  group: backup-production-db
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    name: dump · restore · compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    services:
+      # PostGIS 3.5 against production's 3.6.1 — the same skew ci.yml already carries and
+      # records. It does not weaken the comparison: every geometry check below is either an
+      # exact integer (ST_NPoints) or a digest of the stored bytes, and stored geometry is
+      # copied verbatim by COPY rather than re-encoded by the receiving PostGIS.
+      rehearsal:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pg_dump refuses to read a server newer than itself, and ubuntu-latest ships the
+      # PostgreSQL 16 client against production's 17. Without this the job fails on the first
+      # command with a version mismatch that reads like a connection problem.
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      # The password never reaches argv, $GITHUB_ENV or a log line: it goes into a 0600
+      # passfile under the runner's temp directory, which is destroyed with the runner. The
+      # rest of the connection is exported as libpq environment variables so no later command
+      # has to carry a URL around.
+      #
+      # `sslaccept=strict` in the repository secret is a *Prisma* parameter. libpq rejects a
+      # URI query parameter it does not recognise outright — `invalid URI query parameter` —
+      # so the URL is rebuilt from its parts rather than passed through.
+      - name: Read the connection parameters out of the repository secret
+        env:
+          SOURCE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const raw = process.env.SOURCE_URL ?? '';
+          if (!raw) {
+            console.error('::error::DIRECT_DATABASE_URL is not set on this repository.');
+            process.exit(1);
+          }
+
+          let url;
+          try {
+            url = new URL(raw);
+          } catch {
+            console.error('::error::DIRECT_DATABASE_URL is not a URL.');
+            process.exit(1);
+          }
+
+          const host = url.hostname;
+          const port = url.port || '5432';
+          const user = decodeURIComponent(url.username);
+          const password = decodeURIComponent(url.password);
+          const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
+
+          if (!host.endsWith('.postgres.database.azure.com')) {
+            console.error(`::error::${host} is not an Azure Flexible Server. Refusing to dump it.`);
+            process.exit(1);
+          }
+          if (!password) {
+            console.error('::error::DIRECT_DATABASE_URL carries no password.');
+            process.exit(1);
+          }
+
+          // Everything libpq is not going to accept, named rather than silently dropped.
+          const libpq = new Set(['sslmode', 'sslrootcert', 'connect_timeout', 'application_name']);
+          const dropped = [...url.searchParams.keys()].filter((k) => !libpq.has(k));
+
+          console.log(`::add-mask::${password}`);
+
+          const temp = process.env.RUNNER_TEMP;
+          const passfile = path.join(temp, 'pgpass');
+          // The rehearsal container's throwaway credential rides in the same file so that no
+          // command in this job needs a password on its command line.
+          fs.writeFileSync(
+            passfile,
+            `${host}:${port}:*:${user}:${password}\nlocalhost:5433:*:*:postgres\n`,
+            { mode: 0o600 },
+          );
+
+          fs.appendFileSync(
+            process.env.GITHUB_ENV,
+            [
+              `PGHOST=${host}`,
+              `PGPORT=${port}`,
+              `PGUSER=${user}`,
+              `PGDATABASE=${database}`,
+              `PGPASSFILE=${passfile}`,
+              // verify-full, not require. The firewall spans the whole of IPv4, so an
+              // encrypted session that accepts whatever certificate it is handed
+              // authenticates nothing. libpq fails closed without a root store, hence
+              // PGSSLROOTCERT: Ubuntu's bundle already carries both Azure roots.
+              'PGSSLMODE=verify-full',
+              'PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt',
+              `SOURCE_ROLE=${user}`,
+              `WORK=${path.join(temp, 'backup')}`,
+            ].join('\n') + '\n',
+          );
+
+          console.log(`Source: ${user}@${host}:${port}/${database}`);
+          if (dropped.length > 0) {
+            console.log(`Query parameters libpq does not accept, dropped: ${dropped.join(', ')}`);
+          }
+          JS
+
+      # Read-only, and it prints the facts that identify which database this run is about to
+      # copy. The collation is read rather than assumed: the rehearsal database is created
+      # with exactly the source's, and a guess here would report a flawless restore as a
+      # collation mismatch.
+      - name: Confirm which database this is
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          psql -X -tAq -v ON_ERROR_STOP=1 -f - <<'SQL' | tee "$WORK/source-environment.txt"
+          SELECT 'server_version|' || current_setting('server_version');
+          SELECT 'postgis_version|' || extversion FROM pg_extension WHERE extname = 'postgis';
+          SELECT 'database|' || current_database();
+          SELECT 'size|' || pg_size_pretty(pg_database_size(current_database()));
+          SELECT 'default_text_search_config|' || current_setting('default_text_search_config');
+          SELECT 'datcollate|' || datcollate FROM pg_database WHERE datname = current_database();
+          SELECT 'datctype|' || datctype FROM pg_database WHERE datname = current_database();
+          SELECT 'spatial_ref_sys_rows|' || count(*) FROM public.spatial_ref_sys;
+          SQL
+
+          {
+            echo "SRC_COLLATE=$(grep '^datcollate|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
+            echo "SRC_CTYPE=$(grep '^datctype|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
+            echo "SRC_TEXT_SEARCH=$(grep '^default_text_search_config|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
+            echo "SRC_SRS_ROWS=$(grep '^spatial_ref_sys_rows|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
+            echo "DUMP_NAME=switchback-prod-$(date -u +%Y%m%dT%H%M%SZ).dump"
+          } >> "$GITHUB_ENV"
+
+      # Census and dump share one transaction snapshot, so the numbers below describe exactly
+      # the rows the archive contains rather than the rows that existed a minute later. The
+      # alternative — comparing a restore against a live database that keeps taking ingest
+      # writes — can only ever produce a tolerance, and a tolerance is what a real difference
+      # hides in.
+      - name: Census and dump production, inside one snapshot
+        run: |
+          set -euo pipefail
+
+          # Removed rather than assumed absent: the wait below breaks as soon as the file is
+          # non-empty, so a leftover id from an earlier attempt would be read as this run's
+          # and every query would join a snapshot that no longer exists.
+          rm -f "$WORK/snapshot.id"
+
+          # A session that opens a repeatable-read transaction, publishes its snapshot, and
+          # then keeps itself busy until it is killed. `SELECT 1 \watch` rather than
+          # pg_sleep: each iteration is a short separate statement, so a killed client is
+          # noticed by the backend within the interval. A backend parked inside one long
+          # pg_sleep holds the snapshot — and blocks vacuum on production — until it returns.
+          psql -X -q -v ON_ERROR_STOP=1 > "$WORK/holder.log" 2>&1 <<SQL &
+          BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+          \pset tuples_only on
+          \pset format unaligned
+          \o $WORK/snapshot.id
+          SELECT pg_export_snapshot();
+          \o
+          SELECT 1 \watch 5
+          SQL
+          HOLDER=$!
+          trap 'kill "$HOLDER" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 60); do
+            [ -s "$WORK/snapshot.id" ] && break
+            sleep 1
+          done
+          SNAPSHOT="$(tr -d '[:space:]' < "$WORK/snapshot.id" 2>/dev/null || true)"
+          if [ -z "$SNAPSHOT" ]; then
+            echo '::error::The snapshot holder never published a snapshot id.'
+            cat "$WORK/holder.log" || true
+            exit 1
+          fi
+          echo "Snapshot $SNAPSHOT"
+
+          # Joining the snapshot fails loudly if the holder has died, so a census taken
+          # outside it is not a state this job can reach.
+          psql -X -tAq -v ON_ERROR_STOP=1 > "$WORK/census-source.txt" <<SQL
+          BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+          SET TRANSACTION SNAPSHOT '$SNAPSHOT';
+          \i infra/backup/census.sql
+          COMMIT;
+          SQL
+          echo "Census: $(wc -l < "$WORK/census-source.txt") lines"
+
+          pg_dump --format=custom --compress=9 --snapshot="$SNAPSHOT" --verbose \
+            --file="$WORK/$DUMP_NAME" 2> "$WORK/pg_dump.log"
+
+          # The greppable half. Schema only, so it carries no personal data and can be kept
+          # and read for far longer than the archive it describes.
+          pg_dump --format=plain --schema-only --snapshot="$SNAPSHOT" \
+            --file="$WORK/schema.sql"
+
+          kill "$HOLDER" 2>/dev/null || true
+          wait "$HOLDER" 2>/dev/null || true
+          trap - EXIT
+
+          ( cd "$WORK" && sha256sum "$DUMP_NAME" schema.sql > MANIFEST.txt )
+          ls -l "$WORK/$DUMP_NAME" "$WORK/schema.sql"
+          cat "$WORK/MANIFEST.txt"
+
+      # Roles are created before the restore rather than stripped out of it with --no-owner.
+      # The grants are the point: `sbapp` is the least-privilege credential Vercel carries,
+      # and postgres.bicep lists it as a compensating control for a firewall spanning the
+      # internet. A rehearsal that discards the ACLs cannot tell whether the dump has them.
+      - name: Build the rehearsal database
+        run: |
+          set -euo pipefail
+          ADMIN='postgresql://postgres@localhost:5433/postgres?sslmode=disable'
+
+          {
+            grep -oE '(OWNER TO|FOR ROLE|GRANTED BY) +[A-Za-z0-9_]+' "$WORK/schema.sql" || true
+            grep -oE '\b(TO|FROM) +[A-Za-z0-9_]+;' "$WORK/schema.sql" || true
+            echo "x $SOURCE_ROLE"
+          } | awk '{ print $NF }' | tr -d ';' | sort -u \
+            | grep -vixE 'public|postgres|current_user|session_user|current_role|none' \
+            > "$WORK/roles.txt" || true
+          echo 'Roles the archive references:'
+          sed 's/^/  /' "$WORK/roles.txt"
+
+          while read -r role; do
+            [ -n "$role" ] || continue
+            psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$role\" NOLOGIN"
+          done < "$WORK/roles.txt"
+
+          # The restore runs as the production admin role so that objects it creates —
+          # spatial_ref_sys above all, which CREATE EXTENSION makes rather than the archive —
+          # end up with production's owner. Restoring as `postgres` instead leaves exactly one
+          # ownership line different and turns a clean rehearsal red.
+          psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE \"$SOURCE_ROLE\" LOGIN SUPERUSER PASSWORD 'rehearsal'"
+          psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE switchback_restore OWNER \"$SOURCE_ROLE\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE '$SRC_COLLATE' LC_CTYPE '$SRC_CTYPE'"
+
+          TARGET="postgresql://$SOURCE_ROLE:rehearsal@localhost:5433/switchback_restore?sslmode=disable"
+          echo "TARGET_URL=$TARGET" >> "$GITHUB_ENV"
+
+          # Not carried by the dump: production sets this as an Azure *server* parameter, so
+          # it is invisible to pg_dump and has to be restated on any restore target. Left at
+          # Azure's default of pg_catalog.english, future ingest tokenises differently from
+          # the rows that arrived and search quietly stops finding trails.
+          psql "$TARGET" -X -q -v ON_ERROR_STOP=1 \
+            -c "ALTER DATABASE switchback_restore SET default_text_search_config = '$SRC_TEXT_SEARCH'"
+
+      - name: Restore the dump
+        run: |
+          set -euo pipefail
+          DUMP="$WORK/$DUMP_NAME"
+
+          # The table of contents is kept as evidence: it is the list of what the archive
+          # actually holds, and it is what `pg_restore -L` reads for a selective restore.
+          pg_restore --list "$DUMP" > "$WORK/toc.txt"
+
+          # --exit-on-error, deliberately. pg_restore's default is to keep going and print a
+          # count of ignored errors at the end, which is how a restore that dropped a whole
+          # section still exits looking successful.
+          pg_restore --dbname="$TARGET_URL" --exit-on-error "$DUMP"
+
+          # Reported rather than compared. pg_dump carries only the SRIDs outside the
+          # catalogue PostGIS ships — see infra/backup/census.sql — so these two numbers
+          # differ by whatever 3.6.1 and 3.5 disagree about, and that is a fact about the two
+          # PostGIS builds rather than about this backup.
+          echo "spatial_ref_sys rows: production $SRC_SRS_ROWS, restored copy $(psql "$TARGET_URL" -X -tAq -c 'SELECT count(*) FROM public.spatial_ref_sys')"
+
+      - name: Census the restored copy and compare
+        run: |
+          set -euo pipefail
+          psql "$TARGET_URL" -X -tAq -v ON_ERROR_STOP=1 > "$WORK/census-restored.txt" <<'SQL'
+          BEGIN;
+          \i infra/backup/census.sql
+          COMMIT;
+          SQL
+
+          # Printed before the verdict so the numbers are in the log whether or not the diff
+          # is empty. Anything shaped like a row of user data is a digest by construction —
+          # the census emits counts, hashes and DDL.
+          grep -E '^(rows|geo|db)\|' "$WORK/census-restored.txt" | sed 's/^/  /'
+
+          if diff -u "$WORK/census-source.txt" "$WORK/census-restored.txt" > "$WORK/census.diff"; then
+            echo
+            echo "Identical: $(wc -l < "$WORK/census-source.txt") census lines match production."
+          else
+            echo '::error::The restored copy does not match production. The differences follow.'
+            cat "$WORK/census.diff"
+            exit 1
+          fi
+
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        run: |
+          # Deliberately not `set -u`: this step runs after a failure too, and the point of a
+          # summary on a red run is to say how far it got, not to abort on the first variable
+          # the failed step never exported.
+          set -eo pipefail
+          {
+            echo '## Backup of production'
+            echo
+            echo '| Fact | Value |'
+            echo '| --- | --- |'
+            sed 's/|/ | /; s/^/| /; s/$/ |/' "$WORK/source-environment.txt" 2>/dev/null || true
+            echo "| dump | \`${DUMP_NAME:-not reached}\` |"
+            echo "| dump size | $(du -h "$WORK/${DUMP_NAME:-none}" 2>/dev/null | cut -f1) |"
+            echo "| dump sha256 | $(cut -d' ' -f1 < "$WORK/MANIFEST.txt" 2>/dev/null | head -1) |"
+            echo "| retention | ${{ inputs.dump_retention_days }} days |"
+            echo
+            echo '### Restored and compared'
+            echo
+            echo '```'
+            grep -E '^(rows|geo|db)\|' "$WORK/census-restored.txt" 2>/dev/null \
+              || echo 'The restore did not get far enough to census.'
+            echo '```'
+            echo
+            echo '### Restoring it by hand'
+            echo
+            echo '```bash'
+            echo '# Into a server that has PostGIS available. CREATE EXTENSION runs from the'
+            echo '# archive; the shipped SRID catalogue comes from it, not from the dump.'
+            echo "createdb --template=template0 --encoding=UTF8 --lc-collate='${SRC_COLLATE:-C.UTF-8}' --lc-ctype='${SRC_CTYPE:-C.UTF-8}' switchback"
+            echo "psql -d switchback -c \"ALTER DATABASE switchback SET default_text_search_config = '${SRC_TEXT_SEARCH:-pg_catalog.simple}';\""
+            echo "psql -d switchback -c 'CREATE ROLE ${SOURCE_ROLE:-sbadmin}; CREATE ROLE sbapp;'  # where they do not already exist"
+            echo "pg_restore -d switchback --exit-on-error ${DUMP_NAME:-<dump>}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Personal data, kept apart from the evidence and kept briefly. Every collaborator on
+      # this repository can download it, and so can any workflow that runs with `actions:
+      # read` — so the retention is the control, and it is deliberately days.
+      - name: Upload the dump
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: switchback-production-dump
+          path: ${{ env.WORK }}/${{ env.DUMP_NAME }}
+          retention-days: ${{ inputs.dump_retention_days }}
+          # Already compressed by pg_dump. Re-deflating a gzip stream costs minutes and saves
+          # nothing.
+          compression-level: 0
+          if-no-files-found: error
+
+      # Counts, digests, DDL and logs. No rows, so this outlives the dump and is what anyone
+      # auditing the run later actually reads.
+      - name: Upload the evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: switchback-backup-evidence
+          path: |
+            ${{ env.WORK }}/census-source.txt
+            ${{ env.WORK }}/census-restored.txt
+            ${{ env.WORK }}/census.diff
+            ${{ env.WORK }}/source-environment.txt
+            ${{ env.WORK }}/schema.sql
+            ${{ env.WORK }}/MANIFEST.txt
+            ${{ env.WORK }}/toc.txt
+            ${{ env.WORK }}/pg_dump.log
+            ${{ env.WORK }}/roles.txt
+          retention-days: 30
+          if-no-files-found: warn
