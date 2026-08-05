@@ -12,7 +12,19 @@ param location string
 
 param identityName string
 
-@description('owner/repo the federated credentials trust, e.g. mbahgatTech/switchback.')
+@description('''
+Repository the federated credentials trust, in GitHub's **immutable** subject form —
+`<owner>@<ownerId>/<repo>@<repoId>`, not `owner/repo`.
+
+This is not a style choice. GitHub mints this repository's OIDC tokens with the immutable
+subject, so a credential written the familiar way is never matched and the exchange fails with
+`AADSTS700213: No matching federated identity record found for presented assertion subject`,
+naming a subject that does not appear anywhere in the template. Measured 2026-08-05, run
+31048227364. The ids also survive a rename of either the account or the repository, which the
+readable form does not.
+
+  gh api repos/<owner>/<repo> --jq '{repoId: .id, ownerId: .owner.id}'
+''')
 param repository string
 
 @description('Branches whose workflow runs may assume this identity.')

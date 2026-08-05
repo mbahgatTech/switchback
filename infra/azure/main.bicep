@@ -318,8 +318,12 @@ param minTlsVersion string = 'TLSv1.2'
 @description('Name of the user-assigned managed identity CI reaches Postgres with.')
 param ciIdentityName string = 'id-switchback-postgres-ci'
 
-@description('owner/repo whose GitHub Actions OIDC tokens the CI identity trusts.')
-param repository string = 'mbahgatTech/switchback'
+@description('''
+Repository whose GitHub Actions OIDC tokens the CI identity trusts, in GitHub's immutable
+subject form. See the parameter of the same name in ci-identity.bicep for why it is not
+`mbahgatTech/switchback`.
+''')
+param repository string = 'mbahgatTech@81331884/switchback@1316632119'
 
 @description('''
 Branches whose workflow runs may assume the CI identity. One federated credential each —
