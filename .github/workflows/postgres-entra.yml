@@ -264,6 +264,10 @@ jobs:
           echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
 
       - uses: azure/login@v2
+        # The federated credential this matches is declared in infra/azure/ci-identity.bicep,
+        # and its subject uses GitHub's immutable `owner@id/repo@id` form because that is what
+        # this repository's OIDC tokens actually carry. A credential written `owner/repo` fails
+        # here with AADSTS700213 and a subject string that appears in no template.
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
