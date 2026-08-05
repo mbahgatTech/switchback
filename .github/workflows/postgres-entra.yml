@@ -91,6 +91,14 @@ jobs:
             }
             const password = decodeURIComponent(url.password);
             if (password) console.log(`::add-mask::${password}`);
+            // `new URL` strips trailing whitespace, so a secret written with a stray newline
+            // parses cleanly here and then reaches Prisma — which reads the raw string — as
+            // `sslmode=verify-full\n`. Setting these secrets from a pipe rather than a file
+            // is the usual way to acquire one.
+            if (raw !== raw.trim()) {
+              console.error(`::error::${label} has leading or trailing whitespace.`);
+              process.exitCode = 1;
+            }
             const query = [...url.searchParams.entries()]
               .map(([k, v]) => `${k}=${v}`)
               .join('&');
@@ -198,7 +206,7 @@ jobs:
            GROUP BY c.relacl
            ORDER BY 1;
 
-          SELECT 'defacl|' || pg_get_userbyid(d.defaclrole) || '|' || d.defaclobjtype || '|'
+          SELECT 'defacl|' || pg_get_userbyid(d.defaclrole) || '|' || d.defaclobjtype::text || '|'
                  || coalesce(array_to_string(d.defaclacl, ','), '-')
             FROM pg_default_acl d
            ORDER BY 1;
