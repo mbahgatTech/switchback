@@ -333,8 +333,8 @@ whole of the maths.
 stateDiagram-v2
   [*] --> running: claimed
   running --> ready: committed inside 540 s
-  running --> pending: deadline exhausted, z &lt; 11
-  running --> failed: deadline exhausted, z = 11
+  running --> pending: out of clock, z &lt; 11
+  running --> failed: out of clock at z11, or Overpass unavailable
   pending --> pending: children outstanding
   pending --> ready: all four children ready
   note right of pending
@@ -342,6 +342,14 @@ stateDiagram-v2
     one ingest_tile job each
   end note
 ```
+
+**Out of clock has two shapes and both split.** The commit loop can exhaust `deadlineAt`, which is
+the failure the 2026-08-04 run measured; and the tile's own Overpass query can exhaust the Overpass
+budget, in which case `processTile` never reaches the commit loop at all. Both mean the same thing —
+this box cannot be served in one invocation — so both subdivide. Every other Overpass failure is
+kept apart deliberately: a breaker that is open, a mirror answering 504 and a malformed query all
+mean come back later, and subdividing on those would quadruple the load on a service already
+refusing.
 
 **Split on failure, not up front.** Pre-sizing every tile with an Overpass `out count` costs one
 query per tile forever — measured at 3.2 s and one request for `120221203` — to save a wasted run on
