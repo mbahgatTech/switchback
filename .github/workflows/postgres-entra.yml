@@ -1,0 +1,208 @@
+# The hands that reach production Postgres, because the workstation cannot.
+#
+# A VPN adapter on the machine this repository is developed on holds the default route and
+# kills the TLS handshake to 5432 before the server sees it. Every data-plane step of the move
+# to Microsoft Entra authentication — reading what `sbapp` may do, creating the Entra-mapped
+# roles, proving a token still works after it has expired — therefore runs here.
+#
+# `survey` is read-only and is the one to run when something looks wrong. It prints the shape
+# of the repository secrets without printing the secrets, and it prints exactly which
+# privileges the application role holds, which is the specification the Entra roles have to
+# match.
+name: Postgres identity
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'survey — read-only: secret shapes, server auth config, sbapp privileges'
+        required: true
+        default: survey
+        type: choice
+        options:
+          - survey
+  # Temporary, and removed before this branch merges: `workflow_dispatch` only offers
+  # workflows that already exist on the default branch, and this one does not yet.
+  push:
+    branches:
+      - worktree-wf_189485a3-0e7-2
+      - feat/credential-free-postgres
+    paths:
+      - .github/workflows/postgres-entra.yml
+      - infra/postgres-identity/**
+
+permissions:
+  contents: read
+
+# One at a time. These run against the 2-vCore Burstable server that serves the live site.
+concurrency:
+  group: postgres-entra
+  cancel-in-progress: false
+
+jobs:
+  survey:
+    name: survey
+    if: github.event_name == 'push' || inputs.action == 'survey'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest ships the PostgreSQL 16 client and production runs 17. psql itself is
+      # tolerant of the skew, but the rest of this migration is not, and installing the
+      # matching client once here keeps every step on one version.
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      # The two repository secrets are connection strings with a password in them. This step
+      # is the only description of them anyone can get without being able to read them: it
+      # prints every part except the password, and the password length rather than the
+      # password. Rotating the admin credential means rewriting these secrets by hand, and
+      # doing that blind is how a working deploy pipeline gets broken.
+      - name: Describe the repository secrets without printing them
+        env:
+          POOLED_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          function describe(label, raw) {
+            if (!raw) {
+              console.log(`${label}: not set`);
+              return null;
+            }
+            let url;
+            try {
+              url = new URL(raw);
+            } catch {
+              console.log(`${label}: set, but does not parse as a URL`);
+              return null;
+            }
+            const password = decodeURIComponent(url.password);
+            if (password) console.log(`::add-mask::${password}`);
+            const query = [...url.searchParams.entries()]
+              .map(([k, v]) => `${k}=${v}`)
+              .join('&');
+            console.log(
+              `${label}: ${url.protocol}//${decodeURIComponent(url.username)}:<${password.length} chars>` +
+                `@${url.hostname}:${url.port || '5432'}${url.pathname}?${query}`,
+            );
+            return url;
+          }
+
+          describe('DATABASE_URL', process.env.POOLED_URL);
+          const direct = describe('DIRECT_DATABASE_URL', process.env.DIRECT_URL);
+          if (!direct) {
+            console.error('::error::DIRECT_DATABASE_URL is unusable; the rest of this job needs it.');
+            process.exit(1);
+          }
+
+          const host = direct.hostname;
+          if (!host.endsWith('.postgres.database.azure.com')) {
+            console.error(`::error::${host} is not an Azure Flexible Server.`);
+            process.exit(1);
+          }
+
+          // The password reaches a 0600 passfile under the runner temp directory and nothing
+          // else — not argv, not $GITHUB_ENV, not a log line.
+          const port = direct.port || '5432';
+          const user = decodeURIComponent(direct.username);
+          const passfile = path.join(process.env.RUNNER_TEMP, 'pgpass');
+          fs.writeFileSync(
+            passfile,
+            `${host}:${port}:*:${user}:${decodeURIComponent(direct.password)}\n`,
+            { mode: 0o600 },
+          );
+
+          fs.appendFileSync(
+            process.env.GITHUB_ENV,
+            [
+              `PGHOST=${host}`,
+              `PGPORT=${port}`,
+              `PGUSER=${user}`,
+              `PGDATABASE=${decodeURIComponent(direct.pathname.replace(/^\//, ''))}`,
+              `PGPASSFILE=${passfile}`,
+              'PGSSLMODE=verify-full',
+              'PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt',
+            ].join('\n') + '\n',
+          );
+          JS
+
+      - name: Who am I, and over what
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'current_user|' || current_user;
+          SELECT 'session_user|' || session_user;
+          SELECT 'database|' || current_database();
+          SELECT 'server_version|' || current_setting('server_version');
+          SELECT 'ssl|' || ssl::text || '|' || coalesce(version, '-') || '|' || coalesce(cipher, '-')
+            FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+          SELECT 'pgaadauth_installed|' || (count(*) > 0)::text
+            FROM pg_extension WHERE extname = 'pgaadauth';
+          SQL
+
+      # The specification the Entra-mapped roles have to match. Everything `sbapp` may do, in
+      # a form that can be diffed against the same query run after the new roles exist: role
+      # attributes, memberships, schema and table and sequence privileges, and the default
+      # privileges that decide what it gets on a table `prisma db push` creates tomorrow.
+      - name: Exactly what sbapp may do
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'role|' || rolname || '|super=' || rolsuper::text || '|createdb=' || rolcreatedb::text
+                 || '|createrole=' || rolcreaterole::text || '|login=' || rolcanlogin::text
+                 || '|inherit=' || rolinherit::text || '|repl=' || rolreplication::text
+                 || '|bypassrls=' || rolbypassrls::text
+            FROM pg_roles
+           WHERE rolname NOT LIKE 'pg\_%'
+           ORDER BY rolname;
+
+          SELECT 'member|' || r.rolname || '|of|' || g.rolname || '|admin=' || m.admin_option::text
+            FROM pg_auth_members m
+            JOIN pg_roles r ON r.oid = m.member
+            JOIN pg_roles g ON g.oid = m.roleid
+           WHERE r.rolname NOT LIKE 'pg\_%'
+           ORDER BY r.rolname, g.rolname;
+
+          SELECT 'schema|' || n.nspname || '|' || coalesce(array_to_string(n.nspacl, ','), '-')
+            FROM pg_namespace n
+           WHERE n.nspname IN ('public', 'topology')
+           ORDER BY n.nspname;
+
+          -- Collapsed to the distinct ACL shapes rather than one line per table: 20-odd
+          -- tables carrying the same grant is one fact, and printing it 20 times hides the
+          -- one table that differs.
+          SELECT 'tblacl|' || coalesce(array_to_string(c.relacl, ','), '-') || '|tables=' || count(*)::text
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND c.relkind = 'r'
+           GROUP BY c.relacl
+           ORDER BY 1;
+
+          SELECT 'seqacl|' || coalesce(array_to_string(c.relacl, ','), '-') || '|sequences=' || count(*)::text
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = 'public' AND c.relkind = 'S'
+           GROUP BY c.relacl
+           ORDER BY 1;
+
+          SELECT 'defacl|' || pg_get_userbyid(d.defaclrole) || '|' || d.defaclobjtype || '|'
+                 || coalesce(array_to_string(d.defaclacl, ','), '-')
+            FROM pg_default_acl d
+           ORDER BY 1;
+
+          SELECT 'dbacl|' || datname || '|' || coalesce(array_to_string(datacl, ','), '-')
+            FROM pg_database WHERE datname = current_database();
+          SQL
