@@ -55,10 +55,10 @@ env:
   FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
   VERCEL_OID: c9bfba39-4191-4695-996d-a588b7154e58
 
-# One at a time. These run against the 2-vCore Burstable server that serves the live site.
-concurrency:
-  group: postgres-entra
-  cancel-in-progress: false
+# Concurrency is per job rather than per workflow. These jobs do very different things to the
+# same 2-vCore Burstable server — the soak holds one idle connection for eighty minutes, the
+# others open a handful for a few seconds — and a single workflow-level group would make a
+# one-line fix wait out a soak.
 
 jobs:
   survey:
@@ -66,6 +66,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.action == 'survey'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: postgres-entra-survey
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
@@ -247,6 +250,9 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'provision')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    concurrency:
+      group: postgres-entra-provision
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@v4
@@ -377,9 +383,14 @@ jobs:
   # ---------------------------------------------------------------------------------------
   soak:
     name: hold a connection past token expiry
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'soak')
+    # Dispatch only. Eighty minutes is too long to spend on every push, and the one execution
+    # this branch needed was fired by the temporary push trigger above before this line.
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'soak'
     runs-on: ubuntu-latest
     timeout-minutes: 110
+    concurrency:
+      group: postgres-entra-soak
+      cancel-in-progress: false
 
     steps:
       - name: Install the PostgreSQL 17 client
