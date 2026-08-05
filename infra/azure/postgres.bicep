@@ -33,6 +33,21 @@ param administratorLoginPassword string
 param minTlsVersion string
 param entraAuthEnabled bool
 param entraAdministrators entraAdministrator[]
+
+@description('''
+Object id of a managed identity this deployment also creates, to be made an administrator.
+
+Separate from `entraAdministrators` rather than appended to it, and the reason is `what-if`.
+A copy count has to be computable before the deployment starts, so a loop whose length comes
+from `reference()` on a not-yet-deployed resource makes ARM refuse to expand this whole module —
+`NestedDeploymentShortCircuited` — and every Postgres resource silently reports as `Ignore`
+instead of as a change. Losing the preview on the database is a far worse trade than one extra
+parameter. Measured 2026-08-05.
+''')
+param ciAdministratorObjectId string
+
+@description('Resource name of that identity, which is also its Postgres role name.')
+param ciAdministratorName string
 param logAnalyticsWorkspaceId string
 param alertActionGroupId string
 param tags object
@@ -68,7 +83,7 @@ var pooledPort = pgBouncerEnabled ? 6432 : 5432
 // Declaring an administrator implies the feature, so the two cannot disagree in the direction
 // that matters. The flag exists for the other direction — on, with nobody declared yet — which
 // is the only way to sequence this safely. See the parameter's description in main.bicep.
-var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators)
+var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators) || !empty(ciAdministratorObjectId)
 
 // ---------------------------------------------------------------------------------------
 // The server.
@@ -608,6 +623,21 @@ resource entraAdmins 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2
     dependsOn: [database]
   }
 ]
+
+// Not part of the loop above — see `ciAdministratorObjectId`. `what-if` still cannot analyse
+// this one resource, because its ARM name *is* the runtime reference, and reports it as
+// `Unsupported`. That is the residual cost and it is the right size: one named resource that
+// cannot be previewed, rather than every Postgres resource silently reported as `Ignore`.
+resource ciAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = if (!empty(ciAdministratorObjectId)) {
+  parent: server
+  name: ciAdministratorObjectId
+  properties: {
+    principalName: ciAdministratorName
+    principalType: 'ServicePrincipal'
+    tenantId: subscription().tenantId
+  }
+  dependsOn: [entraAdmins]
+}
 
 // ---------------------------------------------------------------------------------------
 // Outputs. No credential appears here or may ever be added — deployment outputs are stored

@@ -528,17 +528,12 @@ module postgres 'postgres.bicep' = {
     administratorLoginPassword: administratorLoginPassword
     minTlsVersion: minTlsVersion
     entraAuthEnabled: entraAuthEnabled
+    entraAdministrators: entraAdministrators
     // The CI identity is an administrator because `prisma db push` needs DDL over tables
     // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
-    // Appended here rather than listed in the parameter file because its object id does not
-    // exist until the identity above is deployed.
-    entraAdministrators: union(entraAdministrators, [
-      {
-        objectId: ciIdentity.outputs.principalId
-        principalName: ciIdentityName
-        principalType: 'ServicePrincipal'
-      }
-    ])
+    // Passed separately rather than appended to the list — see the parameter in postgres.bicep.
+    ciAdministratorObjectId: ciIdentity.outputs.principalId
+    ciAdministratorName: ciIdentityName
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
     alertActionGroupId: monitoring.outputs.actionGroupId
     tags: tags
