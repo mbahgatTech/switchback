@@ -386,6 +386,15 @@ make cheaper — so deeper than this the overhead, not the work, is what fills t
 dense tile fails exactly as it did before, and children already created still ingest and still roll
 up, so the switch is safe to throw mid-flight.
 
+**Children wait for the backlog, and that is the pump's shape rather than subdivision's.** They are
+enqueued at `SPLIT_PRIORITY` — level with a live viewport — but the pump only refills the broker
+when fewer than `INGEST_PUMP_LOW_WATER` (4) messages are in flight, and at equal priority
+`claimJobs` and the pump both order by `runAfter ASC`, so a child created now sorts behind every
+tile already queued. With eight dense tiles ahead of it and one message worked at a time, a child
+can wait the better part of an hour before its signal is published. Nothing is lost — the row is
+durable and the parent stays `pending` — but "the tile splits" and "the tile is ready" are separated
+by the queue, not by the split.
+
 **Overpass budget.** A split z9 costs four tile queries, four waypoint queries and four region
 lookups where it cost one of each, so roughly 4x for the tiles that split and nothing at all for the
 tiles that do not. The 2-concurrent bound is untouched: children are ordinary jobs, the host takes
