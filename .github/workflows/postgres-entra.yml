@@ -370,16 +370,23 @@ jobs:
   # ---------------------------------------------------------------------------------------
   # Does an established session die when its token expires?
   #
-  # Nobody should answer this from memory, and a five-minute smoke test answers it wrongly.
-  # One connection is opened with a token, held, and asked the time every five minutes for
-  # eighty — past the hour the documentation quotes — printing `pg_backend_pid()` each round so
-  # a silent reconnect cannot be mistaken for survival. psql runs a whole script in one
-  # session, so a constant backend pid means the connection is the original one.
+  # **This job does not currently answer that, and the reason is worth keeping.** It was built
+  # against the documented user-token lifetime of one hour and holds a connection for eighty
+  # minutes. Run 31049068312 held backend pid 844034 from 21:32:50 to 22:52:53 UTC — same pid,
+  # same role, sixteen probes, no error — and proved nothing about expiry, because the token it
+  # authenticated with printed `lifetime=1440min`. A managed identity gets **24 hours**, not one
+  # hour, so eighty minutes is comfortably inside the window. A test that cannot fail is not a
+  # test.
   #
-  # The answer decides the design. If a live session survives, per-connection token acquisition
-  # plus a bounded connection lifetime is sufficient and nothing ever needs restarting. If it
-  # does not, no amount of pooling discipline is enough and the application has to survive a
-  # backend disappearing mid-query.
+  # A GitHub-hosted job is capped at six hours, so waiting the token out here is not available.
+  # Two designs that would work, neither yet tried: shorten the lifetime with an Entra token
+  # lifetime policy on this identity's service principal, or hold the connection from something
+  # without a six-hour cap. Until one of them runs, the token lifecycle in docs/architecture.md
+  # says the question is open, and it should keep saying so.
+  #
+  # What the job does establish, and it is not nothing: a token-authenticated session is stable
+  # for eighty minutes on the same backend, so the connection is not being cycled underneath us
+  # by anything else.
   # ---------------------------------------------------------------------------------------
   soak:
     name: hold a connection past token expiry
@@ -424,7 +431,9 @@ jobs:
             const part = process.argv[1].split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
             const claims = JSON.parse(Buffer.from(part, "base64").toString());
             const left = claims.exp - Math.floor(Date.now() / 1000);
-            console.log(`exp=${new Date(claims.exp * 1000).toISOString()} lifetime=${Math.round(left / 60)}min aud=${claims.aud}`);
+            const mins = Math.round(left / 60);
+            console.log(`exp=${new Date(claims.exp * 1000).toISOString()} lifetime=${mins}min aud=${claims.aud}`);
+            require("node:fs").appendFileSync(process.env.GITHUB_ENV, `TOKEN_LIFETIME_MIN=${mins}\n`);
           ' "$token"
 
       - name: One session, eighty minutes
@@ -438,3 +447,14 @@ jobs:
             done
           } > "$RUNNER_TEMP/soak.sql"
           psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$'
+
+      # Says out loud whether the run above could have failed. Without this the log reads as a
+      # clean pass on a question it never asked.
+      - name: Did this actually cross the expiry boundary?
+        run: |
+          set -euo pipefail
+          if [ "${TOKEN_LIFETIME_MIN:-0}" -gt 80 ]; then
+            echo "::warning::INCONCLUSIVE — the token was valid for ${TOKEN_LIFETIME_MIN} minutes and this job held the session for 80. Nothing here says what happens at expiry."
+          else
+            echo "Conclusive: the session outlived a token valid for ${TOKEN_LIFETIME_MIN} minutes."
+          fi

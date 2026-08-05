@@ -325,11 +325,22 @@ Three properties, and the reason for each:
 
 Whether the third is a correctness requirement or only hygiene turns on one question nobody should
 answer from memory: **is the token checked only at connect, or is a live session terminated when it
-expires?** The `soak` action of the `Postgres identity` workflow measures it — one connection, held
-and queried every five minutes for eighty, printing `pg_backend_pid()` each round so a silent
-reconnect cannot pass as survival. Until that has run, treat the answer as unknown: if a live
-session _is_ terminated, no pooling discipline is sufficient and the application has to survive a
-backend vanishing mid-query.
+expires?**
+
+**That question is still open, and the attempt to close it is worth recording.** The `soak` action
+of the `Postgres identity` workflow holds one connection and queries it every five minutes for
+eighty, printing `pg_backend_pid()` each round so a silent reconnect cannot pass as survival. Run
+31049068312 held backend pid 844034 from 21:32:50 to 22:52:53 UTC — same pid, same role, sixteen
+probes, no error. It proves the session is stable for eighty minutes and **nothing about expiry**,
+because the token it authenticated with reported `lifetime=1440min`: a managed identity gets 24
+hours, not the hour the documentation quotes for a user. The test never reached the boundary it was
+built to cross.
+
+A GitHub-hosted job is capped at six hours, so waiting the token out is not available there. Either
+shorten the lifetime with an Entra token lifetime policy on that service principal, or hold the
+connection from somewhere without the cap. Until one of those runs, the safe assumption is the
+pessimistic one: bound the connection lifetime, and treat a mid-query disconnection as something
+the application has to survive rather than something that cannot happen.
 
 ### Sign-in for people
 
