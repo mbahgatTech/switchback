@@ -302,7 +302,7 @@ sequenceDiagram
   DB->>DB: validate once, at connect
   DB-->>P: session established
 
-  Note over P,DB: the session outlives its token —<br/>Postgres does not re-check
+  Note over P,DB: does the session outlive its token?<br/>measured, not assumed — see below
   P->>P: connection retired at maxLifetimeSeconds<br/>(below token lifetime)
   P->>T: password() again for the replacement
 
@@ -319,10 +319,17 @@ Three properties, and the reason for each:
   promise and calls it on every new connection, and `@prisma/adapter-pg`'s `PrismaPg` accepts a
   `pg.Pool` rather than only a connection string — so this needs no change at any call site.
 - **Renew two minutes before expiry**, matching `TOKEN_SKEW_MS` in `packages/ingest/src/publish.ts`
-  rather than inventing a second number. The margin only has to cover clock skew and one round
-  trip, because the token is checked at connect and never again.
+  rather than inventing a second number. The margin has to cover clock skew and one round trip.
 - **Retire connections below the token lifetime**, so the pool rotates naturally instead of
   accumulating sessions whose authority was granted long ago.
+
+Whether the third is a correctness requirement or only hygiene turns on one question nobody should
+answer from memory: **is the token checked only at connect, or is a live session terminated when it
+expires?** The `soak` action of the `Postgres identity` workflow measures it — one connection, held
+and queried every five minutes for eighty, printing `pg_backend_pid()` each round so a silent
+reconnect cannot pass as survival. Until that has run, treat the answer as unknown: if a live
+session _is_ terminated, no pooling discipline is sufficient and the application has to survive a
+backend vanishing mid-query.
 
 ### Sign-in for people
 
