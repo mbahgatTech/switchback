@@ -18,6 +18,7 @@ import {
 import type { Prisma, PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
+  MAX_INGEST_ZOOM,
   lineLengthM,
   lngLatToTile,
   quadkeyToBBox,
@@ -52,6 +53,16 @@ import {
 } from './overpass';
 import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
+import {
+  CHILDREN_PER_TILE,
+  canSubdivide,
+  childTiles,
+  promoteFrom,
+  queueStaleChildren,
+  rollUpAncestors,
+  splitTile,
+} from './subdivide';
+import type { ChildTile } from './subdivide';
 import { Gate, forEachConcurrent } from './pool';
 
 /** Resample interval for the elevation profile. Matches `ElevationProfile.spacingM`. */
@@ -109,11 +120,8 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
   return rendered;
 }
 
-/**
- * A tile is re-fetched when its data is older than this. Weekly would be mostly wasted
- * Overpass load; a season would let a rerouted path go unnoticed. See `docs/architecture.md`.
- */
-export const TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** Re-exported from their own module so subdivision can ask the same question without a cycle. */
+export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
 
 export interface PipelineDeps {
   db?: PrismaClient;
@@ -143,23 +151,18 @@ export interface ProcessTileResult {
   skipped: number;
   failed: number;
   fetchMs: number;
-}
-
-/** Whether a tile's cached data is still good enough to serve without re-fetching. */
-export function isTileFresh(
-  tile: { status: TileStatus; fetchedAt: Date | null } | null,
-  now: Date,
-  ttlMs = TILE_TTL_MS,
-): boolean {
-  if (!tile?.fetchedAt) return false;
-  if (tile.status !== TileStatus.ready && tile.status !== TileStatus.empty) return false;
-  return now.getTime() - tile.fetchedAt.getTime() < ttlMs;
+  /** The z+1 quadkeys this run put in play. Empty unless the tile is subdivided. */
+  children: string[];
 }
 
 /**
- * Fetch, assemble and commit every trail in one z9 tile. Returns rather than throws for the
+ * Fetch, assemble and commit every trail in one tile. Returns rather than throws for the
  * ordinary failure modes — the caller is a job handler that records the outcome either way —
  * but throws when Overpass is unavailable, so the queue backs off instead of burning attempts.
+ *
+ * A tile that already has children is never fetched: subdivision has moved the work down a
+ * level, so this becomes the roll-up — queue whatever child is stale, promote the parent once
+ * all four are in. See `subdivide.ts`.
  */
 export async function processTile(quadkey: string, deps: PipelineDeps): Promise<ProcessTileResult> {
   const db = deps.db ?? backgroundPrisma;
@@ -168,11 +171,18 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const terrain = deps.terrain ?? new TerrainSource({ fetchImpl: deps.fetchImpl });
 
   const tile = quadkeyToTile(quadkey);
-  if (tile.z !== INGEST_ZOOM) {
-    throw new Error(`processTile expects a z${INGEST_ZOOM} quadkey, got z${tile.z} (${quadkey})`);
+  if (tile.z < INGEST_ZOOM || tile.z > MAX_INGEST_ZOOM) {
+    throw new Error(
+      `processTile expects a z${INGEST_ZOOM}-z${MAX_INGEST_ZOOM} quadkey, got z${tile.z} (${quadkey})`,
+    );
   }
   const bbox = quadkeyToBBox(quadkey);
   const startedAt = Date.now();
+
+  const children = await childTiles(db, quadkey);
+  if (children.length === CHILDREN_PER_TILE) {
+    return rollUpSplitTile(db, quadkey, children, now(), log, startedAt);
+  }
 
   await db.ingestTile.upsert({
     where: { quadkey },
@@ -223,6 +233,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
         fetchMs: Date.now() - startedAt,
       },
     });
+    await rollUpAncestors(db, quadkey);
     return {
       quadkey,
       status: TileStatus.empty,
@@ -230,6 +241,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       skipped: 0,
       failed: 0,
       fetchMs: Date.now() - startedAt,
+      children: [],
     };
   }
 
@@ -284,13 +296,34 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
 
   /*
    * The per-trail catch above is what keeps one bad trail from costing its tile, and it
-   * swallows the deadline too — so re-check it here and fail the tile deliberately. A tile
-   * whose remaining trails were never attempted must not be written `ready`: it would be
-   * served short and never refetched until the TTL. `drainJobs` catches this, writes
-   * `lastError` and releases the lease, which is what the retry needs.
+   * swallows the deadline too — so re-check it here and decide deliberately. A tile whose
+   * remaining trails were never attempted must not be written `ready`: it would be served
+   * short and never refetched until the TTL.
+   *
+   * Running out of clock is what "this tile is too big" looks like from inside, so this is
+   * where subdivision is triggered rather than at the top: the ceiling being tested is the
+   * whole handler's, and nothing before the commit loop knows how much of it a tile will
+   * want. Below the zoom floor there is nowhere left to go, so the tile fails as it always
+   * did — `drainJobs` catches it, writes `lastError`, and the retry ladder runs out.
    */
   if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) {
     const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt);
+    const fetchMs = Date.now() - startedAt;
+
+    if (canSubdivide(tile.z)) {
+      const split = await splitTile(db, quadkey, { fetchMs });
+      log('tile split', { quadkey, committed, children: split, fetchMs });
+      return {
+        quadkey,
+        status: TileStatus.pending,
+        trailCount: committed,
+        skipped,
+        failed,
+        fetchMs,
+        children: split,
+      };
+    }
+
     await db.ingestTile.update({
       where: { quadkey },
       data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
@@ -311,8 +344,48 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   });
 
   await discoverParentRoutes(db, assembled, deps);
+  await rollUpAncestors(db, quadkey);
 
-  return { quadkey, status: TileStatus.ready, trailCount: committed, skipped, failed, fetchMs };
+  return {
+    quadkey,
+    status: TileStatus.ready,
+    trailCount: committed,
+    skipped,
+    failed,
+    fetchMs,
+    children: [],
+  };
+}
+
+/**
+ * A tile that has been subdivided, revisited. It fetches nothing: the children own the ground
+ * now, so all this does is put back whatever child has gone stale and promote the parent once
+ * all four are in. Cheap by design — every viewport over a split tile lands here, because
+ * `ensureCoverage` still queues the z9 parent and knows nothing about the split.
+ */
+async function rollUpSplitTile(
+  db: PrismaClient,
+  quadkey: string,
+  children: readonly ChildTile[],
+  now: Date,
+  log: (message: string, detail?: Record<string, unknown>) => void,
+  startedAt: number,
+): Promise<ProcessTileResult> {
+  const queued = await queueStaleChildren(db, children, now);
+  const promoted = await promoteFrom(db, quadkey);
+  const settled = promoted.includes(quadkey);
+
+  log('split tile', { quadkey, queued, ready: settled });
+
+  return {
+    quadkey,
+    status: settled ? TileStatus.ready : TileStatus.pending,
+    trailCount: children.reduce((sum, child) => sum + child.trailCount, 0),
+    skipped: 0,
+    failed: 0,
+    fetchMs: Date.now() - startedAt,
+    children: children.map((child) => child.quadkey),
+  };
 }
 
 /**

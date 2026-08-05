@@ -103,9 +103,9 @@ describe('pickRegion', () => {
 });
 
 describe('processTile', () => {
-  it('refuses a quadkey at the wrong zoom before touching the database', async () => {
-    // Ingest is defined at z9. A z12 quadkey would mark a tile ready whose bbox covers a
-    // sixty-fourth of the area the ingest zoom implies, leaving the rest silently unfetched.
+  it('refuses a quadkey below the ingest zoom before touching the database', async () => {
+    // z8 is a tile twice as wide as ingest is defined for; marking it ready would claim four
+    // z9 tiles' worth of ground from one z9 fetch.
     let queried = false;
     const overpass = {
       query: async () => {
@@ -114,8 +114,153 @@ describe('processTile', () => {
       },
     } as unknown as OverpassClient;
 
-    await expect(processTile('033311323012', { overpass })).rejects.toThrow(/z9 quadkey/);
+    await expect(processTile('03331132', { overpass })).rejects.toThrow(/z9-z11 quadkey/);
     expect(queried).toBe(false);
+  });
+
+  it('refuses a quadkey past the subdivision floor', async () => {
+    // Subdivision stops at z11, so a z12 quadkey is a key nothing in this system produces.
+    let queried = false;
+    const overpass = {
+      query: async () => {
+        queried = true;
+        return { elements: [] };
+      },
+    } as unknown as OverpassClient;
+
+    await expect(processTile('033311323012', { overpass })).rejects.toThrow(/z9-z11 quadkey/);
+    expect(queried).toBe(false);
+  });
+});
+
+describe('processTile, out of clock', () => {
+  const DENSE = '120221203';
+
+  /** One named way, long enough to survive `MIN_TRAIL_LENGTH_M`. */
+  const oneTrail: OverpassElement[] = [
+    {
+      type: 'way',
+      id: 42,
+      tags: { highway: 'path', name: 'Chamonix Balcon' },
+      geometry: [
+        { lat: 46.1, lon: 6.5 },
+        { lat: 46.11, lon: 6.5 },
+      ],
+    },
+  ];
+
+  interface Recorded {
+    updates: Array<{ quadkey: string; data: Record<string, unknown> }>;
+    upserts: string[];
+    jobs: string[];
+  }
+
+  function fakeDb(children: Array<Record<string, unknown>> = []): {
+    db: PrismaClient;
+    recorded: Recorded;
+  } {
+    const recorded: Recorded = { updates: [], upserts: [], jobs: [] };
+    const db = {
+      ingestTile: {
+        findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
+          Promise.resolve(
+            children.filter((row) => where.quadkey.in.includes(row.quadkey as string)),
+          ),
+        upsert: (args: { where: { quadkey: string } }) => {
+          recorded.upserts.push(args.where.quadkey);
+          return Promise.resolve({});
+        },
+        update: (args: { where: { quadkey: string }; data: Record<string, unknown> }) => {
+          recorded.updates.push({ quadkey: args.where.quadkey, data: args.data });
+          return Promise.resolve({});
+        },
+      },
+      ingestJob: {
+        updateMany: () => Promise.resolve({ count: 0 }),
+        upsert: (args: { where: { dedupeKey: string } }) => {
+          recorded.jobs.push(args.where.dedupeKey);
+          return Promise.resolve({});
+        },
+      },
+    } as unknown as PrismaClient;
+    return { db, recorded };
+  }
+
+  it('splits a tile that ran out of clock instead of failing it', async () => {
+    // The measured failure: six Alps tiles exhausted the 540 s budget and were written
+    // `failed`, retried whole, and failed again. A tile that cannot be finished at this zoom
+    // is a tile that has to be finished at the next one.
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() - 1,
+    });
+
+    expect(result.children).toEqual(['1202212030', '1202212031', '1202212032', '1202212033']);
+    expect(recorded.jobs).toEqual(result.children.map((key) => `ingest_tile:${key}`));
+    expect(recorded.updates.at(-1)).toEqual({
+      quadkey: DENSE,
+      data: expect.objectContaining({ status: TileStatus.pending }) as Record<string, unknown>,
+    });
+    // Nothing anywhere is written `failed`, which is what the retry ladder used to burn on.
+    expect(recorded.updates.some((update) => update.data.status === TileStatus.failed)).toBe(false);
+  });
+
+  it('fails a tile at the floor, because there is nowhere left to split', async () => {
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile('12022120300', {
+        db,
+        overpass,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() - 1,
+      }),
+    ).rejects.toThrow(/deadline/);
+
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.failed);
+    expect(recorded.jobs).toEqual([]);
+  });
+
+  it('never re-fetches a tile that has already been split', async () => {
+    // `ensureCoverage` still queues the z9 parent and knows nothing about the split, so this
+    // path runs on every viewport over subdivided ground. Asking Overpass again would spend
+    // the invocation that subdivision exists to save.
+    const children = ['1202212030', '1202212031', '1202212032', '1202212033'].map((quadkey) => ({
+      quadkey,
+      status: TileStatus.ready,
+      fetchedAt: new Date(),
+      trailCount: 7,
+      fetchMs: 100,
+    }));
+    const { db, recorded } = fakeDb(children);
+    let queried = false;
+    const overpass = {
+      query: async () => {
+        queried = true;
+        return { elements: [] };
+      },
+    } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, { db, overpass });
+
+    expect(queried).toBe(false);
+    expect(result.status).toBe(TileStatus.ready);
+    expect(result.trailCount).toBe(28);
+    expect(recorded.updates).toEqual([
+      {
+        quadkey: DENSE,
+        data: expect.objectContaining({ status: TileStatus.ready, trailCount: 28 }) as Record<
+          string,
+          unknown
+        >,
+      },
+    ]);
   });
 });
 

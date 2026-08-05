@@ -112,6 +112,18 @@ export async function runIngestSignal(
 }
 
 /**
+ * The literal `switchback-ingest-drain-failed` greps for.
+ *
+ * A job failure is invisible at the invocation level: `drainJobs` catches every handler error,
+ * writes it to the row and returns normally, so the request row is `success == true`. On
+ * 2026-08-04 that read as 14/14 successful invocations while six Alps tiles were failing. An
+ * alert therefore has to read `traces`, and a KQL query matching on prose is one reworded
+ * sentence away from silence — so the sentence carries a token instead, asserted against
+ * `infra/azure/ingest.bicep` in `test/drain.test.ts`.
+ */
+export const JOB_FAILED_MARKER = 'ingest-job-failed';
+
+/**
  * Say what happened. Every count that is not a plain success gets a line, because the worker's
  * own logs are the only place some of them appear — `failed` writes `lastError` to the row and
  * `lost` writes nothing anywhere.
@@ -128,7 +140,9 @@ function report(signal: IngestSignal, result: DrainResult, log: WorkerLog): void
   }
 
   if (result.failed > 0) {
-    log.error(`ingest ${key}: handler failed — see "lastError" on the job row; retry scheduled`);
+    log.error(
+      `${JOB_FAILED_MARKER} ${key}: handler failed — see "lastError" on the job row; retry scheduled`,
+    );
   }
 
   if (result.deferred > 0) {

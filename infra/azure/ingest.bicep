@@ -727,6 +727,20 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'INGEST_DEADLINE_MS'
             value: '540000'
           }
+          // How deep a tile that outruns that budget may be subdivided. A z9 tile the handler
+          // cannot finish is split into its four z10 children, which run as ordinary jobs and
+          // roll their result back up; a child that also overruns splits once more. Six Alps
+          // tiles hit the 540 s wall on 2026-08-04 and `120221203` measures 6,440 Overpass
+          // elements at z9 against 1,641 in its first z10 child, so one level is expected to be
+          // enough and this is the margin.
+          //
+          // **Set this to 9 to turn subdivision off**: no tile splits, a dense one fails exactly
+          // as it did before, and children already created still finish and still roll up. That
+          // is the rollback, and it needs no deploy — one `az functionapp config appsettings set`.
+          {
+            name: 'INGEST_SUBDIVIDE_MAX_ZOOM'
+            value: '11'
+          }
           {
             name: 'NODE_ENV'
             value: 'production'
@@ -799,23 +813,25 @@ resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 }
 
 @description('''
-**A failed drain has to page somebody, because the dead-letter alert structurally cannot see it.**
+**A failed drain has to page somebody, and neither of the obvious signals sees one.**
 
-`switchback-ingest-deadletter` fires on `DeadletteredMessages`, and a drain that the host kills
-never dead-letters: the redelivery finds the `ingest_jobs` row still under the dead invocation's
-lease, logs "nothing claimable" and *completes* the message in ~165 ms, so `DeliveryCount` never
-reaches 2. On 2026-08-03 that happened twice in one hour with `deadLetterMessageCount` at 0 the
-whole time — an indefinite loop at one wasted ten-minute Consumption invocation per lease sweep,
-visible only to somebody who thought to run `requests | where success == false`.
+`switchback-ingest-deadletter` fires on `DeadletteredMessages`, and a drain the host kills never
+dead-letters: the redelivery finds the `ingest_jobs` row still under the dead invocation's lease,
+logs "nothing claimable" and *completes* the message in ~165 ms, so `DeliveryCount` never reaches 2.
 
-`INGEST_DEADLINE_MS` is the fix for the loop; this is the fix for the silence, and it is worth
-keeping even now that the handler is bounded — a deadline that stops working is exactly the thing
-whose only symptom is a failed request nobody reads.
+The `requests` table does not see one either, and that is the trap this rule was caught by. A
+handler error is caught inside `drainJobs`, written to the job row, and the invocation returns
+normally — so on 2026-08-04 `requests | success == true` was 14/14 while six Alps tiles failed.
+The first arm below is still worth keeping (a host kill *is* a failed request), but on its own it
+was a rule that could not fire on the failure mode it was written for.
 
-The query is `requests`, not `exceptions`: a host kill produces no exception, only a request row
-with `success == false`. `Count`/`GreaterThan 0` over fifteen minutes, so a single failure is
-enough. `autoMitigate` is off — the condition is "this happened", not "this is happening", and an
-alert that resolves itself the moment the tile stops being retried is an alert nobody reads.
+The second arm reads `traces` for the token `runIngestSignal` logs beside every job-level failure.
+Matching a token rather than the sentence is deliberate: a reworded log line must not silently
+disarm the alert, and `apps/ingest-worker/test/drain.test.ts` asserts the two agree.
+
+`Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough. `autoMitigate` is off
+— the condition is "this happened", not "this is happening", and an alert that resolves itself the
+moment the tile stops being retried is an alert nobody reads.
 ''')
 resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-failed'
@@ -823,7 +839,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   tags: tags
   properties: {
     displayName: 'switchback-ingest-drain-failed'
-    description: 'An ingestDrain invocation failed or was killed by the host. This does not dead-letter, so this rule is the only signal.'
+    description: 'An ingest job failed, or its invocation was killed by the host. Neither dead-letters, so this rule is the only signal.'
     severity: 2
     enabled: true
     scopes: [
@@ -834,7 +850,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'requests | where name == "ingestDrain" | where success == false'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0

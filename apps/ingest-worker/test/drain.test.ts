@@ -11,9 +11,16 @@ import {
   OVERPASS_MAX_CONCURRENT,
   OVERPASS_MAX_TOTAL_MS,
   OverpassDeadlineError,
+  subdivideMaxZoom,
   withDeadline,
 } from '@switchback/ingest';
-import { HANDLER_DEADLINE_MS, OVERPASS_DEADLINE_MS, runIngestSignal } from '../src/drain';
+import { MAX_INGEST_ZOOM } from '@switchback/geo';
+import {
+  HANDLER_DEADLINE_MS,
+  JOB_FAILED_MARKER,
+  OVERPASS_DEADLINE_MS,
+  runIngestSignal,
+} from '../src/drain';
 import type { Drain } from '../src/drain';
 import type { WorkerLog } from '../src/log';
 
@@ -228,4 +235,38 @@ describe('the Overpass concurrency clamp, from the template', () => {
   it('lets the one client hold two requests', () => {
     expect(Number(appSetting('OVERPASS_MAX_CONCURRENT'))).toBe(OVERPASS_MAX_CONCURRENT);
   });
+});
+
+/**
+ * The alert has to fire on the failure this worker actually produces. A job that fails is caught
+ * by `drainJobs`, recorded on the row, and returned as a successful invocation — so a rule reading
+ * only `requests` was structurally blind to it, and was, for the whole of the 2026-08-04 run.
+ */
+describe('the drain-failure alert, from the template', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const query = /query: '([^']+)'/.exec(bicep)?.[1] ?? '';
+
+  it('greps traces for the token the worker logs, not for its prose', () => {
+    // The coupling that keeps this honest: reword the sentence and the test still passes;
+    // change the token on either side alone and it does not.
+    expect(query).toContain(JOB_FAILED_MARKER);
+    expect(query).toContain('traces');
+  });
+
+  it('still catches an invocation the host killed, which logs nothing at all', () => {
+    expect(query).toContain('ingestDrain');
+    expect(query).toContain('success == false');
+  });
+
+  it('deploys a subdivision ceiling the code will accept', () => {
+    const ceiling = Number(appSetting('INGEST_SUBDIVIDE_MAX_ZOOM'));
+    expect(ceiling).toBe(MAX_INGEST_ZOOM);
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: String(ceiling) })).toBe(ceiling);
+  });
+
+  function appSetting(name: string): string {
+    const found = new RegExp(`name: '${name}'\\s*\\r?\\n\\s*value: '([^']+)'`).exec(bicep);
+    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
+    return found[1]!;
+  }
 });

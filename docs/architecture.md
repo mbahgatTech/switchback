@@ -290,16 +290,21 @@ would kill the process. Each terrarium request also carries its own 20 s `AbortS
 because Node's `fetch` imposes none and a stalled socket is how you reach 615,938 ms without any
 phase ever _starting_ late.
 
-**And it now alerts.** It did not, and the reason is worth keeping: a killed invocation does not
-dead-letter. The redelivery finds the row still under the killed invocation's lease, logs "nothing
-claimable" and _completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2 and
+**And it now alerts — on the job, which is where the failure actually lands.** A killed invocation
+does not dead-letter: the redelivery finds the row still under the killed invocation's lease, logs
+"nothing claimable" and _completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2 and
 `switchback-ingest-deadletter` — which fires on `DeadletteredMessages` — structurally cannot see it.
-`deadLetterMessageCount` was 0 for the whole run while this happened twice. The tile came back on
-the lease sweep and was killed again, indefinitely, at one wasted ten-minute Consumption invocation
-per turn, visible only to somebody who thought to run `requests | where success == false`.
-`switchback-ingest-drain-failed` in `ingest.bicep` is that query as a scheduled query rule on
-`appi-switchback-ingest`, severity 2, onto the same action group, `autoMitigate: false`. Keep it
-even though the deadline closes the loop: a deadline that stops working has exactly this symptom.
+`deadLetterMessageCount` was 0 for the whole run while this happened twice.
+
+The first version of `switchback-ingest-drain-failed` read `requests | where success == false`, and
+that was blind to the failure mode it was written for. `drainJobs` catches every handler error,
+writes it to the job row and returns normally, so the 2026-08-04 run was 14/14 successful
+invocations while six Alps tiles were failing — the failure existed only as six `traces` lines. The
+rule now unions the request arm with a `traces` arm keyed on the literal `ingest-job-failed` that
+`runIngestSignal` logs beside every job-level failure. Matching a token rather than a sentence is
+deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code and the template still
+agree on it. Severity 2, onto the same action group, `autoMitigate: false` — the condition is "this
+happened", not "this is happening".
 
 **What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
 plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
@@ -315,10 +320,84 @@ was never running alone.
 
 So the honest statement is: a z9 tile in dense alpine terrain does not fit in one Consumption
 invocation, and no bound on the handler can change that — the bound only decides whether the
-failure is clean and visible or a silent ten-minute kill loop. **Splitting dense tiles is the
-remaining work**; `INGEST_ZOOM` is the knob and it is a data-shape change, not a timeout change.
-Until then those tiles retire after their attempts and stay un-ingested, which is what they did
-before, minus the wasted invocations and plus an alert.
+failure is clean and visible or a silent ten-minute kill loop.
+
+### Subdivision: a tile that will not fit is replaced by its four children
+
+A quadkey is a prefix code, so the four z10 tiles covering `120221203` are that string with `0`,
+`1`, `2` and `3` appended, and `IngestTile` already stores `z`/`x`/`y` per row. Splitting therefore
+needs no schema change and no new geometry — `childQuadkeys` in `packages/geo/src/tiles.ts` is the
+whole of the maths.
+
+```mermaid
+stateDiagram-v2
+  [*] --> running: claimed
+  running --> ready: committed inside 540 s
+  running --> pending: deadline exhausted, z &lt; 11
+  running --> failed: deadline exhausted, z = 11
+  pending --> pending: children outstanding
+  pending --> ready: all four children ready
+  note right of pending
+    four child rows written at z+1,
+    one ingest_tile job each
+  end note
+```
+
+**Split on failure, not up front.** Pre-sizing every tile with an Overpass `out count` costs one
+query per tile forever — measured at 3.2 s and one request for `120221203` — to save a wasted run on
+the small minority that are dense. Deadline exhaustion is free and it is the exact signal: the tile
+that could not be finished is the tile that has to be split. What a post-hoc split costs is one
+ten-minute invocation per dense tile per TTL, and not even that is wasted, because every trail the
+run committed before the clock ran out is already in `trails` and the children only re-upsert it.
+
+**Splitting is a status, not a flag.** `splitTile` writes the four child rows, enqueues one
+`ingest_tile` job each at viewport priority, and leaves the parent `pending` — not `failed`, because
+it is no longer a failure, and `pending` is what keeps it out of `readyTiles` while the children
+run. Admission control is deliberately not consulted: this is ground already admitted and already
+paid for, and a refusal here would strand a parent with no children and no route to ready.
+
+**A parent is ready only when every descendant is.** `rollUp` takes the four child rows and returns
+the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
+`fetchedAt` is the *oldest* child's, so the parent leaves the TTL when its stalest quarter does —
+taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
+sweep for another month. `trailCount` sums. A parent whose children are all `empty` is `empty`; one
+child with trails in it makes the parent `ready`, because that is a place worth re-querying.
+
+**Nothing in `coverage.ts` changed, and that is the design.** `ensureCoverage` still covers a
+viewport with z9 quadkeys and still reads the z9 row, so `readyTiles`, `pendingTiles` and the TTL
+all keep working with no knowledge of the split — precisely because the roll-up writes the answer
+onto the z9 row. While children are outstanding the parent reads `pending`, the client keeps
+polling, and the trails the finished children committed are already on the map: `browse` selects by
+bounding box, not by tile status, so three-quarters done looks like three-quarters of the map.
+
+Because coverage is unchanged, a viewport over split ground keeps queueing the z9 parent. That path
+is cheap and useful rather than wasteful: `processTile` sees four child rows, makes no Overpass call
+at all, re-queues any child that is not fresh, and promotes the parent if it can. It is also how a
+split tile refreshes — the parent goes stale when its oldest child does, `ensureCoverage` queues the
+parent, and the parent re-queues exactly the stale children.
+
+**The floor is z11 and it fails honestly.** `INGEST_SUBDIVIDE_MAX_ZOOM` (11 in `ingest.bicep`) is
+the deepest zoom a tile may reach; at the floor a tile that still exhausts its budget is marked
+`failed` and throws, exactly as before. Sixteen z11 tiles cover one z9, and each level quadruples
+the fixed per-tile cost — a region lookup and a tile-wide waypoint query that a smaller box does not
+make cheaper — so deeper than this the overhead, not the work, is what fills the invocation.
+
+**Turning it off** is one setting and no deploy: `INGEST_SUBDIVIDE_MAX_ZOOM=9`. No tile splits, a
+dense tile fails exactly as it did before, and children already created still ingest and still roll
+up, so the switch is safe to throw mid-flight.
+
+**Overpass budget.** A split z9 costs four tile queries, four waypoint queries and four region
+lookups where it cost one of each, so roughly 4x for the tiles that split and nothing at all for the
+tiles that do not. The 2-concurrent bound is untouched: children are ordinary jobs, the host takes
+one message at a time, and the ceiling is the shared `OverpassClient`'s queue, not the number of
+tiles in play.
+
+**Boundary trails cost a duplicate fetch, not a duplicate row.** A trail crossing a child seam is
+returned by both children's bbox queries and committed twice, and `commitTrail` upserts on
+`(osmType, osmId)`, so the second write updates the first row. `wayToCoords` drops any way Overpass
+returned with a hole in its geometry rather than interpolating across it, which is the same rule
+that already governs neighbouring z9 tiles — a way clipped in one child is contributed whole by the
+sibling that contains it.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a
