@@ -39,6 +39,9 @@ flowchart LR
   [Budgets](#the-two-unconverged-budgets).
 - **Neon's schema is frozen at the cutover commit** and nothing keeps it current, so a rollback is
   now two steps rather than one. See [Rollback expiry](#rollback-expiry).
+- **There is a portable backup, and it has been restored.** Point-in-time restore only restores
+  into Azure; `.github/workflows/backup-production-db.yml` produces a dump that does not, and
+  proves it by loading it and comparing. See [Backups](#backups) for what it does not carry.
 
 ---
 
@@ -125,6 +128,116 @@ The Azure-only write set has the same shape: it has to stay small enough to repl
 grows every day. **Keep Neon for at least 30 days,** and treat the rollback as expiring rather than
 permanent. Neon suspends idle compute automatically and retains the data, so a warm rollback costs
 nothing.
+
+---
+
+## Backups
+
+Two of them, because they fail in different ways.
+
+### Azure point-in-time restore — the floor
+
+Free, automatic, and the fastest way back from a bad `db push`. Measured 2026-08-05:
+
+| Fact                   | Value                                                               |
+| ---------------------- | ------------------------------------------------------------------- |
+| Retention configured   | 14 days, locally redundant, `geoRedundantBackup: Disabled`          |
+| Earliest restore point | `2026-07-30T16:32:40Z` — the server's own creation                  |
+| Full backups taken     | Daily, one per day since creation, plus continuous transaction logs |
+| Server state           | `Ready`, `replicationRole: Primary` — eligible                      |
+
+```bash
+az postgres flexible-server show \
+  --resource-group rg-switchback-prod-northcentralus \
+  --name psql-switchback-prod-37ywppu5p7fri \
+  --query 'backup' -o json
+```
+
+**The window is as deep as the server is old, not 14 days.** The server was created on 2026-07-30,
+so today it reaches back six days. It becomes a true 14-day window on 2026-08-13, and until then
+the retention setting is a ceiling rather than a fact.
+
+Two limits worth knowing before relying on it. A restore provisions a **new** Flexible Server —
+about $57/month for as long as it exists, against a subscription that is already over its credit
+with the spending limit `On`. And it restores into Azure and nowhere else, which is no help if the
+subscription is what failed.
+
+### The logical dump — the portable half
+
+`.github/workflows/backup-production-db.yml`, run on demand. It runs on a runner because this
+machine cannot reach 5432; the workflow header says why in full.
+
+It takes the census and the dump inside **one exported transaction snapshot**, restores the dump
+into a throwaway PostGIS container in the same run, runs `infra/backup/census.sql` against both,
+and fails unless the two are byte-identical. A dump nobody has restored is a hope, so the run
+either produces a verified archive or a red job — never an unexamined file.
+
+`infra/backup/rehearse-locally.sh` is the same comparison against a synthetic database in Docker,
+which is how `census.sql` is tested without touching production.
+
+**What comes out, and who can read it:**
+
+| Artifact                     | Contents                                     | Retention      | Readable by                                               |
+| ---------------------------- | -------------------------------------------- | -------------- | --------------------------------------------------------- |
+| `switchback-production-dump` | `-Fc` archive of the whole database          | 3 days (input) | every collaborator, and any workflow with `actions: read` |
+| `switchback-backup-evidence` | census, diff, schema-only SQL, TOC, manifest | 30 days        | the same                                                  |
+
+**A GitHub artifact is a proving ground, not a home.** It is unencrypted, its deletion leaves no
+audit trail, and its access boundary is "anyone with repository access". It is not encrypted on
+purpose: a passphrase minted by a workflow and kept only in a repository secret cannot be read
+back, which is exactly the failure this file already records for the admin password. If a durable
+off-Azure copy is wanted rather than a rehearsal, it belongs in a private container in a Storage
+account inside `rg-switchback-prod-northcentralus`, where the delete lock, a lifecycle rule and
+Azure's own access logs already apply. Nothing in this repository does that yet.
+
+Two facts that bound how urgent that is. The archive is **371 MiB**, against a GitHub Free plan
+whose included Actions storage for a private repository is 500 MB — an upload at that size
+succeeded with the repository already past the allowance, so the limit is evidently not a hard
+block, but two of these lying beside each other is still not something to leave unattended.
+And the personal data in it is currently **one account, one user row, two sessions and no
+recorded activities at all**: 43,179 trails, 384,209 waypoints, 107,672 photo rows and 33,709
+ingest jobs are all derived from OpenStreetMap. That is a statement about today, not about the
+design — the retention is short because of what this archive will hold once people use the
+product, not because of what it holds now.
+
+### Restoring the dump
+
+Download the artifact, check it against `MANIFEST.txt`, then — into any server that has PostGIS
+available, which the archive needs and does not carry:
+
+```bash
+createdb --template=template0 --encoding=UTF8 --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 switchback
+psql -d switchback -c "ALTER DATABASE switchback SET default_text_search_config = 'pg_catalog.simple';"
+psql -d switchback -c 'CREATE ROLE sbadmin; CREATE ROLE sbapp;'   # where they do not already exist
+pg_restore -d switchback --exit-on-error switchback-prod-<timestamp>.dump
+```
+
+`--exit-on-error` is not optional. `pg_restore`'s default is to continue and print a count of
+ignored errors at the end, which is how a restore that dropped a whole section still looks like it
+worked.
+
+**Four things the archive does not carry**, each of which has to be supplied by hand:
+
+- **`default_text_search_config`.** Production sets it as an Azure _server_ parameter, so pg_dump
+  cannot see it. Left at the default of `pg_catalog.english`, future ingest tokenises differently
+  from the rows that arrived and search quietly stops finding trails.
+- **Role passwords.** Roles are named in the dump; their credentials are not, and never were.
+- **The SRID catalogue PostGIS ships.** `spatial_ref_sys` is registered with
+  `pg_extension_config_dump` under a filter several hundred ranges long, so only SRIDs added by
+  hand are in the dump — `CREATE EXTENSION postgis` supplies the rest. Restore into a database
+  without PostGIS and SRID 4326 is simply absent, which fails every `::geography` cast in the
+  product. This is why the verification asserts that the SRIDs the data _uses_ are present rather
+  than diffing the whole table: production runs PostGIS 3.6.1 and the rehearsal container 3.5, and
+  their shipped catalogues legitimately disagree.
+- **An override of a shipped SRID.** Editing 3857's definition in place puts it inside that filter,
+  so it would not be backed up. Nothing here does that; this is the note that would make it
+  noticeable if something ever did.
+
+One more thing pg_dump cannot carry, which is why the verification restores as `azuresu` rather
+than `sbadmin`: **ownership of a table an extension creates.** `spatial_ref_sys` belongs to
+whoever ran `CREATE EXTENSION postgis`, which on this server is Azure's internal superuser. A
+restore elsewhere will have it owned by whoever runs the restore, and nothing about the product
+depends on that.
 
 ---
 
