@@ -416,6 +416,17 @@ returned with a hole in its geometry rather than interpolating across it, which 
 that already governs neighbouring z9 tiles — a way clipped in one child is contributed whole by the
 sibling that contains it.
 
+**UNVERIFIED in production: a tile has not yet been observed splitting.** The unit suite covers the
+decision and the roll-up, and the 2026-08-05T20:17Z–21:23Z flag-on run deployed and exercised the
+worker — thirteen `ingestDrain` invocations, zero failed, zero killed, longest 545,209.7 ms, no
+Overpass 429 and no dead letters — but every tile it handled finished inside the budget, so
+`splitTile` was never reached. The six tiles this exists for exhausted their retry ladders in rounds
+4 and 5, and the pump only publishes runnable rows, so none of them was offered to the worker.
+Reviving one means `ensureCoverage` — and while production Vercel serves a commit older than the
+flag, that also starts an inline drain which strands the lease for `LEASE_TIMEOUT_MS`. Until a
+`tile split` trace exists beside four child `done` traces and a z9 that `trails.browse` calls ready,
+treat subdivision as built and deployed rather than as proven.
+
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a
 few seconds around a recycle two host instances of the same app are alive. Telemetry from
