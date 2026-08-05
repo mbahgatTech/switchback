@@ -225,6 +225,11 @@ jobs:
           SELECT 'datcollate|' || datcollate FROM pg_database WHERE datname = current_database();
           SELECT 'datctype|' || datctype FROM pg_database WHERE datname = current_database();
           SELECT 'spatial_ref_sys_rows|' || count(*) FROM public.spatial_ref_sys;
+          -- Whoever ran CREATE EXTENSION owns spatial_ref_sys, and pg_dump does not carry
+          -- ownership for a table an extension provides. On this server that is Azure's
+          -- internal `azuresu`, not sbadmin. The rehearsal restores as this role so the
+          -- comparison can stay a strict diff instead of growing an exception.
+          SELECT 'postgis_owner|' || pg_get_userbyid(extowner) FROM pg_extension WHERE extname = 'postgis';
           SQL
 
           {
@@ -232,6 +237,7 @@ jobs:
             echo "SRC_CTYPE=$(grep '^datctype|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
             echo "SRC_TEXT_SEARCH=$(grep '^default_text_search_config|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
             echo "SRC_SRS_ROWS=$(grep '^spatial_ref_sys_rows|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
+            echo "SRC_EXT_OWNER=$(grep '^postgis_owner|' "$WORK/source-environment.txt" | cut -d'|' -f2)"
             echo "DUMP_NAME=switchback-prod-$(date -u +%Y%m%dT%H%M%SZ).dump"
           } >> "$GITHUB_ENV"
 
@@ -317,6 +323,7 @@ jobs:
             grep -oE '(OWNER TO|FOR ROLE|GRANTED BY) +[A-Za-z0-9_]+' "$WORK/schema.sql" || true
             grep -oE '\b(TO|FROM) +[A-Za-z0-9_]+;' "$WORK/schema.sql" || true
             echo "x $SOURCE_ROLE"
+            echo "x $SRC_EXT_OWNER"
           } | awk '{ print $NF }' | tr -d ';' | sort -u \
             | grep -vixE 'public|postgres|current_user|session_user|current_role|none' \
             > "$WORK/roles.txt" || true
@@ -328,16 +335,22 @@ jobs:
             psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$role\" NOLOGIN"
           done < "$WORK/roles.txt"
 
-          # The restore runs as the production admin role so that objects it creates —
-          # spatial_ref_sys above all, which CREATE EXTENSION makes rather than the archive —
-          # end up with production's owner. Restoring as `postgres` instead leaves exactly one
-          # ownership line different and turns a clean rehearsal red.
+          # The restore connects as production's *extension* owner, which on Azure is the
+          # internal `azuresu` rather than sbadmin. pg_dump carries `ALTER TABLE … OWNER TO`
+          # for every table it creates, but spatial_ref_sys is created by CREATE EXTENSION and
+          # inherits the connecting role — so restoring as anyone else leaves exactly one
+          # ownership line different and turns a clean rehearsal red. Measured: it did.
+          #
+          # A real disaster restore does not need this. Ownership of a catalogue table PostGIS
+          # provides changes nothing about whether the product works; it is reproduced here so
+          # that the verification can stay a strict diff rather than a diff with an exception
+          # list, which is the thing that stops being trustworthy.
           psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 \
-            -c "ALTER ROLE \"$SOURCE_ROLE\" LOGIN SUPERUSER PASSWORD 'rehearsal'"
+            -c "ALTER ROLE \"$SRC_EXT_OWNER\" LOGIN SUPERUSER PASSWORD 'rehearsal'"
           psql "$ADMIN" -X -q -v ON_ERROR_STOP=1 \
             -c "CREATE DATABASE switchback_restore OWNER \"$SOURCE_ROLE\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE '$SRC_COLLATE' LC_CTYPE '$SRC_CTYPE'"
 
-          TARGET="postgresql://$SOURCE_ROLE:rehearsal@localhost:5433/switchback_restore?sslmode=disable"
+          TARGET="postgresql://$SRC_EXT_OWNER:rehearsal@localhost:5433/switchback_restore?sslmode=disable"
           echo "TARGET_URL=$TARGET" >> "$GITHUB_ENV"
 
           # Not carried by the dump: production sets this as an Azure *server* parameter, so
@@ -379,7 +392,7 @@ jobs:
           # Printed before the verdict so the numbers are in the log whether or not the diff
           # is empty. Anything shaped like a row of user data is a digest by construction —
           # the census emits counts, hashes and DDL.
-          grep -E '^(rows|geo|db)\|' "$WORK/census-restored.txt" | sed 's/^/  /'
+          grep -E '^(rows|geo|srs|db)\|' "$WORK/census-restored.txt" | sed 's/^/  /'
 
           if diff -u "$WORK/census-source.txt" "$WORK/census-restored.txt" > "$WORK/census.diff"; then
             echo
@@ -411,7 +424,7 @@ jobs:
             echo '### Restored and compared'
             echo
             echo '```'
-            grep -E '^(rows|geo|db)\|' "$WORK/census-restored.txt" 2>/dev/null \
+            grep -E '^(rows|geo|srs|db)\|' "$WORK/census-restored.txt" 2>/dev/null \
               || echo 'The restore did not get far enough to census.'
             echo '```'
             echo
