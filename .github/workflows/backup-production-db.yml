@@ -54,6 +54,15 @@
 name: Backup production database
 
 on:
+  # TEMPORARY, REMOVED IN THE NEXT COMMIT ON THIS BRANCH. `workflow_dispatch` is only
+  # dispatchable once the file is on the default branch, and this backup has to be proven
+  # before the pull request that puts it there is worth reviewing. The path filter means the
+  # commit that adds these four lines is the only push that can fire it, and the commit that
+  # deletes them cannot fire anything, because the workflow GitHub reads is the one in the
+  # pushed commit.
+  push:
+    branches: [feat/credential-free-postgres]
+    paths: ['.github/workflows/backup-production-db.yml']
   workflow_dispatch:
     inputs:
       dump_retention_days:
@@ -397,7 +406,7 @@ jobs:
             echo "| dump | \`${DUMP_NAME:-not reached}\` |"
             echo "| dump size | $(du -h "$WORK/${DUMP_NAME:-none}" 2>/dev/null | cut -f1) |"
             echo "| dump sha256 | $(cut -d' ' -f1 < "$WORK/MANIFEST.txt" 2>/dev/null | head -1) |"
-            echo "| retention | ${{ inputs.dump_retention_days }} days |"
+            echo "| retention | ${{ inputs.dump_retention_days || '3' }} days |"
             echo
             echo '### Restored and compared'
             echo
@@ -427,7 +436,9 @@ jobs:
         with:
           name: switchback-production-dump
           path: ${{ env.WORK }}/${{ env.DUMP_NAME }}
-          retention-days: ${{ inputs.dump_retention_days }}
+          # `|| '3'` because `inputs` is empty on any event that is not a dispatch, and an
+          # empty retention-days is not "the default", it is a malformed upload.
+          retention-days: ${{ inputs.dump_retention_days || '3' }}
           # Already compressed by pg_dump. Re-deflating a gzip stream costs minutes and saves
           # nothing.
           compression-level: 0
