@@ -200,13 +200,138 @@ what bounds the work, making cost track screen area rather than track length.
 justify, and records what was turned down: differential privacy, because noise sufficient to defeat
 snapshot-differencing invents traffic on ground nobody has hiked.
 
-## Auth
+## Authentication
 
-Auth.js with the Prisma adapter and a **database** session strategy: a session row can be deleted, so
-"sign out everywhere" and "this account was compromised" are one query, where a JWT cannot be revoked
-before it expires. The cost is a read per request, which loading `ctx.user` needed anyway. Apple sits
-behind a flag because its client secret is a JWT signed per use — hence the async Auth.js factory. The
-iOS app borrows the website's sign-in: Expo Go hands out an `exp://…` redirect no provider registers.
+Six trust relationships, no shared secret between any two of them except one that is on its way
+out. This section is the single picture, because until it existed the story lived in a Bicep
+comment, a workflow, a Vercel setting and two people's memory.
+
+### Who trusts whom
+
+Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
+The dashed edge is the last stored password in the system.
+
+```mermaid
+graph LR
+  subgraph People
+    OWNER[Owner<br/>Mazen, Entra user]
+    READER[Signed-in reader]
+  end
+  subgraph Machines
+    VERCEL[Vercel functions<br/>id-switchback-vercel-publisher]
+    FUNC[Function App<br/>system-assigned identity]
+    CI[GitHub Actions<br/>id-switchback-postgres-ci]
+    SP[Deploying service principal]
+  end
+  subgraph Azure
+    SB[(Service Bus<br/>ingest-jobs)]
+    PG[(Postgres<br/>switchback)]
+    RG[Resource group<br/>rg-switchback-prod-northcentralus]
+  end
+
+  VERCEL -->|Data Sender| SB
+  FUNC -->|Data Receiver| SB
+  VERCEL -.->|sbapp password<br/>still in use| PG
+  FUNC -.->|sbapp password<br/>still in use| PG
+  VERCEL -->|sbapp_vercel<br/>role created, not yet used| PG
+  FUNC -->|sbapp_func<br/>role created, not yet used| PG
+  CI -->|Entra administrator| PG
+  OWNER -->|Entra administrator| PG
+  OWNER -->|Owner| RG
+  SP -->|Contributor| RG
+  READER -->|session cookie| VERCEL
+```
+
+Two things the diagram is meant to make obvious. The deploying service principal holds
+Contributor and therefore cannot reach the database at all — it writes ARM, not rows. And the CI
+identity holds **no Azure RBAC whatsoever**: its entire authority is the Postgres administrator
+grant, so a leak of it cannot touch the resource group, the queue or the billing.
+
+`disableLocalAuth: true` on the Service Bus namespace and zero queue SAS rules are what make the
+two Service Bus edges solid rather than dashed. Postgres still has `passwordAuth: Enabled`
+because the two dashed edges are real; see _What is left_ below.
+
+### The federated exchange
+
+No secret is stored at either end. Vercel mints an OIDC token per invocation, Entra checks the
+issuer, subject and audience against a federated credential declared in Bicep, and hands back an
+access token.
+
+```mermaid
+sequenceDiagram
+  participant V as Vercel function
+  participant E as Microsoft Entra ID
+  participant A as Azure resource
+
+  Note over V: x-vercel-oidc-token header,<br/>minted per request
+  V->>E: POST /oauth2/v2.0/token<br/>client_assertion = OIDC token
+  Note over E: issuer https://oidc.vercel.com/mbahgattechs-projects<br/>subject owner:mbahgattechs-projects:project:switchback:environment:production<br/>(and :environment:preview)<br/>audience https://vercel.com/mbahgattechs-projects
+  E-->>V: access token for the requested scope
+  V->>A: request with Bearer token
+  A-->>V: response
+```
+
+The same shape serves GitHub Actions, with issuer `https://token.actions.githubusercontent.com`
+and subject `repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/master`. That subject
+is GitHub's **immutable** form — account id and repository id rather than their names. It is not a
+preference: this repository's OIDC tokens carry that form, so a credential written the readable
+way is never matched and the exchange fails with `AADSTS700213`, quoting a subject that appears in
+no template.
+
+### The database token lifecycle
+
+An access token is the _password_ on a Postgres connection, and it is short-lived. The design
+below is what the pool has to do so that nothing ever needs restarting.
+
+```mermaid
+sequenceDiagram
+  participant P as pg.Pool
+  participant T as Token cache
+  participant E as Entra ID
+  participant DB as Postgres
+
+  P->>T: password() — called per new connection
+  alt cached and more than 2 min left
+    T-->>P: cached token
+  else expired, or inside the margin
+    T->>E: acquire for ossrdbms-aad.database.windows.net
+    E-->>T: token, exp ~60 min
+    T-->>P: fresh token
+  end
+  P->>DB: connect, token as password
+  DB->>DB: validate once, at connect
+  DB-->>P: session established
+
+  Note over P,DB: the session outlives its token —<br/>Postgres does not re-check
+  P->>P: connection retired at maxLifetimeSeconds<br/>(below token lifetime)
+  P->>T: password() again for the replacement
+
+  rect rgb(255, 240, 240)
+    Note over T,E: renewal fails
+    T-->>P: serve the cached token while it is still valid
+    Note over P,DB: existing sessions keep working —<br/>an Entra outage is not a database outage
+  end
+```
+
+Three properties, and the reason for each:
+
+- **Acquire per connection, not per process.** `pg` accepts `password` as a function returning a
+  promise and calls it on every new connection, and `@prisma/adapter-pg`'s `PrismaPg` accepts a
+  `pg.Pool` rather than only a connection string — so this needs no change at any call site.
+- **Renew two minutes before expiry**, matching `TOKEN_SKEW_MS` in `packages/ingest/src/publish.ts`
+  rather than inventing a second number. The margin only has to cover clock skew and one round
+  trip, because the token is checked at connect and never again.
+- **Retire connections below the token lifetime**, so the pool rotates naturally instead of
+  accumulating sessions whose authority was granted long ago.
+
+### Sign-in for people
+
+Auth.js with the Prisma adapter and a **database** session strategy: a session row can be deleted,
+so "sign out everywhere" and "this account was compromised" are one query, where a JWT cannot be
+revoked before it expires. The cost is a read per request, which loading `ctx.user` needed anyway.
+Apple sits behind a flag because its client secret is a JWT signed per use — hence the async
+Auth.js factory. The iOS app borrows the website's sign-in: Expo Go hands out an `exp://…` redirect
+no provider registers.
 
 ```mermaid
 sequenceDiagram
@@ -231,6 +356,17 @@ because on iOS any app may claim a URL scheme); everything is single-use inside 
 redirect is allow-listed when stored, not when used; and the row is bound to the authorising browser
 as well as the claiming device, so a cross-site GET to `/complete` cannot mint a token pair on
 somebody else's account.
+
+### What is left
+
+The database roles exist and the mechanism is proven, but the two application dashed edges above
+are still passwords. Moving them needs the pool change described in _The database token lifecycle_,
+and Vercel needs one thing more: its OIDC token is a **per-request header**, never an environment
+variable, so a module-level Prisma client has nothing to exchange. Threading the request's token to
+a connection opened during that request is the open design problem, not the token handling.
+
+`passwordAuth` stays `Enabled` until all three consumers are moved. Turning it off first would lock
+the application out of its own database with no way back that does not involve a restore.
 
 ## Design decisions, recorded once
 

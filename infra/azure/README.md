@@ -23,10 +23,17 @@ flowchart LR
 
 ## Read this first
 
-- **The admin password is unconfirmed, not safe.** The three `AZURE_*` migration secrets held the
-  last remaining copy, and they were deleted. Only the deletion leaves evidence anything here can
-  query; a password-manager entry does not. Treat the password as lost until someone who ran the
-  step says otherwise. Everything under [Redeploying](#redeploying) depends on it.
+- **The admin password is known again, and it is not the one that was lost.** The old value was
+  never recorded anywhere and could not be read back out of ARM, which blocked every redeploy. On
+  2026-08-05 it was deliberately _set_ to a freshly generated 48-character value rather than
+  recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately —
+  and the two repository secrets were rewritten to match. It now lives in exactly two places: the
+  owner's password manager, and a 0600 file on the owner's machine. It is still unreadable from
+  ARM, from GitHub and from Vercel, so a redeploy still has to be given the same value.
+- **There is now a path into this database that needs no password at all.** The owner is a declared
+  Microsoft Entra administrator; see [Connecting by hand, with no
+  password](#connecting-by-hand-with-no-password). That is what stops "the password is not recorded
+  anywhere" from ever being an outage again.
 - **No SLA.** The subscription is **Visual Studio Enterprise**, which carries dev/test terms and no
   service-level agreement, and Microsoft may suspend instances that look like production use. This
   database is production use. That is a business risk this file cannot mitigate, only name.
@@ -34,9 +41,10 @@ flowchart LR
   subscription** — see the last row of [Signals](#signals-that-something-is-wrong). The
   subscription was already over its $150 credit on other workloads before this database billed
   anything, so headroom here is negative.
-- **Two budget drifts are unconverged**, both blocked on the admin password above, because
-  converging them means a redeploy and a redeploy writes the password. See
-  [Budgets](#the-two-unconverged-budgets).
+- **The two budget drifts are converged.** Both were blocked on the admin password; the deployment
+  of 2026-08-05 applied them. The resource-group budget needed its own start date — ARM will not
+  create a monthly budget beginning before the current month — which is why `budgetStartDate` and
+  `workloadBudgetStartDate` are two parameters rather than one.
 - **Neon's schema is frozen at the cutover commit** and nothing keeps it current, so a rollback is
   now two steps rather than one. See [Rollback expiry](#rollback-expiry).
 - **There is a portable backup, and it has been restored.** Point-in-time restore only restores
@@ -266,9 +274,64 @@ depends on that.
 | Network           | Public, one firewall rule spanning the internet                 |
 | Extensions        | `postgis`, `pg_trgm`, `btree_gist` allow-listed                 |
 | Delete lock       | `switchback-prod-no-delete`, `CanNotDelete`, **in place**       |
+| Authentication    | Microsoft Entra **and** password, both enabled                  |
 
 The server name's 13-character suffix is a pure function of the resource group id, so a redeploy
 reconciles this server rather than provisioning beside it.
+
+### Connecting by hand, with no password
+
+This is the break-glass path, and it exists because the admin password once was not recorded
+anywhere and nothing could be deployed. It needs no stored credential at all: the owner is a
+declared Microsoft Entra administrator of the server, so an `az login` is enough.
+
+```bash
+az login
+export PGHOST=psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+export PGUSER="$(az ad signed-in-user show --query userPrincipalName -o tsv)"
+export PGDATABASE=switchback
+export PGSSLMODE=verify-full
+export PGPASSWORD="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+psql -c 'select current_user'
+unset PGPASSWORD
+```
+
+The username is the full UPN including the `#EXT#` part for a guest account — Azure matches the
+token to the role by object id, but the role's _name_ is the UPN, and psql sends the name.
+
+**When that does not work.** The token is valid for about an hour, so a session opened yesterday
+needs a fresh one; re-run the `PGPASSWORD` line. If `psql` reports the password is wrong, check
+`az account show` is the right tenant before suspecting the database. If the TLS handshake dies
+with `server closed the connection unexpectedly` and the server's `connections_failed` metric
+stays at zero, the server never saw the attempt and the problem is the local network path — a VPN
+holding the default route does this. Run it from a GitHub Actions runner instead: the
+`Postgres identity` workflow's `survey` action is that path, and it is read-only.
+
+Password authentication is still enabled, so `sbadmin` remains available as the second break-glass.
+Its password is not in this repository, not in ARM and not readable from any secret store — it is
+in the owner's password manager, and re-deploying the template requires passing the same value.
+
+### Machine identities
+
+| Principal                        | Database role               | May do                           |
+| -------------------------------- | --------------------------- | -------------------------------- |
+| Owner (Entra user)               | the UPN                     | administer                       |
+| `id-switchback-postgres-ci`      | `id-switchback-postgres-ci` | administer, so `db push` can DDL |
+| `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
+| `id-switchback-vercel-publisher` | `sbapp_vercel`              | exactly what `sbapp` may do      |
+
+The two application roles hold their privileges by membership in `sbapp` rather than by a copied
+list of grants, so they cannot drift from it — including for a table `prisma db push` creates
+tomorrow, which `sbapp`'s default privileges already cover. `infra/postgres-identity/` holds the
+SQL, and the `provision` action of the `Postgres identity` workflow applies and re-verifies it.
+
+ARM cannot create these: they are SQL objects behind `pgaadauth_create_principal_with_oid`, which
+runs in the database as an Entra administrator. A `Microsoft.Resources/deploymentScripts` resource
+could run it and keep the call inside the template, and it was rejected: it provisions a container
+instance and a storage account on every deployment, on a subscription whose spending limit
+deallocates everything when the credit runs out, to run two idempotent statements. The workflow is
+declarative in the way that matters — the files are the source of truth, the run re-asserts and
+re-verifies them — and costs nothing.
 
 ### Cost
 
@@ -298,15 +361,21 @@ reason. What it changes is the _alerting_: a subscription-scoped budget cannot s
 this database when 94% of the spend is somebody else's, which is why `monitoring.bicep` carries a
 second, resource-group-scoped budget.
 
-### The two unconverged budgets
+### The two budgets, converged
 
-Both are fixed by deploying, not by editing a file, and both are blocked on the admin password —
-a redeploy writes `administratorLoginPassword` to whatever `PGADMIN_PASSWORD` holds.
+Both drifts were fixed by the deployment of 2026-08-05, which was possible because the admin
+password is known again — a redeploy writes `administratorLoginPassword` to whatever
+`PGADMIN_PASSWORD` holds, so it could not be attempted while the value was lost.
 
-| Budget                      | `what-if` | State                                                                         |
-| --------------------------- | --------- | ----------------------------------------------------------------------------- |
-| `switchback-database`       | `Create`  | **Does not exist.** The resource-group-scoped one, the only number about this |
-| `switchback-monthly-credit` | `Modify`  | Live ramp is `half`/`threeQuarters`/`nearlyOut`, not the declared 90% + 100%  |
+| Budget                      | Was      | Now                                                                         |
+| --------------------------- | -------- | --------------------------------------------------------------------------- |
+| `switchback-database`       | `Create` | Created. The resource-group-scoped one, the only number about this workload |
+| `switchback-monthly-credit` | `Modify` | Converged to the declared ramp, 90% + 100%                                  |
+
+Creating the first one needed a second parameter. ARM refuses to create a monthly budget whose
+start date is before the current month, and the subscription budget — created in July and holding
+a live window nobody should move — keeps `2026-07-01`. Hence `budgetStartDate` and
+`workloadBudgetStartDate`, which are not duplication but two different immutable facts.
 
 `main.bicep`'s header lists the other `what-if` diffs, which are provider-assigned residue and
 never converge. Read it before concluding the template has drifted.
@@ -442,6 +511,38 @@ Export the override for the run and both work again:
 ```bash
 export DEPLOY_DELETE_LOCK=false
 ```
+
+### Prerequisite: `DEPLOY_DATABASE=false` against a server that already has one
+
+`main.bicep` declares the `switchback` database and `deployDatabase` defaults to `true`, which is
+right for a from-scratch build and wrong for every redeploy after it. Charset and collation are
+fixed by `CREATE DATABASE` and cannot be altered, so ARM has no update to perform — and the
+provider does not treat re-declaring them as a no-op. It rejects a PUT carrying the value the
+server itself reads back:
+
+```
+Invalid value given for parameter collation. Specify a valid parameter value.
+```
+
+Measured 2026-08-05 against this server, whose `az postgres flexible-server db show` reports
+`"collation": "C.UTF-8"` — the exact string being sent. The deployment fails _after_ the server
+resource has been written, which is the worst place to stop.
+
+```bash
+export DEPLOY_DATABASE=false
+```
+
+### Prerequisite: Entra authentication before Entra administrators
+
+On a server whose `activeDirectoryAuth` is still `Disabled`, ARM refuses an `administrators` child
+— and refuses it at preview time too, so `what-if` returns `BadRequest` on that resource instead of
+a change list, and the one deployment that restarts the production database cannot be reviewed
+first. Bootstrapping therefore takes two runs: one with `entraAuthEnabled = true` and
+`entraAdministrators` empty, then one with the list filled in. Enabling it installs the `pgaadauth`
+extension and **restarts the server**; adding administrators afterwards does not.
+
+On the live server this was done imperatively, and the deployment that followed converged it. The
+restart was watched with the site under a request every twenty seconds and never dropped one.
 
 **A failed run is genuinely a no-op — it does not rotate the admin password.** ARM authorizes the
 whole template at preflight, before any resource is touched, so the deployment is rejected rather
