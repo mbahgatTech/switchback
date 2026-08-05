@@ -233,6 +233,79 @@ jobs:
           SQL
 
   # ---------------------------------------------------------------------------------------
+  # The break-glass path, and the only read-only one that needs no password.
+  #
+  # infra/azure/README.md sends an operator here when the local network path to 5432 is dead,
+  # which is the state the owner's workstation is permanently in. It must therefore never
+  # acquire a stored credential: everything below authenticates with the federated token.
+  # ---------------------------------------------------------------------------------------
+  inspect:
+    name: read the database with a token and no password
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'inspect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: postgres-entra-inspect
+      cancel-in-progress: false
+
+    steps:
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Mint a database access token
+        run: |
+          set -euo pipefail
+          token="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
+          echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
+
+      # Deliberately a single read-only transaction. An operator reaching for break-glass is
+      # usually already having a bad day, and this job is not a place to discover it can write.
+      - name: What the database says about itself
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          BEGIN READ ONLY;
+          SELECT 'current_user|' || current_user;
+          SELECT 'is_admin|' || pg_has_role(current_user, 'azure_pg_admin', 'member')::text;
+          SELECT 'database|' || current_database();
+          SELECT 'server_version|' || current_setting('server_version');
+          SELECT 'ssl|' || version || '|' || cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+          SELECT 'role|' || rolname || '|login=' || rolcanlogin::text || '|super=' || rolsuper::text
+            FROM pg_roles WHERE rolname NOT LIKE 'pg\_%' ORDER BY rolname;
+          SELECT 'connections|' || count(*)::text FROM pg_stat_activity WHERE datname = current_database();
+          SELECT 'table|' || relname || '|' || n_live_tup::text
+            FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 10;
+          COMMIT;
+          SQL
+
+      - name: Who Azure thinks may administer this server
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          BEGIN READ ONLY;
+          SELECT 'entra|' || row_to_json(p)::text
+            FROM pg_catalog.pgaadauth_list_principals(false) p ORDER BY 1;
+          COMMIT;
+          SQL
+
+  # ---------------------------------------------------------------------------------------
   # The first credential-free path. Nothing in this job reads a password: `azure/login`
   # exchanges the runner's OIDC token for an Azure one against the federated credential on
   # `id-switchback-postgres-ci`, that identity is an ARM-declared Entra administrator of the
@@ -307,9 +380,13 @@ jobs:
           psql -X -tAq -v ON_ERROR_STOP=1 -f infra/postgres-identity/grants.sql
           echo "roles.sql and grants.sql applied"
 
-      # The assertion that the least-privilege claim is true rather than intended. Each new
-      # role must hold exactly `sbapp`'s privileges — by membership, so this compares the
-      # inherited set — and must be refused DDL.
+      # The assertion that the least-privilege claim is true rather than intended.
+      #
+      # Comparing the new roles' *effective* privileges against `sbapp`'s proves nothing: they
+      # are members of `sbapp` and inherit from it, so `has_table_privilege` is equal by
+      # construction and the query cannot return a row. What can differ, and is what a mistake
+      # would actually look like, is a grant made to one of the new roles **directly** — so
+      # that is what this checks, plus a control that proves the comparison can fail at all.
       - name: Prove the new roles can do what sbapp does and no more
         run: |
           set -euo pipefail
@@ -319,22 +396,74 @@ jobs:
                  || '|login=' || rolcanlogin::text
             FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
 
-          -- The comparison that matters: for every table in public, does each new role have
-          -- exactly the privileges sbapp has? Any row here is a mismatch.
-          SELECT 'MISMATCH|' || r.role || '|' || t.relname || '|' || p.priv
+          -- Authority must be inherited, never granted directly. Any row is a direct grant on
+          -- a table in public to one of the new roles, which is authority sbapp cannot revoke
+          -- by losing its own.
+          SELECT 'DIRECT_GRANT|' || r.role || '|' || c.relname || '|' || a.privilege_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
+           CROSS JOIN LATERAL aclexplode(c.relacl) AS a
+           WHERE n.nspname = 'public' AND c.relkind = 'r'
+             AND pg_get_userbyid(a.grantee) = r.role;
+
+          -- Membership must be exactly sbapp: not azure_pg_admin, not each other.
+          SELECT 'MEMBERSHIP|' || r.rolname || '|of|' || g.rolname
+            FROM pg_auth_members m
+            JOIN pg_roles r ON r.oid = m.member
+            JOIN pg_roles g ON g.oid = m.roleid
+           WHERE r.rolname IN ('sbapp_func', 'sbapp_vercel') AND g.rolname <> 'sbapp';
+
+          -- The control. sbadmin genuinely differs from sbapp, so this must return rows; if it
+          -- returns none the comparison above is broken and its silence means nothing.
+          SELECT 'CONTROL_ROWS|' || count(*)::text
             FROM pg_class t
             JOIN pg_namespace n ON n.oid = t.relnamespace
-           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
            CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
                               ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) AS p(priv)
            WHERE n.nspname = 'public' AND t.relkind = 'r'
-             AND has_table_privilege(r.role, t.oid, p.priv)
+             AND has_table_privilege('sbadmin', t.oid, p.priv)
                  <> has_table_privilege('sbapp', t.oid, p.priv);
 
           SELECT 'create_on_public|' || rolname || '|'
                  || has_schema_privilege(rolname, 'public', 'CREATE')::text
             FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
           SQL
+
+      - name: Fail if any of those assertions returned a finding
+        run: |
+          set -euo pipefail
+          findings="$(psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
+          SELECT 'DIRECT_GRANT|' || r.role || '|' || c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
+           CROSS JOIN LATERAL aclexplode(c.relacl) AS a
+           WHERE n.nspname = 'public' AND c.relkind = 'r'
+             AND pg_get_userbyid(a.grantee) = r.role
+          UNION ALL
+          SELECT 'MEMBERSHIP|' || r.rolname || '|of|' || g.rolname
+            FROM pg_auth_members m
+            JOIN pg_roles r ON r.oid = m.member
+            JOIN pg_roles g ON g.oid = m.roleid
+           WHERE r.rolname IN ('sbapp_func', 'sbapp_vercel') AND g.rolname <> 'sbapp'
+          UNION ALL
+          SELECT 'CONTROL_IS_VACUOUS'
+           WHERE NOT EXISTS (
+             SELECT 1 FROM pg_class t
+               JOIN pg_namespace n ON n.oid = t.relnamespace
+              CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) AS p(priv)
+              WHERE n.nspname = 'public' AND t.relkind = 'r'
+                AND has_table_privilege('sbadmin', t.oid, p.priv)
+                    <> has_table_privilege('sbapp', t.oid, p.priv));
+          SQL
+          )"
+          if [ -n "$findings" ]; then
+            echo "::error::Least-privilege assertions failed:"
+            echo "$findings"
+            exit 1
+          fi
+          echo "No direct grants, no unexpected membership, and the control is not vacuous."
 
       - name: List what Azure thinks is Entra-mapped
         run: |
@@ -345,20 +474,23 @@ jobs:
           SQL
 
       # A privilege check that reads well is not the same as a privilege that is enforced.
-      # This asks the server, as the role, and expects to be refused.
+      # This asks the server, as each role, and expects to be refused by both — the previous
+      # version probed only `sbapp_func`, so `sbapp_vercel` was asserted and never tested.
       - name: Refuse DDL, out loud
         run: |
           set -euo pipefail
-          if psql -X -q -v ON_ERROR_STOP=1 \
-               -c "SET ROLE sbapp_func" \
-               -c "CREATE TABLE ddl_probe_should_fail (id int)" 2> "$RUNNER_TEMP/ddl.err"; then
-            echo "::error::sbapp_func created a table. It is not least-privilege."
-            psql -X -q -c "DROP TABLE IF EXISTS ddl_probe_should_fail"
-            exit 1
-          fi
-          grep -q 'permission denied' "$RUNNER_TEMP/ddl.err" \
-            || { echo "::error::CREATE TABLE failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
-          sed 's/^/refused: /' "$RUNNER_TEMP/ddl.err"
+          for role in sbapp_func sbapp_vercel; do
+            if psql -X -q -v ON_ERROR_STOP=1 \
+                 -c "SET ROLE $role" \
+                 -c "CREATE TABLE ddl_probe_should_fail (id int)" 2> "$RUNNER_TEMP/ddl.err"; then
+              echo "::error::$role created a table. It is not least-privilege."
+              psql -X -q -c "DROP TABLE IF EXISTS ddl_probe_should_fail"
+              exit 1
+            fi
+            grep -q 'permission denied' "$RUNNER_TEMP/ddl.err" \
+              || { echo "::error::CREATE TABLE as $role failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
+            sed "s/^/refused ($role): /" "$RUNNER_TEMP/ddl.err"
+          done
 
   # ---------------------------------------------------------------------------------------
   # Does an established session die when its token expires?

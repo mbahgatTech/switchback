@@ -689,9 +689,21 @@ output pooledPort int = pooledPort
 // only the standard PG* variables, so `sslaccept` never reaches libpq (which would reject it
 // as an invalid connection option).
 //
+// **What is deployed does not match these templates, and that is a live gap rather than a
+// note.** These outputs are templates a human pastes from; nothing propagates them. Measured
+// 2026-08-05: the Function App's `DATABASE_URL` app setting carries `?sslmode=verify-full`
+// and no `sslaccept`, and the two repository secrets were written the same way. Read together
+// with the finding just above — Prisma ignores connection parameters it does not recognise,
+// silently — that means the Prisma clients are connecting **without** server-certificate
+// verification today, because the only parameter they were given is one they do not read.
+// Vercel's values are marked sensitive and cannot be read back, so they are unmeasured and
+// should be assumed to be in the same state. Closing this means rewriting those settings to
+// carry both parameters and re-reading them; it is listed in infra/azure/README.md.
+//
 // The migration workflow's preflight asserts this rather than assuming it — it connects with
 // PGSSLMODE=verify-full and prints pg_stat_ssl, and a connection that could not verify the
-// chain fails there, from a runner, before any data moves.
+// chain fails there, from a runner, before any data moves. That covers libpq, which is what
+// the workflow uses; it says nothing about the Prisma clients above.
 // ---------------------------------------------------------------------------------------
 //
 // Deliberately no `connection_limit` on either template. It looks like a sensible thing to

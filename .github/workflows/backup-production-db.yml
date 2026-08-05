@@ -118,9 +118,12 @@ jobs:
       # rest of the connection is exported as libpq environment variables so no later command
       # has to carry a URL around.
       #
-      # `sslaccept=strict` in the repository secret is a *Prisma* parameter. libpq rejects a
-      # URI query parameter it does not recognise outright — `invalid URI query parameter` —
-      # so the URL is rebuilt from its parts rather than passed through.
+      # The secret may carry `sslaccept=strict`, which is a *Prisma* parameter, not a libpq
+      # one — libpq rejects a URI query parameter it does not recognise outright (`invalid URI
+      # query parameter`). So the URL is rebuilt from its parts rather than passed through,
+      # which is correct whether or not the parameter is present. Measured 2026-08-05 it is
+      # not: the secret carries `?sslmode=verify-full` alone. See the SSL note in
+      # infra/azure/postgres.bicep for why that matters to Prisma and not to this job.
       - name: Read the connection parameters out of the repository secret
         env:
           SOURCE_URL: ${{ secrets.DIRECT_DATABASE_URL }}

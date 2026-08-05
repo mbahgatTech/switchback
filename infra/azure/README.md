@@ -26,10 +26,13 @@ flowchart LR
 - **The admin password is known again, and it is not the one that was lost.** The old value was
   never recorded anywhere and could not be read back out of ARM, which blocked every redeploy. On
   2026-08-05 it was deliberately _set_ to a freshly generated 48-character value rather than
-  recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately —
-  and the two repository secrets were rewritten to match. It now lives in exactly two places: the
-  owner's password manager, and a 0600 file on the owner's machine. It is still unreadable from
-  ARM, from GitHub and from Vercel, so a redeploy still has to be given the same value.
+  recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately.
+  It now lives in **three** places: the owner's password manager, a 0600 file on the owner's
+  machine, and the `DIRECT_DATABASE_URL` repository secret, which `ci.yml` and the backup workflow
+  both read. The third is the one that matters for blast radius: anyone with write access to this
+  repository can add a workflow step that prints it, so compromise of repository write access is
+  compromise of the database administrator. It remains unreadable from ARM, so a redeploy still has
+  to be given the same value.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
   Microsoft Entra administrator; see [Connecting by hand, with no
   password](#connecting-by-hand-with-no-password). That is what stops "the password is not recorded
@@ -291,6 +294,11 @@ export PGHOST=psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
 export PGUSER="$(az ad signed-in-user show --query userPrincipalName -o tsv)"
 export PGDATABASE=switchback
 export PGSSLMODE=verify-full
+# Without this libpq looks only in ~/.postgresql/root.crt under verify-full and fails closed,
+# which reads as a rejected credential. Point it at the system trust store instead. The path
+# is Debian/Ubuntu; on Fedora or RHEL use /etc/pki/tls/certs/ca-bundle.crt, and on macOS with
+# Homebrew openssl "$(brew --prefix)/etc/openssl@3/cert.pem".
+export PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
 export PGPASSWORD="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
 psql -c 'select current_user'
 unset PGPASSWORD
@@ -299,17 +307,32 @@ unset PGPASSWORD
 The username is the full UPN including the `#EXT#` part for a guest account — Azure matches the
 token to the role by object id, but the role's _name_ is the UPN, and psql sends the name.
 
-**When that does not work.** The token is valid for about an hour, so a session opened yesterday
-needs a fresh one; re-run the `PGPASSWORD` line. If `psql` reports the password is wrong, check
-`az account show` is the right tenant before suspecting the database. If the TLS handshake dies
-with `server closed the connection unexpectedly` and the server's `connections_failed` metric
-stays at zero, the server never saw the attempt and the problem is the local network path — a VPN
-holding the default route does this. Run it from a GitHub Actions runner instead: the
-`Postgres identity` workflow's `survey` action is that path, and it is read-only.
+**When that does not work.**
+
+- _`root certificate file "…/.postgresql/root.crt" does not exist`_, or a certificate-verify
+  failure: `PGSSLROOTCERT` is unset or points at the wrong path for this distribution. This is the
+  most common way the recipe above fails on a fresh machine.
+- _The token expired._ It is valid for about an hour for a user, so a session opened yesterday
+  needs a fresh one; re-run the `PGPASSWORD` line.
+- _The password is rejected._ Check `az account show` is the right tenant before suspecting the
+  database, and check `PGUSER` is the full UPN.
+- _`server closed the connection unexpectedly` while the server's `connections_failed` metric
+  stays at zero._ The server never saw the attempt, so the problem is the local network path — a
+  VPN holding the default route does this. Run it from a GitHub Actions runner instead: dispatch
+  the `Postgres identity` workflow with the **`inspect`** action, which takes the same federated
+  token path and reads the same things, with no password anywhere. Do **not** reach for `survey`
+  here: that action authenticates with `secrets.DIRECT_DATABASE_URL` and exists only to describe
+  the repository secrets, so it is useless in exactly the case where the password is the problem.
+
+**This path has never been walked end to end by a person.** The owner's machine cannot reach 5432
+at all, so the block above is derived from the same token exchange the `inspect` job performs
+rather than from someone running it locally. Treat the first real use as a test of the recipe as
+well as of the database, and correct this file if it is wrong.
 
 Password authentication is still enabled, so `sbadmin` remains available as the second break-glass.
-Its password is not in this repository, not in ARM and not readable from any secret store — it is
-in the owner's password manager, and re-deploying the template requires passing the same value.
+Its password is not in ARM and not readable from Vercel, but it **is** in the `DIRECT_DATABASE_URL`
+repository secret as well as the owner's password manager — see "Read this first". Re-deploying the
+template requires passing the same value.
 
 ### Machine identities
 

@@ -202,14 +202,16 @@ snapshot-differencing invents traffic on ground nobody has hiked.
 
 ## Authentication
 
-Six trust relationships, no shared secret between any two of them except one that is on its way
-out. This section is the single picture, because until it existed the story lived in a Bicep
-comment, a workflow, a Vercel setting and two people's memory.
+Seven trust relationships. Four are identity-based and carry no secret at all; three still pass a
+stored password, and moving those is the work in progress. This section is the single picture,
+because until it existed the story lived in a Bicep comment, a workflow, a Vercel setting and two
+people's memory.
 
 ### Who trusts whom
 
 Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
-The dashed edge is the last stored password in the system.
+Dashed edges still carry a stored password. There are three of them, and one — `sbadmin` — holds
+full DDL.
 
 ```mermaid
 graph LR
@@ -220,6 +222,7 @@ graph LR
   subgraph Machines
     VERCEL[Vercel functions<br/>id-switchback-vercel-publisher]
     FUNC[Function App<br/>system-assigned identity]
+    GHA[GitHub Actions<br/>ci.yml, backup-production-db.yml]
     CI[GitHub Actions<br/>id-switchback-postgres-ci]
     SP[Deploying service principal]
   end
@@ -231,16 +234,25 @@ graph LR
 
   VERCEL -->|Data Sender| SB
   FUNC -->|Data Receiver| SB
-  VERCEL -.->|sbapp password<br/>still in use| PG
-  FUNC -.->|sbapp password<br/>still in use| PG
+  VERCEL -.->|sbapp password| PG
+  FUNC -.->|sbapp password| PG
+  GHA -.->|sbadmin password, full DDL<br/>secrets.DIRECT_DATABASE_URL| PG
   VERCEL -->|sbapp_vercel<br/>role created, not yet used| PG
   FUNC -->|sbapp_func<br/>role created, not yet used| PG
-  CI -->|Entra administrator| PG
+  CI -->|Entra administrator<br/>proven, not yet consumed| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
   SP -->|Contributor| RG
   READER -->|session cookie| VERCEL
 ```
+
+Read the two GitHub Actions boxes together, because the difference between them is the whole
+point of this work. `id-switchback-postgres-ci` is an identity that reaches the database with no
+password and is a working Entra administrator — but **nothing consumes it yet**. The schema push
+in `.github/workflows/ci.yml` and the dump in `.github/workflows/backup-production-db.yml` both
+still authenticate with `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` and can create and drop
+anything. That is the largest remaining credential in the system and it is a repository secret, so
+its blast radius is everyone with write access to this repository.
 
 Two things the diagram is meant to make obvious. The deploying service principal holds
 Contributor and therefore cannot reach the database at all — it writes ARM, not rows. And the CI
@@ -291,11 +303,11 @@ sequenceDiagram
   participant DB as Postgres
 
   P->>T: password() — called per new connection
-  alt cached and more than 2 min left
+  alt cached and more than 5 min left
     T-->>P: cached token
-  else expired, or inside the margin
+  else inside the renewal margin, or expired
     T->>E: acquire for ossrdbms-aad.database.windows.net
-    E-->>T: token, exp ~60 min
+    E-->>T: token, exp 60 min (user) or 24 h (managed identity)
     T-->>P: fresh token
   end
   P->>DB: connect, token as password
@@ -313,19 +325,37 @@ sequenceDiagram
   end
 ```
 
-Three properties, and the reason for each:
+Three properties, and the reason for each. The mechanism each rests on was measured at the
+version this repository pins, `@prisma/client` and `@prisma/adapter-pg` 6.19.3 with `pg` 8:
 
 - **Acquire per connection, not per process.** `pg` accepts `password` as a function returning a
-  promise and calls it on every new connection, and `@prisma/adapter-pg`'s `PrismaPg` accepts a
-  `pg.Pool` rather than only a connection string — so this needs no change at any call site.
-- **Renew two minutes before expiry**, matching `TOKEN_SKEW_MS` in `packages/ingest/src/publish.ts`
-  rather than inventing a second number. The margin has to cover clock skew and one round trip.
-- **Retire connections below the token lifetime**, so the pool rotates naturally instead of
-  accumulating sessions whose authority was granted long ago.
+  promise and calls it once per _physical_ connection — proven by standing up a server that speaks
+  the authentication handshake and recording the bytes: three concurrent checkouts produced three
+  invocations and three distinct passwords on the wire, and releasing then re-acquiring a live
+  connection produced none. `PrismaPg`'s constructor at 6.19.3 is
+  `constructor(poolOrConfig: pg.Pool | pg.PoolConfig, options?)`, so the pool carrying that
+  callback can be handed to Prisma directly.
+- **Renew five minutes before expiry.** `RENEW_MARGIN_MS` in `packages/db/src/entra-token.ts`.
+  Five because that is Entra's own tolerated clock skew, so treating the last five minutes as
+  already gone removes skew from the problem rather than budgeting for it; it also leaves room for
+  one failed renewal to be retried by the next connection while the current token still works.
+- **Retire connections below the token lifetime.** `CONNECTION_LIFETIME_S`, thirty minutes,
+  against a shortest issued lifetime of one hour. `pg.Pool`'s `maxLifetimeSeconds` retires the
+  connection and the replacement invokes the password callback again — also measured, on the same
+  harness.
 
-Whether the third is a correctness requirement or only hygiene turns on one question nobody should
-answer from memory: **is the token checked only at connect, or is a live session terminated when it
-expires?**
+What this does **not** yet do is run in production. `packages/db/src/client.ts` still builds both
+Prisma clients from `DATABASE_URL` with a password in it; the token provider is tested and exported
+but no call site consumes it. Wiring it is a separate change, because it also has to restate
+`BACKGROUND_POOL_SIZE` and the background pool's thirty-second wait as `pg.Pool`'s `max` and
+`connectionTimeoutMillis` — a driver adapter ignores the `connection_limit` and `pool_timeout`
+parameters Prisma reads off the URL today, and `datasourceUrl` cannot be combined with an adapter
+at all. Losing that sizing silently is the outage recorded in that file's own comment, so the
+migration has to move it deliberately rather than inherit it.
+
+Whether retiring connections is a correctness requirement or only hygiene turns on one question
+nobody should answer from memory: **is the token checked only at connect, or is a live session
+terminated when it expires?**
 
 **That question is still open, and the attempt to close it is worth recording.** The `soak` action
 of the `Postgres identity` workflow holds one connection and queries it every five minutes for
@@ -334,13 +364,17 @@ eighty, printing `pg_backend_pid()` each round so a silent reconnect cannot pass
 probes, no error. It proves the session is stable for eighty minutes and **nothing about expiry**,
 because the token it authenticated with reported `lifetime=1440min`: a managed identity gets 24
 hours, not the hour the documentation quotes for a user. The test never reached the boundary it was
-built to cross.
+built to cross, and the job now exits non-zero and says so rather than reporting green.
 
 A GitHub-hosted job is capped at six hours, so waiting the token out is not available there. Either
 shorten the lifetime with an Entra token lifetime policy on that service principal, or hold the
-connection from somewhere without the cap. Until one of those runs, the safe assumption is the
-pessimistic one: bound the connection lifetime, and treat a mid-query disconnection as something
-the application has to survive rather than something that cannot happen.
+connection from somewhere without the cap.
+
+The thirty-minute connection lifetime is what makes the open question stop being load-bearing: a
+connection is replaced, with a freshly minted token, long before the shortest token any of these
+principals is issued could expire. If Azure does terminate expired sessions, no session lives long
+enough to be terminated; if it does not, nothing accumulates authority granted an hour ago either
+way. The answer is still worth having, and it is not worth blocking on.
 
 ### Sign-in for people
 
@@ -377,14 +411,42 @@ somebody else's account.
 
 ### What is left
 
-The database roles exist and the mechanism is proven, but the two application dashed edges above
-are still passwords. Moving them needs the pool change described in _The database token lifecycle_,
-and Vercel needs one thing more: its OIDC token is a **per-request header**, never an environment
-variable, so a module-level Prisma client has nothing to exchange. Threading the request's token to
-a connection opened during that request is the open design problem, not the token handling.
+The database roles exist, and the refresh mechanism is proven at the pinned versions and covered by
+tests — but **nothing consumes either yet**. Three passwords are still live, and they come off in
+this order:
 
-`passwordAuth` stays `Enabled` until all three consumers are moved. Turning it off first would lock
-the application out of its own database with no way back that does not involve a restore.
+1. **The Function App.** The simplest, because it is a long-lived process with a system-assigned
+   identity and no request scoping to solve. Its `DATABASE_URL` app setting still carries `sbapp`.
+2. **CI and the backup workflow.** `id-switchback-postgres-ci` is a proven Entra administrator that
+   nothing uses; `ci.yml` and `backup-production-db.yml` both still read
+   `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` with full DDL. Switching them cannot be
+   rehearsed on a branch, because the federated credential trusts `refs/heads/master` alone. Two
+   things will bite when it is tried: `prisma db push` would then run as a role that is not
+   `sbadmin`, so new tables would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would
+   not apply — `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and
+   is untested.
+3. **Vercel, which is a design problem rather than remaining work.** Its OIDC token arrives as the
+   per-request `x-vercel-oidc-token` header and is never in `process.env` on a deployed function —
+   `packages/ingest/src/publish.ts` documents this for the Service Bus path. `packages/db/src/client.ts`
+   constructs its clients at module level, so a password callback fires with no request in scope
+   and nothing to exchange. Threading the request's token to a connection opened during that
+   request — `AsyncLocalStorage` is the obvious candidate — is unsolved, and background work started
+   by `waitUntil` may open connections outside any request context at all.
+
+`passwordAuth` stays `Enabled` until all three are moved. Turning it off first would lock the
+application out of its own database with no way back that does not involve a restore.
+
+Two smaller things, both measured rather than suspected:
+
+- **The Prisma clients are not verifying the server's certificate.** The connection strings that
+  are actually deployed carry `sslmode=verify-full` and nothing else, and Prisma ignores parameters
+  it does not recognise — so the only TLS instruction it was given is one it does not read. The
+  templates in `infra/azure/postgres.bicep` emit `sslaccept=strict` as well, but nothing propagates
+  a template into a setting. libpq consumers (the workflows) are unaffected and do verify.
+- **This repository is public.** Everything below is readable by anyone, and workflow artifacts —
+  including the production database dump the backup workflow produces — are listed publicly and
+  downloadable by any authenticated GitHub user. That dump contains real accounts and real GPS
+  tracks.
 
 ## Design decisions, recorded once
 
