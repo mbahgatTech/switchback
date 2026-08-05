@@ -221,10 +221,11 @@ param minTlsVersion = 'TLSv1.2'
 // it; see infra/azure/README.md.
 param entraAuthEnabled = true
 
-// One federated credential per branch. `master` is the steady state — `ci.yml`'s schema push
-// runs there and nowhere else. The second is temporary, for proving this migration from its
-// own branch, and comes out before merge.
-param ciIdentityBranches = ['master', 'worktree-wf_189485a3-0e7-2']
+// One federated credential per branch. `master` only: `ci.yml`'s schema push runs there and
+// nowhere else, and a credential is an exact-string match with no wildcard, so every extra
+// entry is a branch that may assume a Postgres administrator. A scratch branch was trusted
+// here while this migration was proved from one; it is not any more.
+param ciIdentityBranches = ['master']
 
 // The owner is here as break-glass: a human who can reach the database with a token and no
 // password at all, which is what stops "the admin password is not recorded anywhere" from

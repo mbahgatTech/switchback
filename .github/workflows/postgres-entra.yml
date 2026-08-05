@@ -5,10 +5,11 @@
 # to Microsoft Entra authentication — reading what `sbapp` may do, creating the Entra-mapped
 # roles, proving a token still works after it has expired — therefore runs here.
 #
-# `survey` is read-only and is the one to run when something looks wrong. It prints the shape
-# of the repository secrets without printing the secrets, and it prints exactly which
-# privileges the application role holds, which is the specification the Entra roles have to
-# match.
+# Two read-only actions, and the difference between them is which credential they need.
+# `inspect` authenticates with a federated token and no password, and is the break-glass path
+# the runbook points at: it is the one to run when the admin credential is unavailable or
+# suspect. `survey` needs the stored password, and exists only to describe the two repository
+# secrets — which is a thing no token can do.
 name: Postgres identity
 
 on:
@@ -21,17 +22,9 @@ on:
         type: choice
         options:
           - survey
+          - inspect
           - provision
           - soak
-  # Temporary, and removed before this branch merges: `workflow_dispatch` only offers
-  # workflows that already exist on the default branch, and this one does not yet.
-  push:
-    branches:
-      - worktree-wf_189485a3-0e7-2
-      - feat/credential-free-postgres
-    paths:
-      - .github/workflows/postgres-entra.yml
-      - infra/postgres-identity/**
 
 permissions:
   contents: read
@@ -247,7 +240,7 @@ jobs:
   # ---------------------------------------------------------------------------------------
   provision:
     name: create the Entra-mapped roles
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'provision')
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'provision'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -390,8 +383,7 @@ jobs:
   # ---------------------------------------------------------------------------------------
   soak:
     name: hold a connection past token expiry
-    # Dispatch only. Eighty minutes is too long to spend on every push, and the one execution
-    # this branch needed was fired by the temporary push trigger above before this line.
+    # Dispatch only. Eighty minutes is too long to spend on every push.
     if: github.event_name == 'workflow_dispatch' && inputs.action == 'soak'
     runs-on: ubuntu-latest
     timeout-minutes: 110
@@ -439,22 +431,41 @@ jobs:
       - name: One session, eighty minutes
         run: |
           set -euo pipefail
+          # The hold is derived once, here, and exported. The verdict step below compares the
+          # token's lifetime against this number rather than against a second hardcoded 80,
+          # so changing the loop cannot leave the verdict measuring the old duration.
+          probes=16
+          sleep_s=300
+          hold_min=$(( probes * sleep_s / 60 ))
+          echo "SOAK_HOLD_MIN=$hold_min" >> "$GITHUB_ENV"
           {
             echo "SELECT 'start|' || now()::text || '|pid=' || pg_backend_pid()::text;"
-            for i in $(seq 1 16); do
-              echo "SELECT pg_sleep(300);"
+            for i in $(seq 1 "$probes"); do
+              echo "SELECT pg_sleep($sleep_s);"
               echo "SELECT 'probe|$i|' || now()::text || '|pid=' || pg_backend_pid()::text || '|user=' || current_user;"
             done
           } > "$RUNNER_TEMP/soak.sql"
           psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$'
 
-      # Says out loud whether the run above could have failed. Without this the log reads as a
-      # clean pass on a question it never asked.
+      # Says out loud whether the run above could have failed, and fails when it could not.
+      #
+      # `if: always()` because the interesting outcome is the one where psql dies at the
+      # boundary: without it a terminated session exits non-zero here and the classification
+      # never prints, leaving a red run that reads the same as a broken runner. `exit 1` on
+      # INCONCLUSIVE because a warning does not fail a job, and a soak that proves nothing
+      # must not report green a second time.
       - name: Did this actually cross the expiry boundary?
+        if: always()
         run: |
           set -euo pipefail
-          if [ "${TOKEN_LIFETIME_MIN:-0}" -gt 80 ]; then
-            echo "::warning::INCONCLUSIVE — the token was valid for ${TOKEN_LIFETIME_MIN} minutes and this job held the session for 80. Nothing here says what happens at expiry."
-          else
-            echo "Conclusive: the session outlived a token valid for ${TOKEN_LIFETIME_MIN} minutes."
+          lifetime="${TOKEN_LIFETIME_MIN:-0}"
+          hold="${SOAK_HOLD_MIN:-0}"
+          if [ "$hold" -eq 0 ]; then
+            echo "::error::The session hold never started, so there is nothing to classify."
+            exit 1
           fi
+          if [ "$lifetime" -gt "$hold" ]; then
+            echo "::error::INCONCLUSIVE — the token was valid for ${lifetime} minutes and this job held the session for ${hold}. Nothing here says what happens at expiry."
+            exit 1
+          fi
+          echo "Conclusive: the session was held ${hold} minutes against a token valid for ${lifetime}."
