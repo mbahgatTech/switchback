@@ -1197,6 +1197,17 @@ az rest --method POST --url "https://management.azure.com/subscriptions/$SUB/res
 Within a minute `az functionapp function list` shows `ingestDrain` and `ingestPump`. Verified
 2026-08-03T18:47Z.
 
+**Zip the bundle with forward slashes.** Windows PowerShell 5.1's `Compress-Archive` writes entry
+names with `\`, which the Linux host reads as one long filename rather than a path — so `node_modules`
+never lands in `wwwroot` and the worker dies indexing with `Cannot find module '@azure/functions'`,
+under a `0 functions found (Custom)` that looks identical to a package that never mounted.
+`[IO.Compression.ZipFile]::CreateFromDirectory` from `pwsh` normalises them. Observed 2026-08-05.
+
+**`az functionapp function list` lags the host.** It returned `[]` for ten minutes after a deploy the
+host had already indexed. `curl -H "x-functions-key: <master>" https://<app>.azurewebsites.net/admin/functions`
+asks the host itself and is the answer to trust. So is the queue depth: `az servicebus queue show …
+--query countDetails` moved to 8 while Application Insights was still a tick behind.
+
 `what-if` is safe and is the check worth running before any deploy — nothing under
 `Microsoft.DBforPostgreSQL` may appear as a create or a modify.
 

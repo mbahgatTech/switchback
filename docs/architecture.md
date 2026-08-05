@@ -358,7 +358,7 @@ paid for, and a refusal here would strand a parent with no children and no route
 
 **A parent is ready only when every descendant is.** `rollUp` takes the four child rows and returns
 the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
-`fetchedAt` is the *oldest* child's, so the parent leaves the TTL when its stalest quarter does —
+`fetchedAt` is the _oldest_ child's, so the parent leaves the TTL when its stalest quarter does —
 taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
 sweep for another month. `trailCount` sums. A parent whose children are all `empty` is `empty`; one
 child with trails in it makes the parent `ready`, because that is a place worth re-querying.

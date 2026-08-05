@@ -307,7 +307,6 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    * did — `drainJobs` catches it, writes `lastError`, and the retry ladder runs out.
    */
   if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) {
-    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt);
     const fetchMs = Date.now() - startedAt;
 
     if (canSubdivide(tile.z)) {
@@ -324,6 +323,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       };
     }
 
+    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt);
     await db.ingestTile.update({
       where: { quadkey },
       data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
