@@ -829,6 +829,18 @@ The second arm reads `traces` for the token `runIngestSignal` logs beside every 
 Matching a token rather than the sentence is deliberate: a reworded log line must not silently
 disarm the alert, and `apps/ingest-worker/test/drain.test.ts` asserts the two agree.
 
+The third arm is subdivision, which would otherwise have *disarmed* the second. Before it a tile
+that exhausted `deadlineAt` threw `IngestDeadlineError`, `drainJobs` recorded a failure and the
+token above was logged; now that tile splits, `processTile` returns normally and the invocation
+logs `done`. An operator would read 8/8 tiles succeeded while two of them ingested nothing and
+deferred to four children each. A split is a deferral, not a success, and the ground a reader is
+waiting for is still missing when one happens.
+
+Both trace arms depend on `traces` arriving at all. `host.json` samples Application Insights at
+five items per second and adaptive sampling drops correlated *sets*, so a dense tile's dependency
+telemetry could take the one line these arms match with it. `excludedTypes` there now holds
+`Trace`, which is what makes this rule's evidence non-droppable.
+
 `Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough. `autoMitigate` is off
 — the condition is "this happened", not "this is happening", and an alert that resolves itself the
 moment the tile stops being retried is an alert nobody reads.
@@ -839,7 +851,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   tags: tags
   properties: {
     displayName: 'switchback-ingest-drain-failed'
-    description: 'An ingest job failed, or its invocation was killed by the host. Neither dead-letters, so this rule is the only signal.'
+    description: 'An ingest job failed, was killed by the host, or deferred its tile to four children. None of the three dead-letters, so this rule is the only signal.'
     severity: 2
     enabled: true
     scopes: [
@@ -850,7 +862,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0

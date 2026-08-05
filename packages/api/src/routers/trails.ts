@@ -390,6 +390,9 @@ const inlineDrain = createInlineDrain((keys) =>
     limit: Math.min(keys.length, MAX_INLINE_DRAIN),
     workerId: 'inline',
     dedupeKeys: keys,
+    // Vercel has no Application Insights, so `TILE_SPLIT_MARKER` and `SUBTREE_STUCK_MARKER`
+    // would go nowhere on the drainer that is actually running. Console is where they land.
+    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
   }),
 );
 

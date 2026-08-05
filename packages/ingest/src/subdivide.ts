@@ -26,11 +26,38 @@ export const CHILDREN_PER_TILE = 4;
  */
 export const SPLIT_PRIORITY = 5;
 
-/** The zoom past which a tile is failed rather than split. Set to `INGEST_ZOOM` to disable. */
+/**
+ * The literal `switchback-ingest-tile-split` greps for, on every line subdivision emits.
+ *
+ * A split is not a success and must not be reported as one. Before subdivision a tile that ran
+ * out of clock threw, `drainJobs` recorded a failure, and `JOB_FAILED_MARKER` armed the alert;
+ * now it returns normally and the invocation logs `done`. Without a token of its own the only
+ * telemetry an on-call reader has cannot tell a dense tile deferring to four children from one
+ * that actually ingested. `infra/azure/ingest.bicep` greps for this and
+ * `apps/ingest-worker/test/drain.test.ts` asserts the two agree.
+ */
+export const TILE_SPLIT_MARKER = 'switchback-ingest-tile-split';
+
+/**
+ * The literal an operator greps for when a subtree cannot finish.
+ *
+ * A parent whose descendant failed at the zoom floor can never roll up, so the z9 a reader is
+ * polling stays `pending` forever. The retry ladder retires the leaf and says nothing about the
+ * ancestor waiting on it, which is the one row anybody is watching.
+ */
+export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
+
+/**
+ * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision,
+ * and that is what an absent or unusable variable returns: the two processes that drain
+ * `ingest_jobs` do not both declare it — `apps/web/src/env.ts` has no entry — so a default of
+ * `MAX_INGEST_ZOOM` turned subdivision on wherever nobody had thought about it. It has to be
+ * switched on deliberately, which is also what makes deleting the setting a rollback.
+ */
 export function subdivideMaxZoom(source: NodeJS.ProcessEnv = process.env): number {
   const value = Number(source.INGEST_SUBDIVIDE_MAX_ZOOM);
   if (!Number.isInteger(value) || value < INGEST_ZOOM || value > MAX_INGEST_ZOOM) {
-    return MAX_INGEST_ZOOM;
+    return INGEST_ZOOM;
   }
   return value;
 }
@@ -113,8 +140,14 @@ export async function childTiles(db: PrismaClient, quadkey: string): Promise<Chi
  * Admission control is deliberately not consulted. `queueTiles` asks it because a viewport is
  * requesting *new ground*; this is ground already admitted, already attempted, and already paid
  * for with a ten-minute invocation — a refusal here would strand the parent with no children and
- * no route to ready. The parent row is left `pending` rather than `failed`: it is not a failure
- * any more, and `pending` is what keeps it out of `readyTiles` while the children run.
+ * no route to ready.
+ *
+ * A parent that has served trails before keeps its `ready`/`empty` status and its old
+ * `fetchedAt` rather than dropping to `pending`. `ensureCoverage` classifies a settled-but-stale
+ * tile as ready-and-refreshing and anything else as pending, so demoting it would flip a reader
+ * from "here are your trails, refreshing" to "still loading" for as long as the four children
+ * take — which is the drain queue's problem, not a length anybody is watching. The children are
+ * enqueued here directly, so nothing depends on the parent being re-queued to drive them.
  */
 export async function splitTile(
   db: PrismaClient,
@@ -123,6 +156,10 @@ export async function splitTile(
 ): Promise<string[]> {
   const children = childQuadkeys(quadkey);
   const priority = options.priority ?? SPLIT_PRIORITY;
+  const parent = await db.ingestTile.findUnique({
+    where: { quadkey },
+    select: { status: true, fetchedAt: true },
+  });
 
   for (const child of children) {
     const { x, y, z } = quadkeyToTile(child);
@@ -140,10 +177,12 @@ export async function splitTile(
     });
   }
 
+  const servesData = parent !== null && isTileSettled(parent.status) && parent.fetchedAt !== null;
+
   await db.ingestTile.update({
     where: { quadkey },
     data: {
-      status: TileStatus.pending,
+      status: servesData ? parent.status : TileStatus.pending,
       lastError: `split into ${children.length} tiles at z${quadkey.length + 1}`,
       ...(options.fetchMs === undefined ? {} : { fetchMs: options.fetchMs }),
     },
@@ -152,14 +191,26 @@ export async function splitTile(
   return children;
 }
 
-/** Queue every child that is not currently serving fresh data. Returns what it queued. */
+/**
+ * Queue every child that is not currently serving fresh data and has not already given up.
+ * Returns what it queued, and separately what it refused to.
+ *
+ * A `failed` child is deliberately skipped. `enqueue` revives a `dead` job and clears its
+ * attempts, `ensureCoverage` re-queues a split parent on every viewport poll, and every drain of
+ * that parent lands here — so re-queueing a failed child makes one unfinishable leaf an engine
+ * that re-arms its whole subtree, indefinitely, on a worker that takes one message at a time. A
+ * child that failed still has its own retry ladder; this is not the thing that should restart it.
+ */
 export async function queueStaleChildren(
   db: PrismaClient,
   children: readonly ChildTile[],
   now: Date,
   priority = SPLIT_PRIORITY,
-): Promise<string[]> {
-  const stale = children.filter((child) => !isTileFresh(child, now));
+): Promise<{ queued: string[]; blocked: string[] }> {
+  const outstanding = children.filter((child) => !isTileFresh(child, now));
+  const blocked = outstanding.filter((child) => child.status === TileStatus.failed);
+  const stale = outstanding.filter((child) => child.status !== TileStatus.failed);
+
   for (const child of stale) {
     await enqueue(db, {
       kind: JobKind.ingest_tile,
@@ -168,7 +219,8 @@ export async function queueStaleChildren(
       priority,
     });
   }
-  return stale.map((child) => child.quadkey);
+
+  return { queued: stale.map((child) => child.quadkey), blocked: blocked.map((c) => c.quadkey) };
 }
 
 /**

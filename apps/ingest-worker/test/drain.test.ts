@@ -11,6 +11,8 @@ import {
   OVERPASS_MAX_CONCURRENT,
   OVERPASS_MAX_TOTAL_MS,
   OverpassDeadlineError,
+  SUBTREE_STUCK_MARKER,
+  TILE_SPLIT_MARKER,
   subdivideMaxZoom,
   withDeadline,
 } from '@switchback/ingest';
@@ -68,7 +70,11 @@ describe('runIngestSignal', () => {
       derivedLimit: 0,
       dedupeKeys: [KEY],
       workerId: 'sb-1',
-      deps: { overpass, deadlineAt: expect.any(Number) as number },
+      deps: {
+        overpass,
+        deadlineAt: expect.any(Number) as number,
+        logger: expect.any(Function) as () => void,
+      },
     });
 
     // Every phase gets the same wall clock, not only Overpass — that is the whole point of
@@ -78,6 +84,23 @@ describe('runIngestSignal', () => {
     ).mock.calls[0]![0].deps;
     expect(deadlineAt).toBeGreaterThanOrEqual(before + HANDLER_DEADLINE_MS);
     expect(deadlineAt).toBeLessThanOrEqual(Date.now() + HANDLER_DEADLINE_MS);
+  });
+
+  it('hands the pipeline a logger that reaches the host, so a split is not silent', async () => {
+    /*
+     * The defect this pins: `PipelineDeps.logger` existed but was set on no deployed path, so
+     * `log(TILE_SPLIT_MARKER, …)` went to `deps.logger ?? (() => {})` and a whole round was
+     * spent inferring "the split path was never reached" from a trace the code could not emit.
+     */
+    const log = fakeLog();
+    const drain = vi.fn(async (options: { deps?: { logger?: (m: string) => void } }) => {
+      options.deps?.logger?.(`${TILE_SPLIT_MARKER} 120221203: ran out of clock`);
+      return outcome({ claimed: 1, succeeded: 1 });
+    }) as unknown as Drain;
+
+    await runIngestSignal({ dedupeKey: KEY }, log, { workerId: 'sb-1', drain, overpass });
+
+    expect(log.lines).toContainEqual(['warn', expect.stringContaining(TILE_SPLIT_MARKER)]);
   });
 
   it('hands the pipeline an Overpass view that closes before functionTimeout does', async () => {
@@ -258,10 +281,26 @@ describe('the drain-failure alert, from the template', () => {
     expect(query).toContain('success == false');
   });
 
-  it('deploys a subdivision ceiling the code will accept', () => {
-    const ceiling = Number(appSetting('INGEST_SUBDIVIDE_MAX_ZOOM'));
-    expect(ceiling).toBe(MAX_INGEST_ZOOM);
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: String(ceiling) })).toBe(ceiling);
+  it('fires on a split, which returns normally and would otherwise log only "done"', () => {
+    expect(query).toContain(TILE_SPLIT_MARKER);
+    expect(query).toContain(SUBTREE_STUCK_MARKER);
+  });
+
+  it('exempts traces from sampling, since both trace arms are what it reads', () => {
+    const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
+      logging: { applicationInsights: { samplingSettings: { excludedTypes?: string } } };
+    };
+    expect(host.logging.applicationInsights.samplingSettings.excludedTypes).toContain('Trace');
+  });
+
+  it('deploys a subdivision ceiling that survives the round trip through env', () => {
+    // Asserted against a literal rather than against `subdivideMaxZoom`'s fallback: the fallback
+    // is what every *invalid* input returns, so comparing the two would hold for an
+    // implementation that ignored its argument entirely.
+    expect(appSetting('INGEST_SUBDIVIDE_MAX_ZOOM')).toBe('11');
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11' })).toBe(11);
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
+    expect(MAX_INGEST_ZOOM).toBeGreaterThanOrEqual(11);
   });
 
   function appSetting(name: string): string {

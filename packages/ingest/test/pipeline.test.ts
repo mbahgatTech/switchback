@@ -11,6 +11,7 @@ import {
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
+import { MAX_INGEST_ZOOM } from '@switchback/geo';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
 const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
@@ -163,6 +164,7 @@ describe('processTile, out of clock', () => {
     const recorded: Recorded = { updates: [], upserts: [], jobs: [] };
     const db = {
       ingestTile: {
+        findUnique: () => Promise.resolve(null),
         findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
           Promise.resolve(
             children.filter((row) => where.quadkey.in.includes(row.quadkey as string)),
@@ -198,6 +200,7 @@ describe('processTile, out of clock', () => {
       db,
       overpass,
       enrichWaypoints: false,
+      subdivideMaxZoom: MAX_INGEST_ZOOM,
       deadlineAt: Date.now() - 1,
     });
 
@@ -211,6 +214,32 @@ describe('processTile, out of clock', () => {
     expect(recorded.updates.some((update) => update.data.status === TileStatus.failed)).toBe(false);
   });
 
+  it('does not split for a trail that failed on its own account', async () => {
+    /*
+     * The gate is "the deadline refused work", not "a trail failed" and not "the clock is
+     * past". Both production splits on 2026-08-05 (540,311 ms and 545,210 ms against a
+     * 540,000 ms deadline) were 311 ms and 5.2 s late with nothing left to do, and splitting
+     * there discards a finished tile to queue four children over work already in `trails`.
+     *
+     * The minimal fake below has no `trail` model, so `commitTrail` throws for a reason that is
+     * not the clock — one row's worth of damage, and no subdivision.
+     */
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() + 600_000,
+    });
+
+    expect(result.failed).toBe(1);
+    expect(result.children).toEqual([]);
+    expect(recorded.jobs).toEqual([]);
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.ready);
+  });
+
   it('fails a tile at the floor, because there is nowhere left to split', async () => {
     const { db, recorded } = fakeDb();
     const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
@@ -220,6 +249,7 @@ describe('processTile, out of clock', () => {
         db,
         overpass,
         enrichWaypoints: false,
+        subdivideMaxZoom: MAX_INGEST_ZOOM,
         deadlineAt: Date.now() - 1,
       }),
     ).rejects.toThrow(/deadline/);
@@ -236,7 +266,12 @@ describe('processTile, out of clock', () => {
       query: () => Promise.reject(new OverpassDeadlineError(1_000)),
     } as unknown as OverpassClient;
 
-    const result = await processTile(DENSE, { db, overpass, deadlineAt: Date.now() + 60_000 });
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      subdivideMaxZoom: MAX_INGEST_ZOOM,
+      deadlineAt: Date.now() + 60_000,
+    });
 
     expect(result.children).toHaveLength(4);
     expect(recorded.jobs).toEqual(result.children.map((key) => `ingest_tile:${key}`));
@@ -252,7 +287,12 @@ describe('processTile, out of clock', () => {
     } as unknown as OverpassClient;
 
     await expect(
-      processTile(DENSE, { db, overpass, deadlineAt: Date.now() + 60_000 }),
+      processTile(DENSE, {
+        db,
+        overpass,
+        subdivideMaxZoom: MAX_INGEST_ZOOM,
+        deadlineAt: Date.now() + 60_000,
+      }),
     ).rejects.toThrow(/circuit breaker/);
 
     expect(recorded.jobs).toEqual([]);

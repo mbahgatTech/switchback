@@ -56,12 +56,15 @@ import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overp
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
 import {
   CHILDREN_PER_TILE,
+  SUBTREE_STUCK_MARKER,
+  TILE_SPLIT_MARKER,
   canSubdivide,
   childTiles,
   promoteFrom,
   queueStaleChildren,
   rollUpAncestors,
   splitTile,
+  subdivideMaxZoom,
 } from './subdivide';
 import type { ChildTile } from './subdivide';
 import { Gate, forEachConcurrent } from './pool';
@@ -136,6 +139,12 @@ export interface PipelineDeps {
    * on the Vercel path, where the platform's own timeout is the bound.
    */
   deadlineAt?: number;
+  /**
+   * Deepest zoom a tile may split to. Resolved once in `pipelineDeps` rather than read from
+   * `process.env` here, so the value a process will actually use is visible at the seam and a
+   * test can set it without touching the environment. `INGEST_ZOOM` disables subdivision.
+   */
+  subdivideMaxZoom?: number;
   now?: () => Date;
   mapillaryToken?: string;
   userAgent?: string;
@@ -170,6 +179,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const now = deps.now ?? (() => new Date());
   const log = deps.logger ?? (() => {});
   const terrain = deps.terrain ?? new TerrainSource({ fetchImpl: deps.fetchImpl });
+  const maxZoom = deps.subdivideMaxZoom ?? subdivideMaxZoom();
 
   const tile = quadkeyToTile(quadkey);
   if (tile.z < INGEST_ZOOM || tile.z > MAX_INGEST_ZOOM) {
@@ -214,10 +224,15 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
      * answering 504, a malformed query are all "come back later", and subdividing on those would
      * quadruple the load on a service that is already refusing.
      */
-    if (error instanceof OverpassDeadlineError && canSubdivide(tile.z)) {
+    if (error instanceof OverpassDeadlineError && canSubdivide(tile.z, maxZoom)) {
       const fetchMs = Date.now() - startedAt;
       const split = await splitTile(db, quadkey, { fetchMs });
-      log('tile split', { quadkey, phase: 'tile query', children: split, fetchMs });
+      log(`${TILE_SPLIT_MARKER} ${quadkey}: Overpass could not answer the tile query in time`, {
+        quadkey,
+        phase: 'tile query',
+        children: split,
+        fetchMs,
+      });
       return {
         quadkey,
         status: TileStatus.pending,
@@ -289,6 +304,8 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   let committed = 0;
   let skipped = 0;
   let failed = 0;
+  /** Trails the deadline refused outright. The only count that justifies a split. */
+  let refused = 0;
 
   // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
   // throws must cost its tile one row, not the rest of the tile.
@@ -308,6 +325,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       if (outcome === 'committed') committed += 1;
       else skipped += 1;
     } catch (error) {
+      if (error instanceof IngestDeadlineError) refused += 1;
       failed += 1;
       log('trail failed', {
         quadkey,
@@ -319,22 +337,39 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
 
   /*
    * The per-trail catch above is what keeps one bad trail from costing its tile, and it
-   * swallows the deadline too — so re-check it here and decide deliberately. A tile whose
-   * remaining trails were never attempted must not be written `ready`: it would be served
-   * short and never refetched until the TTL.
+   * swallows the deadline too — so re-check it here and decide deliberately.
    *
-   * Running out of clock is what "this tile is too big" looks like from inside, so this is
-   * where subdivision is triggered rather than at the top: the ceiling being tested is the
-   * whole handler's, and nothing before the commit loop knows how much of it a tile will
-   * want. Below the zoom floor there is nowhere left to go, so the tile fails as it always
-   * did — `drainJobs` catches it, writes `lastError`, and the retry ladder runs out.
+   * The clock alone is not the test, and `failed` is not either. `forEachConcurrent` visits
+   * every trail, so a tile is only short of work when the deadline *refused* one: a tile whose
+   * last commit landed a millisecond late is finished, and splitting it would discard the
+   * `ready` write and queue four children to redo work already in `trails`. Both production
+   * splits on 2026-08-05 (540,311 ms and 545,210 ms against a 540,000 ms deadline) sat in
+   * exactly that band. `refused` counts only `IngestDeadlineError`, so a trail that threw for
+   * its own reasons costs its row and nothing else — as it always did.
+   *
+   * Running out of clock with trails unattempted is what "this tile is too big" looks like from
+   * inside, so this is where subdivision is triggered rather than at the top: nothing before
+   * the commit loop knows how much of the handler's budget a tile will want. Below the zoom
+   * floor there is nowhere left to go, so the tile fails as it always did.
    */
-  if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) {
+  if (refused > 0) {
     const fetchMs = Date.now() - startedAt;
 
-    if (canSubdivide(tile.z)) {
+    if (canSubdivide(tile.z, maxZoom)) {
       const split = await splitTile(db, quadkey, { fetchMs });
-      log('tile split', { quadkey, committed, children: split, fetchMs });
+      log(
+        `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted`,
+        {
+          quadkey,
+          phase: 'commit',
+          committed,
+          skipped,
+          failed,
+          refused,
+          children: split,
+          fetchMs,
+        },
+      );
       return {
         quadkey,
         status: TileStatus.pending,
@@ -346,7 +381,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       };
     }
 
-    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt);
+    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt!);
     await db.ingestTile.update({
       where: { quadkey },
       data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
@@ -394,11 +429,28 @@ async function rollUpSplitTile(
   log: (message: string, detail?: Record<string, unknown>) => void,
   startedAt: number,
 ): Promise<ProcessTileResult> {
-  const queued = await queueStaleChildren(db, children, now);
+  const { queued, blocked } = await queueStaleChildren(db, children, now);
   const promoted = await promoteFrom(db, quadkey);
   const settled = promoted.includes(quadkey);
 
-  log('split tile', { quadkey, queued, ready: settled });
+  /*
+   * A blocked descendant is the one state nothing else reports. `rollUp` needs all four
+   * children settled, so a leaf that failed at the zoom floor holds its ancestors pending
+   * forever while `ingest-job-failed` names only the leaf — leaving the z9 a reader is
+   * actually waiting on silent.
+   */
+  if (blocked.length > 0 && !settled) {
+    log(`${SUBTREE_STUCK_MARKER} ${quadkey}: cannot roll up — ${blocked.join(', ')} failed`, {
+      quadkey,
+      blocked,
+      // Whether anything is still moving is the difference between "wait" and "intervene".
+      queued,
+    });
+    await db.ingestTile.update({
+      where: { quadkey },
+      data: { lastError: `blocked by failed descendant(s): ${blocked.join(', ')}`.slice(0, 1000) },
+    });
+  }
 
   return {
     quadkey,

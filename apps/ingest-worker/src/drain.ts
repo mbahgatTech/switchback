@@ -93,7 +93,7 @@ export async function runIngestSignal(
       derivedLimit: 0,
       dedupeKeys: [signal.dedupeKey],
       workerId: options.workerId,
-      deps: { overpass, deadlineAt: startedAt + handlerDeadlineMs() },
+      deps: { overpass, deadlineAt: startedAt + handlerDeadlineMs(), logger: pipelineLogger(log) },
     });
   } catch (error) {
     /*
@@ -116,12 +116,29 @@ export async function runIngestSignal(
  *
  * A job failure is invisible at the invocation level: `drainJobs` catches every handler error,
  * writes it to the row and returns normally, so the request row is `success == true`. On
- * 2026-08-04 that read as 14/14 successful invocations while six Alps tiles were failing. An
+ * 2026-08-04 that read as 14/14 successful invocations while six Alps tiles failed. An
  * alert therefore has to read `traces`, and a KQL query matching on prose is one reworded
  * sentence away from silence — so the sentence carries a token instead, asserted against
  * `infra/azure/ingest.bicep` in `test/drain.test.ts`.
  */
 export const JOB_FAILED_MARKER = 'ingest-job-failed';
+
+/**
+ * Give the pipeline somewhere to log. Until this existed `PipelineDeps.logger` was set on no
+ * deployed path — only `scripts/ingest.ts` — so every line subdivision emits went to
+ * `deps.logger ?? (() => {})` and a split was indistinguishable from an ordinary `done`. A
+ * round was spent inferring "the split path was never reached" from the absence of a trace the
+ * code could not emit.
+ *
+ * Warning rather than information because the events that reach it are all deferrals or
+ * blockages, and `host.json` excludes `Trace` from sampling so none of them can be dropped.
+ */
+function pipelineLogger(
+  log: WorkerLog,
+): (message: string, detail?: Record<string, unknown>) => void {
+  return (message, detail) =>
+    detail === undefined ? log.warn(message) : log.warn(message, JSON.stringify(detail));
+}
 
 /**
  * Say what happened. Every count that is not a plain success gets a line, because the worker's

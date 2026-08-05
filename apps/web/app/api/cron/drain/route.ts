@@ -118,7 +118,14 @@ async function sweepFinishedJobs(): Promise<{ done: number; failed: number } | n
  */
 async function drainOrReclaim(): Promise<DrainResult> {
   if (env.INGEST_QUEUE_DRIVER !== 'servicebus') {
-    return drainIngest({ limit: BATCH, derivedLimit: DERIVED_BATCH, workerId: 'cron' });
+    return drainIngest({
+      limit: BATCH,
+      derivedLimit: DERIVED_BATCH,
+      workerId: 'cron',
+      // Subdivision's only voice. Without it a tile that defers to four children is
+      // indistinguishable in the log from one that ingested — see `TILE_SPLIT_MARKER`.
+      deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
+    });
   }
 
   const { requeued, retired } = await reclaimExpiredJobs(prisma);

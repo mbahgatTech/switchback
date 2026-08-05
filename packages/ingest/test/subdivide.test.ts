@@ -47,10 +47,14 @@ interface Recorded {
 }
 
 /** A Prisma stand-in covering only what this module calls. */
-function fakeDb(rows: ChildTile[] = []): { db: PrismaClient; recorded: Recorded } {
+function fakeDb(
+  rows: ChildTile[] = [],
+  parent: { status: TileStatus; fetchedAt: Date | null } | null = null,
+): { db: PrismaClient; recorded: Recorded } {
   const recorded: Recorded = { tileUpserts: [], tileUpdates: [], jobUpserts: [] };
   const db = {
     ingestTile: {
+      findUnique: () => Promise.resolve(parent),
       findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
         Promise.resolve(rows.filter((row) => where.quadkey.in.includes(row.quadkey))),
       upsert: (args: { where: { quadkey: string } }) => {
@@ -82,9 +86,11 @@ function fakeDb(rows: ChildTile[] = []): { db: PrismaClient; recorded: Recorded 
 
 describe('canSubdivide', () => {
   it('splits at the ingest zoom and stops at the floor', () => {
-    expect(canSubdivide(INGEST_ZOOM)).toBe(true);
-    expect(canSubdivide(MAX_INGEST_ZOOM - 1)).toBe(true);
-    expect(canSubdivide(MAX_INGEST_ZOOM)).toBe(false);
+    // The ceiling is passed rather than read from the environment: what is under test is the
+    // comparison, and the environment's own default is the subject of `subdivideMaxZoom`.
+    expect(canSubdivide(INGEST_ZOOM, MAX_INGEST_ZOOM)).toBe(true);
+    expect(canSubdivide(MAX_INGEST_ZOOM - 1, MAX_INGEST_ZOOM)).toBe(true);
+    expect(canSubdivide(MAX_INGEST_ZOOM, MAX_INGEST_ZOOM)).toBe(false);
   });
 
   it('turns off entirely when the ceiling is the ingest zoom', () => {
@@ -103,9 +109,16 @@ describe('subdivideMaxZoom', () => {
     // Below `INGEST_ZOOM` there is no tile to split; above the floor is unbounded recursion,
     // and both are one typo away in a portal field.
     for (const value of ['8', '99', 'deep', '', '10.5']) {
-      expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: value })).toBe(MAX_INGEST_ZOOM);
+      expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: value })).toBe(INGEST_ZOOM);
     }
-    expect(subdivideMaxZoom({})).toBe(MAX_INGEST_ZOOM);
+  });
+
+  it('is off when nothing declares it, so it has to be switched on deliberately', () => {
+    // `apps/web/src/env.ts` has no entry for it, and Vercel drains `ingest_jobs` whenever the
+    // queue driver is rolled back — a default of `MAX_INGEST_ZOOM` turned subdivision on there
+    // without anyone choosing it.
+    expect(subdivideMaxZoom({})).toBe(INGEST_ZOOM);
+    expect(canSubdivide(INGEST_ZOOM, subdivideMaxZoom({}))).toBe(false);
   });
 });
 
@@ -168,7 +181,7 @@ describe('splitTile', () => {
     );
   });
 
-  it('leaves the parent pending rather than failed, and says what happened', async () => {
+  it('leaves a parent that has never served data pending, and says what happened', async () => {
     const { db, recorded } = fakeDb();
 
     await splitTile(db, PARENT);
@@ -180,19 +193,40 @@ describe('splitTile', () => {
       },
     ]);
   });
+
+  it('keeps a parent that was already serving trails in readyTiles while children run', async () => {
+    // `ensureCoverage` calls a settled-but-stale tile ready-and-refreshing and anything else
+    // pending, so demoting this one would flip a reader from "here are your trails" back to
+    // "still loading" for as long as four children take.
+    const fetchedAt = ago(TILE_TTL_MS + 1);
+    const { db, recorded } = fakeDb([], { status: TileStatus.ready, fetchedAt });
+
+    await splitTile(db, PARENT);
+
+    expect(recorded.tileUpdates[0]!.data.status).toBe(TileStatus.ready);
+  });
+
+  it('will not call a parent ready on the strength of a status it never earned', async () => {
+    // `ready` with no `fetchedAt` is a row that has been claimed but never wrote trails.
+    const { db, recorded } = fakeDb([], { status: TileStatus.ready, fetchedAt: null });
+
+    await splitTile(db, PARENT);
+
+    expect(recorded.tileUpdates[0]!.data.status).toBe(TileStatus.pending);
+  });
 });
 
 describe('queueStaleChildren', () => {
   it('queues only the children that are not serving fresh data', async () => {
     const rows = siblings([
       {},
-      { status: TileStatus.failed },
+      { status: TileStatus.pending },
       { fetchedAt: ago(TILE_TTL_MS + 1) },
       { status: TileStatus.empty },
     ]);
     const { db, recorded } = fakeDb(rows);
 
-    const queued = await queueStaleChildren(db, rows, NOW);
+    const { queued } = await queueStaleChildren(db, rows, NOW);
 
     // The fresh ready child and the fresh empty one are left alone; re-queueing them would
     // re-fetch ground that is already served.
@@ -200,6 +234,22 @@ describe('queueStaleChildren', () => {
     expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual(
       queued.map((key) => `${JobKind.ingest_tile}:${key}`),
     );
+  });
+
+  it('reports a failed child as blocked rather than re-arming it', async () => {
+    /*
+     * The loop this closes: `enqueue` clears attempts on a `dead` job, `ensureCoverage`
+     * re-queues a split parent on every viewport poll, and every drain of that parent lands
+     * here — so one unfinishable leaf would restart its whole subtree indefinitely.
+     */
+    const rows = siblings([{}, {}, {}, { status: TileStatus.failed }]);
+    const { db, recorded } = fakeDb(rows);
+
+    const { queued, blocked } = await queueStaleChildren(db, rows, NOW);
+
+    expect(queued).toEqual([]);
+    expect(blocked).toEqual([rows[3]!.quadkey]);
+    expect(recorded.jobUpserts).toEqual([]);
   });
 });
 
