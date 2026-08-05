@@ -21,10 +21,10 @@
 # definition, table ownership and grants, and the PostGIS facts a lost SRID would move.
 #
 # **Custom format, not plain SQL.** `-Fc` restores selectively (`pg_restore -l` then `-L`),
-# restores in parallel, restores section by section — which is what makes the spatial_ref_sys
-# handling below possible at all — and compresses. The one thing it is not is greppable, so a
-# plain-SQL *schema-only* dump ships alongside it. That is the half anyone actually reads, and
-# it carries no rows, so it lives in the evidence artifact rather than the restricted one.
+# restores in parallel, restores one section at a time when a partial failure has to be picked
+# apart, and compresses. The one thing it is not is greppable, so a plain-SQL *schema-only*
+# dump ships alongside it. That is the half anyone actually reads, and it carries no rows, so
+# it lives in the evidence artifact rather than the restricted one.
 #
 # **spatial_ref_sys is not backed up, and that is correct.** PostGIS registers it with
 # `pg_extension_config_dump` under a filter several hundred SRID ranges long, so pg_dump
@@ -54,15 +54,6 @@
 name: Backup production database
 
 on:
-  # TEMPORARY, REMOVED IN THE NEXT COMMIT ON THIS BRANCH. `workflow_dispatch` is only
-  # dispatchable once the file is on the default branch, and this backup has to be proven
-  # before the pull request that puts it there is worth reviewing. The path filter means the
-  # commit that adds these four lines is the only push that can fire it, and the commit that
-  # deletes them cannot fire anything, because the workflow GitHub reads is the one in the
-  # pushed commit.
-  push:
-    branches: [feat/credential-free-postgres]
-    paths: ['.github/workflows/backup-production-db.yml']
   workflow_dispatch:
     inputs:
       dump_retention_days:
