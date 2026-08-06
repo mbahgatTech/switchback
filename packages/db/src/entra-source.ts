@@ -1,4 +1,5 @@
 import { ClientAssertionCredential, DefaultAzureCredential } from '@azure/identity';
+import { getVercelOidcToken } from '@vercel/oidc';
 import type { TokenSource } from './entra-token';
 
 /** Where a process gets its database access tokens, and how it proves who it is. */
@@ -24,28 +25,21 @@ export function databaseAuthMode(env: NodeJS.ProcessEnv = process.env): Database
 }
 
 /**
- * Vercel has no managed identity, so it proves itself with an OIDC token it mints per
- * invocation and Azure trades for an access token against the federated credential on
- * `id-switchback-vercel-publisher`.
+ * Vercel has no managed identity, so it proves itself with an OIDC token Azure trades for an
+ * access token against the federated credential on `id-switchback-vercel-publisher`.
  *
- * The assertion is read inside the callback, never captured at construction: Vercel replaces
- * `VERCEL_OIDC_TOKEN` in the environment as it ages, and a module-scope copy would outlive it.
+ * `getVercelOidcToken` is *referenced* here and called later, which Vercel's OIDC reference
+ * requires: on a deployed function the token is not in the environment at all, it arrives as
+ * the `x-vercel-oidc-token` header of the request in scope. No custom audience — the deployed
+ * federated credentials trust Vercel's default, `https://vercel.com/mbahgattechs-projects`.
  */
-function vercelCredential(
-  env: NodeJS.ProcessEnv,
-): DefaultAzureCredential | ClientAssertionCredential {
+function vercelCredential(env: NodeJS.ProcessEnv): ClientAssertionCredential {
   const tenantId = env.AZURE_TENANT_ID;
   const clientId = env.AZURE_CLIENT_ID;
   if (!tenantId || !clientId) {
     throw new Error('entra-vercel needs AZURE_TENANT_ID and AZURE_CLIENT_ID.');
   }
-  return new ClientAssertionCredential(tenantId, clientId, () => {
-    const assertion = process.env.VERCEL_OIDC_TOKEN;
-    if (!assertion) {
-      throw new Error('VERCEL_OIDC_TOKEN is absent, so there is no assertion to exchange.');
-    }
-    return Promise.resolve(assertion);
-  });
+  return new ClientAssertionCredential(tenantId, clientId, () => getVercelOidcToken());
 }
 
 export function createEntraTokenSource(

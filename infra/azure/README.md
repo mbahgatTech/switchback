@@ -659,16 +659,47 @@ postgresql://sbadmin:…@<host>:5432/switchback?sslmode=verify-full&sslaccept=st
 postgresql://sbapp:…@<host>:5432/switchback?sslmode=verify-full&sslaccept=strict
 ```
 
-`sslmode=verify-full` rather than `require`, and `sslaccept=strict` alongside it, are both
-load-bearing — see the note at the foot of `postgres.bicep`. `require` encrypts the session and
-then accepts whatever certificate it is handed, which on an endpoint reachable from all of IPv4
-authenticates nothing; `verify-full` is the libpq half and `sslaccept=strict` is the Prisma half,
-and each client ignores the other's parameter.
+`sslmode=verify-full` rather than `require` is load-bearing — see the note at the foot of
+`postgres.bicep`. `require` encrypts the session and then accepts whatever certificate it is
+handed, which on an endpoint reachable from all of IPv4 authenticates nothing.
+
+`sslaccept=strict` sits alongside it for libpq's benefit only. It was added believing it was "the
+Prisma half", and that is **not true**: Prisma silently drops connection parameters it does not
+recognise, and `sslaccept` is one of them on PostgreSQL. Until a consumer is moved to
+`DATABASE_AUTH` (below), Prisma's TLS on this path is unverified. libpq consumers — `psql`,
+`pg_dump`, `pg_restore`, the workflows — read `sslmode=verify-full` and do verify.
 
 libpq looks for a root store in `~/.postgresql/root.crt` and fails closed when it is absent, so
 anything running `psql`, `pg_dump` or `pg_restore` against these URLs must also set
 `PGSSLROOTCERT` to a bundle containing DigiCert Global Root G2 and Microsoft RSA Root CA 2017. On
 Debian and Ubuntu that is `/etc/ssl/certs/ca-certificates.crt`; both roots are already in it.
+
+#### `DATABASE_AUTH`: the switch that takes the password out
+
+Each application consumer moves off its password on its own, by setting one variable. It defaults
+to `password`, so a deploy that does not set it behaves exactly as before.
+
+| Value          | Who sets it             | Credential                                                 |
+| -------------- | ----------------------- | ---------------------------------------------------------- |
+| `password`     | default                 | the password in `DATABASE_URL`                             |
+| `entra`        | Function App, operators | `DefaultAzureCredential` — managed identity, or `az login` |
+| `entra-vercel` | Vercel                  | the per-request OIDC token, exchanged for an access token  |
+
+Under either Entra value `DATABASE_URL` must carry **no password** and the username becomes the
+Entra-mapped role — `sbapp_func` or `sbapp_vercel`:
+
+```
+postgresql://sbapp_func@<host>:5432/switchback?sslmode=verify-full
+```
+
+A URL that still has a password in it is rejected at construction rather than quietly preferred, so
+a half-finished cutover fails loudly. `entra-vercel` additionally needs `AZURE_TENANT_ID` and
+`AZURE_CLIENT_ID` (the **client** id of `id-switchback-vercel-publisher`, not its principal id).
+
+On this path Prisma is driven through `@prisma/adapter-pg`, which means `sslmode` is finally read
+and enforced — and also that `connection_limit` and `pool_timeout` in the URL stop having any
+effect, because the adapter bypasses the connection string. Both pool sizes are set in
+`packages/db/src/client.ts` instead.
 
 `DATABASE_URL` and `DIRECT_DATABASE_URL` are identical on this tier, and that is correct rather
 than redundant — `schema.prisma` requires `directUrl` to exist, and keeping the split means the

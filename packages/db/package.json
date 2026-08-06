@@ -26,6 +26,7 @@
     "@prisma/adapter-pg": "6.19.3",
     "@prisma/client": "^6.2.1",
     "@switchback/core": "*",
+    "@vercel/oidc": "^3.8.2",
     "pg": "8.22.0"
   },
   "//devDependencies": "@switchback/geo is used only by scripts/seed.ts, for quadkey maths. The runtime db package does not depend on geo and must not — geo already imports core, and db importing geo at runtime is the first half of a cycle.",

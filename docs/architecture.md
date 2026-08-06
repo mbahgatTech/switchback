@@ -359,45 +359,62 @@ measured and runs under `npm test`, so a driver upgrade that breaks any of them 
 
 Two failure modes are handled rather than assumed away. A renewal that fails serves the cached
 token while it is still valid and suppresses the next attempt for `RENEW_RETRY_BACKOFF_MS`, so a
-fast-failing Entra does not turn into one token request per connection. A token issued
-shorter-lived than the margin — which an Entra token-lifetime policy can impose — cannot satisfy
-the invariant at all; the cache halves its margin so it stays useful and says so through
-`onTokenTooShort`, which warns by default rather than needing a caller to remember it.
+fast-failing Entra does not turn into one token request per connection — including once the cached
+token is genuinely dead, which is the outage the backoff exists for and the one an earlier version
+left unprotected. A token issued shorter-lived than the margin — which an Entra token-lifetime
+policy can impose — cannot satisfy the invariant at all; the cache halves its margin so it stays
+useful and says so through `onTokenTooShort`, which logs at **error** level by default and names
+how far past expiry a connection could then run. That is a weaker control than it should be: only
+the Function App's logs reach an Azure alert rule, so on Vercel and in CI the log line is the whole
+signal. It is not reachable with the tokens this system actually gets — 60 minutes for an app
+registration, 24 hours for a managed identity, both comfortably over the 35-minute margin.
 
-What this does **not** yet do is run in production. `packages/db/src/client.ts` still builds both
-Prisma clients from `DATABASE_URL` with a password in it; the token provider is tested and exported
-but no call site consumes it. Wiring it is a separate change, because it also has to restate
-`BACKGROUND_POOL_SIZE` and the background pool's thirty-second wait as `pg.Pool`'s `max` and
-`connectionTimeoutMillis` — a driver adapter ignores the `connection_limit` and `pool_timeout`
-parameters Prisma reads off the URL today, and `datasourceUrl` cannot be combined with an adapter
-at all. Losing that sizing silently is the outage recorded in that file's own comment, so the
-migration has to move it deliberately rather than inherit it.
+**What is wired, and what is switched on.** `packages/db/src/client.ts` builds both Prisma clients
+through `createClient`, which reads `DATABASE_AUTH`. It defaults to `password` and behaves exactly
+as it did before — so deploying this code changes nothing until a consumer is moved deliberately.
+Set to `entra` or `entra-vercel` it builds a `pg.Pool` whose `password` is the token cache and
+whose `maxLifetimeSeconds` is `CONNECTION_LIFETIME_S`, wraps it in `PrismaPg`, and hands that to
+Prisma as `adapter`.
 
-**Where each consumer's token comes from, once it does.** This is a design read off vendor
-documentation, not a measurement — nothing below has been run. The Function App and CI are the
-easy two: both run somewhere Azure will hand a managed identity a token unprompted, so the source
-is `DefaultAzureCredential` — what `apps/ingest-worker/src/service-bus.ts` already uses — scoped
-to `https://ossrdbms-aad.database.windows.net/.default`. Vercel is the one an earlier round
-recorded as an unsolved design problem, and it has an answer. Its OIDC token arrives as the
-per-request `x-vercel-oidc-token` header and is never in `process.env` on a deployed function, so
-a module-level pool cannot read it — but the pool does not need to. Vercel's OIDC reference gives
-the shape for exactly this, against Azure: construct a
-`ClientAssertionCredential(tenantId, clientId, getVercelOidcToken)` at module level and let the
-assertion callback run later, because `getVercelOidcToken()` reads the header off whatever
-request is in scope when it is called. The same page is explicit that the function must not be
-_called_ at module level. A physical connection is opened while a query is running, and a query
-is running inside a request, so the callback has a request to read.
+Three things had to move with it, because a driver adapter bypasses the connection string. Prisma
+reads `connection_limit` and `pool_timeout` off the URL and `datasourceUrl` cannot be combined with
+an adapter at all, so `BACKGROUND_POOL_SIZE` and the background pool's thirty-second wait are
+restated as `pg.Pool`'s `max` and `connectionTimeoutMillis`; the request pool restates Prisma's own
+default of `cores * 2 + 1`, which it would otherwise silently lose to `pg`'s default of ten. Losing
+that sizing is the outage recorded in that file's own comment.
+`packages/db/test/entra-pool.test.ts` asserts the constructed pool carries each of them.
 
-The residual risk is narrow and worth naming rather than discovering: a connection opened with a
-cold cache from outside any request — the cron drain, or `waitUntil` work that outlives the
-response — has no assertion to exchange and fails. A warm cache needs no assertion at all, and
-the 35-minute margin means only one connection in every 35 minutes of traffic asks for one, so
-the exposure is a deployment whose _only_ traffic for that long is background work. Capturing
-each request's header into a module-level holder closes even that, at the cost of holding a
-two-hour bearer token in memory. Either way this is the same assertion
-`publishIngestSignals` already exchanges for a Service Bus token, against the same identity —
-`id-switchback-vercel-publisher`, whose principal id `c9bfba39-…` is the one carried by the
-`sbapp_vercel` database role.
+The URL is split into discrete fields rather than passed through as `connectionString`, and that is
+not a style choice. `pg` merges a parsed connection string **over** the explicit config, so a URL
+carrying no password replaces the password callback with `null` — every connection would then
+authenticate with nothing and the token would never be requested. Measured on `pg` 8.22.0 and
+asserted in both directions. Splitting it also means `sslmode` is finally read: the deployed URLs
+have carried `verify-full` all along and Prisma ignores parameters it does not recognise, so under
+the adapter it becomes a real `rejectUnauthorized` plus hostname check for the first time.
+
+**Where each consumer's token comes from.** `DATABASE_AUTH=entra` uses `DefaultAzureCredential`,
+which covers the Function App's managed identity, a workload identity and an operator's `az login`
+without naming any of them. `DATABASE_AUTH=entra-vercel` uses
+`ClientAssertionCredential(tenantId, clientId, () => getVercelOidcToken())` from `@vercel/oidc`.
+The callback is referenced and called later, never invoked at module level, because Vercel's OIDC
+reference is explicit that on a deployed function the token is not in the environment at all — it
+arrives as the `x-vercel-oidc-token` header of the request in scope. No custom audience is passed:
+the deployed federated credentials trust Vercel's default,
+`https://vercel.com/mbahgattechs-projects`.
+
+**UNVERIFIED: none of this has run against the production database.** The code compiles, the pool
+it constructs is asserted, and the driver behaviour underneath it is measured — but no consumer has
+`DATABASE_AUTH` set anywhere, so no Entra-authenticated Prisma query has ever been executed. The
+Vercel path in particular has never run in a Vercel runtime, and its named residual risk is
+unchanged: a connection opened from the cron drain or from `waitUntil` work that outlives the
+response has no request in scope, so `getVercelOidcToken()` has no header to read and that
+connection fails. A warm cache needs no assertion at all, and the 35-minute margin means only one
+connection in every 35 minutes of traffic asks for one, so the exposure is a deployment whose
+_only_ traffic for that long is background work. Capturing each request's header into a
+module-level holder closes even that, at the cost of holding a two-hour bearer token in memory.
+
+The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
+same one already trusted for Service Bus, and the one carried by the `sbapp_vercel` database role.
 
 Whether retiring connections is a correctness requirement or only hygiene turns on one question
 nobody should answer from memory: **is the token checked only at connect, or is a live session
@@ -478,46 +495,44 @@ somebody else's account.
 
 ### What is left
 
-The database roles exist, and the refresh mechanism is proven at the pinned versions and covered by
-tests — but **nothing consumes either yet**. Three passwords are still live, and they come off in
-this order:
+The database roles exist, the refresh mechanism is proven at the pinned versions, and both Prisma
+clients can now be built on it — but **no consumer has `DATABASE_AUTH` set**, so the path is still
+password-authenticated end to end. Three passwords are live, and they come off in this order:
 
 1. **The Function App.** The simplest, because it is a long-lived process with a system-assigned
-   identity and no request scoping to solve. Its `DATABASE_URL` app setting still carries `sbapp`.
-2. **CI and the backup workflow.** `id-switchback-postgres-ci` is a proven Entra administrator that
+   identity and no request scoping to solve: `DATABASE_AUTH=entra` and a `DATABASE_URL` with the
+   password removed and the user set to `sbapp_func`. Its app setting still carries `sbapp`. Its
+   code also lives on `feat/servicebus-ingest` (PR #42) rather than here, so it cannot be moved
+   from this branch at all.
+2. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
+   `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
+   cold-cache-outside-a-request risk above is real and unmitigated.
+3. **CI and the backup workflow.** `id-switchback-postgres-ci` is a proven Entra administrator that
    nothing uses; `ci.yml` and `backup-production-db.yml` both still read
    `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` with full DDL. Switching them cannot be
-   rehearsed on a branch, because the federated credential trusts `refs/heads/master` alone. Two
-   things will bite when it is tried: `prisma db push` would then run as a role that is not
+   rehearsed on a branch, because the federated credential trusts `refs/heads/master` alone. One
+   thing will bite when it is tried: `prisma db push` would then run as a role that is not
    `sbadmin`, so new tables would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would
    not apply — `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and
    is untested.
-3. **Vercel, which is a design problem rather than remaining work.** Its OIDC token arrives as the
-   per-request `x-vercel-oidc-token` header and is never in `process.env` on a deployed function —
-   `packages/ingest/src/publish.ts` documents this for the Service Bus path. `packages/db/src/client.ts`
-   constructs its clients at module level, so a password callback fires with no request in scope
-   and nothing to exchange. Threading the request's token to a connection opened during that
-   request — `AsyncLocalStorage` is the obvious candidate — is unsolved, and background work started
-   by `waitUntil` may open connections outside any request context at all.
 
-`passwordAuth` stays `Enabled` until all three are moved. Turning it off first would lock the
-application out of its own database with no way back that does not involve a restore.
+`passwordAuth` stays `Enabled` until all three are moved, and `infra/azure/postgres.bicep`
+hardcodes it rather than taking it as a parameter, so no deployment of that template can turn it
+off by accident. Turning it off first would lock the application out of its own database with no
+way back that does not involve a restore.
 
-Two smaller things, both measured rather than suspected:
+One more thing, measured rather than suspected: **this repository is public.** Everything below is
+readable by anyone, and a workflow artifact is downloadable by any authenticated GitHub user. That
+is how a 371 MiB production dump — containing `sessions.sessionToken` and the `accounts` OAuth
+tokens in plaintext, alongside real accounts and real GPS tracks — came to be published by run 31043403970. It was deleted on 2026-08-05 and the backup workflow now withholds the dump unless the
+repository is private, but the session and OAuth tokens it exposed should be treated as
+compromised. Whether this repository should be public at all is an open owner decision, and every
+risk judgement in this document assumes it is.
 
-- **The Prisma clients are not verifying the server's certificate.** The connection strings that
-  are actually deployed carry `sslmode=verify-full` and nothing else, and Prisma ignores parameters
-  it does not recognise — so the only TLS instruction it was given is one it does not read. The
-  templates in `infra/azure/postgres.bicep` emit `sslaccept=strict` as well, but nothing propagates
-  a template into a setting. libpq consumers (the workflows) are unaffected and do verify.
-- **This repository is public.** Everything below is readable by anyone, and a workflow artifact
-  is downloadable by any authenticated GitHub user. That is how a 371 MiB production dump —
-  containing `sessions.sessionToken` and the `accounts` OAuth tokens in plaintext, alongside real
-  accounts and real GPS tracks — came to be published by run 31043403970. It was deleted on
-  2026-08-05 and the backup workflow now withholds the dump unless the repository is private, but
-  the session and OAuth tokens it exposed should be treated as compromised. Whether this
-  repository should be public at all is an open owner decision, and every risk judgement in this
-  document assumes it is.
+The certificate-verification gap that used to sit here is closed by the wiring above, but only on
+the Entra path: under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and
+hostname check. In `password` mode Prisma still receives `sslmode=verify-full` as a parameter it
+does not read, so until a consumer moves, its TLS is unverified.
 
 ## Design decisions, recorded once
 

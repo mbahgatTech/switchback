@@ -45,6 +45,13 @@ env:
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
   # Object ids of the two application identities. Not secrets — they are in the Bicep outputs
   # and the portal — and they are what the database roles are matched against.
+  #
+  # Literals rather than read from `az` at run time, deliberately: `id-switchback-postgres-ci`
+  # holds **zero** Azure RBAC, which is the property that makes a leak of it unable to touch
+  # the resource group, and `az functionapp identity show` would require granting it Reader.
+  # A stale literal is caught where it matters instead — `roles.sql` asserts the live role maps
+  # to exactly this object id, so an identity that has been recreated fails the job rather than
+  # passing with a role that matches nothing.
   FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
   VERCEL_OID: c9bfba39-4191-4695-996d-a588b7154e58
 
