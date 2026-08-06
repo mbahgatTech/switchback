@@ -188,28 +188,41 @@ which is how `census.sql` is tested without touching production.
 
 **What comes out, and who can read it:**
 
-| Artifact                     | Contents                                     | Retention      | Readable by                                               |
-| ---------------------------- | -------------------------------------------- | -------------- | --------------------------------------------------------- |
-| `switchback-production-dump` | `-Fc` archive of the whole database          | 3 days (input) | every collaborator, and any workflow with `actions: read` |
-| `switchback-backup-evidence` | census, diff, schema-only SQL, TOC, manifest | 30 days        | the same                                                  |
+| Artifact                     | Contents                                     | Retention      | Readable by                                                        |
+| ---------------------------- | -------------------------------------------- | -------------- | ------------------------------------------------------------------ |
+| `switchback-production-dump` | `-Fc` archive of the whole database          | 3 days (input) | **withheld entirely unless the repository is private** — see below |
+| `switchback-backup-evidence` | census, diff, schema-only SQL, TOC, manifest | 30 days        | anyone who can read the repository, which today is everyone        |
 
-**A GitHub artifact is a proving ground, not a home.** It is unencrypted, its deletion leaves no
-audit trail, and its access boundary is "anyone with repository access". It is not encrypted on
-purpose: a passphrase minted by a workflow and kept only in a repository secret cannot be read
-back, which is exactly the failure this file already records for the admin password. If a durable
-off-Azure copy is wanted rather than a rehearsal, it belongs in a private container in a Storage
-account inside `rg-switchback-prod-northcentralus`, where the delete lock, a lifecycle rule and
-Azure's own access logs already apply. Nothing in this repository does that yet.
+**An Actions artifact is readable by everyone who can read the repository.** On a public
+repository that is every GitHub account, not "every collaborator" — which is what this file and
+the workflow both used to say, while the repository was already public. What that mistake cost:
+run 31043403970 published a 371 MiB full dump for a day. `sessions.sessionToken` and the
+`accounts` `refresh_token`, `access_token` and `id_token` columns are stored in plaintext, so
+that archive was an account-takeover primitive for every account in it, not a privacy problem.
+It was deleted on 2026-08-05; the two session rows and the OAuth tokens it exposed should still
+be treated as compromised.
 
-Two facts that bound how urgent that is. The archive is **371 MiB**, against a GitHub Free plan
-whose included Actions storage for a private repository is 500 MB — an upload at that size
-succeeded with the repository already past the allowance, so the limit is evidently not a hard
-block, but two of these lying beside each other is still not something to leave unattended.
-And the personal data in it is currently **one account, one user row, two sessions and no
-recorded activities at all**: 43,179 trails, 384,209 waypoints, 107,672 photo rows and 33,709
-ingest jobs are all derived from OpenStreetMap. That is a statement about today, not about the
-design — the retention is short because of what this archive will hold once people use the
-product, not because of what it holds now.
+The workflow no longer trusts a comment about visibility. It asks the API, and uploads the dump
+only on a `private == true` answer — a failed call, a deleted step or a renamed field all
+withhold it. The dump is still taken, restored and compared either way, so the verification runs
+on a public repository; only the durable copy is refused, and the run summary says so rather than
+skipping quietly.
+
+**A GitHub artifact is a proving ground, not a home.** It is unencrypted and its deletion leaves
+no audit trail. It is not encrypted on purpose: a passphrase minted by a workflow and kept only
+in a repository secret cannot be read back, which is exactly the failure this file already
+records for the admin password. A durable off-Azure copy belongs in a private container in a
+Storage account inside `rg-switchback-prod-northcentralus`, where the delete lock, a lifecycle
+rule and Azure's own access logs already apply. Nothing in this repository does that yet, so
+while the repository stays public there is no dump-based rollback — Azure's own point-in-time
+restore, which reaches back to the server's creation and deepens to 14 days on 2026-08-13, is
+the one that remains.
+
+The archive is **371 MiB**. The personal data in it is currently one account, one user row, two
+sessions and no recorded activities: 43,179 trails, 384,209 waypoints, 107,672 photo rows and
+33,709 ingest jobs are all derived from OpenStreetMap. That is a statement about today, not
+about the design — the retention is short, and the visibility gate exists, because of what this
+archive will hold once people use the product.
 
 ### Restoring the dump
 

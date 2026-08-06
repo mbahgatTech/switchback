@@ -43,14 +43,25 @@
 #
 # ---------------------------------------------------------------------------------------
 #
-# **Where the dump goes, and who can read it.** A GitHub Actions artifact on this private
-# repository: every collaborator, and every workflow that runs with `actions: read`. It holds
-# every account's email address and every recorded GPS track, so the retention is days rather
-# than the 90-day default, and it is not encrypted — a passphrase generated here and stored
-# only in a repository secret would recreate exactly the failure this repository already has
-# with the database admin password, which is a credential nobody can read back. If this dump
-# is wanted as a durable rollback rather than as proof the backup works, it belongs in a
-# private Azure Storage container in the locked resource group, not here.
+# **Where the dump goes, and who can read it.** Nowhere, unless the repository is private.
+#
+# An Actions artifact is readable by anyone who can read the repository, so on a public one
+# that is every GitHub account. This dump holds `sessions.sessionToken` and the `accounts`
+# OAuth refresh and id tokens as well as account emails and recorded GPS tracks, which makes
+# a published copy an account-takeover primitive rather than a privacy problem. That is not
+# hypothetical: this workflow ran once while its own header claimed the repository was
+# private and the repository was already public, and the resulting 371 MiB artifact was live
+# for a day before it was deleted.
+#
+# So the upload is gated on `github.event.repository.private`, twice, and the verification
+# does not depend on it. The dump is still taken, still restored, still compared line by line
+# — the run proves the backup works either way. Only the durable copy is withheld, and the
+# summary says so in as many words rather than leaving a silent skip to be mistaken for one.
+# Retention is days rather than the 90-day default, and the archive is not encrypted: a
+# passphrase generated here and stored only in a repository secret would recreate exactly the
+# failure this repository already has with the database admin password, which is a credential
+# nobody can read back. If a durable rollback is wanted rather than proof the backup works,
+# it belongs in a private Azure Storage container in the locked resource group, not here.
 name: Backup production database
 
 on:
@@ -434,11 +445,27 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Personal data, kept apart from the evidence and kept briefly. Every collaborator on
-      # this repository can download it, and so can any workflow that runs with `actions:
-      # read` — so the retention is the control, and it is deliberately days.
+      # Asked of the API rather than read off `github.event.repository.private`, for two
+      # reasons: the answer is current rather than a snapshot taken when the run was queued,
+      # and it cannot be wrong about a context field's shape. Any failure — no token, no
+      # network, a renamed field — leaves `private=false`, so the dump is withheld.
+      - name: Resolve repository visibility
+        id: visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          private=$(gh api "repos/${{ github.repository }}" --jq '.private' 2>/dev/null || echo 'false')
+          [ "$private" = 'true' ] || private='false'
+          echo "private=$private" >> "$GITHUB_OUTPUT"
+          echo "Repository is $([ "$private" = 'true' ] && echo private || echo PUBLIC)."
+
+      # The dump is withheld unless the repository is private, because an artifact is readable
+      # by everyone who can read the repository. Every way this can go wrong withholds it: a
+      # deleted step leaves the output empty, a failed `gh` call leaves it `false`, and a
+      # renamed field leaves it neither. The failure it exists to prevent already happened
+      # once, on a header comment that asserted the wrong visibility.
       - name: Upload the dump
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.visibility.outputs.private == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: switchback-production-dump
@@ -450,6 +477,26 @@ jobs:
           # nothing.
           compression-level: 0
           if-no-files-found: error
+
+      # A withheld upload must not read as a completed one. This is the loud half of the
+      # guard: the verdict above still says the backup restores, and this says plainly that
+      # no copy of it survives the runner.
+      - name: Say that the dump was verified and not published
+        if: ${{ !cancelled() && steps.visibility.outputs.private != 'true' }}
+        run: |
+          {
+            echo '## No dump artifact was published'
+            echo
+            echo 'An Actions artifact is readable by everyone who can read the repository, and'
+            echo 'this dump carries `sessions.sessionToken` and the `accounts` OAuth refresh and'
+            echo 'id tokens. It was taken, restored and compared — the verdict above is real —'
+            echo 'and then discarded with the runner.'
+            echo
+            echo 'For a durable rollback, make the repository private and dispatch again, or'
+            echo 'write the dump to a private Azure Storage container in the locked resource'
+            echo 'group. See `infra/azure/README.md`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Dump withheld::The dump was verified and discarded, not published, because the repository is not private."
 
       # Counts, digests, DDL and logs. No rows, so this outlives the dump and is what anyone
       # auditing the run later actually reads.
