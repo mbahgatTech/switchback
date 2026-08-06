@@ -303,7 +303,7 @@ sequenceDiagram
   participant DB as Postgres
 
   P->>T: password() — called per new connection
-  alt cached and more than 5 min left
+  alt cached, with more than the renewal margin left
     T-->>P: cached token
   else inside the renewal margin, or expired
     T->>E: acquire for ossrdbms-aad.database.windows.net
@@ -311,11 +311,10 @@ sequenceDiagram
     T-->>P: fresh token
   end
   P->>DB: connect, token as password
-  DB->>DB: validate once, at connect
   DB-->>P: session established
 
-  Note over P,DB: does the session outlive its token?<br/>measured, not assumed — see below
-  P->>P: connection retired at maxLifetimeSeconds<br/>(below token lifetime)
+  Note over P,DB: whether the token is re-checked after connect<br/>is UNVERIFIED — the design assumes it is
+  P->>P: retired at maxLifetimeSeconds, on release
   P->>T: password() again for the replacement
 
   rect rgb(255, 240, 240)
@@ -325,8 +324,10 @@ sequenceDiagram
   end
 ```
 
-Three properties, and the reason for each. The mechanism each rests on was measured at the
-version this repository pins, `@prisma/client` and `@prisma/adapter-pg` 6.19.3 with `pg` 8:
+Three properties, and the reason for each. The mechanism each rests on was measured against the
+versions this repository now pins exactly — `pg` 8.22.0, `@prisma/adapter-pg` 6.19.3 — by
+`infra/postgres-identity/pg-password-callback-probe.mjs`, which prints the `pg` version it
+measured and runs under `npm test`, so a driver upgrade that breaks any of them fails a build:
 
 - **Acquire per connection, not per process.** `pg` accepts `password` as a function returning a
   promise and calls it once per _physical_ connection — proven by standing up a server that speaks
@@ -335,14 +336,27 @@ version this repository pins, `@prisma/client` and `@prisma/adapter-pg` 6.19.3 w
   connection produced none. `PrismaPg`'s constructor at 6.19.3 is
   `constructor(poolOrConfig: pg.Pool | pg.PoolConfig, options?)`, so the pool carrying that
   callback can be handed to Prisma directly.
-- **Renew five minutes before expiry.** `RENEW_MARGIN_MS` in `packages/db/src/entra-token.ts`.
-  Five because that is Entra's own tolerated clock skew, so treating the last five minutes as
-  already gone removes skew from the problem rather than budgeting for it; it also leaves room for
-  one failed renewal to be retried by the next connection while the current token still works.
-- **Retire connections below the token lifetime.** `CONNECTION_LIFETIME_S`, thirty minutes,
-  against a shortest issued lifetime of one hour. `pg.Pool`'s `maxLifetimeSeconds` retires the
-  connection and the replacement invokes the password callback again — also measured, on the same
-  harness.
+- **Retire connections, and budget for the checkout that outlives the timer.**
+  `maxLifetimeSeconds` does **not** evict a connection that is currently checked out: pg-pool's
+  timer moves the client to `_expired` and can only act in `release()`. Measured on the same
+  harness — a connection held for 2.5× its lifetime stayed open and was replaced only after it
+  was released. So a connection's real ceiling is `CONNECTION_LIFETIME_S` (20 min) plus one
+  `MAX_CHECKOUT_S` (10 min, the Functions Consumption ceiling, above Vercel's 60s route cap and
+  the 30s trail transaction).
+- **Renew far enough ahead to cover both.** `RENEW_MARGIN_MS` is derived rather than chosen:
+  `(CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000 + CLOCK_SKEW_MS`, 35 minutes. A flat five
+  minutes against a thirty-minute connection — what this file previously described — let a
+  connection run up to 25 minutes on an expired token, which negated the whole reason for
+  retiring connections at all. `packages/db/test/entra-token.test.ts` asserts the invariant
+  behaviourally, by sampling the life left on every token handed out across a simulated day,
+  rather than comparing two constants.
+
+Two failure modes are handled rather than assumed away. A renewal that fails serves the cached
+token while it is still valid and suppresses the next attempt for `RENEW_RETRY_BACKOFF_MS`, so a
+fast-failing Entra does not turn into one token request per connection. A token issued
+shorter-lived than the margin — which an Entra token-lifetime policy can impose — cannot satisfy
+the invariant at all; the cache halves its margin so it stays useful and says so through
+`onTokenTooShort`, which warns by default rather than needing a caller to remember it.
 
 What this does **not** yet do is run in production. `packages/db/src/client.ts` still builds both
 Prisma clients from `DATABASE_URL` with a password in it; the token provider is tested and exported
@@ -370,11 +384,21 @@ A GitHub-hosted job is capped at six hours, so waiting the token out is not avai
 shorten the lifetime with an Entra token lifetime policy on that service principal, or hold the
 connection from somewhere without the cap.
 
-The thirty-minute connection lifetime is what makes the open question stop being load-bearing: a
-connection is replaced, with a freshly minted token, long before the shortest token any of these
-principals is issued could expire. If Azure does terminate expired sessions, no session lives long
-enough to be terminated; if it does not, nothing accumulates authority granted an hour ago either
-way. The answer is still worth having, and it is not worth blocking on.
+Microsoft's own documentation does not settle it either, which is worth writing down so the next
+person does not re-read it hoping. `security-entra-concepts` gives the lifetimes — "User tokens
+are valid for up to 1 hour. Tokens for system-assigned managed identities are valid for up to 24
+hours" — and says a deleted principal "can still sign in until the token expires". Both are
+statements about _establishing_ a connection. Neither says anything about a session already
+established, and the PostgreSQL wire protocol has no re-authentication step for one, so
+terminating it would take something out of band that nothing documents. That is a strong prior,
+not an answer, and it is recorded here as a prior.
+
+The 35-minute renewal margin is what keeps the open question off the critical path, and the claim
+is now the arithmetic one rather than a hopeful one: no connection is ever opened with a token
+that has less life left than that connection can possibly consume. That holds whichever way the
+question resolves. It is **not** a substitute for the answer — if Azure does terminate expired
+sessions, the margin is the only thing preventing it, and nothing has yet observed a real
+boundary being crossed.
 
 ### Sign-in for people
 
@@ -443,10 +467,14 @@ Two smaller things, both measured rather than suspected:
   it does not recognise — so the only TLS instruction it was given is one it does not read. The
   templates in `infra/azure/postgres.bicep` emit `sslaccept=strict` as well, but nothing propagates
   a template into a setting. libpq consumers (the workflows) are unaffected and do verify.
-- **This repository is public.** Everything below is readable by anyone, and workflow artifacts —
-  including the production database dump the backup workflow produces — are listed publicly and
-  downloadable by any authenticated GitHub user. That dump contains real accounts and real GPS
-  tracks.
+- **This repository is public.** Everything below is readable by anyone, and a workflow artifact
+  is downloadable by any authenticated GitHub user. That is how a 371 MiB production dump —
+  containing `sessions.sessionToken` and the `accounts` OAuth tokens in plaintext, alongside real
+  accounts and real GPS tracks — came to be published by run 31043403970. It was deleted on
+  2026-08-05 and the backup workflow now withholds the dump unless the repository is private, but
+  the session and OAuth tokens it exposed should be treated as compromised. Whether this
+  repository should be public at all is an open owner decision, and every risk judgement in this
+  document assumes it is.
 
 ## Design decisions, recorded once
 

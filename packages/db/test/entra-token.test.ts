@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CONNECTION_LIFETIME_S, RENEW_MARGIN_MS, createTokenProvider } from '../src/entra-token';
+import {
+  CLOCK_SKEW_MS,
+  CONNECTION_LIFETIME_S,
+  MAX_CHECKOUT_S,
+  RENEW_MARGIN_MS,
+  RENEW_RETRY_BACKOFF_MS,
+  createTokenProvider,
+} from '../src/entra-token';
 import type { AccessToken } from '../src/entra-token';
 
 /** A clock the test moves by hand, so the renewal boundary is crossed without waiting for it. */
@@ -90,7 +97,7 @@ describe('createTokenProvider', () => {
     await expect(token()).rejects.toThrow('Entra unreachable');
   });
 
-  it('recovers on the next call after a renewal failure', async () => {
+  it('recovers once the backoff has elapsed after a renewal failure', async () => {
     const clock = fakeClock();
     const source = vi
       .fn<() => Promise<AccessToken>>()
@@ -102,15 +109,102 @@ describe('createTokenProvider', () => {
     const first = await token();
     clock.advance(HOUR - 60_000);
     expect(await token()).toBe(first); // the blip is absorbed
+    clock.advance(RENEW_RETRY_BACKOFF_MS + 1);
     expect(await token()).not.toBe(first); // the retry succeeds
   });
 });
 
 describe('connection lifetime', () => {
-  // The guarantee that makes "does Azure kill a session at expiry?" stop mattering: a
-  // connection is retired well before the shortest token any of these principals is issued.
-  it('retires a connection inside the shortest token lifetime, with the margin to spare', () => {
-    const shortestTokenLifetimeMs = HOUR; // a user principal; managed identities get 24h
-    expect(CONNECTION_LIFETIME_S * 1000).toBeLessThan(shortestTokenLifetimeMs - RENEW_MARGIN_MS);
+  /**
+   * The invariant the whole module exists for. Behavioural on purpose: it samples the life
+   * left on every token actually handed out across a day of connections, rather than
+   * comparing two constants — the assertion it replaced compared connection lifetime against
+   * *full* token lifetime and so passed while permitting 25 minutes of use past expiry.
+   */
+  it('never hands out a token with less life left than a connection can consume', async () => {
+    const clock = fakeClock();
+    const minted = new Map<string, number>();
+    let n = 0;
+    const source = async () => {
+      const t = { token: `tok-${++n}`, expiresOnTimestamp: clock.now() + HOUR };
+      minted.set(t.token, t.expiresOnTimestamp);
+      return t;
+    };
+    const token = createTokenProvider(source, { now: clock.now });
+
+    let worstRemainingMs = Infinity;
+    for (let minute = 0; minute < 24 * 60; minute++) {
+      const handed = await token();
+      worstRemainingMs = Math.min(worstRemainingMs, minted.get(handed)! - clock.now());
+      clock.advance(60_000);
+    }
+
+    expect(worstRemainingMs).toBeGreaterThanOrEqual(
+      (CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000,
+    );
+  });
+
+  it('derives the margin from the two bounds it has to cover', () => {
+    expect(RENEW_MARGIN_MS).toBe((CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000 + CLOCK_SKEW_MS);
+  });
+});
+
+describe('degraded sources', () => {
+  it('says so, and halves its margin, when a token is shorter-lived than the margin', async () => {
+    const clock = fakeClock();
+    const lifetimeMs = 10 * 60_000; // what an Entra token-lifetime policy can impose
+    const source = vi.fn(async () => tokenExpiringIn(clock, lifetimeMs));
+    const onTokenTooShort = vi.fn();
+    const token = createTokenProvider(source, { now: clock.now, onTokenTooShort });
+
+    const first = await token();
+    expect(onTokenTooShort).toHaveBeenCalledWith(lifetimeMs, RENEW_MARGIN_MS);
+
+    // Still cached for the first half of its life rather than re-acquired per connection.
+    clock.advance(4 * 60_000);
+    expect(await token()).toBe(first);
+    expect(source).toHaveBeenCalledTimes(1);
+
+    clock.advance(2 * 60_000);
+    expect(await token()).not.toBe(first);
+  });
+
+  it('does not re-ask a failing source on every connection', async () => {
+    const clock = fakeClock();
+    const source = vi
+      .fn<() => Promise<AccessToken>>()
+      .mockResolvedValueOnce(tokenExpiringIn(clock, HOUR))
+      .mockRejectedValue(new Error('Entra unreachable'));
+    const token = createTokenProvider(source, { now: clock.now, onRenewalFailure: () => {} });
+
+    await token();
+    clock.advance(HOUR - RENEW_MARGIN_MS + 1_000); // inside the margin, far from expiry
+    await token();
+    expect(source).toHaveBeenCalledTimes(2);
+
+    // Ten more connections inside the backoff must not become ten more token requests.
+    for (let i = 0; i < 10; i++) await token();
+    expect(source).toHaveBeenCalledTimes(2);
+
+    clock.advance(RENEW_RETRY_BACKOFF_MS + 1);
+    await token();
+    expect(source).toHaveBeenCalledTimes(3);
+  });
+
+  it('warns by default rather than degrading silently', async () => {
+    const clock = fakeClock();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const source = vi
+      .fn<() => Promise<AccessToken>>()
+      .mockResolvedValueOnce(tokenExpiringIn(clock, HOUR))
+      .mockRejectedValue(new Error('Entra unreachable'));
+    const token = createTokenProvider(source, { now: clock.now });
+
+    await token();
+    clock.advance(HOUR - 60_000);
+    await token();
+
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
   });
 });
