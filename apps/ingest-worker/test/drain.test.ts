@@ -293,19 +293,35 @@ describe('the drain-failure alert, from the template', () => {
     expect(host.logging.applicationInsights.samplingSettings.excludedTypes).toContain('Trace');
   });
 
-  it('deploys a subdivision ceiling that survives the round trip through env', () => {
-    // Asserted against a literal rather than against `subdivideMaxZoom`'s fallback: the fallback
-    // is what every *invalid* input returns, so comparing the two would hold for an
-    // implementation that ignored its argument entirely.
-    expect(appSetting('INGEST_SUBDIVIDE_MAX_ZOOM')).toBe('11');
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11' })).toBe(11);
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
-    expect(MAX_INGEST_ZOOM).toBeGreaterThanOrEqual(11);
+  it('takes the subdivision ceiling from a parameter, so a deploy cannot re-enable it', () => {
+    /*
+     * The rollback the docs promise is `az functionapp config appsettings set
+     * INGEST_SUBDIVIDE_MAX_ZOOM=9`, and an ARM application-settings write replaces the collection
+     * whole — so a literal in the template would undo that operator's 3am decision on the next
+     * routine deploy. `ingest.bicepparam` resolves the parameter to `9` unless the deploying shell
+     * says otherwise, which puts the accident on the safe side.
+     */
+    const setting = /name: 'INGEST_SUBDIVIDE_MAX_ZOOM'\s*\r?\n\s*value: ([^\s]+)/.exec(bicep)?.[1];
+    expect(setting).toBe('ingestSubdivideMaxZoom');
+    expect(bicep).toContain('param ingestSubdivideMaxZoom string');
+    expect(bicep).not.toContain('param ingestSubdivideMaxZoom string =');
+
+    const params = readFileSync(
+      resolve(__dirname, '../../../infra/azure/ingest.bicepparam'),
+      'utf8',
+    );
+    expect(params).toContain(
+      "param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')",
+    );
   });
 
-  function appSetting(name: string): string {
-    const found = new RegExp(`name: '${name}'\\s*\\r?\\n\\s*value: '([^']+)'`).exec(bicep);
-    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
-    return found[1]!;
-  }
+  it('reads a deployed ceiling of 11 as two levels of subdivision, and 9 as off', () => {
+    // Literals rather than `subdivideMaxZoom`'s own fallback: the fallback is what every
+    // *invalid* input returns, so comparing the two would hold for an implementation that
+    // ignored its argument entirely.
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11' })).toBe(11);
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
+    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '9' })).toBe(9);
+    expect(MAX_INGEST_ZOOM).toBeGreaterThanOrEqual(11);
+  });
 });

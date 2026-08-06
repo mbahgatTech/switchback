@@ -86,6 +86,32 @@ restored. Every deployment must state the driver; `ingest.bicepparam` reads it f
 ])
 param ingestQueueDriver string
 
+@description('''
+How deep a tile that outruns `INGEST_DEADLINE_MS` may be subdivided. `9` is off: no tile splits,
+a dense one fails exactly as it did before, and children already created still finish and still
+roll up. `11` allows two levels — six Alps tiles hit the 540 s wall on 2026-08-04, and `120221203`
+measures 6,440 Overpass elements at z9 against 1,641 in its first z10 child, so one level is
+expected to be enough and the second is margin.
+
+**A parameter, not a literal, and `ingest.bicepparam` resolves it to `9` unless the deploying
+shell says otherwise.** An ARM application-settings write replaces the collection whole, so a
+value baked into the template would re-enable subdivision on the next routine deploy after an
+operator had turned it off at 3am. The polarity is the point and it is the opposite of
+`ingestQueueDriver`'s: for the driver both values are dangerous, so it has no fallback at all;
+here the unsafe direction is only ever *on*, so a forgotten `export` must land on off.
+
+Subdivision stays off in the committed parameters until task #228 lands. A new interior seam
+fragments a multi-way trail that crosses it — `assembleTrails` keys a way-trail by the lowest way
+id *it saw*, and `commitTrail` only ever upserts — so a split writes damage into `trails` that
+turning the flag back off does not undo.
+''')
+@allowed([
+  '9'
+  '10'
+  '11'
+])
+param ingestSubdivideMaxZoom string
+
 @description('Vercel team slug. Half of the OIDC issuer and subject the publisher credential trusts.')
 param vercelTeamSlug string = 'mbahgattechs-projects'
 
@@ -727,19 +753,13 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'INGEST_DEADLINE_MS'
             value: '540000'
           }
-          // How deep a tile that outruns that budget may be subdivided. A z9 tile the handler
-          // cannot finish is split into its four z10 children, which run as ordinary jobs and
-          // roll their result back up; a child that also overruns splits once more. Six Alps
-          // tiles hit the 540 s wall on 2026-08-04 and `120221203` measures 6,440 Overpass
-          // elements at z9 against 1,641 in its first z10 child, so one level is expected to be
-          // enough and this is the margin.
-          //
-          // **Set this to 9 to turn subdivision off**: no tile splits, a dense one fails exactly
-          // as it did before, and children already created still finish and still roll up. That
-          // is the rollback, and it needs no deploy — one `az functionapp config appsettings set`.
+          // How deep a tile that outruns that budget may be subdivided, from the parameter above
+          // rather than a literal — an application-settings write replaces the collection whole,
+          // so a value baked in here would re-enable subdivision on the next deploy after an
+          // operator had turned it off.
           {
             name: 'INGEST_SUBDIVIDE_MAX_ZOOM'
-            value: '11'
+            value: ingestSubdivideMaxZoom
           }
           {
             name: 'NODE_ENV'
@@ -835,6 +855,14 @@ token above was logged; now that tile splits, `processTile` returns normally and
 logs `done`. An operator would read 8/8 tiles succeeded while two of them ingested nothing and
 deferred to four children each. A split is a deferral, not a success, and the ground a reader is
 waiting for is still missing when one happens.
+
+**Both tokens in that arm are edge-triggered, and the rule depends on it.** A split is logged once,
+when it happens. `switchback-ingest-subtree-stuck` is written only when the parent's stored
+`lastError` does not already say so — without that it would be logged on every drain of a blocked
+parent, and a blocked parent is `pending`, so `ensureCoverage` re-queues it on every viewport poll
+and `explore.tsx` polls *because* it is pending. One stuck subtree would then page every fifteen
+minutes for as long as anyone left that map open, on the same rule as the genuine failure signal,
+which trains an operator to ignore exactly the signal this rule was created for.
 
 Both trace arms depend on `traces` arriving at all. `host.json` samples Application Insights at
 five items per second and adaptive sampling drops correlated *sets*, so a dense tile's dependency

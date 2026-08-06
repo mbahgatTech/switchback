@@ -3,7 +3,7 @@
  * by its four z+1 children, which ingest independently and roll their result back up.
  */
 
-import { JobKind, TileStatus } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
@@ -39,11 +39,11 @@ export const SPLIT_PRIORITY = 5;
 export const TILE_SPLIT_MARKER = 'switchback-ingest-tile-split';
 
 /**
- * The literal an operator greps for when a subtree cannot finish.
+ * The literal an operator greps for when a descendant of a split tile has run out of retries.
  *
- * A parent whose descendant failed at the zoom floor can never roll up, so the z9 a reader is
- * polling stays `pending` forever. The retry ladder retires the leaf and says nothing about the
- * ancestor waiting on it, which is the one row anybody is watching.
+ * The leaf's own failure names the leaf; nothing names the z9 ancestor a reader is polling, and
+ * that is the row somebody is waiting on. Written once per transition rather than once per drain
+ * — see `rollUpSplitTile`, which compares it against the parent's stored `lastError`.
  */
 export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
 
@@ -134,6 +134,9 @@ export async function childTiles(db: PrismaClient, quadkey: string): Promise<Chi
   });
 }
 
+/** A tile row as it stood before the run that is now splitting it. Null when there was no row. */
+export type TileSnapshot = { status: TileStatus; fetchedAt: Date | null } | null;
+
 /**
  * Replace a tile with its four children and queue them.
  *
@@ -146,20 +149,21 @@ export async function childTiles(db: PrismaClient, quadkey: string): Promise<Chi
  * `fetchedAt` rather than dropping to `pending`. `ensureCoverage` classifies a settled-but-stale
  * tile as ready-and-refreshing and anything else as pending, so demoting it would flip a reader
  * from "here are your trails, refreshing" to "still loading" for as long as the four children
- * take — which is the drain queue's problem, not a length anybody is watching. The children are
- * enqueued here directly, so nothing depends on the parent being re-queued to drive them.
+ * take.
+ *
+ * **`previous` is a parameter and not a read, because by the time this runs the row no longer
+ * says what the tile was.** `processTile` writes `running` before it fetches, so a re-read here
+ * sees `running` for every caller and the preservation above is dead code — which is exactly what
+ * it was until this parameter existed. The caller holds the only honest answer.
  */
 export async function splitTile(
   db: PrismaClient,
   quadkey: string,
-  options: { fetchMs?: number; priority?: number } = {},
+  options: { previous: TileSnapshot; fetchMs?: number; priority?: number },
 ): Promise<string[]> {
   const children = childQuadkeys(quadkey);
   const priority = options.priority ?? SPLIT_PRIORITY;
-  const parent = await db.ingestTile.findUnique({
-    where: { quadkey },
-    select: { status: true, fetchedAt: true },
-  });
+  const previous = options.previous;
 
   for (const child of children) {
     const { x, y, z } = quadkeyToTile(child);
@@ -177,12 +181,13 @@ export async function splitTile(
     });
   }
 
-  const servesData = parent !== null && isTileSettled(parent.status) && parent.fetchedAt !== null;
+  const servesData =
+    previous !== null && isTileSettled(previous.status) && previous.fetchedAt !== null;
 
   await db.ingestTile.update({
     where: { quadkey },
     data: {
-      status: servesData ? parent.status : TileStatus.pending,
+      status: servesData ? previous.status : TileStatus.pending,
       lastError: `split into ${children.length} tiles at z${quadkey.length + 1}`,
       ...(options.fetchMs === undefined ? {} : { fetchMs: options.fetchMs }),
     },
@@ -191,36 +196,69 @@ export async function splitTile(
   return children;
 }
 
+/** What a drain of a split parent decided about its children. */
+export interface ChildQueueOutcome {
+  /** Children this call put back on the queue. */
+  queued: string[];
+  /** Children the queue already owns: claimed, running, or waiting out a backoff. */
+  waiting: string[];
+  /**
+   * Children whose retry ladder ran out. A subset of `queued` — they are revived here, because
+   * nothing else can — and separately named because five failed attempts is a fact about the
+   * ground, not about the schedule, and a sixth is unlikely to go differently.
+   */
+  exhausted: string[];
+}
+
 /**
- * Queue every child that is not currently serving fresh data and has not already given up.
- * Returns what it queued, and separately what it refused to.
+ * Queue every child that is not serving fresh data and that nothing else is going to run.
  *
- * A `failed` child is deliberately skipped. `enqueue` revives a `dead` job and clears its
- * attempts, `ensureCoverage` re-queues a split parent on every viewport poll, and every drain of
- * that parent lands here — so re-queueing a failed child makes one unfinishable leaf an engine
- * that re-arms its whole subtree, indefinitely, on a worker that takes one message at a time. A
- * child that failed still has its own retry ladder; this is not the thing that should restart it.
+ * The job row decides, not the tile row. `IngestTile.status` is `failed` both for a child thirty
+ * seconds from its next attempt and for one that has given up, and `enqueue` clears `attempts` —
+ * so re-queueing on tile status alone resets the backoff ladder of a child that was already
+ * coming back, on every viewport poll. `failJob` writes `queued` with a future `runAfter` while
+ * attempts remain and `dead` only when they are gone, which is the distinction this reads.
+ *
+ * **A `dead` child is revived, deliberately.** It is the only path back: `splitTile` enqueues each
+ * child exactly once, `ensureCoverage` covers z9 alone, and `reclaimExpiredJobs` does not touch a
+ * dead row. Before subdivision a viewport poll revived a dead z9 the same way, so this restores
+ * the recovery the split had removed rather than inventing one.
  */
 export async function queueStaleChildren(
   db: PrismaClient,
   children: readonly ChildTile[],
   now: Date,
   priority = SPLIT_PRIORITY,
-): Promise<{ queued: string[]; blocked: string[] }> {
+): Promise<ChildQueueOutcome> {
   const outstanding = children.filter((child) => !isTileFresh(child, now));
-  const blocked = outstanding.filter((child) => child.status === TileStatus.failed);
-  const stale = outstanding.filter((child) => child.status !== TileStatus.failed);
+  if (outstanding.length === 0) return { queued: [], waiting: [], exhausted: [] };
 
-  for (const child of stale) {
+  const jobs = await db.ingestJob.findMany({
+    where: { dedupeKey: { in: outstanding.map((child) => tileJobKey(child.quadkey)) } },
+    select: { dedupeKey: true, status: true },
+  });
+  const jobStatus = new Map(jobs.map((job) => [job.dedupeKey, job.status]));
+
+  const outcome: ChildQueueOutcome = { queued: [], waiting: [], exhausted: [] };
+
+  for (const child of outstanding) {
+    const status = jobStatus.get(tileJobKey(child.quadkey)) ?? null;
+    if (status === JobStatus.queued || status === JobStatus.running) {
+      outcome.waiting.push(child.quadkey);
+      continue;
+    }
+
+    if (status === JobStatus.dead) outcome.exhausted.push(child.quadkey);
     await enqueue(db, {
       kind: JobKind.ingest_tile,
       dedupeKey: tileJobKey(child.quadkey),
       payload: { quadkey: child.quadkey },
       priority,
     });
+    outcome.queued.push(child.quadkey);
   }
 
-  return { queued: stale.map((child) => child.quadkey), blocked: blocked.map((c) => c.quadkey) };
+  return outcome;
 }
 
 /**

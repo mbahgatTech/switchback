@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { JobKind, TileStatus } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { INGEST_ZOOM, MAX_INGEST_ZOOM, childQuadkeys } from '@switchback/geo';
 import {
@@ -49,12 +49,11 @@ interface Recorded {
 /** A Prisma stand-in covering only what this module calls. */
 function fakeDb(
   rows: ChildTile[] = [],
-  parent: { status: TileStatus; fetchedAt: Date | null } | null = null,
+  jobs: Record<string, JobStatus> = {},
 ): { db: PrismaClient; recorded: Recorded } {
   const recorded: Recorded = { tileUpserts: [], tileUpdates: [], jobUpserts: [] };
   const db = {
     ingestTile: {
-      findUnique: () => Promise.resolve(parent),
       findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
         Promise.resolve(rows.filter((row) => where.quadkey.in.includes(row.quadkey))),
       upsert: (args: { where: { quadkey: string } }) => {
@@ -71,6 +70,12 @@ function fakeDb(
       },
     },
     ingestJob: {
+      findMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) =>
+        Promise.resolve(
+          where.dedupeKey.in
+            .filter((key) => jobs[key] !== undefined)
+            .map((key) => ({ dedupeKey: key, status: jobs[key]! })),
+        ),
       updateMany: () => Promise.resolve({ count: 0 }),
       upsert: (args: { where: { dedupeKey: string }; create: { priority: number } }) => {
         recorded.jobUpserts.push({
@@ -169,7 +174,7 @@ describe('splitTile', () => {
   it('writes four child tiles and queues one job each', async () => {
     const { db, recorded } = fakeDb();
 
-    const children = await splitTile(db, PARENT, { fetchMs: 543_653 });
+    const children = await splitTile(db, PARENT, { previous: null, fetchMs: 543_653 });
 
     expect(children).toEqual(childQuadkeys(PARENT));
     expect(recorded.tileUpserts).toEqual(childQuadkeys(PARENT));
@@ -184,7 +189,7 @@ describe('splitTile', () => {
   it('leaves a parent that has never served data pending, and says what happened', async () => {
     const { db, recorded } = fakeDb();
 
-    await splitTile(db, PARENT);
+    await splitTile(db, PARENT, { previous: null });
 
     expect(recorded.tileUpdates).toEqual([
       {
@@ -199,24 +204,27 @@ describe('splitTile', () => {
     // pending, so demoting this one would flip a reader from "here are your trails" back to
     // "still loading" for as long as four children take.
     const fetchedAt = ago(TILE_TTL_MS + 1);
-    const { db, recorded } = fakeDb([], { status: TileStatus.ready, fetchedAt });
+    const { db, recorded } = fakeDb();
 
-    await splitTile(db, PARENT);
+    await splitTile(db, PARENT, { previous: { status: TileStatus.ready, fetchedAt } });
 
     expect(recorded.tileUpdates[0]!.data.status).toBe(TileStatus.ready);
   });
 
   it('will not call a parent ready on the strength of a status it never earned', async () => {
     // `ready` with no `fetchedAt` is a row that has been claimed but never wrote trails.
-    const { db, recorded } = fakeDb([], { status: TileStatus.ready, fetchedAt: null });
+    const { db, recorded } = fakeDb();
 
-    await splitTile(db, PARENT);
+    await splitTile(db, PARENT, { previous: { status: TileStatus.ready, fetchedAt: null } });
 
     expect(recorded.tileUpdates[0]!.data.status).toBe(TileStatus.pending);
   });
 });
 
 describe('queueStaleChildren', () => {
+  const keys = childQuadkeys(PARENT);
+  const jobKey = (quadkey: string): string => `${JobKind.ingest_tile}:${quadkey}`;
+
   it('queues only the children that are not serving fresh data', async () => {
     const rows = siblings([
       {},
@@ -231,25 +239,38 @@ describe('queueStaleChildren', () => {
     // The fresh ready child and the fresh empty one are left alone; re-queueing them would
     // re-fetch ground that is already served.
     expect(queued).toEqual([rows[1]!.quadkey, rows[2]!.quadkey]);
-    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual(
-      queued.map((key) => `${JobKind.ingest_tile}:${key}`),
-    );
+    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual(queued.map(jobKey));
   });
 
-  it('reports a failed child as blocked rather than re-arming it', async () => {
+  it('leaves a child alone while its own retry ladder still owns it', async () => {
     /*
-     * The loop this closes: `enqueue` clears attempts on a `dead` job, `ensureCoverage`
-     * re-queues a split parent on every viewport poll, and every drain of that parent lands
-     * here — so one unfinishable leaf would restart its whole subtree indefinitely.
+     * The distinction the tile row cannot make. `failJob` writes the *job* `queued` with a future
+     * `runAfter` while attempts remain, and the *tile* `failed` either way — so re-queueing on
+     * tile status would clear `attempts` on a child that was already coming back, on every
+     * viewport poll, and a rate-limited tile becomes one we hammer once per render.
      */
-    const rows = siblings([{}, {}, {}, { status: TileStatus.failed }]);
-    const { db, recorded } = fakeDb(rows);
+    const rows = siblings([{}, {}, {}, { status: TileStatus.failed, fetchedAt: null }]);
+    const { db, recorded } = fakeDb(rows, { [jobKey(keys[3])]: JobStatus.queued });
 
-    const { queued, blocked } = await queueStaleChildren(db, rows, NOW);
+    const outcome = await queueStaleChildren(db, rows, NOW);
 
-    expect(queued).toEqual([]);
-    expect(blocked).toEqual([rows[3]!.quadkey]);
+    expect(outcome).toEqual({ queued: [], waiting: [keys[3]], exhausted: [] });
     expect(recorded.jobUpserts).toEqual([]);
+  });
+
+  it('revives a child whose ladder ran out, and says that it did', async () => {
+    /*
+     * The only path back. `splitTile` enqueues each child once, `ensureCoverage` covers z9 alone,
+     * and `reclaimExpiredJobs` does not touch a dead row — so without this a single exhausted
+     * leaf holds its z9 ancestor `pending` forever and no code anywhere can restart it.
+     */
+    const rows = siblings([{}, {}, {}, { status: TileStatus.failed, fetchedAt: null }]);
+    const { db, recorded } = fakeDb(rows, { [jobKey(keys[3])]: JobStatus.dead });
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome).toEqual({ queued: [keys[3]], waiting: [], exhausted: [keys[3]] });
+    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[3])]);
   });
 });
 

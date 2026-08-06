@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TileStatus } from '@switchback/db';
+import { JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   TILE_TTL_MS,
@@ -11,6 +11,7 @@ import {
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
+import { SUBTREE_STUCK_MARKER } from '../src/subdivide';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
@@ -157,28 +158,66 @@ describe('processTile, out of clock', () => {
     jobs: string[];
   }
 
-  function fakeDb(children: Array<Record<string, unknown>> = []): {
+  interface TileRow extends Record<string, unknown> {
+    quadkey: string;
+    status?: TileStatus;
+    fetchedAt?: Date | null;
+    lastError?: string | null;
+  }
+
+  /**
+   * A Prisma stand-in that *stores* the rows it is given rather than replaying a fixed answer.
+   * The difference is load-bearing: `processTile` writes `running` to the parent before it
+   * fetches, so a fake whose `findUnique` always returns null cannot tell a parent that was
+   * serving trails from one that never has, and the branch that preserves the first is exactly
+   * where a bug hid behind a green test.
+   */
+  function fakeDb(
+    seed: TileRow[] = [],
+    jobs: Record<string, JobStatus> = {},
+  ): {
     db: PrismaClient;
     recorded: Recorded;
   } {
     const recorded: Recorded = { updates: [], upserts: [], jobs: [] };
+    const tiles = new Map<string, TileRow>(seed.map((row) => [row.quadkey, { ...row }]));
     const db = {
       ingestTile: {
-        findUnique: () => Promise.resolve(null),
+        findUnique: ({ where }: { where: { quadkey: string } }) =>
+          Promise.resolve(tiles.get(where.quadkey) ?? null),
         findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
           Promise.resolve(
-            children.filter((row) => where.quadkey.in.includes(row.quadkey as string)),
+            [...tiles.values()].filter((row) => where.quadkey.in.includes(row.quadkey)),
           ),
-        upsert: (args: { where: { quadkey: string } }) => {
+        upsert: (args: {
+          where: { quadkey: string };
+          create: Record<string, unknown>;
+          update: Record<string, unknown>;
+        }) => {
           recorded.upserts.push(args.where.quadkey);
+          const existing = tiles.get(args.where.quadkey);
+          tiles.set(
+            args.where.quadkey,
+            existing
+              ? { ...existing, ...args.update, quadkey: args.where.quadkey }
+              : ({ ...args.create, quadkey: args.where.quadkey }),
+          );
           return Promise.resolve({});
         },
         update: (args: { where: { quadkey: string }; data: Record<string, unknown> }) => {
           recorded.updates.push({ quadkey: args.where.quadkey, data: args.data });
+          const existing = tiles.get(args.where.quadkey);
+          if (existing) Object.assign(existing, args.data);
           return Promise.resolve({});
         },
       },
       ingestJob: {
+        findMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) =>
+          Promise.resolve(
+            where.dedupeKey.in
+              .filter((key) => jobs[key] !== undefined)
+              .map((key) => ({ dedupeKey: key, status: jobs[key]! })),
+          ),
         updateMany: () => Promise.resolve({ count: 0 }),
         upsert: (args: { where: { dedupeKey: string } }) => {
           recorded.jobs.push(args.where.dedupeKey);
@@ -333,6 +372,66 @@ describe('processTile, out of clock', () => {
         >,
       },
     ]);
+  });
+
+  it('keeps a parent that was serving trails in readyTiles when it splits', async () => {
+    /*
+     * Through `processTile`, not by calling `splitTile` with a hand-built row: the tile is
+     * written `running` before the fetch, so a split that re-read the row would see `running`,
+     * decide the parent had never served anything, and flip a reader from "here are your trails,
+     * refreshing" to "still loading" for as long as four children take. That regression passed a
+     * unit test for a whole round because the unit test never went through this path.
+     */
+    const { db, recorded } = fakeDb([
+      { quadkey: DENSE, status: TileStatus.ready, fetchedAt: ago(TILE_TTL_MS + 1) },
+    ]);
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      enrichWaypoints: false,
+      subdivideMaxZoom: MAX_INGEST_ZOOM,
+      deadlineAt: Date.now() - 1,
+    });
+
+    expect(result.children).toHaveLength(4);
+    expect(recorded.updates.at(-1)).toEqual({
+      quadkey: DENSE,
+      data: expect.objectContaining({ status: TileStatus.ready }) as Record<string, unknown>,
+    });
+  });
+
+  it('reports an exhausted descendant once, not on every drain', async () => {
+    /*
+     * The alert this feeds is Count > 0 over fifteen minutes with `autoMitigate` off, and a
+     * blocked parent is `pending` — so `ensureCoverage` re-queues it on every viewport poll and
+     * the client polls precisely *because* it is pending. A line per drain would page every
+     * quarter of an hour for as long as anyone left that map open.
+     */
+    const children = ['1202212030', '1202212031', '1202212032', '1202212033'].map(
+      (quadkey, index) => ({
+        quadkey,
+        status: index === 3 ? TileStatus.failed : TileStatus.ready,
+        fetchedAt: index === 3 ? null : new Date(),
+        trailCount: index === 3 ? 0 : 7,
+        fetchMs: 100,
+      }),
+    );
+    const { db } = fakeDb(
+      [{ quadkey: DENSE, status: TileStatus.pending, lastError: null }, ...children],
+      {
+        'ingest_tile:1202212033': JobStatus.dead,
+      },
+    );
+    const overpass = { query: async () => ({ elements: [] }) } as unknown as OverpassClient;
+    const lines: string[] = [];
+    const deps = { db, overpass, logger: (message: string) => lines.push(message) };
+
+    await processTile(DENSE, deps);
+    await processTile(DENSE, deps);
+
+    expect(lines.filter((line) => line.includes(SUBTREE_STUCK_MARKER))).toHaveLength(1);
   });
 });
 

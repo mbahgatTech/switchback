@@ -190,9 +190,25 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const bbox = quadkeyToBBox(quadkey);
   const startedAt = Date.now();
 
+  /*
+   * Read before the `running` write below, because that write destroys the answer. Whether this
+   * tile is already serving trails decides what a split leaves behind, and after the upsert every
+   * tile looks like `running` — see `splitTile`, whose preservation was dead code for exactly as
+   * long as it re-read the row itself.
+   */
+  const previous = await db.ingestTile.findUnique({
+    where: { quadkey },
+    select: { status: true, fetchedAt: true, lastError: true },
+  });
+
   const children = await childTiles(db, quadkey);
   if (children.length === CHILDREN_PER_TILE) {
-    return rollUpSplitTile(db, quadkey, children, now(), log, startedAt);
+    return rollUpSplitTile(db, quadkey, children, {
+      now: now(),
+      log,
+      startedAt,
+      lastError: previous?.lastError ?? null,
+    });
   }
 
   await db.ingestTile.upsert({
@@ -226,7 +242,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
      */
     if (error instanceof OverpassDeadlineError && canSubdivide(tile.z, maxZoom)) {
       const fetchMs = Date.now() - startedAt;
-      const split = await splitTile(db, quadkey, { fetchMs });
+      const split = await splitTile(db, quadkey, { previous, fetchMs });
       log(`${TILE_SPLIT_MARKER} ${quadkey}: Overpass could not answer the tile query in time`, {
         quadkey,
         phase: 'tile query',
@@ -342,10 +358,9 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    * The clock alone is not the test, and `failed` is not either. `forEachConcurrent` visits
    * every trail, so a tile is only short of work when the deadline *refused* one: a tile whose
    * last commit landed a millisecond late is finished, and splitting it would discard the
-   * `ready` write and queue four children to redo work already in `trails`. Both production
-   * splits on 2026-08-05 (540,311 ms and 545,210 ms against a 540,000 ms deadline) sat in
-   * exactly that band. `refused` counts only `IngestDeadlineError`, so a trail that threw for
-   * its own reasons costs its row and nothing else — as it always did.
+   * `ready` write and queue four children to redo work already in `trails`. `refused` counts
+   * only `IngestDeadlineError`, so a trail that threw for its own reasons costs its row and
+   * nothing else — as it always did.
    *
    * Running out of clock with trails unattempted is what "this tile is too big" looks like from
    * inside, so this is where subdivision is triggered rather than at the top: nothing before
@@ -356,7 +371,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     const fetchMs = Date.now() - startedAt;
 
     if (canSubdivide(tile.z, maxZoom)) {
-      const split = await splitTile(db, quadkey, { fetchMs });
+      const split = await splitTile(db, quadkey, { previous, fetchMs });
       log(
         `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted`,
         {
@@ -425,31 +440,39 @@ async function rollUpSplitTile(
   db: PrismaClient,
   quadkey: string,
   children: readonly ChildTile[],
-  now: Date,
-  log: (message: string, detail?: Record<string, unknown>) => void,
-  startedAt: number,
+  context: {
+    now: Date;
+    log: (message: string, detail?: Record<string, unknown>) => void;
+    startedAt: number;
+    /** The parent's stored `lastError`, which is what makes the report below edge-triggered. */
+    lastError: string | null;
+  },
 ): Promise<ProcessTileResult> {
-  const { queued, blocked } = await queueStaleChildren(db, children, now);
+  const { queued, waiting, exhausted } = await queueStaleChildren(db, children, context.now);
   const promoted = await promoteFrom(db, quadkey);
   const settled = promoted.includes(quadkey);
 
   /*
-   * A blocked descendant is the one state nothing else reports. `rollUp` needs all four
-   * children settled, so a leaf that failed at the zoom floor holds its ancestors pending
-   * forever while `ingest-job-failed` names only the leaf — leaving the z9 a reader is
-   * actually waiting on silent.
+   * A descendant out of retries is the one state nothing else reports: `ingest-job-failed` names
+   * the leaf, and the z9 a reader is actually polling stays `pending` with nothing said about it.
+   *
+   * Written once per transition, not once per drain. A blocked parent is `pending`, so
+   * `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
+   * pending — a line per drain would page every fifteen minutes for as long as anyone left that
+   * map open, on the same rule as the genuine failure signal. The parent's stored `lastError` is
+   * the edge, and it survives a restart where a module-level flag would not. Clearing it is
+   * `promoteFrom`'s job, which nulls it the moment the roll-up lands.
    */
-  if (blocked.length > 0 && !settled) {
-    log(`${SUBTREE_STUCK_MARKER} ${quadkey}: cannot roll up — ${blocked.join(', ')} failed`, {
+  const stalled = `blocked by exhausted descendant(s): ${exhausted.join(', ')}`.slice(0, 1000);
+  if (exhausted.length > 0 && !settled && stalled !== context.lastError) {
+    context.log(`${SUBTREE_STUCK_MARKER} ${quadkey}: ${stalled} — requeued after five failures`, {
       quadkey,
-      blocked,
-      // Whether anything is still moving is the difference between "wait" and "intervene".
+      exhausted,
+      // Whether anything else is still moving is the difference between "wait" and "intervene".
       queued,
+      waiting,
     });
-    await db.ingestTile.update({
-      where: { quadkey },
-      data: { lastError: `blocked by failed descendant(s): ${blocked.join(', ')}`.slice(0, 1000) },
-    });
+    await db.ingestTile.update({ where: { quadkey }, data: { lastError: stalled } });
   }
 
   return {
@@ -458,7 +481,7 @@ async function rollUpSplitTile(
     trailCount: children.reduce((sum, child) => sum + child.trailCount, 0),
     skipped: 0,
     failed: 0,
-    fetchMs: Date.now() - startedAt,
+    fetchMs: Date.now() - context.startedAt,
     children: children.map((child) => child.quadkey),
   };
 }

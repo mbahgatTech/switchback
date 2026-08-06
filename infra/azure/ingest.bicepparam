@@ -39,6 +39,14 @@ param alertActionGroupName = 'ag-switchback-prod'
 // operator had just rolled back. Stating it is one word; guessing it wrong is an outage.
 param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 
+// How deep subdivision may go. `9` is off, and off is what an unset variable resolves to: unlike
+// the driver above, only one direction of this flag is dangerous. A split cuts fresh interior
+// seam through tiles that are currently whole, and a multi-way trail crossing one is written back
+// truncated plus a duplicate — permanently, because `commitTrail` only upserts. Deleting the
+// setting stops new splits and does not undo that, so subdivision stays off here until task #228
+// fixes trail identity across a seam.
+param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')
+
 // The two halves of the Vercel OIDC subject the publisher credential trusts. Renaming either on
 // Vercel breaks the token exchange silently — the claim follows the new name and the credential
 // does not — so they are parameters rather than literals buried in the template.

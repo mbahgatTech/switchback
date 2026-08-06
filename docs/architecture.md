@@ -386,33 +386,68 @@ that split on a TTL refresh would flip a reader from "here are your trails" back
 for however long four children sit in the drain queue — which is not a length anybody is watching.
 A parent with no `fetchedAt` has nothing to serve and still reads `pending`.
 
+**That status is passed in, not read back, and the difference was a live bug.** `processTile` writes
+`running` to the parent before it fetches, so a `splitTile` that re-read the row saw `running` for
+every caller, decided the parent had never served anything, and wrote `pending` — on every
+production path. It passed its unit test because the test called `splitTile` directly with a
+hand-built `ready` row that `processTile` cannot produce. `previous` is now a required parameter and
+`packages/ingest/test/pipeline.test.ts` proves the behaviour through `processTile` against a fake
+that stores rows rather than replaying a fixed answer.
+
 Because coverage is unchanged, a viewport over split ground keeps queueing the z9 parent. That path
 is cheap and useful rather than wasteful: `processTile` sees four child rows, makes no Overpass call
 at all, re-queues any child that is not fresh, and promotes the parent if it can. It is also how a
 split tile refreshes — the parent goes stale when its oldest child does, `ensureCoverage` queues the
 parent, and the parent re-queues exactly the stale children.
 
-**A failed child is not re-armed by its parent.** `enqueue` clears `attempts` on a `dead` job and
-`ensureCoverage` re-queues a split parent on every viewport poll, so re-queueing failed children
-from the roll-up would make one unfinishable z11 leaf an engine that restarts its whole subtree
-indefinitely — up to 21 tile ingests per poll on a worker that takes one message at a time.
-`queueStaleChildren` therefore skips `failed` children and returns them as `blocked`; the leaf keeps
-its own retry ladder, and the parent records the blockage in `lastError` and logs
-`switchback-ingest-subtree-stuck`, because otherwise the z9 a reader is waiting on reports `pending`
-forever with nothing saying it is stuck.
+**Whether to re-queue a child is a question about its job, not about its tile.** `IngestTile.status`
+reads `failed` both for a child thirty seconds from its next attempt and for one that has given up,
+and `enqueue` clears `attempts` — so deciding on the tile row resets the backoff ladder of a child
+that was already coming back, on every viewport poll, which is how a rate-limited tile becomes one
+we hammer once per render. `failJob` writes the *job* `queued` with a future `runAfter` while
+attempts remain and `dead` only when they are gone, and that is what `queueStaleChildren` reads: a
+`queued` or `running` child is left alone, anything else is enqueued.
 
-**The floor is z11 and it fails honestly.** `INGEST_SUBDIVIDE_MAX_ZOOM` (11 in `ingest.bicep`) is
-the deepest zoom a tile may reach; at the floor a tile that still exhausts its budget is marked
-`failed` and throws, exactly as before. Sixteen z11 tiles cover one z9, and each level quadruples
-the fixed per-tile cost — a region lookup and a tile-wide waypoint query that a smaller box does not
-make cheaper — so deeper than this the overhead, not the work, is what fills the invocation.
+**A `dead` child is revived, because nothing else can revive it.** `splitTile` enqueues each child
+exactly once, `ensureCoverage` covers z9 alone (`coverBBox(bbox, INGEST_ZOOM)`), `JobKind.refresh_tile`
+has no producer, and `reclaimExpiredJobs` does not touch a dead row. Skipping dead children — which
+an earlier revision of this section described as deliberate — left a subtree that could never finish
+and a z9 ancestor permanently `pending`, with no documented manual recovery. Reviving from the
+parent's drain restores exactly the recovery a z9 tile had before subdivision, where a viewport poll
+revived a dead job through `ensureCoverage`, and it is bounded the same way: the revived child gets a
+five-attempt ladder, and while it is `queued` the next drain leaves it alone.
 
-**Turning it off** is one setting and no deploy: `INGEST_SUBDIVIDE_MAX_ZOOM=9`. No tile splits, a
-dense tile fails exactly as it did before, and children already created still ingest and still roll
-up, so the switch is safe to throw mid-flight. **Deleting the setting turns it off too** — an absent
-or unusable value resolves to `INGEST_ZOOM`, not to the ceiling. That is deliberate: `apps/web`
-never declared the variable, so a permissive default had subdivision on in the Vercel drain, which
-is the live drainer whenever the queue driver is rolled back to `postgres`.
+**Five failed attempts is still worth a human, and it is reported once.** `queueStaleChildren`
+returns the revived-from-dead children as `exhausted`; `rollUpSplitTile` writes them to the parent's
+`lastError` and logs `switchback-ingest-subtree-stuck` — but only when that message differs from what
+the row already says. Edge-triggering is load-bearing rather than tidy: a blocked parent is `pending`,
+so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
+pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
+would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
+genuine failure signal — which trains an operator to ignore the signal round 5 was convened to create.
+`promoteFrom` nulls `lastError` when the roll-up lands, so the edge re-arms itself.
+
+**The floor is a parameter and it fails honestly at the bottom.** `INGEST_SUBDIVIDE_MAX_ZOOM` is the
+deepest zoom a tile may reach; at the floor a tile that still exhausts its budget is marked `failed`
+and throws, exactly as before. Sixteen z11 tiles cover one z9, and each level quadruples the fixed
+per-tile cost — a region lookup and a tile-wide waypoint query that a smaller box does not make
+cheaper — so deeper than z11 the overhead, not the work, is what fills the invocation.
+
+**It ships off, and turning it on is a deliberate act.** `ingest.bicepparam` resolves
+`ingestSubdivideMaxZoom` to `9` — subdivision disabled — unless `INGEST_SUBDIVIDE_MAX_ZOOM` is
+exported in the deploying shell. That is because of the seam defect below: a split writes damage into
+`trails` that turning the flag back off does not undo, so nothing may split until task #228 lands.
+
+**Off is one setting and no deploy: `az functionapp config appsettings set … INGEST_SUBDIVIDE_MAX_ZOOM=9`.**
+No tile splits, a dense tile fails exactly as it did before, and children already created still
+ingest and still roll up, so the switch is safe to throw mid-flight. **Deleting the setting turns it
+off too** — an absent or unusable value resolves to `INGEST_ZOOM`, not to the ceiling — and so does
+the next template deploy, because the committed parameter is `9`. That last point is the one that
+matters: an ARM application-settings write replaces the collection whole, so a hand-set value does
+not survive a deploy. `ingestQueueDriver` has no default at all for the same reason and the opposite
+polarity — both of its values are dangerous if guessed, whereas the only dangerous direction here is
+*on*, so a forgotten `export` has to land on off. Turning subdivision on for an experiment is
+therefore a hand-set app setting that the next deploy will revoke, which is the correct asymmetry.
 
 **A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
 its deadline threw, `drainJobs` recorded a failure, and the drain-failure alert armed. Now it
@@ -448,57 +483,57 @@ Overpass returned with a hole in its geometry rather than interpolating across i
 rule that already governs neighbouring z9 tiles.
 
 **A multi-way trail spanning a seam is a known defect that subdivision amplifies, and is not fixed
-here.** `assembleTrails` gives a standalone way-trail the identity `Math.min(...line.wayIds)` over
-only the ways that tile's query returned, so a trail of ways 10/20/30/40 cut by a seam becomes
-`(way, 10)` truncated to half its length in one child and a second row `(way, 30)` in the other.
-This is not new — neighbouring z9 tiles have always had it — but a z9 at 46°N is ~54 km square, so
-one split cuts ~108 km of fresh interior seam and two levels ~324 km. Fixing it means making trail
-identity independent of the observed subset, which is a change to how every trail in the database is
-keyed and belongs in its own work order, not in this one. Until then, treat a split as trading a
-larger blast radius for the ability to ingest the tile at all, and prefer the shallowest ceiling that
-gets a region in.
+here — which is why subdivision ships off.** `assembleTrails` gives a standalone way-trail the
+identity `Math.min(...line.wayIds)` over only the ways that tile's query returned, so a trail of ways
+10/20/30/40 cut by a seam becomes `(way, 10)` truncated to half its length in one child and a second
+row `(way, 30)` in the other; if the second fragment is under `MIN_TRAIL_LENGTH_M` it is dropped
+entirely. `commitTrail` preserves `slug` on update, so the truncation lands on the same public URL.
+Relation-backed trails are immune — their identity is the relation id, and `out body geom` returns
+every member whichever child asked.
 
-**UNVERIFIED in production, and the previous account of why was wrong.** An earlier revision of this
-section said "every tile it handled finished inside the budget, so `splitTile` was never reached".
-Retract that. It was inferred from the absence of a `tile split` trace, and no deployed process
-could emit one: `PipelineDeps.logger` was set nowhere outside `scripts/ingest.ts`, so every line
-subdivision wrote went to `deps.logger ?? (() => {})`. The absence of the trace said nothing about
-the code path, and reading it as evidence is the same mistake round 5 made with
-`requests | success == true`. The logger is wired now — worker to `InvocationContext`, both Vercel
-drains to `console` — and the events carry `switchback-ingest-tile-split` and
-`switchback-ingest-subtree-stuck` so a query matches a token rather than a sentence.
+This is not new: neighbouring z9 tiles have always had it. What is new is that a split cuts seam
+*inside* a tile that was whole. A z9 at 46°N is ~54 km square, so one split cuts ~108 km of fresh
+interior seam and two levels ~324 km, in exactly the alpine tiles this feature exists for. Nothing
+deletes a trail row, so the damage outlives the flag: setting `INGEST_SUBDIVIDE_MAX_ZOOM=9` stops new
+splits and leaves the truncated row and its duplicate in place permanently.
 
-What the telemetry actually supports, measured 2026-08-05 over the full 30-day window (pass
-`--offset 30d` to `az monitor app-insights query`; it defaults to the last hour, which is its own
-way of producing a confident wrong answer):
+The fix — making trail identity independent of the observed subset — changes how every trail in the
+database is keyed and is tracked as task #228. Until it lands the committed parameter is `9`, so a
+merge of this branch cannot split anything. Enabling it for a measured experiment means recording the
+trails in the parent's box before and after through `trails.browse` and comparing name, slug and
+`lengthM` per row; that is the only check available from outside the database.
 
-- **No child has ever run.** `traces | where message has 'ingest_tile:'`, keyed by quadkey length,
-  returns z9 and nothing else — 208 mentions across 66 distinct keys, zero at z10 or z11. Whatever
-  else happened, no child job has ever been delivered to the worker.
-- **Eleven invocations have exceeded the 540 s deadline**, not zero: four on 2026-08-03 (before the
-  deadline existed — those are host kills, to 615,938 ms), five on 2026-08-04 (to 543,654 ms) and
-  two on 2026-08-05 (540,311 ms and 545,210 ms). The claim that no tile reached the wall is wrong,
-  and the run table printed beside it said so.
-- **`120221231` is `pending` in production** with 17 trails inside its box (`trails.browse`,
-  2026-08-05). Consistent with a split, and equally consistent with a partial failure. From outside
-  the database the two are indistinguishable, which is the point above.
-- **Sampling can drop the line an alert depends on.** Over the same window `traces` is 17,602 rows
-  representing 18,354 items and `requests` 1,626 representing 1,633 — 4.1% of traces and 0.4% of
-  requests were dropped. Small, and irrelevant to a rate; fatal to a rule that fires on a single
-  occurrence of one token. `host.json` now sets `excludedTypes: "Exception;Trace"`.
+**Observed in production, 2026-08-06.** Subdivision fires, and the trace that says so is the one this
+round wired. Two dense alpine z9 tiles reached the wall and split rather than failing:
 
-So subdivision remains **built, tested and deployed, but not observed**. Neither "it never fired"
-nor "it fired twice" is supported by evidence anybody can reach today: a `traces` search for
-`tile split`, `split tile`, `split into` and `subdivide` over the whole window returns zero rows,
-and always would have. The bar is unchanged and now reachable: a `switchback-ingest-tile-split`
-trace, four child `done` traces beside it, and a z9 that `trails.browse` calls ready with
-`pendingTiles` empty.
+```
+00:00:25Z  switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unattempted
+           {"phase":"commit","committed":127,"failed":2033,"refused":2032,
+            "children":["1202302020","1202302021","1202302022","1202302023"],"fetchMs":542349}
+00:09:25Z  switchback-ingest-tile-split 120230220: ran out of clock with 1488 trail(s) unattempted
+           {"phase":"commit","committed":160,"failed":1489,"refused":1488,
+            "children":["1202302200","1202302201","1202302202","1202302203"],"fetchMs":540513}
+```
 
-**Two things block that proof, and both are outside this branch.** The six tiles this exists for
-exhausted their retry ladders in rounds 4 and 5, so reviving one means `ensureCoverage` — and
-production Vercel serves `master`, whose `processTile` still begins `if (tile.z !== INGEST_ZOOM)
-throw`. Master can neither produce a child nor process one, and its inline drain claims the parent
-for `LEASE_TIMEOUT_MS` on the same request that revives it. Merging is what removes both.
+Both are the commit-loop shape: the tile query returned, the deadline refused the rest, `refused > 0`
+selected the split, and the invocation returned `done` at 542,349 ms and 540,513 ms against a
+540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought. `2032` and `1488`
+unattempted trails is the size of the problem stated plainly: these boxes are an order of magnitude
+past what one invocation can commit.
+
+**Earlier rounds' account of this is now settled, and both halves of it were wrong.** Round 1 said
+`splitTile` was never reached; a reviewer said subdivision had fired twice on 2026-08-05. Neither was
+supported then and neither is now: the 2026-08-05 over-deadline invocations logged `done` with no
+token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
+path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
+
+**The children wait for the queue, and that is the honest cost.** Children are enqueued at
+`SPLIT_PRIORITY`, level with a live viewport, but `claimJobs` and the pump break a priority tie on
+`runAfter ASC` — so a child created at 00:00 sorts behind every tile queued before it. On a worker
+that takes one message at a time, with dense alpine tiles ahead of it at ~9 minutes each, that is the
+gap between "the tile splits" and "the tile is ready". Nothing is lost while it waits: the rows are
+durable, the parent stays `pending`, and the trails each parent committed before the wall are already
+in `trails`.
 
 **Direct Postgres is unavailable from a maintainer workstation behind the agent sandbox, and the
 earlier diagnosis of why was wrong.** It is not `connection_throttle.enable`. TCP 5432 accepts in
