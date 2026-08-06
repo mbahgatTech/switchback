@@ -319,6 +319,30 @@ param minTlsVersion string = 'TLSv1.2'
 param ciIdentityName string = 'id-switchback-postgres-ci'
 
 @description('''
+Name of the user-assigned managed identity every runtime client authenticates as — Vercel
+production, Vercel preview and the ingest worker. See runtime-identity.bicep for why one
+identity serves all three and what that costs.
+''')
+param runtimeIdentityName string = 'id-switchback-vercel-publisher'
+
+@description('Vercel team slug. Half of every federated-credential subject; see runtime-identity.bicep.')
+param vercelTeamSlug string = 'mbahgattechs-projects'
+
+@description('Vercel project name. The other half.')
+param vercelProjectName string = 'switchback'
+
+@description('''
+Service Bus namespace holding the ingest queue, or empty to declare no queue grant here.
+
+ingest.bicep declares the namespace, the queue and the worker. This template declares only the
+one grant the shared identity lacks, because that grant fails silently when forgotten.
+''')
+param serviceBusNamespaceName string = ''
+
+@description('Queue the ingest worker receives from. Ignored when the namespace name is empty.')
+param serviceBusQueueName string = 'ingest-jobs'
+
+@description('''
 Repository whose GitHub Actions OIDC tokens the CI identity trusts, in GitHub's immutable
 subject form. See the parameter of the same name in ci-identity.bicep for why it is not
 `mbahgatTech/switchback`.
@@ -360,6 +384,20 @@ installs the `pgaadauth` extension. Use `entraAuthEnabled` to take that restart 
   az identity show -g <rg> -n <name> --query principalId -o tsv
 ''')
 param entraAdministrators entraAdministrator[] = []
+
+@description('''
+Whether the server accepts a password at all.
+
+**True until every consumer has been proved on a token, and flipping it is its own deployment.**
+Turning it off while anything still holds a connection string locks the database against its own
+application, and the way back is an ARM write that itself needs Entra. The order is: move each
+consumer, prove it with passwords still enabled, re-prove both administrator doors, then flip.
+See infra/azure/README.md.
+
+False also makes `administratorLoginPassword` unnecessary, which permanently retires the
+accidental-rotation hazard the file header calls the one item with teeth.
+''')
+param passwordAuthEnabled bool = true
 
 // ---------------------------------------------------------------------------------------
 // Budget and alerting
@@ -508,6 +546,20 @@ module ciIdentity 'ci-identity.bicep' = {
   }
 }
 
+module runtimeIdentity 'runtime-identity.bicep' = {
+  name: 'switchback-runtime-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: runtimeIdentityName
+    vercelTeamSlug: vercelTeamSlug
+    vercelProjectName: vercelProjectName
+    serviceBusNamespaceName: serviceBusNamespaceName
+    serviceBusQueueName: serviceBusQueueName
+    tags: tags
+  }
+}
+
 module postgres 'postgres.bicep' = {
   name: 'switchback-postgres'
   scope: rg
@@ -529,6 +581,7 @@ module postgres 'postgres.bicep' = {
     minTlsVersion: minTlsVersion
     entraAuthEnabled: entraAuthEnabled
     entraAdministrators: entraAdministrators
+    passwordAuthEnabled: passwordAuthEnabled
     // The CI identity is an administrator because `prisma db push` needs DDL over tables
     // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
     // Passed separately rather than appended to the list — see the parameter in postgres.bicep.
@@ -744,3 +797,18 @@ output applicationDatabaseUrlTemplate string = postgres.outputs.applicationDatab
 
 @description('Log Analytics workspace holding PostgreSQLLogs, including the connection log.')
 output logAnalyticsWorkspaceId string = monitoring.outputs.workspaceId
+
+@description('''
+Resource id of the shared runtime identity. The parameter ingest.bicep takes so the worker runs
+as the same principal Vercel does.
+''')
+output runtimeIdentityResourceId string = runtimeIdentity.outputs.resourceId
+
+@description('Client id of the shared runtime identity — `AZURE_CLIENT_ID` on every runtime consumer.')
+output runtimeIdentityClientId string = runtimeIdentity.outputs.clientId
+
+@description('''
+Object id of the shared runtime identity. What `sbapp_runtime` is mapped to, and the argument
+`postgres-entra.yml` asserts the live role against.
+''')
+output runtimeIdentityPrincipalId string = runtimeIdentity.outputs.principalId

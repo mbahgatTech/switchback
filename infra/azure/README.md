@@ -177,95 +177,22 @@ about $57/month for as long as it exists, against a subscription that is already
 with the spending limit `On`. And it restores into Azure and nowhere else, which is no help if the
 subscription is what failed.
 
-### The logical dump — the portable half
+### The portable half — there is not one
 
-`.github/workflows/backup-production-db.yml`, run on demand. It runs on a runner because this
-machine cannot reach 5432; the workflow header says why in full.
+Nothing in this repository takes a logical dump. A workflow did, and it was removed: it needed the
+`sbadmin` password to run, which the move to identity retires, and its verified archive landed in a
+GitHub Actions artifact — readable by every GitHub account, because this repository is public. Run
+31043403970 published a 371 MiB full dump for a day that way. `sessions.sessionToken` and the
+`accounts` `refresh_token`, `access_token` and `id_token` columns are stored in plaintext, so those
+credentials were treated as compromised and invalidated.
 
-It takes the census and the dump inside **one exported transaction snapshot**, restores the dump
-into a throwaway PostGIS container in the same run, runs `infra/backup/census.sql` against both,
-and fails unless the two are byte-identical. A dump nobody has restored is a hope, so the run
-either produces a verified archive or a red job — never an unexamined file.
-
-`infra/backup/rehearse-locally.sh` is the same comparison against a synthetic database in Docker,
-which is how `census.sql` is tested without touching production.
-
-**What comes out, and who can read it:**
-
-| Artifact                     | Contents                                     | Retention      | Readable by                                                        |
-| ---------------------------- | -------------------------------------------- | -------------- | ------------------------------------------------------------------ |
-| `switchback-production-dump` | `-Fc` archive of the whole database          | 3 days (input) | **withheld entirely unless the repository is private** — see below |
-| `switchback-backup-evidence` | census, diff, schema-only SQL, TOC, manifest | 30 days        | anyone who can read the repository, which today is everyone        |
-
-**An Actions artifact is readable by everyone who can read the repository.** On a public
-repository that is every GitHub account, not "every collaborator" — which is what this file and
-the workflow both used to say, while the repository was already public. What that mistake cost:
-run 31043403970 published a 371 MiB full dump for a day. `sessions.sessionToken` and the
-`accounts` `refresh_token`, `access_token` and `id_token` columns are stored in plaintext, so
-that archive was an account-takeover primitive for every account in it, not a privacy problem.
-It was deleted on 2026-08-05; the two session rows and the OAuth tokens it exposed should still
-be treated as compromised.
-
-The workflow no longer trusts a comment about visibility. It asks the API, and uploads the dump
-only on a `private == true` answer — a failed call, a deleted step or a renamed field all
-withhold it. The dump is still taken, restored and compared either way, so the verification runs
-on a public repository; only the durable copy is refused, and the run summary says so rather than
-skipping quietly.
-
-**A GitHub artifact is a proving ground, not a home.** It is unencrypted and its deletion leaves
-no audit trail. It is not encrypted on purpose: a passphrase minted by a workflow and kept only
-in a repository secret cannot be read back, which is exactly the failure this file already
-records for the admin password. A durable off-Azure copy belongs in a private container in a
-Storage account inside `rg-switchback-prod-northcentralus`, where the delete lock, a lifecycle
-rule and Azure's own access logs already apply. Nothing in this repository does that yet, so
-while the repository stays public there is no dump-based rollback — Azure's own point-in-time
-restore, which reaches back to the server's creation and deepens to 14 days on 2026-08-13, is
-the one that remains.
-
-The archive is **371 MiB**. The personal data in it is currently one account, one user row, two
-sessions and no recorded activities: 43,179 trails, 384,209 waypoints, 107,672 photo rows and
-33,709 ingest jobs are all derived from OpenStreetMap. That is a statement about today, not
-about the design — the retention is short, and the visibility gate exists, because of what this
-archive will hold once people use the product.
-
-### Restoring the dump
-
-Download the artifact, check it against `MANIFEST.txt`, then — into any server that has PostGIS
-available, which the archive needs and does not carry:
-
-```bash
-createdb --template=template0 --encoding=UTF8 --lc-collate=C.UTF-8 --lc-ctype=C.UTF-8 switchback
-psql -d switchback -c "ALTER DATABASE switchback SET default_text_search_config = 'pg_catalog.simple';"
-psql -d switchback -c 'CREATE ROLE sbadmin; CREATE ROLE sbapp;'   # where they do not already exist
-pg_restore -d switchback --exit-on-error switchback-prod-<timestamp>.dump
-```
-
-`--exit-on-error` is not optional. `pg_restore`'s default is to continue and print a count of
-ignored errors at the end, which is how a restore that dropped a whole section still looks like it
-worked.
-
-**Four things the archive does not carry**, each of which has to be supplied by hand:
-
-- **`default_text_search_config`.** Production sets it as an Azure _server_ parameter, so pg_dump
-  cannot see it. Left at the default of `pg_catalog.english`, future ingest tokenises differently
-  from the rows that arrived and search quietly stops finding trails.
-- **Role passwords.** Roles are named in the dump; their credentials are not, and never were.
-- **The SRID catalogue PostGIS ships.** `spatial_ref_sys` is registered with
-  `pg_extension_config_dump` under a filter several hundred ranges long, so only SRIDs added by
-  hand are in the dump — `CREATE EXTENSION postgis` supplies the rest. Restore into a database
-  without PostGIS and SRID 4326 is simply absent, which fails every `::geography` cast in the
-  product. This is why the verification asserts that the SRIDs the data _uses_ are present rather
-  than diffing the whole table: production runs PostGIS 3.6.1 and the rehearsal container 3.5, and
-  their shipped catalogues legitimately disagree.
-- **An override of a shipped SRID.** Editing 3857's definition in place puts it inside that filter,
-  so it would not be backed up. Nothing here does that; this is the note that would make it
-  noticeable if something ever did.
-
-One more thing pg_dump cannot carry, which is why the verification restores as `azuresu` rather
-than `sbadmin`: **ownership of a table an extension creates.** `spatial_ref_sys` belongs to
-whoever ran `CREATE EXTENSION postgis`, which on this server is Azure's internal superuser. A
-restore elsewhere will have it owned by whoever runs the restore, and nothing about the product
-depends on that.
+So the restore story is Azure's point-in-time restore and nothing else. That is a real gap and it
+has a shape worth stating plainly rather than arguing about: PITR reaches back only as far as the
+server's age, restores only into a **new** Azure Flexible Server at roughly $57/month, and is no
+help at all if the subscription is what failed. A durable off-Azure copy belongs in a private
+container in a Storage account inside `rg-switchback-prod-northcentralus`, where the delete lock,
+a lifecycle rule and Azure's own access logs already apply. An Actions artifact is a proving
+ground, not a home.
 
 ---
 
@@ -365,13 +292,21 @@ template requires passing the same value.
 | -------------------------------- | --------------------------- | -------------------------------- |
 | Owner (Entra user)               | the UPN                     | administer                       |
 | `id-switchback-postgres-ci`      | `id-switchback-postgres-ci` | administer, so `db push` can DDL |
+| `id-switchback-vercel-publisher` | `sbapp_runtime`             | exactly what `sbapp` may do      |
 | `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
-| `id-switchback-vercel-publisher` | `sbapp_vercel`              | exactly what `sbapp` may do      |
 
-The two application roles hold their privileges by membership in `sbapp` rather than by a copied
-list of grants, so they cannot drift from it — including for a table `prisma db push` creates
-tomorrow, which `sbapp`'s default privileges already cover. `infra/postgres-identity/` holds the
-SQL, and the `provision` action of the `Postgres identity` workflow applies and re-verifies it.
+`id-switchback-vercel-publisher` is the shared runtime identity: Vercel production, Vercel preview
+and — once `infra/azure/ingest.bicep` moves the worker onto it — the ingest worker all authenticate
+as this one principal. The resource name is narrower than the role because ARM cannot rename a
+user-assigned identity; the `component: runtime-identity` tag and the `sbapp_runtime` role name are
+where a reader is told what it actually is. `sbapp_func` is the worker's role until that move
+lands, and the `retire` action of the `Postgres identity` workflow drops it afterwards — it refuses
+to run while either legacy role is still serving a connection.
+
+The application role holds its privileges by membership in `sbapp` rather than by a copied list of
+grants, so it cannot drift from it — including for a table `prisma db push` creates tomorrow, which
+`sbapp`'s default privileges already cover. `infra/postgres-identity/` holds the SQL, and the
+`provision` action of the `Postgres identity` workflow applies and re-verifies it.
 
 ARM cannot create these: they are SQL objects behind `pgaadauth_create_principal_with_oid`, which
 runs in the database as an Entra administrator. A `Microsoft.Resources/deploymentScripts` resource
@@ -693,10 +628,10 @@ to `password`, so a deploy that does not set it behaves exactly as before.
 | `entra-vercel` | Vercel                  | the per-request OIDC token, exchanged for an access token  |
 
 Under either Entra value `DATABASE_URL` must carry **no password** and the username becomes the
-Entra-mapped role — `sbapp_func` or `sbapp_vercel`:
+Entra-mapped role — `sbapp_runtime` for both Vercel and the worker:
 
 ```
-postgresql://sbapp_func@<host>:5432/switchback?sslmode=verify-full
+postgresql://sbapp_runtime@<host>:5432/switchback?sslmode=verify-full
 ```
 
 A URL that still has a password in it is rejected at construction rather than quietly preferred, so
@@ -896,6 +831,52 @@ target checksum files byte identical.
 **Already done.** Kept because the same steps apply to any rebuild. Steps 1 and 3–8 ran; step 2 was
 dropped as incoherent and step 9 was deliberately not done — both are covered under
 [Rolling back](#rolling-back-to-neon) and [Rollback expiry](#rollback-expiry).
+
+### Taking the password out
+
+A separate cutover, not yet run, and its order is not negotiable — turning `passwordAuth` off while
+any consumer still needs one takes the site down, and the way back is an ARM write that itself
+authenticates against Entra.
+
+Two flags carry it, and each is a rollback rather than a one-way door. `DATABASE_AUTH` moves one
+consumer at a time and defaults to `password`, so a consumer that misbehaves is reverted by unsetting
+one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
+side and stays `true` until every consumer has been proved on a token.
+
+1. Deploy the shared identity, and — in `infra/azure/ingest.bicep` — move the Function App onto it:
+   `identity.type` to `SystemAssigned,UserAssigned`, `AZURE_CLIENT_ID` and
+   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`. Both phases keep
+   every grant the worker already has.
+2. Run `Postgres identity` → `provision`. It renames `sbapp_vercel` to `sbapp_runtime` and then
+   asserts the Entra mapping followed the rename. If the assertion fails, the inverse rename is the
+   rollback and nothing has been dropped.
+3. Set `DATABASE_AUTH=entra-vercel` on Vercel preview, then production, with password-free URLs
+   naming `sbapp_runtime`. Prove a signed-in read and a write — `session.findUnique` is the canary.
+4. Set `DATABASE_AUTH=entra` on the Function App and prove a tile ingests end to end.
+5. Drop the Function App's system-assigned identity, delete the two role assignments it leaves
+   behind — removing a `roleAssignment` from Bicep is not a revocation — and run `Postgres identity`
+   → `retire`.
+6. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect`, and the
+   owner connecting from their own machine with ProtonVPN disconnected. Not "it worked last week".
+7. Only now set `passwordAuthEnabled = false` and deploy.
+
+Two things to settle before step 7. The `migrate` job in `ci.yml` mints its own token and no longer
+reads `secrets.DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/` while
+passwords still work, so a failure is a red run rather than an outage. And `.env` on the owner's
+machine points at production — point it at the local Docker Postgres first, or every db script,
+`npm run dev` and the e2e suite stop working at step 7 with a connection error and no explanation.
+
+After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
+server refuses password authentication outright. Keep the role's password hash rather than clearing
+it — inert while `passwordAuth` is Disabled, and it makes re-enabling one ARM property flip instead
+of a flip plus a credential reset needing an administrator who may be the reason you are there.
+
+**Never deploy this resource group in Complete mode.** Incremental deployments leave undeclared
+children alone, so the `administrators` entries survive a run with an accidentally-empty
+`entraAdministrators`. Complete mode would remove both administrators in one operation, and with
+passwords off that is a total lockout with no way to grant anything back.
+
+### Cutting over from Neon
 
 Preconditions: verification green, and a low-traffic hour. Avoid 04:17 UTC —
 `apps/web/vercel.json` runs the ingest drain cron then.

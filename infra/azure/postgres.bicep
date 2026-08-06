@@ -35,6 +35,12 @@ param entraAuthEnabled bool
 param entraAdministrators entraAdministrator[]
 
 @description('''
+Whether the server accepts a password. See the parameter of the same name in main.bicep for the
+sequencing this must not be flipped ahead of.
+''')
+param passwordAuthEnabled bool = true
+
+@description('''
 Object id of a managed identity this deployment also creates, to be made an administrator.
 
 Separate from `entraAdministrators` rather than appended to it, and the reason is `what-if`.
@@ -258,10 +264,10 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     }
 
     authConfig: {
-      // Both, until every consumer has been moved. Turning `passwordAuth` off while anything
-      // still holds a connection string locks the database against its own application, and
-      // there is no way back in that does not involve a restore.
-      passwordAuth: 'Enabled'
+      // Both, until every consumer has been proved on a token. Turning `passwordAuth` off while
+      // anything still holds a connection string locks the database against its own application,
+      // and the way back is an ARM write that itself authenticates against Entra.
+      passwordAuth: passwordAuthEnabled ? 'Enabled' : 'Disabled'
       activeDirectoryAuth: entraAuthOn ? 'Enabled' : 'Disabled'
       tenantId: entraAuthOn ? subscription().tenantId : null
     }

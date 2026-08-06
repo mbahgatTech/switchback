@@ -2,17 +2,17 @@ import pg from 'pg';
 import { describe, expect, it } from 'vitest';
 import { createEntraPool } from '../src/entra-client';
 import { entraPoolConfig } from '../src/entra-pool';
-import { CONNECTION_LIFETIME_S, MAX_CHECKOUT_S, createTokenProvider } from '../src/entra-token';
+import { CONNECTION_LIFETIME_S, CONNECT_BUDGET_MS, createTokenProvider } from '../src/entra-token';
 import type { AccessToken } from '../src/entra-token';
 
 const URL_WITHOUT_PASSWORD =
-  'postgresql://sbapp_vercel@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full';
+  'postgresql://sbapp_runtime@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full';
 
 const sizing = { max: 7, connectionTimeoutMillis: 30_000 };
 const password = () => Promise.resolve('a-token');
 
 describe('entraPoolConfig', () => {
-  it('bounds connection lifetime, which is what the renewal margin is derived from', () => {
+  it('bounds connection lifetime, which is what caps the revocation window', () => {
     expect(entraPoolConfig(URL_WITHOUT_PASSWORD, { ...sizing, password }).maxLifetimeSeconds).toBe(
       CONNECTION_LIFETIME_S,
     );
@@ -27,7 +27,7 @@ describe('entraPoolConfig', () => {
   it('splits the URL into discrete fields rather than passing it through', () => {
     const config = entraPoolConfig(URL_WITHOUT_PASSWORD, { ...sizing, password });
     expect(config.connectionString).toBeUndefined();
-    expect(config.user).toBe('sbapp_vercel');
+    expect(config.user).toBe('sbapp_runtime');
     expect(config.database).toBe('switchback');
     expect(config.port).toBe(5432);
     expect(config.host).toBe('psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com');
@@ -84,18 +84,27 @@ describe('the pool the client is actually built from', () => {
 
 describe('the pool and the token cache together', () => {
   /**
-   * Binds the two halves: whatever lifetime the pool is configured with, plus the longest a
-   * checkout may hold a connection, must fit inside the life left on the least-fresh token the
-   * cache will hand out. Sampling the cache rather than restating its arithmetic.
+   * Binds the two halves at the seam that actually exists. A session outlives its own token —
+   * measured, run 31062754668 — so the pool's lifetime bound is not protecting the token, and
+   * what the token cache owes the pool is narrower: every connection the pool opens must get a
+   * token with more life left than the connection attempt is allowed to take.
    */
-  it('cannot let a connection outlive the token that opened it', async () => {
+  it('serves every connection a token that outlasts the connect timeout', async () => {
     const pool = createEntraPool(URL_WITHOUT_PASSWORD, sizing, 'entra');
     const configuredLifetimeS = pool.options.maxLifetimeSeconds;
+    const connectTimeoutMs = pool.options.connectionTimeoutMillis;
     await pool.end();
-    // Without this the arithmetic below goes to NaN, and `toBeGreaterThanOrEqual(NaN)` passes
-    // — an unbounded pool would satisfy the invariant it is supposed to violate.
-    expect(typeof configuredLifetimeS).toBe('number');
-    expect(configuredLifetimeS).toBeGreaterThan(0);
+    // Thrown rather than expected: a `toBeGreaterThanOrEqual(undefined)` below would not fail,
+    // and an unbounded pool would satisfy the invariant it is supposed to violate.
+    if (typeof configuredLifetimeS !== 'number' || configuredLifetimeS <= 0) {
+      throw new Error(`the pool reports no connection lifetime: ${String(configuredLifetimeS)}`);
+    }
+    if (typeof connectTimeoutMs !== 'number') {
+      throw new Error(`the pool reports no connect timeout: ${String(connectTimeoutMs)}`);
+    }
+    // The margin the provider renews on is derived from this number, so they have to be the
+    // same number rather than two that happen to agree.
+    expect(connectTimeoutMs).toBe(CONNECT_BUDGET_MS);
 
     let t = 1_700_000_000_000;
     const clock = { now: () => t };
@@ -117,6 +126,6 @@ describe('the pool and the token cache together', () => {
       t += 60_000;
     }
 
-    expect(worstRemainingMs).toBeGreaterThanOrEqual((configuredLifetimeS + MAX_CHECKOUT_S) * 1_000);
+    expect(worstRemainingMs).toBeGreaterThanOrEqual(connectTimeoutMs);
   });
 });

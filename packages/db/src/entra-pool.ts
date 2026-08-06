@@ -49,9 +49,11 @@ export function entraPoolConfig(databaseUrl: string, options: EntraPoolOptions):
     password: options.password,
     max: options.max,
     connectionTimeoutMillis: options.connectionTimeoutMillis,
-    // The invariant `RENEW_MARGIN_MS` is derived from. Without it `pg-pool` leaves a physical
-    // connection alive until it errors or idles out, so it can outlive the token that opened
-    // it by any amount and the margin protects a quantity nothing enforces.
+    // Bounds how long a connection authenticated by a since-revoked identity keeps serving.
+    // A session survives its own token's expiry — measured, run 31062754668 — so nothing
+    // retires it on credential grounds and revocation would otherwise take effect only at the
+    // next cold start. With the firewall spanning the whole IPv4 internet, identity is the
+    // only boundary here, which makes that window a security parameter rather than a nicety.
     maxLifetimeSeconds: CONNECTION_LIFETIME_S,
   };
 }

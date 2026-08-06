@@ -227,6 +227,30 @@ param entraAuthEnabled = true
 // here while this migration was proved from one; it is not any more.
 param ciIdentityBranches = ['master']
 
+// One identity for every runtime client — Vercel production, Vercel preview and the ingest
+// worker. The name is the deployed one and is now narrower than the role: ARM cannot rename a
+// user-assigned identity, so renaming it here would create a second one and leave the first
+// holding every live grant. runtime-identity.bicep carries the accurate description.
+param runtimeIdentityName = 'id-switchback-vercel-publisher'
+
+// Both halves of every federated-credential subject. Entra matches the subject as an exact
+// string, so renaming the Vercel team or the project silently stops the exchange working.
+param vercelTeamSlug = 'mbahgattechs-projects'
+param vercelProjectName = 'switchback'
+
+// The queue the ingest worker receives from. Named here so the shared identity's Data Receiver
+// grant is declared — the one grant it does not already hold, and the one whose absence stops
+// the worker draining with no error anyone sees. ingest.bicep declares the namespace, the queue
+// and the publisher's Data Sender grant.
+param serviceBusNamespaceName = 'sb-switchback-prod-37ywppu5p7fri'
+param serviceBusQueueName = 'ingest-jobs'
+
+// Passwords stay on. Flipping this to `false` is the cutover, and it is gated on every consumer
+// having been proved on a token *and* both administrator doors re-proved in the same hour — see
+// infra/azure/README.md. It is a separate, reviewable deployment on purpose: the way back from a
+// wrong flip is an ARM write that itself needs Entra to be working.
+param passwordAuthEnabled = true
+
 // The owner is here as break-glass: a human who can reach the database with a token and no
 // password at all, which is what stops "the admin password is not recorded anywhere" from
 // being an outage a second time. The Entra-mapped roles the *applications* use are not

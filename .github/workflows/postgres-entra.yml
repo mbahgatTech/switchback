@@ -1,20 +1,15 @@
-# The hands that reach production Postgres, because the workstation cannot.
+# Operational tooling, not a pipeline: the only hands that reach production Postgres holding
+# no credential.
 #
 # A VPN adapter on the machine this repository is developed on holds the default route and
-# kills the TLS handshake to 5432 before the server sees it. Every data-plane step of the move
-# to Microsoft Entra authentication — reading what `sbapp` may do, creating the Entra-mapped
-# roles — therefore runs here.
+# kills the TLS handshake to 5432 before the server sees it — TCP connects, the 8-byte
+# SSLRequest gets no reply, the socket resets. So every data-plane act against production runs
+# here, and `inspect` is the break-glass `infra/azure/README.md` sends an on-call operator to.
+# Once `passwordAuth` is Disabled it is the only proven way in, which is why it stays.
 #
-# Three actions, and what separates them is which credential each needs. `inspect` authenticates
-# with a federated token and no password, and is the break-glass path the runbook points at: it
-# is the one to run when the admin credential is unavailable or suspect. `provision` uses the
-# same token and writes the roles. `survey` needs the stored password, and exists only to
-# describe the two repository secrets — which is a thing no token can do.
-#
-# Whether an established session survives its token expiring is answered by
-# `token-expiry-probe.yml`, not here. A soak job did live here and could not answer it: it
-# authenticated as a managed identity, whose token Azure gives a 24-hour life, and a runner is
-# capped at six hours, so it could never reach the boundary however long it held.
+# Neither action reads a stored password. `azure/login` exchanges the runner's OIDC token for
+# an Azure access token against the federated credential on `id-switchback-postgres-ci`, an
+# ARM-declared Entra administrator of the server, and that token is handed to libpq.
 name: Postgres identity
 
 on:
@@ -23,12 +18,12 @@ on:
       action:
         description: 'What to run'
         required: true
-        default: survey
+        default: inspect
         type: choice
         options:
-          - survey
           - inspect
           - provision
+          - retire
 
 permissions:
   contents: read
@@ -47,200 +42,22 @@ env:
   PGUSER: id-switchback-postgres-ci
   AZURE_CLIENT_ID: 81c76484-bea1-4a75-8e86-2ccb3093e753
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
-  # Object ids of the two application identities. Not secrets — they are in the Bicep outputs
-  # and the portal — and they are what the database roles are matched against.
+  # Object id of the shared runtime identity — `id-switchback-vercel-publisher`, which now
+  # serves Vercel and the Function App alike. Not a secret; it is a Bicep output and is in the
+  # portal, and it is what the database role is matched against.
   #
-  # Literals rather than read from `az` at run time, deliberately: `id-switchback-postgres-ci`
+  # A literal rather than read from `az` at run time, deliberately: `id-switchback-postgres-ci`
   # holds **zero** Azure RBAC, which is the property that makes a leak of it unable to touch
-  # the resource group, and `az functionapp identity show` would require granting it Reader.
-  # A stale literal is caught where it matters instead — `roles.sql` asserts the live role maps
-  # to exactly this object id, so an identity that has been recreated fails the job rather than
+  # the resource group, and `az identity show` would require granting it Reader. A stale
+  # literal is caught where it matters instead — `roles.sql` asserts the live role maps to
+  # exactly this object id, so an identity that has been recreated fails the job rather than
   # passing with a role that matches nothing.
-  FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
-  VERCEL_OID: c9bfba39-4191-4695-996d-a588b7154e58
+  RUNTIME_OID: c9bfba39-4191-4695-996d-a588b7154e58
 
 # Concurrency is per job rather than per workflow. A one-line fix to `inspect` should not wait
 # out a `provision` that is mid-way through applying roles, and neither should block the other.
 
 jobs:
-  survey:
-    name: survey
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'survey'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    concurrency:
-      group: postgres-entra-survey
-      cancel-in-progress: false
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # ubuntu-latest ships the PostgreSQL 16 client and production runs 17. psql itself is
-      # tolerant of the skew, but the rest of this migration is not, and installing the
-      # matching client once here keeps every step on one version.
-      - name: Install the PostgreSQL 17 client
-        run: |
-          set -euo pipefail
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client-17
-          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
-
-      # The two repository secrets are connection strings with a password in them. This step
-      # is the only description of them anyone can get without being able to read them: it
-      # prints every part except the password, and the password length rather than the
-      # password. Rotating the admin credential means rewriting these secrets by hand, and
-      # doing that blind is how a working deploy pipeline gets broken.
-      - name: Describe the repository secrets without printing them
-        env:
-          POOLED_URL: ${{ secrets.DATABASE_URL }}
-          DIRECT_URL: ${{ secrets.DIRECT_DATABASE_URL }}
-        run: |
-          node - <<'JS'
-          const fs = require('node:fs');
-          const path = require('node:path');
-
-          function describe(label, raw) {
-            if (!raw) {
-              console.log(`${label}: not set`);
-              return null;
-            }
-            let url;
-            try {
-              url = new URL(raw);
-            } catch {
-              console.log(`${label}: set, but does not parse as a URL`);
-              return null;
-            }
-            const password = decodeURIComponent(url.password);
-            if (password) console.log(`::add-mask::${password}`);
-            // `new URL` strips trailing whitespace, so a secret written with a stray newline
-            // parses cleanly here and then reaches Prisma — which reads the raw string — as
-            // `sslmode=verify-full\n`. Setting these secrets from a pipe rather than a file
-            // is the usual way to acquire one.
-            if (raw !== raw.trim()) {
-              console.error(`::error::${label} has leading or trailing whitespace.`);
-              process.exitCode = 1;
-            }
-            const query = [...url.searchParams.entries()]
-              .map(([k, v]) => `${k}=${v}`)
-              .join('&');
-            console.log(
-              `${label}: ${url.protocol}//${decodeURIComponent(url.username)}:<${password.length} chars>` +
-                `@${url.hostname}:${url.port || '5432'}${url.pathname}?${query}`,
-            );
-            return url;
-          }
-
-          describe('DATABASE_URL', process.env.POOLED_URL);
-          const direct = describe('DIRECT_DATABASE_URL', process.env.DIRECT_URL);
-          if (!direct) {
-            console.error('::error::DIRECT_DATABASE_URL is unusable; the rest of this job needs it.');
-            process.exit(1);
-          }
-
-          const host = direct.hostname;
-          if (!host.endsWith('.postgres.database.azure.com')) {
-            console.error(`::error::${host} is not an Azure Flexible Server.`);
-            process.exit(1);
-          }
-
-          // The password reaches a 0600 passfile under the runner temp directory and nothing
-          // else — not argv, not $GITHUB_ENV, not a log line.
-          const port = direct.port || '5432';
-          const user = decodeURIComponent(direct.username);
-          const passfile = path.join(process.env.RUNNER_TEMP, 'pgpass');
-          fs.writeFileSync(
-            passfile,
-            `${host}:${port}:*:${user}:${decodeURIComponent(direct.password)}\n`,
-            { mode: 0o600 },
-          );
-
-          fs.appendFileSync(
-            process.env.GITHUB_ENV,
-            [
-              `PGHOST=${host}`,
-              `PGPORT=${port}`,
-              `PGUSER=${user}`,
-              `PGDATABASE=${decodeURIComponent(direct.pathname.replace(/^\//, ''))}`,
-              `PGPASSFILE=${passfile}`,
-              'PGSSLMODE=verify-full',
-              'PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt',
-            ].join('\n') + '\n',
-          );
-          JS
-
-      - name: Who am I, and over what
-        run: |
-          set -euo pipefail
-          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
-          SELECT 'current_user|' || current_user;
-          SELECT 'session_user|' || session_user;
-          SELECT 'database|' || current_database();
-          SELECT 'server_version|' || current_setting('server_version');
-          SELECT 'ssl|' || ssl::text || '|' || coalesce(version, '-') || '|' || coalesce(cipher, '-')
-            FROM pg_stat_ssl WHERE pid = pg_backend_pid();
-          SELECT 'pgaadauth_installed|' || (count(*) > 0)::text
-            FROM pg_extension WHERE extname = 'pgaadauth';
-          SQL
-
-      # The specification the Entra-mapped roles have to match. Everything `sbapp` may do, in
-      # a form that can be diffed against the same query run after the new roles exist: role
-      # attributes, memberships, schema and table and sequence privileges, and the default
-      # privileges that decide what it gets on a table `prisma db push` creates tomorrow.
-      - name: Exactly what sbapp may do
-        run: |
-          set -euo pipefail
-          psql -X -tAq -v ON_ERROR_STOP=1 <<'SQL'
-          SELECT 'role|' || rolname || '|super=' || rolsuper::text || '|createdb=' || rolcreatedb::text
-                 || '|createrole=' || rolcreaterole::text || '|login=' || rolcanlogin::text
-                 || '|inherit=' || rolinherit::text || '|repl=' || rolreplication::text
-                 || '|bypassrls=' || rolbypassrls::text
-            FROM pg_roles
-           WHERE rolname NOT LIKE 'pg\_%'
-           ORDER BY rolname;
-
-          SELECT 'member|' || r.rolname || '|of|' || g.rolname || '|admin=' || m.admin_option::text
-            FROM pg_auth_members m
-            JOIN pg_roles r ON r.oid = m.member
-            JOIN pg_roles g ON g.oid = m.roleid
-           WHERE r.rolname NOT LIKE 'pg\_%'
-           ORDER BY r.rolname, g.rolname;
-
-          SELECT 'schema|' || n.nspname || '|' || coalesce(array_to_string(n.nspacl, ','), '-')
-            FROM pg_namespace n
-           WHERE n.nspname IN ('public', 'topology')
-           ORDER BY n.nspname;
-
-          -- Collapsed to the distinct ACL shapes rather than one line per table: 20-odd
-          -- tables carrying the same grant is one fact, and printing it 20 times hides the
-          -- one table that differs.
-          SELECT 'tblacl|' || coalesce(array_to_string(c.relacl, ','), '-') || '|tables=' || count(*)::text
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE n.nspname = 'public' AND c.relkind = 'r'
-           GROUP BY c.relacl
-           ORDER BY 1;
-
-          SELECT 'seqacl|' || coalesce(array_to_string(c.relacl, ','), '-') || '|sequences=' || count(*)::text
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-           WHERE n.nspname = 'public' AND c.relkind = 'S'
-           GROUP BY c.relacl
-           ORDER BY 1;
-
-          SELECT 'defacl|' || pg_get_userbyid(d.defaclrole) || '|' || d.defaclobjtype::text || '|'
-                 || coalesce(array_to_string(d.defaclacl, ','), '-')
-            FROM pg_default_acl d
-           ORDER BY 1;
-
-          SELECT 'dbacl|' || datname || '|' || coalesce(array_to_string(datacl, ','), '-')
-            FROM pg_database WHERE datname = current_database();
-          SQL
-
   # ---------------------------------------------------------------------------------------
   # The break-glass path, and the only read-only one that needs no password.
   #
@@ -384,7 +201,7 @@ jobs:
         run: |
           set -euo pipefail
           psql -X -tAq -v ON_ERROR_STOP=1 -d postgres \
-            -v func_oid="$FUNC_OID" -v vercel_oid="$VERCEL_OID" \
+            -v runtime_oid="$RUNTIME_OID" \
             -f infra/postgres-identity/roles.sql
           psql -X -tAq -v ON_ERROR_STOP=1 -f infra/postgres-identity/grants.sql
           echo "roles.sql and grants.sql applied"
@@ -403,7 +220,7 @@ jobs:
           SELECT 'attrs|' || rolname || '|super=' || rolsuper::text || '|createdb=' || rolcreatedb::text
                  || '|createrole=' || rolcreaterole::text || '|bypassrls=' || rolbypassrls::text
                  || '|login=' || rolcanlogin::text
-            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
+            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_runtime') ORDER BY rolname;
 
           -- Authority must be inherited, never granted directly. Any row is a direct grant on
           -- a table in public to one of the new roles, which is authority sbapp cannot revoke
@@ -411,7 +228,7 @@ jobs:
           SELECT 'DIRECT_GRANT|' || r.role || '|' || c.relname || '|' || a.privilege_type
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
+           CROSS JOIN (VALUES ('sbapp_runtime')) AS r(role)
            CROSS JOIN LATERAL aclexplode(c.relacl) AS a
            WHERE n.nspname = 'public' AND c.relkind = 'r'
              AND pg_get_userbyid(a.grantee) = r.role;
@@ -421,7 +238,7 @@ jobs:
             FROM pg_auth_members m
             JOIN pg_roles r ON r.oid = m.member
             JOIN pg_roles g ON g.oid = m.roleid
-           WHERE r.rolname IN ('sbapp_func', 'sbapp_vercel') AND g.rolname <> 'sbapp';
+           WHERE r.rolname IN ('sbapp_runtime') AND g.rolname <> 'sbapp';
 
           -- The control. sbadmin genuinely differs from sbapp, so this must return rows; if it
           -- returns none the comparison above is broken and its silence means nothing.
@@ -436,7 +253,7 @@ jobs:
 
           SELECT 'create_on_public|' || rolname || '|'
                  || has_schema_privilege(rolname, 'public', 'CREATE')::text
-            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_func', 'sbapp_vercel') ORDER BY rolname;
+            FROM pg_roles WHERE rolname IN ('sbapp', 'sbapp_runtime') ORDER BY rolname;
           SQL
 
       - name: Fail if any of those assertions returned a finding
@@ -446,7 +263,7 @@ jobs:
           SELECT 'DIRECT_GRANT|' || r.role || '|' || c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-           CROSS JOIN (VALUES ('sbapp_func'), ('sbapp_vercel')) AS r(role)
+           CROSS JOIN (VALUES ('sbapp_runtime')) AS r(role)
            CROSS JOIN LATERAL aclexplode(c.relacl) AS a
            WHERE n.nspname = 'public' AND c.relkind = 'r'
              AND pg_get_userbyid(a.grantee) = r.role
@@ -455,7 +272,7 @@ jobs:
             FROM pg_auth_members m
             JOIN pg_roles r ON r.oid = m.member
             JOIN pg_roles g ON g.oid = m.roleid
-           WHERE r.rolname IN ('sbapp_func', 'sbapp_vercel') AND g.rolname <> 'sbapp'
+           WHERE r.rolname IN ('sbapp_runtime') AND g.rolname <> 'sbapp'
           UNION ALL
           -- The privilege control, on the same seven privileges the step above prints. On four
           -- it is vacuous against the real database: production ACLs are sbadmin=arwdDxtm and
@@ -500,8 +317,7 @@ jobs:
           SQL
 
       # A privilege check that reads well is not the same as a privilege that is enforced.
-      # This asks the server, as each role, and expects to be refused by both — the previous
-      # version probed only `sbapp_func`, so `sbapp_vercel` was asserted and never tested.
+      # This asks the server, as the role, and expects to be refused.
       #
       # `SET ROLE` is confirmed to have taken effect first. Without that, a `SET ROLE` that was
       # itself refused would leave "permission denied" in the error file, the CREATE would
@@ -509,7 +325,7 @@ jobs:
       - name: Refuse DDL, out loud
         run: |
           set -euo pipefail
-          for role in sbapp_func sbapp_vercel; do
+          for role in sbapp_runtime; do
             became="$(psql -X -tAq -v ON_ERROR_STOP=1 -c "SET ROLE $role" -c 'SELECT current_user')"
             if [ "$became" != "$role" ]; then
               echo "::error::SET ROLE $role did not take effect; current_user was '$became'."
@@ -526,3 +342,73 @@ jobs:
               || { echo "::error::CREATE TABLE as $role failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
             sed "s/^/refused ($role): /" "$RUNNER_TEMP/ddl.err"
           done
+
+  # ---------------------------------------------------------------------------------------
+  # The one destructive action, and the last step of the consolidation rather than part of it.
+  #
+  # `sbapp_func` is the ingest worker's only credential-free door until the worker runs as the
+  # shared identity, so this runs after that move is proved and not before. The SQL refuses to
+  # proceed while either legacy role is still serving a connection, which is what "proved"
+  # means here in a form the job can check for itself.
+  # ---------------------------------------------------------------------------------------
+  retire:
+    name: drop the roles the shared identity replaced
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'retire'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Shares `provision`'s group: both write roles, and interleaving them would let a retire
+    # land between a provision's rename and its assertion.
+    concurrency:
+      group: postgres-entra-provision
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Mint a database access token
+        run: |
+          set -euo pipefail
+          token="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
+          echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
+
+      - name: Drop them
+        run: |
+          set -euo pipefail
+          psql -X -tAq -v ON_ERROR_STOP=1 -f infra/postgres-identity/retire-legacy-roles.sql
+
+      # The drop is not the assertion. `pgaadauth_list_principals` is what Azure matches a token
+      # against, so a role that survived this would still be a live credential-free door.
+      - name: Prove no legacy role is still Entra-mapped
+        run: |
+          set -euo pipefail
+          left="$(psql -X -tAq -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          SELECT p.rolname FROM pg_catalog.pgaadauth_list_principals(false) p
+           WHERE p.rolname IN ('sbapp_func', 'sbapp_vercel', 'sb-token-expiry-probe');
+          SQL
+          )"
+          if [ -n "$left" ]; then
+            echo "::error::still Entra-mapped after the drop:"
+            printf '%s\n' "$left"
+            exit 1
+          fi
+          echo "no legacy Entra-mapped role remains"

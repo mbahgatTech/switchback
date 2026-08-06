@@ -1,0 +1,141 @@
+# Deploying infrastructure, with the change list shown before anything is written.
+#
+# Everything in `infra/azure/` is Bicep and none of it had a pipeline: the resource group, the
+# server, the alerts and the identities were all deployed from a workstation. This is the
+# pipeline, and it is deliberately narrower than "deploy all the infrastructure".
+#
+# **It deploys the templates that carry no secret.** `runtime-identity.bicep` is one; `main.bicep`
+# is not, because `administratorLoginPassword` is a required `@secure()` parameter that ARM
+# rewrites on every deployment, so deploying it from CI means keeping the production database
+# password in a public repository's secret store and rotating the live credential on any run that
+# gets it wrong. `main.bicep` joins this workflow when `passwordAuthEnabled` is false and the
+# parameter is no longer needed — which is one of the concrete things the cutover buys.
+#
+# **What-if runs on every push that touches the templates**, so a change list is attached to the
+# pull request that proposes it rather than produced at the moment of applying. Applying is a
+# separate deliberate act: a dispatch with `apply: true`, behind the `production` environment.
+#
+# **`--mode Incremental`, stated rather than defaulted.** Complete mode deletes what the template
+# stops declaring, and the `administrators` children of the Postgres server are declared from a
+# parameter that can be empty. A Complete-mode run with an empty `entraAdministrators` would
+# remove both Entra administrators in one operation, and with `passwordAuth` Disabled that is a
+# total lockout with no way to grant anything back.
+name: Infrastructure
+
+on:
+  push:
+    branches: [master]
+    paths: ['infra/azure/**']
+  pull_request:
+    paths: ['infra/azure/**']
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Write the changes, rather than only previewing them'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-switchback-prod-northcentralus
+  AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
+  TAGS: '{"app":"switchback","env":"production","managedBy":"bicep","repo":"mbahgatTech/switchback","sourcePath":"infra/azure","costCenter":"vs-enterprise-monthly-credit","dataClassification":"user-content","rollback":"neon-us-east-1-retained"}'
+
+jobs:
+  # Compiling every template is the half of this that needs no credential at all, so it runs on
+  # every pull request including ones from forks, where the OIDC exchange below is unavailable.
+  build:
+    name: compile the templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: az bicep build, every template
+        run: |
+          set -euo pipefail
+          failed=0
+          for f in infra/azure/*.bicep; do
+            if az bicep build --file "$f" --outfile /dev/null; then
+              echo "ok    $f"
+            else
+              echo "::error file=$f::did not compile"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  preview:
+    name: what-if
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Applying gets a reviewable environment; previewing does not need one. The condition is on
+    # the step below rather than the job so the change list is produced either way.
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.apply) && 'production' || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The identity this runs as needs Contributor on the resource group, which is more than
+      # `id-switchback-postgres-ci` has by design — that one holds no Azure RBAC at all so a leak
+      # of it cannot touch the resource group. So this is a *different* principal, and it does not
+      # exist yet: set the `AZURE_INFRA_CLIENT_ID` repository variable to a user-assigned identity
+      # with a federated credential for this repository's `master` ref. Granting a public
+      # repository's workflows Contributor on production is a decision worth making on purpose,
+      # which is why this fails with instructions rather than defaulting to something.
+      - name: Refuse to guess which identity to assume
+        run: |
+          set -euo pipefail
+          if [ -z "${{ vars.AZURE_INFRA_CLIENT_ID }}" ]; then
+            echo "::error::AZURE_INFRA_CLIENT_ID is not set. This workflow needs a user-assigned"
+            echo "::error::identity with Contributor on $RESOURCE_GROUP and a federated credential"
+            echo "::error::trusting this repository's master ref. See infra/azure/README.md."
+            exit 1
+          fi
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_INFRA_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What would change
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --mode Incremental \
+            --name switchback-runtime-identity \
+            --template-file infra/azure/runtime-identity.bicep \
+            --parameters location=northcentralus \
+                         identityName=id-switchback-vercel-publisher \
+                         vercelTeamSlug=mbahgattechs-projects \
+                         vercelProjectName=switchback \
+                         serviceBusNamespaceName=sb-switchback-prod-37ywppu5p7fri \
+                         serviceBusQueueName=ingest-jobs \
+                         tags="$TAGS"
+
+      - name: Write it
+        if: github.event_name == 'workflow_dispatch' && inputs.apply
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --mode Incremental \
+            --name switchback-runtime-identity \
+            --template-file infra/azure/runtime-identity.bicep \
+            --parameters location=northcentralus \
+                         identityName=id-switchback-vercel-publisher \
+                         vercelTeamSlug=mbahgattechs-projects \
+                         vercelProjectName=switchback \
+                         serviceBusNamespaceName=sb-switchback-prod-37ywppu5p7fri \
+                         serviceBusQueueName=ingest-jobs \
+                         tags="$TAGS" \
+            --query 'properties.provisioningState' -o tsv

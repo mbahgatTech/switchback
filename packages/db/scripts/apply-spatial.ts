@@ -46,6 +46,10 @@ function splitStatements(sql: string): string[] {
 async function main(): Promise<void> {
   const sql = await readFile(SQL_PATH, 'utf8');
   const statements = splitStatements(sql);
+  // Its own client, not the shared one, and so unaffected by `DATABASE_AUTH`. This runs beside
+  // `prisma db push` in CI, and the Prisma CLI has no driver-adapter seam either — both read a
+  // connection *string*. Under identity authentication the caller puts a freshly minted token in
+  // the password field of `DATABASE_URL`; see the `migrate` job in `.github/workflows/ci.yml`.
   const prisma = new PrismaClient();
 
   try {

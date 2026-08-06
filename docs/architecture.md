@@ -220,9 +220,10 @@ graph LR
     READER[Signed-in reader]
   end
   subgraph Machines
-    VERCEL[Vercel functions<br/>id-switchback-vercel-publisher]
+    VERCEL[Vercel functions<br/>production and preview]
     FUNC[Function App<br/>system-assigned identity]
-    GHA[GitHub Actions<br/>ci.yml, backup-production-db.yml]
+    RUNTIME[id-switchback-vercel-publisher<br/>shared runtime identity]
+    GHA[GitHub Actions<br/>ci.yml deploy]
     CI[GitHub Actions<br/>id-switchback-postgres-ci]
     SP[Deploying service principal]
   end
@@ -232,42 +233,51 @@ graph LR
     RG[Resource group<br/>rg-switchback-prod-northcentralus]
   end
 
-  VERCEL -->|Data Sender| SB
+  VERCEL -->|FIC, both environments| RUNTIME
+  FUNC -.->|not yet: needs AZURE_CLIENT_ID| RUNTIME
+  RUNTIME -->|Data Sender, Data Receiver| SB
   FUNC -->|Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
-  GHA -.->|sbadmin password, full DDL<br/>secrets.DIRECT_DATABASE_URL| PG
-  VERCEL -->|sbapp_vercel<br/>role created, not yet used| PG
-  FUNC -->|sbapp_func<br/>role created, not yet used| PG
-  CI -->|Entra administrator<br/>proven, not yet consumed| PG
+  RUNTIME -->|sbapp_runtime<br/>role mapped, not yet used| PG
+  FUNC -->|sbapp_func<br/>retired once the worker moves| PG
+  CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
   SP -->|Contributor| RG
   READER -->|session cookie| VERCEL
 ```
 
-Read the two GitHub Actions boxes together, because the difference between them is the whole
-point of this work. `id-switchback-postgres-ci` is an identity that reaches the database with no
-password and is a working Entra administrator — but **nothing consumes it yet**. The schema push
-in `.github/workflows/ci.yml` and the dump in `.github/workflows/backup-production-db.yml` both
-still authenticate with `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` and can create and drop
-anything. That is the largest remaining credential in the system and it is a repository secret, so
-its blast radius is everyone with write access to this repository.
+**One identity for every runtime client.** `id-switchback-vercel-publisher` is what Vercel
+production, Vercel preview and the ingest worker all authenticate as — one principal, one Postgres
+role, one grant set. Its two federated credentials distinguish the Vercel environments to Entra and
+to nothing else: the access token carries the identity's object id, so Postgres, Azure RBAC and
+every policy downstream see one caller. Preview writing production is carried forward rather than
+created by this — preview already holds `DATABASE_URL` pointing at the production server — but the
+consolidation does remove the ability to revoke one consumer without the others. The two roles it
+replaces held identical privileges, so nothing that was ever differentiated is lost; what is lost is
+attribution, and `application_name` is what restores it. Attribution, not a boundary: any client can
+set it to anything.
 
-The two unused solid edges are drawn from the object ids on both ends rather than from the names,
-because a role mapped to the wrong principal fails only at first use. `sbapp_func` carries
-`3db30cfd-…`, which is `func-switchback-ingest-37ywppu5p7fri`'s system-assigned identity;
-`sbapp_vercel` carries `c9bfba39-…`, which is `id-switchback-vercel-publisher`, the same identity
-Service Bus already trusts.
+The dashed edges are what is left. Both consumers still authenticate to Postgres by password, and
+`DATABASE_AUTH` is set nowhere, so no Entra-authenticated query has run against production. The
+Function App still has its own system-assigned identity and its own `sbapp_func` role; moving it
+onto the shared identity is a change to `infra/azure/ingest.bicep`, which declares the worker.
 
-Two things the diagram is meant to make obvious. The deploying service principal holds
-Contributor and therefore cannot reach the database at all — it writes ARM, not rows. And the CI
-identity holds **no Azure RBAC whatsoever**: its entire authority is the Postgres administrator
-grant, so a leak of it cannot touch the resource group, the queue or the billing.
+The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
+because a role mapped to the wrong principal fails only at first use. `sbapp_runtime` carries
+`c9bfba39-…`, which is `id-switchback-vercel-publisher`; `sbapp_func` carries `3db30cfd-…`, which is
+`func-switchback-ingest-37ywppu5p7fri`'s system-assigned identity. `infra/postgres-identity/roles.sql`
+asserts the first of those against the live catalog rather than assuming it.
+
+Two things the diagram is meant to make obvious. The deploying service principal holds Contributor
+and therefore cannot reach the database at all — it writes ARM, not rows. And the CI identity holds
+**no Azure RBAC whatsoever**: its entire authority is the Postgres administrator grant, so a leak of
+it cannot touch the resource group, the queue or the billing.
 
 `disableLocalAuth: true` on the Service Bus namespace and zero queue SAS rules are what make the
-two Service Bus edges solid rather than dashed. Postgres still has `passwordAuth: Enabled`
-because the two dashed edges are real; see _What is left_ below.
+Service Bus edges solid. Postgres still has `passwordAuth: Enabled` because the two dashed edges are
+real; see _What is left_ below.
 
 ### The federated exchange
 
@@ -342,32 +352,44 @@ measured and runs under `npm test`, so a driver upgrade that breaks any of them 
   connection produced none. `PrismaPg`'s constructor at 6.19.3 is
   `constructor(poolOrConfig: pg.Pool | pg.PoolConfig, options?)`, so the pool carrying that
   callback can be handed to Prisma directly.
-- **Retire connections, and budget for the checkout that outlives the timer.**
-  `maxLifetimeSeconds` does **not** evict a connection that is currently checked out: pg-pool's
-  timer moves the client to `_expired` and can only act in `release()`. Measured on the same
-  harness — a connection held for 2.5× its lifetime stayed open and was replaced only after it
-  was released. So a connection's real ceiling is `CONNECTION_LIFETIME_S` (20 min) plus one
-  `MAX_CHECKOUT_S` (10 min, the Functions Consumption ceiling, above Vercel's 60s route cap and
-  the 30s trail transaction).
-- **Renew far enough ahead to cover both.** `RENEW_MARGIN_MS` is derived rather than chosen:
-  `(CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000 + CLOCK_SKEW_MS`, 35 minutes. A flat five
-  minutes against a thirty-minute connection — what this file previously described — let a
-  connection run up to 25 minutes on an expired token, which negated the whole reason for
-  retiring connections at all. `packages/db/test/entra-token.test.ts` asserts the invariant
-  behaviourally, by sampling the life left on every token handed out across a simulated day,
-  rather than comparing two constants.
+- **Retire connections on a revocation budget, not a credential one.** `maxLifetimeSeconds` does
+  **not** evict a connection that is currently checked out: pg-pool's timer moves the client to
+  `_expired` and can only act in `release()`. Measured on the same harness — a connection held for
+  2.5× its lifetime stayed open and was replaced only after it was released. `CONNECTION_LIFETIME_S`
+  is 20 minutes, and what that number buys is a ceiling on how long a connection authenticated by a
+  since-revoked identity keeps serving. With the firewall spanning the whole IPv4 internet, identity
+  is the only boundary here, so that window is a security parameter.
+- **Renew on the issuer's own hint, and never later than one handshake before expiry.** The renewal
+  point is `refreshAfterTimestamp` — Entra's `refresh_in`, roughly half-life, which
+  `@azure/identity` populates on both the client-assertion and managed-identity paths — bounded by
+  `RENEW_MARGIN_MS`, which is `CLOCK_SKEW_MS + CONNECT_BUDGET_MS`, 5.5 minutes. The margin is that
+  small because a session is not re-validated after connect (below), so it only has to cover the
+  handshake plus skew.
 
-Two failure modes are handled rather than assumed away. A renewal that fails serves the cached
-token while it is still valid and suppresses the next attempt for `RENEW_RETRY_BACKOFF_MS`, so a
+  A larger margin would buy nothing, and this is the constraint that decides the design.
+  `credential.getToken()` answers from MSAL's cache, and MSAL treats a token as expired only inside
+  its own five-minute offset (`DEFAULT_TOKEN_RENEWAL_OFFSET_SEC`), so no request made earlier than
+  that can return a fresher token than the one already held. Past `refresh_in` it refreshes in the
+  background and returns the stale token meanwhile — which the cache detects by unchanged expiry and
+  answers with a backoff rather than an alarm, because it is the normal path.
+
+**Whether a session outlives its token: no, it is never re-checked.** Measured against the live
+server, workflow run 31062754668. One connection polled every minute and one left idle both kept
+serving 19.2 minutes past their token's expiry, on the same backend pid. Microsoft's documentation
+speaks only about sign-in and does not answer this, so the measurement is the only evidence — and it
+is load-bearing, because a margin sized for the handshake alone is only safe while it holds. Any
+change to `RENEW_MARGIN_MS` needs it re-established.
+
+Two failure modes are handled rather than assumed away. A renewal that fails serves the cached token
+while it is still valid and suppresses the next attempt for `RENEW_RETRY_BACKOFF_MS`, so a
 fast-failing Entra does not turn into one token request per connection — including once the cached
-token is genuinely dead, which is the outage the backoff exists for and the one an earlier version
-left unprotected. A token issued shorter-lived than the margin — which an Entra token-lifetime
-policy can impose — cannot satisfy the invariant at all; the cache halves its margin so it stays
-useful and says so through `onTokenTooShort`, which logs at **error** level by default and names
-how far past expiry a connection could then run. That is a weaker control than it should be: only
-the Function App's logs reach an Azure alert rule, so on Vercel and in CI the log line is the whole
-signal. It is not reachable with the tokens this system actually gets — 60 minutes for an app
-registration, 24 hours for a managed identity, both comfortably over the 35-minute margin.
+token is genuinely dead, which is the outage the backoff exists for. And a token served with less
+life left than a connection attempt may take says so through `onTokenNearlyExpired`, which logs at
+**error** level. That is a weaker control than it should be: only the Function App's logs reach an
+Azure alert rule, so on Vercel and in CI the log line is the whole signal. It is unreachable on
+either healthy path, which is what makes it worth reading — an earlier margin derived from
+connection lifetime instead fired it 28 times per 12 hours against a 60-minute token while handing
+out tokens with 9 minutes of life left.
 
 **What is wired, and what is switched on.** `packages/db/src/client.ts` builds both Prisma clients
 through `createClient`, which reads `DATABASE_AUTH`. It defaults to `password` and behaves exactly
