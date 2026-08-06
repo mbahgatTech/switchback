@@ -27,12 +27,13 @@ flowchart LR
   never recorded anywhere and could not be read back out of ARM, which blocked every redeploy. On
   2026-08-05 it was deliberately _set_ to a freshly generated 48-character value rather than
   recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately.
-  It now lives in **three** places: the owner's password manager, a 0600 file on the owner's
-  machine, and the `DIRECT_DATABASE_URL` repository secret, which `ci.yml` and the backup workflow
-  both read. The third is the one that matters for blast radius: anyone with write access to this
-  repository can add a workflow step that prints it, so compromise of repository write access is
-  compromise of the database administrator. It remains unreadable from ARM, so a redeploy still has
-  to be given the same value.
+  It now lives in **two** verified places: a file on the owner's machine readable only by the
+  owner (`LOQ\mazen:(R,W)`, inheritance stripped), and the `DIRECT_DATABASE_URL` repository
+  secret, which `ci.yml` and the backup workflow both read. The second is the one that matters for
+  blast radius: anyone with write access to this repository can add a workflow step that prints it,
+  so compromise of repository write access is compromise of the database administrator. It remains
+  unreadable from ARM, so a redeploy still has to be given the same value. A copy in the owner's
+  password manager was claimed here previously; nobody observed it being made, so it is not counted.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
   Microsoft Entra administrator; see [Connecting by hand, with no
   password](#connecting-by-hand-with-no-password). That is what stops "the password is not recorded
@@ -50,9 +51,12 @@ flowchart LR
   `workloadBudgetStartDate` are two parameters rather than one.
 - **Neon's schema is frozen at the cutover commit** and nothing keeps it current, so a rollback is
   now two steps rather than one. See [Rollback expiry](#rollback-expiry).
-- **There is a portable backup, and it has been restored.** Point-in-time restore only restores
-  into Azure; `.github/workflows/backup-production-db.yml` produces a dump that does not, and
-  proves it by loading it and comparing. See [Backups](#backups) for what it does not carry.
+- **The portable backup has been proven and is not retained.** Run 31043403970 dumped production,
+  restored it and compared it row for row, so the mechanism works. But the dump artifact it
+  published was deleted the same day, and the workflow now withholds the dump while the repository
+  is public, so **no off-Azure copy of this database exists right now** — only a 26 KiB evidence
+  artifact of counts and DDL. The live rollback is Azure point-in-time restore alone. See
+  [Backups](#backups).
 
 ---
 
@@ -352,7 +356,7 @@ as well as of the database, and correct this file if it is wrong.
 
 Password authentication is still enabled, so `sbadmin` remains available as the second break-glass.
 Its password is not in ARM and not readable from Vercel, but it **is** in the `DIRECT_DATABASE_URL`
-repository secret as well as the owner's password manager — see "Read this first". Re-deploying the
+repository secret and in a file on the owner's machine — see "Read this first". Re-deploying the
 template requires passing the same value.
 
 ### Machine identities
