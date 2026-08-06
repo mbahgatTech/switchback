@@ -124,7 +124,10 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/probe" && cd "$RUNNER_TEMP/probe"
           npm install --silent --no-save --no-package-lock pg@8.22.0
-          node "$GITHUB_WORKSPACE/infra/postgres-identity/token-expiry-probe.mjs" \
+          # Node resolves a bare import from the *script's* directory, not the shell's, so the
+          # probe has to sit beside the node_modules that was just installed for it.
+          cp "$GITHUB_WORKSPACE/infra/postgres-identity/token-expiry-probe.mjs" .
+          node ./token-expiry-probe.mjs \
             "$PGHOST" "$PROBE_ROLE" postgres "$RUNNER_TEMP/probe.jwt" "$HOLD_MIN" \
             | tee "$RUNNER_TEMP/probe.log"
 
