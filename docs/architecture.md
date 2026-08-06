@@ -404,7 +404,7 @@ parent, and the parent re-queues exactly the stale children.
 reads `failed` both for a child thirty seconds from its next attempt and for one that has given up,
 and `enqueue` clears `attempts` — so deciding on the tile row resets the backoff ladder of a child
 that was already coming back, on every viewport poll, which is how a rate-limited tile becomes one
-we hammer once per render. `failJob` writes the *job* `queued` with a future `runAfter` while
+we hammer once per render. `failJob` writes the _job_ `queued` with a future `runAfter` while
 attempts remain and `dead` only when they are gone, and that is what `queueStaleChildren` reads: a
 `queued` or `running` child is left alone, anything else is enqueued.
 
@@ -421,7 +421,7 @@ five-attempt ladder, and while it is `queued` the next drain leaves it alone.
 returns the revived-from-dead children as `exhausted`; `rollUpSplitTile` writes them to the parent's
 `lastError` and logs `switchback-ingest-subtree-stuck` — but only when that message differs from what
 the row already says. Edge-triggering is load-bearing rather than tidy: a blocked parent is `pending`,
-so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
+so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
 pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
 would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
 genuine failure signal — which trains an operator to ignore the signal round 5 was convened to create.
@@ -446,7 +446,7 @@ the next template deploy, because the committed parameter is `9`. That last poin
 matters: an ARM application-settings write replaces the collection whole, so a hand-set value does
 not survive a deploy. `ingestQueueDriver` has no default at all for the same reason and the opposite
 polarity — both of its values are dangerous if guessed, whereas the only dangerous direction here is
-*on*, so a forgotten `export` has to land on off. Turning subdivision on for an experiment is
+_on_, so a forgotten `export` has to land on off. Turning subdivision on for an experiment is
 therefore a hand-set app setting that the next deploy will revoke, which is the correct asymmetry.
 
 **A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
@@ -492,7 +492,7 @@ Relation-backed trails are immune — their identity is the relation id, and `ou
 every member whichever child asked.
 
 This is not new: neighbouring z9 tiles have always had it. What is new is that a split cuts seam
-*inside* a tile that was whole. A z9 at 46°N is ~54 km square, so one split cuts ~108 km of fresh
+_inside_ a tile that was whole. A z9 at 46°N is ~54 km square, so one split cuts ~108 km of fresh
 interior seam and two levels ~324 km, in exactly the alpine tiles this feature exists for. Nothing
 deletes a trail row, so the damage outlives the flag: setting `INGEST_SUBDIVIDE_MAX_ZOOM=9` stops new
 splits and leaves the truncated row and its duplicate in place permanently.
@@ -504,22 +504,37 @@ trails in the parent's box before and after through `trails.browse` and comparin
 `lengthM` per row; that is the only check available from outside the database.
 
 **Observed in production, 2026-08-06.** Subdivision fires, and the trace that says so is the one this
-round wired. Two dense alpine z9 tiles reached the wall and split rather than failing:
+round wired. Four dense alpine z9 tiles reached the wall and split rather than failing:
+
+| tile        | at (UTC) | elapsed    | committed | unattempted | children      |
+| ----------- | -------- | ---------- | --------- | ----------- | ------------- |
+| `120230202` | 00:00:25 | 542,349 ms | 127       | 2,032       | `1202302020…` |
+| `120230220` | 00:09:25 | 540,513 ms | 160       | 1,488       | `1202302200…` |
+| `120230203` | 00:21:45 | 540,582 ms | 196       | 793         | `1202302030…` |
+| `120230212` | 00:37:11 | 540,244 ms | 241       | 748         | `1202302120…` |
 
 ```
-00:00:25Z  switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unattempted
-           {"phase":"commit","committed":127,"failed":2033,"refused":2032,
-            "children":["1202302020","1202302021","1202302022","1202302023"],"fetchMs":542349}
-00:09:25Z  switchback-ingest-tile-split 120230220: ran out of clock with 1488 trail(s) unattempted
-           {"phase":"commit","committed":160,"failed":1489,"refused":1488,
-            "children":["1202302200","1202302201","1202302202","1202302203"],"fetchMs":540513}
+switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unattempted
+  {"phase":"commit","committed":127,"failed":2033,"refused":2032,
+   "children":["1202302020","1202302021","1202302022","1202302023"],"fetchMs":542349}
 ```
 
-Both are the commit-loop shape: the tile query returned, the deadline refused the rest, `refused > 0`
-selected the split, and the invocation returned `done` at 542,349 ms and 540,513 ms against a
-540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought. `2032` and `1488`
-unattempted trails is the size of the problem stated plainly: these boxes are an order of magnitude
-past what one invocation can commit.
+All four are the commit-loop shape: the tile query returned, the deadline refused the rest,
+`refused > 0` selected the split, and each invocation returned normally between 540,244 ms and
+542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought.
+Two thousand unattempted trails is the size of the problem stated plainly: these boxes are an order
+of magnitude past what one invocation can commit. Overpass was healthy throughout: no 429, no
+`Retry-After`, no breaker trip in `traces` between 23:00Z and 00:45Z, and `ingest-jobs` held 0
+dead-lettered messages.
+
+**No child ran, and the reason is the queue rather than the split.** Children are enqueued at
+`SPLIT_PRIORITY`, level with a live viewport, but `claimJobs` and the pump break a priority tie on
+`runAfter ASC` — so a child created at 00:00 sorts behind every tile queued before it, and the
+alpine backlog ahead of these was itself made of nine-minute tiles. Sixteen z10 rows are `pending`
+with durable jobs behind them; none had been claimed when the window was closed. **So the chain is
+proven as far as the split and no further: no `done` at z10, no roll-up, and no z9 that
+`trails.browse` calls ready because it subdivided.** The deepest zoom reached is z10, as rows, not as
+work.
 
 **Earlier rounds' account of this is now settled, and both halves of it were wrong.** Round 1 said
 `splitTile` was never reached; a reviewer said subdivision had fired twice on 2026-08-05. Neither was
@@ -527,13 +542,13 @@ supported then and neither is now: the 2026-08-05 over-deadline invocations logg
 token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
 path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
 
-**The children wait for the queue, and that is the honest cost.** Children are enqueued at
-`SPLIT_PRIORITY`, level with a live viewport, but `claimJobs` and the pump break a priority tie on
-`runAfter ASC` — so a child created at 00:00 sorts behind every tile queued before it. On a worker
-that takes one message at a time, with dense alpine tiles ahead of it at ~9 minutes each, that is the
-gap between "the tile splits" and "the tile is ready". Nothing is lost while it waits: the rows are
-durable, the parent stays `pending`, and the trails each parent committed before the wall are already
-in `trails`.
+**The seam baseline, for whoever finishes this.** `trails.browse` over `120230202`'s box at
+00:41:13Z, after the split and before any child ran, returns 104 trails under 104 distinct names —
+zero duplicates. That is the "before" the fragmentation question needs: re-run the same box once the
+children have ingested, and a duplicate name or a shortened `lengthM` is the defect in task #228
+made visible. Do the same for `120230220`, `120230203` and `120230212` before enabling subdivision
+again; each `trails.browse` costs one doomed inline drain on `master`, so take the baseline
+deliberately rather than by polling.
 
 **Direct Postgres is unavailable from a maintainer workstation behind the agent sandbox, and the
 earlier diagnosis of why was wrong.** It is not `connection_throttle.enable`. TCP 5432 accepts in
@@ -543,17 +558,36 @@ cannot accept a connection, so what accepted both was a local proxy: the sandbox
 nothing else. Read production tile state through `trails.browse` and job state through App Insights,
 or run the query from CI, which holds `DATABASE_URL`.
 
-**Live production state, 2026-08-05, so the next reader is not surprised by it.** Two z9 tiles sit
-`pending` with trails partly committed — `120221231` (17 trails in its box) and `031313112` — and
-`ingest-jobs` holds 5 active messages with 0 dead-lettered. Whether either tile has z10 child rows
-cannot be read from outside the database, and no z10 key has ever been delivered to the worker, so
-if children exist they have never run. `INGEST_QUEUE_DRIVER` is `postgres` on the worker and
-`INGEST_SUBDIVIDE_MAX_ZOOM` is 11; the worker drops every signal it receives and Vercel owns the
-drain. **Do not turn the queue driver back to `servicebus` until this branch is merged**: master's
-`processTile` throws on any z≠9 quadkey, so any child job that does exist would burn its retry
-ladder against a drainer that cannot process it, and master's inline drain re-fetches a split parent
-whole on every viewport. Merging is what clears both, because it gives master the subdivision-aware
-`processTile`.
+**How this was run before the branch was merged, and what it cost.** The worker is deployed from a
+zip, so it can carry this branch's `processTile` while Vercel still serves `master`. Setting
+`INGEST_QUEUE_DRIVER=servicebus` on the worker alone therefore gets subdivision into production
+without a merge — but it leaves two drainers on one `ingest_jobs` table, because `master` has no
+such flag. That is survivable for a bounded experiment and wrong as a resting state:
+
+- `claimJobs` uses `FOR UPDATE SKIP LOCKED`, so the two never work the same row.
+- `master`'s inline drain is scoped to `coverage.queued`, which is `coverBBox(bbox, INGEST_ZOOM)` —
+  z9 keys only. It structurally cannot claim a z10 child, which is what makes the arrangement safe
+  enough to try. `master`'s daily `/api/cron/drain` at 04:17 UTC is not scoped and can.
+- The Overpass ceiling during the window is 2 per drainer, not 2 overall.
+- Reviving one of the six failed tiles needs `ensureCoverage`, which only `trails.browse` reaches —
+  and the same request kicks `master`'s inline drain, which claims the tile for the full 30-minute
+  `LEASE_TIMEOUT_MS` and dies at Vercel's function limit with nothing written. The tile is then
+  invisible until `reclaimExpiredJobs`. Budget half an hour for that before the worker sees it.
+
+Merging removes all four, which is the argument for merging before the next run rather than a reason
+the run cannot happen.
+
+**Live production state, 2026-08-06.** `INGEST_QUEUE_DRIVER` is back to `postgres` and
+`INGEST_SUBDIVIDE_MAX_ZOOM` back to `9` on the worker: the worker drops every signal it receives,
+Vercel owns the drain, and no further tile can split. Four z9 tiles carry four z10 child rows each —
+`120230202`, `120230220`, `120230203` and `120230212` — and those sixteen children are `pending` with
+durable `ingest_tile` jobs behind them. **They cannot run under `master`,** whose `processTile` begins
+`if (tile.z !== INGEST_ZOOM) throw`, so leaving the driver on `postgres` is what keeps the worker from
+competing for them; the daily `/api/cron/drain` at 04:17 UTC is unscoped and will claim a few, throw,
+and eventually retire them to `dead`. That is survivable rather than terminal, and only because of
+the recovery above: after this branch merges, one viewport over the parent runs `rollUpSplitTile`,
+which revives a `dead` child and reports it once. Until then those four z9 tiles serve the trails each
+committed before the wall — 127, 160, 196 and 241 — and read `pending`.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

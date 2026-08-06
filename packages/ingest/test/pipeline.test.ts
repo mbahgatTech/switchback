@@ -200,7 +200,7 @@ describe('processTile, out of clock', () => {
             args.where.quadkey,
             existing
               ? { ...existing, ...args.update, quadkey: args.where.quadkey }
-              : ({ ...args.create, quadkey: args.where.quadkey }),
+              : { ...args.create, quadkey: args.where.quadkey },
           );
           return Promise.resolve({});
         },
