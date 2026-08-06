@@ -3,13 +3,18 @@
 # A VPN adapter on the machine this repository is developed on holds the default route and
 # kills the TLS handshake to 5432 before the server sees it. Every data-plane step of the move
 # to Microsoft Entra authentication — reading what `sbapp` may do, creating the Entra-mapped
-# roles, proving a token still works after it has expired — therefore runs here.
+# roles — therefore runs here.
 #
-# Two read-only actions, and the difference between them is which credential they need.
-# `inspect` authenticates with a federated token and no password, and is the break-glass path
-# the runbook points at: it is the one to run when the admin credential is unavailable or
-# suspect. `survey` needs the stored password, and exists only to describe the two repository
-# secrets — which is a thing no token can do.
+# Three actions, and what separates them is which credential each needs. `inspect` authenticates
+# with a federated token and no password, and is the break-glass path the runbook points at: it
+# is the one to run when the admin credential is unavailable or suspect. `provision` uses the
+# same token and writes the roles. `survey` needs the stored password, and exists only to
+# describe the two repository secrets — which is a thing no token can do.
+#
+# Whether an established session survives its token expiring is answered by
+# `token-expiry-probe.yml`, not here. A soak job did live here and could not answer it: it
+# authenticated as a managed identity, whose token Azure gives a 24-hour life, and a runner is
+# capped at six hours, so it could never reach the boundary however long it held.
 name: Postgres identity
 
 on:
@@ -24,7 +29,6 @@ on:
           - survey
           - inspect
           - provision
-          - soak
 
 permissions:
   contents: read
@@ -55,10 +59,8 @@ env:
   FUNC_OID: 3db30cfd-ea61-47ce-9b03-8b34ebc420b0
   VERCEL_OID: c9bfba39-4191-4695-996d-a588b7154e58
 
-# Concurrency is per job rather than per workflow. These jobs do very different things to the
-# same 2-vCore Burstable server — the soak holds one idle connection for eighty minutes, the
-# others open a handful for a few seconds — and a single workflow-level group would make a
-# one-line fix wait out a soak.
+# Concurrency is per job rather than per workflow. A one-line fix to `inspect` should not wait
+# out a `provision` that is mid-way through applying roles, and neither should block the other.
 
 jobs:
   survey:
@@ -524,123 +526,3 @@ jobs:
               || { echo "::error::CREATE TABLE as $role failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
             sed "s/^/refused ($role): /" "$RUNNER_TEMP/ddl.err"
           done
-
-  # ---------------------------------------------------------------------------------------
-  # Does an established session die when its token expires?
-  #
-  # **This job does not currently answer that, and the reason is worth keeping.** It was built
-  # against the documented user-token lifetime of one hour and holds a connection for eighty
-  # minutes. Run 31049068312 held backend pid 844034 from 21:32:50 to 22:52:53 UTC — same pid,
-  # same role, sixteen probes, no error — and proved nothing about expiry, because the token it
-  # authenticated with printed `lifetime=1440min`. A managed identity gets **24 hours**, not one
-  # hour, so eighty minutes is comfortably inside the window. A test that cannot fail is not a
-  # test.
-  #
-  # A GitHub-hosted job is capped at six hours, so waiting the token out here is not available.
-  # Two designs that would work, neither yet tried: shorten the lifetime with an Entra token
-  # lifetime policy on this identity's service principal, or hold the connection from something
-  # without a six-hour cap. Until one of them runs, the token lifecycle in docs/architecture.md
-  # says the question is open, and it should keep saying so.
-  #
-  # What the job does establish, and it is not nothing: a token-authenticated session is stable
-  # for eighty minutes on the same backend, so the connection is not being cycled underneath us
-  # by anything else.
-  # ---------------------------------------------------------------------------------------
-  soak:
-    name: hold a connection past token expiry
-    # Dispatch only. Eighty minutes is too long to spend on every push.
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'soak'
-    runs-on: ubuntu-latest
-    timeout-minutes: 110
-    concurrency:
-      group: postgres-entra-soak
-      cancel-in-progress: false
-
-    steps:
-      - name: Install the PostgreSQL 17 client
-        run: |
-          set -euo pipefail
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client-17
-          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
-
-      - uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Mint a database access token
-        run: |
-          set -euo pipefail
-          token="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
-          echo "::add-mask::$token"
-          umask 077
-          printf '%s:%s:*:%s:%s\n' "$PGHOST" "$PGPORT" "$PGUSER" "$token" > "$RUNNER_TEMP/pgpass"
-          echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
-          # The `exp` claim, read rather than assumed. Base64url, so the alphabet is translated
-          # before decoding.
-          node -e '
-            const part = process.argv[1].split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-            const claims = JSON.parse(Buffer.from(part, "base64").toString());
-            const left = claims.exp - Math.floor(Date.now() / 1000);
-            const mins = Math.round(left / 60);
-            console.log(`exp=${new Date(claims.exp * 1000).toISOString()} lifetime=${mins}min aud=${claims.aud}`);
-            require("node:fs").appendFileSync(process.env.GITHUB_ENV, `TOKEN_LIFETIME_MIN=${mins}\n`);
-          ' "$token"
-
-      - name: One session, eighty minutes
-        id: hold
-        run: |
-          set -euo pipefail
-          probes=16
-          sleep_s=300
-          echo "SOAK_PROBE_MINUTES=$(( sleep_s / 60 ))" >> "$GITHUB_ENV"
-          {
-            echo "SELECT 'start|' || now()::text || '|pid=' || pg_backend_pid()::text;"
-            for i in $(seq 1 "$probes"); do
-              echo "SELECT pg_sleep($sleep_s);"
-              echo "SELECT 'probe|$i|' || now()::text || '|pid=' || pg_backend_pid()::text || '|user=' || current_user;"
-            done
-          } > "$RUNNER_TEMP/soak.sql"
-          psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$' \
-            | tee "$RUNNER_TEMP/soak.log"
-
-      # Says out loud whether the run above could have failed, and fails when it could not.
-      #
-      # The hold is read back from the probes psql actually printed, never from the number the
-      # loop intended. Those differ in exactly the case this step exists for: if the session is
-      # terminated at the boundary, psql dies partway and the intended eighty minutes is a
-      # fiction. `if: always()` so a terminated session is classified rather than showing up as
-      # a red step that reads like a broken runner.
-      - name: Did this actually cross the expiry boundary?
-        if: always()
-        run: |
-          set -euo pipefail
-          lifetime="${TOKEN_LIFETIME_MIN:-0}"
-          per_probe="${SOAK_PROBE_MINUTES:-0}"
-          log="$RUNNER_TEMP/soak.log"
-          last="$(grep -c '^probe|' "$log" 2>/dev/null || true)"
-          held=$(( last * per_probe ))
-
-          if [ "${{ steps.hold.outcome }}" = "failure" ]; then
-            echo "The session did NOT survive. It was held ${held} minutes against a token valid for ${lifetime}."
-            echo "That is the answer this job was built to get. The psql error is in the step above."
-            [ "$held" -ge "$lifetime" ] && exit 0
-            echo "::error::...but it died BEFORE the token expired, so the cause is not expiry."
-            exit 1
-          fi
-
-          if [ "$held" -eq 0 ]; then
-            echo "::error::No probe line was printed, so there is nothing to classify."
-            exit 1
-          fi
-          if [ "$lifetime" -gt "$held" ]; then
-            echo "::error::INCONCLUSIVE — the token was valid for ${lifetime} minutes and the session was held ${held}. Nothing here says what happens at expiry."
-            exit 1
-          fi
-          echo "Conclusive: the session was held ${held} minutes against a token valid for ${lifetime}."

@@ -1,6 +1,11 @@
 # Answers one question that three rounds of this work could not: when the Entra access token
 # that authenticated a Postgres connection expires, does the server drop the session?
 #
+# **It does not.** Run 31062754668 held two connections 79 minutes against a 60-minute token and
+# both were serving 19 minutes past expiry — see the token lifecycle section of
+# docs/architecture.md for the log. The question is settled; this workflow is kept so the
+# measurement can be repeated rather than believed.
+#
 # It could not be answered with the CI managed identity because Azure issues managed-identity
 # tokens with a 24-hour life and a GitHub runner is capped at six. A throwaway **app
 # registration** gets 60 minutes, which fits, so this job authenticates as one — federated, no
@@ -8,17 +13,24 @@
 # other sits idle across expiry and is queried only afterwards, which is the shape a pooled
 # connection in the application actually has.
 #
-# The principals this needs are created and destroyed around the run. Nothing here is part of
-# the deployed system, and the workflow is dispatch-only so it never fires on a push.
+# **The principals this needs no longer exist.** They were deleted after the run, because an app
+# registration is a Microsoft Graph object that cannot be declared in Bicep and must not be left
+# behind holding a database role. To run this again, recreate them and update PROBE_CLIENT_ID
+# and PROBE_OID below with what these print:
+#
+#   az ad app create --display-name sb-token-expiry-probe --sign-in-audience AzureADMyOrg
+#   az ad sp create --id <appId>
+#   az ad app federated-credential create --id <appObjectId> --parameters '{
+#     "name":"gh-branch","issuer":"https://token.actions.githubusercontent.com",
+#     "subject":"repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/<branch>",
+#     "audiences":["api://AzureADTokenExchange"]}'
+#
+# PROBE_OID is the **service principal** object id, because that is the `oid` claim Azure matches
+# the database role against — not the application object id.
 name: Postgres token expiry probe
 
 on:
   workflow_dispatch:
-  push:
-    branches: [feat/credential-free-postgres]
-    paths:
-      - .github/workflows/token-expiry-probe.yml
-      - infra/postgres-identity/token-expiry-probe.mjs
 
 permissions:
   contents: read

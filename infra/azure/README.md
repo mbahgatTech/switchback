@@ -334,7 +334,10 @@ token to the role by object id, but the role's _name_ is the UPN, and psql sends
   stays at zero._ The server never saw the attempt, so the problem is the local network path — a
   VPN holding the default route does this. Run it from a GitHub Actions runner instead: dispatch
   the `Postgres identity` workflow with the **`inspect`** action, which takes the same federated
-  token path and reads the same things, with no password anywhere. Do **not** reach for `survey`
+  token path and reads the same things, with no password anywhere. **This path has been run** —
+  run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3, reported
+  `is_admin|true`, `server_version|17.10` and the full role and row-count census, with no
+  credential in the job but a federated token. Do **not** reach for `survey`
   here: that action authenticates with `secrets.DIRECT_DATABASE_URL` and exists only to describe
   the repository secrets, so it is useless in exactly the case where the password is the problem.
 

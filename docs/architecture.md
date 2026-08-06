@@ -319,7 +319,7 @@ sequenceDiagram
   P->>DB: connect, token as password
   DB-->>P: session established
 
-  Note over P,DB: whether the token is re-checked after connect<br/>is UNVERIFIED — the design assumes it is
+  Note over P,DB: the token is checked at connect and never again —<br/>measured, run 31062754668: a session survived 19 min past expiry
   P->>P: retired at maxLifetimeSeconds, on release
   P->>T: password() again for the replacement
 
@@ -420,45 +420,53 @@ Whether retiring connections is a correctness requirement or only hygiene turns 
 nobody should answer from memory: **is the token checked only at connect, or is a live session
 terminated when it expires?**
 
-**That question is still open, and the attempt to close it is worth recording.** The `soak` action
-of the `Postgres identity` workflow holds one connection and queries it every five minutes for
-eighty, printing `pg_backend_pid()` each round so a silent reconnect cannot pass as survival. Run
-31049068312 held backend pid 844034 from 21:32:50 to 22:52:53 UTC — same pid, same role, sixteen
-probes, no error. It proves the session is stable for eighty minutes and **nothing about expiry**,
-because the token it authenticated with reported `lifetime=1440min`: twenty-four hours, not the
-hour the documentation quotes for a user. The test never reached the boundary it was
-built to cross, and the job now exits non-zero and says so rather than reporting green.
+**It is checked only at connect. Measured, run 31062754668.** Two connections were opened with one
+60-minute token and held for 79 minutes — 19 minutes past its expiry:
 
-A GitHub-hosted job is capped at six hours, so waiting the token out is not available there — and
-the obvious shortcut is closed rather than merely unattempted. `AccessTokenLifetime` does bottom
-out at ten minutes, but `configurable-token-lifetimes` states that "configuring token lifetimes for
-managed identity service principals isn't supported", and every principal on this path is a managed
-identity. The 1440 minutes the soak measured is not a managed-identity quirk either: where client
-and resource both speak Continuous Access Evaluation, Entra deliberately issues a 24–28 hour token
-and revokes it in near real time instead of expiring it early.
+```
+token_expires_at|2026-08-06T02:27:13.000Z
+token_life_remaining_min|59.9
+planned_hold_min|79
+poll|59|past_expiry=-0.8min|ok
+poll|60|past_expiry=0.2min|ok        <- the boundary
+poll|79|past_expiry=19.2min|ok
+idle-reuse|past_expiry=19.2min|pid=866503|ok
+VERDICT|crossed_expiry|true
+VERDICT|polled_survived|true|last_good_minute=79
+VERDICT|idle_reuse_survived|true
+```
 
-So two routes remain, both follow-on work. Hold a session for more than a day from a host without
-the runner cap. Or stand up a throwaway app registration — the one principal shape a ten-minute
-policy does attach to — federate it to this repository, make it an Entra principal on the server,
-soak it for twenty minutes and tear it down. The second is faster and answers the question
-directly, but an app registration is a Microsoft Graph object rather than an ARM one, so it cannot
-be declared in Bicep and must not be left behind.
+Both shapes were covered deliberately. One connection was queried every minute, so it was never
+idle and its survival cannot be confused with a reconnect — same backend throughout. The other sat
+untouched for the whole 79 minutes and was queried for the first time 19 minutes _after_ the token
+died, on backend pid 866503, which is the pooled-connection case the application actually has: a
+connection that goes quiet for an hour and is then handed to a request.
 
-Microsoft's own documentation does not settle it either, which is worth writing down so the next
-person does not re-read it hoping. `security-entra-concepts` gives the lifetimes — "User tokens
-are valid for up to 1 hour. Tokens for system-assigned managed identities are valid for up to 24
-hours" — and says a deleted principal "can still sign in until the token expires". Both are
-statements about _establishing_ a connection. Neither says anything about a session already
-established, and the PostgreSQL wire protocol has no re-authentication step for one, so
-terminating it would take something out of band that nothing documents. That is a strong prior,
-not an answer, and it is recorded here as a prior.
+**Three earlier rounds could not get this, and the reason is worth keeping.** The `soak` job used
+the CI managed identity, and Azure issues managed-identity tokens with a 24-hour life while a
+GitHub runner is capped at six — so it could not reach the boundary however long it held. A
+token-lifetime policy does not close that: `configurable-token-lifetimes` states that "configuring
+token lifetimes for managed identity service principals isn't supported". What does close it is a
+**throwaway app registration**, whose token for this resource is exactly 60 minutes — measured,
+`expires_in=3599`. `.github/workflows/token-expiry-probe.yml` federates one to this repository, has
+the Entra administrator map it to a grantless database role, holds the two connections, drops the
+role, and the Graph objects are deleted afterwards. It is a reproducible experiment rather than
+part of the deployed system, and its header carries the two `az` commands to stand it up again.
 
-The 35-minute renewal margin is what keeps the open question off the critical path, and the claim
-is now the arithmetic one rather than a hopeful one: no connection is ever opened with a token
-that has less life left than that connection can possibly consume. That holds whichever way the
-question resolves. It is **not** a substitute for the answer — if Azure does terminate expired
-sessions, the margin is the only thing preventing it, and nothing has yet observed a real
-boundary being crossed.
+Microsoft's own documentation never settles this, which is worth writing down so the next person
+does not re-read it hoping. `security-entra-concepts` gives the lifetimes — "User tokens are valid
+for up to 1 hour. Tokens for system-assigned managed identities are valid for up to 24 hours" — and
+says a deleted principal "can still sign in until the token expires". Both are statements about
+_establishing_ a connection. Neither says anything about a session already established. The
+measurement above is what the prose could not give.
+
+**What this changes.** Retiring connections at `maxLifetimeSeconds` is hygiene, not the only thing
+standing between the app and an outage: a connection that outlives its token keeps working. The
+renewal margin still matters, because every _new_ physical connection presents a token and that one
+must be valid — which is exactly what the password callback provides. The claim the margin now
+carries is the modest, arithmetic one: no connection is ever opened with a token that has less life
+left than that connection can possibly consume. Bounding connection lifetime remains worth doing so
+authority does not accumulate indefinitely in a long-lived pool, but it is defence in depth.
 
 ### Sign-in for people
 
