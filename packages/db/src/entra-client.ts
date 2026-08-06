@@ -15,11 +15,16 @@ export interface EntraPoolSizing {
 // One cache per process, shared by both pools. Two caches would double the traffic to Entra
 // and halve the value of collapsing concurrent refreshes, for no isolation worth having:
 // both pools authenticate as the same principal.
-let sharedProvider: (() => Promise<string>) | undefined;
+let shared: { mode: DatabaseAuthMode; provider: () => Promise<string> } | undefined;
 
 function tokenProvider(mode: DatabaseAuthMode): () => Promise<string> {
-  sharedProvider ??= createTokenProvider(createEntraTokenSource(mode));
-  return sharedProvider;
+  // Sharing one cache only makes sense while every pool authenticates the same way. A second
+  // mode would silently get the first one's credential, so it is refused rather than ignored.
+  if (shared && shared.mode !== mode) {
+    throw new Error(`Token cache already built for "${shared.mode}"; cannot also serve "${mode}".`);
+  }
+  shared ??= { mode, provider: createTokenProvider(createEntraTokenSource(mode)) };
+  return shared.provider;
 }
 
 export function createEntraPool(
@@ -39,9 +44,4 @@ export function createEntraPool(
  */
 export function createEntraAdapter(pool: Pool): PrismaPg {
   return new PrismaPg(pool);
-}
-
-/** Test seam: the process-wide token cache is memoised, and suites need a clean one. */
-export function resetTokenProviderForTests(): void {
-  sharedProvider = undefined;
 }
