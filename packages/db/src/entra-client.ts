@@ -36,11 +36,11 @@ export function createEntraPool(
 }
 
 /**
- * A Prisma driver adapter over a pool this module owns.
+ * A Prisma driver adapter over a pool the caller already holds.
  *
- * The pool is constructed here rather than handed to `PrismaPg` as a config object, because a
- * pool the caller holds is a pool the caller can assert on — and `maxLifetimeSeconds` being
- * present on the real pool is the whole safety argument.
+ * `PrismaPg` also accepts a bare config and builds its own pool, which would leave nothing to
+ * inspect — and `maxLifetimeSeconds` being present on the real pool is the whole safety
+ * argument, so the pool has to be reachable to assert on.
  */
 export function createEntraAdapter(pool: Pool): PrismaPg {
   return new PrismaPg(pool);
