@@ -1,5 +1,11 @@
 export { BACKGROUND_POOL_SIZE, backgroundPrisma, prisma } from './client';
 export type { PrismaClient } from './client';
+export { createEntraAdapter, createEntraPool, resetTokenProviderForTests } from './entra-client';
+export type { EntraPoolSizing } from './entra-client';
+export { entraPoolConfig } from './entra-pool';
+export type { EntraPoolOptions } from './entra-pool';
+export { createEntraTokenSource, databaseAuthMode, POSTGRES_SCOPE } from './entra-source';
+export type { DatabaseAuthMode } from './entra-source';
 export { CONNECTION_LIFETIME_S, RENEW_MARGIN_MS, createTokenProvider } from './entra-token';
 export type { AccessToken, TokenProviderOptions, TokenSource } from './entra-token';
 export * from './spatial';

@@ -36,7 +36,9 @@ function connect(label) {
       // A backend killed underneath an idle client surfaces as an 'error' event, and an
       // unhandled one takes the process down before the verdict can be printed. Recording it
       // is the point of the run.
-      client.on('error', (error) => log('session-error', label, `t=${minutesIn()}min`, error.message));
+      client.on('error', (error) =>
+        log('session-error', label, `t=${minutesIn()}min`, error.message),
+      );
       log('connected', label, `pid=${rows[0].pid}`, `t=${minutesIn()}min`);
       return client;
     });
@@ -83,7 +85,12 @@ const [pollResult, idleResult] = await Promise.all([pollUntilDone(polled), query
 // A run that never outlived the token proves nothing, whatever the two sessions did.
 const crossed = Date.now() > expiresAt * 1000;
 log('VERDICT', 'crossed_expiry', crossed);
-log('VERDICT', 'polled_survived', pollResult.survived, `last_good_minute=${pollResult.lastGoodMinute}`);
+log(
+  'VERDICT',
+  'polled_survived',
+  pollResult.survived,
+  `last_good_minute=${pollResult.lastGoodMinute}`,
+);
 log('VERDICT', 'idle_reuse_survived', idleResult.survived);
 
 await polled.end().catch(() => {});

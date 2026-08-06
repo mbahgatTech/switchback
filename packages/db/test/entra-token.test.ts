@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  CLOCK_SKEW_MS,
   CONNECTION_LIFETIME_S,
   MAX_CHECKOUT_S,
   RENEW_MARGIN_MS,
@@ -143,10 +142,6 @@ describe('connection lifetime', () => {
       (CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000,
     );
   });
-
-  it('derives the margin from the two bounds it has to cover', () => {
-    expect(RENEW_MARGIN_MS).toBe((CONNECTION_LIFETIME_S + MAX_CHECKOUT_S) * 1000 + CLOCK_SKEW_MS);
-  });
 });
 
 describe('degraded sources', () => {
@@ -188,6 +183,28 @@ describe('degraded sources', () => {
 
     clock.advance(RENEW_RETRY_BACKOFF_MS + 1);
     await token();
+    expect(source).toHaveBeenCalledTimes(3);
+  });
+
+  it('stops asking Entra once the cached token is dead and Entra is still failing', async () => {
+    const clock = fakeClock();
+    const source = vi
+      .fn<() => Promise<AccessToken>>()
+      .mockResolvedValueOnce(tokenExpiringIn(clock, HOUR))
+      .mockRejectedValue(new Error('Entra unreachable'));
+    const token = createTokenProvider(source, { now: clock.now, onRenewalFailure: () => {} });
+
+    await token();
+    clock.advance(HOUR + 1_000); // the cached token is now genuinely expired
+    await expect(token()).rejects.toThrow('Entra unreachable');
+    expect(source).toHaveBeenCalledTimes(2);
+
+    // The outage the backoff exists for. Ten more connections must not be ten more requests.
+    for (let i = 0; i < 10; i++) await expect(token()).rejects.toThrow('Entra unreachable');
+    expect(source).toHaveBeenCalledTimes(2);
+
+    clock.advance(RENEW_RETRY_BACKOFF_MS + 1);
+    await expect(token()).rejects.toThrow('Entra unreachable');
     expect(source).toHaveBeenCalledTimes(3);
   });
 

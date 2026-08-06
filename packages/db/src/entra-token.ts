@@ -1,6 +1,7 @@
 /**
- * The password half of Entra authentication to Postgres: a cached access token, renewed on a
- * timer rather than on a failure, handed to `pg` as the per-connection password.
+ * The password half of Entra authentication to Postgres: a cached access token, renewed the
+ * first time a new connection asks for one inside the margin, and handed to `pg` as that
+ * connection's password.
  */
 
 /** What a token source returns. Matches `@azure/identity`'s `AccessToken` field-for-field. */
@@ -62,11 +63,15 @@ export interface TokenProviderOptions {
 const warnRenewalFailure = (error: unknown): void =>
   console.warn('[entra-token] renewal failed; serving the cached token', error);
 
+// `error`, not `warn`: this one means the module's one invariant no longer holds and a
+// connection can outlive its token. Only the Function App's logs reach an Azure alert rule,
+// so on Vercel this line is the whole signal.
 const warnTokenTooShort = (lifetimeMs: number, requiredMs: number): void =>
-  console.warn(
-    `[entra-token] token lifetime ${Math.round(lifetimeMs / 1000)}s is under the ${Math.round(
-      requiredMs / 1000,
-    )}s renewal margin; a connection may outlive it`,
+  console.error(
+    `[entra-token] INVARIANT BROKEN: token lifetime ${Math.round(lifetimeMs / 1000)}s is under ` +
+      `the ${Math.round(requiredMs / 1000)}s renewal margin, so a connection may run up to ` +
+      `${Math.round((requiredMs - lifetimeMs / 2) / 1000)}s past expiry. Lengthen the token ` +
+      `lifetime or shorten CONNECTION_LIFETIME_S.`,
   );
 
 /**
@@ -89,6 +94,7 @@ export function createTokenProvider(
   let inFlight: Promise<AccessToken> | undefined;
   let effectiveMarginMs = renewMarginMs;
   let retryNotBefore = 0;
+  let lastFailure: unknown;
 
   // `isUsable` is a type predicate; freshness deliberately is not. A predicate's false branch
   // narrows away `AccessToken`, and "not fresh" means the token is old, not absent — modelling
@@ -127,19 +133,25 @@ export function createTokenProvider(
     const current = cached;
     if (current !== undefined && isFresh(current)) return current.token;
 
-    // A renewal that just failed is not retried on the next connection, only after the
-    // backoff — but only while the cached token is still genuinely usable.
-    if (isUsable(current) && now() < retryNotBefore) return current.token;
+    // A renewal that just failed is not retried until the backoff elapses. While the cached
+    // token is still usable that means serving it; once it is not, it means failing on the
+    // recorded error rather than adding a request to an Entra already refusing them — which
+    // is the outage the backoff exists for and the one it used to leave unprotected.
+    if (now() < retryNotBefore) {
+      if (isUsable(current)) return current.token;
+      throw lastFailure;
+    }
 
     try {
       return (await refresh()).token;
     } catch (error) {
+      retryNotBefore = now() + RENEW_RETRY_BACKOFF_MS;
+      lastFailure = error;
       // Inside the renewal margin the previous token is still accepted, so a transient
       // failure to renew must not fail the connection — it is retried by a later one. The
       // app only goes down if renewal is still failing once the old token has genuinely
       // expired, which is the point at which there is nothing honest left to return.
       if (isUsable(current)) {
-        retryNotBefore = now() + RENEW_RETRY_BACKOFF_MS;
         onRenewalFailure(error);
         return current.token;
       }

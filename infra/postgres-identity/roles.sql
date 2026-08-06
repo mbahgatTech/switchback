@@ -29,10 +29,20 @@ SELECT pg_catalog.pgaadauth_create_principal_with_oid('sbapp_func', :'func_oid',
 SELECT pg_catalog.pgaadauth_create_principal_with_oid('sbapp_vercel', :'vercel_oid', 'service', false, false)
  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sbapp_vercel');
 
--- Whatever the branch above did, these two must now exist and be Entra-mapped. The whole row
--- is printed as JSON rather than picking columns out of it: the documented result column is
--- `rolename` and the server's is `rolname`, so naming them is a way to fail on a typo instead
--- of on the fact being checked.
+-- Whatever the branch above did, these two must now exist and be mapped to the object ids
+-- this run was given — not merely exist. Creation is guarded on the role's *name*, so a
+-- Function App or user-assigned identity that has been recreated since keeps a role that
+-- matches nothing, and a count would still say two. That failure surfaces at first use.
+--
+-- The oids travel through `set_config` because psql does not interpolate `:'var'` inside a
+-- dollar-quoted body — it hands the block to the server verbatim and the server reports
+-- `syntax error at or near ":"`.
+SELECT set_config('switchback.func_oid', :'func_oid', false),
+       set_config('switchback.vercel_oid', :'vercel_oid', false);
+
+-- The whole row is printed as JSON rather than picking columns out of it: the documented
+-- result column is `rolename` and the server's is `rolname`, so naming them is a way to fail
+-- on a typo instead of on the fact being checked.
 SELECT 'principal|' || row_to_json(p)::text
   FROM pg_catalog.pgaadauth_list_principals(false) p
  WHERE p.rolname IN ('sbapp_func', 'sbapp_vercel')
@@ -40,13 +50,17 @@ SELECT 'principal|' || row_to_json(p)::text
 
 DO $$
 DECLARE
-  found int;
+  wrong text;
 BEGIN
-  SELECT count(*) INTO found
-    FROM pg_catalog.pgaadauth_list_principals(false) p
-   WHERE p.rolname IN ('sbapp_func', 'sbapp_vercel');
-  IF found <> 2 THEN
-    RAISE EXCEPTION 'expected two Entra-mapped application roles, found %', found;
+  SELECT string_agg(expected.rolname, ', ') INTO wrong
+    FROM (VALUES ('sbapp_func', current_setting('switchback.func_oid')),
+                 ('sbapp_vercel', current_setting('switchback.vercel_oid'))) AS expected(rolname, objectid)
+    LEFT JOIN pg_catalog.pgaadauth_list_principals(false) p
+      ON p.rolname = expected.rolname
+     AND lower(p.objectid::text) = lower(expected.objectid)
+   WHERE p.rolname IS NULL;
+  IF wrong IS NOT NULL THEN
+    RAISE EXCEPTION 'missing, or mapped to a different Entra object id: %', wrong;
   END IF;
 END
 $$;

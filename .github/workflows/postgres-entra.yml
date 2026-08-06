@@ -448,14 +448,31 @@ jobs:
             JOIN pg_roles g ON g.oid = m.roleid
            WHERE r.rolname IN ('sbapp_func', 'sbapp_vercel') AND g.rolname <> 'sbapp'
           UNION ALL
-          SELECT 'CONTROL_IS_VACUOUS'
+          -- The privilege control, on the same seven privileges the step above prints. On four
+          -- it is vacuous against the real database: production ACLs are sbadmin=arwdDxtm and
+          -- sbapp=arwd, identical on SELECT/INSERT/UPDATE/DELETE, so a four-privilege
+          -- comparison finds nothing on a healthy server and fails the job.
+          SELECT 'CONTROL_IS_VACUOUS|privilege-comparison'
            WHERE NOT EXISTS (
              SELECT 1 FROM pg_class t
                JOIN pg_namespace n ON n.oid = t.relnamespace
-              CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')) AS p(priv)
+              CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'),
+                                 ('TRUNCATE'), ('REFERENCES'), ('TRIGGER')) AS p(priv)
               WHERE n.nspname = 'public' AND t.relkind = 'r'
                 AND has_table_privilege('sbadmin', t.oid, p.priv)
-                    <> has_table_privilege('sbapp', t.oid, p.priv));
+                    <> has_table_privilege('sbapp', t.oid, p.priv))
+          UNION ALL
+          -- The control for the DIRECT_GRANT assertion itself, which the privilege comparison
+          -- above does not cover: that assertion is aclexplode over public tables, and if
+          -- relacl were NULL everywhere it would return nothing whatever anyone had been
+          -- granted. sbapp holds its privileges by direct grant, so this must find it.
+          SELECT 'CONTROL_IS_VACUOUS|acl-shape'
+           WHERE NOT EXISTS (
+             SELECT 1 FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              CROSS JOIN LATERAL aclexplode(c.relacl) AS a
+              WHERE n.nspname = 'public' AND c.relkind = 'r'
+                AND pg_get_userbyid(a.grantee) = 'sbapp');
           SQL
           )"
           if [ -n "$findings" ]; then
@@ -476,10 +493,19 @@ jobs:
       # A privilege check that reads well is not the same as a privilege that is enforced.
       # This asks the server, as each role, and expects to be refused by both — the previous
       # version probed only `sbapp_func`, so `sbapp_vercel` was asserted and never tested.
+      #
+      # `SET ROLE` is confirmed to have taken effect first. Without that, a `SET ROLE` that was
+      # itself refused would leave "permission denied" in the error file, the CREATE would
+      # never have run, and the probe would report a least-privilege role it never exercised.
       - name: Refuse DDL, out loud
         run: |
           set -euo pipefail
           for role in sbapp_func sbapp_vercel; do
+            became="$(psql -X -tAq -v ON_ERROR_STOP=1 -c "SET ROLE $role" -c 'SELECT current_user')"
+            if [ "$became" != "$role" ]; then
+              echo "::error::SET ROLE $role did not take effect; current_user was '$became'."
+              exit 1
+            fi
             if psql -X -q -v ON_ERROR_STOP=1 \
                  -c "SET ROLE $role" \
                  -c "CREATE TABLE ddl_probe_should_fail (id int)" 2> "$RUNNER_TEMP/ddl.err"; then
@@ -487,7 +513,7 @@ jobs:
               psql -X -q -c "DROP TABLE IF EXISTS ddl_probe_should_fail"
               exit 1
             fi
-            grep -q 'permission denied' "$RUNNER_TEMP/ddl.err" \
+            grep -q 'permission denied for schema public' "$RUNNER_TEMP/ddl.err" \
               || { echo "::error::CREATE TABLE as $role failed for the wrong reason:"; cat "$RUNNER_TEMP/ddl.err"; exit 1; }
             sed "s/^/refused ($role): /" "$RUNNER_TEMP/ddl.err"
           done
@@ -561,15 +587,12 @@ jobs:
           ' "$token"
 
       - name: One session, eighty minutes
+        id: hold
         run: |
           set -euo pipefail
-          # The hold is derived once, here, and exported. The verdict step below compares the
-          # token's lifetime against this number rather than against a second hardcoded 80,
-          # so changing the loop cannot leave the verdict measuring the old duration.
           probes=16
           sleep_s=300
-          hold_min=$(( probes * sleep_s / 60 ))
-          echo "SOAK_HOLD_MIN=$hold_min" >> "$GITHUB_ENV"
+          echo "SOAK_PROBE_MINUTES=$(( sleep_s / 60 ))" >> "$GITHUB_ENV"
           {
             echo "SELECT 'start|' || now()::text || '|pid=' || pg_backend_pid()::text;"
             for i in $(seq 1 "$probes"); do
@@ -577,27 +600,40 @@ jobs:
               echo "SELECT 'probe|$i|' || now()::text || '|pid=' || pg_backend_pid()::text || '|user=' || current_user;"
             done
           } > "$RUNNER_TEMP/soak.sql"
-          psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$'
+          psql -X -tAq -v ON_ERROR_STOP=1 -f "$RUNNER_TEMP/soak.sql" | grep -v '^$' \
+            | tee "$RUNNER_TEMP/soak.log"
 
       # Says out loud whether the run above could have failed, and fails when it could not.
       #
-      # `if: always()` because the interesting outcome is the one where psql dies at the
-      # boundary: without it a terminated session exits non-zero here and the classification
-      # never prints, leaving a red run that reads the same as a broken runner. `exit 1` on
-      # INCONCLUSIVE because a warning does not fail a job, and a soak that proves nothing
-      # must not report green a second time.
+      # The hold is read back from the probes psql actually printed, never from the number the
+      # loop intended. Those differ in exactly the case this step exists for: if the session is
+      # terminated at the boundary, psql dies partway and the intended eighty minutes is a
+      # fiction. `if: always()` so a terminated session is classified rather than showing up as
+      # a red step that reads like a broken runner.
       - name: Did this actually cross the expiry boundary?
         if: always()
         run: |
           set -euo pipefail
           lifetime="${TOKEN_LIFETIME_MIN:-0}"
-          hold="${SOAK_HOLD_MIN:-0}"
-          if [ "$hold" -eq 0 ]; then
-            echo "::error::The session hold never started, so there is nothing to classify."
+          per_probe="${SOAK_PROBE_MINUTES:-0}"
+          log="$RUNNER_TEMP/soak.log"
+          last="$(grep -c '^probe|' "$log" 2>/dev/null || true)"
+          held=$(( last * per_probe ))
+
+          if [ "${{ steps.hold.outcome }}" = "failure" ]; then
+            echo "The session did NOT survive. It was held ${held} minutes against a token valid for ${lifetime}."
+            echo "That is the answer this job was built to get. The psql error is in the step above."
+            [ "$held" -ge "$lifetime" ] && exit 0
+            echo "::error::...but it died BEFORE the token expired, so the cause is not expiry."
             exit 1
           fi
-          if [ "$lifetime" -gt "$hold" ]; then
-            echo "::error::INCONCLUSIVE — the token was valid for ${lifetime} minutes and this job held the session for ${hold}. Nothing here says what happens at expiry."
+
+          if [ "$held" -eq 0 ]; then
+            echo "::error::No probe line was printed, so there is nothing to classify."
             exit 1
           fi
-          echo "Conclusive: the session was held ${hold} minutes against a token valid for ${lifetime}."
+          if [ "$lifetime" -gt "$held" ]; then
+            echo "::error::INCONCLUSIVE — the token was valid for ${lifetime} minutes and the session was held ${held}. Nothing here says what happens at expiry."
+            exit 1
+          fi
+          echo "Conclusive: the session was held ${held} minutes against a token valid for ${lifetime}."
