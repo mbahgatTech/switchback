@@ -254,6 +254,12 @@ still authenticate with `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` and ca
 anything. That is the largest remaining credential in the system and it is a repository secret, so
 its blast radius is everyone with write access to this repository.
 
+The two unused solid edges are drawn from the object ids on both ends rather than from the names,
+because a role mapped to the wrong principal fails only at first use. `sbapp_func` carries
+`3db30cfd-…`, which is `func-switchback-ingest-37ywppu5p7fri`'s system-assigned identity;
+`sbapp_vercel` carries `c9bfba39-…`, which is `id-switchback-vercel-publisher`, the same identity
+Service Bus already trusts.
+
 Two things the diagram is meant to make obvious. The deploying service principal holds
 Contributor and therefore cannot reach the database at all — it writes ARM, not rows. And the CI
 identity holds **no Azure RBAC whatsoever**: its entire authority is the Postgres administrator
@@ -367,6 +373,32 @@ parameters Prisma reads off the URL today, and `datasourceUrl` cannot be combine
 at all. Losing that sizing silently is the outage recorded in that file's own comment, so the
 migration has to move it deliberately rather than inherit it.
 
+**Where each consumer's token comes from, once it does.** This is a design read off vendor
+documentation, not a measurement — nothing below has been run. The Function App and CI are the
+easy two: both run somewhere Azure will hand a managed identity a token unprompted, so the source
+is `DefaultAzureCredential` — what `apps/ingest-worker/src/service-bus.ts` already uses — scoped
+to `https://ossrdbms-aad.database.windows.net/.default`. Vercel is the one an earlier round
+recorded as an unsolved design problem, and it has an answer. Its OIDC token arrives as the
+per-request `x-vercel-oidc-token` header and is never in `process.env` on a deployed function, so
+a module-level pool cannot read it — but the pool does not need to. Vercel's OIDC reference gives
+the shape for exactly this, against Azure: construct a
+`ClientAssertionCredential(tenantId, clientId, getVercelOidcToken)` at module level and let the
+assertion callback run later, because `getVercelOidcToken()` reads the header off whatever
+request is in scope when it is called. The same page is explicit that the function must not be
+_called_ at module level. A physical connection is opened while a query is running, and a query
+is running inside a request, so the callback has a request to read.
+
+The residual risk is narrow and worth naming rather than discovering: a connection opened with a
+cold cache from outside any request — the cron drain, or `waitUntil` work that outlives the
+response — has no assertion to exchange and fails. A warm cache needs no assertion at all, and
+the 35-minute margin means only one connection in every 35 minutes of traffic asks for one, so
+the exposure is a deployment whose _only_ traffic for that long is background work. Capturing
+each request's header into a module-level holder closes even that, at the cost of holding a
+two-hour bearer token in memory. Either way this is the same assertion
+`publishIngestSignals` already exchanges for a Service Bus token, against the same identity —
+`id-switchback-vercel-publisher`, whose principal id `c9bfba39-…` is the one carried by the
+`sbapp_vercel` database role.
+
 Whether retiring connections is a correctness requirement or only hygiene turns on one question
 nobody should answer from memory: **is the token checked only at connect, or is a live session
 terminated when it expires?**
@@ -376,13 +408,24 @@ of the `Postgres identity` workflow holds one connection and queries it every fi
 eighty, printing `pg_backend_pid()` each round so a silent reconnect cannot pass as survival. Run
 31049068312 held backend pid 844034 from 21:32:50 to 22:52:53 UTC — same pid, same role, sixteen
 probes, no error. It proves the session is stable for eighty minutes and **nothing about expiry**,
-because the token it authenticated with reported `lifetime=1440min`: a managed identity gets 24
-hours, not the hour the documentation quotes for a user. The test never reached the boundary it was
+because the token it authenticated with reported `lifetime=1440min`: twenty-four hours, not the
+hour the documentation quotes for a user. The test never reached the boundary it was
 built to cross, and the job now exits non-zero and says so rather than reporting green.
 
-A GitHub-hosted job is capped at six hours, so waiting the token out is not available there. Either
-shorten the lifetime with an Entra token lifetime policy on that service principal, or hold the
-connection from somewhere without the cap.
+A GitHub-hosted job is capped at six hours, so waiting the token out is not available there — and
+the obvious shortcut is closed rather than merely unattempted. `AccessTokenLifetime` does bottom
+out at ten minutes, but `configurable-token-lifetimes` states that "configuring token lifetimes for
+managed identity service principals isn't supported", and every principal on this path is a managed
+identity. The 1440 minutes the soak measured is not a managed-identity quirk either: where client
+and resource both speak Continuous Access Evaluation, Entra deliberately issues a 24–28 hour token
+and revokes it in near real time instead of expiring it early.
+
+So two routes remain, both follow-on work. Hold a session for more than a day from a host without
+the runner cap. Or stand up a throwaway app registration — the one principal shape a ten-minute
+policy does attach to — federate it to this repository, make it an Entra principal on the server,
+soak it for twenty minutes and tear it down. The second is faster and answers the question
+directly, but an app registration is a Microsoft Graph object rather than an ARM one, so it cannot
+be declared in Bicep and must not be left behind.
 
 Microsoft's own documentation does not settle it either, which is worth writing down so the next
 person does not re-read it hoping. `security-entra-concepts` gives the lifetimes — "User tokens

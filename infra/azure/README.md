@@ -325,8 +325,9 @@ token to the role by object id, but the role's _name_ is the UPN, and psql sends
 - _`root certificate file "…/.postgresql/root.crt" does not exist`_, or a certificate-verify
   failure: `PGSSLROOTCERT` is unset or points at the wrong path for this distribution. This is the
   most common way the recipe above fails on a fresh machine.
-- _The token expired._ It is valid for about an hour for a user, so a session opened yesterday
-  needs a fresh one; re-run the `PGPASSWORD` line.
+- _The token expired._ Entra issues these with a randomised 60–90 minute life (one measured on
+  2026-08-05 carried 78 minutes), so a session opened yesterday needs a fresh one; re-run the
+  `PGPASSWORD` line.
 - _The password is rejected._ Check `az account show` is the right tenant before suspecting the
   database, and check `PGUSER` is the full UPN.
 - _`server closed the connection unexpectedly` while the server's `connections_failed` metric
@@ -337,10 +338,14 @@ token to the role by object id, but the role's _name_ is the UPN, and psql sends
   here: that action authenticates with `secrets.DIRECT_DATABASE_URL` and exists only to describe
   the repository secrets, so it is useless in exactly the case where the password is the problem.
 
-**This path has never been walked end to end by a person.** The owner's machine cannot reach 5432
-at all, so the block above is derived from the same token exchange the `inspect` job performs
-rather than from someone running it locally. Treat the first real use as a test of the recipe as
-well as of the database, and correct this file if it is wrong.
+**Everything above the `psql` line has now been run by a person; the `psql` line has not.** On
+2026-08-05 the owner's machine produced the UPN the recipe expects
+(`mazenbahgat_outlook.com#EXT#@mazenbahgatoutlook.onmicrosoft.com`) and a token for
+`https://ossrdbms-aad.database.windows.net` whose `oid` claim is
+`8c682736-d90b-4c33-a718-1916597894f8` — the same object id the server carries as its human Entra
+administrator, which is what the match is made on. What remains unproven is the connection itself,
+because that machine cannot reach 5432 at all. Treat the first real `psql` as a test of the recipe
+as well as of the database, and correct this file if it is wrong.
 
 Password authentication is still enabled, so `sbadmin` remains available as the second break-glass.
 Its password is not in ARM and not readable from Vercel, but it **is** in the `DIRECT_DATABASE_URL`
