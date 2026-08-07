@@ -34,6 +34,7 @@ import {
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
 import { decodeCursor, encodeCursor } from '../cursor';
+import { createInlineDrain } from '../inline-drain';
 import { readProfile } from '../profiles';
 import { summarySelect, toSummary } from '../trail-shape';
 import { deliberateServerError, publicProcedure, router } from '../trpc';
@@ -376,16 +377,18 @@ async function surveyIfWide(ctx: Context, bbox: BBox, coverage: CoverageResult) 
 }
 
 /**
- * Whether an inline drain is already running in this process. Load-bearing: `coverage.queued`
- * reports every outstanding tile, not just newly enqueued ones, so without this every poll
- * starts another drain. They do not race (`claimJobs` uses `FOR UPDATE SKIP LOCKED`) — they
- * pile more claimed work behind an Overpass client capped at two concurrent requests, so the
- * tile the reader is waiting on sinks down the queue with nothing reporting an error.
- *
- * Module state is the right scope: it guards this process's Overpass concurrency, and what
- * keeps separate instances from duplicating work is the lock in Postgres.
+ * The process's one inline drain. Module state is the right scope: it guards this process's
+ * Overpass concurrency, and what keeps separate instances from duplicating work is the lock in
+ * Postgres. `coverage.queued` reports every outstanding tile rather than only newly enqueued
+ * ones, so without the serialisation every poll would start another drain.
  */
-let inlineDrain: Promise<unknown> | null = null;
+const inlineDrain = createInlineDrain((keys) =>
+  drainIngest({
+    limit: Math.min(keys.length, MAX_INLINE_DRAIN),
+    workerId: 'inline',
+    dedupeKeys: keys,
+  }),
+);
 
 /**
  * Start the queued work now, if the platform will let us. An optimisation over the cron,
@@ -401,22 +404,9 @@ let inlineDrain: Promise<unknown> | null = null;
  * at all. See `drainJobs` and `DERIVED_QUEUE_WARN_DEPTH`.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil || queued.length === 0 || inlineDrain) return;
-
-  const work = drainIngest({
-    limit: Math.min(queued.length, MAX_INLINE_DRAIN),
-    workerId: 'inline',
-    dedupeKeys: queued.map(tileJobKey),
-  })
-    .catch(() => {
-      /* see ingest_jobs.lastError */
-    })
-    .finally(() => {
-      inlineDrain = null;
-    });
-
-  inlineDrain = work;
-  ctx.waitUntil(work);
+  if (!ctx.waitUntil) return;
+  const work = inlineDrain.request(queued.map(tileJobKey));
+  if (work) ctx.waitUntil(work);
 }
 
 // ---------------------------------------------------------------------------

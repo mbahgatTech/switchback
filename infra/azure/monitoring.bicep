@@ -25,9 +25,8 @@
 // file's `switchback-database` at resource-group scope, which is the only one whose number is
 // about Postgres.
 //
-// The second is the connection ceiling. Production connects to Neon's *pooled* endpoint
-// today; on Burstable there is no PgBouncer, so after cutover every client connection lands
-// on Postgres directly against a 414-connection ceiling, where the failure mode is
+// The second is the connection ceiling. Burstable has no PgBouncer, so every client connection
+// lands on Postgres directly against a 414-connection ceiling, where the failure mode is
 // `FATAL: sorry, too many clients already` on every request rather than a slowdown.
 //
 // **Cost.** Log Analytics bills on ingestion with a free allowance well above what a
@@ -134,8 +133,8 @@ output actionGroupId string = actionGroup.id
 The budget for **this workload**, evaluated against this resource group only.
 
 `main.bicep` also declares a subscription-scoped budget pegged to the monthly credit, and the
-two are not redundant — they answer different questions, and until this revision only the
-subscription one existed, which meant neither question was answered.
+two are not redundant — they answer different questions, and a subscription-scoped budget alone
+answers neither.
 
 The subscription is the thing that gets *disabled*: exceed the credit with the spending limit
 on and every resource in it is deallocated, including this server, regardless of whose spend

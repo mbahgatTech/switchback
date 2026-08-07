@@ -82,19 +82,50 @@ test.describe('Explore', () => {
 
     const row = page.locator('li[data-trail-id]').first();
     const name = (await row.getByRole('heading', { level: 3 }).innerText()).trim();
+
+    /*
+     * Armed before the click, and read from the frame the card is first drawn in. Measured
+     * afterwards instead, this passes on a card that covered the scale bar for a second and
+     * then stepped off it — which is the shape the defect took, and which nothing the reader
+     * sees distinguishes from a card that never covered it. A MutationObserver callback runs
+     * after the DOM is committed and before the browser paints, so the boxes it reads are the
+     * ones about to appear.
+     */
+    await page.evaluate(() => {
+      window.__pickCardFirstFrame = new Promise((resolve) => {
+        const box = (element: Element | null | undefined) => {
+          if (!element) return null;
+          const { x, y, width, height } = element.getBoundingClientRect();
+          return { x, y, width, height };
+        };
+        const observer = new MutationObserver(() => {
+          const card = document.querySelector('aside[aria-label="Selected trail"]');
+          if (!card) return;
+          observer.disconnect();
+          const pane = document.querySelector('[aria-label="Map of trails in the current view"]');
+          resolve({
+            card: box(card),
+            // Both bottom corners, because the card is full-width below `md` and reaches the
+            // zoom control as well as the scale bar.
+            chrome: ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right'].map((selector) => ({
+              selector,
+              box: box(pane?.querySelector(selector)),
+            })),
+          });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+      });
+    });
+
     await row.getByRole('button', { name: `Show ${name} on the map` }).click();
+    await expect(selectedCard(page)).toBeVisible();
 
-    const card = selectedCard(page);
-    await expect(card).toBeVisible();
-    const over = await card.boundingBox();
-    if (!over) throw new Error('the pick card is visible but has no box');
+    const first = await page.evaluate(() => window.__pickCardFirstFrame);
+    if (!first?.card) throw new Error('the pick card is visible but was drawn with no box');
 
-    // Both bottom corners, because the card is full-width below `md` and reaches the zoom
-    // control as well as the scale bar.
-    for (const chrome of ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right']) {
-      const under = await sheet.locator(chrome).first().boundingBox();
-      if (!under) throw new Error(`${chrome} is not drawn on the sheet`);
-      expect(overlaps(over, under), `the card covers ${chrome}`).toBe(false);
+    for (const { selector, box } of first.chrome) {
+      if (!box) throw new Error(`${selector} is not drawn on the sheet`);
+      expect(overlaps(first.card, box), `the card covers ${selector}`).toBe(false);
     }
 
     /*
@@ -172,6 +203,18 @@ interface Box {
   y: number;
   width: number;
   height: number;
+}
+
+/** What the page hands back from the frame the pick card is first drawn in. */
+interface FirstFrame {
+  card: Box | null;
+  chrome: { selector: string; box: Box | null }[];
+}
+
+declare global {
+  interface Window {
+    __pickCardFirstFrame?: Promise<FirstFrame>;
+  }
 }
 
 /**

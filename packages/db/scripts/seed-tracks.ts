@@ -90,7 +90,8 @@ function assertNotProduction(): void {
   }
   // These rows are *public* recordings attributed to named accounts — the one kind of seed data
   // strangers would see if it reached a live database. `postgres.database.azure.com` is
-  // production; neon.tech stays listed for as long as Neon remains the live rollback.
+  // production; the other three are managed-host shapes this repository has used or could
+  // plausibly point at.
   if (
     /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u.test(url) &&
     !process.env.SEED_ALLOW_REMOTE

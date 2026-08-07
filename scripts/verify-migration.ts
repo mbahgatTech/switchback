@@ -1,6 +1,7 @@
 /**
- * Proves the Azure database holds what Neon held, or says exactly which claim failed.
- * Neon is the retained rollback, so this comparator stays meaningful until it is retired.
+ * Compares a source PostgreSQL database against a target and says exactly which claim failed.
+ * Written for the 2026-07-30 Neon-to-Azure move, whose vocabulary it keeps; the source it names
+ * was deleted on 2026-08-07, so today its use is any restore, rebuild or future move.
  *
  *   npm run verify:migration
  *

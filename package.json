@@ -53,7 +53,8 @@
     "tsx": "^4.19.2",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.65.0",
-    "vitest": "^3.2.6"
+    "vitest": "^3.2.6",
+    "yaml": "^2.9.0"
   },
   "//audit": "npm audit reports GHSA-mh99-v99m-4gvg (brace-expansion DoS) with no fix available: the patch landed only in 5.0.8, and eslint reaches it through minimatch@3, which calls the v1 default export that v5 removed — overriding to ^5.0.8 clears the audit and breaks `npm run lint` with `expand is not a function`. Left unpinned deliberately. Exposure is dev-only: brace-expansion is reached from eslint's config globbing over patterns from eslint.config.mjs and argv, never from user input, and eslint ships in no bundle. Revisit when @eslint/config-array moves to a patched minimatch.",
   "//audit-uuid": "uuid@7 (GHSA, bounds check in v3/v5/v6) reaches the tree through xcode@3 under @expo/config-plugins, and is the single root cause of every remaining advisory — the other nine entries npm lists are just the @expo/* packages that depend on it. Left alone: it is only executed by `expo prebuild`, against our own app.config.ts, and it appears in no shipped bundle — verified by exporting the iOS bundle and grepping it. Forcing uuid@11 there would swap the API out from under a package that has not been updated for it, trading a theoretical dev-time issue for a broken prebuild.",

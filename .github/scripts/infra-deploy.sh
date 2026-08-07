@@ -34,7 +34,8 @@ case "$template" in
     # provider rejects a PUT restating them — see the parameter's description.
     #
     # `DEPLOY_DELETE_LOCK=false` because this workflow deploys as `id-switchback-infra-deploy`,
-    # which holds Contributor and nothing else. Contributor excludes
+    # which does not exist yet and, when created from main.bicep, would hold Contributor and
+    # nothing else. Contributor excludes
     # `Microsoft.Authorization/*/Write`, so a template declaring the resource group's
     # `CanNotDelete` lock fails preflight — `what-if` with `InvalidTemplateDeployment` and the
     # apply with `AuthorizationFailed` — whether or not an identical lock already exists, because

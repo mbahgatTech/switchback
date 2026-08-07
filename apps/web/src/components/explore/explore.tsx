@@ -1,6 +1,6 @@
 'use client';
 
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { useQuery } from '@tanstack/react-query';
 import type { BBox } from '@switchback/core';
@@ -13,9 +13,8 @@ import { CoverageNote } from './coverage-note';
 import { EMPTY_FACETS, type Facets } from './facets';
 import { FetchArea } from './fetch-area';
 import { Filters } from './filters';
-import { liftCeiling } from './lift';
+import { PickCard } from './pick-card';
 import { SearchBox } from './search-box';
-import { SelectedTrail } from './selected-trail';
 import { TrailCard } from './trail-card';
 import {
   exploreUrlSearch,
@@ -277,37 +276,7 @@ export function Explore({
     list.scrollBy({ top: delta, behavior: still ? 'auto' : 'smooth' });
   }, [selectedId, trails]);
 
-  /**
-   * How much of the bottom of the sheet the pick card is standing on, so MapLibre's own
-   * corner chrome can step up out of its way — the scale bar and the zoom pair both live down
-   * there. Measured rather than a constant: the card's height is whatever its title wraps to.
-   */
   const sheetRef = useRef<HTMLDivElement>(null);
-  const cardRef = useRef<HTMLDivElement>(null);
-  const [cardLift, setCardLift] = useState(0);
-  const picked = selected !== null;
-
-  useEffect(() => {
-    const sheet = sheetRef.current;
-    const card = cardRef.current;
-    if (!sheet || !card) {
-      setCardLift(0);
-      return;
-    }
-
-    const measure = () => {
-      const pane = sheet.getBoundingClientRect();
-      const room = pane.bottom - card.getBoundingClientRect().top;
-      setCardLift(Math.min(Math.max(0, Math.round(room)), liftCeiling(pane.height)));
-    };
-
-    // The card's own height is the usual reason to re-measure, but the ceiling is a fraction
-    // of the pane, so a pane that changes height moves it — both are watched.
-    const observer = new ResizeObserver(measure);
-    observer.observe(card);
-    observer.observe(sheet);
-    return () => observer.disconnect();
-  }, [picked]);
 
   return (
     <div className="grid min-h-0 flex-1 grid-rows-[45dvh_1fr] md:grid-cols-[minmax(340px,26rem)_1fr] md:grid-rows-1">
@@ -316,11 +285,12 @@ export function Explore({
         ref={sheetRef}
         /*
          * MapLibre's corner containers are positioned against `bottom: 0`, so a bottom margin
-         * of `--sb-card-lift` walks them clear of the pick card. Bottom-right only below `md`,
-         * where the card runs the full width; above it the card stops at 26rem.
+         * of `--sb-card-lift` walks them clear of the pick card, which measures itself into the
+         * variable. Bottom-right only below `md`, where the card runs the full width; above it
+         * the card stops at 26rem. The zero here is the no-card resting state, in a rule rather
+         * than a `style` prop so a re-render cannot clobber what the card wrote.
          */
-        style={{ '--sb-card-lift': `${cardLift}px` } as CSSProperties}
-        className="relative order-first [&_.maplibregl-ctrl-bottom-left]:mb-[var(--sb-card-lift)] max-md:[&_.maplibregl-ctrl-bottom-right]:mb-[var(--sb-card-lift)] md:order-last"
+        className="relative order-first [--sb-card-lift:0px] [&_.maplibregl-ctrl-bottom-left]:mb-[var(--sb-card-lift)] max-md:[&_.maplibregl-ctrl-bottom-right]:mb-[var(--sb-card-lift)] md:order-last"
       >
         {initial ? (
           <TrailMap
@@ -381,14 +351,7 @@ export function Explore({
         </div>
 
         {selected ? (
-          // Bottom-left, clear of the layer switcher at top-right. It stands on MapLibre's own
-          // bottom chrome, which steps up out of its way — see `--sb-card-lift` above.
-          <div
-            ref={cardRef}
-            className="clear-home-indicator pointer-events-none absolute bottom-xl left-lg right-lg flex md:right-auto"
-          >
-            <SelectedTrail trail={selected} onDismiss={() => setSelectedId(null)} />
-          </div>
+          <PickCard pane={sheetRef} trail={selected} onDismiss={() => setSelectedId(null)} />
         ) : null}
       </div>
 

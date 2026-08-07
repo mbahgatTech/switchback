@@ -1,9 +1,8 @@
 import { LONG_TRAIL, VESPER, expect, test } from './fixtures';
 
 /**
- * A trail's own page. The along-trail forecast talks to Open-Meteo over the network on
- * purpose: a stubbed forecast would only assert that our component renders an object we
- * handed it.
+ * A trail's own page. The along-trail forecast is served by `e2e/weather-stub.ts`, which
+ * `playwright.config.ts` pins the dev server at — see the note in `weather-stub.ts` for why.
  */
 
 test.describe('Trail detail', () => {
@@ -19,8 +18,8 @@ test.describe('Trail detail', () => {
      * means the pipeline dropped something rather than that the layout moved.
      *
      * Scoped to the description-list terms rather than page text: the page legitimately says
-     * "High point" twice, and a page-wide locator fails strict mode only once the live
-     * Open-Meteo call lands — a flake by the clock that reaches CI and nowhere else.
+     * "High point" twice, and a page-wide locator fails strict mode only once the forecast
+     * lands — a flake by the clock that reaches CI and nowhere else.
      */
     const terms = page.getByRole('term');
     for (const label of ['Length', 'Ascent', 'Descent', 'High point', 'Low point', 'Moving time']) {
@@ -82,7 +81,8 @@ test.describe('Trail detail', () => {
 test.describe('The section collar', () => {
   /**
    * Nothing in the collar above the drawing may be printed over anything else in it. The
-   * assertion is geometric because the words are a live forecast, and deliberately not scoped
+   * assertion is geometric because the words are a forecast read at the hour the suite runs —
+   * pinned readings, but sunrise, sunset and daylight still move — and deliberately not scoped
    * to callouts: anything that lands in the collar later inherits the same rule.
    */
   test('never prints one annotation over another, however early the high point comes', async ({
@@ -93,10 +93,10 @@ test.describe('The section collar', () => {
     const section = page.getByRole('img', { name: /Elevation profile/i }).first();
     await expect(section).toBeVisible();
     // The callouts are the forecast, so they arrive with it rather than with the document. A lower
-    // bound, not an exact count: `.collar` is a typeface, and the freezing-level annotation wears it
-    // too while being drawn inside the plot — so the exact number depends on whether the forecast
-    // puts the freezing level below the summit, which is a function of hemisphere and season. The
-    // overprint check below reads the collar off the geometry instead, and is the real guard.
+    // bound, not an exact count: `.collar` is a typeface worn by more than the callouts — the
+    // freezing-level annotation wears it too, inside the plot — and how many appear is a property
+    // of the forecast, not of the layout. The overprint check below reads the collar off the
+    // geometry instead, and is the real guard.
     await expect
       .poll(async () => section.locator('text.collar').count(), { timeout: 60_000 })
       .toBeGreaterThanOrEqual(2);

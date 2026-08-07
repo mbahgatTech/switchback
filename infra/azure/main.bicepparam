@@ -18,9 +18,9 @@
 // deleting the file** — it cannot be read back out of ARM, out of a GitHub secret, or out of
 // Vercel, and a redeploy has to pass the same value. See README.md, "Deploying".
 //
-// Note `az` will not accept a `.bicepparam` alongside any other `--parameters` argument, so
-// there is no second file to merge in. Everything non-secret lives here; the secret lives in
-// the environment.
+// A `.bicepparam` may be combined with further `--parameters name=value` overrides, and
+// `.github/scripts/infra-deploy.sh` relies on it — it passes this file and `deployDatabase=false`
+// in the same command. Everything non-secret lives here; the secret lives in the environment.
 
 using './main.bicep'
 
@@ -79,22 +79,48 @@ param serverNamePrefix = 'psql-switchback-prod'
 //
 // Epistemic status: reasoned from the permission set, not measured — confirming it means
 // running a deployment against the production database, which is not a thing to do to settle a
-// comment. What *is* measured is the permission set itself. The RG-scope permissions API
-// returns exactly one entry for this principal — `actions: ["*"]`, with both
-// `Microsoft.Authorization/*/Write` and `Microsoft.Authorization/*/Delete` in `notActions` —
-// and `az role assignment list --assignee 3ac53469-d72f-4813-b5e8-4bbf937cc76d --all
-// --include-inherited` returns one row, Contributor at subscription scope, with nothing
-// compensating. The error quoted above is the same check failing for the same reason.
+// comment. What *is* measured is the permission set itself, and it is **two** assignments, not
+// one. `az role assignment list --assignee 3ac53469-d72f-4813-b5e8-4bbf937cc76d --all
+// --include-inherited`, re-run 2026-08-07:
+//
+//   Contributor                          /subscriptions/5cb9e7c3-…        2026-03-01T22:12:04Z
+//   Role Based Access Control Administrator
+//                                        …/rg-switchback-prod-northcentralus  2026-08-03T16:53:36Z
+//
+// Contributor is the one the error above comes from: `actions: ["*"]` with both
+// `Microsoft.Authorization/*/Write` and `Microsoft.Authorization/*/Delete` in `notActions`.
+// The second grants `Microsoft.Authorization/roleAssignments/write` and `/delete`, `*/read` and
+// `Microsoft.Support/*`, with empty `notActions` — and **no condition**, on the role definition
+// (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) or on the assignment
+// (`8baf9393-029a-4226-a882-992a8146d775`). It exists because a Contributor cannot write the role
+// assignments the templates declare; `infraContributor` in main.bicep is one, and the queue grants
+// on branch `feat/servicebus-ingest` are more. It was created by the owner's own object id,
+// `8c682736-…`, the same one declared as the Entra administrator below.
+//
+// **State the consequence rather than let it be inferred.** Role Based Access Control
+// Administrator does not carry `Microsoft.Authorization/locks/write`, so the override above is
+// still needed and the paragraph before it still holds. But an unconditioned
+// `roleAssignments/write` at this scope lets the principal assign itself Owner here, and Owner
+// carries `Microsoft.Authorization/*` — including `locks/delete`. So the delete lock is a control
+// against accident and against any principal holding only Contributor. It is **not** a control
+// against this principal, and an earlier revision of this comment claiming it was is wrong.
+//
+// Constraining it is an owner decision because it can break the deploy path, so it is written
+// down rather than done: replace the assignment with one carrying the standard
+// `constrainRoles` condition, which permits assigning only the roles named in it.
+//
+//   az role assignment delete --ids <the assignment id above>
+//   az role assignment create --assignee 3ac53469-d72f-4813-b5e8-4bbf937cc76d \
+//     --role "Role Based Access Control Administrator" \
+//     --scope /subscriptions/5cb9e7c3-…/resourceGroups/rg-switchback-prod-northcentralus \
+//     --condition-version 2.0 --condition "<constrainRoles, listing only the roles the
+//       templates assign>"
 //
 // An Owner placing the lock by hand needs the name to match this template exactly, or a later
 // deployment adds a second lock beside the first:
 //
 //   az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
 //     --resource-group rg-switchback-prod-northcentralus --notes "<copy lockNotes from main.bicep>"
-//
-// Note the `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` — also
-// stops a Contributor removing the lock afterwards. The principal the lock defends against
-// cannot lift it, which is the entire point.
 param deployDeleteLock = bool(readEnvironmentVariable('DEPLOY_DELETE_LOCK', 'true'))
 
 
@@ -266,8 +292,8 @@ param tags = {
   sourcePath: 'infra/azure'
   costCenter: 'vs-enterprise-monthly-credit'
   dataClassification: 'user-content'
-  // Read by anyone opening the portal: Neon is still live and is the way back.
-  rollback: 'neon-us-east-1-retained'
+  // Read by anyone opening the portal: what the recovery is if this server is lost.
+  rollback: 'azure-pitr-14d-lrs-new-server'
 }
 
 // The only secret, and it is not stored here — see the header. Empty when the variable is unset,

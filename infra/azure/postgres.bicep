@@ -502,12 +502,12 @@ resource diagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' 
 // parameters un-redeployable until they are updated. It should be a message, not an
 // archaeological finding.
 //
-// `active_connections` — the number that distinguishes "the migration is fine" from "the
-// migration is fine until the next traffic spike". Production currently connects through
-// Neon's *pooled* endpoint; on Burstable there is no PgBouncer, so after cutover every
-// client connection lands on Postgres directly against a ceiling of 414 user connections.
-// 300 is the same threshold README.md nominates as the signal to escalate to General
-// Purpose, and until now it was a number in prose that nothing measured.
+// `active_connections` — the number that distinguishes "this is fine" from "this is fine
+// until the next traffic spike". Burstable has no PgBouncer, so every client connection lands
+// on Postgres directly against a ceiling of 414 ordinary user connections: `max_connections`
+// is 429, less 10 `superuser_reserved_connections` and 5 `reserved_connections`, all three read
+// from `pg_settings` on the live server. 300 is the same threshold README.md nominates as the
+// signal to escalate to General Purpose, which is the tier that brings a pooler.
 // ---------------------------------------------------------------------------------------
 
 resource storageAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
@@ -676,10 +676,10 @@ output pooledPort int = pooledPort
 // ---------------------------------------------------------------------------------------
 // **Why `sslmode=verify-full` *and* `sslaccept=strict`, and not either alone.**
 //
-// `sslmode=require` — which is what these templates said until this revision — encrypts the
-// session and then accepts whatever certificate it is handed. No root-CA check, no hostname
-// check. `require_secure_transport = ON` above does not help with this: it forces the client
-// to use TLS, it cannot authenticate the *server* to the client. Against a firewall spanning
+// `sslmode=require` encrypts the session and then accepts whatever certificate it is handed.
+// No root-CA check, no hostname check. `require_secure_transport = ON` above does not help
+// with this: it forces the client to use TLS, it cannot authenticate the *server* to the
+// client. Against a firewall spanning
 // all of IPv4 that is the wrong way round, because the threat model stated above is that the
 // credential leaks — and an unauthenticated TLS handshake is a way for it to leak. Anyone who
 // can answer for `*.postgres.database.azure.com` on the path between Vercel's AWS runtime and
