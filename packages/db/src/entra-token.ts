@@ -32,27 +32,16 @@ export const CONNECT_BUDGET_MS = 30_000;
 export const CONNECTION_LIFETIME_S = 20 * 60;
 
 /**
- * Renew this far ahead of expiry.
+ * Renew this far ahead of expiry: enough for the handshake plus skew, and no more.
  *
- * The token is validated at connect and never again — measured on the live server, run
- * 31062754668: a connection opened with a token still served 19.2 minutes past that token's
- * expiry, on the same backend pid. So the margin only has to cover the handshake plus skew,
- * not the life of the connection the handshake produces.
- *
- * It cannot usefully be larger. `source()` is `credential.getToken()`, which answers from
- * MSAL's cache; MSAL treats a token as expired only inside its own five-minute offset, so
- * asking earlier than that returns the token already held. A margin past that floor renews
- * nothing and merely asks more often.
+ * The token is checked at connect and never again, and MSAL will not mint one earlier than its own
+ * five-minute floor — both measured, both in docs/architecture.md under the token lifecycle.
  */
 export const RENEW_MARGIN_MS = CLOCK_SKEW_MS + CONNECT_BUDGET_MS;
 
 /**
- * How long a fruitless acquisition suppresses the next attempt.
- *
- * Two shapes need it. A fast-failing Entra would otherwise get one request per new physical
- * connection — the per-principal throttling the in-flight collapse below avoids, arriving by
- * the other door. And past `refreshAfterTimestamp` MSAL refreshes in the background while
- * returning the token it already has, so every connection would ask again until it lands.
+ * How long a fruitless acquisition suppresses the next attempt, so a fast-failing Entra or a
+ * background MSAL refresh gets one retry rather than one per new physical connection.
  */
 export const RENEW_RETRY_BACKOFF_MS = 10_000;
 

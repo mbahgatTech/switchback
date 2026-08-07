@@ -14,8 +14,8 @@ flowchart LR
   A["Azure Postgres 17 + PostGIS — live<br/>psql-switchback-prod-37ywppu5p7fri<br/>rg-switchback-prod-northcentralus"]
   N["Neon — retained rollback<br/>idle, schema frozen at cutover"]
 
-  V -->|"sbapp, DML only"| A
-  CI -->|"sbadmin, DDL"| A
+  V -->|"sbapp, password, DML only"| A
+  CI -->|"id-switchback-postgres-ci, Entra token, DDL"| A
   V -.->|"rollback: repoint and redeploy, 3-5 min"| N
 ```
 
@@ -29,10 +29,14 @@ flowchart LR
   recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately.
   It now lives in **two** verified places: a file on the owner's machine readable only by the
   owner (`LOQ\mazen:(R,W)`, inheritance stripped), and the `DIRECT_DATABASE_URL` repository
-  secret, which `ci.yml` and the backup workflow both read. The second is the one that matters for
-  blast radius: anyone with write access to this repository can add a workflow step that prints it,
-  so compromise of repository write access is compromise of the database administrator. It remains
-  unreadable from ARM, so a redeploy still has to be given the same value. A copy in the owner's
+  secret. **Nothing reads that secret any more** — the `migrate` job mints an Entra token instead,
+  and the backup workflow it also fed has been deleted — so it is now a stored production
+  administrator credential with no consumer. It still sets the blast radius while it exists:
+  anyone with write access to this repository can add a workflow step that prints it, so
+  compromise of repository write access is compromise of the database administrator. Delete it and
+  `DATABASE_URL` at step 7 of the cutover, not before — until then they are the way back if the
+  token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
+  given the same value. A copy in the owner's
   password manager was claimed here previously; nobody observed it being made, so it is not counted.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
   Microsoft Entra administrator; see [Connecting by hand, with no
@@ -217,7 +221,7 @@ ground, not a home.
 | Backups           | 14 days, locally redundant, no geo-redundancy                   |
 | High availability | None                                                            |
 | Database          | `switchback`, collation `C.UTF-8` (matched to Neon)             |
-| Admin login       | `sbadmin` (migration/CI); app connects as `sbapp`               |
+| Admin login       | `sbadmin`, password, unused by CI; app connects as `sbapp`      |
 | Network           | Public, one firewall rule spanning the internet                 |
 | Extensions        | `postgis`, `pg_trgm`, `btree_gist` allow-listed                 |
 | Delete lock       | `switchback-prod-no-delete`, `CanNotDelete`, **in place**       |
@@ -282,9 +286,18 @@ machine with no PostgreSQL client installed.
   federated credential on `id-switchback-postgres-ci` trusts
   `repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/master` and nothing else, so a
   dispatch from any other branch fails at `azure/login` with `AADSTS700213` quoting a subject that
-  appears in no template — which reads as a broken identity rather than a wrong branch. This path
-  has been run: run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3 and reported
-  `is_admin|true`, `server_version|17.10` and the full role and row-count census.
+  appears in no template — which reads as a broken identity rather than a wrong branch. The token
+  path itself has been run: run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3
+  and reported `is_admin|true`, `server_version|17.10` and the full role and row-count census.
+  **That run used a branch credential that has since been deleted, and the `github-master`
+  credential this instruction depends on has never been exercised** — every successful `inspect`
+  ran on `feat/credential-free-postgres` or a worktree branch, and the one dispatch attempted from
+  a feature branch after those credentials were removed failed with `AADSTS700213`. What is proven
+  is that the identity can reach the database and is an administrator; what is unproven is the
+  `master` ref exchange. `postgres-entra.yml` is added to `master` by this change, so the first
+  dispatch from `master` is also the first test of it. Do that while passwords still work — step 6
+  of the cutover requires it — rather than discovering it when there is no password to fall back
+  on.
 
 Do not use `connections_failed` to decide whether the server saw an attempt. It is not zero on this
 server and never has been: measured over 2026-08-05T12:00Z–2026-08-06T12:00Z it records 35 failures
@@ -898,11 +911,31 @@ script, `npm run dev` and the e2e suite stop working at step 7 with a connection
 explanation.
 
 After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
-server refuses password authentication outright. Keep the role's password hash rather than clearing
-it — inert while `passwordAuth` is Disabled, and it makes re-enabling one ARM property flip instead
-of a flip plus a credential reset needing an administrator who may be the reason you are there. From
-step 7 onward the template needs no password at all: `administratorLoginPassword` defaults to empty
-and is omitted from the payload, so the accidental-rotation hazard is gone rather than dormant.
+server refuses password authentication outright. From step 7 onward the template needs no password
+at all: `administratorLoginPassword` defaults to empty and is omitted from the payload, so the
+accidental-rotation hazard is gone rather than dormant.
+
+**Rolling step 7 back — set `passwordAuthEnabled = true` and export the password with it.**
+
+```bash
+export PGADMIN_PASSWORD="$(cat ~/.sb-pgadmin)"   # the recorded value; without this the deploy
+                                                 # omits the property and writes no password
+```
+
+Then deploy with `passwordAuthEnabled = true`. The export is not optional politeness.
+`writeAdministratorPassword` in `postgres.bicep` is `passwordAuthEnabled && !empty(...)`, so a
+reversal run with no password exported omits `administratorLoginPassword` from the payload
+entirely and **still reports success** — leaving password authentication switched on over whatever
+verifier the server happens to hold. Exporting the recorded value makes the reversal write a
+credential known to work, which costs nothing if the old verifier survived and is the whole
+rollback if it did not.
+
+Whether the SCRAM verifier survives a Disable → Enable cycle is **UNVERIFIED**. Nothing in this
+repository establishes it either way, Microsoft's documentation does not say, and measuring it
+needs a throwaway Flexible Server the subscription cannot currently afford (~$57/month, and it is
+already over its credit with the spending limit on). Treat the recorded password as the thing that
+makes the reversal work rather than as a formality, and do not clear the hash on the way in — an
+inert hash costs nothing while `passwordAuth` is Disabled and is the cheap half of the way back.
 
 **Never deploy this resource group in Complete mode.** Incremental deployments leave undeclared
 children alone, so the `administrators` entries survive a run with an accidentally-empty

@@ -100,6 +100,10 @@ var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators) || !empty(ciAd
 // redeploy carrying a different one silently rotates the live credential; omitting the property
 // leaves it alone. This is what makes `passwordAuthEnabled: false` deployable with no password
 // held anywhere, and what stops a routine redeploy touching the credential in the meantime.
+//
+// The edge that bites is the reversal: turning password auth back on without exporting the
+// password omits the property and still succeeds, so the flip has to carry the credential with
+// it. The rollback recipe in infra/azure/README.md does.
 var writeAdministratorPassword = passwordAuthEnabled && !empty(administratorLoginPassword)
 
 // ---------------------------------------------------------------------------------------

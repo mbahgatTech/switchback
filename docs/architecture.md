@@ -256,8 +256,33 @@ Postgres, Azure RBAC and every policy downstream see one caller. Preview writing
 carried forward rather than created by this — preview already holds `DATABASE_URL` pointing at the
 production server — but the consolidation does remove the ability to revoke one consumer without
 the others. The two roles it replaces hold identical privileges, so nothing that was ever
-differentiated is lost; what is lost is attribution, and `application_name` is what restores it.
-Attribution, not a boundary: any client can set it to anything.
+differentiated is lost in _privilege_; what is lost there is attribution, and `application_name` is
+what restores it. Attribution, not a boundary: any client can set it to anything.
+
+**What does change is how the credential is obtained, and that is the part worth deciding on.**
+Today a preview deployment reaches production Postgres by holding a secret — `DATABASE_URL`
+carrying `sbapp`'s password, scoped by Vercel to the Preview environment. After the cutover it
+reaches production by being a preview deployment: the OIDC assertion is injected by the platform as
+the `x-vercel-oidc-token` request header, not as an environment variable, so it is not subject to
+Vercel's env-var scoping, and the other three inputs — client id `cd074036-4c63-4d1e-8ebb-72f448bb95a2`,
+the tenant id and the server hostname — are public identifiers that appear in this repository. The
+failure scenario therefore changes shape rather than size: an actor who gets attacker-controlled
+code into any preview deployment no longer needs to extract a scoped secret to read and write
+production rows. Whether a fork's pull request can produce such a deployment depends on the Vercel
+project's `gitForkProtection` setting, which is **UNVERIFIED** here — the API returned 403 to the
+token available.
+
+**The cheapest mitigation, if that is judged unacceptable: move the preview credential, not the
+architecture.** Delete the `vercel-switchback-preview` federated credential from this identity and
+place it on a second UAMI with its own Postgres role — `SELECT`-only, or its own database. That is
+one identity, one credential move and one role, and it costs nothing per month. It deliberately
+re-opens the multiplicity this change exists to remove, so it is worth doing only on its own merits.
+The cheaper half, worth doing regardless, is to stop preview pointing at the production database at
+all; that is a decision this change does not make, because folding it in would let a real question
+ride along unexamined. What is **not** a mitigation, in principle rather than in practice: no
+Postgres role, `pg_hba` entry or RLS predicate can tell the two Vercel environments apart, because
+the FIC subject does not survive the token exchange — only the identity's object id does. Entra's
+sign-in logs can, which makes it forensics, not enforcement.
 
 **The consolidation is declared, not yet performed, and the diagram says so.** What is deployed is
 the identity and its two federated credentials. What is not:
@@ -272,20 +297,22 @@ the identity and its two federated credentials. What is not:
 - The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and still holds
   both Service Bus grants under it. Moving it is a change to `infra/azure/ingest.bicep`, which
   lives on `feat/servicebus-ingest` rather than here.
-- The shared identity is declared with **Data Sender** on the ingest queue and no Data Receiver.
-  Receive is granted when the worker actually moves, by the template that owns the queue. Granting
-  it earlier would give every Vercel deployment, preview included, the ability to drain the
-  production ingest queue for a capability nothing exercises.
+- Neither Service Bus grant is declared by any template on this branch. `ingest.bicep` owns the
+  namespace and the queue, and therefore the grants scoped to them, and it lives on
+  `feat/servicebus-ingest` rather than here. Live today, read with `az role assignment list --all`,
+  the shared identity holds **both** Data Sender (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data
+  Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) on `ingest-jobs`. So the IaC in this branch
+  understates what the principal can do on that queue, and an audit run from the repository alone
+  reaches the wrong answer — which is why it is written here.
 
-  One live assignment does not match that yet. `0090d328-0cee-592f-8359-e4cc64940694` grants the
-  shared identity Data Receiver on `ingest-jobs`; it was deployed before the grant was moved out of
-  this template, and incremental ARM does not delete what a template stops declaring. Revoking it
-  was attempted and refused: the delete returns `ScopeLocked` naming
-  `switchback-prod-no-delete`, the resource group's `CanNotDelete` lock, so it is live today and
-  lifting that lock is an Owner action. It is inert — no Service Bus receive code exists in this
-  repository — and it becomes real capability only when the worker's code merges. Either revoke it
-  then, or let `ingest.bicep` adopt it in the same change that moves the worker: the `guid()` inputs
-  are identical, so the assignment it would create is this one.
+  Receiver is the half that matters. It was deployed before the grant moved out of this template,
+  and incremental ARM does not delete what a template stops declaring, so removing it from Bicep is
+  not a revocation. Revoking it was attempted and refused: the delete returns `ScopeLocked` naming
+  `switchback-prod-no-delete`, the resource group's `CanNotDelete` lock, and lifting that is an
+  Owner action. It is inert while no Service Bus receive code exists in this repository, and it
+  becomes real capability — for every Vercel deployment, preview included — the moment the worker's
+  code merges. Either revoke it before then, or let `ingest.bicep` adopt it in the change that moves
+  the worker: the `guid()` inputs are identical, so the assignment it would create is this one.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
 because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
@@ -594,10 +621,12 @@ session and OAuth tokens it exposed should be treated as compromised. Whether th
 should be public at all is an open owner decision, and every risk judgement in this document
 assumes it is.
 
-The certificate-verification gap that used to sit here is closed by the wiring above, but only on
-the Entra path: under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and
-hostname check. In `password` mode Prisma still receives `sslmode=verify-full` as a parameter it
-does not read, so until a consumer moves, its TLS is unverified.
+The certificate-verification gap that used to sit here is closed on two paths and open on one.
+Under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and hostname check, and
+CI's schema push gets `sslaccept=strict` alongside `sslmode=verify-full` from
+`.github/scripts/pg-token-url.sh` — both parameters, because Prisma reads only the second and
+libpq only the first. In `password` mode Prisma still receives `sslmode=verify-full` alone, a
+parameter it does not read, so until a consumer moves its TLS is unverified.
 
 ## Design decisions, recorded once
 

@@ -4,7 +4,8 @@
 # **It does not.** Run 31062754668 held two connections 79 minutes against a 60-minute token and
 # both were serving 19 minutes past expiry — see the token lifecycle section of
 # docs/architecture.md for the log. The question is settled; this workflow is kept so the
-# measurement can be repeated rather than believed.
+# measurement can be repeated rather than believed. Repeating it is not a bare dispatch — the
+# principals it authenticates as were deleted, so the Graph setup below has to be done first.
 #
 # It could not be answered with the CI managed identity because Azure issues managed-identity
 # tokens with a 24-hour life and a GitHub runner is capped at six. A throwaway **app

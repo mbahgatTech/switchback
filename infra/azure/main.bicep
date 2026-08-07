@@ -328,10 +328,22 @@ param minTlsVersion string = 'TLSv1.2'
 @description('Name of the user-assigned managed identity CI reaches Postgres with.')
 param ciIdentityName string = 'id-switchback-postgres-ci'
 
+@description('Name of the user-assigned managed identity the Infrastructure workflow deploys as.')
+param infraIdentityName string = 'id-switchback-infra-deploy'
+
 @description('''
-Name of the user-assigned managed identity every runtime client authenticates as — Vercel
-production, Vercel preview and the ingest worker. See runtime-identity.bicep for why one
-identity serves all three and what that costs.
+Whether to grant that identity Contributor on this subscription. Off until the owner decides that
+a public repository's `master` workflows may write production infrastructure; see
+infra-identity.bicep. The identity and its federated credential are created either way, so
+flipping this is the only step between a compile-only pipeline and a deploying one.
+''')
+param grantInfraIdentityContributor bool = false
+
+@description('''
+Name of the user-assigned managed identity the runtime clients are being consolidated onto —
+Vercel production, Vercel preview and the ingest worker. Declared, not yet in force; see
+runtime-identity.bicep for what is live today, why one identity serves all three, and what
+that costs.
 ''')
 param runtimeIdentityName string = 'id-switchback-vercel-publisher'
 
@@ -461,6 +473,9 @@ resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   tags: tags
 }
 
+// Built-in Contributor. A literal because role definition ids are fixed across every tenant.
+var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
+
 // ---------------------------------------------------------------------------------------
 // The delete lock.
 //
@@ -555,6 +570,39 @@ module runtimeIdentity 'runtime-identity.bicep' = {
     vercelTeamSlug: vercelTeamSlug
     vercelProjectName: vercelProjectName
     tags: tags
+  }
+}
+
+module infraIdentity 'infra-identity.bicep' = {
+  name: 'switchback-infra-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: infraIdentityName
+    repository: repository
+    branch: 'master'
+    tags: tags
+  }
+}
+
+// Subscription scope because `main.bicep` declares the resource group itself, so a group-scoped
+// Contributor could deploy every other template but never this one.
+//
+// Off by default, and that is the whole point of the parameter. Creating the identity above is
+// reversible and grants nothing; this is the write that lets any workflow run on `master` of a
+// **public** repository change production infrastructure. Turn it on deliberately, having decided
+// that merge review on `master` is the control you want standing between a pull request and the
+// estate.
+// The name is keyed off `infraIdentityName`, not the principal id: ARM requires a role
+// assignment's name to be computable before the deployment starts, and a module output is not.
+// `principalType: 'ServicePrincipal'` is what stops the assignment failing on a freshly created
+// identity that has not yet replicated through Entra.
+resource infraContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (grantInfraIdentityContributor) {
+  name: guid(subscription().id, infraIdentityName, contributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+    principalId: infraIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -810,3 +858,10 @@ Object id of the shared runtime identity. What `sbapp_runtime` is mapped to, and
 `postgres-entra.yml` asserts the live role against.
 ''')
 output runtimeIdentityPrincipalId string = runtimeIdentity.outputs.principalId
+
+@description('''
+Client id of the infrastructure deployment identity — the `AZURE_INFRA_CLIENT_ID` repository
+variable `.github/workflows/infrastructure.yml` reads. Deploying is still gated on
+`grantInfraIdentityContributor`.
+''')
+output infraIdentityClientId string = infraIdentity.outputs.clientId

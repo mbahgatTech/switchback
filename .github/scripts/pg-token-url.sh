@@ -19,7 +19,12 @@ echo "::add-mask::$_token"
 _encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read().strip(), safe=""))' <<< "$_token")"
 echo "::add-mask::$_encoded"
 
-_url="postgresql://${PGUSER}:${_encoded}@${PGHOST}:5432/${PGDATABASE}?sslmode=verify-full"
+# Both TLS parameters, because the two readers of this string honour different ones and each
+# ignores the other's. Prisma — `db push` and `apply-spatial.ts`, the only consumers here — reads
+# `sslaccept` and silently discards `sslmode`, so `verify-full` alone would leave an administrator
+# token crossing an unverified session. `sslmode` stays for any libpq reader. See the measurement
+# in infra/azure/postgres.bicep.
+_url="postgresql://${PGUSER}:${_encoded}@${PGHOST}:5432/${PGDATABASE}?sslmode=verify-full&sslaccept=strict"
 echo "::add-mask::$_url"
 
 export DATABASE_URL="$_url"

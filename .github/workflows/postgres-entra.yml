@@ -50,9 +50,9 @@ env:
   PGUSER: id-switchback-postgres-ci
   AZURE_CLIENT_ID: 81c76484-bea1-4a75-8e86-2ccb3093e753
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
-  # Object id of the shared runtime identity — `id-switchback-vercel-publisher`, which now
-  # serves Vercel and the Function App alike. Not a secret; it is a Bicep output and is in the
-  # portal, and it is what the database role is matched against.
+  # Object id of the shared runtime identity — `id-switchback-vercel-publisher`, which Vercel
+  # and the Function App are being consolidated onto. Not a secret; it is a Bicep output and is
+  # in the portal, and it is what the database role is matched against.
   #
   # A literal rather than read from `az` at run time, deliberately: `id-switchback-postgres-ci`
   # holds **zero** Azure RBAC, which is the property that makes a leak of it unable to touch

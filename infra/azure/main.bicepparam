@@ -1,9 +1,9 @@
 // Non-secret parameters for infra/azure/main.bicep. Committed on purpose.
 //
-// The password is not in this file and must never be. `administratorLoginPassword` is
-// declared `@secure()` with no default in main.bicep, and a `.bicepparam` file has to assign
-// every required parameter — so it is read from the environment instead, which is the one
-// place that is neither this file, nor argv, nor a log line:
+// The password is not in this file and must never be. `administratorLoginPassword` is declared
+// `@secure()` in main.bicep and defaults to empty, so it is not required and a deployment that
+// supplies nothing leaves the live credential untouched. It is read from the environment when it
+// is supplied at all, which is the one place that is neither this file, nor argv, nor a log line:
 //
 //   openssl rand -hex 32 > "$TMP/pgpw"
 //   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"

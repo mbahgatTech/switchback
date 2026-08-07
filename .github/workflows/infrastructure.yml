@@ -12,6 +12,12 @@
 # fork's pull request assume an identity with Contributor on production, which is why it is not
 # done here by default.
 #
+# **Today this workflow compiles and nothing more.** The identity it deploys as is declared in
+# `infra/azure/infra-identity.bicep` but its Contributor grant is off (`grantInfraIdentityContributor`
+# defaults to false) and the two repository variables below are unset, so `preview` and the apply
+# step skip on every run. The `report` job says so on each run rather than letting the skip pass
+# for a pass. Turning it on is three steps, listed there.
+#
 # **`--mode Incremental`, stated rather than defaulted.** Complete mode deletes what the template
 # stops declaring, and the `administrators` children of the Postgres server are declared from a
 # parameter that can be empty. A Complete-mode run with an empty `entraAdministrators` would
@@ -92,8 +98,16 @@ jobs:
     if: github.event_name != 'pull_request' && vars.AZURE_INFRA_CLIENT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Applying gets a reviewable environment; previewing does not need one. The condition is on
-    # the steps below rather than the job so the change list is produced either way.
+    # Applying runs under the `production` environment; previewing does not need one. The
+    # condition is on the steps below rather than the job so the change list is produced either
+    # way.
+    #
+    # **That environment carries no protection rules today** — `gh api
+    # repos/mbahgatTech/switchback/environments` returns `protection_rules: []` and
+    # `deployment_branch_policy: null` — so naming it buys a deployment record and a place to hang
+    # a control, not the control itself. An apply is gated by nothing but who can dispatch. Add a
+    # required reviewer and a `master`-only branch policy before turning this on; the flag that
+    # makes applying possible at all is `grantInfraIdentityContributor` in main.bicep.
     environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.apply) && 'production' || '' }}
 
     steps:
@@ -121,22 +135,31 @@ jobs:
 
   report:
     name: deployment identity
-    needs: build
-    if: github.event_name != 'pull_request'
+    needs: [build, preview]
+    # `always()` because the point of this job is to speak when `preview` was skipped, and a
+    # skipped dependency would otherwise skip this too.
+    if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Reports the preview job's actual result rather than re-reading the variables it gated on.
+      # Inferring "what-if ran" from the same condition that decided whether to run it would claim
+      # success for a job that started and failed.
       - name: Say whether this repository can deploy infrastructure
+        env:
+          PREVIEW_RESULT: ${{ needs.preview.result }}
         run: |
           set -euo pipefail
-          if [ -n "${{ vars.AZURE_INFRA_CLIENT_ID }}" ] && [ -n "${{ vars.AZURE_SUBSCRIPTION_ID }}" ]; then
-            echo "AZURE_INFRA_CLIENT_ID and AZURE_SUBSCRIPTION_ID are set; what-if ran."
-            exit 0
-          fi
+          case "$PREVIEW_RESULT" in
+            success) echo "what-if ran and the change list is in the 'what-if' job." ; exit 0 ;;
+            failure|cancelled)
+              echo "::warning::what-if ran and did not succeed — read the 'what-if' job."
+              exit 0 ;;
+          esac
           echo "::notice::Infrastructure deployment is not configured, so what-if was skipped."
-          echo "::notice::Set the AZURE_INFRA_CLIENT_ID and AZURE_SUBSCRIPTION_ID repository"
-          echo "::notice::variables to a user-assigned identity holding Contributor on"
-          echo "::notice::$RESOURCE_GROUP, with a federated credential trusting this"
-          echo "::notice::repository's master ref. Granting a public repository's workflows"
-          echo "::notice::Contributor on production is a decision to make on purpose — see"
-          echo "::notice::infra/azure/README.md."
+          echo "::notice::Deploy main.bicep once to create id-switchback-infra-deploy and its"
+          echo "::notice::federated credential, then set grantInfraIdentityContributor=true to"
+          echo "::notice::grant it Contributor, and set the AZURE_INFRA_CLIENT_ID (the"
+          echo "::notice::infraIdentityClientId output) and AZURE_SUBSCRIPTION_ID repository"
+          echo "::notice::variables. Granting a public repository's workflows Contributor on"
+          echo "::notice::production is a decision to make on purpose — see infra/azure/README.md."
