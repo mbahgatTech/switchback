@@ -158,8 +158,7 @@ not have it. Contributor's `notActions` — read back from this subscription wit
   Microsoft.Authorization/elevateAccess/Action
   ...
 
-So a principal holding only Contributor — which is what the deployment service principal on
-this subscription holds, and nothing more — cannot deploy this template with the lock enabled.
+So a principal holding only Contributor cannot deploy this template with the lock enabled.
 It fails with `AuthorizationFailed` before anything else happens, which would take the
 README's "redeploy is a no-op" path with it, and that path is also the only documented way to
 reapply the *same* admin password. Export `DEPLOY_DELETE_LOCK=false` in that situation — see
@@ -172,12 +171,18 @@ or User Access Administrator create the lock separately:
 **That override does not expire when the lock is placed.** Preflight authorizes the *action*,
 so a template declaring this lock issues a PUT and needs `locks/write` on every run, existing
 lock or not. A Contributor keeps exporting `false` until the principal is granted a role that
-carries `Microsoft.Authorization/*/Write`. See `main.bicepparam` for the measured permission
-set behind that.
+carries `Microsoft.Authorization/*/Write`.
 
 Note the same `notActions` entry that blocks creation — `Microsoft.Authorization/*/Delete` —
 also stops a Contributor **removing** the lock once an Owner has placed it. That asymmetry is
-the whole point: the principal the lock defends against cannot lift it.
+what the lock is for, and it holds against any principal carrying Contributor alone.
+
+**It does not hold against the principal that actually deploys this subscription.** That one
+also holds Role Based Access Control Administrator on `rg-switchback-prod-northcentralus`,
+unconditioned, so it can assign itself Owner there and Owner carries
+`Microsoft.Authorization/*`. `main.bicepparam` measures the grant, says why it exists, and
+records what constraining it would take. Read that before relying on the lock as a boundary
+around this principal rather than around an accident.
 ''')
 param deployDeleteLock bool = true
 

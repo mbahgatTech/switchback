@@ -325,9 +325,15 @@ because a role mapped to the wrong principal fails only at first use. `roles.sql
 mapping against the live catalog after the rename rather than assuming the rename carried it.
 
 Two things the diagram is meant to make obvious. The deploying service principal holds Contributor
-and therefore cannot reach the database at all — it writes ARM, not rows. And the CI identity holds
-**no Azure RBAC whatsoever**: its entire authority is the Postgres administrator grant, so a leak of
-it cannot touch the resource group, the queue or the billing.
+at subscription scope and Role Based Access Control Administrator on the production resource group,
+and neither reaches the database — it writes ARM, not rows. And the CI identity holds **no Azure
+RBAC whatsoever**: its entire authority is the Postgres administrator grant, so a leak of it cannot
+touch the resource group, the queue or the billing.
+
+The second grant is unconditioned, which makes the deploying principal able to assign itself Owner
+on that resource group. `infra/azure/main.bicepparam` measures it and says what constraining it
+would take; the resource group's delete lock is a control against accident, not against this
+principal.
 
 `disableLocalAuth: true` on the Service Bus namespace and zero queue SAS rules are what make the
 Service Bus edges solid. Postgres still has `passwordAuth: Enabled` because the two dashed edges are

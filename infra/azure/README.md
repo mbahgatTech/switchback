@@ -509,9 +509,11 @@ az provider register --namespace Microsoft.DBforPostgreSQL --wait
 `true`. Creating a lock is `Microsoft.Authorization/locks/write`, which built-in **Contributor**
 does not have — it is excluded by the `Microsoft.Authorization/*/Write` entry in Contributor's
 `notActions`. The service principal that deploys this subscription holds Contributor at
-subscription scope and nothing else, so with the default left alone **both `az deployment sub
-create` and `az deployment sub what-if` fail** — the first with `AuthorizationFailed`, the second
-with `InvalidTemplateDeployment` wrapping the same denial, because preflight is preflight:
+subscription scope — plus Role Based Access Control Administrator on
+`rg-switchback-prod-northcentralus`, which grants role assignments and not locks — so with the
+default left alone **both `az deployment sub create` and `az deployment sub what-if` fail** — the
+first with `AuthorizationFailed`, the second with `InvalidTemplateDeployment` wrapping the same
+denial, because preflight is preflight:
 
 ```
 ERROR: (AuthorizationFailed) The client '…' does not have authorization to perform action
