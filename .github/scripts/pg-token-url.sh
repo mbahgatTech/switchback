@@ -19,11 +19,14 @@ echo "::add-mask::$_token"
 _encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read().strip(), safe=""))' <<< "$_token")"
 echo "::add-mask::$_encoded"
 
-# Both TLS parameters, because the two readers of this string honour different ones and each
-# ignores the other's. Prisma — `db push` and `apply-spatial.ts`, the only consumers here — reads
-# `sslaccept` and silently discards `sslmode`, so `verify-full` alone would leave an administrator
-# token crossing an unverified session. `sslmode` stays for any libpq reader. See the measurement
-# in infra/azure/postgres.bicep.
+# Both TLS parameters, because the two readers of this string honour different ones. Prisma —
+# `db push` and `apply-spatial.ts`, the only consumers here — reads `sslaccept`, and
+# `sslaccept=strict` is what makes it verify the server certificate: chain against the platform
+# trust store, and hostname. It does read `sslmode`, but only understands disable/prefer/require;
+# `verify-full` is not a value it recognises, so that half is inert for Prisma and present for
+# libpq, which needs it and rejects `sslaccept`. Neither parameter makes TLS mandatory for
+# Prisma — `require_secure_transport = ON` on the server does. See the measurement in
+# infra/azure/postgres.bicep.
 _url="postgresql://${PGUSER}:${_encoded}@${PGHOST}:5432/${PGDATABASE}?sslmode=verify-full&sslaccept=strict"
 echo "::add-mask::$_url"
 

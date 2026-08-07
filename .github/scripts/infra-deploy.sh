@@ -32,6 +32,17 @@ case "$template" in
     # postgres.bicep then omits the property, so this run cannot rotate the admin credential.
     # `deployDatabase=false` because charset and collation are fixed by CREATE DATABASE and the
     # provider rejects a PUT restating them — see the parameter's description.
+    #
+    # `DEPLOY_DELETE_LOCK=false` because this workflow deploys as `id-switchback-infra-deploy`,
+    # which holds Contributor and nothing else. Contributor excludes
+    # `Microsoft.Authorization/*/Write`, so a template declaring the resource group's
+    # `CanNotDelete` lock fails preflight — `what-if` with `InvalidTemplateDeployment` and the
+    # apply with `AuthorizationFailed` — whether or not an identical lock already exists, because
+    # ARM authorizes the action rather than the diff. The lock is placed and maintained by an
+    # Owner out of band; Incremental mode does not delete what this run stops declaring, so
+    # skipping the declaration leaves the live lock in place. See main.bicepparam, which binds
+    # this variable and records the measured permission set.
+    export DEPLOY_DELETE_LOCK=false
     az deployment sub "$action" \
       --location northcentralus \
       --name switchback-db \

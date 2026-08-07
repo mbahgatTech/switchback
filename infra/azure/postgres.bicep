@@ -687,24 +687,43 @@ output pooledPort int = pooledPort
 // proxies the session.
 //
 // The two parameters are here because the two clients that read these strings honour
-// different ones, and each ignores the other's:
+// different ones. Measured against Prisma 6.19.3 and node-postgres 8.22.0, the pinned
+// versions, by dialling a server that answers the SSLRequest and presents a certificate the
+// client has no reason to trust:
 //
 //   `sslmode=verify-full`  is what **libpq** understands — psql, pg_dump and pg_restore, which
 //                          must also be given PGSSLROOTCERT pointing at a CA bundle holding
 //                          DigiCert Global Root G2 and Microsoft RSA Root CA 2017, because
 //                          libpq otherwise looks only in ~/.postgresql/root.crt and fails
-//                          closed.
+//                          closed. Prisma's query and schema engines do read `sslmode`, but
+//                          understand only disable/prefer/require: `verify-full` is not a
+//                          value they recognise and behaves exactly as `sslmode=nonsense`
+//                          does, falling back to the default. Against a server that answers
+//                          the SSLRequest with `N`, both continue in cleartext; `require` is
+//                          the only value that aborts.
 //
-//   `sslaccept=strict`     is what **Prisma** understands, and it is the load-bearing half on
-//                          Vercel. Measured on Prisma 6.19.3 rather than assumed: a client
-//                          constructed with `sslmode=nonsense` raises no error at all, so
-//                          Prisma does not validate this parameter and an unrecognised value
-//                          is silently ignored rather than refused. Relying on `verify-full`
-//                          alone would therefore have been a change that reads as a fix and
-//                          verifies nothing. `sslaccept=strict` turns certificate verification
-//                          on explicitly, against the system trust store — which already
-//                          contains DigiCert Global Root G2 and Microsoft RSA Root CA 2017,
-//                          the two roots Flexible Server chains to.
+//   `sslaccept=strict`     is what **Prisma** understands, and it is the half that
+//                          authenticates the server. With it, a self-signed certificate is
+//                          refused — "terminated in a root certificate which is not trusted"
+//                          — so the platform trust store is consulted, and it already holds
+//                          the two roots Flexible Server chains to. It is verify-full and not
+//                          verify-ca: given a certificate signed by a supplied root but
+//                          naming a different host, the engine refuses with "the
+//                          certificate's CN name does not match the passed value".
+//                          node-postgres is the mirror image — it reads `sslmode` (both
+//                          `require` and `verify-full` force TLS and reject an untrusted
+//                          chain) and ignores `sslaccept` completely, sending no SSLRequest
+//                          at all when that is the only parameter given.
+//
+// So the CI administrator path is verified: `sslaccept=strict` is what makes Prisma check the
+// chain and the hostname, and that is the parameter `.github/scripts/pg-token-url.sh` emits.
+// What neither parameter does is make TLS *mandatory* for Prisma — that is
+// `require_secure_transport = ON` above, server-side, which a client cannot talk down.
+//
+// Measured on Windows, where the engine's TLS backend is SChannel. Which parameters are read,
+// and which values are recognised, is connection-string parsing and does not vary by platform;
+// the certificate-verification behaviour of the OpenSSL backend the ubuntu-latest runner uses
+// is **UNVERIFIED** here.
 //
 // Neither reaches the wrong parser: the workflow splits these URLs in Node and passes libpq
 // only the standard PG* variables, so `sslaccept` never reaches libpq (which would reject it
@@ -714,9 +733,9 @@ output pooledPort int = pooledPort
 // note.** These outputs are templates a human pastes from; nothing propagates them. Measured
 // 2026-08-05: the Function App's `DATABASE_URL` app setting carries `?sslmode=verify-full`
 // and no `sslaccept`, and the two repository secrets were written the same way. Read together
-// with the finding just above — Prisma ignores connection parameters it does not recognise,
-// silently — that means the Prisma clients are connecting **without** server-certificate
-// verification today, because the only parameter they were given is one they do not read.
+// with the finding just above — `sslmode=verify-full` is inert for Prisma — that means the
+// Prisma clients are connecting **without** server-certificate verification today, because
+// the only parameter they were given is one whose value they do not recognise.
 // Vercel's values are marked sensitive and cannot be read back, so they are unmeasured and
 // should be assumed to be in the same state. Closing this means rewriting those settings to
 // carry both parameters and re-reading them; it is listed in infra/azure/README.md.

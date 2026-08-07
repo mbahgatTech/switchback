@@ -235,7 +235,7 @@ graph LR
 
   VERCEL -->|FIC, both environments| RUNTIME
   FUNC -.->|not yet: needs AZURE_CLIENT_ID| RUNTIME
-  RUNTIME -->|Data Sender| SB
+  RUNTIME -->|Data Sender, Data Receiver<br/>Receiver is the over-grant| SB
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
@@ -589,8 +589,10 @@ order, each proved with passwords still enabled:
 2. **The Function App.** `DATABASE_AUTH=entra`, `AZURE_CLIENT_ID` for the shared identity, and a
    `DATABASE_URL` with the password removed. Its app setting still carries `sbapp`. Its identity
    block lives in `infra/azure/ingest.bicep`, on `feat/servicebus-ingest` (PR #42) rather than
-   here, so the move cannot be made from this branch at all — and its Service Bus Data Receiver
-   grant moves in that same change, which is why the shared identity does not hold one yet.
+   here, so the move cannot be made from this branch at all. Its Service Bus Data Receiver grant
+   moves in that same change, and the shared identity already holds a Receiver assignment of its
+   own on `ingest-jobs` — the over-grant described above, which is either revoked before PR #42
+   merges or adopted by `ingest.bicep` in it.
 3. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.
@@ -624,9 +626,13 @@ assumes it is.
 The certificate-verification gap that used to sit here is closed on two paths and open on one.
 Under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and hostname check, and
 CI's schema push gets `sslaccept=strict` alongside `sslmode=verify-full` from
-`.github/scripts/pg-token-url.sh` — both parameters, because Prisma reads only the second and
-libpq only the first. In `password` mode Prisma still receives `sslmode=verify-full` alone, a
-parameter it does not read, so until a consumer moves its TLS is unverified.
+`.github/scripts/pg-token-url.sh` — both parameters, because the two readers honour different
+ones. `sslaccept=strict` is Prisma's half and is what verifies the chain and the hostname;
+`sslmode=verify-full` is libpq's, and is inert for Prisma, whose engines understand only
+`disable`/`prefer`/`require` for that key. In `password` mode Prisma still receives
+`sslmode=verify-full` alone — a key it reads at a value it does not recognise, which leaves it at
+the default — so until a consumer moves its TLS is unverified. Measured against Prisma 6.19.3 and
+node-postgres 8.22.0; the full matrix is at the foot of `infra/azure/postgres.bicep`.
 
 ## Design decisions, recorded once
 

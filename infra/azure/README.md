@@ -27,9 +27,10 @@ flowchart LR
   never recorded anywhere and could not be read back out of ARM, which blocked every redeploy. On
   2026-08-05 it was deliberately _set_ to a freshly generated 48-character value rather than
   recovered — `az rest PATCH` with the body in a file outside the repository, deleted immediately.
-  It now lives in **two** verified places: a file on the owner's machine readable only by the
-  owner (`LOQ\mazen:(R,W)`, inheritance stripped), and the `DIRECT_DATABASE_URL` repository
-  secret. **Nothing reads that secret any more** — the `migrate` job mints an Entra token instead,
+  It now lives in **two** verified places: `~/.switchback/pg-sbadmin-password` on the owner's
+  machine, readable only by the owner (`LOQ\mazen:(R,W)`, inheritance stripped), and the
+  `DIRECT_DATABASE_URL` repository secret. **Nothing reads that secret any more** — the `migrate`
+  job mints an Entra token instead,
   and the backup workflow it also fed has been deleted — so it is now a stored production
   administrator credential with no consumer. It still sets the blast radius while it exists:
   anyone with write access to this repository can add a workflow step that prints it, so
@@ -638,11 +639,18 @@ postgresql://sbapp:…@<host>:5432/switchback?sslmode=verify-full&sslaccept=stri
 `postgres.bicep`. `require` encrypts the session and then accepts whatever certificate it is
 handed, which on an endpoint reachable from all of IPv4 authenticates nothing.
 
-`sslaccept=strict` sits alongside it for libpq's benefit only. It was added believing it was "the
-Prisma half", and that is **not true**: Prisma silently drops connection parameters it does not
-recognise, and `sslaccept` is one of them on PostgreSQL. Until a consumer is moved to
-`DATABASE_AUTH` (below), Prisma's TLS on this path is unverified. libpq consumers — `psql`,
-`pg_dump`, `pg_restore`, the workflows — read `sslmode=verify-full` and do verify.
+`sslaccept=strict` sits alongside it for Prisma, and it is the half that authenticates the server
+to a Prisma client. Measured against Prisma 6.19.3: `sslaccept=strict` makes the engine check the
+certificate chain against the platform trust store and the hostname against the certificate — full
+verification, not chain-only. Prisma does read `sslmode`, but understands only
+`disable`/`prefer`/`require`; `verify-full` is not a value it recognises, so that parameter does
+nothing for Prisma and is present for libpq, which needs it and would reject `sslaccept` as an
+invalid option. Neither parameter makes TLS mandatory for Prisma — `require_secure_transport` on
+the server does that. libpq consumers — `psql`, `pg_dump`, `pg_restore`, the workflows — read
+`sslmode=verify-full` and verify.
+
+A URL carrying `sslmode=verify-full` alone therefore leaves a Prisma client's TLS unverified, which
+is the state the deployed app settings are in; see the note at the foot of `postgres.bicep`.
 
 libpq looks for a root store in `~/.postgresql/root.crt` and fails closed when it is absent, so
 anything running `psql`, `pg_dump` or `pg_restore` against these URLs must also set
@@ -880,12 +888,25 @@ side and stays `true` until every consumer has been proved on a token.
 
 1. Deploy the shared identity, and — in `infra/azure/ingest.bicep` — move the Function App onto it:
    `identity.type` to `SystemAssigned,UserAssigned`, `AZURE_CLIENT_ID` and
-   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and a Service Bus
-   **Data Receiver** grant for the shared identity, which it does not hold today. That grant is
-   declared by `ingest.bicep` because `ingest.bicep` owns the queue, and it is deliberately not
-   granted before the worker needs it: the shared identity is also Vercel's, so granting Receive
-   early lets any preview deployment drain the production ingest queue. Both phases keep every
+   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and the Service
+   Bus **Data Receiver** grant declared by `ingest.bicep`, because `ingest.bicep` owns the queue.
+
+   That grant is not a new capability, and the ordering below depends on knowing so. Read live with
+   `az role assignment list --all`, the shared identity **already holds** Data Receiver on
+   `ingest-jobs` — assignment `0090d328-0cee-592f-8359-e4cc64940694`, alongside Data Sender
+   `f1b97f59-263a-5e18-a1c0-40ce18436d52`. It was deployed before the grant moved out of this
+   template, and incremental ARM does not delete what a template stops declaring, so its absence
+   from the Bicep here is not a revocation. Revoking it was attempted and refused: the delete
+   returns `ScopeLocked` naming `switchback-prod-no-delete`, the resource group's `CanNotDelete`
+   lock, and lifting that is an Owner action.
+
+   The grant is inert while no Service Bus receive code exists in this repository, and it becomes
+   real capability — for every Vercel deployment, preview included, because the shared identity is
+   also Vercel's — the moment the worker's code merges. So it is **revoked before PR #42 merges**,
+   or `ingest.bicep` adopts it in the change that moves the worker: the `guid()` inputs are
+   identical, so the assignment that template would create is this one. Both phases keep every
    grant the worker already has.
+
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
    renames `sbapp_vercel` to `sbapp_runtime` and then asserts the Entra mapping followed the rename.
@@ -918,8 +939,8 @@ accidental-rotation hazard is gone rather than dormant.
 **Rolling step 7 back — set `passwordAuthEnabled = true` and export the password with it.**
 
 ```bash
-export PGADMIN_PASSWORD="$(cat ~/.sb-pgadmin)"   # the recorded value; without this the deploy
-                                                 # omits the property and writes no password
+# The recorded value. Without it the deploy omits the property and writes no password.
+export PGADMIN_PASSWORD="$(cat ~/.switchback/pg-sbadmin-password)"
 ```
 
 Then deploy with `passwordAuthEnabled = true`. The export is not optional politeness.

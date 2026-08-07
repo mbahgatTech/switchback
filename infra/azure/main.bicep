@@ -312,12 +312,20 @@ Minimum TLS version the server will negotiate.
 
 TLSv1.2 rather than TLSv1.3, deliberately, and stated as a parameter so raising it is one
 value. TLS 1.2 with modern ciphers is not a weak setting; it is Azure\'s own default and it
-is what Neon serves today. TLSv1.3 would be marginally better and carries a real failure
-mode: if Prisma\'s Rust query engine cannot negotiate it from wherever Vercel is running,
-the connection fails in a way indistinguishable from a firewall or credential problem, and
-the machine that owns this repository cannot reach 5432 to tell the difference. The
-migration workflow prints the negotiated TLS version from a runner; raise this to TLSv1.3
-once that output says 1.3, with evidence rather than optimism.
+is what Neon serves today. What holds the floor is the client side: if Prisma\'s Rust query
+engine cannot negotiate 1.3 from wherever Vercel is running, the connection fails in a way
+that reads like a firewall or a credential problem, and nothing here establishes that it can.
+
+Diagnosis is not the obstacle. The machine that owns this repository does reach 5432: on
+2026-08-06, with ProtonVPN disconnected, psql 16 connected under `sslmode=verify-full` as
+the owner\'s Entra administrator and the server answered. ProtonVPN\'s ProTUN adapter tears
+the session down above TCP, which reads as unreachability and is not. So a raise that breaks
+a client can be told apart from a firewall or credential failure, and rolled back, from a
+second door.
+
+What is still missing is a measurement from the runtime that matters. The migration workflow
+prints the negotiated TLS version from a runner; raise this to TLSv1.3 once that output says
+1.3 and a Vercel deployment has been shown to connect, with evidence rather than optimism.
 ''')
 @allowed([
   'TLSv1.2'
