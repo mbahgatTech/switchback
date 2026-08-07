@@ -38,10 +38,11 @@
 // 2. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
 //    is passed is written. The parameter therefore defaults to empty and postgres.bicep omits
 //    the property entirely when it is: a redeploy that supplies no value leaves the live
-//    credential alone rather than rewriting it, which is why it does not appear in the change
-//    list above. Supply a value only to create the server or to rotate deliberately, and when
-//    rotating, expect every connection string carrying the old one to stop working. See
-//    infra/azure/README.md, "Redeploying".
+//    credential alone. It shows up in the server's `before` and `after` snapshots as ARM's
+//    seven-asterisk redaction, identical on both sides, so it contributes no delta. Supply a
+//    value only to create the server or to rotate deliberately, and when rotating, expect every
+//    connection string carrying the old one to stop working. See infra/azure/README.md,
+//    "Redeploying".
 //
 // 3. Three server parameters report as changed on every run and never converge:
 //    `log_connections`, `log_disconnections` and `ssl_min_protocol_version`. The template
@@ -74,11 +75,14 @@
 //    administrators?api-version=2024-08-01"` lists `id-switchback-postgres-ci` beside the Entra
 //    user declared in main.bicepparam.
 //
-// 7. Eight `Ignore` entries — the Service Bus namespace, the storage account, the Application
-//    Insights component, the Function App and its plan, and the two ingest alerts, all declared
-//    in `ingest.bicep` and deployed separately at resource-group scope; plus the Smart Detection
-//    action group Application Insights creates for itself. `Ignore` is what an incremental
-//    deployment does to a resource it does not declare: it leaves it alone.
+// 7. Eight `Ignore` entries — the Service Bus namespace `sb-switchback-prod-37ywppu5p7fri`, the
+//    storage account, `appi-switchback-ingest`, `func-switchback-ingest-37ywppu5p7fri` and its
+//    plan, and the two ingest alerts, plus the Smart Detection action group Application Insights
+//    creates for itself. `Ignore` is what an incremental deployment does to a resource it does
+//    not declare: it leaves it alone. **Seven of the eight are declared by no file in this
+//    repository** — they live in `infra/azure/ingest.bicep` on branch `feat/servicebus-ingest`
+//    and were deployed from there at resource-group scope. So a third of this resource group is
+//    outside the IaC on this branch until that branch merges.
 //
 // Creating the server, or rotating the credential on purpose:
 //
