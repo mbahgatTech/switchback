@@ -398,9 +398,9 @@ subscription: `az postgres flexible-server list-skus --location eastus2` returns
 editions and the reason "Subscriptions are restricted from provisioning in this region", and
 `eastus` says the same. Of the four regions available — North Central US, Central US, Canada
 Central, West US 3 — Chicago is closest to Vercel's `iad1`. So the database is roughly
-**20 ms further** from the application than Virginia would have been, and a
-tRPC call pays that round trip several times. Pricing is identical, so the $57.00 total is
-unaffected. A Flexible Server cannot be moved between regions afterwards.
+**20 ms further** from the application than Virginia would have been, and a tRPC call pays that
+round trip several times. Pricing is identical, so the $57.00 total is unaffected. A Flexible
+Server cannot be moved between regions afterwards.
 
 **Burstable, which means no PgBouncer.** Azure's pooler is not available on this tier. That is a
 real loss, bought deliberately: General Purpose `Standard_D2ds_v5` plus this storage is about
@@ -448,7 +448,7 @@ inventory the thing to keep honest:
 | GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                 |
 | GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin` |
 | Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`    |
-| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | separate entries, added after the cutover        |
+| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | own entries, separate from Production            |
 
 That table is the whole inventory, and the three `AZURE_*` GitHub secrets are gone. Verify rather
 than trust this paragraph:
@@ -893,7 +893,9 @@ children alone, so the `administrators` entries survive a run with an accidental
 `entraAdministrators`. Complete mode would remove both administrators in one operation, and with
 passwords off that is a total lockout with no way to grant anything back.
 
-### Loading bulk data into this server
+---
+
+## Loading bulk data into this server
 
 The local route to Azure **corrupts TLS records under sustained `COPY`**
 (`SSL error: sslv3 alert bad record mac`), which has killed both a 4-way parallel `pg_restore` and a

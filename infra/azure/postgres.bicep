@@ -196,11 +196,15 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
       // be noticed and rewound.
       backupRetentionDays: backupRetentionDays
 
-      // Immutable after creation, so this is decided now or never. Disabled — and this is the
-      // weak point rather than a saving: at this ratio geo-redundancy would in fact be free.
-      // What is left is locally-redundant point-in-time restore into a new server inside the
-      // same subscription, so a region-level failure takes the recovery with the original.
-      // Closing it means rebuilding the server and moving the data.
+      // Immutable after creation, so this is decided now or never — and it is off. That is a
+      // gap rather than a saving: the region supports it (`az postgres flexible-server
+      // list-skus --location northcentralus -o json` reports `geoBackupSupported: Enabled`,
+      // measured 2026-08-07) and at this ratio it would be free, and nothing in this
+      // repository records a reason. A from-scratch deployment that wants geo-redundancy has
+      // to set this Enabled here, before the first create. What the current value leaves is
+      // locally-redundant point-in-time restore into a new server inside the same
+      // subscription, so a region-level failure takes the recovery with the original, and
+      // closing it on the live server means rebuilding it and moving the data.
       geoRedundantBackup: 'Disabled'
     }
 
@@ -244,10 +248,12 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     //   - A least-privilege application role (`applicationLogin`, `sbapp` by default). This
     //     one is *not* created by this template — ARM has no way to run SQL — so it would be
     //     easy for this list to claim a boundary that does not exist. It is created by hand,
-    //     by the `Create the least-privilege application role` step of the runbook in
-    //     infra/azure/README.md, and the verification step asserts afterwards that the role
-    //     exists and that it cannot execute DDL. The credential Vercel carries is that role;
-    //     `administratorLogin` never leaves the GitHub repository secrets.
+    //     by the `The least-privilege application role` step of the runbook in
+    //     infra/azure/README.md, which also carries the two checks that turn this bullet into
+    //     a claim: a catalogue query proving the role is not a member of `azure_pg_admin`, and
+    //     a `CREATE TABLE` attempt made as the role itself, which must be refused. The
+    //     credential Vercel carries is that role; `administratorLogin` never leaves the GitHub
+    //     repository secrets.
     //   - Full certificate verification on every client (`sslmode=verify-full` for libpq,
     //     `sslaccept=strict` for Prisma — see the connection-string outputs at the foot of
     //     this file). Encryption alone would not authenticate the *server*, which on an
@@ -434,7 +440,7 @@ resource logDisconnections 'Microsoft.DBforPostgreSQL/flexibleServers/configurat
 // ---------------------------------------------------------------------------------------
 // Text search configuration, pinned rather than left at the Azure provider default.
 //
-// `pg_catalog.simple`, where a Flexible Server starts on `pg_catalog.english`. Every
+// Pinned to `pg_catalog.simple`; a Flexible Server starts on `pg_catalog.english`. Every
 // `to_tsvector` and `websearch_to_tsquery` call in this codebase names `'english'` explicitly
 // — packages/db/src/spatial.ts writes the vector, packages/api/src/routers/trails.ts reads it
 // — so no current query consults this GUC and search behaviour is identical either way today.
@@ -739,9 +745,9 @@ output pooledPort int = pooledPort
 // sized against.
 var sslArgs = 'sslmode=verify-full&sslaccept=strict'
 
-// The two administrator templates. These are the *migration and CI* credential: they belong
-// in GitHub repository secrets and nowhere else. `sbadmin` is a member of `azure_pg_admin`
-// and can execute DDL, which `prisma db push` needs and a web request never does.
+// The two administrator templates. They belong in GitHub repository secrets and nowhere else:
+// `sbadmin` is a member of `azure_pg_admin` and can execute DDL, which `prisma db push` needs
+// and a web request never does.
 output databaseUrlTemplate string = 'postgresql://${administratorLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:${pooledPort}/${databaseName}?${sslArgs}${pgBouncerEnabled ? '&pgbouncer=true' : ''}'
 
 output directDatabaseUrlTemplate string = 'postgresql://${administratorLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:5432/${databaseName}?${sslArgs}'
@@ -752,8 +758,9 @@ output directDatabaseUrlTemplate string = 'postgresql://${administratorLogin}:<P
 // so the web app has no use for a DDL-capable credential and should not carry one.
 //
 // The role behind it does not exist yet at deployment time — ARM cannot run SQL. It is
-// created by hand, by the `Create the least-privilege application role` step of the runbook
-// in infra/azure/README.md, from the connection string built out of this template, and the
-// verification step then asserts that the role exists, that it is not a member of
-// azure_pg_admin, and that it cannot create a table.
+// created by hand, by the `The least-privilege application role` step of the runbook in
+// infra/azure/README.md, from the connection string built out of this template. That step
+// also carries the two checks that assert the boundary: a catalogue query showing the role is
+// not a member of azure_pg_admin, and a `CREATE TABLE` attempt made as the role, which must
+// be refused.
 output applicationDatabaseUrlTemplate string = 'postgresql://${applicationLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:${pooledPort}/${databaseName}?${sslArgs}${pgBouncerEnabled ? '&pgbouncer=true' : ''}'

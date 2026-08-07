@@ -133,9 +133,8 @@ subscription restriction, not a trade anyone chose. `canadacentral` (Toronto) is
 on latency and was passed over only because it moves user data across a border for no
 benefit; `centralus` and `westus3` are both further.
 
-Budget the ~20 ms into the post-cutover watch: the p95 of `/nearby` is expected to rise, and
-that is the expected outcome rather than a symptom. A Flexible Server cannot be moved between
-regions afterwards, so revisiting this means a second migration.
+A Flexible Server cannot be moved between regions after creation, so this is a one-way choice:
+revisiting it means building a new server elsewhere and moving the data onto it.
 ''')
 param location string = 'northcentralus'
 
@@ -280,8 +279,7 @@ the role itself, which must be refused.
 The point of it: with a firewall spanning the whole internet the perimeter is a credential,
 and the credential handed to every Vercel serverless function should be able to read and
 write rows and nothing else. `administratorLogin` above can `DROP TABLE` and manage roles;
-it stays in the GitHub repository secrets that CI and the migration use, and never reaches
-Vercel.
+it stays in the GitHub repository secrets and never reaches Vercel.
 ''')
 param applicationLogin string = 'sbapp'
 
@@ -313,9 +311,9 @@ Minimum TLS version the server will negotiate.
 
 TLSv1.2 rather than TLSv1.3, deliberately, and stated as a parameter so raising it is one
 value. TLS 1.2 with modern ciphers is not a weak setting; it is Azure\'s own default. What holds
-the floor is the client side: if Prisma\'s Rust query
-engine cannot negotiate 1.3 from wherever Vercel is running, the connection fails in a way
-that reads like a firewall or a credential problem, and nothing here establishes that it can.
+the floor is the client side: if Prisma\'s Rust query engine cannot negotiate 1.3 from wherever
+Vercel is running, the connection fails in a way that reads like a firewall or a credential
+problem, and nothing here establishes that it can.
 
 Diagnosis is not the obstacle. The machine that owns this repository does reach 5432: on
 2026-08-06, with ProtonVPN disconnected, psql 16 connected under `sslmode=verify-full` as
@@ -821,7 +819,7 @@ output databaseName string = databaseName
 @description('Administrator login. Half a credential; the other half is never emitted.')
 output administratorLogin string = administratorLogin
 
-@description('Login of the least-privilege application role the migration workflow creates.')
+@description('Login of the least-privilege application role the runbook creates by hand.')
 output applicationLogin string = applicationLogin
 
 @description('Port for DATABASE_URL — 6432 when PgBouncer is running, otherwise 5432.')
@@ -836,8 +834,8 @@ output pgBouncerEnabled bool = postgres.outputs.pgBouncerEnabled
 @description('''
 Shape of the ADMINISTRATOR `DATABASE_URL`, with the credential left as a placeholder.
 
-This is the **migration and CI** credential and belongs in GitHub repository secrets only.
-Vercel gets `applicationDatabaseUrlTemplate` below instead — see `applicationLogin`.
+It belongs in GitHub repository secrets only. Vercel gets `applicationDatabaseUrlTemplate`
+below instead — see `applicationLogin`.
 ''')
 output databaseUrlTemplate string = postgres.outputs.databaseUrlTemplate
 
@@ -846,8 +844,8 @@ output directDatabaseUrlTemplate string = postgres.outputs.directDatabaseUrlTemp
 
 @description('''
 Shape of the APPLICATION connection string — the one Vercel gets, for both `DATABASE_URL` and
-`DIRECT_DATABASE_URL`. The role it names is created by the migration workflow, not by this
-template.
+`DIRECT_DATABASE_URL`. The role it names is created by hand from the runbook in
+infra/azure/README.md, not by this template — see `applicationLogin`.
 ''')
 output applicationDatabaseUrlTemplate string = postgres.outputs.applicationDatabaseUrlTemplate
 
