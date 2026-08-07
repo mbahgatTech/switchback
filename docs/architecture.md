@@ -456,9 +456,9 @@ carries a split marker or a stuck-subtree marker. The gauge is clear and can fir
 `az resource list -g rg-switchback-prod-northcentralus --resource-type
 Microsoft.Insights/scheduledqueryrules` returns `switchback-ingest-drain-failed`,
 `switchback-ingest-queue-distress` and `switchback-ingest-worker-silent`. The Function App runs a
-bundle published by `.github/scripts/deploy-worker.sh`, which is what `ci.yml`'s `deploy ingest
-worker` job invokes on every push to master — and which refuses to report success until the running
-host emits a line only the current `health.ts` produces.
+bundle published by `.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest
+worker` job will invoke on every push to master — and which refuses to report success until the
+running host emits a heartbeat naming the commit it just pushed.
 
 **The distress rule alone would still read a dead worker as a healthy estate**, because its whole
 firing condition is a log line and a host that is down or serving an old bundle produces none.
@@ -934,7 +934,7 @@ Both facts are load-bearing:
 | Step | Command                                                                 | Why the order                                                                                                            |
 | ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, and in doing so removes `WEBSITE_RUN_FROM_PACKAGE`. The app is codeless from here until step 2. |
-| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip`                    | Pushes the package, syncs the trigger cache, and waits for proof.                                                        |
+| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Pushes the package, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.                                |
 
 Step 2 alone is the routine case; step 1 is only needed when the template changes.
 

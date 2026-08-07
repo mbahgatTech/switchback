@@ -1022,15 +1022,16 @@ a setting added by hand in the portal is erased by the next deployment: worker e
 the template.
 
 ```bash
-bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip
+bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip "$(git rev-parse HEAD)"
 ```
 
 That script is the whole sequence — push, trigger sync, and a wait for the running host to emit
-`switchback-ingest-queue-health`, which no build without the current
-`apps/ingest-worker/src/health.ts` produces. It fails if the package blob did not change or if no
-heartbeat arrives, so a stale deploy cannot report success. `ci.yml`'s `deploy ingest worker` job
-invokes the same file on every push to master; running it by hand and letting CI run it are the same
-code path, which is the point.
+`switchback-ingest-queue-health build=<commit>`, a line only the package built from that commit can
+produce. It fails if the package blob did not change or if that heartbeat does not arrive, so a
+stale deploy cannot report success. `ci.yml`'s `deploy ingest worker` job will invoke the same file
+on every push to master; running it by hand and letting CI run it are the same code path, which is
+the point. That job has not executed yet — it is gated on master and nothing has merged since it was
+written.
 
 The trigger sync inside it is not optional and cost half an hour to find. After an ARM deployment has
 removed `WEBSITE_RUN_FROM_PACKAGE` and the push has put it back, the host comes up reporting
