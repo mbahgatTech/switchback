@@ -32,6 +32,11 @@ export default tseslint.config(
       // Agent worktrees, which git puts inside the repo root. Each is a whole extra copy of the
       // monorepo, so without this `npm run lint` reports failures from files CI never sees.
       '.claude/**',
+      // Diagnostics that sit outside every workspace, so no tsconfig covers them and
+      // type-aware linting parse-errors on anything it cannot resolve. They still run: the
+      // driver probe is executed by `packages/db/test/pg-driver-contract.test.ts` under
+      // `npm test`, and the expiry probe by the workflow of the same name.
+      'infra/postgres-identity/*.mjs',
     ],
   },
   js.configs.recommended,

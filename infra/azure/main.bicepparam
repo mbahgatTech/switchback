@@ -1,9 +1,9 @@
 // Non-secret parameters for infra/azure/main.bicep. Committed on purpose.
 //
-// The password is not in this file and must never be. `administratorLoginPassword` is
-// declared `@secure()` with no default in main.bicep, and a `.bicepparam` file has to assign
-// every required parameter — so it is read from the environment instead, which is the one
-// place that is neither this file, nor argv, nor a log line:
+// The password is not in this file and must never be. `administratorLoginPassword` is declared
+// `@secure()` in main.bicep and defaults to empty, so it is not required and a deployment that
+// supplies nothing leaves the live credential untouched. It is read from the environment when it
+// is supplied at all, which is the one place that is neither this file, nor argv, nor a log line:
 //
 //   openssl rand -hex 32 > "$TMP/pgpw"
 //   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
@@ -149,6 +149,15 @@ param databaseName = 'switchback'
 // value means dropping and recreating the database, not redeploying over it.
 param databaseCollation = 'C.UTF-8'
 
+// The committed intent is `true` — a from-scratch build must create the database. Against the
+// live server it has to be `false`: charset and collation are immutable after CREATE DATABASE
+// and the provider refuses a PUT that restates them, so a redeploy fails on this resource
+// after the server has already been written. Like `DEPLOY_DELETE_LOCK`, the override is a
+// visible act in the shell rather than a quiet edit here that nobody puts back.
+//
+//   DEPLOY_DATABASE=false
+param deployDatabase = bool(readEnvironmentVariable('DEPLOY_DATABASE', 'true'))
+
 param administratorLogin = 'sbadmin'
 
 // The least-privilege role Vercel connects as. Created by hand from the runbook in README.md,
@@ -189,6 +198,11 @@ param workloadBudgetUsd = 150
 // what-if afterwards — the same permanent-diff problem in a different costume. Measured, not
 // guessed.
 param budgetStartDate = '2026-07-01T00:00:00Z'
+
+// The resource-group budget was created a month later than the subscription one, and ARM
+// refuses to create a monthly budget starting before the current month. See the parameter's
+// description in main.bicep.
+param workloadBudgetStartDate = '2026-08-01T00:00:00Z'
 param budgetEndDate = '2036-07-01T00:00:00Z'
 
 // TLSv1.2 is Azure's default and what Neon serves today. Raise to 'TLSv1.3' only after a
@@ -197,11 +211,52 @@ param budgetEndDate = '2036-07-01T00:00:00Z'
 // exactly this reason. See the parameter description in main.bicep.
 param minTlsVersion = 'TLSv1.2'
 
-// Optional Microsoft Entra administrator, so a human can connect without the application's
-// password. Empty leaves Entra auth off entirely. Fill both or neither:
-//   az ad signed-in-user show --query id -o tsv
-param entraAdminObjectId = ''
-param entraAdminPrincipalName = ''
+// Entra authentication, on alongside the password login while consumers are moved across.
+//
+// **Bootstrapping this on a server that does not have it yet takes two deployments**, because
+// ARM rejects an `administrators` child while `activeDirectoryAuth` is Disabled — and rejects
+// it during `what-if` too, so the run that restarts the database cannot be previewed. Deploy
+// once with `entraAdministrators` empty and this true, then again with the list below. On the
+// live server this was done imperatively instead, and the deployment that followed converged
+// it; see infra/azure/README.md.
+param entraAuthEnabled = true
+
+// One federated credential per branch. `master` only: `ci.yml`'s schema push runs there and
+// nowhere else, and a credential is an exact-string match with no wildcard, so every extra
+// entry is a branch that may assume a Postgres administrator. A scratch branch was trusted
+// here while this migration was proved from one; it is not any more.
+param ciIdentityBranches = ['master']
+
+// One identity for every runtime client — Vercel production, Vercel preview and the ingest
+// worker. The name is the deployed one and is now narrower than the role: ARM cannot rename a
+// user-assigned identity, so renaming it here would create a second one and leave the first
+// holding every live grant. runtime-identity.bicep carries the accurate description.
+param runtimeIdentityName = 'id-switchback-vercel-publisher'
+
+// Both halves of every federated-credential subject. Entra matches the subject as an exact
+// string, so renaming the Vercel team or the project silently stops the exchange working.
+param vercelTeamSlug = 'mbahgattechs-projects'
+param vercelProjectName = 'switchback'
+
+// Passwords stay on. Flipping this to `false` is the cutover, and it is gated on every consumer
+// having been proved on a token *and* both administrator doors re-proved in the same hour — see
+// infra/azure/README.md. It is a separate, reviewable deployment on purpose: the way back from a
+// wrong flip is an ARM write that itself needs Entra to be working.
+param passwordAuthEnabled = true
+
+// The owner is here as break-glass: a human who can reach the database with a token and no
+// password at all, which is what stops "the admin password is not recorded anywhere" from
+// being an outage a second time. The Entra-mapped roles the *applications* use are not
+// administrators and are not declared here — they are SQL objects, not ARM ones.
+//
+//   az ad signed-in-user show --query "{id:id,upn:userPrincipalName}" -o json
+param entraAdministrators = [
+  {
+    objectId: '8c682736-d90b-4c33-a718-1916597894f8'
+    principalName: 'mazenbahgat_outlook.com#EXT#@mazenbahgatoutlook.onmicrosoft.com'
+    principalType: 'User'
+  }
+]
 
 param tags = {
   app: 'switchback'
@@ -215,7 +270,7 @@ param tags = {
   rollback: 'neon-us-east-1-retained'
 }
 
-// The only secret, and it is not stored here — see the header. No fallback default: a missing
-// PGADMIN_PASSWORD must fail the deployment loudly rather than provision a production database
-// with something a reader of this file could guess.
-param administratorLoginPassword = readEnvironmentVariable('PGADMIN_PASSWORD')
+// The only secret, and it is not stored here — see the header. Empty when the variable is unset,
+// which is the ordinary case: postgres.bicep then omits the property and the live credential is
+// left untouched. Export PGADMIN_PASSWORD only to create the server or to rotate on purpose.
+param administratorLoginPassword = readEnvironmentVariable('PGADMIN_PASSWORD', '')

@@ -257,19 +257,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    env:
-      # Azure Postgres, from repository secrets — both were repointed from Neon at the
-      # 2026-07-30 cutover. `schema.prisma` names the second as `directUrl`; on Azure's
-      # Burstable tier there is no PgBouncer, so the two are the same 5432 endpoint today and
-      # the split is what keeps DDL correct if the tier ever changes. Nothing else in this
-      # workflow sees these; the two jobs above run against their own throwaway Postgres
-      # service.
-      #
-      # This runs here rather than from a developer's machine for a boring, concrete reason:
-      # a VPN that routes 5432 into a black hole is common enough, and the person who owns
-      # this repository is behind one. A runner is not.
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DIRECT_DATABASE_URL: ${{ secrets.DIRECT_DATABASE_URL }}
+    # `id-token` is what makes this job credential-free: the runner mints an OIDC assertion,
+    # `azure/login` trades it for an Azure token against the federated credential on
+    # `id-switchback-postgres-ci`, and that token is the database password. Naming any
+    # permission replaces the default set, so `contents` is restated for the checkout.
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -307,6 +301,52 @@ jobs:
           fi
 
       - if: steps.schema.outputs.changed == 'true'
+        uses: azure/login@v2
+        # The same identity and the same federated credential `postgres-entra.yml` uses, and
+        # for the same reason: it holds no Azure RBAC at all, so `allow-no-subscriptions` is
+        # the least privilege working rather than a broken credential.
+        with:
+          client-id: 81c76484-bea1-4a75-8e86-2ccb3093e753
+          tenant-id: f0f92920-ce90-42c9-b87f-3ea8644bccd8
+          allow-no-subscriptions: true
+
+      # The Prisma CLI has no driver-adapter seam — `db push` reads a connection *string* off
+      # `schema.prisma`'s `url` and `directUrl`, so the token provider in packages/db cannot
+      # serve it. A token is a string, though, so it goes in the password field.
+      #
+      # Minted inside each step that needs it rather than exported once to `$GITHUB_ENV`. This
+      # token authenticates `id-switchback-postgres-ci`, a full Postgres administrator; putting
+      # it in the job environment hands it to every later step and to every process they start,
+      # for a credential that only two steps have any use for. `::add-mask::` redacts the log,
+      # not the environment.
+      #
+      # Both variables, not one: `prisma db push` reads `directUrl` and
+      # `packages/db/scripts/apply-spatial.ts` constructs its own client from `DATABASE_URL`.
+      - name: Prove the token connects, and as an administrator
+        if: steps.schema.outputs.changed == 'true'
+        env:
+          PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+          PGUSER: id-switchback-postgres-ci
+          PGDATABASE: switchback
+        run: |
+          set -euo pipefail
+          . ./.github/scripts/pg-token-url.sh
+          # Local, pinned and already installed by `npm ci`. `npx --yes` would resolve tsx and
+          # its whole dependency closure from the registry at job time, unpinned, into a process
+          # holding an administrator credential for the production database.
+          ./node_modules/.bin/tsx -e '
+            import pg from "pg";
+            const c = new pg.Client({ connectionString: process.env.DIRECT_DATABASE_URL,
+                                      ssl: { rejectUnauthorized: true } });
+            await c.connect();
+            const { rows } = await c.query(
+              "select current_user, pg_has_role(current_user, \x27azure_pg_admin\x27, \x27member\x27) as is_admin");
+            console.log(`current_user=${rows[0].current_user} is_admin=${rows[0].is_admin}`);
+            await c.end();
+            if (!rows[0].is_admin) { console.error("::error::not an administrator; db push will fail"); process.exit(1); }
+          '
+
+      - if: steps.schema.outputs.changed == 'true'
         run: npm run db:generate
 
       # No `--accept-data-loss`, deliberately. Prisma refuses a destructive reconciliation
@@ -314,7 +354,15 @@ jobs:
       # job — and therefore blocks the deploy — instead of quietly executing against the one
       # database with real data in it. Making that change is then a manual, deliberate act.
       - if: steps.schema.outputs.changed == 'true'
-        run: npm run db:push
+        name: Reconcile the production schema
+        env:
+          PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+          PGUSER: id-switchback-postgres-ci
+          PGDATABASE: switchback
+        run: |
+          set -euo pipefail
+          . ./.github/scripts/pg-token-url.sh
+          npm run db:push
 
   deploy:
     name: deploy production

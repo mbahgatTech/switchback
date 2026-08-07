@@ -1,4 +1,7 @@
 import { PrismaClient } from '@prisma/client';
+import { availableParallelism } from 'node:os';
+import { createEntraAdapter, createEntraPool, type EntraPoolSizing } from './entra-client';
+import { databaseAuthMode } from './entra-source';
 
 /**
  * Two Prisma clients: one pool for requests, a separate one for background work.
@@ -17,11 +20,56 @@ const globalForPrisma = globalThis as unknown as {
   backgroundPrisma?: PrismaClient;
 };
 
+/**
+ * How this process proves who it is to Postgres. Read once — a mode that changed under a
+ * running process would leave the two pools authenticating differently.
+ */
+const AUTH_MODE = databaseAuthMode();
+
+/**
+ * Prisma's own default pool size, restated.
+ *
+ * Prisma derives `cores * 2 + 1` from the connection string, and a driver adapter never sees
+ * the connection string. Without this the request pool would silently fall to `pg`'s default
+ * of ten.
+ */
+const requestPoolSize = (): number => availableParallelism() * 2 + 1;
+
+/** Prisma's default `pool_timeout`, restated for the same reason. */
+const REQUEST_POOL_TIMEOUT_S = 10;
+
+type PrismaLog = NonNullable<ConstructorParameters<typeof PrismaClient>[0]>['log'];
+
+/**
+ * One Prisma client, built the way the configured authentication mode requires.
+ *
+ * Under Entra the pool parameters cannot travel in the URL: `datasourceUrl` and `adapter` are
+ * mutually exclusive, and Prisma reads `connection_limit` and `pool_timeout` off a string the
+ * adapter bypasses. They are passed to `pg.Pool` directly instead, which is why both sizes
+ * appear twice in this file rather than once.
+ */
+function createClient(
+  sizing: EntraPoolSizing,
+  log: PrismaLog,
+  datasourceUrl?: string,
+): PrismaClient {
+  if (AUTH_MODE === 'password') {
+    return new PrismaClient({ log, ...(datasourceUrl ? { datasourceUrl } : {}) });
+  }
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error('DATABASE_AUTH is set to Entra but DATABASE_URL is absent.');
+  return new PrismaClient({
+    log,
+    adapter: createEntraAdapter(createEntraPool(url, sizing, AUTH_MODE)),
+  });
+}
+
 export const prisma: PrismaClient =
   globalForPrisma.prisma ??
-  new PrismaClient({
-    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
-  });
+  createClient(
+    { max: requestPoolSize(), connectionTimeoutMillis: REQUEST_POOL_TIMEOUT_S * 1_000 },
+    process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+  );
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
 
@@ -66,10 +114,12 @@ const BACKGROUND_POOL_TIMEOUT_S = 30;
 /**
  * `DATABASE_URL` with the pool parameters set, unless the operator already set them.
  *
- * Prisma reads `connection_limit` and `pool_timeout` off the connection string and strips
- * them before handing it to Postgres. Leaving an explicitly-set value alone matters on a
- * managed database where the ceiling is not ours to choose — PgBouncer in transaction mode
- * wants a low limit and says so in the URL it hands out.
+ * Password mode only. Prisma reads `connection_limit` and `pool_timeout` off the connection
+ * string and strips them before handing it to Postgres; under a driver adapter it never sees
+ * the string at all, which is why `createClient` passes the same two numbers to `pg.Pool`
+ * instead. Leaving an explicitly-set value alone matters on a managed database where the
+ * ceiling is not ours to choose — PgBouncer in transaction mode wants a low limit and says so
+ * in the URL it hands out.
  *
  * A URL that will not parse is passed through untouched. It is about to fail at connect
  * time with a far better message than anything this function could raise.
@@ -102,10 +152,14 @@ function backgroundUrl(): string | undefined {
  */
 export const backgroundPrisma: PrismaClient =
   globalForPrisma.backgroundPrisma ??
-  (() => {
-    const url = backgroundUrl();
-    return new PrismaClient({ log: ['error'], ...(url ? { datasourceUrl: url } : {}) });
-  })();
+  createClient(
+    {
+      max: BACKGROUND_POOL_SIZE,
+      connectionTimeoutMillis: BACKGROUND_POOL_TIMEOUT_S * 1_000,
+    },
+    ['error'],
+    backgroundUrl(),
+  );
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.backgroundPrisma = backgroundPrisma;
 

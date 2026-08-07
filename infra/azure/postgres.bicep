@@ -23,18 +23,56 @@ param backupRetentionDays int
 param postgresVersion string
 param databaseName string
 param databaseCollation string
+param deployDatabase bool
 param administratorLogin string
 param applicationLogin string
 
+@description('''
+Administrator password, or empty to leave the live credential untouched. See the parameter of the
+same name in main.bicep.
+''')
 @secure()
-param administratorLoginPassword string
+param administratorLoginPassword string = ''
 
 param minTlsVersion string
-param entraAdminObjectId string
-param entraAdminPrincipalName string
+param entraAuthEnabled bool
+param entraAdministrators entraAdministrator[]
+
+@description('''
+Whether the server accepts a password. See the parameter of the same name in main.bicep for the
+sequencing this must not be flipped ahead of.
+''')
+param passwordAuthEnabled bool = true
+
+@description('''
+Object id of a managed identity this deployment also creates, to be made an administrator.
+
+Separate from `entraAdministrators` rather than appended to it, and the reason is `what-if`.
+A copy count has to be computable before the deployment starts, so a loop whose length comes
+from `reference()` on a not-yet-deployed resource makes ARM refuse to expand this whole module —
+`NestedDeploymentShortCircuited` — and every Postgres resource silently reports as `Ignore`
+instead of as a change. Losing the preview on the database is a far worse trade than one extra
+parameter. Measured 2026-08-05.
+''')
+param ciAdministratorObjectId string
+
+@description('Resource name of that identity, which is also its Postgres role name.')
+param ciAdministratorName string
 param logAnalyticsWorkspaceId string
 param alertActionGroupId string
 param tags object
+
+@export()
+@description('One Microsoft Entra principal that may administer the database.')
+type entraAdministrator = {
+  @description('Entra object id. Becomes the ARM resource name of the administrator.')
+  objectId: string
+
+  @description('UPN for a user, display name for a group, service principal or managed identity.')
+  principalName: string
+
+  principalType: 'User' | 'Group' | 'ServicePrincipal'
+}
 
 // ---------------------------------------------------------------------------------------
 
@@ -52,7 +90,21 @@ var serverName = '${serverNamePrefix}-${uniqueString(resourceGroup().id)}'
 var pgBouncerEnabled = tier != 'Burstable'
 var pooledPort = pgBouncerEnabled ? 6432 : 5432
 
-var entraAdminConfigured = !empty(entraAdminObjectId)
+// Declaring an administrator implies the feature, so the two cannot disagree in the direction
+// that matters. The flag exists for the other direction — on, with nobody declared yet — which
+// is the only way to sequence this safely. See the parameter's description in main.bicep.
+var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators) || !empty(ciAdministratorObjectId)
+
+// Omitted from the payload unless there is something to write and password authentication is on
+// to write it for. ARM cannot read a password back, so a declared value is always written and a
+// redeploy carrying a different one silently rotates the live credential; omitting the property
+// leaves it alone. This is what makes `passwordAuthEnabled: false` deployable with no password
+// held anywhere, and what stops a routine redeploy touching the credential in the meantime.
+//
+// The edge that bites is the reversal: turning password auth back on without exporting the
+// password omits the property and still succeeds, so the flip has to carry the credential with
+// it. The rollback recipe in infra/azure/README.md does.
+var writeAdministratorPassword = passwordAuthEnabled && !empty(administratorLoginPassword)
 
 // ---------------------------------------------------------------------------------------
 // The server.
@@ -98,7 +150,7 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
   properties: {
     version: postgresVersion
     administratorLogin: administratorLogin
-    administratorLoginPassword: administratorLoginPassword
+    administratorLoginPassword: writeAdministratorPassword ? administratorLoginPassword : null
     createMode: 'Default'
 
     storage: {
@@ -227,11 +279,12 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     }
 
     authConfig: {
-      // Password authentication must stay enabled whatever else happens here: Prisma has no
-      // Microsoft Entra token flow, so disabling it breaks the application outright.
-      passwordAuth: 'Enabled'
-      activeDirectoryAuth: entraAdminConfigured ? 'Enabled' : 'Disabled'
-      tenantId: entraAdminConfigured ? subscription().tenantId : null
+      // Both, until every consumer has been proved on a token. Turning `passwordAuth` off while
+      // anything still holds a connection string locks the database against its own application,
+      // and the way back is an ARM write that itself authenticates against Entra.
+      passwordAuth: passwordAuthEnabled ? 'Enabled' : 'Disabled'
+      activeDirectoryAuth: entraAuthOn ? 'Enabled' : 'Disabled'
+      tenantId: entraAuthOn ? subscription().tenantId : null
     }
 
     // A named window rather than "system managed", so a maintenance restart never lands on
@@ -550,7 +603,16 @@ resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@
 // list and the partial unique index on `trail_lists` is built under different rules. The
 // migration workflow reads Neon's `datcollate` and refuses to run on a mismatch rather than
 // discovering it later.
-resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-01' = {
+//
+// **Create-only, hence the flag — and that is Azure's constraint, not a preference.** Charset
+// and collation are fixed by `CREATE DATABASE` and cannot be altered afterwards, so there is
+// no update for ARM to perform. Worse, the provider does not treat re-declaring them as a
+// no-op: a PUT carrying the value the server itself reads back is rejected with
+// `Invalid value given for parameter collation` (measured 2026-08-05 against this database,
+// which reports `collation: "C.UTF-8"` — the exact string being sent). Leaving this true on a
+// redeploy therefore fails the whole deployment, and it fails it *after* the server has been
+// written, which is the worst place to stop.
+resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-01' = if (deployDatabase) {
   parent: server
   name: databaseName
   properties: {
@@ -560,17 +622,42 @@ resource database 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2025-08-0
   dependsOn: [allowInternet]
 }
 
-// Optional. Lets a human and `az` connect without sharing the application's password.
-// Password authentication is unaffected — see `authConfig` above.
-resource entraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = if (entraAdminConfigured) {
+// Declaring one of these is what flips `activeDirectoryAuth` above, and **that flip restarts
+// the server** — Azure installs the `pgaadauth` extension and bounces it. Adding or removing
+// an administrator afterwards does not.
+//
+// An administrator here is an ARM-level grant only. It carries the rights of the original
+// PostgreSQL administrator and can create the Entra-mapped roles the application uses, but
+// those roles are SQL objects that no template can declare: see `infra/postgres-identity/`.
+// `@batchSize(1)` for the same reason the configurations above are chained: each of these is
+// a long-running write against one server object, and ARM would otherwise issue them at once.
+@batchSize(1)
+resource entraAdmins 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = [
+  for admin in entraAdministrators: {
+    parent: server
+    name: admin.objectId
+    properties: {
+      principalName: admin.principalName
+      principalType: admin.principalType
+      tenantId: subscription().tenantId
+    }
+    dependsOn: [database]
+  }
+]
+
+// Not part of the loop above — see `ciAdministratorObjectId`. `what-if` still cannot analyse
+// this one resource, because its ARM name *is* the runtime reference, and reports it as
+// `Unsupported`. That is the residual cost and it is the right size: one named resource that
+// cannot be previewed, rather than every Postgres resource silently reported as `Ignore`.
+resource ciAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2025-08-01' = if (!empty(ciAdministratorObjectId)) {
   parent: server
-  name: entraAdminObjectId
+  name: ciAdministratorObjectId
   properties: {
-    principalName: entraAdminPrincipalName
-    principalType: 'User'
+    principalName: ciAdministratorName
+    principalType: 'ServicePrincipal'
     tenantId: subscription().tenantId
   }
-  dependsOn: [database]
+  dependsOn: [entraAdmins]
 }
 
 // ---------------------------------------------------------------------------------------
@@ -600,32 +687,63 @@ output pooledPort int = pooledPort
 // proxies the session.
 //
 // The two parameters are here because the two clients that read these strings honour
-// different ones, and each ignores the other's:
+// different ones. Measured against Prisma 6.19.3 and node-postgres 8.22.0, the pinned
+// versions, by dialling a server that answers the SSLRequest and presents a certificate the
+// client has no reason to trust:
 //
 //   `sslmode=verify-full`  is what **libpq** understands — psql, pg_dump and pg_restore, which
 //                          must also be given PGSSLROOTCERT pointing at a CA bundle holding
 //                          DigiCert Global Root G2 and Microsoft RSA Root CA 2017, because
 //                          libpq otherwise looks only in ~/.postgresql/root.crt and fails
-//                          closed.
+//                          closed. Prisma's query and schema engines do read `sslmode`, but
+//                          understand only disable/prefer/require: `verify-full` is not a
+//                          value they recognise and behaves exactly as `sslmode=nonsense`
+//                          does, falling back to the default. Against a server that answers
+//                          the SSLRequest with `N`, both continue in cleartext; `require` is
+//                          the only value that aborts.
 //
-//   `sslaccept=strict`     is what **Prisma** understands, and it is the load-bearing half on
-//                          Vercel. Measured on Prisma 6.19.3 rather than assumed: a client
-//                          constructed with `sslmode=nonsense` raises no error at all, so
-//                          Prisma does not validate this parameter and an unrecognised value
-//                          is silently ignored rather than refused. Relying on `verify-full`
-//                          alone would therefore have been a change that reads as a fix and
-//                          verifies nothing. `sslaccept=strict` turns certificate verification
-//                          on explicitly, against the system trust store — which already
-//                          contains DigiCert Global Root G2 and Microsoft RSA Root CA 2017,
-//                          the two roots Flexible Server chains to.
+//   `sslaccept=strict`     is what **Prisma** understands, and it is the half that
+//                          authenticates the server. With it, a self-signed certificate is
+//                          refused — "terminated in a root certificate which is not trusted"
+//                          — so the platform trust store is consulted, and it already holds
+//                          the two roots Flexible Server chains to. It is verify-full and not
+//                          verify-ca: given a certificate signed by a supplied root but
+//                          naming a different host, the engine refuses with "the
+//                          certificate's CN name does not match the passed value".
+//                          node-postgres is the mirror image — it reads `sslmode` (both
+//                          `require` and `verify-full` force TLS and reject an untrusted
+//                          chain) and ignores `sslaccept` completely, sending no SSLRequest
+//                          at all when that is the only parameter given.
+//
+// So the CI administrator path is verified: `sslaccept=strict` is what makes Prisma check the
+// chain and the hostname, and that is the parameter `.github/scripts/pg-token-url.sh` emits.
+// What neither parameter does is make TLS *mandatory* for Prisma — that is
+// `require_secure_transport = ON` above, server-side, which a client cannot talk down.
+//
+// Measured on Windows, where the engine's TLS backend is SChannel. Which parameters are read,
+// and which values are recognised, is connection-string parsing and does not vary by platform;
+// the certificate-verification behaviour of the OpenSSL backend the ubuntu-latest runner uses
+// is **UNVERIFIED** here.
 //
 // Neither reaches the wrong parser: the workflow splits these URLs in Node and passes libpq
 // only the standard PG* variables, so `sslaccept` never reaches libpq (which would reject it
 // as an invalid connection option).
 //
-// The migration workflow's preflight asserts this rather than assuming it — it connects with
+// **What is deployed does not match these templates, and that is a live gap rather than a
+// note.** These outputs are templates a human pastes from; nothing propagates them. Measured
+// 2026-08-05: the Function App's `DATABASE_URL` app setting carries `?sslmode=verify-full`
+// and no `sslaccept`, and the two repository secrets were written the same way. Read together
+// with the finding just above — `sslmode=verify-full` is inert for Prisma — that means the
+// Prisma clients are connecting **without** server-certificate verification today, because
+// the only parameter they were given is one whose value they do not recognise.
+// Vercel's values are marked sensitive and cannot be read back, so they are unmeasured and
+// should be assumed to be in the same state. Closing this means rewriting those settings to
+// carry both parameters and re-reading them; it is listed in infra/azure/README.md.
+//
+// `Postgres identity` → `inspect` asserts this rather than assuming it — it connects with
 // PGSSLMODE=verify-full and prints pg_stat_ssl, and a connection that could not verify the
-// chain fails there, from a runner, before any data moves.
+// chain fails there, from a runner, before anything else in that job runs. That covers libpq,
+// which is what the workflow uses; it says nothing about the Prisma clients above.
 // ---------------------------------------------------------------------------------------
 //
 // Deliberately no `connection_limit` on either template. It looks like a sensible thing to

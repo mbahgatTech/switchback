@@ -26,11 +26,11 @@
 // ---- Permanent residue. Nothing here changes behaviour. ----
 //
 // 1. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
-//    is passed is written. Pass the *same* value every time — a redeploy with a freshly
-//    generated password silently rotates the admin credential and every connection string
-//    that carries it stops working. See infra/azure/README.md, "Redeploying", which also says
-//    where that value has to live for this to be possible at all. This is the one item on the
-//    list with teeth.
+//    is passed is written. The parameter therefore defaults to empty and postgres.bicep omits
+//    the property entirely when it is: a redeploy that supplies no value leaves the live
+//    credential alone rather than rewriting it. Supply a value only to create the server or to
+//    rotate deliberately, and when rotating, expect every connection string carrying the old
+//    one to stop working. See infra/azure/README.md, "Redeploying".
 //
 // 2. Three server parameters report as changed on every run and never converge:
 //    `log_connections`, `log_disconnections` and `ssl_min_protocol_version`. The template
@@ -100,6 +100,8 @@
 // where the value is kept afterwards.
 
 targetScope = 'subscription'
+
+import { entraAdministrator } from './postgres.bicep'
 
 // ---------------------------------------------------------------------------------------
 // Location
@@ -247,6 +249,18 @@ CREATE DATABASE, so a change here means recreating the database rather than rede
 ''')
 param databaseCollation string = 'C.UTF-8'
 
+@description('''
+Declare the database itself. True on a from-scratch build; false against a server that already
+has it.
+
+Charset and collation are fixed by `CREATE DATABASE`, so ARM has no update to perform — and
+the provider rejects a PUT that merely restates them, including the exact string it reads back
+(`Invalid value given for parameter collation`, measured 2026-08-05). A redeploy with this
+true fails after the server has already been written. Export `DEPLOY_DATABASE=false` for any
+run against the live server; see infra/azure/README.md.
+''')
+param deployDatabase bool = true
+
 @description('Administrator login. Not `postgres`, `admin`, or `azure_superuser` — reserved.')
 param administratorLogin string = 'sbadmin'
 
@@ -271,29 +285,48 @@ Vercel.
 param applicationLogin string = 'sbapp'
 
 @description('''
-Administrator password. No default, `@secure()`, never in a committed parameter file.
+Administrator password. `@secure()`, never in a committed parameter file.
+
+**Empty means "do not write one", and that is the safe default rather than an omission.** ARM
+cannot read a password back, so any value passed is written — passing none is the only way to
+redeploy without rewriting the live credential. postgres.bicep therefore omits the property
+entirely when this is empty, which makes a redeploy leave the credential alone instead of
+rotating it, and makes `passwordAuthEnabled: false` deployable with no value held anywhere.
+
+A value is required only to *create* the server, or to deliberately rotate: the provider refuses
+a create with no password while password authentication is on, which is the correct failure.
 
 Generate it URL-safe. Three places in this repository parse `DATABASE_URL` with the WHATWG
 URL parser (`apps/web/src/env.ts`, `packages/db/src/client.ts`, `vitest.config.ts`), and a
 `/` in the userinfo — which `openssl rand -base64` emits about half the time — does not
 throw. It terminates the authority, the host silently becomes something else, and the
-failure names nothing useful. `openssl rand -hex 32` has no such characters.
+failure names nothing useful. `openssl rand -hex 32` has no such characters. There is no
+minimum length declared here because the type now has to admit the empty case; Azure enforces
+its own floor, and the recipe above produces 64 characters.
 ''')
 @secure()
-@minLength(24)
-param administratorLoginPassword string
+param administratorLoginPassword string = ''
 
 @description('''
 Minimum TLS version the server will negotiate.
 
 TLSv1.2 rather than TLSv1.3, deliberately, and stated as a parameter so raising it is one
 value. TLS 1.2 with modern ciphers is not a weak setting; it is Azure\'s own default and it
-is what Neon serves today. TLSv1.3 would be marginally better and carries a real failure
-mode: if Prisma\'s Rust query engine cannot negotiate it from wherever Vercel is running,
-the connection fails in a way indistinguishable from a firewall or credential problem, and
-the machine that owns this repository cannot reach 5432 to tell the difference. The
-migration workflow prints the negotiated TLS version from a runner; raise this to TLSv1.3
-once that output says 1.3, with evidence rather than optimism.
+is what Neon serves today. What holds the floor is the client side: if Prisma\'s Rust query
+engine cannot negotiate 1.3 from wherever Vercel is running, the connection fails in a way
+that reads like a firewall or a credential problem, and nothing here establishes that it can.
+
+Diagnosis is not the obstacle. The machine that owns this repository does reach 5432: on
+2026-08-06, with ProtonVPN disconnected, psql 16 connected under `sslmode=verify-full` as
+the owner\'s Entra administrator and the server answered. ProtonVPN\'s ProTUN adapter tears
+the session down above TCP, which reads as unreachability and is not. So a raise that breaks
+a client can be told apart from a firewall or credential failure, and rolled back, from a
+second door.
+
+What is still missing is a measurement from the runtime that matters. `Postgres identity` →
+`inspect` in .github/workflows/postgres-entra.yml reads `pg_stat_ssl` and prints the negotiated
+version and cipher from a runner; raise this to TLSv1.3 once that output says 1.3 and a Vercel
+deployment has been shown to connect, with evidence rather than optimism.
 ''')
 @allowed([
   'TLSv1.2'
@@ -301,23 +334,91 @@ once that output says 1.3, with evidence rather than optimism.
 ])
 param minTlsVersion string = 'TLSv1.2'
 
-@description('''
-Object id of the Microsoft Entra principal to make a database administrator.
+@description('Name of the user-assigned managed identity CI reaches Postgres with.')
+param ciIdentityName string = 'id-switchback-postgres-ci'
 
-Optional. Empty (the default) leaves Entra authentication off entirely and password
-authentication as the only path, which is what the app needs and all it needs. Supplying one
-adds an Entra admin *alongside* the password login, so a human or `az` can connect without
-sharing the application credential.
+@description('Name of the user-assigned managed identity the Infrastructure workflow deploys as.')
+param infraIdentityName string = 'id-switchback-infra-deploy'
+
+@description('''
+Whether to grant that identity Contributor on this subscription. Off until the owner decides that
+a public repository's `master` workflows may write production infrastructure; see
+infra-identity.bicep. The identity and its federated credential are created either way, so
+flipping this is the only step between a compile-only pipeline and a deploying one.
+''')
+param grantInfraIdentityContributor bool = false
+
+@description('''
+Name of the user-assigned managed identity the runtime clients are being consolidated onto —
+Vercel production, Vercel preview and the ingest worker. Declared, not yet in force; see
+runtime-identity.bicep for what is live today, why one identity serves all three, and what
+that costs.
+''')
+param runtimeIdentityName string = 'id-switchback-vercel-publisher'
+
+@description('Vercel team slug. Half of every federated-credential subject; see runtime-identity.bicep.')
+param vercelTeamSlug string = 'mbahgattechs-projects'
+
+@description('Vercel project name. The other half.')
+param vercelProjectName string = 'switchback'
+
+@description('''
+Repository whose GitHub Actions OIDC tokens the CI identity trusts, in GitHub's immutable
+subject form. See the parameter of the same name in ci-identity.bicep for why it is not
+`mbahgatTech/switchback`.
+''')
+param repository string = 'mbahgatTech@81331884/switchback@1316632119'
+
+@description('''
+Branches whose workflow runs may assume the CI identity. One federated credential each —
+GitHub puts the ref in the OIDC subject and Entra matches subjects exactly, with no wildcard.
+''')
+param ciIdentityBranches string[] = ['master']
+
+@description('''
+Turn Microsoft Entra authentication on without yet declaring who administers it.
+
+**This exists because the two cannot be deployed together.** ARM refuses an
+`administrators` child on a server whose `activeDirectoryAuth` is still Disabled, and it
+refuses it at *preview* time too — `what-if` returns BadRequest on the administrator rather
+than showing the change list, so the one deployment that restarts the production database
+would have to be run blind. Setting this true with `entraAdministrators` empty makes the
+restart its own reviewable deployment; the administrators go in the next one.
+
+Declaring an administrator turns the feature on regardless, so leaving this false afterwards
+does not turn it back off.
+''')
+param entraAuthEnabled bool = false
+
+@description('''
+Microsoft Entra principals that may administer the database.
+
+Empty (the default) leaves nobody declared. A non-empty list turns Entra authentication on
+alongside the password login, which is the state this deployment holds while consumers are
+moved across one at a time.
+
+**Filling this in on a server whose Entra authentication is still off restarts it** — Azure
+installs the `pgaadauth` extension. Use `entraAuthEnabled` to take that restart separately.
 
   az ad signed-in-user show --query id -o tsv
-
-Password authentication stays enabled either way. Prisma has no Entra token flow; disabling
-it breaks the application.
+  az identity show -g <rg> -n <name> --query principalId -o tsv
 ''')
-param entraAdminObjectId string = ''
+param entraAdministrators entraAdministrator[] = []
 
-@description('UPN or display name of the Entra admin. Required when `entraAdminObjectId` is set.')
-param entraAdminPrincipalName string = ''
+@description('''
+Whether the server accepts a password at all.
+
+**True until every consumer has been proved on a token, and flipping it is its own deployment.**
+Turning it off while anything still holds a connection string locks the database against its own
+application, and the way back is an ARM write that itself needs Entra. The order is: move each
+consumer, prove it with passwords still enabled, re-prove both administrator doors, then flip.
+See infra/azure/README.md.
+
+False also stops `administratorLoginPassword` being written at all, so the cutover ends with no
+password anywhere in the deployment path — including the one this template would otherwise
+rewrite on every run.
+''')
+param passwordAuthEnabled bool = true
 
 // ---------------------------------------------------------------------------------------
 // Budget and alerting
@@ -380,6 +481,9 @@ resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   location: location
   tags: tags
 }
+
+// Built-in Contributor. A literal because role definition ids are fixed across every tenant.
+var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 
 // ---------------------------------------------------------------------------------------
 // The delete lock.
@@ -449,8 +553,65 @@ module monitoring 'monitoring.bicep' = {
     tags: tags
     alertEmailAddress: alertEmailAddress
     workloadBudgetUsd: workloadBudgetUsd
-    budgetStartDate: budgetStartDate
+    workloadBudgetStartDate: workloadBudgetStartDate
     budgetEndDate: budgetEndDate
+  }
+}
+
+module ciIdentity 'ci-identity.bicep' = {
+  name: 'switchback-ci-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: ciIdentityName
+    repository: repository
+    branches: ciIdentityBranches
+    tags: tags
+  }
+}
+
+module runtimeIdentity 'runtime-identity.bicep' = {
+  name: 'switchback-runtime-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: runtimeIdentityName
+    vercelTeamSlug: vercelTeamSlug
+    vercelProjectName: vercelProjectName
+    tags: tags
+  }
+}
+
+module infraIdentity 'infra-identity.bicep' = {
+  name: 'switchback-infra-identity'
+  scope: rg
+  params: {
+    location: location
+    identityName: infraIdentityName
+    repository: repository
+    branch: 'master'
+    tags: tags
+  }
+}
+
+// Subscription scope because `main.bicep` declares the resource group itself, so a group-scoped
+// Contributor could deploy every other template but never this one.
+//
+// Off by default, and that is the whole point of the parameter. Creating the identity above is
+// reversible and grants nothing; this is the write that lets any workflow run on `master` of a
+// **public** repository change production infrastructure. Turn it on deliberately, having decided
+// that merge review on `master` is the control you want standing between a pull request and the
+// estate.
+// The name is keyed off `infraIdentityName`, not the principal id: ARM requires a role
+// assignment's name to be computable before the deployment starts, and a module output is not.
+// `principalType: 'ServicePrincipal'` is what stops the assignment failing on a freshly created
+// identity that has not yet replicated through Entra.
+resource infraContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (grantInfraIdentityContributor) {
+  name: guid(subscription().id, infraIdentityName, contributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', contributorRoleId)
+    principalId: infraIdentity.outputs.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -468,12 +629,19 @@ module postgres 'postgres.bicep' = {
     postgresVersion: postgresVersion
     databaseName: databaseName
     databaseCollation: databaseCollation
+    deployDatabase: deployDatabase
     administratorLogin: administratorLogin
     applicationLogin: applicationLogin
     administratorLoginPassword: administratorLoginPassword
     minTlsVersion: minTlsVersion
-    entraAdminObjectId: entraAdminObjectId
-    entraAdminPrincipalName: entraAdminPrincipalName
+    entraAuthEnabled: entraAuthEnabled
+    entraAdministrators: entraAdministrators
+    passwordAuthEnabled: passwordAuthEnabled
+    // The CI identity is an administrator because `prisma db push` needs DDL over tables
+    // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
+    // Passed separately rather than appended to the list — see the parameter in postgres.bicep.
+    ciAdministratorObjectId: ciIdentity.outputs.principalId
+    ciAdministratorName: ciIdentityName
     logAnalyticsWorkspaceId: monitoring.outputs.workspaceId
     alertActionGroupId: monitoring.outputs.actionGroupId
     tags: tags
@@ -579,6 +747,20 @@ character for character, so the two cannot disagree.
 param budgetStartDate string = '2026-07-01T00:00:00Z'
 
 @description('''
+First day of the *resource group* budget's window, UTC, same full ISO-8601 form.
+
+Separate from `budgetStartDate`, and the reason is a rule that only bites on creation: ARM
+rejects a new monthly budget whose start date is before the current month —
+`Start date for monthly time grain should not be prior to current month` — while an existing
+budget keeps whatever date it was created with and can be updated freely. The subscription
+budget was created in July 2026 and the resource-group one in August, so a single shared value
+cannot deploy both. The paragraph above predicted a stale date would fail a redeploy on the
+operation that is riskiest to improvise; this is that failure, and splitting the parameter is
+the fix rather than moving the live subscription window.
+''')
+param workloadBudgetStartDate string = '2026-08-01T00:00:00Z'
+
+@description('''
 Last day of the budget window, UTC, in the same full ISO-8601 form as `budgetStartDate`.
 Matches what Azure assigns by default.
 ''')
@@ -670,3 +852,25 @@ output applicationDatabaseUrlTemplate string = postgres.outputs.applicationDatab
 
 @description('Log Analytics workspace holding PostgreSQLLogs, including the connection log.')
 output logAnalyticsWorkspaceId string = monitoring.outputs.workspaceId
+
+@description('''
+Resource id of the shared runtime identity. The parameter ingest.bicep takes so the worker runs
+as the same principal Vercel does.
+''')
+output runtimeIdentityResourceId string = runtimeIdentity.outputs.resourceId
+
+@description('Client id of the shared runtime identity — `AZURE_CLIENT_ID` on every runtime consumer.')
+output runtimeIdentityClientId string = runtimeIdentity.outputs.clientId
+
+@description('''
+Object id of the shared runtime identity. What `sbapp_runtime` is mapped to, and the argument
+`postgres-entra.yml` asserts the live role against.
+''')
+output runtimeIdentityPrincipalId string = runtimeIdentity.outputs.principalId
+
+@description('''
+Client id of the infrastructure deployment identity — the `AZURE_INFRA_CLIENT_ID` repository
+variable `.github/workflows/infrastructure.yml` reads. Deploying is still gated on
+`grantInfraIdentityContributor`.
+''')
+output infraIdentityClientId string = infraIdentity.outputs.clientId

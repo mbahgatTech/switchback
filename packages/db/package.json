@@ -22,14 +22,19 @@
     "backfill:peak-elevations": "dotenv -e ../../.env -- tsx scripts/backfill-peak-elevations.ts"
   },
   "dependencies": {
+    "@azure/identity": "4.13.1",
+    "@prisma/adapter-pg": "6.19.3",
     "@prisma/client": "^6.2.1",
-    "@switchback/core": "*"
+    "@switchback/core": "*",
+    "@vercel/oidc": "^3.8.2",
+    "pg": "8.22.0"
   },
   "//devDependencies": "@switchback/geo is used only by scripts/seed.ts, for quadkey maths. The runtime db package does not depend on geo and must not — geo already imports core, and db importing geo at runtime is the first half of a cycle.",
   "//devDependencies-ingest": "@switchback/ingest is used only by scripts/backfill-peak-elevations.ts, for the Overpass client and parseEleM — reusing the queue, backoff, mirror failover and breaker the public instances require, rather than hand-rolling a second client that obeys none of them. It does close a loop, since ingest depends on db, but only through a script: nothing under packages/db/src imports it, npm links both as workspaces, and the alternative is a copy of the etiquette that drifts.",
   "devDependencies": {
     "@switchback/geo": "*",
     "@switchback/ingest": "*",
+    "@types/pg": "8.20.4",
     "dotenv-cli": "^8.0.0",
     "prisma": "^6.2.1"
   }

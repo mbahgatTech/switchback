@@ -56,12 +56,17 @@ param alertEmailAddress string
 param workloadBudgetUsd int
 
 @description('''
-First day of the budget window, UTC, as full ISO-8601 — `yyyy-MM-01T00:00:00Z`, the form ARM
-stores and reads back. Fixed, not `utcNow()`. See main.bicep.
-''')
-param budgetStartDate string
+First day of this budget's window, UTC, as full ISO-8601 — `yyyy-MM-01T00:00:00Z`, the form
+ARM stores and reads back. Fixed, not `utcNow()`.
 
-@description('Last day of the budget window, UTC, same form as `budgetStartDate`.')
+Separate from the subscription budget's date in main.bicep, and not by preference: ARM refuses
+to *create* a monthly budget whose start date is before the current month, while an existing
+one keeps whatever date it was created with. The two budgets here were created in different
+months, so one shared value cannot satisfy both.
+''')
+param workloadBudgetStartDate string
+
+@description('Last day of the budget window, UTC, same form as `workloadBudgetStartDate`.')
 param budgetEndDate string
 
 // ---------------------------------------------------------------------------------------
@@ -163,7 +168,7 @@ resource workloadBudget 'Microsoft.Consumption/budgets@2023-05-01' = {
     timeGrain: 'Monthly'
     amount: workloadBudgetUsd
     timePeriod: {
-      startDate: budgetStartDate
+      startDate: workloadBudgetStartDate
       endDate: budgetEndDate
     }
     notifications: {
