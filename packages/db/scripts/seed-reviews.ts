@@ -137,8 +137,8 @@ function assertNotProduction(): void {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
   // Stricter than the trail seed because this *writes user rows*: made-up accounts in a live
-  // users table are not a tidy mistake. `postgres.database.azure.com` is production; neon.tech
-  // stays listed for as long as Neon remains the retained rollback.
+  // users table are not a tidy mistake. `postgres.database.azure.com` is production; the other
+  // three are managed-host shapes this repository has used or could plausibly point at.
   if (
     /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
     !process.env.SEED_ALLOW_REMOTE

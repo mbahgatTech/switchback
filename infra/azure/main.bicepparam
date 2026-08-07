@@ -266,8 +266,8 @@ param tags = {
   sourcePath: 'infra/azure'
   costCenter: 'vs-enterprise-monthly-credit'
   dataClassification: 'user-content'
-  // Read by anyone opening the portal: Neon is still live and is the way back.
-  rollback: 'neon-us-east-1-retained'
+  // Read by anyone opening the portal: what the recovery is if this server is lost.
+  rollback: 'azure-pitr-14d-lrs-new-server'
 }
 
 // The only secret, and it is not stored here — see the header. Empty when the variable is unset,

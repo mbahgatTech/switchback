@@ -4,19 +4,19 @@ One **Azure Database for PostgreSQL Flexible Server** — PostgreSQL 17 with Pos
 resource group, described entirely in Bicep. It replaced **Neon** and nothing else: the app stays
 on Vercel, photographs stay in Cloudflare R2, CI stays on GitHub Actions.
 
-**Production has served from Azure since 2026-07-30, about 20:09 UTC.** Neon is retained, intact
-and idle, as the rollback.
+**Production has served from Azure since 2026-07-30, about 20:09 UTC.** It is the only copy of
+this data. The Neon project that used to be the rollback was deleted on 2026-08-07.
 
 ```mermaid
 flowchart LR
   V["Vercel<br/>switchback-three.vercel.app"]
   CI["GitHub Actions<br/>ci.yml migrate job"]
   A["Azure Postgres 17 + PostGIS — live<br/>psql-switchback-prod-37ywppu5p7fri<br/>rg-switchback-prod-northcentralus"]
-  N["Neon — retained rollback<br/>idle, schema frozen at cutover"]
+  P["Point-in-time restore<br/>14 days, locally redundant<br/>restores into a new server"]
 
   V -->|"sbapp, password, DML only"| A
   CI -->|"id-switchback-postgres-ci, Entra token, DDL"| A
-  V -.->|"rollback: repoint and redeploy, 3-5 min"| N
+  A -.->|"the only recovery"| P
 ```
 
 ---
@@ -53,8 +53,11 @@ flowchart LR
   of 2026-08-05 applied them. The resource-group budget needed its own start date — ARM will not
   create a monthly budget beginning before the current month — which is why `budgetStartDate` and
   `workloadBudgetStartDate` are two parameters rather than one.
-- **Neon's schema is frozen at the cutover commit** and nothing keeps it current, so a rollback is
-  now two steps rather than one. See [Rollback expiry](#rollback-expiry).
+- **There is no second copy of this data, and no rollback target.** Neon was deleted on
+  2026-08-07 — the Vercel↔Neon marketplace resource was removed, and the endpoint stopped
+  answering minutes later. Everything that used to say "roll back to Neon" now resolves to
+  point-in-time restore into a **new** Azure server, and nothing else. See
+  [Backups](#backups) and [If this server is lost](#if-this-server-is-lost).
 - **The portable backup has been proven and is not retained.** Run 31043403970 dumped production,
   restored it and compared it row for row, so the mechanism works. But the dump artifact it
   published was deleted the same day, and the workflow now withholds the dump while the repository
@@ -88,73 +91,51 @@ A 500 on its own tells you nothing. These do:
 
 That last row is the one with no five-minute fix. The recovery is either to wait for the next
 billing month or to remove the spending limit, which converts the subscription to pay-as-you-go
-and starts charging a card. Roll back to Neon while deciding.
+and starts charging a card. There is no third option and no other database to serve from while
+deciding.
 
-**If a symptom is not fixable in five minutes, roll back first and diagnose afterwards.** Neon is
-warm and the cost of rolling back is one redeploy.
+**There is nowhere to roll back to.** Every symptom above has to be diagnosed and fixed in place.
+Restoring costs a new server and loses everything written since the restore point, so it is the
+answer to data loss, not to a slow page.
 
-### Rolling back to Neon
+### If this server is lost
 
-Neon is retained, populated and reachable. Rolling back is a Vercel change and a redeploy.
+The recovery is Azure point-in-time restore and nothing else. It is not a rollback: it does not
+repoint the site at a second copy, it builds a third one.
 
-1. **Get the Neon connection strings.** They are on this machine, in two files:
-
-   ```bash
-   cat ~/.sb-neon.url          # direct endpoint  -> DIRECT_DATABASE_URL
-   cat ~/.sb-neon-pooled.url   # pooled endpoint  -> DATABASE_URL
-   ```
-
-   If those are gone, the **Neon console** connection-string panel is the source that survives
-   everything else; reset the role password there and rebuild the URL if it is no longer shown.
-
-   **Not** from a GitHub Actions secret — those are write-only, so a rollback copy in one is not a
-   copy. And no longer from Vercel: the Neon integration variables that used to make
-   `POSTGRES_URL_NON_POOLING` readable there are deleted and the integration is disconnected.
-
-   Then set `DATABASE_URL` and `DIRECT_DATABASE_URL` in Vercel → Production back to those values.
-
-2. Redeploy. Poll `/api/version`. Run the six smoke routes.
-   **Time to restore service: about 3–5 minutes**, nearly all of it the redeploy.
-
-3. **Push the schema to Neon before trusting it.** Its schema is frozen at the cutover commit — see
-   [Rollback expiry](#rollback-expiry). If anything has shipped since, reconcile it by hand:
+1. **Establish what you are recovering from.** A bad `db push`, a deleted row set, and a deleted
+   server are three different problems. Only the first two have a restore point that helps.
+2. **Pick a target time before the damage.** The window reaches back to
+   `2026-07-30T16:32:40Z` at the earliest and 14 days at the most, whichever is later.
+3. **Restore into a new server.** `az postgres flexible-server restore` takes `--source-server`
+   and creates the server named by `--name`; there is no in-place restore. Budget ~$57/month for
+   as long as it exists, against a subscription already over its credit.
 
    ```bash
-   DATABASE_URL='<neon-pooled>' DIRECT_DATABASE_URL='<neon-direct>' npm run db:push
+   az postgres flexible-server restore \
+     --resource-group rg-switchback-prod-northcentralus \
+     --name psql-switchback-recover-<yyyymmdd> \
+     --source-server psql-switchback-prod-37ywppu5p7fri \
+     --restore-time '<iso8601-utc>'
    ```
 
-   Read the diff Prisma proposes before accepting it. `db:push` loads `.env` through `dotenv-cli`,
-   which does not override variables already present in the environment — so the two above win, but
-   check the host it prints before answering any prompt.
+4. **Re-point Vercel** `DATABASE_URL` / `DIRECT_DATABASE_URL` at the restored host and redeploy.
+   The restored server has its own firewall rules, its own admin credential and no Entra
+   administrator — expect to reapply all three before anything connects.
+5. **Leave the original running and intact** until the cause is understood.
 
-4. Revert the repository secrets `DATABASE_URL` / `DIRECT_DATABASE_URL` to the Neon values.
-5. Reconcile in reverse: rows written to Azure since cutover exist only there. This is manual — no
-   script here performs it. Replay by hand if the set turns out to matter.
-6. **Leave Azure running and intact** until the cause is understood. Do not delete the evidence.
-
-#### Rollback expiry
-
-**Neon's schema is frozen at the cutover commit, and nothing keeps it current.** Keeping it current
-would have meant a second `db push` against Neon from `ci.yml`. That was proposed, never added, and
-is not going to be: a schema migration running unwatched against the one copy of the data that
-exists if Azure is broken is a worse failure mode than the one it prevents. So the first schema
-change shipped after 2026-07-30 20:09 UTC makes a rollback two steps rather than one, and the
-further past the cutover, the larger the diff `db push` proposes against a database holding the
-only copy of anything Azure has lost. Survivable while it is a column or two. It stops being
-survivable quietly.
-
-The Azure-only write set has the same shape: it has to stay small enough to replay by hand, and it
-grows every day. **Keep Neon for at least 30 days,** and treat the rollback as expiring rather than
-permanent. Neon suspends idle compute automatically and retains the data, so a warm rollback costs
-nothing.
+Two limits this does not cover. A restore lands inside the same subscription, so it is no help if
+the subscription is what failed — and if the credit ran out and deallocated everything, the
+restore target is deallocated too. And deleting a Flexible Server takes its backups with it, so
+there is no restore point at all for the one failure the delete lock exists to prevent.
 
 ---
 
 ## Backups
 
-Two of them, because they fail in different ways.
+There is one, and it is not portable.
 
-### Azure point-in-time restore — the floor
+### Azure point-in-time restore — the only recovery
 
 Free, automatic, and the fastest way back from a bad `db push`. Measured 2026-08-05:
 
@@ -173,13 +154,20 @@ az postgres flexible-server show \
 ```
 
 **The window is as deep as the server is old, not 14 days.** The server was created on 2026-07-30,
-so today it reaches back six days. It becomes a true 14-day window on 2026-08-13, and until then
-the retention setting is a ceiling rather than a fact.
+so it becomes a true 14-day window on 2026-08-13; before that the retention setting is a ceiling
+rather than a fact. Read the earliest restore point rather than assuming either number:
+
+```bash
+az postgres flexible-server show \
+  --resource-group rg-switchback-prod-northcentralus \
+  --name psql-switchback-prod-37ywppu5p7fri \
+  --query 'backup.earliestRestoreDate' -o tsv
+```
 
 Two limits worth knowing before relying on it. A restore provisions a **new** Flexible Server —
 about $57/month for as long as it exists, against a subscription that is already over its credit
 with the spending limit `On`. And it restores into Azure and nowhere else, which is no help if the
-subscription is what failed.
+subscription is what failed. [If this server is lost](#if-this-server-is-lost) is the procedure.
 
 ### The portable half — there is not one
 
@@ -476,14 +464,18 @@ GitHub's values cannot be read back, so the `Notes` column is design intent plus
 demonstrably requires, not a readback. If you need to know what a secret contains, the only honest
 answer is to set it again from a source you trust.
 
-**No geo-redundant backup, no high availability.** Both would be reasonable on a database without a
-warm standby. This one has Neon: the disaster procedure is "point `DATABASE_URL` back at Neon and
-redeploy", minutes to restore with no data loss up to the cutover. Geo-restore takes minutes to
-hours, has up to an hour of RPO, and cannot do point-in-time restore at all.
+**No geo-redundant backup, no high availability — and, since 2026-08-07, no warm standby either.**
+Both settings were chosen when the disaster procedure was "point `DATABASE_URL` back at Neon and
+redeploy": minutes to restore, no data loss up to the cutover, so paying for geo-restore (minutes
+to hours, up to an hour of RPO, no point-in-time) bought nothing. Neon is now deleted, and that
+argument went with it.
 
-`geoRedundantBackup` is **immutable after creation**. If Neon is ever decommissioned this becomes
-the weak point, and changing it means rebuilding the server. Say so out loud at that time rather
-than discovering it.
+This is the weak point, said out loud rather than discovered. What is left is locally-redundant
+point-in-time restore into a new server, inside the same subscription — so a region-level failure,
+or the credit cliff deallocating the subscription, takes the recovery with the original.
+`geoRedundantBackup` is **immutable after creation**, so closing this means rebuilding the server
+and moving the data again. The cheaper half is a portable dump into a private container in this
+resource group, which is a decision nobody has taken yet; see [Backups](#backups).
 
 ---
 
@@ -813,7 +805,9 @@ cannot be fooled by a misread catalogue.
 
 `scripts/verify-migration.ts` compares a source and a target and prints a table of pass/fail. Worth
 re-running after any restore, any rebuild, and any cutover. It prints no connection string and no
-row of user data, and exits non-zero on any failure.
+row of user data, and exits non-zero on any failure. `NEON_*` in the variable names is where the
+source happened to be the first time; the script reads any two PostgreSQL URLs, and the Neon
+project itself is gone.
 
 ```bash
 export NEON_VERIFY_URL='postgresql://…@…neon.tech/switchback?sslmode=verify-full'
@@ -841,7 +835,7 @@ variable into a clean bill of health. A green run means every check ran.
 Checksum files are `table|rows|md5` per line, computed in SQL on each side. On the source they must
 be taken from _inside the transaction snapshot `pg_dump` used_, and `CHECKSUM_SNAPSHOT_CONSISTENT=1`
 is the assertion that they were. Without it the ingest-derived tables (trails, waypoints, tiles,
-jobs, sessions) are compared against a live Neon that keeps taking writes, so a difference in those
+jobs, sessions) are compared against a source that keeps taking writes, so a difference in those
 is a warning rather than a failure. `photos` is deliberately not on the forgiving list: it holds
 user uploads as well as ingest-derived hero images, and treating somebody's lost photograph as
 expected churn is the wrong default.
@@ -876,9 +870,9 @@ target checksum files byte identical.
 
 ## Cutting over
 
-**Already done.** Kept because the same steps apply to any rebuild. Steps 1 and 3–8 ran; step 2 was
-dropped as incoherent and step 9 was deliberately not done — both are covered under
-[Rolling back](#rolling-back-to-neon) and [Rollback expiry](#rollback-expiry).
+**Already done.** Kept because the same steps apply to any rebuild. Read it as a procedure, not as a
+description of the estate: the source database it repeatedly tells you to preserve was deleted on
+2026-08-07, and what replaced the rollback is [If this server is lost](#if-this-server-is-lost).
 
 ### Taking the password out
 
@@ -1053,8 +1047,10 @@ and there is not one `autoincrement()`, so there are no sequences to resync and 
 covers **inserts only**; updates and deletes made in the window are not recoverable this way. So
 plan any cutover on the assumption that **writes in the window are not automatically recovered** —
 tolerable because the window is minutes, ingest is self-healing and the irreplaceable set is small,
-not because the recovery exists. Nothing is _lost_ while Neon is retained: anything stranded there
-can still be read and replayed by hand by someone with both credentials in front of them.
+not because the recovery exists. That last clause used to be softened by the source database being
+kept: anything stranded there could still be read and replayed by hand. Neon was deleted on
+2026-08-07, so on any future move the window is the loss, and the only way to shrink it is to keep
+it short.
 
 ### If you ever have to move the data again
 

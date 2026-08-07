@@ -456,8 +456,11 @@ param workloadBudgetUsd int = 150
 Tags applied to the resource group and restated on the server.
 
 `rollback` is here so that someone reading the portal — with no access to the pull request
-that created this — learns that Neon is still live and is the fallback, without having to
-ask anyone.
+that created this — learns what the recovery actually is, without having to ask anyone. It
+carried `neon-us-east-1-retained` while a second live copy of the data existed; that project
+was deleted on 2026-08-07 and the only recovery now is Azure point-in-time restore, locally
+redundant, into a **new** server. `.github/workflows/infrastructure.yml` restates this value
+in its `TAGS` environment variable and the two must agree.
 ''')
 param tags object = {
   app: 'switchback'
@@ -467,7 +470,7 @@ param tags object = {
   sourcePath: 'infra/azure'
   costCenter: 'vs-enterprise-monthly-credit'
   dataClassification: 'user-content'
-  rollback: 'neon-us-east-1-retained'
+  rollback: 'azure-pitr-14d-lrs-new-server'
 }
 
 // ---------------------------------------------------------------------------------------
@@ -490,9 +493,9 @@ var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 // minutes — except the data, which cannot be rebuilt from anything in this repository. The
 // server holds every user account, every recorded GPS track, and 19,157 trails. Deleting a
 // Flexible Server takes its automated backups with it: there is no recycle bin, no soft
-// delete, and no "restore the server I deleted yesterday". The recovery story for a deleted
-// server is the Neon copy named in the `rollback` tag, and that copy stops being current the
-// moment cutover finishes.
+// delete, and no "restore the server I deleted yesterday". There is no second copy of this
+// data anywhere — no geo-redundancy, no standby, no logical dump, and the Neon project that
+// used to be the answer was deleted on 2026-08-07. A deleted server is the end of the data.
 //
 // The realistic ways it goes:
 //

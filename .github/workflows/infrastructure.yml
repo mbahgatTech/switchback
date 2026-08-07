@@ -64,7 +64,7 @@ concurrency:
 env:
   RESOURCE_GROUP: rg-switchback-prod-northcentralus
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
-  TAGS: '{"app":"switchback","env":"production","managedBy":"bicep","repo":"mbahgatTech/switchback","sourcePath":"infra/azure","costCenter":"vs-enterprise-monthly-credit","dataClassification":"user-content","rollback":"neon-us-east-1-retained"}'
+  TAGS: '{"app":"switchback","env":"production","managedBy":"bicep","repo":"mbahgatTech/switchback","sourcePath":"infra/azure","costCenter":"vs-enterprise-monthly-credit","dataClassification":"user-content","rollback":"azure-pitr-14d-lrs-new-server"}'
 
 jobs:
   build:
