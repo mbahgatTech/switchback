@@ -590,10 +590,17 @@ export const trailsRouter = router({
   bySlug: publicProcedure
     .input(z.object({ slug: z.string().min(1).max(200) }))
     .query(async ({ ctx, input }) => {
-      const row = await ctx.db.trail.findUnique({
-        where: { slug: input.slug },
-        select: detailSelect,
-      });
+      const row =
+        (await ctx.db.trail.findUnique({ where: { slug: input.slug }, select: detailSelect })) ??
+        // A merge retires one of two slugs, and both were public URLs from first index. The
+        // alias table is what keeps the retired one answering rather than 404ing every inbound
+        // link — see `mergeTrails` in @switchback/ingest, which writes it.
+        (
+          await ctx.db.trailSlugAlias.findUnique({
+            where: { slug: input.slug },
+            select: { trail: { select: detailSelect } },
+          })
+        )?.trail;
       if (!row) throw notFound();
       return toDetail(row);
     }),

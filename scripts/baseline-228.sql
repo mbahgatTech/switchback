@@ -1,8 +1,16 @@
 -- #254 baseline for issue #228, taken against the two tiles that actually split
--- (120230203, 120230212) while all 24 z10 children are still status='pending'
--- with fetchedAt IS NULL. Read-only.
+-- (120230203, 120230212). Read-only.
+--
+-- B1 is the precondition: no descendant of either tile has ever ingested, so the fragmentation
+-- these numbers record is the state at split time. `scripts/retire-244.sql` deleted the z10 rows
+-- and their jobs, so the check is that nothing at z10 exists and nothing owns a z10 quadkey.
 
-\echo '=== B1: child ingest state — baseline is only valid while every row is pending/NULL ==='
+\echo '=== B1: the baseline is only valid while no descendant has ingested ==='
+select (select count(*) from ingest_tiles where z > 9)                     as tiles_below_z9,
+       (select count(*) from trails where length(quadkey) <> 9)            as trails_owned_below_z9,
+       (select count(*) from ingest_tiles
+         where quadkey in ('120230203', '120230212') and "fetchedAt" is not null) as parents_fetched;
+
 select t.quadkey, t.z, t.status, t."fetchedAt", t.attempts, t."trailCount"
 from ingest_tiles t
 where t.quadkey like '120230203%' or t.quadkey like '120230212%'
@@ -49,21 +57,44 @@ from (
 ) s;
 
 \echo ''
-\echo '=== B5: corpus-wide fragmentation — way-trails in a name group spanning >1 quadkey ==='
-select count(*)                                                  as fragmented_way_trails,
+\echo '=== B5: corpus-wide fragmentation — way-trails a shared line can actually collapse ==='
+-- Two way-trails are one trail split by a seam only if they are the same line in two places.
+-- A shared name is not that: "Ridge Trail" occurs in unrelated ranges on two continents, and
+-- no claim table will ever merge those. `name_spanning_way_trails` is the name-only count and
+-- is reported beside the real one as the upper bound it is. The 50 m predicate is the one
+-- `scripts/verify-merge.sql` uses to select the pairs the merge primitive was measured on.
+with spanning as (
+  select t.id, t.name, t.quadkey, t.geom
+  from trails t
+  where t."osmType" = 'way'
+    and t.name <> ''
+    and t.quadkey is not null
+    and t.geom is not null
+    and exists (
+      select 1 from trails o
+      where o.name = t.name
+        and o."osmType" = 'way'
+        and o.quadkey is distinct from t.quadkey
+        and o.quadkey is not null
+    )
+),
+judged as (
+  select a.id,
+         exists (
+           select 1 from spanning b
+           where b.name = a.name
+             and b.id <> a.id
+             and b.quadkey is distinct from a.quadkey
+             and st_dwithin(a.geom::geography, b.geom::geography, 50)
+         ) as adjacent
+  from spanning a
+)
+select count(*) filter (where adjacent)                          as fragmented_way_trails,
+       count(*)                                                  as name_spanning_way_trails,
        (select count(*) from trails where "osmType" = 'way')      as total_way_trails,
-       round(100.0 * count(*)
+       round(100.0 * count(*) filter (where adjacent)
              / nullif((select count(*) from trails where "osmType" = 'way'), 0), 1) as pct
-from trails t
-where t."osmType" = 'way'
-  and t.name <> ''
-  and exists (
-    select 1 from trails o
-    where o.name = t.name
-      and o."osmType" = 'way'
-      and o.quadkey is distinct from t.quadkey
-      and o.quadkey is not null
-  );
+from judged;
 
 \echo ''
 \echo '=== B6: corpus totals ==='

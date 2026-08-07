@@ -8,6 +8,7 @@
 import { OverpassClient } from './overpass';
 import { TerrainSource } from './elevate';
 import { subdivideMaxZoom } from './subdivide';
+import { trailIdentityMode } from './identity';
 import type { PipelineDeps } from './pipeline';
 
 let overpassClient: OverpassClient | null = null;
@@ -82,6 +83,7 @@ export function pipelineDeps(overrides: Partial<PipelineDeps> = {}): PipelineDep
     mapillaryToken: process.env.MAPILLARY_TOKEN,
     userAgent: process.env.OVERPASS_USER_AGENT,
     subdivideMaxZoom: subdivideMaxZoom(),
+    trailIdentity: trailIdentityMode(),
     ...overrides,
   };
 }

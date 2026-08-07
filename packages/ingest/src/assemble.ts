@@ -375,7 +375,7 @@ export function assembleTrails(
  * "North Ridge Trail" and "South Ridge Trail" are two trails, and punctuation-stripping
  * clever enough to merge names is clever enough to merge those.
  */
-function normalizeName(name: string): string {
+export function normalizeName(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 

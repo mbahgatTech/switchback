@@ -57,11 +57,14 @@ import {
 import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
 import {
+  ClaimConflictError,
+  canMergeTrails,
   claimWays,
   mergeTrails,
   resolveTrail as resolveClaims,
   trailIdentityMode,
 } from './identity';
+import type { ClaimPolicy, TrailIdentityMode } from './identity';
 import {
   CHILDREN_PER_TILE,
   SUBTREE_STUCK_MARKER,
@@ -153,6 +156,13 @@ export interface PipelineDeps {
    * test can set it without touching the environment. `INGEST_ZOOM` disables subdivision.
    */
   subdivideMaxZoom?: number;
+  /**
+   * Whether a way-derived trail is identified by its `TrailWay` claims or by `(osmType, osmId)`.
+   * Resolved once in `pipelineDeps` for the same reason as `subdivideMaxZoom`: the value a process
+   * will actually use is visible at the seam, and a test can drive the claim path without setting
+   * an environment variable.
+   */
+  trailIdentity?: TrailIdentityMode;
   now?: () => Date;
   mapillaryToken?: string;
   userAgent?: string;
@@ -188,6 +198,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const log = deps.logger ?? (() => {});
   const terrain = deps.terrain ?? new TerrainSource({ fetchImpl: deps.fetchImpl });
   const maxZoom = deps.subdivideMaxZoom ?? subdivideMaxZoom();
+  const identity = deps.trailIdentity ?? trailIdentityMode();
 
   const tile = quadkeyToTile(quadkey);
   if (tile.z < INGEST_ZOOM || tile.z > MAX_INGEST_ZOOM) {
@@ -343,6 +354,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           region,
           terrain,
           now: now(),
+          identity,
           deadlineAt: deps.deadlineAt,
         }),
       );
@@ -785,6 +797,7 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
     region,
     terrain,
     now: now(),
+    identity: deps.trailIdentity ?? trailIdentityMode(),
     deadlineAt: deps.deadlineAt,
   });
 
@@ -805,6 +818,7 @@ interface CommitContext {
   region: RegionInfo;
   terrain: TerrainSource;
   now: Date;
+  identity: TrailIdentityMode;
   deadlineAt?: number;
 }
 
@@ -815,6 +829,7 @@ interface CommitContext {
 interface ResolvedTrail {
   trailId: string | null;
   retiredIds: string[];
+  claim: ClaimPolicy;
   coords: LngLat[];
   bbox: BBox;
   lengthM: number;
@@ -826,57 +841,110 @@ interface ResolvedTrail {
  * The union has to happen here, not at the write: every stat, the elevation profile and each
  * waypoint's `distM` are computed from the coordinate array further down, so a merge applied at
  * the end would leave all of them describing one fragment of the trail.
+ *
+ * A resolution that cannot be carried out in full is downgraded rather than half-applied. When
+ * the union is refused, or a loser holds a review the winner's author already wrote, the losing
+ * rows stay where they are and keep their claims — the corpus is left as it was rather than
+ * collapsed onto a trail that does not contain it.
  */
 async function resolveIdentity(
   db: PrismaClient,
   trail: AssembledTrail,
+  mode: TrailIdentityMode,
 ): Promise<ResolvedTrail | null> {
   const fallback: ResolvedTrail = {
     trailId: null,
     retiredIds: [],
+    // Claims are written under both settings so neither direction of the flag needs a backfill.
+    // Under `osm-id` they yield: a commit must not fail on a table this mode never reads.
+    claim: 'yield',
     coords: trail.coords,
     bbox: trail.bbox,
     lengthM: trail.lengthM,
   };
-  if (trailIdentityMode() !== 'claim') return fallback;
+  if (mode !== 'claim') return fallback;
 
   const resolution = await resolveClaims(db, {
     osmType: trail.osmType,
+    name: trail.name,
     memberWayIds: trail.memberWayIds,
   });
   if (resolution.kind === 'skip') return null;
-  if (resolution.kind === 'create') return fallback;
+  if (resolution.kind === 'create') return { ...fallback, claim: resolution.claim };
 
   const merged = await mergeTrailGeometry(db, {
     trailId: resolution.trailId,
+    // The losers' lines are unioned in as well, so `unioned` is also the proof that retiring
+    // them keeps their geometry: a loser the union cannot absorb makes the result branch.
+    alsoTrailIds: resolution.kind === 'merge' ? resolution.retiredIds : [],
     incoming: { type: 'LineString', coordinates: [...trail.coords] },
   });
-  if (!merged) return { ...fallback, trailId: resolution.trailId };
+  // The winner was deleted between the claim read and here. Drop the whole resolution rather
+  // than keep half of it, and let the `(osmType, osmId)` upsert give this assembly a row.
+  if (!merged) return fallback;
 
-  // A child tile re-reading a trail its parent already committed contributes nothing but a
-  // full DEM pass and a transaction. This is the only skip-if-fresh the pipeline has.
-  if (merged.mergedLengthM <= merged.existingLengthM) return null;
+  const retiredIds =
+    resolution.kind === 'merge' &&
+    merged.unioned &&
+    (await canMergeTrails(db, resolution.trailId, resolution.retiredIds))
+      ? resolution.retiredIds
+      : [];
+  const retiring = retiredIds.length > 0;
 
   return {
     trailId: resolution.trailId,
-    retiredIds: resolution.kind === 'merge' ? resolution.retiredIds : [],
+    retiredIds,
+    // Losers that keep their rows keep their ways too, so the resolution stays stable instead of
+    // flipping the winner on every ingest.
+    claim: resolution.kind === 'merge' && !retiring ? 'yield' : resolution.claim,
     coords: merged.coords,
     bbox: bboxOf(merged.coords),
-    lengthM: merged.mergedLengthM,
+    // Measured here rather than taken off PostGIS: `lineLengthM` is what the assembler and
+    // `deriveDisplayName` use, and a trail must not change length by 0.3% because a second tile
+    // touched it.
+    lengthM: lineLengthM(merged.coords),
   };
 }
 
 /**
- * One trail, committed or skipped. The transaction covers the trail row, its geometry, its
- * profile and its waypoints: a trail row whose `geom` write failed is invisible to every
- * spatial query while still appearing in search, and nothing about it looks broken.
+ * Attempts a trail gets when it loses a race for the ways it is made of. Each one re-reads the
+ * claims, so a second pass sees the winner the first pass collided with and adopts it. Two, not
+ * more: a third would be re-running a full elevation pass on a contention that is already rare.
+ */
+const MAX_CLAIM_ATTEMPTS = 2;
+
+/**
+ * One trail, committed or skipped. Retried when another committer claims a way underneath this
+ * one — that conflict invalidates the resolution the line and every derived stat were built from,
+ * so the whole commit is re-run rather than the transaction alone. A trail that loses twice
+ * concedes: the ways belong to the winner, and this tile's copy of them is a fragment of it.
  */
 async function commitTrail(
   db: PrismaClient,
   trail: AssembledTrail,
   ctx: CommitContext,
 ): Promise<'committed' | 'skipped'> {
-  const resolved = await resolveIdentity(db, trail);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await attemptCommit(db, trail, ctx);
+    } catch (error) {
+      if (!(error instanceof ClaimConflictError)) throw error;
+      if (attempt >= MAX_CLAIM_ATTEMPTS) return 'skipped';
+    }
+  }
+}
+
+/**
+ * The transaction covers the trail row, its geometry, its profile and its waypoints: a trail row
+ * whose `geom` write failed is invisible to every spatial query while still appearing in search,
+ * and nothing about it looks broken.
+ */
+async function attemptCommit(
+  db: PrismaClient,
+  trail: AssembledTrail,
+  ctx: CommitContext,
+): Promise<'committed' | 'skipped'> {
+  const resolved = await resolveIdentity(db, trail, ctx.identity);
   if (!resolved) return 'skipped';
 
   const spacingM = profileSpacingFor(resolved.lengthM);
@@ -1008,7 +1076,7 @@ async function commitTrail(
 
     // Written whatever `INGEST_TRAIL_IDENTITY` says, so switching it on needs no backfill and
     // switching it off leaves a populated table that simply stops being consulted.
-    await claimWays(tx, saved.id, trail.memberWayIds);
+    await claimWays(tx, saved.id, trail.memberWayIds, resolved.claim);
 
     await writeTrailGeometry(tx, {
       trailId: saved.id,

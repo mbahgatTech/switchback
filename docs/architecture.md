@@ -359,10 +359,12 @@ ten-minute invocation per dense tile per TTL, and not even that is wasted, becau
 run committed before the clock ran out is already in `trails` and the children only re-upsert it.
 
 **Splitting is a status, not a flag.** `splitTile` writes the four child rows, enqueues one
-`ingest_tile` job each at viewport priority, and leaves the parent `pending` — not `failed`, because
-it is no longer a failure, and `pending` is what keeps it out of `readyTiles` while the children
-run. Admission control is deliberately not consulted: this is ground already admitted and already
-paid for, and a refusal here would strand a parent with no children and no route to ready.
+`ingest_tile` job each at viewport priority, and leaves the parent out of `readyTiles` while the
+children run — `pending` for a parent with nothing to serve, and its existing `ready`/`empty` and
+`fetchedAt` for one that was already serving trails, for the reason given four paragraphs down. What
+it never writes is `failed`, because a split is no longer a failure. Admission control is
+deliberately not consulted: this is ground already admitted and already paid for, and a refusal here
+would strand a parent with no children and no route to ready.
 
 **A parent is ready only when every descendant is.** `rollUp` takes the four child rows and returns
 the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
@@ -440,6 +442,15 @@ template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTI
 whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
 `min(wayId)` cannot be reached by setting one variable.
 
+**Both settings have to be set on the process that is actually draining.** In the resting
+configuration `INGEST_QUEUE_DRIVER` is `postgres`, the Function App drops every signal it receives,
+and Vercel owns the drain — so setting either variable on the Function App alone changes nothing.
+Both are declared in `apps/web/src/env.ts` as well as in `ingest.bicep`, each defaulting to off, so a
+value set on one side and not the other is a difference an operator can see rather than a flag that
+appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
+of a silent fallback, which is why they exist at all: `@switchback/ingest` reads both from
+`process.env` itself.
+
 **The ceiling stays at 9 even though the seam is fixed, and the reason is arithmetic rather than
 correctness.** Every split observed in production ran out of clock in the _commit_ phase, never the
 query: four `switchback-ingest-tile-split` events, all `"phase":"commit"`, having already assembled
@@ -507,21 +518,50 @@ The union happens before `elevateLine`, because every statistic, the elevation p
 waypoint's `distM` are derived from the coordinate array — a merge applied at the write would leave
 all of them describing one fragment.
 
-Where two rows already exist, the older wins and the younger is folded into it: photos, activities,
-reviews, completions, list items and lifeline sessions are re-pointed, and the retired slug is kept
-in `trail_slug_aliases` so the public URL it was indexed under keeps resolving. Relation-derived
-trails never resolve through claims — a relation id is the same in every tile, so `(osmType, osmId)`
-already identifies them — but they do claim their member ways, which is how a way-assembly in a
-neighbouring tile learns to stand down rather than shadow the route.
+**A union that is still a MultiLineString is refused, and refusal is the safe direction.** 53 of
+those 269 pairs fork or do not touch, and `Trail.geom` is `geometry(LineString, 4326)`, so no single
+line represents them. Keeping the longest component would delete stored geometry with no way back.
+Instead the stored line is handed back unchanged, nothing is retired, and the claims stay where they
+are — the corpus is left exactly as it was, which is what it would have been without the flag.
 
-**The rollback is one setting and no data migration.** Claims are written whatever
-`INGEST_TRAIL_IDENTITY` says; only resolution reads them. Setting it to `claim` therefore needs no
-backfill, and setting it back to `osm-id` returns behaviour exactly to the `(osmType, osmId)` upsert
-with a populated table sitting unused. Existing fragments heal on their own as tiles re-ingest on the
-30-day TTL — no Overpass backfill run, no hours of mirror load.
+Where two rows already exist, the older wins and the younger is folded into it: reviews, photos,
+activities, completions, list items, lifeline sessions and way claims are re-pointed. Two of those
+carry a uniqueness that spans `trailId`, and a collision there is a duplicate rather than a loss — a
+`(source, sourceId)` photo is the same upstream photograph attached to both halves, and a list must
+not hold the merged trail twice — so the loser's row is dropped. Busyness buckets are a derived prior
+recomputed from activity, so the losers' are dropped whole. A `Review` collision is none of those: it
+is one person who reported both halves, and `canMergeTrails` refuses the entire merge rather than
+delete either report. The retired slug is written to `trail_slug_aliases`, and `trails.bySlug` falls
+back to it, so the public URL the loser was indexed under keeps answering.
 
-**Observed in production, 2026-08-06.** Subdivision fires, and the trace that says so is the one this
-round wired. Four dense alpine z9 tiles reached the wall and split rather than failing:
+Relation-derived trails never resolve through claims — a relation id is the same in every tile, so
+`(osmType, osmId)` already identifies them — but they do claim their member ways, which is how a
+way-assembly in a neighbouring tile learns to stand down rather than shadow the route. It stands down
+only when it also carries the relation's name: both halves of the rule `assembleTrails` applies
+inside one tile. A way a relation claims under a _different_ name — the Mist Trail inside the John
+Muir Trail — is a trail in its own right, keeps its own row, and yields the contested way rather than
+fighting for it on every ingest.
+
+**The primary key on `trail_ways.wayId` is the concurrency control.** Two tiles racing for one way is
+the expected case: `COMMIT_CONCURRENCY` is 6 inside each drainer and there are two drainers. The
+loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because the
+line and every statistic derived from it were built on a resolution that is now stale — and the
+retry re-reads the claims and adopts the row the winner created.
+
+**The rollback is one setting, and it is a rollback of behaviour, not of state.** Claims are written
+whatever `INGEST_TRAIL_IDENTITY` says; only resolution reads them. Setting it to `claim` therefore
+needs no backfill, and setting it back to `osm-id` returns behaviour exactly to the `(osmType, osmId)`
+upsert with a populated table sitting unused. What it does not do is un-merge: a merge that has
+already run has deleted the loser `Trail` row, and no setting brings it back. The merge is built so
+that this costs nothing a reader wrote — everything user-authored moves, and the one case that cannot
+move refuses the merge — but an operator turning the flag off is stopping future merges, not
+reversing past ones. Existing fragments heal on their own as tiles re-ingest on the 30-day TTL — no
+Overpass backfill run, no hours of mirror load.
+
+**Observed in production, 2026-08-06**, and re-read from App Insights on 2026-08-07. Subdivision
+fires, and the trace that says so is the one this round wired. Four dense alpine z9 tiles reached the
+wall and split rather than failing. `appi-switchback-ingest` retains `traces` for 90 days, so this
+table stops being reproducible after 2026-11-04 — the rows below are the record after that.
 
 | tile        | at (UTC) | elapsed    | committed | unattempted | children      |
 | ----------- | -------- | ---------- | --------- | ----------- | ------------- |
@@ -559,18 +599,22 @@ supported then and neither is now: the 2026-08-05 over-deadline invocations logg
 token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
 path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
 
-**The seam baseline, measured against the tiles that actually split.** Taken 2026-08-06 while every
-z10 child was still `pending` with `fetchedAt` NULL, so it is a true "before":
+**The seam baseline, measured against the tiles that actually split.** Re-taken 2026-08-07. It is
+still a true "before": no tile below z9 exists, no trail is owned by a quadkey longer than nine
+characters, and neither parent has a `fetchedAt`, so nothing beneath either tile has ever ingested.
 
 | tile        | trails | distinct names | way / relation | total `lengthM` |
 | ----------- | ------ | -------------- | -------------- | --------------- |
 | `120230203` | 477    | 425            | 289 / 188      | 2,901,784       |
 | `120230212` | 232    | 231            | 6 / 226        | 2,644,035       |
 
-Two names already span the seam between those two tiles. Corpus-wide the same measurement is
-6,296 way-trails in a name group spanning more than one quadkey — 13.3% of 47,279 — which is what
-`trail_ways` exists to collapse, and which is measurable today without waiting on any child.
-`scripts/baseline-228.sql` is the query; re-run it to watch the number fall as tiles re-ingest.
+Two names already span the seam between those two tiles. Corpus-wide, 503 way-trails — 1.1% of
+47,279 — have a same-name way-trail in another quadkey whose line comes within 50 m of their own.
+That proximity test is the point: a shared name alone puts 6,296 rows (13.3%) in the set, and most of
+those are unrelated "Ridge Trail"s in different ranges that share no way and no claim table will ever
+merge. `scripts/baseline-228.sql` reports both figures side by side, the second labelled as the upper
+bound it is; the 50 m predicate is the one `scripts/verify-merge.sql` uses to select the pairs the
+merge primitive was measured on. Re-run it to watch the first number fall as tiles re-ingest.
 
 **Direct Postgres is reachable from a maintainer workstation with ProtonVPN disconnected**, using an
 Entra access token as the password — `scripts/pgenv.sh` assembles the session and never prints the
@@ -613,11 +657,15 @@ run would survive and show up in the after-count. The six parents keep their own
 jobs, and `childTiles` now reports zero for each, so each re-fetches at z9 exactly as it did before
 subdivision existed.
 
-One inconsistency is left deliberately and is outside that cleanup: `120230212`'s tile row is
-`pending` while its `ingest_tile` job is `done`. It predates the splits and is not debris this
-created, so it is recorded here rather than silently repaired. Until they are re-attempted those six
-z9 tiles serve the trails each committed before the wall — 127, 160, 196 and 241 for the four
-measured — and read `pending`.
+Two residues are left deliberately, because neither is debris subdivision created and repairing
+production state by hand is not a rollback anybody could audit. `120230212`'s tile row is `pending`
+while its `ingest_tile` job is `done`; it predates the splits. And three of the six parents —
+`120221231`, `120230202`, `120230203` — read `running` with `fetchedAt` NULL and no lease holder,
+which is what a tile row looks like after an invocation was killed mid-write. Neither state is
+visible to a reader: `isTileFresh` refuses `pending` and `running` alike, so both areas serve as cold
+and are re-queried, which is the correct outcome for a tile that never finished. Until they are
+re-attempted those six z9 tiles serve the trails each committed before the wall — 127, 160, 196 and
+241 for the four measured.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

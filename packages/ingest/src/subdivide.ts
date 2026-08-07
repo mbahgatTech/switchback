@@ -49,16 +49,17 @@ export const TILE_SPLIT_MARKER = 'switchback-ingest-tile-split';
 export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
 
 /**
- * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision,
- * and that is what an absent or unusable variable returns: the two processes that drain
- * `ingest_jobs` do not both declare it — `apps/web/src/env.ts` has no entry — so a default of
- * `MAX_INGEST_ZOOM` turned subdivision on wherever nobody had thought about it. It has to be
- * switched on deliberately, which is also what makes deleting the setting a rollback.
+ * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision, and
+ * that is what an absent or unusable variable returns — it has to be switched on deliberately,
+ * which is also what makes deleting the setting a rollback. Both processes that drain
+ * `ingest_jobs` declare it (`apps/web/src/env.ts` and `infra/azure/ingest.bicep`), so a value
+ * set on one and not the other is visible rather than silently half-applied.
  *
  * Subdividing cuts fresh interior seam, and a seam fragments any trail crossing it unless
  * `TrailWay` is deciding identity. So the ceiling is held at `INGEST_ZOOM` whenever
  * `INGEST_TRAIL_IDENTITY` is not `claim`, however the zoom variable is set — the two cannot be
- * flipped independently into the combination that corrupts the corpus.
+ * flipped independently into the combination that corrupts the corpus. Clamped rather than
+ * rejected: this runs inside a request path, and a fail-safe default beats a startup error.
  */
 export function subdivideMaxZoom(source: NodeJS.ProcessEnv = process.env): number {
   const value = Number(source.INGEST_SUBDIVIDE_MAX_ZOOM);

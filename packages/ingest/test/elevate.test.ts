@@ -1,32 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { PNG } from 'pngjs';
 import { NO_DATA_ELEVATION, lineLengthM, resampleLine } from '@switchback/geo';
 import { TerrainSource, decodeTerrarium, elevateLine, fillGaps } from '../src/elevate';
 import { IngestDeadlineError } from '../src/deadline';
-
-/**
- * A terrarium tile where every pixel encodes the same elevation.
- * `elev = R*256 + G + B/256 - 32768`, so 1000 m is R=131, G=232, B=0.
- */
-function flatTile(elevationM: number, size = 64): Buffer {
-  const encoded = elevationM + 32768;
-  const r = Math.floor(encoded / 256);
-  const g = Math.floor(encoded - r * 256);
-  const b = Math.round((encoded - r * 256 - g) * 256);
-
-  const png = new PNG({ width: size, height: size });
-  for (let i = 0; i < size * size; i++) {
-    png.data[i * 4] = r;
-    png.data[i * 4 + 1] = g;
-    png.data[i * 4 + 2] = b;
-    png.data[i * 4 + 3] = 255;
-  }
-  return PNG.sync.write(png);
-}
-
-function pngResponse(buffer: Buffer): Response {
-  return new Response(new Uint8Array(buffer), { status: 200 });
-}
+import { flatTile, pngResponse } from './fixtures/terrarium';
 
 describe('decodeTerrarium', () => {
   it('round-trips a known elevation through the RGB encoding', () => {

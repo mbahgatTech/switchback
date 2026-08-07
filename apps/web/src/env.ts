@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { INGEST_ZOOM, MAX_INGEST_ZOOM } from '@switchback/geo';
 
 /**
  * The single server-side allowlist for environment variables, parsed once at module load so a
@@ -78,6 +79,25 @@ const base = z.object({
    */
   OVERPASS_MAX_CONCURRENT: z.coerce.number().int().positive().optional(),
   OVERPASS_MAX_TOTAL_MS: z.coerce.number().int().positive().optional(),
+
+  /**
+   * How ingest decides what a trail is, and how deep a dense tile may split. Declared here for
+   * the same reason as the two above — `@switchback/ingest` reads both from `process.env` itself
+   * and each defaults to off — but they matter more, because Vercel drains `ingest_jobs` whenever
+   * `INGEST_QUEUE_DRIVER` is `postgres`, which it is. Setting either on the Function App alone
+   * changes nothing about the process actually doing the work.
+   *
+   * The ceiling is inert without `INGEST_TRAIL_IDENTITY=claim`: `subdivideMaxZoom` clamps it to
+   * `INGEST_ZOOM` rather than refusing to start, because a fail-safe clamp beats taking the site
+   * down over a variable that only makes ingest slower when it is wrong.
+   */
+  INGEST_TRAIL_IDENTITY: z.enum(['claim', 'osm-id']).default('osm-id'),
+  INGEST_SUBDIVIDE_MAX_ZOOM: z.coerce
+    .number()
+    .int()
+    .min(INGEST_ZOOM)
+    .max(MAX_INGEST_ZOOM)
+    .optional(),
 
   /**
    * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
