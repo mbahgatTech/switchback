@@ -2,7 +2,7 @@
 
 import { useLayoutEffect, useRef, type RefObject } from 'react';
 import type { TrailMapItem } from '@switchback/core';
-import { liftCeiling } from './lift';
+import { liftFor } from './lift';
 import { SelectedTrail } from './selected-trail';
 
 export interface PickCardProps {
@@ -32,8 +32,7 @@ export function PickCard({ trail, onDismiss, pane }: PickCardProps) {
 
     const measure = () => {
       const box = sheet.getBoundingClientRect();
-      const room = box.bottom - card.getBoundingClientRect().top;
-      const lift = Math.min(Math.max(0, Math.round(room)), liftCeiling(box.height));
+      const lift = liftFor(box, card.getBoundingClientRect().top);
       sheet.style.setProperty('--sb-card-lift', `${String(lift)}px`);
     };
 

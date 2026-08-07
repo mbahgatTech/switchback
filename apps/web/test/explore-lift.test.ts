@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { LIFT_HEADROOM_PX, liftCeiling, MAP_CHROME_PX } from '../src/components/explore/lift';
+import {
+  LIFT_HEADROOM_PX,
+  liftCeiling,
+  liftFor,
+  MAP_CHROME_PX,
+} from '../src/components/explore/lift';
 
 /**
  * The pick card lifts MapLibre's bottom chrome by a bottom margin. Unclamped, a long title made a
@@ -32,5 +37,36 @@ describe('map chrome lift ceiling', () => {
 
   it('grows with the pane, so a tablet is not held to a phone ceiling', () => {
     expect(liftCeiling(900)).toBeGreaterThan(liftCeiling(PANE_320));
+  });
+});
+
+/**
+ * The lift walks MapLibre's bottom chrome up to the card's top edge, so a lift one pixel short
+ * is a scale bar drawn inside the card. `bottom-xl` is a rem inset and the card's height is
+ * whatever its title wraps to, so the measurement is routinely fractional.
+ */
+describe('the lift a measured card asks for', () => {
+  /** The browser suite's pane: 1400×900 viewport, 48 px of neatline above the sheet. */
+  const PANE = { bottom: 900, height: 852 };
+
+  it('reaches exactly the card top when the measurement is whole', () => {
+    expect(liftFor(PANE, 695)).toBe(205);
+  });
+
+  it('rounds up, so a fraction of a pixel never lands the chrome inside the card', () => {
+    const cardTop = 694.6;
+    const lift = liftFor(PANE, cardTop);
+    // The chrome's bottom edge after the lift, which must not cross into the card.
+    expect(PANE.bottom - lift).toBeLessThanOrEqual(cardTop);
+    expect(lift).toBe(206);
+  });
+
+  it('holds the chrome on the pane when the card is taller than the ceiling allows', () => {
+    const short = { bottom: 324, height: 324 };
+    expect(liftFor(short, 20)).toBe(liftCeiling(short.height));
+  });
+
+  it('asks for nothing when the card is below the pane', () => {
+    expect(liftFor(PANE, 950)).toBe(0);
   });
 });

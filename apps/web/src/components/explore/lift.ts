@@ -22,3 +22,13 @@ export const LIFT_HEADROOM_PX = 8;
 export function liftCeiling(paneHeight: number): number {
   return Math.max(0, Math.round(paneHeight - MAP_CHROME_PX - LIFT_HEADROOM_PX));
 }
+
+/**
+ * The lift for a card whose top edge is at `cardTop` over a pane of these bounds. Rounded *up*,
+ * never to nearest: a rem inset and a wrapped line put fractional pixels in the measurement, and
+ * a half-pixel rounded down leaves the chrome inside the card, which is the whole thing this
+ * measurement exists to prevent.
+ */
+export function liftFor(pane: { bottom: number; height: number }, cardTop: number): number {
+  return Math.min(Math.max(0, Math.ceil(pane.bottom - cardTop)), liftCeiling(pane.height));
+}
