@@ -341,6 +341,12 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   let failed = 0;
   /** Trails the deadline refused outright. The only count that justifies a split. */
   let refused = 0;
+  /*
+   * Retiring a trail row is the one thing this pipeline does that no setting reverses, and a
+   * refused union is the one thing that leaves a seam fragmented. Both are counted per tile so an
+   * operator who turns `INGEST_TRAIL_IDENTITY` on can measure what it did.
+   */
+  const identityOutcomes = new Map<IdentityOutcome, number>();
 
   // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
   // throws must cost its tile one row, not the rest of the tile.
@@ -356,6 +362,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           now: now(),
           identity,
           deadlineAt: deps.deadlineAt,
+          onIdentity: (kind) => identityOutcomes.set(kind, (identityOutcomes.get(kind) ?? 0) + 1),
         }),
       );
       if (outcome === 'committed') committed += 1;
@@ -370,6 +377,10 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       });
     }
   });
+
+  if (identityOutcomes.size > 0) {
+    log('identity resolved', { quadkey, ...Object.fromEntries(identityOutcomes) });
+  }
 
   /*
    * The per-trail catch above is what keeps one bad trail from costing its tile, and it
@@ -820,6 +831,7 @@ interface CommitContext {
   now: Date;
   identity: TrailIdentityMode;
   deadlineAt?: number;
+  onIdentity?: (outcome: IdentityOutcome) => void;
 }
 
 /**
@@ -830,10 +842,15 @@ interface ResolvedTrail {
   trailId: string | null;
   retiredIds: string[];
   claim: ClaimPolicy;
+  conceded: readonly number[];
   coords: LngLat[];
   bbox: BBox;
   lengthM: number;
 }
+
+/** What claim resolution did with one assembly, counted per tile so the flag is measurable. */
+export type IdentityOutcome =
+  'adopted' | 'merged' | 'refused-geometry' | 'refused-review' | 'yielded-to-relation';
 
 /**
  * Settle identity and geometry before anything expensive runs.
@@ -842,22 +859,22 @@ interface ResolvedTrail {
  * waypoint's `distM` are computed from the coordinate array further down, so a merge applied at
  * the end would leave all of them describing one fragment of the trail.
  *
- * A resolution that cannot be carried out in full is downgraded rather than half-applied. When
- * the union is refused, or a loser holds a review the winner's author already wrote, the losing
- * rows stay where they are and keep their claims — the corpus is left as it was rather than
- * collapsed onto a trail that does not contain it.
+ * A resolution the geometry refuses is abandoned whole rather than half-applied. The assembly
+ * keeps its own row, its own line and its own free ways, which is what the `osm-id` default would
+ * have given it — adopting a winner whose line cannot contain this one would store the incoming
+ * geometry nowhere while claiming the ways it was drawn from.
  */
 async function resolveIdentity(
   db: PrismaClient,
   trail: AssembledTrail,
   mode: TrailIdentityMode,
+  report: (outcome: IdentityOutcome) => void,
 ): Promise<ResolvedTrail | null> {
   const fallback: ResolvedTrail = {
     trailId: null,
     retiredIds: [],
-    // Claims are written under both settings so neither direction of the flag needs a backfill.
-    // Under `osm-id` they yield: a commit must not fail on a table this mode never reads.
-    claim: 'yield',
+    claim: 'fail',
+    conceded: [],
     coords: trail.coords,
     bbox: trail.bbox,
     lengthM: trail.lengthM,
@@ -870,7 +887,12 @@ async function resolveIdentity(
     memberWayIds: trail.memberWayIds,
   });
   if (resolution.kind === 'skip') return null;
-  if (resolution.kind === 'create') return { ...fallback, claim: resolution.claim };
+
+  const conceded = resolution.conceded;
+  if (resolution.kind === 'create') {
+    if (conceded.length > 0) report('yielded-to-relation');
+    return { ...fallback, claim: resolution.claim, conceded };
+  }
 
   const merged = await mergeTrailGeometry(db, {
     trailId: resolution.trailId,
@@ -881,22 +903,29 @@ async function resolveIdentity(
   });
   // The winner was deleted between the claim read and here. Drop the whole resolution rather
   // than keep half of it, and let the `(osmType, osmId)` upsert give this assembly a row.
-  if (!merged) return fallback;
+  if (!merged) return { ...fallback, conceded };
+
+  // One line cannot hold a fork, a lollipop or two halves that do not touch. Standing down here
+  // leaves both shapes stored under their own rows, fragmented exactly as `osm-id` leaves them —
+  // one trail unrepresented is a worse corpus than two rows that each hold their own geometry.
+  if (!merged.unioned) {
+    report('refused-geometry');
+    return { ...fallback, conceded };
+  }
 
   const retiredIds =
     resolution.kind === 'merge' &&
-    merged.unioned &&
     (await canMergeTrails(db, resolution.trailId, resolution.retiredIds))
       ? resolution.retiredIds
       : [];
-  const retiring = retiredIds.length > 0;
+  if (resolution.kind === 'merge' && retiredIds.length === 0) report('refused-review');
+  else report(retiredIds.length > 0 ? 'merged' : 'adopted');
 
   return {
     trailId: resolution.trailId,
     retiredIds,
-    // Losers that keep their rows keep their ways too, so the resolution stays stable instead of
-    // flipping the winner on every ingest.
-    claim: resolution.kind === 'merge' && !retiring ? 'yield' : resolution.claim,
+    claim: resolution.claim,
+    conceded,
     coords: merged.coords,
     bbox: bboxOf(merged.coords),
     // Measured here rather than taken off PostGIS: `lineLengthM` is what the assembler and
@@ -944,7 +973,7 @@ async function attemptCommit(
   trail: AssembledTrail,
   ctx: CommitContext,
 ): Promise<'committed' | 'skipped'> {
-  const resolved = await resolveIdentity(db, trail, ctx.identity);
+  const resolved = await resolveIdentity(db, trail, ctx.identity, ctx.onIdentity ?? (() => {}));
   if (!resolved) return 'skipped';
 
   const spacingM = profileSpacingFor(resolved.lengthM);
@@ -1019,7 +1048,14 @@ async function attemptCommit(
       await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
     }
 
-    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
+    const slug = await uniqueSlug(
+      tx,
+      trail.name,
+      ctx.region.regionName,
+      osmType,
+      osmId,
+      ctx.identity,
+    );
 
     const row = {
       slug,
@@ -1061,10 +1097,20 @@ async function attemptCommit(
     // `osmType`/`osmId` are never rewritten on an existing row. For a way-derived trail they are
     // one member id out of many, and moving them would shift the unique key a concurrent tile is
     // upserting against — `TrailWay` is the identity now, not `min(wayId)`.
+    //
+    // `quadkey` is held for the same reason: a trail spanning a seam is committed by both tiles,
+    // and rewriting it each time would make "trails owned by tile X" answer differently depending
+    // on which sibling drained last.
     const saved = resolved.trailId
       ? await tx.trail.update({
           where: { id: resolved.trailId },
-          data: { ...row, slug: undefined, osmType: undefined, osmId: undefined },
+          data: {
+            ...row,
+            slug: undefined,
+            osmType: undefined,
+            osmId: undefined,
+            quadkey: undefined,
+          },
         })
       : await tx.trail.upsert({
           where: { osmType_osmId: { osmType, osmId } },
@@ -1074,9 +1120,12 @@ async function attemptCommit(
           update: { ...row, slug: undefined },
         });
 
-    // Written whatever `INGEST_TRAIL_IDENTITY` says, so switching it on needs no backfill and
-    // switching it off leaves a populated table that simply stops being consulted.
-    await claimWays(tx, saved.id, trail.memberWayIds, resolved.claim);
+    // Gated with resolution, not written unconditionally: `osm-id` must stay a complete rollback,
+    // and a runtime that reaches a database without `trail_ways` must still ingest rather than
+    // fail every trail and record the tile covered.
+    if (ctx.identity === 'claim') {
+      await claimWays(tx, saved.id, trail.memberWayIds, resolved.claim, resolved.conceded);
+    }
 
     await writeTrailGeometry(tx, {
       trailId: saved.id,
@@ -1202,6 +1251,7 @@ async function uniqueSlug(
   regionName: string | null,
   osmType: OsmElementType,
   osmId: bigint,
+  identity: TrailIdentityMode,
 ): Promise<string> {
   const candidates = [slugify(name)];
   if (regionName) candidates.push(slugify(name, regionName));
@@ -1213,8 +1263,19 @@ async function uniqueSlug(
       select: { osmType: true, osmId: true },
     });
     // Free, or already ours — a re-ingest of the same trail keeps its URL.
-    if (!existing) return candidate;
-    if (existing.osmType === osmType && existing.osmId === osmId) return candidate;
+    if (existing) {
+      if (existing.osmType !== osmType || existing.osmId !== osmId) continue;
+      return candidate;
+    }
+    // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
+    // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
+    // Only merges retire a slug, and only `claim` merges, so only `claim` reads the table.
+    if (identity !== 'claim') return candidate;
+    const alias = await tx.trailSlugAlias.findUnique({
+      where: { slug: candidate },
+      select: { slug: true },
+    });
+    if (!alias) return candidate;
   }
   return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
 }

@@ -905,10 +905,12 @@ side and stays `true` until every consumer has been proved on a token.
 
    The grant is inert while no Service Bus receive code exists in this repository, and it becomes
    real capability — for every Vercel deployment, preview included, because the shared identity is
-   also Vercel's — the moment the worker's code merges. So it is **revoked before PR #42 merges**,
-   or `ingest.bicep` adopts it in the change that moves the worker: the `guid()` inputs are
-   identical, so the assignment that template would create is this one. Both phases keep every
-   grant the worker already has.
+   also Vercel's — the moment the worker's code merges. Revocation being locked, `ingest.bicep`
+   adopts it instead: resource `publisherReceiver`, named by the literal assignment id rather than
+   `guid(...)`, so the template converges on this assignment rather than proposing a second grant of
+   the same role to the same principal at the same scope. Adoption records the grant; it does not
+   reduce it. Revoking still requires lifting `switchback-prod-no-delete` first, and that stays open
+   as an Owner action.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It

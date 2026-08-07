@@ -281,16 +281,156 @@ describe.skipIf(!IS_LOCAL).sequential('a union that cannot be one line', () => {
     ],
   };
 
-  it('keeps the stored line rather than replacing it with the longest fragment', async () => {
+  /** Which trail, if any, holds each fixture way. */
+  async function claims(): Promise<Record<string, string>> {
+    const rows = await prisma.trailWay.findMany({
+      where: { wayId: { in: WAY_IDS.map(BigInt) } },
+    });
+    return Object.fromEntries(rows.map((row) => [row.wayId.toString(), row.trailId]));
+  }
+
+  /** The northernmost latitude on a stored line — the fork arm's tip, or its absence. */
+  async function northmost(trailId: string): Promise<number> {
+    const row = await prisma.trail.findUniqueOrThrow({
+      where: { id: trailId },
+      select: { geometryJson: true },
+    });
+    const coords = (row.geometryJson as { coordinates: [number, number][] }).coordinates;
+    return Math.max(...coords.map(([, lat]) => lat));
+  }
+
+  it('leaves the refused arm its own row, its own line and its own ways', async () => {
     await processTile(WEST, deps([W1, W2]));
     const before = (await fixtureTrails())[0]!;
 
     await processTile(WEST, deps([W2, BRANCH]));
 
+    /*
+     * Two rows, not one. The arm forks off a way the ridge already holds, so no single
+     * `geometry(LineString, 4326)` covers both — adopting the ridge would store the ridge's own
+     * line back over itself and write the arm nowhere, while claiming the ways it was drawn from.
+     * Standing down leaves the corpus fragmented, which is what `osm-id` leaves it as, rather
+     * than short of a trail that no later ingest could ever restore.
+     */
     const rows = await fixtureTrails();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.id).toBe(before.id);
-    // Nothing was traded away: the branch is not stored, and neither is a shortened line.
-    expect(rows[0]!.lengthM).toBe(before.lengthM);
+    expect(rows).toHaveLength(2);
+
+    const winner = rows.find((row) => row.id === before.id);
+    const arm = rows.find((row) => row.id !== before.id);
+    expect(winner?.lengthM).toBe(before.lengthM);
+    expect(arm).toBeDefined();
+    expect(arm!.slug).not.toBe(winner!.slug);
+
+    // The arm is reachable, not merely counted: its northern tip is on its own line and on
+    // nobody else's.
+    expect(await northmost(arm!.id)).toBeCloseTo(LAT + 0.03, 6);
+    expect(await northmost(winner!.id)).toBeCloseTo(LAT, 6);
+
+    // The shared way stays with the ridge; the arm's own way goes to the arm. A claim pointing
+    // at a trail whose geometry does not contain that way is what makes the loss permanent.
+    expect(await claims()).toEqual({
+      '900001': winner!.id,
+      '900002': winner!.id,
+      '900005': arm!.id,
+    });
+  });
+
+  it('holds that split stable however many times either tile arrives', async () => {
+    await processTile(WEST, deps([W1, W2]));
+    await processTile(WEST, deps([W2, BRANCH]));
+    const first = await fixtureTrails();
+
+    await processTile(WEST, deps([W2, BRANCH]));
+    await processTile(WEST, deps([W1, W2]));
+
+    const again = await fixtureTrails();
+    expect(again.map((row) => [row.id, row.slug, row.lengthM])).toEqual(
+      first.map((row) => [row.id, row.slug, row.lengthM]),
+    );
+  });
+
+  it('matches what the shipped default does with the same two passes', async () => {
+    // The refusal path is only safe if it is no worse than the mode it can roll back to. Same
+    // fixture, `osm-id`: two rows, and the same two lines.
+    await processTile(WEST, deps([W1, W2], { trailIdentity: 'osm-id' }));
+    await processTile(WEST, deps([W2, BRANCH], { trailIdentity: 'osm-id' }));
+
+    const rows = await fixtureTrails();
+    expect(rows).toHaveLength(2);
+    expect(await northmost(rows[1]!.id)).toBeCloseTo(LAT + 0.03, 6);
+  });
+});
+
+describe.skipIf(!IS_LOCAL).sequential('what `osm-id` touches', () => {
+  beforeEach(reset);
+  afterAll(reset);
+
+  it('writes no claim at all, so the table is not a dependency of the default path', async () => {
+    /*
+     * Vercel Preview runs branch code against the production database and CI's migrate job never
+     * runs on a pull request, so a claim written under `osm-id` would throw on a missing relation
+     * for every trail — and `processTile` counts those `failed`, then writes the tile `ready`
+     * with `fetchedAt`, which reads as covered for the whole TTL.
+     */
+    await processTile(WEST, deps([W1, W2], { trailIdentity: 'osm-id' }));
+
+    expect(await fixtureTrails()).toHaveLength(1);
+    expect(await prisma.trailWay.count({ where: { wayId: { in: WAY_IDS.map(BigInt) } } })).toBe(0);
+  });
+});
+
+describe.skipIf(!IS_LOCAL).sequential('a slug a retired trail still answers on', () => {
+  beforeEach(reset);
+  afterAll(reset);
+
+  it('is not handed to a different trail', async () => {
+    // `trails.bySlug` reads the trail table first and falls back to the alias, so a squatter on
+    // an aliased slug silently redirects a permanent public URL to somebody else's trail.
+    const alias = `${PREFIX.toLowerCase().replace(/\s+/g, '-')}-ridge`;
+    const held = await prisma.trail.create({
+      data: {
+        slug: `${alias}-holder`,
+        name: `${PREFIX} Holder`,
+        osmType: 'way',
+        osmId: BigInt(WAY_IDS[4]!),
+        quadkey: WEST,
+        geometryJson: {
+          type: 'LineString',
+          coordinates: [
+            [SEAM_LNG, LAT],
+            [SEAM_LNG + 0.01, LAT],
+          ],
+        },
+        centroidLng: SEAM_LNG,
+        centroidLat: LAT,
+        bboxW: SEAM_LNG,
+        bboxS: LAT,
+        bboxE: SEAM_LNG + 0.01,
+        bboxN: LAT,
+        lengthM: 1,
+        gainM: 0,
+        lossM: 0,
+        minEleM: 0,
+        maxEleM: 0,
+        estimatedTimeS: 1,
+        difficulty: 'easy',
+        difficultyScore: 0,
+        routeType: 'point_to_point',
+      },
+      select: { id: true },
+    });
+    await prisma.trailSlugAlias.create({ data: { slug: alias, trailId: held.id } });
+
+    await processTile(WEST, deps([W1, W2]));
+
+    const [trail] = await prisma.trail.findMany({
+      where: { name: `${PREFIX} Ridge` },
+      select: { slug: true },
+    });
+    expect(trail?.slug).toBeDefined();
+    expect(trail!.slug).not.toBe(alias);
+
+    const resolved = await prisma.trailSlugAlias.findUnique({ where: { slug: alias } });
+    expect(resolved?.trailId).toBe(held.id);
   });
 });

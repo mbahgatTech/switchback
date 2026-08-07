@@ -34,6 +34,7 @@ function txWith(claims: readonly Claim[]): Prisma.TransactionClient {
           claims
             .filter((claim) => asked.includes(claim.wayId))
             .map((claim) => ({
+              wayId: BigInt(claim.wayId),
               trail: {
                 id: claim.id,
                 name: claim.name ?? TRAIL_NAME,
@@ -119,6 +120,7 @@ describe('the seam this exists to close', () => {
     expect(await resolveTrail(txWith([]), claimInput(west))).toEqual({
       kind: 'create',
       claim: 'fail',
+      conceded: [],
     });
 
     const afterWest = txWith(
@@ -133,6 +135,7 @@ describe('the seam this exists to close', () => {
       kind: 'adopt',
       trailId: 'trail-west',
       claim: 'fail',
+      conceded: [300],
     });
   });
 });
@@ -141,10 +144,15 @@ describe('resolveTrail', () => {
   const wayTrail = { osmType: 'way' as const, name: TRAIL_NAME, memberWayIds: [1, 2, 3] };
 
   it('creates when nothing has claimed the ways, or there are none to claim', async () => {
-    expect(await resolveTrail(txWith([]), wayTrail)).toEqual({ kind: 'create', claim: 'fail' });
+    expect(await resolveTrail(txWith([]), wayTrail)).toEqual({
+      kind: 'create',
+      claim: 'fail',
+      conceded: [],
+    });
     expect(await resolveTrail(txWith([]), { ...wayTrail, memberWayIds: [] })).toEqual({
       kind: 'create',
       claim: 'fail',
+      conceded: [],
     });
   });
 
@@ -162,6 +170,7 @@ describe('resolveTrail', () => {
       trailId: 'oldest',
       retiredIds: ['newer', 'newest'],
       claim: 'fail',
+      conceded: [1, 2, 3],
     });
   });
 
@@ -207,25 +216,58 @@ describe('resolveTrail', () => {
     expect(resolution).toEqual({ kind: 'skip', trailId: 'the-route' });
   });
 
-  it('keeps a named way that a relation carries under another name', async () => {
+  it('keeps a named way that a relation carries under another name, and can commit it', async () => {
     // The Mist Trail inside the John Muir Trail. `assembleTrails` requires membership *and* a
     // matching name before it drops a way; dropping on membership alone makes a real trail
     // unsearchable, and leaves no trace that it happened.
-    const resolution = await resolveTrail(
+    const relation = {
+      wayId: 2,
+      id: 'john-muir',
+      name: 'John Muir Trail',
+      osmType: OsmElementType.relation,
+      createdAt: '2026-08-01T00:00:00Z',
+    };
+    const mist = { osmType: 'way' as const, name: 'Mist Trail', memberWayIds: [1, 2, 3] };
+
+    const first = await resolveTrail(txWith([relation]), mist);
+    // Way 2 is conceded, not contested: the relation owns it legitimately, so a commit that finds
+    // it held must not read that as a lost race and unwind.
+    expect(first).toEqual({ kind: 'create', claim: 'fail', conceded: [2] });
+
+    const firstClaim = claimTx({ 2: 'john-muir' });
+    await claimWays(firstClaim.tx, 'mist', mist.memberWayIds, 'fail', [2]);
+    expect(firstClaim.inserted).toEqual([
+      { wayId: 1, trailId: 'mist' },
+      { wayId: 3, trailId: 'mist' },
+    ]);
+
+    /*
+     * The second ingest is where this trail used to disappear. Its own ways are claimed now, so
+     * resolution adopts its own row and way 2 is still the relation's — a policy that failed on
+     * every held way would raise `ClaimConflictError` here, twice, and `commitTrail` would count
+     * the trail `skipped` with no error, no log and no alert, on every ingest from now on.
+     */
+    const second = await resolveTrail(
       txWith([
-        {
-          wayId: 2,
-          id: 'john-muir',
-          name: 'John Muir Trail',
-          osmType: OsmElementType.relation,
-          createdAt: '2026-08-01T00:00:00Z',
-        },
+        relation,
+        { wayId: 1, id: 'mist', osmType: OsmElementType.way, createdAt: '2026-08-02T00:00:00Z' },
+        { wayId: 3, id: 'mist', osmType: OsmElementType.way, createdAt: '2026-08-02T00:00:00Z' },
       ]),
-      { osmType: 'way', name: 'Mist Trail', memberWayIds: [1, 2, 3] },
+      mist,
     );
-    // `yield`, not `fail`: the relation owns way 2 legitimately, so this trail must not spend
-    // every ingest fighting it for the claim.
-    expect(resolution).toEqual({ kind: 'create', claim: 'yield' });
+    expect(second).toEqual({
+      kind: 'adopt',
+      trailId: 'mist',
+      claim: 'fail',
+      conceded: [2, 1, 3],
+    });
+
+    const secondClaim = claimTx({ 1: 'mist', 2: 'john-muir', 3: 'mist' });
+    await expect(
+      claimWays(secondClaim.tx, 'mist', mist.memberWayIds, 'fail', [2, 1, 3]),
+    ).resolves.toBeUndefined();
+    expect(secondClaim.inserted).toEqual([]);
+    expect(secondClaim.repointed).toEqual([]);
   });
 
   it('never routes a relation through claims, so a superroute cannot swallow its members', async () => {
@@ -237,14 +279,14 @@ describe('resolveTrail', () => {
       name: 'Big Route',
       memberWayIds: [1, 2, 3],
     });
-    expect(resolution).toEqual({ kind: 'create', claim: 'take' });
+    expect(resolution).toEqual({ kind: 'create', claim: 'take', conceded: [] });
   });
 });
 
 describe('claimWays', () => {
-  it('refuses to overwrite another trail under `fail`, which is the concurrency control', async () => {
+  it('refuses to overwrite a way the resolution saw free, which is the concurrency control', async () => {
     const { tx, inserted } = claimTx({ 2: 'someone-else' });
-    await expect(claimWays(tx, 'mine', [1, 2, 3], 'fail')).rejects.toBeInstanceOf(
+    await expect(claimWays(tx, 'mine', [1, 2, 3], 'fail', [])).rejects.toBeInstanceOf(
       ClaimConflictError,
     );
     expect(inserted).toEqual([]);
@@ -261,14 +303,23 @@ describe('claimWays', () => {
     await expect(claimWays(racing, 'mine', [1], 'fail')).rejects.toBeInstanceOf(ClaimConflictError);
   });
 
-  it('leaves another trail alone under `yield` and takes only what is free', async () => {
+  it('leaves a conceded way alone and takes only what is free', async () => {
     const { tx, inserted, repointed } = claimTx({ 2: 'someone-else' });
-    await claimWays(tx, 'mine', [1, 2, 3], 'yield');
+    await claimWays(tx, 'mine', [1, 2, 3], 'fail', [2]);
     expect(inserted).toEqual([
       { wayId: 1, trailId: 'mine' },
       { wayId: 3, trailId: 'mine' },
     ]);
     expect(repointed).toEqual([]);
+  });
+
+  it('still fails on a racer while conceding the ways it was told to concede', async () => {
+    // Conceding way 2 must not blind the claim to way 3, which the resolution saw unclaimed.
+    const { tx, inserted } = claimTx({ 2: 'the-route', 3: 'a-racer' });
+    await expect(claimWays(tx, 'mine', [1, 2, 3], 'fail', [2])).rejects.toBeInstanceOf(
+      ClaimConflictError,
+    );
+    expect(inserted).toEqual([]);
   });
 
   it('repoints under `take`, which is how a relation reclaims its members', async () => {

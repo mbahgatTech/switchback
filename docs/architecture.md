@@ -476,6 +476,16 @@ returns normally and `report()` logs `done`, so an operator would read 8/8 tiles
 two of them ingested nothing. `switchback-ingest-drain-failed` therefore has a third arm matching
 `switchback-ingest-tile-split` and `switchback-ingest-subtree-stuck`.
 
+That alert is scoped to `appi-switchback-ingest`, which is the Function App drainer. In the resting
+configuration `INGEST_QUEUE_DRIVER` is `postgres`, so Vercel drains, and Vercel has no Application
+Insights — `packages/api/src/routers/trails.ts` and `apps/web/app/api/cron/drain/route.ts` both send
+the markers to `console` because there is nowhere else for them to go. Both subdivision flags are
+declared in `apps/web/src/env.ts`, so subdivision _can_ be turned on for that drainer, and on that
+drainer nothing is watching — including `switchback-ingest-subtree-stuck`, which is the
+edge-triggered "five failures, a human is needed" signal. Enabling subdivision therefore means
+either moving the drain to the worker first, or accepting that the split and stuck markers land only
+in the Vercel log stream. There is no Vercel log drain in the estate or in any template.
+
 **The split gate is unattempted work, not the clock.** `forEachConcurrent` visits every assembled
 trail, so a tile is only short when the deadline _refused_ one — `processTile` counts
 `IngestDeadlineError` separately from ordinary per-trail failures and splits on that count alone. A
@@ -518,11 +528,20 @@ The union happens before `elevateLine`, because every statistic, the elevation p
 waypoint's `distM` are derived from the coordinate array — a merge applied at the write would leave
 all of them describing one fragment.
 
-**A union that is still a MultiLineString is refused, and refusal is the safe direction.** 53 of
+**A union that is still a MultiLineString is refused, and the whole resolution goes with it.** 53 of
 those 269 pairs fork or do not touch, and `Trail.geom` is `geometry(LineString, 4326)`, so no single
-line represents them. Keeping the longest component would delete stored geometry with no way back.
-Instead the stored line is handed back unchanged, nothing is retired, and the claims stay where they
-are — the corpus is left exactly as it was, which is what it would have been without the flag.
+line represents them. The assembly therefore keeps its own row, its own line and the member ways
+nobody else holds, exactly as the `osm-id` default would give it — `resolveIdentity` returns the
+unresolved fallback rather than the winner's id.
+
+Adopting the winner on a refusal is what the earlier shape of this code did, and it is not a no-op:
+the winner's stored line comes back unchanged, so the incoming arm is written nowhere, while its ways
+are still claimed for the winner — after which no later ingest can restore it, because resolution
+keeps finding those ways claimed and keeps refusing the same union. Standing down leaves that trail
+fragmented across two rows, which is a worse corpus than one row but a strictly better one than a
+trail that has been deleted with no way back. `packages/ingest/test/identity.db.test.ts` asserts both
+halves against a real PostGIS: the arm's northern tip is on the arm's own line, and way `900005` is
+claimed by the arm rather than by the ridge.
 
 Where two rows already exist, the older wins and the younger is folded into it: reviews, photos,
 activities, completions, list items, lifeline sessions and way claims are re-pointed. Two of those
@@ -548,15 +567,23 @@ loser's insert raises P2002, which unwinds the whole commit — not just the tra
 line and every statistic derived from it were built on a resolution that is now stale — and the
 retry re-reads the claims and adopts the row the winner created.
 
-**The rollback is one setting, and it is a rollback of behaviour, not of state.** Claims are written
-whatever `INGEST_TRAIL_IDENTITY` says; only resolution reads them. Setting it to `claim` therefore
-needs no backfill, and setting it back to `osm-id` returns behaviour exactly to the `(osmType, osmId)`
-upsert with a populated table sitting unused. What it does not do is un-merge: a merge that has
-already run has deleted the loser `Trail` row, and no setting brings it back. The merge is built so
-that this costs nothing a reader wrote — everything user-authored moves, and the one case that cannot
-move refuses the merge — but an operator turning the flag off is stopping future merges, not
-reversing past ones. Existing fragments heal on their own as tiles re-ingest on the 30-day TTL — no
-Overpass backfill run, no hours of mirror load.
+**The rollback is one setting, and it is a rollback of behaviour, not of state.** `osm-id` touches
+`trail_ways` and `trail_slug_aliases` not at all — it neither reads nor writes them — so the default
+path has no dependency on either table, and a runtime that reaches a database where the DDL has not
+been applied still ingests. That matters because Vercel Preview builds run branch code against the
+production database automatically, and `ci.yml`'s `migrate` job only runs on a push to `master`.
+Setting the flag to `claim` needs no backfill: claims fill in as tiles re-ingest on the 30-day TTL,
+and until a trail's ways are claimed it resolves exactly as it does today. Setting it back to
+`osm-id` returns behaviour to the `(osmType, osmId)` upsert with a populated table sitting unread.
+
+What it does not do is un-merge: a merge that has already run has deleted the loser `Trail` row, and
+no setting brings it back. The merge is built so that this costs nothing a reader wrote — everything
+user-authored moves, and the one case that cannot move refuses the merge — but an operator turning
+the flag off is stopping future merges, not reversing past ones. `trail_slug_aliases` is the residue
+that says a merge happened, and `processTile` logs `identity resolved` per tile with a count for each
+of `adopted`, `merged`, `refused-geometry`, `refused-review` and `yielded-to-relation`, so the
+irreversible half is measurable while it is happening rather than only afterwards. Existing fragments
+heal on their own as tiles re-ingest — no Overpass backfill run, no hours of mirror load.
 
 **Observed in production, 2026-08-06**, and re-read from App Insights on 2026-08-07. Subdivision
 fires, and the trace that says so is the one this round wired. Four dense alpine z9 tiles reached the
@@ -664,8 +691,11 @@ while its `ingest_tile` job is `done`; it predates the splits. And three of the 
 which is what a tile row looks like after an invocation was killed mid-write. Neither state is
 visible to a reader: `isTileFresh` refuses `pending` and `running` alike, so both areas serve as cold
 and are re-queried, which is the correct outcome for a tile that never finished. Until they are
-re-attempted those six z9 tiles serve the trails each committed before the wall — 127, 160, 196 and
-241 for the four measured.
+re-attempted, what each of the six serves is every trail carrying its quadkey, accumulated over all
+of its attempts — 38, 134, 119, 477, 232 and 158 for `031313112`, `120221231`, `120230202`,
+`120230203`, `120230212` and `120230220`, read on 2026-08-07. The 127, 160, 196 and 241 in the split
+table above are what each _split run_ committed before the wall, which is a smaller and different
+number; do not read either as the other.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

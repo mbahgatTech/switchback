@@ -11,33 +11,41 @@ import { normalizeName } from './assemble';
 export type TrailIdentityMode = 'claim' | 'osm-id';
 
 /**
- * `INGEST_TRAIL_IDENTITY`, defaulting to the pre-claim behaviour. Only *resolution* is gated —
- * claims are written under both settings, so flipping back leaves a populated table unused and
- * flipping forward needs no backfill.
+ * `INGEST_TRAIL_IDENTITY`, defaulting to the pre-claim behaviour. It gates the whole mechanism,
+ * reads and writes alike: under `osm-id` nothing touches `TrailWay`, so a runtime that reaches a
+ * database without the table still ingests.
  */
 export function trailIdentityMode(source: NodeJS.ProcessEnv = process.env): TrailIdentityMode {
   return source.INGEST_TRAIL_IDENTITY === 'claim' ? 'claim' : 'osm-id';
 }
 
 /**
- * What `claimWays` does about a way some other trail already holds.
+ * What `claimWays` does about a contested way — one held by a trail other than the claimant.
  *
- * `fail` is the concurrency control. The resolution that produced it said nobody else owns these
- * ways, so a row appearing underneath it is a committer racing this one, and the only safe answer
- * is to unwind and resolve again — overwriting would leave two trail rows for one trail, which is
- * the corruption `TrailWay` exists to prevent. `yield` is for the cases where another trail owns
- * a way legitimately, and `take` for a relation, whose id is authoritative in every tile.
+ * `fail` is the concurrency control, and it applies only to ways the resolution saw unclaimed. A
+ * row appearing under one of those is a committer racing this one, and the only safe answer is to
+ * unwind and resolve again: overwriting would leave two trail rows for one trail, the corruption
+ * `TrailWay` exists to prevent. `take` is for a relation, whose id is authoritative in every tile.
  */
-export type ClaimPolicy = 'take' | 'yield' | 'fail';
+export type ClaimPolicy = 'take' | 'fail';
 
 /**
  * What to do with an assembled trail. `create` means fall through to the `(osmType, osmId)`
  * upsert — the path taken when nothing has claimed these ways, and always for relations.
+ *
+ * `conceded` carries the member ways another trail already holds legitimately, so `claimWays` can
+ * leave them where they are and still fail loudly on a way that was free a moment ago.
  */
 export type Resolution =
-  | { kind: 'create'; claim: ClaimPolicy }
-  | { kind: 'adopt'; trailId: string; claim: ClaimPolicy }
-  | { kind: 'merge'; trailId: string; retiredIds: string[]; claim: ClaimPolicy }
+  | { kind: 'create'; claim: ClaimPolicy; conceded: readonly number[] }
+  | { kind: 'adopt'; trailId: string; claim: ClaimPolicy; conceded: readonly number[] }
+  | {
+      kind: 'merge';
+      trailId: string;
+      retiredIds: string[];
+      claim: ClaimPolicy;
+      conceded: readonly number[];
+    }
   | { kind: 'skip'; trailId: string };
 
 /** Prisma's code for a unique-constraint violation. */
@@ -76,14 +84,21 @@ export async function resolveTrail(
   tx: Prisma.TransactionClient,
   input: ClaimInput,
 ): Promise<Resolution> {
-  if (input.osmType === 'relation') return { kind: 'create', claim: 'take' };
-  if (input.memberWayIds.length === 0) return { kind: 'create', claim: 'fail' };
+  if (input.osmType === 'relation') return { kind: 'create', claim: 'take', conceded: [] };
+  if (input.memberWayIds.length === 0) return { kind: 'create', claim: 'fail', conceded: [] };
 
   const claims = await tx.trailWay.findMany({
     where: { wayId: { in: input.memberWayIds.map((id) => BigInt(id)) } },
-    select: { trail: { select: { id: true, name: true, osmType: true, createdAt: true } } },
+    select: {
+      wayId: true,
+      trail: { select: { id: true, name: true, osmType: true, createdAt: true } },
+    },
   });
-  if (claims.length === 0) return { kind: 'create', claim: 'fail' };
+  if (claims.length === 0) return { kind: 'create', claim: 'fail', conceded: [] };
+
+  // Every member way somebody already holds. Whichever row this assembly ends up on, these are
+  // not the ways a lost race would show up on, so `claimWays` must not read them as one.
+  const conceded = claims.map((claim) => Number(claim.wayId));
 
   const distinct = new Map<string, Claimant>();
   for (const claim of claims) distinct.set(claim.trail.id, claim.trail);
@@ -105,12 +120,17 @@ export async function resolveTrail(
   const ways = claimants.filter((c) => c.osmType !== OsmElementType.relation);
   // Every claimant is a relation under some other name. Those ways are the relation's; this trail
   // keeps its own row and leaves them alone rather than fighting for them on every ingest.
-  if (ways.length === 0) return { kind: 'create', claim: 'yield' };
+  if (ways.length === 0) return { kind: 'create', claim: 'fail', conceded };
 
   const [winner, ...rest] = ways as [Claimant, ...Claimant[]];
-  return rest.length === 0
-    ? { kind: 'adopt', trailId: winner.id, claim: 'fail' }
-    : { kind: 'merge', trailId: winner.id, retiredIds: rest.map((c) => c.id), claim: 'fail' };
+  if (rest.length === 0) return { kind: 'adopt', trailId: winner.id, claim: 'fail', conceded };
+  return {
+    kind: 'merge',
+    trailId: winner.id,
+    retiredIds: rest.map((c) => c.id),
+    claim: 'fail',
+    conceded,
+  };
 }
 
 /**
@@ -122,9 +142,11 @@ export async function claimWays(
   trailId: string,
   wayIds: readonly number[],
   policy: ClaimPolicy,
+  conceded: readonly number[] = [],
 ): Promise<void> {
   if (wayIds.length === 0) return;
   const ids = [...new Set(wayIds)].map((id) => BigInt(id));
+  const allowed = new Set(conceded.map((id) => BigInt(id)));
 
   const held = await tx.trailWay.findMany({
     where: { wayId: { in: ids } },
@@ -132,14 +154,16 @@ export async function claimWays(
   });
   const contested = held.filter((row) => row.trailId !== trailId);
 
-  if (contested.length > 0) {
-    if (policy === 'fail') throw new ClaimConflictError(contested[0]!.wayId);
-    if (policy === 'take') {
+  if (policy === 'take') {
+    if (contested.length > 0) {
       await tx.trailWay.updateMany({
         where: { wayId: { in: contested.map((row) => row.wayId) } },
         data: { trailId },
       });
     }
+  } else {
+    const raced = contested.find((row) => !allowed.has(row.wayId));
+    if (raced) throw new ClaimConflictError(raced.wayId);
   }
 
   const seen = new Set(held.map((row) => row.wayId));
@@ -147,10 +171,7 @@ export async function claimWays(
   if (fresh.length === 0) return;
 
   try {
-    await tx.trailWay.createMany({
-      data: fresh.map((wayId) => ({ wayId, trailId })),
-      skipDuplicates: policy === 'yield',
-    });
+    await tx.trailWay.createMany({ data: fresh.map((wayId) => ({ wayId, trailId })) });
   } catch (error) {
     // The primary key is the serialisation point: `held` was read in this transaction, so a row
     // that was not there and is there now belongs to a committer that got in first.

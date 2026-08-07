@@ -118,8 +118,13 @@ How a way-derived trail is identified. `claim` resolves it through the `trail_wa
 what keeps one trail one row when two tiles each assemble part of it. `osm-id` keeps the
 `(osmType, osmId)` upsert, where the id is the lowest way id the tile happened to see.
 
-Claims are written under both values, so this is a real rollback in both directions: switching to
-`claim` needs no backfill, and switching back leaves a populated table that stops being read.
+`osm-id` neither reads nor writes `trail_ways` and `trail_slug_aliases`, so switching to it stops
+every future merge and restores the previous behaviour on the next tile. It does not undo a merge
+that has already run: that deleted the loser `Trail` row, and no setting brings it back. Turning
+this on is reversible; the rows it has already retired are not.
+
+`claim` requires both tables to exist. Apply the schema before deploying a worker package that can
+run with this set — CI's `migrate` job does that on a push to `master` only.
 ''')
 @allowed([
   'osm-id'
@@ -804,15 +809,31 @@ Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, scoped 
 group, on 2026-08-03. So the parameter, the fallback and the `az role assignment create` in
 README.md are all gone: the template is the only thing that grants anything.
 
-Three assignments, all **scoped to the queue** rather than the namespace, so nothing here has
+Four assignments, all **scoped to the queue** rather than the namespace, so nothing here has
 standing on an entity created later:
 
   worker    Data Sender    the pump publishes a wake-up signal per runnable row
   worker    Data Receiver  the trigger receives, completes, and dead-letters
-  publisher Data Sender    Vercel publishes, and can do nothing else
+  publisher Data Sender    Vercel publishes
+  publisher Data Receiver  the worker's grant, on the identity it is being moved onto
 
 The worker's pair replaces a single Data Owner; see the note beside the role ids above for what
 that was buying and why it is not needed.
+
+`publisherReceiver` is declared because it already exists — assignment
+`0090d328-0cee-592f-8359-e4cc64940694`, deployed before the grant moved out of this template.
+Incremental ARM does not delete what a template stops declaring, so leaving it undeclared does not
+revoke it; it only means no deploy converges it and no reader finds it in the template. Deleting it
+instead was attempted and refused with `ScopeLocked` naming `switchback-prod-no-delete`, the
+resource group's `CanNotDelete` lock, so revocation needs the lock lifted first — an Owner action,
+tracked separately.
+
+`id-switchback-vercel-publisher` is the shared runtime identity: Vercel carries it on every
+deployment, previews included. Receive on `ingest-jobs` is therefore reachable from a preview build
+today, over the same REST surface `packages/ingest/src/publish.ts` already uses to send. That is a
+consequence of one identity serving both runtimes rather than of this template, and it is the reason
+the grant is worth revoking rather than keeping — but the template must describe the estate that
+exists.
 ''')
 resource workerSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: queue
@@ -847,6 +868,26 @@ resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       serviceBusDataSenderRoleId
+    )
+    principalId: publisher.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+/*
+ * Named by its literal assignment id rather than `guid(...)` like its three siblings, because this
+ * one is not being created — it is being adopted. A role assignment's resource name *is* its GUID,
+ * so this is the only form that provably converges on the assignment already in the estate; a
+ * `guid()` expression that resolved to anything else would try to grant the same principal the same
+ * role at the same scope a second time.
+ */
+resource publisherReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: queue
+  name: '0090d328-0cee-592f-8359-e4cc64940694'
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      serviceBusDataReceiverRoleId
     )
     principalId: publisher.properties.principalId
     principalType: 'ServicePrincipal'

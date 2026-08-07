@@ -123,9 +123,9 @@ describe('subdivideMaxZoom', () => {
   });
 
   it('is off when nothing declares it, so it has to be switched on deliberately', () => {
-    // `apps/web/src/env.ts` has no entry for it, and Vercel drains `ingest_jobs` whenever the
-    // queue driver is rolled back — a default of `MAX_INGEST_ZOOM` turned subdivision on there
-    // without anyone choosing it.
+    // Vercel drains `ingest_jobs` whenever the queue driver is rolled back, and both flags are
+    // declared in `apps/web/src/env.ts`, so that drainer can read them too — a default of
+    // `MAX_INGEST_ZOOM` would turn subdivision on there without anyone choosing it.
     expect(subdivideMaxZoom({})).toBe(INGEST_ZOOM);
     expect(canSubdivide(INGEST_ZOOM, subdivideMaxZoom({}))).toBe(false);
   });
@@ -172,12 +172,18 @@ describe('rollUp', () => {
     expect(rollUp(siblings([{}, {}, {}, { fetchedAt: null }]))).toBeNull();
   });
 
-  it('takes the oldest child as the parent freshness', () => {
+  it('takes the oldest child as the parent freshness, wherever it sits in the set', () => {
     const stale = ago(TILE_TTL_MS - 1000);
-    const settled = rollUp(siblings([{ fetchedAt: stale }, {}, {}, {}]));
     // The freshest child would let one quarter refreshed yesterday hold three stale ones out
-    // of the sweep for another month.
-    expect(settled?.fetchedAt).toEqual(stale);
+    // of the sweep for another month. The oldest is placed third rather than first, so an
+    // implementation that reaches for `children[0]` is caught as well as one that inverts the
+    // comparison.
+    for (const at of [0, 2, 3]) {
+      const rows = [{}, {}, {}, {}].map((row, index) =>
+        index === at ? { fetchedAt: stale } : row,
+      );
+      expect(rollUp(siblings(rows))?.fetchedAt).toEqual(stale);
+    }
   });
 
   it('is empty only when every child is', () => {
