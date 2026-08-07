@@ -49,9 +49,16 @@ describe('the subject the deploy credential is written against', () => {
    * Two halves, and each was wrong in a different way. The prefix is what GitHub stamps on every
    * token this repository mints; the suffix is what the *job* determines, and naming an
    * environment silently rewrites it.
+   *
+   * The prefix pattern is the immutable form — `owner@<ownerId>/repo@<repoId>` — because that is
+   * what this repository was measured to issue and `repo:<owner>/<repo>` is what the credential
+   * wrongly carried. `.github/scripts/assert-oidc-subject.sh` is what compares it against a real
+   * token; this only holds the shape, so the two cannot silently swap back.
    */
   it('takes its prefix from a parameter the CI check reads back', () => {
-    expect(bicep).toMatch(/^param workerDeploySubjectPrefix string = 'repo:.+'$/m);
+    expect(bicep).toMatch(
+      /^param workerDeploySubjectPrefix string = 'repo:[^/@']+@\d+\/[^/@']+@\d+'$/m,
+    );
     expect(bicep).toContain("subject: '${workerDeploySubjectPrefix}:ref:refs/heads/master'");
   });
 
