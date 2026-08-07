@@ -63,6 +63,7 @@ import {
 } from '@switchback/ingest';
 import type { IngestRefusal } from '@switchback/ingest';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
+import { createInlineDrain } from '../inline-drain';
 import type { Context } from '../context';
 
 /**
@@ -105,24 +106,19 @@ const GRAPH_CACHE_TTL_MS = 5 * 60_000;
 /** How many saved routes one hiker's index returns. */
 const MAX_ROUTES_LISTED = 200;
 
-/** One inline drain at a time, process-wide — the guard `trails.ts` keeps, same reason. */
-let inlineDrain: Promise<unknown> | null = null;
+/** One inline drain at a time, process-wide — the scheduler `trails.ts` keeps, same reason. */
+const inlineDrain = createInlineDrain((keys) =>
+  drainIngest({
+    limit: Math.min(keys.length, MAX_INLINE_DRAIN),
+    workerId: 'inline-network',
+    dedupeKeys: keys,
+  }),
+);
 
 function kickNetwork(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil || queued.length === 0 || inlineDrain) return;
-  const work = drainIngest({
-    limit: Math.min(queued.length, MAX_INLINE_DRAIN),
-    workerId: 'inline-network',
-    dedupeKeys: queued.map(networkJobKey),
-  })
-    .catch(() => {
-      /* Failures are recorded on the job row; see ingest_jobs.lastError. */
-    })
-    .finally(() => {
-      inlineDrain = null;
-    });
-  inlineDrain = work;
-  ctx.waitUntil(work);
+  if (!ctx.waitUntil) return;
+  const work = inlineDrain.request(queued.map(networkJobKey));
+  if (work) ctx.waitUntil(work);
 }
 
 interface CachedGraph {

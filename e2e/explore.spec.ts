@@ -86,15 +86,33 @@ test.describe('Explore', () => {
 
     const card = selectedCard(page);
     await expect(card).toBeVisible();
-    const over = await card.boundingBox();
-    if (!over) throw new Error('the pick card is visible but has no box');
 
-    // Both bottom corners, because the card is full-width below `md` and reaches the zoom
-    // control as well as the scale bar.
-    for (const chrome of ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right']) {
-      const under = await sheet.locator(chrome).first().boundingBox();
-      if (!under) throw new Error(`${chrome} is not drawn on the sheet`);
-      expect(overlaps(over, under), `the card covers ${chrome}`).toBe(false);
+    /*
+     * Every box in one evaluation, because the clearance is a *layout* the card is responsible
+     * for producing: read one box per round trip and the card's can be measured before the
+     * chrome has moved out of its way and the chrome's after, reporting a clearance that was
+     * never on screen at once. Both bottom corners, because the card is full-width below `md`
+     * and reaches the zoom control as well as the scale bar.
+     */
+    const CHROME = ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right'];
+    const boxes = await page.evaluate((chrome) => {
+      const rect = (element: Element | null | undefined) => {
+        if (!element) return null;
+        const { x, y, width, height } = element.getBoundingClientRect();
+        return { x, y, width, height };
+      };
+      const pane = document.querySelector('[aria-label="Map of trails in the current view"]');
+      return {
+        card: rect(document.querySelector('aside[aria-label="Selected trail"]')),
+        under: chrome.map((selector) => ({ selector, box: rect(pane?.querySelector(selector)) })),
+      };
+    }, CHROME);
+
+    if (!boxes.card) throw new Error('the pick card is visible but has no box');
+
+    for (const { selector, box } of boxes.under) {
+      if (!box) throw new Error(`${selector} is not drawn on the sheet`);
+      expect(overlaps(boxes.card, box), `the card covers ${selector}`).toBe(false);
     }
 
     /*

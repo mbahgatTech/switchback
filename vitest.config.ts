@@ -48,7 +48,9 @@ export default defineConfig({
     ],
   },
   test: {
-    include: ['packages/**/test/**/*.test.ts', 'apps/**/test/**/*.test.ts'],
+    // `test/` at the root is for invariants that belong to no workspace — the CI workflow's
+    // own, so far.
+    include: ['packages/**/test/**/*.test.ts', 'apps/**/test/**/*.test.ts', 'test/**/*.test.ts'],
     environment: 'node',
     env,
     // The db file must stay sequential within itself — enforced there with `describe.sequential`.
