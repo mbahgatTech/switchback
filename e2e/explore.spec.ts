@@ -82,37 +82,50 @@ test.describe('Explore', () => {
 
     const row = page.locator('li[data-trail-id]').first();
     const name = (await row.getByRole('heading', { level: 3 }).innerText()).trim();
-    await row.getByRole('button', { name: `Show ${name} on the map` }).click();
-
-    const card = selectedCard(page);
-    await expect(card).toBeVisible();
 
     /*
-     * Every box in one evaluation, because the clearance is a *layout* the card is responsible
-     * for producing: read one box per round trip and the card's can be measured before the
-     * chrome has moved out of its way and the chrome's after, reporting a clearance that was
-     * never on screen at once. Both bottom corners, because the card is full-width below `md`
-     * and reaches the zoom control as well as the scale bar.
+     * Armed before the click, and read from the frame the card is first drawn in. Measured
+     * afterwards instead, this passes on a card that covered the scale bar for a second and
+     * then stepped off it — which is the shape the defect took, and which nothing the reader
+     * sees distinguishes from a card that never covered it. A MutationObserver callback runs
+     * after the DOM is committed and before the browser paints, so the boxes it reads are the
+     * ones about to appear.
      */
-    const CHROME = ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right'];
-    const boxes = await page.evaluate((chrome) => {
-      const rect = (element: Element | null | undefined) => {
-        if (!element) return null;
-        const { x, y, width, height } = element.getBoundingClientRect();
-        return { x, y, width, height };
-      };
-      const pane = document.querySelector('[aria-label="Map of trails in the current view"]');
-      return {
-        card: rect(document.querySelector('aside[aria-label="Selected trail"]')),
-        under: chrome.map((selector) => ({ selector, box: rect(pane?.querySelector(selector)) })),
-      };
-    }, CHROME);
+    await page.evaluate(() => {
+      window.__pickCardFirstFrame = new Promise((resolve) => {
+        const box = (element: Element | null | undefined) => {
+          if (!element) return null;
+          const { x, y, width, height } = element.getBoundingClientRect();
+          return { x, y, width, height };
+        };
+        const observer = new MutationObserver(() => {
+          const card = document.querySelector('aside[aria-label="Selected trail"]');
+          if (!card) return;
+          observer.disconnect();
+          const pane = document.querySelector('[aria-label="Map of trails in the current view"]');
+          resolve({
+            card: box(card),
+            // Both bottom corners, because the card is full-width below `md` and reaches the
+            // zoom control as well as the scale bar.
+            chrome: ['.maplibregl-ctrl-scale', '.maplibregl-ctrl-bottom-right'].map((selector) => ({
+              selector,
+              box: box(pane?.querySelector(selector)),
+            })),
+          });
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+      });
+    });
 
-    if (!boxes.card) throw new Error('the pick card is visible but has no box');
+    await row.getByRole('button', { name: `Show ${name} on the map` }).click();
+    await expect(selectedCard(page)).toBeVisible();
 
-    for (const { selector, box } of boxes.under) {
+    const first = await page.evaluate(() => window.__pickCardFirstFrame);
+    if (!first?.card) throw new Error('the pick card is visible but was drawn with no box');
+
+    for (const { selector, box } of first.chrome) {
       if (!box) throw new Error(`${selector} is not drawn on the sheet`);
-      expect(overlaps(boxes.card, box), `the card covers ${selector}`).toBe(false);
+      expect(overlaps(first.card, box), `the card covers ${selector}`).toBe(false);
     }
 
     /*
@@ -190,6 +203,18 @@ interface Box {
   y: number;
   width: number;
   height: number;
+}
+
+/** What the page hands back from the frame the pick card is first drawn in. */
+interface FirstFrame {
+  card: Box | null;
+  chrome: { selector: string; box: Box | null }[];
+}
+
+declare global {
+  interface Window {
+    __pickCardFirstFrame?: Promise<FirstFrame>;
+  }
 }
 
 /**
