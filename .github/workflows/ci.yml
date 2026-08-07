@@ -312,12 +312,17 @@ jobs:
 
       # The Prisma CLI has no driver-adapter seam — `db push` reads a connection *string* off
       # `schema.prisma`'s `url` and `directUrl`, so the token provider in packages/db cannot
-      # serve it. A token is a string, though, so it goes in the password field for the length
-      # of this job. It outlives the job by an hour at worst and is masked in the log.
+      # serve it. A token is a string, though, so it goes in the password field.
+      #
+      # Minted inside each step that needs it rather than exported once to `$GITHUB_ENV`. This
+      # token authenticates `id-switchback-postgres-ci`, a full Postgres administrator; putting
+      # it in the job environment hands it to every later step and to every process they start,
+      # for a credential that only two steps have any use for. `::add-mask::` redacts the log,
+      # not the environment.
       #
       # Both variables, not one: `prisma db push` reads `directUrl` and
       # `packages/db/scripts/apply-spatial.ts` constructs its own client from `DATABASE_URL`.
-      - name: Compose a connection string from a token
+      - name: Prove the token connects, and as an administrator
         if: steps.schema.outputs.changed == 'true'
         env:
           PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
@@ -325,25 +330,11 @@ jobs:
           PGDATABASE: switchback
         run: |
           set -euo pipefail
-          token="$(az account get-access-token --tenant f0f92920-ce90-42c9-b87f-3ea8644bccd8 \
-            --resource-type oss-rdbms --query accessToken -o tsv)"
-          echo "::add-mask::$token"
-          encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read().strip(), safe=""))' <<< "$token")"
-          echo "::add-mask::$encoded"
-          url="postgresql://${PGUSER}:${encoded}@${PGHOST}:5432/${PGDATABASE}?sslmode=verify-full"
-          echo "::add-mask::$url"
-          {
-            echo "DATABASE_URL=$url"
-            echo "DIRECT_DATABASE_URL=$url"
-          } >> "$GITHUB_ENV"
-
-      # Proves the credential before anything writes with it. A `db push` that fails to connect
-      # reports a Prisma error about the schema, which sends the reader to the wrong place.
-      - name: Prove the token connects, and as an administrator
-        if: steps.schema.outputs.changed == 'true'
-        run: |
-          set -euo pipefail
-          npx --yes tsx -e '
+          . ./.github/scripts/pg-token-url.sh
+          # Local, pinned and already installed by `npm ci`. `npx --yes` would resolve tsx and
+          # its whole dependency closure from the registry at job time, unpinned, into a process
+          # holding an administrator credential for the production database.
+          ./node_modules/.bin/tsx -e '
             import pg from "pg";
             const c = new pg.Client({ connectionString: process.env.DIRECT_DATABASE_URL,
                                       ssl: { rejectUnauthorized: true } });
@@ -363,7 +354,15 @@ jobs:
       # job — and therefore blocks the deploy — instead of quietly executing against the one
       # database with real data in it. Making that change is then a manual, deliberate act.
       - if: steps.schema.outputs.changed == 'true'
-        run: npm run db:push
+        name: Reconcile the production schema
+        env:
+          PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+          PGUSER: id-switchback-postgres-ci
+          PGDATABASE: switchback
+        run: |
+          set -euo pipefail
+          . ./.github/scripts/pg-token-url.sh
+          npm run db:push
 
   deploy:
     name: deploy production

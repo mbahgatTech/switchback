@@ -71,24 +71,38 @@ function msalShapedSource(
 }
 
 /**
- * Runs a provider once a minute and reports the least life left on any token it served.
+ * How often the drives below open a connection.
+ *
+ * Deliberately shorter than `CONNECT_BUDGET_MS`. A grid coarser than the budget cannot observe
+ * a token served with less life left than the budget, so the assertion that no such token is
+ * ever served would hold however the margin were set — the grid would be guaranteeing it, not
+ * the code. At five seconds the shortest observable lifetime is five seconds, well under the
+ * thirty the assertion is about, so the margin is what has to do the work. The companion test
+ * at the foot of this file drives the same source with no margin at all and requires the
+ * assertion to fail.
+ */
+const SAMPLE_MS = 5_000;
+
+/**
+ * Runs a provider on a fixed grid and reports the least life left on any token it served.
  *
  * The quantity that matters is what the *connection* gets, so it is sampled from what the
  * provider hands back rather than computed from the constants it hands it back by.
  */
-async function driveMinutely(
+async function drive(
   clock: { now: () => number; advance: (ms: number) => number },
   provider: () => Promise<string>,
   expiryOf: Map<string, number>,
-  minutes: number,
+  durationMs: number,
+  intervalMs: number = SAMPLE_MS,
 ): Promise<number> {
   let worstRemainingMs = Infinity;
-  for (let minute = 0; minute < minutes; minute += 1) {
+  for (let elapsed = 0; elapsed < durationMs; elapsed += intervalMs) {
     const served = await provider();
     const expiry = expiryOf.get(served);
     if (expiry === undefined) throw new Error(`served an unrecorded token: ${served}`);
     worstRemainingMs = Math.min(worstRemainingMs, expiry - clock.now());
-    clock.advance(MINUTE);
+    clock.advance(intervalMs);
   }
   return worstRemainingMs;
 }
@@ -211,7 +225,7 @@ describe('against a source that answers from MSAL’s cache', () => {
     const onTokenNearlyExpired = vi.fn();
     const token = createTokenProvider(ledger.source, { now: clock.now, onTokenNearlyExpired });
 
-    const worst = await driveMinutely(clock, token, ledger.expiryOf, 6 * 60);
+    const worst = await drive(clock, token, ledger.expiryOf, 6 * HOUR);
 
     expect(onTokenNearlyExpired).not.toHaveBeenCalled();
     expect(worst).toBeGreaterThanOrEqual(CONNECT_BUDGET_MS);
@@ -224,7 +238,7 @@ describe('against a source that answers from MSAL’s cache', () => {
     const onTokenNearlyExpired = vi.fn();
     const token = createTokenProvider(ledger.source, { now: clock.now, onTokenNearlyExpired });
 
-    const worst = await driveMinutely(clock, token, ledger.expiryOf, 6 * 60);
+    const worst = await drive(clock, token, ledger.expiryOf, 6 * HOUR);
 
     expect(onTokenNearlyExpired).not.toHaveBeenCalled();
     expect(worst).toBeGreaterThanOrEqual(CONNECT_BUDGET_MS);
@@ -283,7 +297,7 @@ describe('against a source that answers from MSAL’s cache', () => {
     const onTokenNearlyExpired = vi.fn();
     const token = createTokenProvider(ledger.source, { now: clock.now, onTokenNearlyExpired });
 
-    const worst = await driveMinutely(clock, token, ledger.expiryOf, 20 * 60);
+    const worst = await drive(clock, token, ledger.expiryOf, 20 * HOUR, MINUTE);
 
     expect(onTokenNearlyExpired).not.toHaveBeenCalled();
     // Two mints in twenty hours: the first, and the one the twelve-hour hint asked for. A
@@ -295,6 +309,37 @@ describe('against a source that answers from MSAL’s cache', () => {
 });
 
 describe('degraded sources', () => {
+  it('reports the current failure, not one the process recovered from hours ago', async () => {
+    const clock = fakeClock();
+    // Fail once, recover, then hold one token for good — the shape MSAL has once a refresh is
+    // pending upstream: the same token back, which arms the backoff with no error behind it.
+    let held: AccessToken | undefined;
+    const source = vi
+      .fn<() => Promise<AccessToken>>()
+      .mockResolvedValueOnce(tokenExpiringIn(clock, HOUR, 'first'))
+      .mockRejectedValueOnce(new Error('a blip, long since over'))
+      .mockImplementation(async () => (held ??= tokenExpiringIn(clock, HOUR, 'settled')));
+    const token = createTokenProvider(source, {
+      now: clock.now,
+      onRenewalFailure: () => {},
+      onTokenNearlyExpired: () => {},
+    });
+
+    await token();
+    clock.advance(HOUR - MINUTE); // inside the margin: renew, and the blip is absorbed
+    await token();
+    clock.advance(RENEW_RETRY_BACKOFF_MS + 1);
+    const settled = await token(); // recovered; the blip must not outlive this
+
+    // Far enough on that the held token has expired and the source keeps handing it back —
+    // which arms the backoff with nothing to report. The next connection inside that window
+    // must ask again, not rethrow an error from an outage that ended two hours ago.
+    clock.advance(2 * HOUR);
+    await expect(token()).resolves.toBe(settled);
+    await expect(token()).resolves.toBe(settled);
+    expect(source).toHaveBeenCalledTimes(5);
+  });
+
   it('says so when a token is served with less life than a connection attempt takes', async () => {
     const clock = fakeClock();
     const source = vi
@@ -378,5 +423,58 @@ describe('degraded sources', () => {
 
     expect(warn).toHaveBeenCalledOnce();
     warn.mockRestore();
+  });
+});
+
+/**
+ * What the drives above are worth.
+ *
+ * An assertion that "no token is served with less than the connect budget left" is only
+ * evidence if it can fail, and the way it silently cannot is a sampling grid coarser than the
+ * budget: the shortest lifetime observable is then one interval, and one interval guarantees
+ * the result regardless of the code. This drives the identical source with the margin removed
+ * and requires the failure. If it ever passes, the grid has drifted above `CONNECT_BUDGET_MS`
+ * and the assertions above have stopped measuring the margin.
+ */
+describe('the margin assertions can fail', () => {
+  it('catches a margin of zero, which the code above exists to keep non-zero', async () => {
+    const clock = fakeClock();
+    const msal = msalShapedSource(clock, { lifetimeMs: HOUR });
+    const ledger = recording(msal.source);
+    const token = createTokenProvider(ledger.source, { now: clock.now, renewMarginMs: 0 });
+
+    const worst = await drive(clock, token, ledger.expiryOf, 6 * HOUR);
+
+    expect(worst).toBeLessThan(CONNECT_BUDGET_MS);
+    expect(SAMPLE_MS).toBeLessThan(CONNECT_BUDGET_MS);
+  });
+
+  it('catches a margin too small to cover the handshake', async () => {
+    const clock = fakeClock();
+    const msal = msalShapedSource(clock, { lifetimeMs: HOUR });
+    const ledger = recording(msal.source);
+    const token = createTokenProvider(ledger.source, {
+      now: clock.now,
+      renewMarginMs: CONNECT_BUDGET_MS / 2,
+    });
+
+    const worst = await drive(clock, token, ledger.expiryOf, 6 * HOUR);
+
+    expect(worst).toBeLessThan(CONNECT_BUDGET_MS);
+  });
+
+  it('is measuring the margin rather than the refresh hint, which makes it inert', async () => {
+    const drivenWith = async (renewMarginMs: number): Promise<number> => {
+      const clock = fakeClock();
+      const msal = msalShapedSource(clock, { lifetimeMs: HOUR, refreshInMs: 30 * MINUTE });
+      const ledger = recording(msal.source);
+      const provider = createTokenProvider(ledger.source, { now: clock.now, renewMarginMs });
+      return drive(clock, provider, ledger.expiryOf, 6 * HOUR);
+    };
+
+    // With a hint at half-life the provider renews on the hint and the margin never binds, so
+    // the hinted drive higher up says nothing about the margin. Recorded here so nobody reads
+    // it as coverage: the no-hint drive is the one that measures it.
+    expect(await drivenWith(RENEW_MARGIN_MS)).toBe(await drivenWith(0));
   });
 });

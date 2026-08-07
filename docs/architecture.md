@@ -235,12 +235,12 @@ graph LR
 
   VERCEL -->|FIC, both environments| RUNTIME
   FUNC -.->|not yet: needs AZURE_CLIENT_ID| RUNTIME
-  RUNTIME -->|Data Sender, Data Receiver| SB
-  FUNC -->|Data Receiver| SB
+  RUNTIME -->|Data Sender| SB
+  FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
-  RUNTIME -->|sbapp_runtime<br/>role mapped, not yet used| PG
-  FUNC -->|sbapp_func<br/>retired once the worker moves| PG
+  RUNTIME -->|sbapp_vercel<br/>mapped, unused, renamed on cutover| PG
+  FUNC -->|sbapp_func<br/>mapped, unused| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
@@ -249,26 +249,47 @@ graph LR
 ```
 
 **One identity for every runtime client.** `id-switchback-vercel-publisher` is what Vercel
-production, Vercel preview and the ingest worker all authenticate as — one principal, one Postgres
-role, one grant set. Its two federated credentials distinguish the Vercel environments to Entra and
-to nothing else: the access token carries the identity's object id, so Postgres, Azure RBAC and
-every policy downstream see one caller. Preview writing production is carried forward rather than
-created by this — preview already holds `DATABASE_URL` pointing at the production server — but the
-consolidation does remove the ability to revoke one consumer without the others. The two roles it
-replaces held identical privileges, so nothing that was ever differentiated is lost; what is lost is
-attribution, and `application_name` is what restores it. Attribution, not a boundary: any client can
-set it to anything.
+production, Vercel preview and the ingest worker are all intended to authenticate as — one
+principal, one Postgres role, one grant set. Its two federated credentials distinguish the Vercel
+environments to Entra and to nothing else: the access token carries the identity's object id, so
+Postgres, Azure RBAC and every policy downstream see one caller. Preview writing production is
+carried forward rather than created by this — preview already holds `DATABASE_URL` pointing at the
+production server — but the consolidation does remove the ability to revoke one consumer without
+the others. The two roles it replaces hold identical privileges, so nothing that was ever
+differentiated is lost; what is lost is attribution, and `application_name` is what restores it.
+Attribution, not a boundary: any client can set it to anything.
 
-The dashed edges are what is left. Both consumers still authenticate to Postgres by password, and
-`DATABASE_AUTH` is set nowhere, so no Entra-authenticated query has run against production. The
-Function App still has its own system-assigned identity and its own `sbapp_func` role; moving it
-onto the shared identity is a change to `infra/azure/ingest.bicep`, which declares the worker.
+**The consolidation is declared, not yet performed, and the diagram says so.** What is deployed is
+the identity and its two federated credentials. What is not:
+
+- `sbapp_runtime` does not exist. Read from the live catalog on 2026-08-06 as the owner's Entra
+  administrator, `pg_roles` holds `sbapp`, `sbapp_func`, `sbapp_vercel` and `sbadmin`, and
+  `pgaadauth_list_principals` maps `sbapp_vercel` to `c9bfba39-…` and `sbapp_func` to
+  `3db30cfd-…` — the two-role topology this change replaces. `infra/postgres-identity/roles.sql`
+  carries the `ALTER ROLE sbapp_vercel RENAME TO sbapp_runtime` that creates it, and that has run
+  nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
+  provisioning workflow cannot execute from a branch.
+- The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and still holds
+  both Service Bus grants under it. Moving it is a change to `infra/azure/ingest.bicep`, which
+  lives on `feat/servicebus-ingest` rather than here.
+- The shared identity is declared with **Data Sender** on the ingest queue and no Data Receiver.
+  Receive is granted when the worker actually moves, by the template that owns the queue. Granting
+  it earlier would give every Vercel deployment, preview included, the ability to drain the
+  production ingest queue for a capability nothing exercises.
+
+  One live assignment does not match that yet. `0090d328-0cee-592f-8359-e4cc64940694` grants the
+  shared identity Data Receiver on `ingest-jobs`; it was deployed before the grant was moved out of
+  this template, and incremental ARM does not delete what a template stops declaring. Revoking it
+  was attempted and refused: the delete returns `ScopeLocked` naming
+  `switchback-prod-no-delete`, the resource group's `CanNotDelete` lock, so it is live today and
+  lifting that lock is an Owner action. It is inert — no Service Bus receive code exists in this
+  repository — and it becomes real capability only when the worker's code merges. Either revoke it
+  then, or let `ingest.bicep` adopt it in the same change that moves the worker: the `guid()` inputs
+  are identical, so the assignment it would create is this one.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
-because a role mapped to the wrong principal fails only at first use. `sbapp_runtime` carries
-`c9bfba39-…`, which is `id-switchback-vercel-publisher`; `sbapp_func` carries `3db30cfd-…`, which is
-`func-switchback-ingest-37ywppu5p7fri`'s system-assigned identity. `infra/postgres-identity/roles.sql`
-asserts the first of those against the live catalog rather than assuming it.
+because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
+mapping against the live catalog after the rename rather than assuming the rename carried it.
 
 Two things the diagram is meant to make obvious. The deploying service principal holds Contributor
 and therefore cannot reach the database at all — it writes ARM, not rows. And the CI identity holds
@@ -430,13 +451,15 @@ it constructs is asserted, and the driver behaviour underneath it is measured �
 Vercel path in particular has never run in a Vercel runtime, and its named residual risk is
 unchanged: a connection opened from the cron drain or from `waitUntil` work that outlives the
 response has no request in scope, so `getVercelOidcToken()` has no header to read and that
-connection fails. A warm cache needs no assertion at all, and the 35-minute margin means only one
-connection in every 35 minutes of traffic asks for one, so the exposure is a deployment whose
-_only_ traffic for that long is background work. Capturing each request's header into a
-module-level holder closes even that, at the cost of holding a two-hour bearer token in memory.
+connection fails. A warm cache needs no assertion at all — the provider renews on the issuer's
+`refresh_in`, roughly half-life, so a busy instance asks perhaps twice an hour — and the exposure
+is a deployment whose _only_ traffic across a renewal is background work. Capturing each request's
+header into a module-level holder closes even that, at the cost of holding a bearer token in
+memory.
 
 The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
-same one already trusted for Service Bus, and the one carried by the `sbapp_vercel` database role.
+same one already trusted for Service Bus, and the one the `sbapp_vercel` database role carries
+until the rename in _What is left_ makes it `sbapp_runtime`.
 
 Whether retiring connections is a correctness requirement or only hygiene turns on one question
 nobody should answer from memory: **is the token checked only at connect, or is a live session
@@ -525,39 +548,51 @@ somebody else's account.
 
 ### What is left
 
-The database roles exist, the refresh mechanism is proven at the pinned versions, and both Prisma
-clients can now be built on it — but **no consumer has `DATABASE_AUTH` set**, so the path is still
-password-authenticated end to end. Three passwords are live, and they come off in this order:
+The refresh mechanism is proven at the pinned versions and both Prisma clients can be built on it,
+but **no consumer has `DATABASE_AUTH` set**, so the path is password-authenticated end to end and
+no Entra-authenticated Prisma query has ever run against production. Four things come off in this
+order, each proved with passwords still enabled:
 
-1. **The Function App.** The simplest, because it is a long-lived process with a system-assigned
-   identity and no request scoping to solve: `DATABASE_AUTH=entra` and a `DATABASE_URL` with the
-   password removed and the user set to `sbapp_func`. Its app setting still carries `sbapp`. Its
-   code also lives on `feat/servicebus-ingest` (PR #42) rather than here, so it cannot be moved
-   from this branch at all.
-2. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
+1. **The database role.** `sbapp_runtime` does not exist yet; `infra/postgres-identity/roles.sql`
+   renames `sbapp_vercel` into it and then asserts the Entra security label survived the rename.
+   That assertion is the gate, because the label follows the role's oid and a rename not carrying
+   it would leave a role mapped to nothing — recoverable by the inverse rename, since nothing is
+   dropped. It cannot run from a branch: the CI identity's federated credential trusts
+   `refs/heads/master` alone, so this executes on merge.
+2. **The Function App.** `DATABASE_AUTH=entra`, `AZURE_CLIENT_ID` for the shared identity, and a
+   `DATABASE_URL` with the password removed. Its app setting still carries `sbapp`. Its identity
+   block lives in `infra/azure/ingest.bicep`, on `feat/servicebus-ingest` (PR #42) rather than
+   here, so the move cannot be made from this branch at all — and its Service Bus Data Receiver
+   grant moves in that same change, which is why the shared identity does not hold one yet.
+3. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.
-3. **CI and the backup workflow.** `id-switchback-postgres-ci` is a proven Entra administrator that
-   nothing uses; `ci.yml` and `backup-production-db.yml` both still read
-   `secrets.DIRECT_DATABASE_URL`, which is `sbadmin` with full DDL. Switching them cannot be
-   rehearsed on a branch, because the federated credential trusts `refs/heads/master` alone. One
-   thing will bite when it is tried: `prisma db push` would then run as a role that is not
-   `sbadmin`, so new tables would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would
-   not apply — `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and
-   is untested.
+4. **CI.** `ci.yml`'s `migrate` job composes a connection string from a freshly minted token for
+   `id-switchback-postgres-ci` rather than reading a stored password. That path has never
+   executed — it fires only when `packages/db/prisma/` changes — so it is written but unproven,
+   and proving it means a no-op schema commit while passwords still work. One thing will bite
+   when it is tried: `prisma db push` then runs as a role that is not `sbadmin`, so new tables
+   would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would not apply.
+   `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and is untested.
 
-`passwordAuth` stays `Enabled` until all three are moved, and `infra/azure/postgres.bicep`
-hardcodes it rather than taking it as a parameter, so no deployment of that template can turn it
-off by accident. Turning it off first would lock the application out of its own database with no
-way back that does not involve a restore.
+`passwordAuth` is a parameter — `passwordAuthEnabled` in `main.bicep`, defaulting true — so the
+flip is a reviewable deployment of its own rather than an edit to a template. It is gated on all
+four of the above and on both administrator doors being re-proved in the same hour. Turning it off
+first would lock the application out of its own database, and the way back is an ARM write that
+itself authenticates against Entra.
 
-One more thing, measured rather than suspected: **this repository is public.** Everything below is
+The parameter also governs the admin password. `postgres.bicep` writes
+`administratorLoginPassword` only when password authentication is on _and_ a value was supplied,
+so a deployment that supplies nothing leaves the live credential untouched, and the flip ends with
+no password in the deployment path at all.
+
+One more thing, measured rather than suspected: **this repository is public.** Everything here is
 readable by anyone, and a workflow artifact is downloadable by any authenticated GitHub user. That
 is how a 371 MiB production dump — containing `sessions.sessionToken` and the `accounts` OAuth
-tokens in plaintext, alongside real accounts and real GPS tracks — came to be published by run 31043403970. It was deleted on 2026-08-05 and the backup workflow now withholds the dump unless the
-repository is private, but the session and OAuth tokens it exposed should be treated as
-compromised. Whether this repository should be public at all is an open owner decision, and every
-risk judgement in this document assumes it is.
+tokens in plaintext, alongside real accounts and real GPS tracks — came to be published by run 31043403970. It was deleted on 2026-08-05, and the workflow that produced it is gone, but the
+session and OAuth tokens it exposed should be treated as compromised. Whether this repository
+should be public at all is an open owner decision, and every risk judgement in this document
+assumes it is.
 
 The certificate-verification gap that used to sit here is closed by the wiring above, but only on
 the Entra path: under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and

@@ -26,11 +26,11 @@
 // ---- Permanent residue. Nothing here changes behaviour. ----
 //
 // 1. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
-//    is passed is written. Pass the *same* value every time — a redeploy with a freshly
-//    generated password silently rotates the admin credential and every connection string
-//    that carries it stops working. See infra/azure/README.md, "Redeploying", which also says
-//    where that value has to live for this to be possible at all. This is the one item on the
-//    list with teeth.
+//    is passed is written. The parameter therefore defaults to empty and postgres.bicep omits
+//    the property entirely when it is: a redeploy that supplies no value leaves the live
+//    credential alone rather than rewriting it. Supply a value only to create the server or to
+//    rotate deliberately, and when rotating, expect every connection string carrying the old
+//    one to stop working. See infra/azure/README.md, "Redeploying".
 //
 // 2. Three server parameters report as changed on every run and never converge:
 //    `log_connections`, `log_disconnections` and `ssl_min_protocol_version`. The template
@@ -285,17 +285,27 @@ Vercel.
 param applicationLogin string = 'sbapp'
 
 @description('''
-Administrator password. No default, `@secure()`, never in a committed parameter file.
+Administrator password. `@secure()`, never in a committed parameter file.
+
+**Empty means "do not write one", and that is the safe default rather than an omission.** ARM
+cannot read a password back, so any value passed is written — passing none is the only way to
+redeploy without rewriting the live credential. postgres.bicep therefore omits the property
+entirely when this is empty, which makes a redeploy leave the credential alone instead of
+rotating it, and makes `passwordAuthEnabled: false` deployable with no value held anywhere.
+
+A value is required only to *create* the server, or to deliberately rotate: the provider refuses
+a create with no password while password authentication is on, which is the correct failure.
 
 Generate it URL-safe. Three places in this repository parse `DATABASE_URL` with the WHATWG
 URL parser (`apps/web/src/env.ts`, `packages/db/src/client.ts`, `vitest.config.ts`), and a
 `/` in the userinfo — which `openssl rand -base64` emits about half the time — does not
 throw. It terminates the authority, the host silently becomes something else, and the
-failure names nothing useful. `openssl rand -hex 32` has no such characters.
+failure names nothing useful. `openssl rand -hex 32` has no such characters. There is no
+minimum length declared here because the type now has to admit the empty case; Azure enforces
+its own floor, and the recipe above produces 64 characters.
 ''')
 @secure()
-@minLength(24)
-param administratorLoginPassword string
+param administratorLoginPassword string = ''
 
 @description('''
 Minimum TLS version the server will negotiate.
@@ -330,17 +340,6 @@ param vercelTeamSlug string = 'mbahgattechs-projects'
 
 @description('Vercel project name. The other half.')
 param vercelProjectName string = 'switchback'
-
-@description('''
-Service Bus namespace holding the ingest queue, or empty to declare no queue grant here.
-
-ingest.bicep declares the namespace, the queue and the worker. This template declares only the
-one grant the shared identity lacks, because that grant fails silently when forgotten.
-''')
-param serviceBusNamespaceName string = ''
-
-@description('Queue the ingest worker receives from. Ignored when the namespace name is empty.')
-param serviceBusQueueName string = 'ingest-jobs'
 
 @description('''
 Repository whose GitHub Actions OIDC tokens the CI identity trusts, in GitHub's immutable
@@ -394,8 +393,9 @@ application, and the way back is an ARM write that itself needs Entra. The order
 consumer, prove it with passwords still enabled, re-prove both administrator doors, then flip.
 See infra/azure/README.md.
 
-False also makes `administratorLoginPassword` unnecessary, which permanently retires the
-accidental-rotation hazard the file header calls the one item with teeth.
+False also stops `administratorLoginPassword` being written at all, so the cutover ends with no
+password anywhere in the deployment path — including the one this template would otherwise
+rewrite on every run.
 ''')
 param passwordAuthEnabled bool = true
 
@@ -554,8 +554,6 @@ module runtimeIdentity 'runtime-identity.bicep' = {
     identityName: runtimeIdentityName
     vercelTeamSlug: vercelTeamSlug
     vercelProjectName: vercelProjectName
-    serviceBusNamespaceName: serviceBusNamespaceName
-    serviceBusQueueName: serviceBusQueueName
     tags: tags
   }
 }

@@ -1,0 +1,179 @@
+# Answers one question that three rounds of this work could not: when the Entra access token
+# that authenticated a Postgres connection expires, does the server drop the session?
+#
+# **It does not.** Run 31062754668 held two connections 79 minutes against a 60-minute token and
+# both were serving 19 minutes past expiry — see the token lifecycle section of
+# docs/architecture.md for the log. The question is settled; this workflow is kept so the
+# measurement can be repeated rather than believed.
+#
+# It could not be answered with the CI managed identity because Azure issues managed-identity
+# tokens with a 24-hour life and a GitHub runner is capped at six. A throwaway **app
+# registration** gets 60 minutes, which fits, so this job authenticates as one — federated, no
+# secret — and holds two connections well past the boundary. One is polled every minute; the
+# other sits idle across expiry and is queried only afterwards, which is the shape a pooled
+# connection in the application actually has.
+#
+# **The principals this needs no longer exist.** They were deleted after the run, because an app
+# registration is a Microsoft Graph object that cannot be declared in Bicep and must not be left
+# behind holding a database role. To run this again, recreate them and update PROBE_CLIENT_ID
+# and PROBE_OID below with what these print:
+#
+#   az ad app create --display-name sb-token-expiry-probe --sign-in-audience AzureADMyOrg
+#   az ad sp create --id <appId>
+#   az ad app federated-credential create --id <appObjectId> --parameters '{
+#     "name":"gh-branch","issuer":"https://token.actions.githubusercontent.com",
+#     "subject":"repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/<branch>",
+#     "audiences":["api://AzureADTokenExchange"]}'
+#
+# PROBE_OID is the **service principal** object id, because that is the `oid` claim Azure matches
+# the database role against — not the application object id.
+name: Postgres token expiry probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+  AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
+  # The Entra admin that creates the probe role. Declared in infra/azure/ci-identity.bicep.
+  CI_CLIENT_ID: 81c76484-bea1-4a75-8e86-2ccb3093e753
+  # The throwaway app registration whose token is under test, and its service principal object
+  # id — which is the `oid` claim Azure matches the database role against.
+  PROBE_CLIENT_ID: df0b900d-2555-4817-a2a1-167dda67b612
+  PROBE_OID: fc638485-a9ec-48ed-8d98-5027e1157218
+  PROBE_ROLE: sb-token-expiry-probe
+
+jobs:
+  probe:
+    name: hold a connection past a 60-minute token
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    concurrency:
+      group: postgres-token-expiry-probe
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the PostgreSQL 17 client
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          echo '/usr/lib/postgresql/17/bin' >> "$GITHUB_PATH"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.CI_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # The probe role is a plain login with no grants at all. It can connect to `postgres`
+      # and read the clock; it cannot see the application's data. That is the whole authority
+      # the experiment needs.
+      - name: Create the probe role as the Entra administrator
+        env:
+          PGDATABASE: postgres
+          PGSSLMODE: verify-full
+          PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
+          PGUSER: id-switchback-postgres-ci
+        run: |
+          set -euo pipefail
+          admin="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$admin"
+          umask 077
+          printf '%s:5432:*:%s:%s\n' "$PGHOST" "$PGUSER" "$admin" > "$RUNNER_TEMP/admin.pgpass"
+          PGPASSFILE="$RUNNER_TEMP/admin.pgpass" psql -X -tAq -v ON_ERROR_STOP=1 \
+            -v role="$PROBE_ROLE" -v oid="$PROBE_OID" <<'SQL'
+          SELECT pg_catalog.pgaadauth_create_principal_with_oid(:'role', :'oid', 'service', false, false)
+           WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role');
+          SELECT 'probe_principal|' || row_to_json(p)::text
+            FROM pg_catalog.pgaadauth_list_principals(false) p WHERE p.rolname = :'role';
+          SQL
+
+      # A client assertion, not a secret: the runner's own OIDC token is exchanged for the
+      # probe application's access token against the federated credential on it.
+      - name: Mint a 60-minute token as the probe application
+        run: |
+          set -euo pipefail
+          assertion="$(curl -fsSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).value))')"
+          echo "::add-mask::$assertion"
+          token="$(curl -fsSL -X POST \
+            "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+            -d grant_type=client_credentials \
+            -d "client_id=$PROBE_CLIENT_ID" \
+            -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+            -d "client_assertion=$assertion" \
+            -d 'scope=https://ossrdbms-aad.database.windows.net/.default' \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).access_token))')"
+          echo "::add-mask::$token"
+          umask 077
+          printf '%s' "$token" > "$RUNNER_TEMP/probe.jwt"
+          # The hold is derived from the token the run actually got, never from a constant:
+          # twenty minutes past whatever life it reports.
+          node -e '
+            const t = require("node:fs").readFileSync(process.argv[1], "utf8");
+            const c = JSON.parse(Buffer.from(t.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"), "base64").toString());
+            const leftMin = Math.floor((c.exp * 1000 - Date.now()) / 60000);
+            console.log(`life_remaining=${leftMin}min exp=${new Date(c.exp*1000).toISOString()} oid=${c.oid}`);
+            require("node:fs").appendFileSync(process.env.GITHUB_ENV, `HOLD_MIN=${leftMin + 20}\n`);
+          ' "$RUNNER_TEMP/probe.jwt"
+
+      - name: Hold two connections past the boundary
+        id: hold
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/probe" && cd "$RUNNER_TEMP/probe"
+          npm install --silent --no-save --no-package-lock pg@8.22.0
+          # Node resolves a bare import from the *script's* directory, not the shell's, so the
+          # probe has to sit beside the node_modules that was just installed for it.
+          cp "$GITHUB_WORKSPACE/infra/postgres-identity/token-expiry-probe.mjs" .
+          node ./token-expiry-probe.mjs \
+            "$PGHOST" "$PROBE_ROLE" postgres "$RUNNER_TEMP/probe.jwt" "$HOLD_MIN" \
+            | tee "$RUNNER_TEMP/probe.log"
+
+      # Classifies from what the probe printed, not from what it intended to do — a session
+      # killed at the boundary is the interesting result, not a broken run.
+      - name: The answer
+        if: always()
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/probe.log"
+          if [ ! -s "$log" ]; then
+            echo "::error::The probe printed nothing, so there is no answer to read."
+            exit 1
+          fi
+          grep -E '^(VERDICT|idle-reuse|token_|planned_)' "$log" || true
+          crossed="$(grep -c '^VERDICT|crossed_expiry|true' "$log" || true)"
+          if [ "$crossed" -eq 0 ]; then
+            echo "::error::INCONCLUSIVE — the run did not outlive the token."
+            exit 1
+          fi
+          echo "Conclusive: the session outlived the token that opened it. Read the VERDICT lines above."
+
+      - name: Drop the probe role
+        if: always()
+        env:
+          PGDATABASE: postgres
+          PGSSLMODE: verify-full
+          PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
+          PGUSER: id-switchback-postgres-ci
+        run: |
+          set -euo pipefail
+          admin="$(az account get-access-token --tenant "$AZURE_TENANT_ID" --resource-type oss-rdbms --query accessToken -o tsv)"
+          echo "::add-mask::$admin"
+          umask 077
+          printf '%s:5432:*:%s:%s\n' "$PGHOST" "$PGUSER" "$admin" > "$RUNNER_TEMP/admin.pgpass"
+          PGPASSFILE="$RUNNER_TEMP/admin.pgpass" psql -X -tAq -v ON_ERROR_STOP=1 \
+            -c "DROP ROLE IF EXISTS \"$PROBE_ROLE\"" -c "SELECT 'dropped'"

@@ -151,8 +151,9 @@ const verdicts = [
   ['each invocation reaches the server as that connection password', distinct === 3],
   ['a reused pooled connection does not re-invoke it', calls === before],
   ['an aged-out idle connection is replaced with a freshly minted token', rotations === 2],
-  // Not a defect to fix, a bound to design against: this is why RENEW_MARGIN_MS budgets a
-  // whole MAX_CHECKOUT_S on top of CONNECTION_LIFETIME_S.
+  // Not a defect to fix, a bound to design against: a connection already checked out keeps
+  // serving past its retirement age, so `maxLifetimeSeconds` bounds when authority is dropped
+  // rather than guaranteeing it by any deadline.
   ['maxLifetimeSeconds does NOT evict a checked-out connection', survivedInUse === true],
   ['the retirement happens on release, not during the checkout', socketsAfterRelease === 2],
 ];

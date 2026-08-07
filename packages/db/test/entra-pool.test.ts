@@ -110,22 +110,32 @@ describe('the pool and the token cache together', () => {
     const clock = { now: () => t };
     const minted = new Map<string, number>();
     let n = 0;
-    const token = createTokenProvider(
-      async (): Promise<AccessToken> => {
-        const issued = { token: `tok-${++n}`, expiresOnTimestamp: t + 60 * 60_000 };
-        minted.set(issued.token, issued.expiresOnTimestamp);
-        return issued;
-      },
-      { now: clock.now },
-    );
+    const sourceFor = (): (() => Promise<AccessToken>) => async () => {
+      const issued = { token: `tok-${++n}`, expiresOnTimestamp: t + 60 * 60_000 };
+      minted.set(issued.token, issued.expiresOnTimestamp);
+      return issued;
+    };
 
-    let worstRemainingMs = Infinity;
-    for (let minute = 0; minute < 24 * 60; minute++) {
-      const handed = await token();
-      worstRemainingMs = Math.min(worstRemainingMs, minted.get(handed)! - t);
-      t += 60_000;
-    }
+    // Sampled well inside the connect timeout. On a grid coarser than the timeout the least
+    // observable lifetime is one interval, so the assertion below would hold however the
+    // provider renewed — the grid would be guaranteeing it. `withMargin` runs the same drive
+    // with no margin so the check is shown to be capable of failing.
+    const sampleMs = connectTimeoutMs / 6;
+    const withMargin = async (renewMarginMs?: number): Promise<number> => {
+      t = 1_700_000_000_000;
+      n = 0;
+      minted.clear();
+      const token = createTokenProvider(sourceFor(), { now: clock.now, renewMarginMs });
+      let worstRemainingMs = Infinity;
+      for (let elapsed = 0; elapsed < 24 * 60 * 60_000; elapsed += sampleMs) {
+        const handed = await token();
+        worstRemainingMs = Math.min(worstRemainingMs, minted.get(handed)! - t);
+        t += sampleMs;
+      }
+      return worstRemainingMs;
+    };
 
-    expect(worstRemainingMs).toBeGreaterThanOrEqual(connectTimeoutMs);
+    expect(await withMargin()).toBeGreaterThanOrEqual(connectTimeoutMs);
+    expect(await withMargin(0)).toBeLessThan(connectTimeoutMs);
   });
 });

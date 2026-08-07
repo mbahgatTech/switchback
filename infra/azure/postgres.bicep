@@ -27,8 +27,12 @@ param deployDatabase bool
 param administratorLogin string
 param applicationLogin string
 
+@description('''
+Administrator password, or empty to leave the live credential untouched. See the parameter of the
+same name in main.bicep.
+''')
 @secure()
-param administratorLoginPassword string
+param administratorLoginPassword string = ''
 
 param minTlsVersion string
 param entraAuthEnabled bool
@@ -91,6 +95,13 @@ var pooledPort = pgBouncerEnabled ? 6432 : 5432
 // is the only way to sequence this safely. See the parameter's description in main.bicep.
 var entraAuthOn = entraAuthEnabled || !empty(entraAdministrators) || !empty(ciAdministratorObjectId)
 
+// Omitted from the payload unless there is something to write and password authentication is on
+// to write it for. ARM cannot read a password back, so a declared value is always written and a
+// redeploy carrying a different one silently rotates the live credential; omitting the property
+// leaves it alone. This is what makes `passwordAuthEnabled: false` deployable with no password
+// held anywhere, and what stops a routine redeploy touching the credential in the meantime.
+var writeAdministratorPassword = passwordAuthEnabled && !empty(administratorLoginPassword)
+
 // ---------------------------------------------------------------------------------------
 // The server.
 //
@@ -135,7 +146,7 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
   properties: {
     version: postgresVersion
     administratorLogin: administratorLogin
-    administratorLoginPassword: administratorLoginPassword
+    administratorLoginPassword: writeAdministratorPassword ? administratorLoginPassword : null
     createMode: 'Default'
 
     storage: {

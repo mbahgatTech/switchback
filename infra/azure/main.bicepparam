@@ -238,13 +238,6 @@ param runtimeIdentityName = 'id-switchback-vercel-publisher'
 param vercelTeamSlug = 'mbahgattechs-projects'
 param vercelProjectName = 'switchback'
 
-// The queue the ingest worker receives from. Named here so the shared identity's Data Receiver
-// grant is declared — the one grant it does not already hold, and the one whose absence stops
-// the worker draining with no error anyone sees. ingest.bicep declares the namespace, the queue
-// and the publisher's Data Sender grant.
-param serviceBusNamespaceName = 'sb-switchback-prod-37ywppu5p7fri'
-param serviceBusQueueName = 'ingest-jobs'
-
 // Passwords stay on. Flipping this to `false` is the cutover, and it is gated on every consumer
 // having been proved on a token *and* both administrator doors re-proved in the same hour — see
 // infra/azure/README.md. It is a separate, reviewable deployment on purpose: the way back from a
@@ -277,7 +270,7 @@ param tags = {
   rollback: 'neon-us-east-1-retained'
 }
 
-// The only secret, and it is not stored here — see the header. No fallback default: a missing
-// PGADMIN_PASSWORD must fail the deployment loudly rather than provision a production database
-// with something a reader of this file could guess.
-param administratorLoginPassword = readEnvironmentVariable('PGADMIN_PASSWORD')
+// The only secret, and it is not stored here — see the header. Empty when the variable is unset,
+// which is the ordinary case: postgres.bicep then omits the property and the live credential is
+// left untouched. Export PGADMIN_PASSWORD only to create the server or to rotate on purpose.
+param administratorLoginPassword = readEnvironmentVariable('PGADMIN_PASSWORD', '')

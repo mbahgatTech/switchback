@@ -1,15 +1,18 @@
-# Operational tooling, not a pipeline: the only hands that reach production Postgres holding
-# no credential.
+# Operational tooling, not a pipeline: hands that reach production Postgres holding no credential.
 #
-# A VPN adapter on the machine this repository is developed on holds the default route and
-# kills the TLS handshake to 5432 before the server sees it — TCP connects, the 8-byte
-# SSLRequest gets no reply, the socket resets. So every data-plane act against production runs
-# here, and `inspect` is the break-glass `infra/azure/README.md` sends an on-call operator to.
-# Once `passwordAuth` is Disabled it is the only proven way in, which is why it stays.
+# `inspect` is the break-glass `infra/azure/README.md` sends an on-call operator to when the local
+# path to 5432 will not work. It is not the only door — the owner is a declared Entra administrator
+# and connects directly from their own machine once ProtonVPN is disconnected, which is the usual
+# cause of a local failure — but it is the one that works from anywhere, and once `passwordAuth` is
+# Disabled the two of them are the whole set.
 #
-# Neither action reads a stored password. `azure/login` exchanges the runner's OIDC token for
-# an Azure access token against the federated credential on `id-switchback-postgres-ci`, an
-# ARM-declared Entra administrator of the server, and that token is handed to libpq.
+# **Every action here must be dispatched from `master`.** The federated credential on
+# `id-switchback-postgres-ci` trusts `refs/heads/master` and nothing else, so a dispatch from a
+# branch fails at `azure/login` with `AADSTS700213` quoting a subject that appears in no template.
+#
+# No action reads a stored password. `azure/login` exchanges the runner's OIDC token for an Azure
+# access token against that credential — the identity is an ARM-declared Entra administrator of the
+# server — and that token is handed to libpq.
 name: Postgres identity
 
 on:
@@ -24,6 +27,11 @@ on:
           - inspect
           - provision
           - retire
+      consumers_moved:
+        description: 'retire only: type MOVED once every consumer runs as the shared identity'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -392,9 +400,13 @@ jobs:
           echo "PGPASSFILE=$RUNNER_TEMP/pgpass" >> "$GITHUB_ENV"
 
       - name: Drop them
+        env:
+          CONSUMERS_MOVED: ${{ inputs.consumers_moved }}
         run: |
           set -euo pipefail
-          psql -X -tAq -v ON_ERROR_STOP=1 -f infra/postgres-identity/retire-legacy-roles.sql
+          psql -X -tAq -v ON_ERROR_STOP=1 \
+            -v consumers_moved="$CONSUMERS_MOVED" \
+            -f infra/postgres-identity/retire-legacy-roles.sql
 
       # The drop is not the assertion. `pgaadauth_list_principals` is what Azure matches a token
       # against, so a role that survived this would still be a live credential-free door.

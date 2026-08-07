@@ -232,6 +232,12 @@ This is the break-glass path, and it exists because the admin password once was 
 anywhere and nothing could be deployed. It needs no stored credential at all: the owner is a
 declared Microsoft Entra administrator of the server, so an `az login` is enough.
 
+**Disconnect ProtonVPN first.** Its `ProTUN` adapter holds the default route and tears the Postgres
+session down after the TCP connection is established, which reads as a hung or rejected connection
+and sends the reader hunting for a firewall or credential problem. With it disconnected this recipe
+works from the owner's machine — run end to end on 2026-08-06, returning `PostgreSQL 17.10` and the
+full role census.
+
 ```bash
 az login
 export PGHOST=psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
@@ -239,10 +245,12 @@ export PGUSER="$(az ad signed-in-user show --query userPrincipalName -o tsv)"
 export PGDATABASE=switchback
 export PGSSLMODE=verify-full
 # Without this libpq looks only in ~/.postgresql/root.crt under verify-full and fails closed,
-# which reads as a rejected credential. Point it at the system trust store instead. The path
-# is Debian/Ubuntu; on Fedora or RHEL use /etc/pki/tls/certs/ca-bundle.crt, and on macOS with
-# Homebrew openssl "$(brew --prefix)/etc/openssl@3/cert.pem".
-export PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
+# which reads as a rejected credential. Point it at the system trust store instead.
+#   Windows, Git Bash:  export PGSSLROOTCERT="$(cygpath -w /usr/ssl/certs/ca-bundle.crt)"
+#   Debian/Ubuntu:      /etc/ssl/certs/ca-certificates.crt
+#   Fedora/RHEL:        /etc/pki/tls/certs/ca-bundle.crt
+#   macOS + Homebrew:   "$(brew --prefix)/etc/openssl@3/cert.pem"
+export PGSSLROOTCERT="$(cygpath -w /usr/ssl/certs/ca-bundle.crt)"
 export PGPASSWORD="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
 psql -c 'select current_user'
 unset PGPASSWORD
@@ -251,40 +259,42 @@ unset PGPASSWORD
 The username is the full UPN including the `#EXT#` part for a guest account — Azure matches the
 token to the role by object id, but the role's _name_ is the UPN, and psql sends the name.
 
+Nothing here needs `psql` specifically. Any libpq or `pg` client works the same way, with the token
+in the password field; `node -e` against the repository's own `pg` is a workable substitute on a
+machine with no PostgreSQL client installed.
+
 **When that does not work.**
 
+- _The connection hangs, or dies just after connecting._ ProtonVPN. See above; this is the single
+  most likely cause on the owner's machine and it does not look like a VPN problem.
 - _`root certificate file "…/.postgresql/root.crt" does not exist`_, or a certificate-verify
-  failure: `PGSSLROOTCERT` is unset or points at the wrong path for this distribution. This is the
-  most common way the recipe above fails on a fresh machine.
+  failure: `PGSSLROOTCERT` is unset or points at the wrong path for this platform. On Windows the
+  bundle ships with Git for Windows at `/usr/ssl/certs/ca-bundle.crt` and libpq needs the Windows
+  form of that path, hence `cygpath -w`.
 - _The token expired._ Entra issues these with a randomised 60–90 minute life (one measured on
   2026-08-05 carried 78 minutes), so a session opened yesterday needs a fresh one; re-run the
   `PGPASSWORD` line.
 - _The password is rejected._ Check `az account show` is the right tenant before suspecting the
   database, and check `PGUSER` is the full UPN.
-- _`server closed the connection unexpectedly` while the server's `connections_failed` metric
-  stays at zero._ The server never saw the attempt, so the problem is the local network path — a
-  VPN holding the default route does this. Run it from a GitHub Actions runner instead: dispatch
-  the `Postgres identity` workflow with the **`inspect`** action, which takes the same federated
-  token path and reads the same things, with no password anywhere. **This path has been run** —
-  run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3, reported
-  `is_admin|true`, `server_version|17.10` and the full role and row-count census, with no
-  credential in the job but a federated token. Do **not** reach for `survey`
-  here: that action authenticates with `secrets.DIRECT_DATABASE_URL` and exists only to describe
-  the repository secrets, so it is useless in exactly the case where the password is the problem.
+- _Nothing local works at all._ Run it from a GitHub Actions runner: dispatch the
+  `Postgres identity` workflow with the **`inspect`** action, which takes the same federated token
+  path and reads the same things, with no password anywhere. **Dispatch it from `master`.** The
+  federated credential on `id-switchback-postgres-ci` trusts
+  `repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/master` and nothing else, so a
+  dispatch from any other branch fails at `azure/login` with `AADSTS700213` quoting a subject that
+  appears in no template — which reads as a broken identity rather than a wrong branch. This path
+  has been run: run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3 and reported
+  `is_admin|true`, `server_version|17.10` and the full role and row-count census.
 
-**Everything above the `psql` line has now been run by a person; the `psql` line has not.** On
-2026-08-05 the owner's machine produced the UPN the recipe expects
-(`mazenbahgat_outlook.com#EXT#@mazenbahgatoutlook.onmicrosoft.com`) and a token for
-`https://ossrdbms-aad.database.windows.net` whose `oid` claim is
-`8c682736-d90b-4c33-a718-1916597894f8` — the same object id the server carries as its human Entra
-administrator, which is what the match is made on. What remains unproven is the connection itself,
-because that machine cannot reach 5432 at all. Treat the first real `psql` as a test of the recipe
-as well as of the database, and correct this file if it is wrong.
+Do not use `connections_failed` to decide whether the server saw an attempt. It is not zero on this
+server and never has been: measured over 2026-08-05T12:00Z–2026-08-06T12:00Z it records 35 failures
+across six of twenty-four hourly buckets, from a periodic caller unrelated to whoever is debugging.
+A non-zero reading says nothing about your connection.
 
 Password authentication is still enabled, so `sbadmin` remains available as the second break-glass.
 Its password is not in ARM and not readable from Vercel, but it **is** in the `DIRECT_DATABASE_URL`
-repository secret and in a file on the owner's machine — see "Read this first". Re-deploying the
-template requires passing the same value.
+repository secret and in a file on the owner's machine — see "Read this first". It stops being a
+door the moment `passwordAuthEnabled` is flipped to false.
 
 ### Machine identities
 
@@ -292,16 +302,26 @@ template requires passing the same value.
 | -------------------------------- | --------------------------- | -------------------------------- |
 | Owner (Entra user)               | the UPN                     | administer                       |
 | `id-switchback-postgres-ci`      | `id-switchback-postgres-ci` | administer, so `db push` can DDL |
-| `id-switchback-vercel-publisher` | `sbapp_runtime`             | exactly what `sbapp` may do      |
+| `id-switchback-vercel-publisher` | `sbapp_vercel`              | exactly what `sbapp` may do      |
 | `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
 
+**Both application roles exist and neither is in use.** Every consumer still authenticates by
+password as `sbapp`; `DATABASE_AUTH` is set nowhere. The role names above are what the live catalog
+holds, read on 2026-08-06.
+
 `id-switchback-vercel-publisher` is the shared runtime identity: Vercel production, Vercel preview
-and — once `infra/azure/ingest.bicep` moves the worker onto it — the ingest worker all authenticate
-as this one principal. The resource name is narrower than the role because ARM cannot rename a
-user-assigned identity; the `component: runtime-identity` tag and the `sbapp_runtime` role name are
-where a reader is told what it actually is. `sbapp_func` is the worker's role until that move
-lands, and the `retire` action of the `Postgres identity` workflow drops it afterwards — it refuses
-to run while either legacy role is still serving a connection.
+and — once `infra/azure/ingest.bicep` moves the worker onto it — the ingest worker are all intended
+to authenticate as this one principal. The resource name is narrower than the role it will hold
+because ARM cannot rename a user-assigned identity; the `component: runtime-identity` tag is where
+a portal reader is told what it actually is.
+
+The consolidation renames `sbapp_vercel` to `sbapp_runtime` and then drops `sbapp_func`, in that
+order and not together. The rename is the `provision` action of the `Postgres identity` workflow;
+it must run from `master`, because the CI identity's federated credential trusts no other ref. The
+drop is the separate `retire` action, and it refuses to run unless the dispatch asserts every
+consumer has been moved — the database cannot establish that for itself, and a sample of
+`pg_stat_activity` cannot stand in for it, because the worker scales to zero between invocations
+and shows no backend for most of any minute however healthy it is.
 
 The application role holds its privileges by membership in `sbapp` rather than by a copied list of
 grants, so it cannot drift from it — including for a table `prisma db push` creates tomorrow, which
@@ -659,15 +679,17 @@ Six commits against five connections is a pool timeout on every drain.
 Re-running the template is a no-op, not a second server. `main.bicep`'s header lists the properties
 `what-if` reports and which never converge; read that before concluding it has drifted.
 
-**The exception with teeth is the password.** ARM cannot read the current password, so whatever is
-passed is written. Pass the _same_ value every time — a redeploy with a freshly generated password
-silently rotates the admin credential and every connection string carrying it stops working,
-including the ones Vercel is using to serve the site. Which means the value has to be readable at
-that moment, and there is exactly one place it can live: **a password-manager entry.** Not the
+**The admin password is written only when you supply one.** ARM cannot read the current password
+back, so any value passed is written — which used to make every redeploy a rotation risk, because
+`PGADMIN_PASSWORD` was required. It is not any more: `main.bicepparam` falls back to empty and
+`postgres.bicep` omits the property entirely when it is empty, so an ordinary redeploy leaves the
+live credential untouched. Export `PGADMIN_PASSWORD` only when creating the server or when you mean
+to rotate, and when you rotate, every connection string carrying the old value stops working —
+including the ones Vercel is serving the site with.
+
+If you do intend to keep a value, a password-manager entry is the only place it can live. Not the
 `$TMP` file, which the deploy procedure shreds; not a GitHub Actions secret, which cannot be read
-back; not Vercel, which is deliberately never given the admin credential. If it is not in a
-password manager it is not anywhere, and "pass the same value every time" is an instruction nobody
-can carry out. Recovering from that is out of band and out of scope for this file.
+back; not Vercel, which is deliberately never given the admin credential.
 
 Deleting a Flexible Server deletes all of its backups, irrecoverably, which is what the resource
 group's `CanNotDelete` lock exists to prevent.
@@ -845,31 +867,42 @@ side and stays `true` until every consumer has been proved on a token.
 
 1. Deploy the shared identity, and — in `infra/azure/ingest.bicep` — move the Function App onto it:
    `identity.type` to `SystemAssigned,UserAssigned`, `AZURE_CLIENT_ID` and
-   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`. Both phases keep
-   every grant the worker already has.
-2. Run `Postgres identity` → `provision`. It renames `sbapp_vercel` to `sbapp_runtime` and then
-   asserts the Entra mapping followed the rename. If the assertion fails, the inverse rename is the
-   rollback and nothing has been dropped.
+   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and a Service Bus
+   **Data Receiver** grant for the shared identity, which it does not hold today. That grant is
+   declared by `ingest.bicep` because `ingest.bicep` owns the queue, and it is deliberately not
+   granted before the worker needs it: the shared identity is also Vercel's, so granting Receive
+   early lets any preview deployment drain the production ingest queue. Both phases keep every
+   grant the worker already has.
+2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
+   trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
+   renames `sbapp_vercel` to `sbapp_runtime` and then asserts the Entra mapping followed the rename.
+   If the assertion fails, the inverse rename is the rollback and nothing has been dropped.
 3. Set `DATABASE_AUTH=entra-vercel` on Vercel preview, then production, with password-free URLs
    naming `sbapp_runtime`. Prove a signed-in read and a write — `session.findUnique` is the canary.
 4. Set `DATABASE_AUTH=entra` on the Function App and prove a tile ingests end to end.
 5. Drop the Function App's system-assigned identity, delete the two role assignments it leaves
    behind — removing a `roleAssignment` from Bicep is not a revocation — and run `Postgres identity`
-   → `retire`.
-6. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect`, and the
-   owner connecting from their own machine with ProtonVPN disconnected. Not "it worked last week".
+   → `retire` with `consumers_moved=MOVED`. The retire action asks for that assertion because the
+   database cannot check it: the worker scales to zero between invocations, so `pg_stat_activity`
+   shows no backend under its role whether or not it has been moved.
+6. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
+   `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
+   worked last week".
 7. Only now set `passwordAuthEnabled = false` and deploy.
 
 Two things to settle before step 7. The `migrate` job in `ci.yml` mints its own token and no longer
-reads `secrets.DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/` while
-passwords still work, so a failure is a red run rather than an outage. And `.env` on the owner's
-machine points at production — point it at the local Docker Postgres first, or every db script,
-`npm run dev` and the e2e suite stop working at step 7 with a connection error and no explanation.
+reads `secrets.DIRECT_DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/`
+while passwords still work, so a failure is a red run rather than an outage. And `.env` on the
+owner's machine points at production — point it at the local Docker Postgres first, or every db
+script, `npm run dev` and the e2e suite stop working at step 7 with a connection error and no
+explanation.
 
 After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
 server refuses password authentication outright. Keep the role's password hash rather than clearing
 it — inert while `passwordAuth` is Disabled, and it makes re-enabling one ARM property flip instead
-of a flip plus a credential reset needing an administrator who may be the reason you are there.
+of a flip plus a credential reset needing an administrator who may be the reason you are there. From
+step 7 onward the template needs no password at all: `administratorLoginPassword` defaults to empty
+and is omitted from the payload, so the accidental-rotation hazard is gone rather than dormant.
 
 **Never deploy this resource group in Complete mode.** Incremental deployments leave undeclared
 children alone, so the `administrators` entries survive a run with an accidentally-empty

@@ -131,6 +131,10 @@ export function createTokenProvider(
         if (previous && token.expiresOnTimestamp === previous.expiresOnTimestamp) {
           retryNotBefore = now() + RENEW_RETRY_BACKOFF_MS;
         }
+        // Cleared here, not merely overwritten on the next failure. A recorded error outlives
+        // the condition that produced it otherwise, and the backoff below rethrows it — so a
+        // long-resolved outage becomes the error reported during the next, unrelated one.
+        lastFailure = undefined;
         cached = token;
         return token;
       })
