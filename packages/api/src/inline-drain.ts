@@ -42,9 +42,10 @@ function newPass(keys: readonly string[]): Pass {
  * waits on a poll, or on the daily cron. Holding the keys and running one more pass costs a
  * single extra claim and makes the wait bounded.
  *
- * Serialised rather than parallel for the reason the guard existed: the Overpass client caps
- * itself at two concurrent requests, so a second drain alongside the first only piles claimed
- * work behind it and sinks the tile someone is waiting on, with nothing reporting an error.
+ * Serialised rather than parallel for the reason the guard existed: two drains do not race —
+ * `claimJobs` claims under `FOR UPDATE SKIP LOCKED` — but the Overpass client caps itself at two
+ * concurrent requests, so a second drain alongside the first only piles claimed work behind it
+ * and sinks the tile someone is waiting on, with nothing reporting an error.
  *
  * A caller waits for the pass carrying its own keys and no further, so a steady stream of
  * requests cannot hold any one response open indefinitely.
