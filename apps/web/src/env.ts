@@ -81,6 +81,14 @@ const base = z.object({
   OVERPASS_MAX_TOTAL_MS: z.coerce.number().int().positive().optional(),
 
   /**
+   * Processes that may hold Overpass-making work at once, fleet-wide. `OVERPASS_MAX_CONCURRENT`
+   * above bounds one `OverpassClient` and a Vercel lambda has its own, so this is the factor that
+   * makes the documented figure true across instances — `packages/ingest/src/drain-slot.ts`
+   * enforces it in Postgres. Declared here for the startup error rather than for the value.
+   */
+  INGEST_MAX_DRAINERS: z.coerce.number().int().positive().optional(),
+
+  /**
    * How ingest decides what a trail is, and how deep a dense tile may split. Declared here for
    * the same reason as the two above — `@switchback/ingest` reads both from `process.env` itself
    * and each defaults to off — but they matter more, because Vercel drains `ingest_jobs` whenever

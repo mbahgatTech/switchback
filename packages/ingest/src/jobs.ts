@@ -311,6 +311,22 @@ export async function reclaimExpiredJobs(
 
 export type JobHandler = (job: ClaimedJob) => Promise<void>;
 
+/** The two claims one drain makes: its batch, and the derived share reserved on top. */
+export interface ClaimedBatch {
+  primary: ClaimedJob[];
+  derived: ClaimedJob[];
+}
+
+/**
+ * Wraps a drain's claims so a caller can bound how many processes drain at once.
+ *
+ * It has to wrap the claim rather than precede it. A check that runs first and a claim that runs
+ * after are two statements, and under `READ COMMITTED` two processes both read "nobody is
+ * draining" before either has committed — see `drainSlotGate`, the implementation that closes
+ * that window, and `docs/architecture.md` for why the bound is a correctness requirement.
+ */
+export type ClaimGate = (claim: (db: Db) => Promise<ClaimedBatch>) => Promise<ClaimedBatch>;
+
 export interface DrainResult {
   claimed: number;
   succeeded: number;
@@ -357,6 +373,13 @@ export async function drainJobs(
     dedupeKeys?: readonly string[];
     /** Additionally claim up to this many derived jobs, which priority would never reach. */
     derivedLimit?: number;
+    /**
+     * Bounds how many processes may hold Overpass-making work at once. Omitted means unbounded,
+     * which is right only for a caller that is not draining Overpass work — a test, or a
+     * bookkeeping pass. Application code reaches the queue through `drainIngest`, which supplies
+     * `drainSlotGate` unless the caller explicitly passes `null`.
+     */
+    gate?: ClaimGate;
   } = {},
 ): Promise<DrainResult> {
   const db = options.db ?? backgroundPrisma;
@@ -365,9 +388,11 @@ export async function drainJobs(
 
   /*
    * Before claiming, not after: a lease that expired a moment ago should be claimable in this
-   * same tick rather than the next one. Every path that claims comes through here, so "you can
-   * only claim what you have already swept" is an invariant rather than a schedule — which
-   * matters, because the drain that ships on this plan runs once a day.
+   * same tick rather than the next one.
+   *
+   * No longer the *only* sweep, and that is the point: `sweepQueue` runs it on paths that drain
+   * nothing, because a drain is a side effect of traffic plus a once-a-day cron, and leases were
+   * sitting six hours past a thirty-minute lease waiting for one.
    *
    * Its own try/catch for the same reason the derived claim below has one: bookkeeping must not
    * be able to stop the drain.
@@ -380,27 +405,42 @@ export async function drainJobs(
     console.error('[ingest] lease sweep failed; draining without it', error);
   }
 
-  const primary = await claimJobs(db, workerId, options.limit ?? 4, now(), options.dedupeKeys);
-
   /*
-   * Unscoped by `dedupeKey` on purpose — the point is to reach work nobody asked for by name.
-   * Claimed after the primary batch so a caller waiting on specific tiles still gets those
-   * first.
+   * Both claims, under whatever gate the caller supplied.
    *
-   * Its own try/catch, and the ordering is why: the primary statement has already flipped its
-   * batch to `running`, so a rejection propagating out of `drainJobs` would leave that batch
-   * locked until `LEASE_TIMEOUT_MS` expires. A fairness optimisation is not worth half an hour
-   * of the queue, so a failure degrades to "no derived work this tick".
+   * Together rather than separately because the gate admits a *drainer*, not a statement: a
+   * process let through for its primary batch has to be able to take its derived share too, and
+   * one that was turned away must take neither. The derived claim keeps its own try/catch —
+   * inside the gate now, so a failure there still leaves the primary batch claimed rather than
+   * unwinding a transaction that has already flipped it to `running`.
    */
   const derivedLimit = options.derivedLimit ?? 0;
-  let derived: ClaimedJob[] = [];
-  if (derivedLimit > 0) {
-    try {
-      derived = await claimJobs(db, workerId, derivedLimit, now(), undefined, DERIVED_KINDS);
-    } catch (error) {
-      console.error('[ingest] derived claim failed; draining primary batch only', error);
+  const claim = async (client: Db): Promise<ClaimedBatch> => {
+    const primary = await claimJobs(
+      client,
+      workerId,
+      options.limit ?? 4,
+      now(),
+      options.dedupeKeys,
+    );
+
+    /*
+     * Unscoped by `dedupeKey` on purpose — the point is to reach work nobody asked for by name.
+     * Claimed after the primary batch so a caller waiting on specific tiles still gets those
+     * first.
+     */
+    let derived: ClaimedJob[] = [];
+    if (derivedLimit > 0) {
+      try {
+        derived = await claimJobs(client, workerId, derivedLimit, now(), undefined, DERIVED_KINDS);
+      } catch (error) {
+        console.error('[ingest] derived claim failed; draining primary batch only', error);
+      }
     }
-  }
+    return { primary, derived };
+  };
+
+  const { primary, derived } = options.gate ? await options.gate(claim) : await claim(db);
 
   const jobs = [...primary, ...derived];
   let succeeded = 0;

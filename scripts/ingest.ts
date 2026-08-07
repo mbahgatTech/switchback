@@ -19,8 +19,16 @@
 import { drainIngest, pipelineDeps, processRoute, processTile } from '@switchback/ingest';
 import { INGEST_ZOOM, lngLatToTile, tileToQuadkey } from '@switchback/geo';
 import { prisma } from '@switchback/db';
+import { randomUUID } from 'node:crypto';
 
 const WATCH_INTERVAL_MS = 5_000;
+
+/**
+ * This run's name on the queue. Random rather than the literal `cli`, because `drainSlotGate`
+ * counts drainers with `count(distinct "lockedBy")` and a shared string reads as one drainer
+ * however many are running.
+ */
+const CLI_WORKER_ID = `cli-${randomUUID().slice(0, 8)}`;
 
 function fail(message: string): never {
   console.error(message);
@@ -38,7 +46,7 @@ async function drain(argv: string[]): Promise<void> {
   const limit = Number(flag(argv, 'limit') ?? 4);
 
   do {
-    const result = await drainIngest({ limit, workerId: 'cli' });
+    const result = await drainIngest({ limit, workerId: CLI_WORKER_ID });
     if (result.claimed > 0) {
       console.log(`claimed ${result.claimed} · ok ${result.succeeded} · failed ${result.failed}`);
     } else if (!watch) {

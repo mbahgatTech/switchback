@@ -70,6 +70,9 @@ describe('runIngestSignal', () => {
       derivedLimit: 0,
       dedupeKeys: [KEY],
       workerId: 'sb-1',
+      // Asserted, not incidental: this host is the whole fleet by Azure configuration, and it is
+      // the only caller entitled to skip `drainSlotGate`. Every Vercel path takes the default.
+      gate: null,
       deps: {
         overpass,
         deadlineAt: expect.any(Number) as number,

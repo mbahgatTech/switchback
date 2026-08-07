@@ -124,3 +124,7 @@ BEGIN
   END IF;
 END
 $$;
+
+-- Every statement here is guarded — twelve inline with IF NOT EXISTS, two by an
+-- enclosing DO block — so re-applying the file is a no-op and `db push` may run it
+-- on any deploy without checking whether a previous one already did.

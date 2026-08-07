@@ -5,8 +5,11 @@
  */
 
 import { JobKind } from '@switchback/db';
+import { backgroundPrisma } from '@switchback/db';
+import type { PrismaClient } from '@switchback/db';
+import { drainSlotGate } from './drain-slot';
 import { drainJobs } from './jobs';
-import type { ClaimedJob, DrainResult, JobHandler } from './jobs';
+import type { ClaimGate, ClaimedJob, DrainResult, JobHandler } from './jobs';
 import { processNetworkTile } from './network';
 import { enrichTrailPhotos, processRoute, processTile } from './pipeline';
 import type { PipelineDeps } from './pipeline';
@@ -65,9 +68,17 @@ export const DEFAULT_DERIVED_SHARE = 2;
  * take a minute, so claiming twenty would mean nineteen locks expiring unhelpfully.
  * `derivedLimit` defaults to a share rather than zero because derived work sits below every
  * requestable kind and a batch that reserves no room for it never runs any. See `drainJobs`.
+ *
+ * **The Overpass bound is the default, not the call site's to remember.** Every handler below can
+ * reach `OverpassClient`, `OVERPASS_MAX_CONCURRENT` bounds one process, and Vercel starts as many
+ * processes as the traffic asks for — so an omitted `gate` used to mean "unbounded against one
+ * egress IP", and one of the three drain call sites omitted it. Opting out is now an argument a
+ * reader can see and a reviewer can question.
  */
 export async function drainIngest(
   options: {
+    /** The client the gate and the claim share. Defaults to the ingest pool. */
+    db?: PrismaClient;
     limit?: number;
     workerId?: string;
     deps?: Partial<PipelineDeps>;
@@ -75,12 +86,22 @@ export async function drainIngest(
     dedupeKeys?: readonly string[];
     /** Derived jobs to claim alongside — see `drainJobs`. Pass 0 to take none. */
     derivedLimit?: number;
+    /**
+     * Bounds how many processes drain at once — see `drainSlotGate`. Omitted is that bound over
+     * `db`; `null` opts out, and only a caller whose own process is the whole fleet may.
+     */
+    gate?: ClaimGate | null;
   } = {},
 ): Promise<DrainResult> {
+  const db = options.db ?? backgroundPrisma;
+  const gate = options.gate === undefined ? drainSlotGate(db) : options.gate;
+
   return drainJobs(ingestHandlers(options.deps), {
+    db,
     limit: options.limit ?? 4,
     workerId: options.workerId,
     derivedLimit: options.derivedLimit ?? DEFAULT_DERIVED_SHARE,
     ...(options.dedupeKeys ? { dedupeKeys: options.dedupeKeys } : {}),
+    ...(gate ? { gate } : {}),
   });
 }
