@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
-import { createThrottledSweep, isDistressed, queueHealth } from '../src/maintenance';
+import { LEASE_TIMEOUT_MS } from '../src/jobs';
+import { createThrottledSweep, isDistressed, queueHealth, sweepQueue } from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
 
 /** A tile row as the sweep reads it. */
@@ -15,6 +16,8 @@ interface TileRow {
 interface Recorded {
   updates: Array<{ quadkey: string; data: Record<string, unknown> }>;
   enqueued: string[];
+  /** Bind values of every `$queryRaw` — the reclaim's, in `[now, reason, cutoff]` order. */
+  rawBinds: unknown[][];
 }
 
 /** The subset of a Prisma `where` the sweep and `childTiles` actually build. */
@@ -28,12 +31,20 @@ interface TileWhere {
 /**
  * A Prisma stand-in over `ingest_tiles` and `ingest_jobs`, covering exactly the calls the sweep
  * makes. `childTiles` reads by `quadkey: { in: [...] }` and the marker sweep by `startsWith`, so
- * the fake serves both off one array.
+ * the fake serves both off one array. `$queryRaw` is the reclaim's single statement; `expired` is
+ * what it returns, one element per lease it took back.
  */
-function fakeDb(tiles: TileRow[]): { db: PrismaClient; recorded: Recorded } {
-  const recorded: Recorded = { updates: [], enqueued: [] };
+function fakeDb(
+  tiles: TileRow[],
+  expired: ReadonlyArray<{ status: JobStatus }> = [],
+): { db: PrismaClient; recorded: Recorded } {
+  const recorded: Recorded = { updates: [], enqueued: [], rawBinds: [] };
 
   const db = {
+    $queryRaw: async (_strings: TemplateStringsArray, ...binds: unknown[]) => {
+      recorded.rawBinds.push(binds);
+      return [...expired];
+    },
     ingestTile: {
       findMany: async ({ where, take }: { where: TileWhere; take?: number }) => {
         const prefix = where.lastError?.startsWith;
@@ -124,6 +135,57 @@ describe('a split marker on a parent that really was subdivided', () => {
     expect(await reconcileOrphanedSplits(db)).toEqual([]);
     expect(recorded.updates).toEqual([]);
     expect(recorded.enqueued).toEqual([]);
+  });
+});
+
+/**
+ * `sweepQueue` is the *only* production entry point for either repair — the cron route calls it
+ * unconditionally, `trails.kickIngest` calls it ahead of its own early return, and nothing else
+ * calls `reconcileOrphanedSplits` or `reclaimExpiredJobs` off a path that drains nothing. Testing
+ * the two halves in isolation leaves the call that makes them real untested: unhook either one and
+ * every other case here stays green while production silently re-wedges.
+ */
+describe('the sweep both live entry points call', () => {
+  const MARKER = 'split into 4 tiles at z10';
+  const NOW = new Date('2026-08-07T10:44:00Z');
+
+  it('clears an orphaned split marker and puts the parent back on the queue', async () => {
+    const { db, recorded } = fakeDb([parent('120230220', TileStatus.running, MARKER)]);
+
+    const result = await sweepQueue(db, NOW);
+
+    expect(result.unsplit).toEqual([{ quadkey: '120230220', status: TileStatus.pending }]);
+    expect(recorded.updates).toEqual([
+      { quadkey: '120230220', data: { status: TileStatus.pending, lastError: null } },
+    ]);
+    expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:120230220`]);
+  });
+
+  it('takes back leases expired against the sweep’s own clock', async () => {
+    const { db, recorded } = fakeDb(
+      [],
+      [{ status: JobStatus.queued }, { status: JobStatus.queued }, { status: JobStatus.dead }],
+    );
+
+    const result = await sweepQueue(db, NOW);
+
+    expect(result).toMatchObject({ requeued: 2, retired: 1 });
+    // The cutoff the reclaim bound, not merely that something ran: `now` has to reach it, or a
+    // sweep would take back leases measured from some other moment.
+    const [, , cutoff] = recorded.rawBinds[0] ?? [];
+    expect(cutoff).toEqual(new Date(NOW.getTime() - LEASE_TIMEOUT_MS));
+  });
+
+  it('still does each half when the other throws, because neither is worth a failed tick', async () => {
+    const { db, recorded } = fakeDb([parent('031313112', TileStatus.pending, MARKER)]);
+    const broken = { ...db, $queryRaw: () => Promise.reject(new Error('lease sweep exploded')) };
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await sweepQueue(broken as unknown as PrismaClient, NOW);
+
+    expect(result).toMatchObject({ requeued: 0, retired: 0 });
+    expect(result.unsplit).toHaveLength(1);
+    expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:031313112`]);
   });
 });
 

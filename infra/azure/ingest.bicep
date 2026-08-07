@@ -799,9 +799,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // list` returned 26 settings on 2026-08-07 and this was not among them, because the
           // live configuration predates this entry. The interlock holds regardless —
           // `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
-          // `claim`, and an absent variable is not — so the drift costs nothing until the next
-          // deployment of this template closes it. No report may describe this value as measured
-          // from deployed configuration.
+          // `claim`, and an absent variable is not — so the drift costs nothing until a
+          // deployment of this template closes it, which no workflow performs. No report may
+          // describe this value as measured from deployed configuration.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
@@ -1026,6 +1026,13 @@ resolved condition open. Severity 3 for the same reason: it is a backlog, not an
 
 `apps/ingest-worker/test/health.test.ts` asserts this query and the marker the code logs agree, so
 a reworded log line fails the build instead of silently disarming the rule.
+
+**Declared here is not deployed.** `az monitor scheduled-query list -g
+rg-switchback-prod-northcentralus -o json` returned one rule on 2026-08-07,
+`switchback-ingest-drain-failed`; this one does not exist in Azure yet. No workflow deploys this
+template — `infrastructure.yml` builds every template and deploys only `main.bicep` and
+`runtime-identity.bicep` — so this rule arrives on a human-run `az deployment group create` against
+this file, alongside the two app settings above that are in the same position.
 ''')
 resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-queue-distress'

@@ -148,16 +148,29 @@ below, run from three places that do not require a drain: the cron route uncondi
 `trails.kickIngest` off any request traffic at most once per fifteen minutes per process, and
 `drainSlotGate` inside the transaction that admits a drainer.
 
-**A split that produced no children leaves a parent claiming it was subdivided.** `splitTile`
-upserts four child rows, enqueues four jobs and then marks the parent; a process that dies between
-the first step and the last leaves the marker with nothing behind it, and nothing else repairs that
-— `promoteFrom` needs four children to read, `queueStaleChildren` needs children to queue, and
-`processTile` only reaches its roll-up branch when `childTiles` returns four. Six such rows are in
-production, written 2026-08-05 21:03 to 2026-08-06 00:54 UTC, with no z10 rows anywhere in the
-table. `reconcileOrphanedSplits` clears the marker and re-queues the parent, writing `status` and
+**A parent can claim a subdivision that has nothing behind it.** `splitTile` upserts four child
+rows, enqueues four jobs and only then marks the parent, so the marker is the _last_ write and a
+process that dies part-way leaves no marker at all — the split cannot produce this state, and
+reading it as a crash window sends the next reader hunting for a window that does not exist. What
+does produce it is a later deletion of the subtree: production's six marked parents were split,
+their stranded z10 rows were cleared afterwards, and no z10 row remains anywhere in the table.
+Anything that deletes a subtree must clear its parent's marker in the same pass. Nothing else
+repairs the parent — `promoteFrom` needs four children to read, `queueStaleChildren` needs children
+to queue, and `processTile` only reaches its roll-up branch when `childTiles` returns four. Six such
+rows are in production, marked 2026-08-05 21:03 to 2026-08-06 00:54 UTC.
+`reconcileOrphanedSplits` clears the marker and re-queues the parent, writing `status` and
 `lastError` and nothing else: `trailCount`, `fetchedAt`, `fetchMs` and every trail the tile ever
 produced are untouched, and a parent still serving trails keeps the status it is serving them
-under. The predicate is the marker the repair removes, so a second pass finds nothing.
+under. The predicate is the marker the repair removes, so a second pass finds nothing. The write
+order is also what makes the repair safe beside a live split: a split that has written the marker
+has already written its four children, so `childTiles` returns four and the parent is left alone.
+
+The six do not all get the same number of tries. `enqueue` resets `attempts` only for a job in
+`done`, `failed` or `dead`, so a parent whose job is already `queued` keeps its ladder — measured
+on 2026-08-07, `ingest_tile:120221231` re-enters at 4 of 5 and has one attempt left, while
+`ingest_tile:120230212` was `done` and starts again at 0. Preserving the ladder is the intent; the
+consequence is that the densest of the six can reach `dead`, which `queueHealth` counts and the
+distress rule reports.
 
 **Turning it on. The order is the mirror of the rollback below, and it matters for the same
 reason.** Vercel first, worker last:
@@ -377,6 +390,15 @@ guard, because `postgres` is exactly the setting under which it matters.
 `apps/ingest-worker/test/health.test.ts` asserts the token, the query and that ordering. Severity 3
 and `autoMitigate: true`, unlike the rule above: this is a gauge re-read every two minutes, so a
 queue that has been repaired should clear it rather than leave a resolved condition open.
+
+**The rule is declared, not yet deployed, and the difference is the whole gap between a template
+and an alert.** `az monitor scheduled-query list -g rg-switchback-prod-northcentralus -o json`
+returned exactly one rule on 2026-08-07, `switchback-ingest-drain-failed`. No workflow deploys
+`infra/azure/ingest.bicep` — `infrastructure.yml` builds every template and deploys only
+`main.bicep` and `runtime-identity.bicep` — so this rule, `INGEST_MAX_DRAINERS` and
+`INGEST_TRAIL_IDENTITY` all reach Azure on the next `az deployment group create` against that
+template, which is a named human action and not a scheduled one. Until then the distress is
+counted and logged by code that ships, and watched by nobody.
 
 **What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
 plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
@@ -1363,9 +1385,10 @@ push, which is blocked on the deploy.
 `INGEST_TRAIL_IDENTITY` is also drifted: `infra/azure/ingest.bicep` declares it and
 `az functionapp config appsettings list` returned 26 settings on 2026-08-07 without it. The effect
 is nil — `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
-`claim`, and an absent variable is not — and the next deployment of that template closes it. No
-report may describe that value as measured from deployed configuration; the two that did were
-unsupported.
+`claim`, and an absent variable is not — and a deployment of that template closes it. Nothing
+schedules that deployment: no workflow targets `ingest.bicep`, so the drift persists until someone
+runs `az deployment group create` against it. No report may describe that value as measured from
+deployed configuration; the two that did were unsupported.
 
 ## Design decisions, recorded once
 

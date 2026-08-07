@@ -316,12 +316,24 @@ export interface OrphanedSplitRepair {
  * Clear the split marker from any parent whose children do not exist, and put it back on the
  * queue.
  *
- * A `splitTile` that dies between its child upserts and its parent update leaves a row saying it
- * was subdivided when nothing was. Six such rows are in production, written 2026-08-05 21:03 to
- * 2026-08-06 00:54 UTC by a build that was not merged until 2026-08-07 10:10; all 483 tile rows
- * are z9 and those six parents have no descendants at all. Nothing else repairs them: `promoteFrom`
- * needs four children to read, `queueStaleChildren` needs children to queue, and `processTile`
- * only reaches its roll-up branch when `childTiles` returns four.
+ * A parent carrying the marker with no children on the ground is a row saying it was subdivided
+ * when nothing of the subdivision remains. Six such rows are in production, written 2026-08-05
+ * 21:03 to 2026-08-06 00:54 UTC by a build that was not merged until 2026-08-07 10:10; all 483
+ * tile rows are z9 and those six parents have no descendants at all. Nothing else repairs them:
+ * `promoteFrom` needs four children to read, `queueStaleChildren` needs children to queue, and
+ * `processTile` only reaches its roll-up branch when `childTiles` returns four.
+ *
+ * **The split itself cannot leave this state**, and reading it as a crash window sends the next
+ * reader hunting for one that does not exist. `splitTile` upserts all four children *before* it
+ * writes the parent's marker, so a run that dies between the two leaves no marker at all. Marker
+ * with no children is what a *later* deletion of the subtree leaves behind — which is what
+ * production holds, having had its stranded z10 rows cleared after the splits completed. The
+ * hazard to carry forward: anything that deletes a subtree must clear its parent's marker in the
+ * same pass, or it wedges the parent exactly this way.
+ *
+ * That same ordering is why this is safe to run beside a live split rather than merely tidy after
+ * a dead one: a split that has got as far as writing the marker has already written four
+ * children, so `childTiles` returns four and the parent is left alone.
  *
  * The repair writes `status` and `lastError` and nothing else. `trailCount`, `fetchedAt`,
  * `fetchMs` and every trail, waypoint and photograph the tile has ever produced are untouched —
