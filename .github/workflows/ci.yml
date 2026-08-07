@@ -295,7 +295,7 @@ jobs:
   # `needs` lists all three. `gates` so a bundle that compiles but fails the unit suite does not
   # ship; `worker` for the artifact; `migrate` because the worker reads the same schema the web app
   # does, so a column it expects has to exist before the code expecting it runs. That ordering is
-  # pinned by `test/ci-steps-runnable.test.ts` — dropping `migrate` from this list is how code
+  # pinned by `test/worker-deploy-path.test.ts` — dropping `migrate` from this list is how code
   # reaches production ahead of the schema it needs.
   #
   # **No `environment:`.** Naming one replaces the `:ref:refs/heads/master` suffix of the OIDC

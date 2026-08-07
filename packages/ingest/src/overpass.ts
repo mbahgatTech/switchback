@@ -11,7 +11,8 @@
  *   callers fail soft to cached data.
  * - A descriptive User-Agent carrying a contact URL, validated and never defaulted.
  *
- * The app uses one shared instance (`defaultOverpass`) — a queue that isn't shared isn't one.
+ * The app uses one shared instance, memoised by `getOverpass()` in `config.ts` — a queue that
+ * isn't shared isn't one.
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';

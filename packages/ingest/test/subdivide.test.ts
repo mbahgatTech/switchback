@@ -384,7 +384,10 @@ describe('unsplitTile', () => {
         return Promise.resolve(1);
       },
       ingestTile: {
-        findUnique: () => Promise.resolve(parentStatus === null ? null : { status: parentStatus }),
+        findUnique: () => {
+          recorded.steps.push('readParent');
+          return Promise.resolve(parentStatus === null ? null : { status: parentStatus });
+        },
         findMany: ({ where }: { where: { quadkey: { startsWith: string } } }) =>
           Promise.resolve(
             tiles
@@ -477,14 +480,19 @@ describe('unsplitTile', () => {
    * Every claim of a tile job is made under `DRAIN_ADMISSION_KEY`, so the count has to be taken
    * after this transaction holds that lock — a count outside it describes the moment before the
    * cron fired, and the operator does not control the cron's schedule.
+   *
+   * The parent's status is under the same rule and for the same reason: it is read here and
+   * written back at the end, so a drain that changed it in between would have that change
+   * silently overwritten with the value from before.
    */
-  it('reads the running count under the same lock the drain claims through', async () => {
+  it('reads the running count and the parent status under the lock the drain claims through', async () => {
     const { db, recorded } = unsplitDb([PARENT, ...CHILDREN]);
 
     await unsplitTile(db, PARENT);
 
     expect(recorded.steps[0]).toBe('lock');
     expect(recorded.steps.indexOf('countRunning')).toBeGreaterThan(recorded.steps.indexOf('lock'));
+    expect(recorded.steps.indexOf('readParent')).toBeGreaterThan(recorded.steps.indexOf('lock'));
     expect(recorded.steps.indexOf('countRunning')).toBeLessThan(
       recorded.steps.indexOf('deleteJobs'),
     );

@@ -118,10 +118,12 @@ How a way-derived trail is identified. `claim` resolves it through the `trail_wa
 what keeps one trail one row when two tiles each assemble part of it. `osm-id` keeps the
 `(osmType, osmId)` upsert, where the id is the lowest way id the tile happened to see.
 
-`osm-id` neither reads nor writes `trail_ways` and `trail_slug_aliases`, so switching to it stops
-every future merge and restores the previous behaviour on the next tile. It does not undo a merge
-that has already run: that deleted the loser `Trail` row, and no setting brings it back. Turning
-this on is reversible; the rows it has already retired are not.
+`osm-id` never writes `trail_ways` or `trail_slug_aliases` and never reads `trail_ways`, so
+switching to it stops every future merge and restores the previous behaviour on the next tile. It
+still reads `trail_slug_aliases`, so a slug a merge retired is not handed to some other trail, and
+tolerates that table being absent. It does not undo a merge that has already run: that deleted the
+loser `Trail` row, and no setting brings it back. Turning this on is reversible; the rows it has
+already retired are not.
 
 `claim` requires both tables to exist. Apply the schema before deploying a worker package that can
 run with this set — CI's `migrate` job does that on a push to `master` only.
@@ -818,13 +820,11 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
           // this on `claim` is the combination that fragments trails across the new seam.
           //
-          // Declared here and *absent from the deployed app*: `az functionapp config appsettings
-          // list` returned 26 settings on 2026-08-07 and this was not among them, because the
-          // live configuration predates this entry. The interlock holds regardless —
-          // `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
-          // `claim`, and an absent variable is not — so the drift costs nothing until a
-          // deployment of this template closes it, which no workflow performs. No report may
-          // describe this value as measured from deployed configuration.
+          // Deployed and readable: `az functionapp config appsettings list` returns 28 settings on
+          // the live app and this one reads `osm-id`, matching `ingest.bicepparam`. Reading it back
+          // is the check an operator should use, because `identity.ts` treats an absent variable
+          // and `osm-id` identically — so an app whose settings collection was replaced without
+          // this entry looks safe and is, but says nothing about which template last converged it.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
@@ -1115,21 +1115,26 @@ which has no Application Insights at all. Its split markers, its stuck-subtree m
 a mirror returns go to a console with no alerting on it, so "no 429s observed" was a statement
 about what could be seen rather than about what happened.
 
-Every one of those conditions is a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
+Five of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
 `lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck.
+The sixth is the absence of rows changing — a drain that has stopped leaves no error behind, so
+`stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`.
 `ingestPump` already runs here every two minutes and already reads that database, so
-`apps/ingest-worker/src/health.ts` reads the five counts and logs `switchback-ingest-queue-distress`
+`apps/ingest-worker/src/health.ts` reads the six counts and logs `switchback-ingest-queue-distress`
 when any is non-zero. That log line is what this rule watches — a condition the running code
 emits, on a schedule that does not depend on which side owns the drain. The report is deliberately
 ahead of the `INGEST_QUEUE_DRIVER` guard in `functions/pump.ts`: `postgres` is exactly the setting
 under which it matters.
 
-**Each of the five can return to zero, which is what makes this a rule rather than a light left
-on.** Two of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
+**Each of the six can return to zero, which is what makes this a rule rather than a light left
+on.** Three of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
 `pruneFinishedJobs` keeps that row for thirty days, so an unwindowed count reads the same
 twenty-five for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
 `packages/ingest/src/maintenance.ts` bounds `dead` and `rateLimited` to the last hour — longer than
-this rule's fifteen-minute window, so nothing falls between evaluations. `orphanedSplits` counts
+this rule's fifteen-minute window, so nothing falls between evaluations. The third is `stalledDrain`,
+which measures silence rather than depth for the same reason: 44,884 jobs are queued and overdue and
+will be for months, so a gauge counting them is a light left on by construction.
+`orphanedSplits` counts
 only parents whose children are actually missing, not every parent midway through a legitimate
 subdivision.
 

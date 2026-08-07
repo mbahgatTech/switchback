@@ -223,14 +223,33 @@ describe('the throttled sweep', () => {
 });
 
 describe('the queue health report', () => {
+  const NOW = new Date('2026-08-07T10:00:00Z');
+
   function countingDb(reading: QueueHealth): PrismaClient {
     // The three job counts are read in declaration order: dead, stale leases, rate limited.
     const jobs = [reading.dead, reading.staleLeases, reading.rateLimited];
     let call = 0;
     return {
-      ingestJob: { count: async () => jobs[call++] ?? 0 },
+      ingestJob: {
+        count: async () => jobs[call++] ?? 0,
+        findFirst: async () => (reading.stalledDrain ? { runAfter: new Date(0) } : null),
+        aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
+      },
       ingestTile: { count: async () => reading.stuckSubtrees },
       $queryRaw: async () => [{ count: reading.orphanedSplits }],
+    } as unknown as PrismaClient;
+  }
+
+  /** A queue holding `oldestDue` overdue work whose last terminal transition was `lastFinished`. */
+  function drainDb(oldestDue: Date | null, lastFinished: Date | null): PrismaClient {
+    return {
+      ingestJob: {
+        count: async () => 0,
+        findFirst: async () => (oldestDue ? { runAfter: oldestDue } : null),
+        aggregate: async () => ({ _max: { completedAt: lastFinished } }),
+      },
+      ingestTile: { count: async () => 0 },
+      $queryRaw: async () => [{ count: 0 }],
     } as unknown as PrismaClient;
   }
 
@@ -240,10 +259,11 @@ describe('the queue health report', () => {
     rateLimited: 3,
     orphanedSplits: 6,
     stuckSubtrees: 1,
+    stalledDrain: 1,
   };
 
-  it('reads the five conditions the drainer leaves behind', async () => {
-    expect(await queueHealth(countingDb(reading))).toEqual(reading);
+  it('reads the six conditions the drainer leaves behind', async () => {
+    expect(await queueHealth(countingDb(reading), NOW)).toEqual(reading);
   });
 
   it('counts a lease as stale only once it is past the lease timeout', async () => {
@@ -255,6 +275,8 @@ describe('the queue health report', () => {
           seen.push(args.where);
           return 0;
         },
+        findFirst: async () => null,
+        aggregate: async () => ({ _max: { completedAt: null } }),
       },
       ingestTile: { count: async () => 0 },
       $queryRaw: async () => [{ count: 0 }],
@@ -282,6 +304,8 @@ describe('the queue health report', () => {
           seen.push(args.where);
           return 0;
         },
+        findFirst: async () => null,
+        aggregate: async () => ({ _max: { completedAt: null } }),
       },
       ingestTile: { count: async () => 0 },
       $queryRaw: async () => [{ count: 0 }],
@@ -305,8 +329,48 @@ describe('the queue health report', () => {
       rateLimited: 0,
       orphanedSplits: 0,
       stuckSubtrees: 0,
+      stalledDrain: 0,
     };
     expect(isDistressed(clean)).toBe(false);
     expect(isDistressed({ ...clean, rateLimited: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, stalledDrain: 1 })).toBe(true);
+  });
+
+  /**
+   * The distinction the gauge exists to draw. Production holds 44,884 overdue jobs and drains
+   * them a handful a day, so depth says "distressed" forever — the pinned gauge in the comment
+   * above, rebuilt in a new field. Only silence while work is due means the drain has stopped.
+   */
+  describe('the stalled-drain gauge', () => {
+    const hoursAgo = (h: number): Date => new Date(NOW.getTime() - h * 3600_000);
+
+    it('stays quiet on a deep backlog that is still being worked', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(3)), NOW);
+      expect(health.stalledDrain).toBe(0);
+    });
+
+    it('fires when work is due and nothing has finished for a day and a half', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(40)), NOW);
+      expect(health.stalledDrain).toBe(1);
+    });
+
+    // 27.90 h was the widest gap between terminal transitions over the 14 days to 2026-08-07,
+    // across 341 of them. A threshold under that pages somebody for ordinary quiet.
+    it('tolerates the widest gap production has actually shown', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(27.9)), NOW);
+      expect(health.stalledDrain).toBe(0);
+    });
+
+    it('stays quiet when nothing is due, however long the drain has been idle', async () => {
+      const health = await queueHealth(drainDb(null, hoursAgo(1000)), NOW);
+      expect(health.stalledDrain).toBe(0);
+    });
+
+    // A queue that has never finished anything has no last-transition time to measure from.
+    // Dating the silence from the oldest due job keeps a freshly seeded deployment healthy.
+    it('dates silence from the oldest due job when nothing has ever finished', async () => {
+      expect((await queueHealth(drainDb(hoursAgo(1), null), NOW)).stalledDrain).toBe(0);
+      expect((await queueHealth(drainDb(hoursAgo(40), null), NOW)).stalledDrain).toBe(1);
+    });
   });
 });

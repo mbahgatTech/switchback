@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { JobStatus, TileStatus } from '@switchback/db';
+import { JobStatus, Prisma, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   TILE_TTL_MS,
@@ -8,6 +8,7 @@ import {
   isTileFresh,
   pickRegion,
   processTile,
+  uniqueSlug,
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
@@ -611,5 +612,68 @@ describe('fetchWayGeometries', () => {
     // the same id would multiply requests against a mirror that is already struggling.
     const succeeded = batches.filter((batch) => batch.length <= 2).flat();
     expect(new Set(succeeded).size).toBe(succeeded.length);
+  });
+});
+
+describe('uniqueSlug', () => {
+  const OSM_ID = 162652736n;
+
+  /** A transaction client that holds no trails, and answers the alias lookup however told to. */
+  function txWith(
+    retired: readonly string[],
+    aliasLookup?: () => Promise<{ slug: string } | null>,
+  ): Prisma.TransactionClient {
+    return {
+      trail: { findUnique: () => Promise.resolve(null) },
+      trailSlugAlias: {
+        findUnique:
+          aliasLookup ??
+          (({ where }: { where: { slug: string } }) =>
+            Promise.resolve(retired.includes(where.slug) ? { slug: where.slug } : null)),
+      },
+    } as unknown as Prisma.TransactionClient;
+  }
+
+  function rejectWith(code: string): () => Promise<never> {
+    return () =>
+      Promise.reject(
+        new Prisma.PrismaClientKnownRequestError(code, { code, clientVersion: 'test' }),
+      );
+  }
+
+  it('takes the bare name when no trail and no alias hold it', async () => {
+    const slug = await uniqueSlug(txWith([]), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID);
+    expect(slug).toBe('kibbie-lake-trail');
+  });
+
+  it('steps past a slug a merge retired, so a permanent link keeps its own trail', async () => {
+    const slug = await uniqueSlug(
+      txWith(['kibbie-lake-trail']),
+      'Kibbie Lake Trail',
+      'Tuolumne',
+      'way',
+      OSM_ID,
+    );
+    expect(slug).toBe('kibbie-lake-trail-tuolumne');
+  });
+
+  // The property `osm-id` is documented to have: no dependency on `trail_slug_aliases` existing.
+  // A Preview build runs branch code against whichever database it is pointed at while `migrate`
+  // runs on `master` alone, so without this the whole commit fails there rather than ingesting.
+  it('ingests against a database that has no trail_slug_aliases at all', async () => {
+    const slug = await uniqueSlug(
+      txWith([], rejectWith('P2021')),
+      'Kibbie Lake Trail',
+      'Tuolumne',
+      'way',
+      OSM_ID,
+    );
+    expect(slug).toBe('kibbie-lake-trail');
+  });
+
+  it('still fails the commit on an error that is not a missing table', async () => {
+    await expect(
+      uniqueSlug(txWith([], rejectWith('P1010')), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID),
+    ).rejects.toMatchObject({ code: 'P1010' });
   });
 });

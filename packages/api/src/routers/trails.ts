@@ -632,9 +632,9 @@ export const trailsRouter = router({
        * alias table is what keeps the retired one answering rather than 404ing every inbound
        * link — see `mergeTrails` in @switchback/ingest, which writes it.
        *
-       * **Read on every mode, unlike `uniqueSlug` and `claimWays`, and that is what makes
-       * `INGEST_TRAIL_IDENTITY` reversible.** A merge is not undone by turning the flag off: the
-       * losing trail's rows are gone and its reviews, activities, sessions and photographs have
+       * **Read on every mode, as `uniqueSlug` reads it and unlike `claimWays`, and that is what
+       * makes `INGEST_TRAIL_IDENTITY` reversible.** A merge is not undone by turning the flag off:
+       * the losing trail's rows are gone and its reviews, activities, sessions and photographs have
        * been repointed at the winner. The alias is the only thing still answering the retired URL,
        * so gating the read on the flag would leave a rollback strictly worse for readers than
        * never having flipped it — every merge kept, every redirect withdrawn.

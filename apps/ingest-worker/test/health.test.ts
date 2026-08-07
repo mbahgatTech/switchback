@@ -15,7 +15,12 @@ function fakeDb(reading: QueueHealth): PrismaClient {
   const jobs = [reading.dead, reading.staleLeases, reading.rateLimited];
   let call = 0;
   return {
-    ingestJob: { count: async () => jobs[call++] ?? 0 },
+    ingestJob: {
+      count: async () => jobs[call++] ?? 0,
+      // Due work plus a terminal transition at the epoch is a stalled drain; no due work is not.
+      findFirst: async () => (reading.stalledDrain ? { runAfter: new Date(0) } : null),
+      aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
+    },
     ingestTile: { count: async () => reading.stuckSubtrees },
     // `orphanedSplits` is a correlated count over the child set, not a Prisma predicate.
     $queryRaw: async () => [{ count: reading.orphanedSplits }],
@@ -28,6 +33,7 @@ const CLEAN: QueueHealth = {
   rateLimited: 0,
   orphanedSplits: 0,
   stuckSubtrees: 0,
+  stalledDrain: 0,
 };
 
 function silentLog() {
@@ -94,14 +100,15 @@ describe('the queue health report', () => {
 
   it('survives a database it cannot read, because the pump hangs off it', async () => {
     const log = silentLog();
+    const unreadable = async (): Promise<never> => {
+      throw new Error('terminating connection due to administrator command');
+    };
+    // Every statement fails, not just the first. A stub where only `count` throws leaves the
+    // rest of the `Promise.all` resolving, which is not what a dropped connection looks like.
     const broken = {
-      ingestJob: {
-        count: async () => {
-          throw new Error('terminating connection due to administrator command');
-        },
-      },
-      ingestTile: { count: async () => 0 },
-      $queryRaw: async () => [{ count: 0 }],
+      ingestJob: { count: unreadable, findFirst: unreadable, aggregate: unreadable },
+      ingestTile: { count: unreadable },
+      $queryRaw: unreadable,
     } as unknown as PrismaClient;
 
     await expect(reportQueueHealth(broken, log)).resolves.toBeNull();

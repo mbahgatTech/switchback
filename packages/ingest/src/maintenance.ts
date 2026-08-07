@@ -115,6 +115,8 @@ export interface QueueHealth {
   orphanedSplits: number;
   /** Subtrees whose leaves have given up, with a z9 ancestor somebody is polling. */
   stuckSubtrees: number;
+  /** 1 when work is due and nothing has finished in `DRAIN_SILENCE_MS` — the drain has stopped. */
+  stalledDrain: number;
 }
 
 /**
@@ -130,16 +132,36 @@ export interface QueueHealth {
  */
 export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
 
+/**
+ * How long the drain may go without finishing anything, while work is due, before that is a
+ * stoppage rather than a quiet patch.
+ *
+ * **Depth is not the signal, and this is the one gauge where that had to be worked out rather
+ * than assumed.** `ingest_jobs` holds 44,884 `queued` rows whose `runAfter` is in the past, the
+ * oldest since 2026-07-30 — a backlog that predates every drainer now running and does not
+ * shrink on any horizon an alert cares about. A field counting due work would read five figures
+ * forever: the pinned gauge `DISTRESS_WINDOW_MS` exists to prevent, rebuilt.
+ *
+ * What separates a stopped drain from a slow one is throughput, so this measures the gap since
+ * the last terminal transition. Over the 14 days to 2026-08-07 there were 341 of them, p95 gap
+ * 0.70 h and maximum 27.90 h. Thirty-six hours clears that maximum and clears a whole missed
+ * `/api/cron/drain` period — it fires once a day at 04:17 and the rest is request-driven — so a
+ * quiet weekend does not page anybody, while a drain that has genuinely stopped is named within
+ * a day and a half instead of never.
+ */
+export const DRAIN_SILENCE_MS = 36 * 60 * 60 * 1000;
+
 /** Whether anything in this reading is worth waking somebody for. */
 export function isDistressed(health: QueueHealth): boolean {
   return Object.values(health).some((count) => count > 0);
 }
 
-/** The five counts as one field list, so the heartbeat and the distress line cannot drift apart. */
+/** The counts as one field list, so the heartbeat and the distress line cannot drift apart. */
 export function formatQueueHealth(health: QueueHealth): string {
   return (
     `dead=${health.dead} staleLeases=${health.staleLeases} rateLimited=${health.rateLimited} ` +
-    `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees}`
+    `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees} ` +
+    `stalledDrain=${health.stalledDrain}`
   );
 }
 
@@ -164,21 +186,61 @@ export async function queueHealth(
 ): Promise<QueueHealth> {
   const staleBefore = new Date(now.getTime() - leaseTimeoutMs);
   const recent = new Date(now.getTime() - DISTRESS_WINDOW_MS);
+  const silentBefore = new Date(now.getTime() - DRAIN_SILENCE_MS);
 
-  const [dead, staleLeases, rateLimited, orphanedSplits, stuckSubtrees] = await Promise.all([
-    db.ingestJob.count({ where: { status: JobStatus.dead, completedAt: { gte: recent } } }),
-    db.ingestJob.count({
-      where: { status: JobStatus.running, lockedAt: { lt: staleBefore } },
-    }),
-    db.ingestJob.count({
-      where: {
-        lastError: { contains: '429' },
-        OR: [{ completedAt: { gte: recent } }, { runAfter: { gte: recent } }],
-      },
-    }),
-    countOrphanedSplits(db),
-    db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
-  ]);
+  const [dead, staleLeases, rateLimited, orphanedSplits, stuckSubtrees, oldestDue, lastFinished] =
+    await Promise.all([
+      db.ingestJob.count({ where: { status: JobStatus.dead, completedAt: { gte: recent } } }),
+      db.ingestJob.count({
+        where: { status: JobStatus.running, lockedAt: { lt: staleBefore } },
+      }),
+      db.ingestJob.count({
+        where: {
+          lastError: { contains: '429' },
+          OR: [{ completedAt: { gte: recent } }, { runAfter: { gte: recent } }],
+        },
+      }),
+      countOrphanedSplits(db),
+      db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
+      db.ingestJob.findFirst({
+        where: { status: JobStatus.queued, runAfter: { lte: now } },
+        orderBy: { runAfter: 'asc' },
+        select: { runAfter: true },
+      }),
+      db.ingestJob.aggregate({
+        where: { status: { in: [JobStatus.done, JobStatus.dead] } },
+        _max: { completedAt: true },
+      }),
+    ]);
 
-  return { dead, staleLeases, rateLimited, orphanedSplits, stuckSubtrees };
+  return {
+    dead,
+    staleLeases,
+    rateLimited,
+    orphanedSplits,
+    stuckSubtrees,
+    stalledDrain: stalledDrain(
+      oldestDue?.runAfter ?? null,
+      lastFinished._max.completedAt,
+      silentBefore,
+    ),
+  };
+}
+
+/**
+ * Whether the drain has stopped, as opposed to having nothing to do or working a long backlog.
+ *
+ * Both conditions are required. Silence alone is an empty queue, which is the healthy resting
+ * state and must not page. Due work alone is the 44,884-row backlog, which is permanent. On a
+ * queue that has never finished anything the oldest due job dates the silence instead, so a
+ * newly seeded deployment reads healthy until its first job is genuinely overdue.
+ */
+function stalledDrain(
+  oldestDue: Date | null,
+  lastFinished: Date | null,
+  silentBefore: Date,
+): number {
+  if (!oldestDue) return 0;
+  const since = lastFinished ?? oldestDue;
+  return since < silentBefore ? 1 : 0;
 }
