@@ -6,7 +6,7 @@
 
 import { JobKind } from '@switchback/db';
 import { drainJobs } from './jobs';
-import type { ClaimedJob, DrainResult, JobHandler } from './jobs';
+import type { ClaimGate, ClaimedJob, DrainResult, JobHandler } from './jobs';
 import { processNetworkTile } from './network';
 import { enrichTrailPhotos, processRoute, processTile } from './pipeline';
 import type { PipelineDeps } from './pipeline';
@@ -75,6 +75,8 @@ export async function drainIngest(
     dedupeKeys?: readonly string[];
     /** Derived jobs to claim alongside — see `drainJobs`. Pass 0 to take none. */
     derivedLimit?: number;
+    /** Bounds how many processes drain at once — see `drainSlotGate`. */
+    gate?: ClaimGate;
   } = {},
 ): Promise<DrainResult> {
   return drainJobs(ingestHandlers(options.deps), {
@@ -82,5 +84,6 @@ export async function drainIngest(
     workerId: options.workerId,
     derivedLimit: options.derivedLimit ?? DEFAULT_DERIVED_SHARE,
     ...(options.dedupeKeys ? { dedupeKeys: options.dedupeKeys } : {}),
+    ...(options.gate ? { gate: options.gate } : {}),
   });
 }

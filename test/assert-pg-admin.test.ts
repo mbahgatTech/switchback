@@ -7,13 +7,15 @@ import { ADMIN_PROBE_SQL, readAdminVerdict } from '../scripts/assert-pg-admin';
  */
 describe('the administrator verdict', () => {
   it('reads the row', () => {
-    expect(readAdminVerdict([{ current_user: 'id-switchback-postgres-ci', is_admin: true }])).toEqual(
-      { currentUser: 'id-switchback-postgres-ci', isAdmin: true },
-    );
+    expect(
+      readAdminVerdict([{ current_user: 'id-switchback-postgres-ci', is_admin: true }]),
+    ).toEqual({ currentUser: 'id-switchback-postgres-ci', isAdmin: true });
   });
 
   it('refuses a driver that returns the flag as text', () => {
-    expect(readAdminVerdict([{ current_user: 'sbapp_runtime', is_admin: 't' }]).isAdmin).toBe(false);
+    expect(readAdminVerdict([{ current_user: 'sbapp_runtime', is_admin: 't' }]).isAdmin).toBe(
+      false,
+    );
   });
 
   it('throws when the probe returned nothing to judge', () => {

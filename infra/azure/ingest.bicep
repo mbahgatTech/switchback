@@ -543,7 +543,8 @@ The worker: one Service Bus queue trigger and one timer pump, in one app, on one
 
 ---
 
-**The Overpass clamp. This is the load-bearing part of the whole deployment.**
+**The Overpass clamp, and what it does and does not bound.** The one statement of the fleet-wide
+bound is `docs/architecture.md`; this is the Azure half of it.
 
 `packages/ingest/src/overpass.ts` serializes at `maxConcurrent: 2` because Overpass allots slots per
 client IP, and exceeding that is what gets an egress IP blocked — taking ingest down for the product,
@@ -557,11 +558,20 @@ instances, each with its own client at 2. The chain that stops it, every link tr
     x 2  requests per client    OVERPASS_MAX_CONCURRENT = 2  (below)
     = 2  concurrent Overpass requests per host instance
 
-The first two lines are the ones doing the work, and the fourth is why: however many invocations the
-host starts, they run in one Node process and share one `OverpassClient`, whose own queue is the
-ceiling. `host.json`'s `maxConcurrentCalls: 1` is set too, but the argument deliberately does not rest
-on it — the host multiplies that value by the instance's core count, and "a Consumption instance is
-typically one core" is not a sentence to build a correctness claim on.
+**Every line of that arithmetic is about this app, and this app performs no Overpass work.**
+`INGEST_QUEUE_DRIVER` is `postgres` in production, the host's own log reads `INGEST_QUEUE_DRIVER is
+not servicebus — Postgres owns the drain`, and `ingestDrain` has zero invocations. The drainer that
+runs is Vercel, where a lambda is a process and the platform starts as many as the traffic asks for,
+so the singleton on the fourth line bounds a fraction of it and the first three lines do not apply at
+all. `INGEST_MAX_DRAINERS` below, enforced by an advisory lock in
+`packages/ingest/src/drain-slot.ts`, is what bounds the fleet; this chain remains correct for the
+day the worker owns the drain.
+
+The first two lines are the ones doing the work here, and the fourth is why: however many
+invocations the host starts, they run in one Node process and share one `OverpassClient`, whose own
+queue is the ceiling. `host.json`'s `maxConcurrentCalls: 1` is set too, but the argument deliberately
+does not rest on it — the host multiplies that value by the instance's core count, and "a
+Consumption instance is typically one core" is not a sentence to build a correctness claim on.
 
 **Read the first line precisely: `functionAppScaleLimit` caps scale-*out*, not instance count.** It
 stops the scale controller adding a second instance for load. It does not stop Consumption replacing
@@ -576,22 +586,23 @@ claim of "2, deployment-wide, always" would not have been true.
 That trace also shows what a mid-drain recycle costs: the evicted instance strands its message for
 the full `PT5M` `lockDuration`, and when it redelivers, the `ingest_jobs` row is still under the dead
 lease from the first attempt, so the handler logs "nothing claimable" and the tile waits for
-`reclaimExpiredJobs`. That is why the Vercel cron still calls `reclaimExpiredJobs` on the
-`servicebus` branch instead of being switched off.
+`reclaimExpiredJobs`. That reclaim no longer waits on a drain happening: `sweepQueue` runs it from
+the Vercel cron and off request traffic, and `drainSlotGate` runs it again inside the transaction
+that admits a drainer.
 
 `OVERPASS_MAX_CONCURRENT` is set explicitly to `2` rather than left to the code default so the number
-is visible in the portal alongside the scale limit. **Raising either of these breaks the fair-use
-guarantee.** They are not throughput knobs.
+is visible in the portal alongside the scale limit. **Raising it, or `INGEST_MAX_DRAINERS`, breaks
+the fair-use guarantee.** They are not throughput knobs.
 
 Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus` — but that is a property
-of *a Vercel environment*, not of the deployment. Production and Preview each carry the flag, or do
-not, independently, and a branch deployed before the flag existed drains inline whatever the
-environment says because its code has no `ingestQueueDriver` call to make. Three call sites reach
-Overpass from a Vercel process and all three are gated on the flag: the cron route's
-`drainOrReclaim`, `trails.ts`'s `kickIngest`, and `routes.ts`'s `kickNetwork`. The last was missed
-once — it drained `ingest_network` inline from a public procedure the planner fires on every
-viewport settle, which the pump also publishes, so that kind had two drainers while this comment
-asserted it had one.
+of *a Vercel environment*, not of the deployment, and production is on `postgres`, so it is not the
+operative case today. Production and Preview each carry the flag, or do not, independently, and a
+branch deployed before the flag existed drains inline whatever the environment says because its code
+has no `ingestQueueDriver` call to make. Three call sites reach Overpass from a Vercel process and
+all three are gated on the flag: the cron route's `drainIfOwned`, `trails.ts`'s `kickIngest`, and
+`routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network` inline from a
+public procedure the planner fires on every viewport settle, which the pump also publishes, so that
+kind had two drainers while this comment asserted it had one.
 
 **The host's 10-minute `functionTimeout` bounds the handler, so the client has to be bounded too.**
 `OverpassClient`'s own worst case on the defaults is `maxAttempts` 6 x `requestTimeoutMs` 190 s plus
@@ -783,9 +794,26 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           }
           // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
           // this on `claim` is the combination that fragments trails across the new seam.
+          //
+          // Declared here and *absent from the deployed app*: `az functionapp config appsettings
+          // list` returned 26 settings on 2026-08-07 and this was not among them, because the
+          // live configuration predates this entry. The interlock holds regardless —
+          // `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
+          // `claim`, and an absent variable is not — so the drift costs nothing until the next
+          // deployment of this template closes it. No report may describe this value as measured
+          // from deployed configuration.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
+          }
+          // How many processes may hold Overpass-making work at once, fleet-wide. One, and
+          // `packages/ingest/src/drain-slot.ts` enforces it in Postgres rather than in a
+          // per-process singleton — which is what `OVERPASS_MAX_CONCURRENT` above is, and why it
+          // bounded this app (one instance, one process) and not Vercel (as many lambdas as the
+          // traffic asks for, one Overpass allowance between them).
+          {
+            name: 'INGEST_MAX_DRAINERS'
+            value: '1'
           }
           {
             name: 'NODE_ENV'
@@ -972,12 +1000,75 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   }
 }
 
+@description('''
+**The drainer that actually runs has no telemetry of its own, and this is how it gets some.**
+
+`switchback-ingest-drain-failed` above is scoped to this Application Insights resource, and every
+arm of it reads something the Function App emits. With `INGEST_QUEUE_DRIVER` on `postgres` — the
+production setting, and the one `ingestDrain`'s zero invocations record — the drain runs on Vercel,
+which has no Application Insights at all. Its split markers, its stuck-subtree markers and any 429
+a mirror returns go to a console with no alerting on it, so "no 429s observed" was a statement
+about what could be seen rather than about what happened.
+
+Every one of those conditions is a *row*: a `dead` job, a lease past `LEASE_TIMEOUT_MS`, a
+`lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck.
+`ingestPump` already runs here every two minutes and already reads that database, so
+`apps/ingest-worker/src/health.ts` reads the five counts and logs `switchback-ingest-queue-distress`
+when any is non-zero. That log line is what this rule watches — a condition the running code
+emits, on a schedule that does not depend on which side owns the drain. The report is deliberately
+ahead of the `INGEST_QUEUE_DRIVER` guard in `functions/pump.ts`: `postgres` is exactly the setting
+under which it matters.
+
+`autoMitigate` is **on**, unlike the rule above, and the difference is deliberate. That one is
+edge-triggered — a thing happened. This is a gauge: distress is present or it is not, the pump
+re-reads it every two minutes, and a fixed queue should clear the alert rather than leave a
+resolved condition open. Severity 3 for the same reason: it is a backlog, not an outage.
+
+`apps/ingest-worker/test/health.test.ts` asserts this query and the marker the code logs agree, so
+a reworded log line fails the build instead of silently disarming the rule.
+''')
+resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-queue-distress'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-queue-distress'
+    description: 'The ingest queue holds dead jobs, expired leases, rate-limited failures, orphaned split markers or stuck subtrees. Reported by ingestPump, whichever side owns the drain.'
+    severity: 3
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'traces | where message has "switchback-ingest-queue-distress" | project timestamp'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------------
 // Outputs. No keys and no connection strings, because there are none: the three values Vercel
 // needs are a hostname, a tenant id and a client id, and none of them authenticates anything on
 // its own.
 // ---------------------------------------------------------------------------------------
-
 output serviceBusNamespace string = namespace.name
 output serviceBusFullyQualifiedNamespace string = '${namespace.name}.servicebus.windows.net'
 output serviceBusQueue string = queue.name

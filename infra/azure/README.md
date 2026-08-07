@@ -1120,6 +1120,13 @@ that directly. Every link in the chain that stops it is readable from configurat
 multiplies that by the instance's core count. The load-bearing property is that Consumption runs one
 host instance for the whole app, so every invocation shares one Node process and one client.
 
+**This table bounds the Function App, which drains nothing today.** `INGEST_QUEUE_DRIVER` is
+`postgres`, so Vercel owns the drain and every row above except the last is a property of the wrong
+process — a lambda is a process, and Vercel starts as many as the traffic wants. What bounds the
+fleet is `INGEST_MAX_DRAINERS = 1`, enforced across processes by an advisory lock in
+`packages/ingest/src/drain-slot.ts`; `docs/architecture.md` states the resulting bound in full and
+is the one place that does.
+
 **`functionAppScaleLimit` caps scale-out, not instance count.** Consumption still replaces instances,
 and for a few seconds around a replacement two hosts of this app run at once with a client each — the
 17:32 trace on 2026-08-03 has instance `0--f7e39076-13` taking sequence 1 and `0--3f3e4037-7d`
