@@ -191,7 +191,9 @@ async function writeOutcome(
 ): Promise<boolean> {
   const { count } = await db.ingestJob.updateMany({
     where: { id: lease.id, lockedBy: lease.lockedBy, lockedAt: lease.lockedAt },
-    data,
+    // Every caller nulls `lockedBy`, which is what keeps a released lease from matching. Copying
+    // it here first is the only reason a finished job can still say which process ran it.
+    data: { ...data, drainedBy: lease.lockedBy },
   });
   return count > 0;
 }
@@ -289,7 +291,8 @@ export async function reclaimExpiredJobs(
 
   // One statement, so a job cannot be requeued and buried by two racing sweeps. Every
   // `attempts + 1` here reads the *old* row — Postgres evaluates the whole SET against the row
-  // as it was — so the retirement test and the new count are the same number. `RETURNING`
+  // as it was — so the retirement test and the new count are the same number, and `"drainedBy" =
+  // "lockedBy"` captures the dead worker rather than the NULL two lines above it. `RETURNING`
   // reports the new status, which is how the two dispositions are counted apart.
   const rows = await db.$queryRaw<Array<{ status: JobStatus }>>`
     UPDATE ingest_jobs SET
@@ -300,6 +303,7 @@ export async function reclaimExpiredJobs(
                            THEN ${now} ELSE "completedAt" END,
       "lockedAt"    = NULL,
       "lockedBy"    = NULL,
+      "drainedBy"   = "lockedBy",
       "lastError"   = ${reason}
     WHERE status = 'running' AND "lockedAt" < ${cutoff}
     RETURNING status

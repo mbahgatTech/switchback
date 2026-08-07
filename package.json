@@ -29,6 +29,7 @@
     "ingest:drain": "tsx --env-file-if-exists=.env scripts/ingest.ts drain",
     "ingest:tile": "tsx --env-file-if-exists=.env scripts/ingest.ts tile",
     "ingest:route": "tsx --env-file-if-exists=.env scripts/ingest.ts route",
+    "ingest:unsplit": "tsx --env-file-if-exists=.env scripts/ingest.ts unsplit",
     "ingest:requeue": "tsx --env-file-if-exists=.env scripts/requeue-jobs.ts",
     "test": "vitest run",
     "test:watch": "vitest",

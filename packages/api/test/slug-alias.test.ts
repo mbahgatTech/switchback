@@ -9,9 +9,11 @@ import { createCallerFactory } from '../src/trpc';
  * refuses to rewrite `slug` on update. A merge retires one of two such URLs, and
  * `trail_slug_aliases` is the only thing standing between that and a 404 on every inbound link.
  *
- * Only a merge writes an alias and only `claim` merges, so the read is gated on the same flag —
- * the second block below holds that gate against a database where the table is absent, which is
- * every database the default path runs against.
+ * The read is deliberately *not* gated on `INGEST_TRAIL_IDENTITY`. Rolling that flag back does not
+ * un-merge anything — the losing trail row is gone — so a gated read would withdraw every redirect
+ * while keeping every merge, leaving readers worse off than if the flag had never been on. The
+ * second block below holds the one property the gate used to provide: a database with no
+ * `trail_slug_aliases` must still answer 404 rather than 500.
  *
  * The first block needs a database because the fallback is a second `findUnique` against a real
  * relation. Skipped unless `DATABASE_URL` is local; CI's `gates` job runs a PostGIS service.
@@ -98,15 +100,30 @@ describe.skipIf(!IS_LOCAL).sequential('a retired trail URL', () => {
       code: 'NOT_FOUND',
     } satisfies Partial<TRPCError>);
   });
+
+  /*
+   * The rollback case, and the reason the read is ungated. `INGEST_TRAIL_IDENTITY` back on its
+   * default is the state an on-caller reaches by following the runbook; the merge that retired
+   * this slug is not undone by it, so the redirect has to survive it too.
+   */
+  it('still answers after the identity flag is rolled back', async () => {
+    vi.stubEnv('INGEST_TRAIL_IDENTITY', 'osm-id');
+    expect((await caller.trails.bySlug({ slug: RETIRED_SLUG })).slug).toBe(LIVE_SLUG);
+  });
+
+  it('still answers with the identity flag absent entirely', async () => {
+    vi.stubEnv('INGEST_TRAIL_IDENTITY', undefined);
+    expect((await caller.trails.bySlug({ slug: RETIRED_SLUG })).slug).toBe(LIVE_SLUG);
+  });
 });
 
 describe('a database with no `trail_slug_aliases`', () => {
   const UNKNOWN = 'zz-no-such-trail-at-all';
 
   /**
-   * Production: `trail_slug_aliases` ships with this branch and `ci.yml` applies the schema only
-   * on a push to master, so the relation is absent wherever the default path runs. Counting the
-   * reads is what separates a gate from a table that merely happens to answer.
+   * `trail_slug_aliases` is in production and in any schema `db push` has touched, but a database
+   * that predates it raises P2021 on this read. Counting the reads is what separates "the fallback
+   * ran and found nothing" from "the fallback was never attempted".
    */
   function againstMissingTable() {
     let aliasReads = 0;
@@ -126,23 +143,12 @@ describe('a database with no `trail_slug_aliases`', () => {
     vi.unstubAllEnvs();
   });
 
-  it('is not consulted under the default mode, so an unknown slug is a 404', async () => {
-    vi.stubEnv('INGEST_TRAIL_IDENTITY', 'osm-id');
-    const { caller: gated, aliasReads } = againstMissingTable();
+  it.each(['osm-id', 'claim'])('is consulted under %s and still 404s, not 500s', async (mode) => {
+    vi.stubEnv('INGEST_TRAIL_IDENTITY', mode);
+    const { caller: against, aliasReads } = againstMissingTable();
 
-    await expect(gated.trails.bySlug({ slug: UNKNOWN })).rejects.toMatchObject({
+    await expect(against.trails.bySlug({ slug: UNKNOWN })).rejects.toMatchObject({
       code: 'NOT_FOUND',
-    } satisfies Partial<TRPCError>);
-    expect(aliasReads()).toBe(0);
-  });
-
-  it('is consulted under `claim`, which is what the gate is holding back', async () => {
-    vi.stubEnv('INGEST_TRAIL_IDENTITY', 'claim');
-    const { caller: ungated, aliasReads } = againstMissingTable();
-
-    // The 500 the gate exists to prevent: without it this is what every 404 returns.
-    await expect(ungated.trails.bySlug({ slug: UNKNOWN })).rejects.toMatchObject({
-      code: 'INTERNAL_SERVER_ERROR',
     } satisfies Partial<TRPCError>);
     expect(aliasReads()).toBe(1);
   });

@@ -91,6 +91,18 @@ export function createThrottledSweep(
  */
 export const QUEUE_DISTRESS_MARKER = 'switchback-ingest-queue-distress';
 
+/**
+ * The literal every reading emits, distressed or not, and the token
+ * `switchback-ingest-worker-silent` alerts on the *absence* of.
+ *
+ * A marker that only appears under distress makes silence ambiguous: a healthy queue and a
+ * process that is not running produce identical telemetry, so no rule reading it can tell a
+ * clean estate from a worker serving a build that has no such rule in it. One line per reading
+ * makes absence the alarmable condition, which is the only signal that catches a worker that
+ * stopped deploying.
+ */
+export const QUEUE_HEALTH_MARKER = 'switchback-ingest-queue-health';
+
 /** Distress the queue can be in, all of it visible to any reader of the two ingest tables. */
 export interface QueueHealth {
   /** Jobs buried within `DISTRESS_WINDOW_MS`. Nothing retries these. */
@@ -121,6 +133,14 @@ export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
 /** Whether anything in this reading is worth waking somebody for. */
 export function isDistressed(health: QueueHealth): boolean {
   return Object.values(health).some((count) => count > 0);
+}
+
+/** The five counts as one field list, so the heartbeat and the distress line cannot drift apart. */
+export function formatQueueHealth(health: QueueHealth): string {
+  return (
+    `dead=${health.dead} staleLeases=${health.staleLeases} rateLimited=${health.rateLimited} ` +
+    `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees}`
+  );
 }
 
 /**

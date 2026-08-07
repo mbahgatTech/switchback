@@ -35,7 +35,6 @@ import {
   requestArea,
   surveyArea,
   tileJobKey,
-  trailIdentityMode,
   VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
@@ -633,17 +632,24 @@ export const trailsRouter = router({
        * alias table is what keeps the retired one answering rather than 404ing every inbound
        * link — see `mergeTrails` in @switchback/ingest, which writes it.
        *
-       * Gated on the flag that writes it, as `uniqueSlug` and `claimWays` are. Only a merge
-       * creates an alias and only `claim` merges, so under the default the table holds nothing
-       * and need not exist — and querying a relation that does not exist would turn every
-       * genuine 404 into a 500, on the not-found page and on every stale inbound link.
+       * **Read on every mode, unlike `uniqueSlug` and `claimWays`, and that is what makes
+       * `INGEST_TRAIL_IDENTITY` reversible.** A merge is not undone by turning the flag off: the
+       * losing trail's rows are gone and its reviews, activities, sessions and photographs have
+       * been repointed at the winner. The alias is the only thing still answering the retired URL,
+       * so gating the read on the flag would leave a rollback strictly worse for readers than
+       * never having flipped it — every merge kept, every redirect withdrawn.
+       *
+       * The catch is what the gate used to be for. `trail_slug_aliases` exists in production and
+       * in any schema `db push` has touched, but a database that predates it would raise P2021
+       * here and turn every genuine 404 into a 500, on the not-found page and on every stale
+       * inbound link. A missing table means no aliases, which means not found.
        */
-      if (trailIdentityMode() !== 'claim') throw notFound();
-
-      const alias = await ctx.db.trailSlugAlias.findUnique({
-        where: { slug: input.slug },
-        select: { trail: { select: detailSelect } },
-      });
+      const alias = await ctx.db.trailSlugAlias
+        .findUnique({
+          where: { slug: input.slug },
+          select: { trail: { select: detailSelect } },
+        })
+        .catch(() => null);
       if (!alias) throw notFound();
       return toDetail(alias.trail);
     }),

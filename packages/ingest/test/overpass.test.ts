@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OVERPASS_STRAIN_MARKER,
   OverpassClient,
   OverpassFatalError,
   OverpassUnavailableError,
@@ -7,6 +8,7 @@ import {
   buildRegionQuery,
   buildTileQuery,
 } from '../src/overpass';
+import type { OverpassOptions } from '../src/overpass';
 
 const UA = 'Switchback/0.1 (+https://switchback.test; test@switchback.test)';
 
@@ -412,6 +414,99 @@ describe('OverpassClient circuit breaker', () => {
     clock += 61_000;
     // Half-open: the probe is allowed out, and its failure re-opens the breaker.
     await expect(client.query('[out:json];')).rejects.not.toBeInstanceOf(OverpassUnavailableError);
+  });
+});
+
+/**
+ * Etiquette is a correctness requirement here — the failure mode is an IP block that takes the
+ * product down — and this client made no `console` call at all, so a retried 429, a mirror
+ * failover and a breaker moving left no record on either drainer. What is asserted is the marker
+ * and that each event produces a line, not the wording after it.
+ */
+describe('OverpassClient strain reporting', () => {
+  const ONLY = 'https://overpass.test/api/interpreter';
+
+  function reporting(fetchImpl: typeof fetch, overrides: Partial<OverpassOptions> = {}) {
+    const lines: string[] = [];
+    const client = new OverpassClient({
+      url: ONLY,
+      userAgent: UA,
+      sleepImpl: async () => {},
+      logImpl: (line) => lines.push(line),
+      fetchImpl,
+      ...overrides,
+    });
+    return { client, strain: () => lines.filter((line) => line.includes(OVERPASS_STRAIN_MARKER)) };
+  }
+
+  it('reports a rate limit that the retry then absorbs', async () => {
+    let calls = 0;
+    const { client, strain } = reporting(async () => {
+      calls += 1;
+      return calls === 1 ? status(429, { 'retry-after': '3' }) : ok({ elements: [] });
+    });
+
+    await client.query('[out:json];');
+
+    // The event a successful retry hides: nothing reaches `ingest_jobs.lastError`, so without
+    // this line the only record of a mirror refusing is that nothing appeared to go wrong.
+    expect(strain()).toHaveLength(1);
+    expect(strain()[0]).toContain('status=429');
+    expect(strain()[0]).toContain('retryAfter=3');
+  });
+
+  it('reports a transport failure, which carries no status to read', async () => {
+    let calls = 0;
+    const { client, strain } = reporting(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('ECONNRESET');
+      return ok({ elements: [] });
+    });
+
+    await client.query('[out:json];');
+
+    expect(strain()).toHaveLength(1);
+    expect(strain()[0]).toContain('transport');
+    expect(strain()[0]).toContain('ECONNRESET');
+  });
+
+  it('reports the breaker opening, half-opening and closing', async () => {
+    let refuse = true;
+    const { client, strain } = reporting(
+      async () => (refuse ? status(503) : ok({ elements: [] })),
+      { failureThreshold: 1, maxAttempts: 1, openMs: 0 },
+    );
+
+    await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(client.breakerState).toBe('open');
+    expect(strain().some((line) => line.includes('breaker=open'))).toBe(true);
+
+    refuse = false;
+    await client.query('[out:json];');
+
+    expect(client.breakerState).toBe('closed');
+    expect(strain().some((line) => line.includes('breaker=half-open'))).toBe(true);
+    expect(strain().some((line) => line.includes('breaker=closed'))).toBe(true);
+  });
+
+  /*
+   * A probe that fails re-opens the breaker at once rather than spending `failureThreshold` more
+   * requests against a service that has just refused one — which is the etiquette rule the breaker
+   * exists to keep, and what the half-open path has always claimed to do.
+   */
+  it('re-opens on a failed probe rather than counting up to the threshold again', async () => {
+    const { client } = reporting(async () => status(503), {
+      failureThreshold: 3,
+      maxAttempts: 1,
+      openMs: 0,
+    });
+
+    for (let i = 0; i < 3; i += 1) await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(client.breakerState).toBe('open');
+
+    // The probe. Without the re-open it would take two more refusals to shut again.
+    await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(client.breakerState).toBe('open');
   });
 });
 
