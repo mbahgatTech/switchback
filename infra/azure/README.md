@@ -377,24 +377,29 @@ reason. What it changes is the _alerting_: a subscription-scoped budget cannot s
 this database when 94% of the spend is somebody else's, which is why `monitoring.bicep` carries a
 second, resource-group-scoped budget.
 
-### The two budgets, converged
+### The two budgets
 
-Both drifts were fixed by the deployment of 2026-08-05, which was possible because the admin
-password is known again — the deploy path required `PGADMIN_PASSWORD` at the time, so it could not
-be attempted while the value was lost. Supplying it is optional now; see [Redeploying](#redeploying).
+Both are live and both report `NoChange` against the template. Verified 2026-08-07 with
+`az consumption budget list` and `az deployment sub what-if`.
 
-| Budget                      | Was      | Now                                                                         |
-| --------------------------- | -------- | --------------------------------------------------------------------------- |
-| `switchback-database`       | `Create` | Created. The resource-group-scoped one, the only number about this workload |
-| `switchback-monthly-credit` | `Modify` | Converged to the declared ramp, 90% + 100%                                  |
+| Budget                      | Scope          | Thresholds    | What its number is about                            |
+| --------------------------- | -------------- | ------------- | --------------------------------------------------- |
+| `switchback-monthly-credit` | Subscription   | 90%, 100%     | Total spend, whoever spent it: the credit cliff     |
+| `switchback-database`       | Resource group | 50%, 75%, 90% | This workload alone, the only figure about Postgres |
 
-Creating the first one needed a second parameter. ARM refuses to create a monthly budget whose
-start date is before the current month, and the subscription budget — created in July and holding
-a live window nobody should move — keeps `2026-07-01`. Hence `budgetStartDate` and
-`workloadBudgetStartDate`, which are not duplication but two different immutable facts.
+They carry different start dates, and that is not duplication. ARM refuses to create a monthly
+budget whose start date is before the current month; the subscription budget was created in July
+and holds a live window nobody should move, so it keeps `2026-07-01` while the resource-group one
+keeps `2026-08-01`. Hence `budgetStartDate` and `workloadBudgetStartDate`, two different immutable
+facts.
 
-`main.bicep`'s header lists the other `what-if` diffs, which are provider-assigned residue and
-never converge. Read it before concluding the template has drifted.
+Neither needs the admin password. `main.bicepparam` falls back to empty and `postgres.bicep` omits
+`administratorLoginPassword` entirely when it is, so a redeploy converging a budget leaves the live
+credential untouched; see [Redeploying](#redeploying).
+
+`main.bicep`'s header lists the rest of the `what-if` change list: provider-assigned residue that
+never converges, and the one entry that is a real to-do. Read it before concluding the template has
+drifted.
 
 ---
 
@@ -748,9 +753,8 @@ az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
 
 Copy the `--notes` text from `lockNotes` in `main.bicep` rather than writing your own: `what-if`
 compares declared properties, not just existence, so notes that differ read as a permanent `Modify`
-— the same never-converging diff as a wrong name, in a quieter costume. **The live lock's notes are
-a shortened paraphrase and do not match `lockNotes`,** so expect exactly that until a deployment
-rewrites them.
+— the same never-converging diff as a wrong name, in a quieter costume. The live notes match
+`lockNotes` character for character, and `what-if` reports the lock as `NoChange`.
 
 ---
 

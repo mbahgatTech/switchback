@@ -15,24 +15,35 @@
 // or a pure function of the resource group id (`uniqueString`), so a redeploy reconciles the
 // existing server rather than provisioning beside it.
 //
-// **"No-op" is a claim someone will check, so here is what checking it actually shows.**
-// Re-measured 2026-08-01 with `az deployment sub what-if` against the live deployment: 18
-// changes — 11 `NoChange`, 6 `Modify`, 1 `Create`. Most of it is residue that never converges,
-// because it is either a value ARM will not read back or a value ARM rewrites on read. Two
-// items are not residue: they are real, and they converge the moment this template is next
-// deployed. The list is written down so nobody spends an afternoon on it a second time, and
-// the two halves are kept apart so nobody dismisses the second half as more of the first.
+// **"No-op" is a claim someone will check, so here is what checking it shows.** Measured
+// 2026-08-07 with `az deployment sub what-if` against the live deployment, `DEPLOY_DATABASE=false`
+// and `PGADMIN_PASSWORD` unset: 35 changes — 19 `NoChange`, 8 `Ignore`, 5 `Modify`, 2 `Create`,
+// 1 `Unsupported`. Both budgets and the delete lock are among the `NoChange`. The two `Create`
+// entries are one real to-do; everything else is residue, because it is either a value ARM will
+// not read back or a value ARM rewrites on read. The list is written down so nobody spends an
+// afternoon on it a second time, and the to-do is kept above the residue so it does not get
+// read as more of the same.
 //
-// ---- Permanent residue. Nothing here changes behaviour. ----
+// ---- Not residue. This is the one thing genuinely absent from the estate. ----
 //
-// 1. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
+// 1. `id-switchback-infra-deploy` and its `github-master` federated credential report `Create`
+//    because they do not exist. `.github/workflows/infrastructure.yml` cannot deploy anything
+//    until they do, and prints the same instruction when `AZURE_INFRA_CLIENT_ID` is unset.
+//    Creating them grants nothing on its own — the Contributor grant is a separate decision,
+//    held behind `grantInfraIdentityContributor`, and the identity is deliberately created
+//    ahead of it so the two can be taken one at a time.
+//
+// ---- Residue. Nothing here changes behaviour. ----
+//
+// 2. `administratorLoginPassword`. ARM has no way to read the current password, so whatever
 //    is passed is written. The parameter therefore defaults to empty and postgres.bicep omits
 //    the property entirely when it is: a redeploy that supplies no value leaves the live
-//    credential alone rather than rewriting it. Supply a value only to create the server or to
-//    rotate deliberately, and when rotating, expect every connection string carrying the old
-//    one to stop working. See infra/azure/README.md, "Redeploying".
+//    credential alone rather than rewriting it, which is why it does not appear in the change
+//    list above. Supply a value only to create the server or to rotate deliberately, and when
+//    rotating, expect every connection string carrying the old one to stop working. See
+//    infra/azure/README.md, "Redeploying".
 //
-// 2. Three server parameters report as changed on every run and never converge:
+// 3. Three server parameters report as changed on every run and never converge:
 //    `log_connections`, `log_disconnections` and `ssl_min_protocol_version`. The template
 //    declares `source: 'user-override'`; Azure collapses `source` back to `system-default`
 //    whenever the value equals the engine default, which all three do, so what-if reports
@@ -44,7 +55,7 @@
 //    `require_secure_transport = ON`, `ssl_min_protocol_version = TLSv1.2`,
 //    `connection_throttle.enable = on` and `azure.extensions = POSTGIS,PG_TRGM,BTREE_GIST`.
 //
-// 3. The server resource reports the deletion of five properties the template does not
+// 4. The server resource reports the deletion of five properties the template does not
 //    declare, because they are provider-assigned and only exist on read:
 //    `dataEncryption` (SystemManaged), `replica`, `replicationRole`, `storage.iops` (240, a
 //    function of the size) and `storage.type` (Premium_LRS). Plus `createMode: "Default"`,
@@ -52,39 +63,24 @@
 //    hard-coding derived values — `storage.iops` in particular moves on its own when autogrow
 //    fires, which is exactly the value main.bicepparam warns against pinning.
 //
-// 4. The diagnostic setting reports `logAnalyticsDestinationType` being removed and its `logs`
+// 5. The diagnostic setting reports `logAnalyticsDestinationType` being removed and its `logs`
 //    and `metrics` arrays as changed. Same cause: `AzureDiagnostics` is the provider's default
 //    fill-in, and what-if compares arrays it cannot match by identity.
 //
-// ---- Not residue. These two are real and this template is the correct side of them. ----
+// 6. One `Unsupported` entry names `ciAdmin`, the Postgres administrator keyed on
+//    `ciIdentity.outputs.principalId`. What-if cannot compute a resource id that depends on a
+//    module output, so it declines to analyse the resource rather than reporting a change. The
+//    administrator is live: `az rest --method get --url ".../flexibleServers/<name>/
+//    administrators?api-version=2024-08-01"` lists `id-switchback-postgres-ci` beside the Entra
+//    user declared in main.bicepparam.
 //
-// 5. `switchback-database`, the resource-group-scoped budget in monitoring.bicep, reports as
-//    `Create` because **it does not exist**. Confirmed directly rather than inferred from the
-//    what-if:
+// 7. Eight `Ignore` entries — the Service Bus namespace, the storage account, the Application
+//    Insights component, the Function App and its plan, and the two ingest alerts, all declared
+//    in `ingest.bicep` and deployed separately at resource-group scope; plus the Smart Detection
+//    action group Application Insights creates for itself. `Ignore` is what an incremental
+//    deployment does to a resource it does not declare: it leaves it alone.
 //
-//      az rest --method get --url ".../rg-switchback-prod-northcentralus/providers/
-//        Microsoft.Consumption/budgets?api-version=2023-05-01"   ->   { "value": [] }
-//
-//    monitoring.bicep argues at length for why this budget is the only one whose number is
-//    about Postgres. That argument has been true and undeployed since it was written.
-//
-// 6. `switchback-monthly-credit` reports `Modify`: the live budget still carries the old
-//    graded ramp — notifications `half` (50%), `threeQuarters` (75%), `nearlyOut` (90%) —
-//    while this file declares the two-notification design the long comment beside the budget
-//    below explains, `nearlyOut` (90%) and `overCredit` (100%). `az consumption budget list`
-//    reports `notifications: half,nearlyOut,threeQuarters`. So the reasoning below describes
-//    an intent, not the deployed state, until the next deployment.
-//
-// Both of 5 and 6 are fixed by deploying, not by editing this file. Neither was converged at
-// the time this note was written, because doing so means passing `administratorLoginPassword`
-// and item 1 makes that the one operation on this list that is worth being certain about
-// first — a redeploy carrying the wrong value rotates the production credential.
-//
-// The budget window used to be on this list, because `budgetStartDate` defaulted to
-// `utcNow()`. It is now a fixed timestamp passed from main.bicepparam with an explicit
-// `endDate`, in the exact form ARM stores (`2026-07-01T00:00:00Z`, not `2026-07-01` — the
-// short form deploys identically and then diffs forever), and it converges: the live budget
-// reads back `2026-07-01T00:00:00Z` / `2036-07-01T00:00:00Z` and neither appears above.
+// Creating the server, or rotating the credential on purpose:
 //
 //   openssl rand -hex 32 > "$TMP/pgpw"
 //   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
@@ -527,13 +523,12 @@ var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 // which is correct, because the point is to make destruction deliberate rather than
 // impossible.
 //
-// **Status at the time this was committed: the lock is declared here and is NOT yet live.**
-// Creating it needs `Microsoft.Authorization/locks/write`, the service principal that deploys
-// this subscription holds only Contributor, and Contributor's `notActions` exclude exactly
-// that. The attempt and its verbatim error are in the pull request. Until someone with Owner
-// or User Access Administrator applies it, `az deployment sub what-if` will report this
-// resource as a `Create` — that is an accurate to-do item, not template drift. See
-// `deployDeleteLock` above for the escape hatch a Contributor-only deployment needs.
+// **The lock is live**, and its notes match `lockNotes` below character for character, so
+// `az deployment sub what-if` reports it as `NoChange`. Maintaining it needs
+// `Microsoft.Authorization/locks/write`, which Contributor's `notActions` exclude — so a
+// Contributor-only principal cannot deploy this template at all while `deployDeleteLock` is
+// true, existing lock or not, because preflight authorizes the action rather than the diff.
+// See `deployDeleteLock` above for the escape hatch that situation needs.
 // ---------------------------------------------------------------------------------------
 
 module deleteLock 'lock.bicep' = if (deployDeleteLock) {
@@ -657,11 +652,10 @@ module postgres 'postgres.bicep' = {
 // which means that when the monthly credit is consumed the subscription is *disabled* and
 // every resource in it is deallocated. postgres.bicep chooses Burstable over General Purpose
 // explicitly to stay at ~38% of the credit rather than ~91%, and README.md argues the same.
-// And until this revision, nothing measured it: `az consumption budget list` returned `[]`.
-// The first notice of the cliff would have been the site being down — with a recovery of
-// either "wait for the next billing month" or "remove the spending limit", which converts the
-// subscription to pay-as-you-go and starts charging a card. Neither is a five-minute fix, and
-// the symptom table in README.md now carries a row for it.
+// Without a budget nothing measures it, and the first notice of the cliff is the site being
+// down — with a recovery of either "wait for the next billing month" or "remove the spending
+// limit", which converts the subscription to pay-as-you-go and starts charging a card. Neither
+// is a five-minute fix, and the symptom table in README.md carries a row for it.
 //
 // A note on verifying that claim, because the obvious command no longer shows it: current
 // `az` returns `subscriptionPolicies.spendingLimit` as `null` from `az account show`. The
