@@ -169,8 +169,10 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
     const { requeued } = await sweepQueue(prisma, NOW);
 
     // The row, not only the count: `requeued` is a total over every expired lease in the table.
+    // `lockedBy` survives on purpose — the status change is what releases the lease, and this is
+    // the only record that `cron` is the process that died holding it.
     const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
-    expect(job).toMatchObject({ status: JobStatus.queued, attempts: 2, lockedBy: null });
+    expect(job).toMatchObject({ status: JobStatus.queued, attempts: 2, lockedBy: 'cron' });
     expect(requeued).toBeGreaterThanOrEqual(1);
   });
 });

@@ -353,6 +353,8 @@ describe('unsplitTile', () => {
 
   interface UnsplitRecorded {
     transactions: number;
+    /** Every operation the transaction body performed, in order, for the fence assertions. */
+    steps: string[];
     deletedJobKeys: string[];
     deletedTiles: string[];
     parentUpdate: Record<string, unknown> | null;
@@ -366,15 +368,20 @@ describe('unsplitTile', () => {
   ): { db: PrismaClient; recorded: UnsplitRecorded } {
     const recorded: UnsplitRecorded = {
       transactions: 0,
+      steps: [],
       deletedJobKeys: [],
       deletedTiles: [],
       parentUpdate: null,
       enqueued: [],
     };
     const db = {
-      $transaction: (operations: Promise<unknown>[]) => {
+      $transaction: (body: (tx: PrismaClient) => Promise<unknown>) => {
         recorded.transactions += 1;
-        return Promise.all(operations);
+        return body(db);
+      },
+      $executeRaw: (strings: TemplateStringsArray) => {
+        recorded.steps.push(strings.join('?').includes('pg_advisory_xact_lock') ? 'lock' : 'raw');
+        return Promise.resolve(1);
       },
       ingestTile: {
         findUnique: () => Promise.resolve(parentStatus === null ? null : { status: parentStatus }),
@@ -385,18 +392,24 @@ describe('unsplitTile', () => {
               .map((quadkey) => ({ quadkey })),
           ),
         deleteMany: ({ where }: { where: { quadkey: { in: string[] } } }) => {
+          recorded.steps.push('deleteTiles');
           recorded.deletedTiles.push(...where.quadkey.in);
           return Promise.resolve({ count: where.quadkey.in.length });
         },
         update: (args: { data: Record<string, unknown> }) => {
+          recorded.steps.push('updateParent');
           recorded.parentUpdate = args.data;
           return Promise.resolve({});
         },
       },
       ingestJob: {
-        count: () => Promise.resolve(runningJobs),
+        count: () => {
+          recorded.steps.push('countRunning');
+          return Promise.resolve(runningJobs);
+        },
         updateMany: () => Promise.resolve({ count: 0 }),
         deleteMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) => {
+          recorded.steps.push('deleteJobs');
           recorded.deletedJobKeys.push(...where.dedupeKey.in);
           return Promise.resolve({ count: where.dedupeKey.in.length });
         },
@@ -455,8 +468,26 @@ describe('unsplitTile', () => {
     const { db, recorded } = unsplitDb([PARENT, ...CHILDREN], TileStatus.pending, 1);
 
     await expect(unsplitTile(db, PARENT)).rejects.toThrow(/still running/);
-    expect(recorded.transactions).toBe(0);
     expect(recorded.deletedTiles).toEqual([]);
+    expect(recorded.deletedJobKeys).toEqual([]);
+  });
+
+  /*
+   * The refusal is only worth anything if nothing can start between reading it and acting on it.
+   * Every claim of a tile job is made under `DRAIN_ADMISSION_KEY`, so the count has to be taken
+   * after this transaction holds that lock — a count outside it describes the moment before the
+   * cron fired, and the operator does not control the cron's schedule.
+   */
+  it('reads the running count under the same lock the drain claims through', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN]);
+
+    await unsplitTile(db, PARENT);
+
+    expect(recorded.steps[0]).toBe('lock');
+    expect(recorded.steps.indexOf('countRunning')).toBeGreaterThan(recorded.steps.indexOf('lock'));
+    expect(recorded.steps.indexOf('countRunning')).toBeLessThan(
+      recorded.steps.indexOf('deleteJobs'),
+    );
   });
 
   it('refuses a quadkey with no tile row at all', async () => {

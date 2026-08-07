@@ -180,8 +180,20 @@ var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
 var websiteContributorRoleId = 'de139f84-1756-47ae-9be6-808fbbe84772'
 var monitoringReaderRoleId = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
 
-@description('GitHub repository whose master branch may publish the worker bundle.')
-param workerDeployRepository string = 'mbahgatTech/switchback'
+@description('''
+The `sub` prefix GitHub actually stamps on this repository's OIDC tokens.
+
+**Not `repo:<owner>/<repo>`.** GitHub issues an immutable subject built from the numeric account
+and repository ids, and a credential written against the human-readable form matches nothing —
+`azure/login` fails with AADSTS70021 and the deploy job that was meant to close the stale-build
+loop reopens it. Read the live value back with:
+
+    gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix
+
+`id-switchback-postgres-ci` — the one federated credential in this estate observed to work, in
+CI run 31183187247 — carries exactly this prefix.
+''')
+param workerDeploySubjectPrefix string = 'repo:mbahgatTech@81331884/switchback@1316632119'
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
@@ -963,17 +975,23 @@ resource workerDeployer 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-0
 @description('''
 The `master` branch of this repository, and nothing else.
 
-Every field is matched exactly and case-sensitively, so a pull request — whose subject is
-`repo:<owner>/<repo>:pull_request` — cannot assume this identity. That matters more here than for
-the identities above: this repository is public, so a fork's pull request runs workflow code the
-fork controls, and a credential a fork could assume is a credential that can rewrite production.
+Every field is matched exactly and case-sensitively, so a pull request — whose subject ends
+`:pull_request` — cannot assume this identity. That matters more here than for the identities
+above: this repository is public, so a fork's pull request runs workflow code the fork controls,
+and a credential a fork could assume is a credential that can rewrite production.
+
+**The suffix is `ref:`, which constrains the workflow that may use it.** A job that names a
+GitHub `environment` presents `:environment:<name>` in place of the ref, so declaring one on
+`deploy ingest worker` silently stops this credential matching. `.github/scripts/assert-oidc-subject.sh`
+runs on every push and compares the token GitHub actually issues against this value, so the two
+cannot drift apart unobserved again.
 ''')
 resource workerDeployerMaster 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
   parent: workerDeployer
   name: 'github-switchback-master'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${workerDeployRepository}:ref:refs/heads/master'
+    subject: '${workerDeploySubjectPrefix}:ref:refs/heads/master'
     audiences: [
       'api://AzureADTokenExchange'
     ]
@@ -1109,7 +1127,7 @@ under which it matters.
 **Each of the five can return to zero, which is what makes this a rule rather than a light left
 on.** Two of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
 `pruneFinishedJobs` keeps that row for thirty days, so an unwindowed count reads the same
-seventeen for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
+twenty-five for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
 `packages/ingest/src/maintenance.ts` bounds `dead` and `rateLimited` to the last hour — longer than
 this rule's fifteen-minute window, so nothing falls between evaluations. `orphanedSplits` counts
 only parents whose children are actually missing, not every parent midway through a legitimate

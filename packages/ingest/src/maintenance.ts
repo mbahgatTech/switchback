@@ -124,7 +124,7 @@ export interface QueueHealth {
  * and never clears — and an alert that cannot change state says nothing about the 429 it exists
  * to surface. Two of the five are cumulative by nature: `failJob` buries a job as `dead` rather
  * than deleting it, deliberately, and `pruneFinishedJobs` keeps those rows for thirty days, so
- * production's resting reading was `dead=17` and would have pinned the gauge on for a month.
+ * production's resting reading is `dead=25` and would have pinned the gauge on for a month.
  * An hour is longer than the rule's fifteen-minute window, so nothing slips between evaluations,
  * and short enough that a fixed queue reads clean by the next tick.
  */
@@ -148,9 +148,14 @@ export function formatQueueHealth(health: QueueHealth): string {
  *
  * `rateLimited` matches on `lastError` rather than on a counter, because the drainer that
  * produces it keeps no counter this process can read — `OverpassClient` records the mirror's 429
- * in the message it throws, `failJob` stores it, and the row outlives the lambda. It counts a job
- * that has not finished at all alongside one buried inside the window: a 429 leaves the job
- * `queued` on a backoff, where `completedAt` is still null and the retry is still ahead of it.
+ * in the message it throws, `failJob` stores it, and the row outlives the lambda.
+ *
+ * Both arms are windowed, and the unfinished one is why. `failJob` requeues a rate-limited job
+ * with `completedAt` still null and `lastError` intact, so a predicate that accepted any null
+ * `completedAt` counted that row until the job finally ran — which, against 44,884 queued jobs,
+ * is weeks. That is the pinned gauge this window exists to prevent, in the field it exists to
+ * report. `runAfter` is what `failJob` moves forward, so it dates the refusal to within one
+ * backoff step.
  */
 export async function queueHealth(
   db: PrismaClient = prisma,
@@ -168,7 +173,7 @@ export async function queueHealth(
     db.ingestJob.count({
       where: {
         lastError: { contains: '429' },
-        OR: [{ completedAt: null }, { completedAt: { gte: recent } }],
+        OR: [{ completedAt: { gte: recent } }, { runAfter: { gte: recent } }],
       },
     }),
     countOrphanedSplits(db),

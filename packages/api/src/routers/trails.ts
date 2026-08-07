@@ -639,17 +639,25 @@ export const trailsRouter = router({
        * so gating the read on the flag would leave a rollback strictly worse for readers than
        * never having flipped it — every merge kept, every redirect withdrawn.
        *
-       * The catch is what the gate used to be for. `trail_slug_aliases` exists in production and
-       * in any schema `db push` has touched, but a database that predates it would raise P2021
-       * here and turn every genuine 404 into a 500, on the not-found page and on every stale
-       * inbound link. A missing table means no aliases, which means not found.
+       * The catch is what the gate used to be for, and it catches exactly one thing.
+       * `trail_slug_aliases` exists in production and in any schema `db push` has touched, but a
+       * database that predates it would raise P2021 here and turn every genuine 404 into a 500,
+       * on the not-found page and on every stale inbound link. A missing table means no aliases,
+       * which means not found. Anything else — a dropped connection, a timeout, a permissions
+       * error — is a real failure and has to keep surfacing as one, or an outage reads to every
+       * caller as "no such trail" on the path that now serves every merged-away URL.
        */
       const alias = await ctx.db.trailSlugAlias
         .findUnique({
           where: { slug: input.slug },
           select: { trail: { select: detailSelect } },
         })
-        .catch(() => null);
+        .catch((error: unknown) => {
+          if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2021') {
+            return null;
+          }
+          throw error;
+        });
       if (!alias) throw notFound();
       return toDetail(alias.trail);
     }),

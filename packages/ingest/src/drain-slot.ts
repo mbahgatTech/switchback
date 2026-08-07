@@ -20,8 +20,12 @@ import type { ClaimGate, ClaimedBatch } from './jobs';
  * Advisory-lock key for the admission decision. Arbitrary but fixed; it names this decision and
  * nothing else, and `pg_advisory_xact_lock` releases it when the transaction ends whatever
  * happens to the process holding it.
+ *
+ * Exported because `unsplitTile` takes the same lock: every claim of a tile job happens under it,
+ * so holding it is the only way to be sure no descendant job starts between reading that none is
+ * running and deleting the subtree.
  */
-const DRAIN_ADMISSION_KEY = 4_155_923_017n;
+export const DRAIN_ADMISSION_KEY = 4_155_923_017n;
 
 /**
  * Processes that may hold Overpass-making work at once, when `INGEST_MAX_DRAINERS` does not say

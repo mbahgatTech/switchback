@@ -186,8 +186,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # `id-token` for the subject check below, which asks GitHub for a token and reads its `sub`.
+    # Naming any permission replaces the default set, so `contents` is restated for the checkout.
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - uses: actions/checkout@v4
+
+      # Before anything expensive, and on every push and pull request rather than only on the
+      # deploys that need it. The `deploy ingest worker` job below is gated on master, so a
+      # subject that stops matching would first appear as a red master with the Function App
+      # still on the last build a human pushed — which is the whole of B1, restored.
+      - name: The deploy credential still matches the subject GitHub issues
+        run: bash .github/scripts/assert-oidc-subject.sh
 
       - uses: actions/setup-node@v4
         with:
@@ -279,9 +292,19 @@ jobs:
   # weeks while the Function App served whatever zip a human last pushed — with every gate green,
   # because a green gate is a statement about a build and not about production.
   #
-  # `needs: gates` as well as `worker`, so a bundle that compiles but fails the unit suite does not
-  # ship. Not `needs: migrate`: the worker reads the same schema the web app does, so a column it
-  # expects has to exist first, and `migrate` is what puts it there. It is listed.
+  # `needs` lists all three. `gates` so a bundle that compiles but fails the unit suite does not
+  # ship; `worker` for the artifact; `migrate` because the worker reads the same schema the web app
+  # does, so a column it expects has to exist before the code expecting it runs. That ordering is
+  # pinned by `test/ci-steps-runnable.test.ts` — dropping `migrate` from this list is how code
+  # reaches production ahead of the schema it needs.
+  #
+  # **No `environment:`.** Naming one replaces the `:ref:refs/heads/master` suffix of the OIDC
+  # subject with `:environment:<name>`, which this job's federated credential does not match — and
+  # the `production` environment carries no protection rules (`gh api
+  # repos/mbahgatTech/switchback/environments` returns `protection_rules: []`), so it would have
+  # bought a deployment record at the cost of the credential. The gate that matters here is the
+  # `if:` below plus the deploy check in ci.yml's `deploy` job: nothing reaches master except
+  # through a pull request.
   worker-deploy:
     name: deploy ingest worker
     needs: [gates, worker, migrate]
@@ -292,9 +315,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-
-    environment:
-      name: production
 
     steps:
       - uses: actions/checkout@v4
@@ -327,12 +347,19 @@ jobs:
           tenant-id: f0f92920-ce90-42c9-b87f-3ea8644bccd8
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # Publishes, syncs the trigger cache, and then waits for the running host to emit a line only
-      # the current `health.ts` produces. It fails if the package did not change or if no heartbeat
-      # arrives — an exit code from the push alone would have reported every stale deploy as a
-      # success.
+      # Not preinstalled on `ubuntu-latest`, and the deploy proof is an Application Insights query.
+      # Installing it explicitly rather than letting `az` offer a dynamic install: that prompt is
+      # declined in a non-interactive shell, and the query would then fail in a way the script
+      # cannot distinguish from a host that never started.
+      - name: Install the Application Insights CLI extension
+        run: az extension add --name application-insights --only-show-errors
+
+      # Publishes, syncs the trigger cache, and then waits for the running host to emit a heartbeat
+      # carrying *this commit's* SHA. It fails if the package did not change or if that line does
+      # not arrive — an exit code from the push alone reported every stale deploy as a success, and
+      # a marker without the SHA would pass on any build that already had the current health.ts.
       - name: Publish the bundle and prove the host is running it
-        run: bash .github/scripts/deploy-worker.sh "$RUNNER_TEMP/ingest-worker.zip"
+        run: bash .github/scripts/deploy-worker.sh "$RUNNER_TEMP/ingest-worker.zip" "$GITHUB_SHA"
 
   browser:
     name: browser suite

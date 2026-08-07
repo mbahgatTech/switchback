@@ -490,6 +490,31 @@ describe('OverpassClient strain reporting', () => {
   });
 
   /*
+   * The one strain event that leaves no other trace at all. A 429 names its status and a
+   * transport failure its error, but a failover is a change of `this.cursor` — reconstructible
+   * only by diffing the `endpoint=` field across consecutive lines, which is not a thing an
+   * on-caller does at three in the morning.
+   */
+  it('names the mirror it moved to', async () => {
+    const SECOND = 'https://overpass.second/api/interpreter';
+    let calls = 0;
+    const { client, strain } = reporting(
+      async () => {
+        calls += 1;
+        return calls === 1 ? status(429) : ok({ elements: [] });
+      },
+      { url: [ONLY, SECOND] },
+    );
+
+    await client.query('[out:json];');
+
+    const failover = strain().find((line) => line.includes('failover='));
+    expect(failover).toBeDefined();
+    expect(failover).toContain(ONLY);
+    expect(failover).toContain(SECOND);
+  });
+
+  /*
    * A probe that fails re-opens the breaker at once rather than spending `failureThreshold` more
    * requests against a service that has just refused one — which is the etiquette rule the breaker
    * exists to keep, and what the half-open path has always claimed to do.

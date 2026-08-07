@@ -13,6 +13,7 @@ import {
   quadkeyToBBox,
   quadkeyToTile,
 } from '@switchback/geo';
+import { DRAIN_ADMISSION_KEY } from './drain-slot';
 import { isTileFresh, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
 import { LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
@@ -423,6 +424,11 @@ export interface UnsplitResult {
  * Refuses while any descendant job is `running`. That job's handler would upsert its tile row back
  * after this deleted it — re-wedging the parent — and a lease is at most `LEASE_TIMEOUT_MS` old, so
  * waiting is a bounded instruction rather than an open one.
+ *
+ * The refusal is decided **inside** the transaction, under `DRAIN_ADMISSION_KEY`. Every claim of a
+ * tile job is made under that same lock, so a count taken outside it is a reading from before the
+ * drain that is about to start: the cron fires on a schedule the operator does not control, and
+ * `INGEST_MAX_DRAINERS=1` narrows the window without closing it.
  */
 export async function unsplitTile(db: PrismaClient, quadkey: string): Promise<UnsplitResult> {
   const parent = await db.ingestTile.findUnique({
@@ -431,34 +437,37 @@ export async function unsplitTile(db: PrismaClient, quadkey: string): Promise<Un
   });
   if (!parent) throw new Error(`no ingest_tiles row for ${quadkey}`);
 
-  // Quadkeys are hierarchical prefixes, so every descendant at every depth starts with the
-  // parent's — which the parent itself also does, hence the exclusion.
-  const descendants = await db.ingestTile.findMany({
-    where: { quadkey: { startsWith: quadkey }, NOT: { quadkey } },
-    select: { quadkey: true },
-  });
-  const keys = descendants.map((tile) => tile.quadkey);
-  const jobKeys = keys.map(tileJobKey);
-
-  const running = await db.ingestJob.count({
-    where: { dedupeKey: { in: jobKeys }, status: JobStatus.running },
-  });
-  if (running > 0) {
-    throw new Error(
-      `${quadkey}: ${running} descendant job(s) still running. Wait for the lease to expire ` +
-        `(at most ${Math.round(LEASE_TIMEOUT_MS / 60_000)} min) and run this again.`,
-    );
-  }
-
   const status = isTileSettled(parent.status) ? parent.status : TileStatus.pending;
 
   // One transaction, because a parent whose marker survives its children is precisely the wedged
   // state this exists to prevent.
-  await db.$transaction([
-    db.ingestJob.deleteMany({ where: { dedupeKey: { in: jobKeys } } }),
-    db.ingestTile.deleteMany({ where: { quadkey: { in: keys } } }),
-    db.ingestTile.update({ where: { quadkey }, data: { status, lastError: null } }),
-  ]);
+  const descendantsRemoved = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`select pg_advisory_xact_lock(${DRAIN_ADMISSION_KEY})`;
+
+    // Quadkeys are hierarchical prefixes, so every descendant at every depth starts with the
+    // parent's — which the parent itself also does, hence the exclusion.
+    const descendants = await tx.ingestTile.findMany({
+      where: { quadkey: { startsWith: quadkey }, NOT: { quadkey } },
+      select: { quadkey: true },
+    });
+    const keys = descendants.map((tile) => tile.quadkey);
+    const jobKeys = keys.map(tileJobKey);
+
+    const running = await tx.ingestJob.count({
+      where: { dedupeKey: { in: jobKeys }, status: JobStatus.running },
+    });
+    if (running > 0) {
+      throw new Error(
+        `${quadkey}: ${running} descendant job(s) still running. Wait for the lease to expire ` +
+          `(at most ${Math.round(LEASE_TIMEOUT_MS / 60_000)} min) and run this again.`,
+      );
+    }
+
+    await tx.ingestJob.deleteMany({ where: { dedupeKey: { in: jobKeys } } });
+    await tx.ingestTile.deleteMany({ where: { quadkey: { in: keys } } });
+    await tx.ingestTile.update({ where: { quadkey }, data: { status, lastError: null } });
+    return keys.length;
+  });
 
   await enqueue(db, {
     kind: JobKind.ingest_tile,
@@ -467,5 +476,5 @@ export async function unsplitTile(db: PrismaClient, quadkey: string): Promise<Un
     priority: SPLIT_PRIORITY,
   });
 
-  return { quadkey, descendantsRemoved: keys.length, status };
+  return { quadkey, descendantsRemoved, status };
 }

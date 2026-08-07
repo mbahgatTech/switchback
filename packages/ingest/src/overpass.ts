@@ -357,6 +357,10 @@ export class OverpassClient implements OverpassQuerier {
       const retry = async (): Promise<void> => {
         this.cursor = (this.cursor + 1) % this.endpoints.length;
         const next = this.endpoints[this.cursor] ?? endpoint;
+        // Named rather than left to be reconstructed by diffing `endpoint=` across consecutive
+        // lines: a failover is the response to a mirror refusing this client, and it is the event
+        // an operator investigating an IP block is looking for.
+        if (next !== endpoint) this.reportStrain(`failover=${endpoint} -> ${next}`);
         if (tried.has(next)) {
           await this.sleepImpl(
             Math.min(this.backoffMs(attempt, retryAfter), Math.max(remaining(), 0)),

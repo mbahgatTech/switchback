@@ -4,6 +4,7 @@ import {
   LEASE_TIMEOUT_MS,
   claimJobs,
   completeJob,
+  deferJob,
   drainJobs,
   enqueue,
   failJob,
@@ -439,9 +440,14 @@ describe('the outcome fence', () => {
 
     await expect(completeJob(db, job(), new Date())).resolves.toBe(true);
 
-    // Conditional on the lease, not on the id alone.
+    // Conditional on the lease *and* on the job still being in it, not on the id alone.
     const fence = recorded.updateManys.at(-1)!.where;
-    expect(fence).toEqual({ id: 'job-1', lockedBy: 'worker-a', lockedAt: job().lockedAt });
+    expect(fence).toEqual({
+      id: 'job-1',
+      status: JobStatus.running,
+      lockedBy: 'worker-a',
+      lockedAt: job().lockedAt,
+    });
   });
 
   it("drops a late worker's outcome rather than overwriting the new owner", async () => {
@@ -468,35 +474,43 @@ describe('the outcome fence', () => {
 /**
  * `INGEST_MAX_DRAINERS` is enforced by `drainSlotGate` counting `distinct "lockedBy"` over
  * `running` rows — a reading that exists only while something is mid-drain, and eight samples over
- * seventy seconds of production caught zero. `drainedBy` is what makes the achieved concurrency
- * recoverable from finished work instead: `count(distinct "drainedBy")` over a window.
+ * seventy seconds of production caught zero. Leaving the lease pair on the row after the outcome
+ * is what makes the achieved concurrency recoverable from finished work instead: `lockedAt` and
+ * `completedAt` bound one drain, so overlapping intervals answer it.
+ *
+ * Nothing is nulled on the way out, so `status` has to be the thing that releases the lease.
+ * Both halves are asserted here — a fence that dropped `status` while the writes stopped nulling
+ * would let a reclaimed-then-requeued job accept its old worker's outcome.
  */
 describe('which process ran a job', () => {
   it.each([
     ['completeJob', (db: Db) => completeJob(db, job(), new Date())],
     ['failJob', (db: Db) => failJob(db, job(), new Error('nope'), new Date())],
-  ])('survives %s nulling the lease', async (_name, write) => {
+    ['deferJob', (db: Db) => deferJob(db, { ...job(), attempts: 1 }, 'wrong build', new Date())],
+  ])('survives %s', async (_name, write) => {
     const { db, recorded } = fakeDb();
 
     await write(db);
 
-    const data = recorded.updateManys.at(-1)!.data;
-    expect(data.lockedBy).toBeNull();
-    expect(data.drainedBy).toBe('worker-a');
+    const write_ = recorded.updateManys.at(-1)!;
+    expect(write_.data).not.toHaveProperty('lockedBy');
+    expect(write_.data).not.toHaveProperty('lockedAt');
+    // The release, in place of the nulls.
+    expect(write_.where.status).toBe(JobStatus.running);
   });
 
-  it('is captured by the lease sweep from the row it is about to clear', async () => {
+  it('survives the lease sweep that takes a dead worker back', async () => {
     const { db, recorded } = fakeDb([], {
       running: [{ id: 'job-9', lockedAt: new Date(0), attempts: 1, maxAttempts: 5 }],
     });
 
     await reclaimExpiredJobs(db, new Date(LEASE_TIMEOUT_MS * 2));
 
-    // Postgres evaluates the whole SET against the pre-update row, so this reads the dead
-    // worker's name rather than the NULL assigned in the same statement.
     const sweep = recorded.rawSql.find((sql) => sql.includes('RETURNING status'))!;
-    expect(sweep).toContain('"drainedBy"   = "lockedBy"');
-    expect(sweep.indexOf('"lockedBy"    = NULL')).toBeLessThan(sweep.indexOf('"drainedBy"'));
+    expect(sweep).not.toContain('"lockedBy"');
+    expect(sweep).not.toContain('"lockedAt"    = NULL');
+    // What releases it instead — the sweep writes `queued` or `dead` over `running`.
+    expect(sweep).toContain("status = 'running'");
   });
 });
 

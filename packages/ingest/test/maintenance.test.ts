@@ -269,7 +269,7 @@ describe('the queue health report', () => {
   /**
    * A gauge that cannot return to zero is not a gauge. `failJob` buries a job as `dead` on
    * purpose and `pruneFinishedJobs` keeps it for thirty days, so an unwindowed count reads
-   * production's seventeen for a month and the alert can never clear — which is the same as
+   * production's twenty-five for a month and the alert can never clear — which is the same as
    * having no alert, on the one signal (a 429) it exists to raise.
    */
   it('counts only what happened recently, so a resolved queue can read clean', async () => {
@@ -293,7 +293,9 @@ describe('the queue health report', () => {
     expect(dead?.completedAt?.gte).toEqual(since);
 
     const limited = seen.find((where) => where.lastError?.contains === '429');
-    expect(limited?.OR).toEqual([{ completedAt: null }, { completedAt: { gte: since } }]);
+    // Both arms windowed. `{ completedAt: null }` here counted a requeued job until it finally
+    // ran, which against a 44,884-row backlog is the pinned gauge two lines up in this comment.
+    expect(limited?.OR).toEqual([{ completedAt: { gte: since } }, { runAfter: { gte: since } }]);
   });
 
   it('is silent when nothing is wrong', () => {

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { QUEUE_DISTRESS_MARKER, QUEUE_HEALTH_MARKER } from '@switchback/ingest';
 import type { QueueHealth } from '@switchback/ingest';
 import type { PrismaClient } from '@switchback/db';
+import { BUILD_COMMIT } from '../src/build';
 import { reportQueueHealth } from '../src/health';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -60,6 +61,20 @@ describe('the queue health report', () => {
     const [line] = log.info.mock.calls[0] as [string];
     expect(line).toContain(QUEUE_HEALTH_MARKER);
     expect(line).toContain('dead=0');
+  });
+
+  /*
+   * The deploy waits for a heartbeat carrying the commit it just pushed. Without the commit the
+   * wait proves only that *a* host is alive: any build already carrying this file satisfies a
+   * bare marker, so a package that failed to mount would pass on the previous build's telemetry.
+   */
+  it('names the build it came from', async () => {
+    const log = silentLog();
+
+    await reportQueueHealth(fakeDb(CLEAN), log);
+
+    const [line] = log.info.mock.calls[0] as [string];
+    expect(line).toContain(`${QUEUE_HEALTH_MARKER} build=${BUILD_COMMIT}`);
   });
 
   /*

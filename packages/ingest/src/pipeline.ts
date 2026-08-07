@@ -1057,14 +1057,7 @@ async function attemptCommit(
       await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
     }
 
-    const slug = await uniqueSlug(
-      tx,
-      trail.name,
-      ctx.region.regionName,
-      osmType,
-      osmId,
-      ctx.identity,
-    );
+    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
 
     const row = {
       slug,
@@ -1260,7 +1253,6 @@ async function uniqueSlug(
   regionName: string | null,
   osmType: OsmElementType,
   osmId: bigint,
-  identity: TrailIdentityMode,
 ): Promise<string> {
   const candidates = [slugify(name)];
   if (regionName) candidates.push(slugify(name, regionName));
@@ -1278,8 +1270,9 @@ async function uniqueSlug(
     }
     // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
     // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
-    // Only merges retire a slug, and only `claim` merges, so only `claim` reads the table.
-    if (identity !== 'claim') return candidate;
+    // Read in every mode, not only `claim`: a merge made while the flag was on retires a slug
+    // permanently, and the rollback that turns the flag off is exactly when an unrelated trail
+    // would otherwise be free to take it.
     const alias = await tx.trailSlugAlias.findUnique({
       where: { slug: candidate },
       select: { slug: true },

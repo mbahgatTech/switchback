@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TRPCError } from '@trpc/server';
-import { Difficulty, RouteType, prisma } from '@switchback/db';
+import { Difficulty, Prisma, RouteType, prisma } from '@switchback/db';
 import { appRouter } from '../src/root';
 import { createCallerFactory } from '../src/trpc';
 
@@ -125,19 +125,25 @@ describe('a database with no `trail_slug_aliases`', () => {
    * that predates it raises P2021 on this read. Counting the reads is what separates "the fallback
    * ran and found nothing" from "the fallback was never attempted".
    */
-  function againstMissingTable() {
+  function againstAliasFailure(error: Error) {
     let aliasReads = 0;
     const db = {
       trail: { findUnique: () => Promise.resolve(null) },
       trailSlugAlias: {
         findUnique: () => {
           aliasReads += 1;
-          return Promise.reject(new Error('relation "trail_slug_aliases" does not exist'));
+          return Promise.reject(error);
         },
       },
     };
     return { caller: callerFor(db as unknown as typeof prisma), aliasReads: () => aliasReads };
   }
+
+  const missingTable = () =>
+    new Prisma.PrismaClientKnownRequestError('The table does not exist', {
+      code: 'P2021',
+      clientVersion: 'test',
+    });
 
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -145,11 +151,22 @@ describe('a database with no `trail_slug_aliases`', () => {
 
   it.each(['osm-id', 'claim'])('is consulted under %s and still 404s, not 500s', async (mode) => {
     vi.stubEnv('INGEST_TRAIL_IDENTITY', mode);
-    const { caller: against, aliasReads } = againstMissingTable();
+    const { caller: against, aliasReads } = againstAliasFailure(missingTable());
 
     await expect(against.trails.bySlug({ slug: UNKNOWN })).rejects.toMatchObject({
       code: 'NOT_FOUND',
     } satisfies Partial<TRPCError>);
     expect(aliasReads()).toBe(1);
+  });
+
+  /*
+   * The catch exists for one error and must not swallow the rest. This path is now the fallback
+   * for every merged-away URL, so an outage reported as "no such trail" would be invisible in
+   * exactly the place a reader is most likely to hit it.
+   */
+  it('lets a connection failure surface rather than reporting it as not found', async () => {
+    const { caller: against } = againstAliasFailure(new Error('Server has closed the connection.'));
+
+    await expect(against.trails.bySlug({ slug: UNKNOWN })).rejects.toThrow(/closed the connection/);
   });
 });
