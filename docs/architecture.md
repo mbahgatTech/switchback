@@ -433,10 +433,20 @@ and throws, exactly as before. Sixteen z11 tiles cover one z9, and each level qu
 per-tile cost — a region lookup and a tile-wide waypoint query that a smaller box does not make
 cheaper — so deeper than z11 the overhead, not the work, is what fills the invocation.
 
-**It ships off, and turning it on is a deliberate act.** `ingest.bicepparam` resolves
-`ingestSubdivideMaxZoom` to `9` — subdivision disabled — unless `INGEST_SUBDIVIDE_MAX_ZOOM` is
-exported in the deploying shell. That is because of the seam defect below: a split writes damage into
-`trails` that turning the flag back off does not undo, so nothing may split until task #228 lands.
+**It ships off, and turning it on takes two settings, not one.** `ingest.bicepparam` resolves
+`ingestSubdivideMaxZoom` to `9` — subdivision disabled — and `ingestTrailIdentity` to `osm-id`,
+unless the deploying shell exports otherwise. The two are coupled in code as well as in the
+template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTITY` is not `claim`,
+whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
+`min(wayId)` cannot be reached by setting one variable.
+
+**The ceiling stays at 9 even though the seam is fixed, and the reason is arithmetic rather than
+correctness.** Every split observed in production ran out of clock in the _commit_ phase, never the
+query: four `switchback-ingest-tile-split` events, all `"phase":"commit"`, having already assembled
+989–2,160 trails. Dividing each tile's own measured commit rate by four puts every z10 child between
+554 s and 2,306 s against a 540 s wall, so no child of any observed tile fits; at z11 the densest
+still needs 577 s with nowhere left to split. Subdivision spends Overpass — the one resource under a
+hard etiquette bound — 4× and 16× over to relieve DEM and database time, which is under none.
 
 **Off is one setting and no deploy: `az functionapp config appsettings set … INGEST_SUBDIVIDE_MAX_ZOOM=9`.**
 No tile splits, a dense tile fails exactly as it did before, and children already created still
@@ -476,32 +486,39 @@ tiles that do not. The 2-concurrent bound is untouched: children are ordinary jo
 one message at a time, and the ceiling is the shared `OverpassClient`'s queue, not the number of
 tiles in play.
 
-**Boundary trails cost a duplicate fetch, not a duplicate row — for a single way.** A way crossing a
-child seam is returned by both children's bbox queries and committed twice, and `commitTrail` upserts
-on `(osmType, osmId)`, so the second write updates the first row. `wayToCoords` drops any way
-Overpass returned with a hole in its geometry rather than interpolating across it, which is the same
-rule that already governs neighbouring z9 tiles.
+**Boundary trails cost a duplicate fetch, not a duplicate row.** A way crossing a child seam is
+returned by both children's bbox queries: `buildTileQuery` filters per statement and declares no
+global `[bbox:]`, so Overpass returns each intersecting way whole to both tiles rather than clipped.
+That shared way is what makes identity recoverable.
 
-**A multi-way trail spanning a seam is a known defect that subdivision amplifies, and is not fixed
-here — which is why subdivision ships off.** `assembleTrails` gives a standalone way-trail the
-identity `Math.min(...line.wayIds)` over only the ways that tile's query returned, so a trail of ways
-10/20/30/40 cut by a seam becomes `(way, 10)` truncated to half its length in one child and a second
-row `(way, 30)` in the other; if the second fragment is under `MIN_TRAIL_LENGTH_M` it is dropped
-entirely. `commitTrail` preserves `slug` on update, so the truncation lands on the same public URL.
-Relation-backed trails are immune — their identity is the relation id, and `out body geom` returns
-every member whichever child asked.
+**A multi-way trail spanning a seam keeps one row, because `trail_ways` decides identity.**
+`assembleTrails` still labels a standalone way-trail `Math.min(...line.wayIds)` over only the ways
+that tile's query returned, so the same trail cut by a seam still arrives under two different labels
+— ways 10/20/30/40 become `(way, 10)` in one child and `(way, 30)` in the other. What changed is that
+the label is no longer the identity. Every commit claims its member ways in `trail_ways`, whose
+primary key is the way id; the second tile's assembly finds its ways already claimed and resolves
+onto the existing row instead of creating a second one.
 
-This is not new: neighbouring z9 tiles have always had it. What is new is that a split cuts seam
-_inside_ a tile that was whole. A z9 at 46°N is ~54 km square, so one split cuts ~108 km of fresh
-interior seam and two levels ~324 km, in exactly the alpine tiles this feature exists for. Nothing
-deletes a trail row, so the damage outlives the flag: setting `INGEST_SUBDIVIDE_MAX_ZOOM=9` stops new
-splits and leaves the truncated row and its duplicate in place permanently.
+The two fragments overlap rather than butt-join, so the halves are unioned geometrically —
+`ST_LineMerge(ST_UnaryUnion(ST_Collect(…)))` in `mergeTrailGeometry` — and never concatenated.
+Across the 269 fragmented pairs measurable in production today, concatenation overstates length by a
+mean 4,358 m; on `Hastings Heritage Trail` it overstates by 13,138 m against a true union of 62,110 m.
+The union happens before `elevateLine`, because every statistic, the elevation profile and each
+waypoint's `distM` are derived from the coordinate array — a merge applied at the write would leave
+all of them describing one fragment.
 
-The fix — making trail identity independent of the observed subset — changes how every trail in the
-database is keyed and is tracked as task #228. Until it lands the committed parameter is `9`, so a
-merge of this branch cannot split anything. Enabling it for a measured experiment means recording the
-trails in the parent's box before and after through `trails.browse` and comparing name, slug and
-`lengthM` per row; that is the only check available from outside the database.
+Where two rows already exist, the older wins and the younger is folded into it: photos, activities,
+reviews, completions, list items and lifeline sessions are re-pointed, and the retired slug is kept
+in `trail_slug_aliases` so the public URL it was indexed under keeps resolving. Relation-derived
+trails never resolve through claims — a relation id is the same in every tile, so `(osmType, osmId)`
+already identifies them — but they do claim their member ways, which is how a way-assembly in a
+neighbouring tile learns to stand down rather than shadow the route.
+
+**The rollback is one setting and no data migration.** Claims are written whatever
+`INGEST_TRAIL_IDENTITY` says; only resolution reads them. Setting it to `claim` therefore needs no
+backfill, and setting it back to `osm-id` returns behaviour exactly to the `(osmType, osmId)` upsert
+with a populated table sitting unused. Existing fragments heal on their own as tiles re-ingest on the
+30-day TTL — no Overpass backfill run, no hours of mirror load.
 
 **Observed in production, 2026-08-06.** Subdivision fires, and the trace that says so is the one this
 round wired. Four dense alpine z9 tiles reached the wall and split rather than failing:
@@ -530,8 +547,8 @@ dead-lettered messages.
 **No child ran, and the reason is the queue rather than the split.** Children are enqueued at
 `SPLIT_PRIORITY`, level with a live viewport, but `claimJobs` and the pump break a priority tie on
 `runAfter ASC` — so a child created at 00:00 sorts behind every tile queued before it, and the
-alpine backlog ahead of these was itself made of nine-minute tiles. Sixteen z10 rows are `pending`
-with durable jobs behind them; none had been claimed when the window was closed. **So the chain is
+alpine backlog ahead of these was itself made of nine-minute tiles. Twenty-four z10 rows across six
+parents were `pending` with durable jobs behind them; none was ever claimed. **So the chain is
 proven as far as the split and no further: no `done` at z10, no roll-up, and no z9 that
 `trails.browse` calls ready because it subdivided.** The deepest zoom reached is z10, as rows, not as
 work.
@@ -542,21 +559,23 @@ supported then and neither is now: the 2026-08-05 over-deadline invocations logg
 token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
 path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
 
-**The seam baseline, for whoever finishes this.** `trails.browse` over `120230202`'s box at
-00:41:13Z, after the split and before any child ran, returns 104 trails under 104 distinct names —
-zero duplicates. That is the "before" the fragmentation question needs: re-run the same box once the
-children have ingested, and a duplicate name or a shortened `lengthM` is the defect in task #228
-made visible. Do the same for `120230220`, `120230203` and `120230212` before enabling subdivision
-again; each `trails.browse` costs one doomed inline drain on `master`, so take the baseline
-deliberately rather than by polling.
+**The seam baseline, measured against the tiles that actually split.** Taken 2026-08-06 while every
+z10 child was still `pending` with `fetchedAt` NULL, so it is a true "before":
 
-**Direct Postgres is unavailable from a maintainer workstation behind the agent sandbox, and the
-earlier diagnosis of why was wrong.** It is not `connection_throttle.enable`. TCP 5432 accepts in
-77 ms and is reset at 19,599 ms with the `SSLRequest` packet unanswered — and port 5433, which
-Azure Postgres does not listen on, behaves identically (63 ms, reset at 19,606 ms). A closed port
-cannot accept a connection, so what accepted both was a local proxy: the sandbox permits HTTPS and
-nothing else. Read production tile state through `trails.browse` and job state through App Insights,
-or run the query from CI, which holds `DATABASE_URL`.
+| tile        | trails | distinct names | way / relation | total `lengthM` |
+| ----------- | ------ | -------------- | -------------- | --------------- |
+| `120230203` | 477    | 425            | 289 / 188      | 2,901,784       |
+| `120230212` | 232    | 231            | 6 / 226        | 2,644,035       |
+
+Two names already span the seam between those two tiles. Corpus-wide the same measurement is
+6,296 way-trails in a name group spanning more than one quadkey — 13.3% of 47,279 — which is what
+`trail_ways` exists to collapse, and which is measurable today without waiting on any child.
+`scripts/baseline-228.sql` is the query; re-run it to watch the number fall as tiles re-ingest.
+
+**Direct Postgres is reachable from a maintainer workstation with ProtonVPN disconnected**, using an
+Entra access token as the password — `scripts/pgenv.sh` assembles the session and never prints the
+token. The earlier finding that only HTTPS egress was permitted described the sandbox of the day, not
+the server.
 
 **How this was run before the branch was merged, and what it cost.** The worker is deployed from a
 zip, so it can carry this branch's `processTile` while Vercel still serves `master`. Setting
@@ -579,15 +598,26 @@ the run cannot happen.
 
 **Live production state, 2026-08-06.** `INGEST_QUEUE_DRIVER` is back to `postgres` and
 `INGEST_SUBDIVIDE_MAX_ZOOM` back to `9` on the worker: the worker drops every signal it receives,
-Vercel owns the drain, and no further tile can split. Four z9 tiles carry four z10 child rows each —
-`120230202`, `120230220`, `120230203` and `120230212` — and those sixteen children are `pending` with
-durable `ingest_tile` jobs behind them. **They cannot run under `master`,** whose `processTile` begins
-`if (tile.z !== INGEST_ZOOM) throw`, so leaving the driver on `postgres` is what keeps the worker from
-competing for them; the daily `/api/cron/drain` at 04:17 UTC is unscoped and will claim a few, throw,
-and eventually retire them to `dead`. That is survivable rather than terminal, and only because of
-the recovery above: after this branch merges, one viewport over the parent runs `rollUpSplitTile`,
-which revives a `dead` child and reports it once. Until then those four z9 tiles serve the trails each
-committed before the wall — 127, 160, 196 and 241 — and read `pending`.
+Vercel owns the drain, and no further tile can split. Six z9 tiles had split — `031313112`,
+`120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four z10 child
+rows and twenty-four queued `ingest_tile` jobs.
+
+**Those children are retired, not finished, and the reason is the arithmetic above.** None had ever
+run: every row was `pending` with `fetchedAt` NULL, `attempts` 0 and `trailCount` 0, and no trail in
+the corpus was ever owned by a z10 quadkey. They could not have finished either — each sits between
+554 s and 2,306 s of commit work against a 540 s wall — and nothing would have rolled them up, since
+the ceiling stays at `9`. Leaving twenty-four claimable jobs pointed at work that cannot complete
+spends Overpass, which is the one budget under a hard etiquette bound. `scripts/retire-244.sql`
+deletes them in one transaction, guarded on the never-ingested predicate so a child that had really
+run would survive and show up in the after-count. The six parents keep their own rows and their own
+jobs, and `childTiles` now reports zero for each, so each re-fetches at z9 exactly as it did before
+subdivision existed.
+
+One inconsistency is left deliberately and is outside that cleanup: `120230212`'s tile row is
+`pending` while its `ingest_tile` job is `done`. It predates the splits and is not debris this
+created, so it is recorded here rather than silently repaired. Until they are re-attempted those six
+z9 tiles serve the trails each committed before the wall — 127, 160, 196 and 241 for the four
+measured — and read `pending`.
 
 **Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
 instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a

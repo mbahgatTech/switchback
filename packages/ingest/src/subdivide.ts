@@ -14,6 +14,7 @@ import {
   quadkeyToTile,
 } from '@switchback/geo';
 import { isTileFresh, isTileSettled } from './freshness';
+import { trailIdentityMode } from './identity';
 import { enqueue, tileJobKey } from './jobs';
 
 /** How many children a quadkey has. Four, always — that is what "quad" means. */
@@ -53,12 +54,18 @@ export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
  * `ingest_jobs` do not both declare it — `apps/web/src/env.ts` has no entry — so a default of
  * `MAX_INGEST_ZOOM` turned subdivision on wherever nobody had thought about it. It has to be
  * switched on deliberately, which is also what makes deleting the setting a rollback.
+ *
+ * Subdividing cuts fresh interior seam, and a seam fragments any trail crossing it unless
+ * `TrailWay` is deciding identity. So the ceiling is held at `INGEST_ZOOM` whenever
+ * `INGEST_TRAIL_IDENTITY` is not `claim`, however the zoom variable is set — the two cannot be
+ * flipped independently into the combination that corrupts the corpus.
  */
 export function subdivideMaxZoom(source: NodeJS.ProcessEnv = process.env): number {
   const value = Number(source.INGEST_SUBDIVIDE_MAX_ZOOM);
   if (!Number.isInteger(value) || value < INGEST_ZOOM || value > MAX_INGEST_ZOOM) {
     return INGEST_ZOOM;
   }
+  if (trailIdentityMode(source) !== 'claim') return INGEST_ZOOM;
   return value;
 }
 

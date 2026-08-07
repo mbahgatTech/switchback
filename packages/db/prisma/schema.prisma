@@ -440,8 +440,8 @@ model Trail {
   osmId           BigInt?
   /// When ingest last reconciled this trail against OSM. Drives the staleness sweep.
   sourceUpdatedAt DateTime?
-  /// z9 tile this trail was ingested from. A trail spanning tiles is claimed by the tile
-  /// containing its first vertex, so two tiles never both create it.
+  /// Tile this trail was most recently ingested from. Not an identity: a trail crossing a
+  /// seam is assembled by both tiles, and `TrailWay` is what keeps that one row.
   quadkey         String?
 
   // --- Geometry ---
@@ -514,6 +514,8 @@ model Trail {
   completions  Completion[]
   busyness     BusynessBucket[]
   lifelines    LifelineSession[]
+  ways         TrailWay[]
+  slugAliases  TrailSlugAlias[]
 
   @@unique([osmType, osmId])
   @@index([quadkey])
@@ -524,6 +526,32 @@ model Trail {
   @@index([popularity])
   @@index([sourceUpdatedAt])
   @@map("trails")
+}
+
+/// Which OSM way belongs to which trail. The identity of a way-derived trail across tile
+/// seams: two tiles assembling the same straddling way resolve to the same row.
+model TrailWay {
+  /// Primary key, not just unique. Two tiles racing to claim one way is the expected case,
+  /// and the loser's P2002 is what sends it into resolution instead of creating a duplicate.
+  wayId   BigInt @id
+  trailId String
+  trail   Trail  @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  @@index([trailId])
+  @@map("trail_ways")
+}
+
+/// A slug a trail used to answer on, kept after a merge retired it. Trail URLs are public
+/// from first index, so the retired half of a merge must keep resolving.
+model TrailSlugAlias {
+  slug    String @id
+  trailId String
+  trail   Trail  @relation(fields: [trailId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([trailId])
+  @@map("trail_slug_aliases")
 }
 
 /// Elevation samples, one row per trail. Split out because the profile is 100–2,000

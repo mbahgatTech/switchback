@@ -100,10 +100,11 @@ operator had turned it off at 3am. The polarity is the point and it is the oppos
 `ingestQueueDriver`'s: for the driver both values are dangerous, so it has no fallback at all;
 here the unsafe direction is only ever *on*, so a forgotten `export` must land on off.
 
-Subdivision stays off in the committed parameters until task #228 lands. A new interior seam
-fragments a multi-way trail that crosses it — `assembleTrails` keys a way-trail by the lowest way
-id *it saw*, and `commitTrail` only ever upserts — so a split writes damage into `trails` that
-turning the flag back off does not undo.
+Subdivision stays off in the committed parameters until `INGEST_TRAIL_IDENTITY` is `claim`. A new
+interior seam fragments a multi-way trail that crosses it — `assembleTrails` keys a way-trail by
+the lowest way id *it saw*, and `commitTrail` only ever upserts — so a split writes damage into
+`trails` that turning the flag back off does not undo. `subdivideMaxZoom` enforces the pairing in
+code as well: with identity on `osm-id` the ceiling reads as `9` whatever is deployed here.
 ''')
 @allowed([
   '9'
@@ -111,6 +112,20 @@ turning the flag back off does not undo.
   '11'
 ])
 param ingestSubdivideMaxZoom string
+
+@description('''
+How a way-derived trail is identified. `claim` resolves it through the `trail_ways` table, which is
+what keeps one trail one row when two tiles each assemble part of it. `osm-id` keeps the
+`(osmType, osmId)` upsert, where the id is the lowest way id the tile happened to see.
+
+Claims are written under both values, so this is a real rollback in both directions: switching to
+`claim` needs no backfill, and switching back leaves a populated table that stops being read.
+''')
+@allowed([
+  'osm-id'
+  'claim'
+])
+param ingestTrailIdentity string
 
 @description('Vercel team slug. Half of the OIDC issuer and subject the publisher credential trusts.')
 param vercelTeamSlug string = 'mbahgattechs-projects'
@@ -760,6 +775,12 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           {
             name: 'INGEST_SUBDIVIDE_MAX_ZOOM'
             value: ingestSubdivideMaxZoom
+          }
+          // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
+          // this on `claim` is the combination that fragments trails across the new seam.
+          {
+            name: 'INGEST_TRAIL_IDENTITY'
+            value: ingestTrailIdentity
           }
           {
             name: 'NODE_ENV'

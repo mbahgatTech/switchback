@@ -191,3 +191,66 @@ export async function measureTrailLengthM(db: Db, trailId: string): Promise<numb
   `;
   return rows[0]?.m ?? null;
 }
+
+export interface MergedGeometry {
+  coords: LngLat[];
+  mergedLengthM: number;
+  /** Length already stored. `mergedLengthM` at or below it means the incoming line adds nothing. */
+  existingLengthM: number;
+}
+
+/**
+ * Union a stored trail line with an incoming one and return the result as coordinates.
+ *
+ * Geometric, not concatenation: two tiles assembling the same seam-crossing trail return
+ * overlapping lines — a mean 2.79 km of shared line across the 238 fragmented pairs measured in
+ * production — so splicing the arrays would add that overlap to the length twice. `ST_UnaryUnion`
+ * dissolves it and `ST_LineMerge` stitches what remains back into one line. Where the union stays
+ * a MultiLineString the longest component wins, the same rule `pickPrimary` applies to a branchy
+ * relation.
+ */
+export async function mergeTrailGeometry(
+  db: Db,
+  input: { trailId: string; incoming: LineString },
+): Promise<MergedGeometry | null> {
+  const geojson = JSON.stringify(input.incoming);
+  const rows = await db.$queryRaw<
+    Array<{ geojson: string | null; mergedLengthM: number | null; existingLengthM: number | null }>
+  >`
+    WITH incoming AS (
+      SELECT ST_SetSRID(ST_GeomFromGeoJSON(${geojson}), 4326) AS g
+    ),
+    merged AS (
+      SELECT t."geom" AS existing,
+             ST_LineMerge(ST_UnaryUnion(ST_Collect(COALESCE(t."geom", i.g), i.g))) AS g
+        FROM trails t, incoming i
+       WHERE t.id = ${input.trailId}
+    ),
+    longest AS (
+      SELECT existing,
+             CASE WHEN GeometryType(g) = 'MULTILINESTRING'
+                  THEN (SELECT d.geom
+                          FROM ST_Dump(g) d
+                         ORDER BY ST_Length(d.geom::geography) DESC
+                         LIMIT 1)
+                  ELSE g
+             END AS g
+        FROM merged
+    )
+    SELECT ST_AsGeoJSON(g)                          AS geojson,
+           ST_Length(g::geography)                  AS "mergedLengthM",
+           COALESCE(ST_Length(existing::geography), 0) AS "existingLengthM"
+      FROM longest
+  `;
+
+  const row = rows[0];
+  if (!row?.geojson) return null;
+  const parsed = JSON.parse(row.geojson) as { type: string; coordinates: LngLat[] };
+  if (parsed.type !== 'LineString' || parsed.coordinates.length < 2) return null;
+
+  return {
+    coords: parsed.coordinates,
+    mergedLengthM: row.mergedLengthM ?? 0,
+    existingLengthM: row.existingLengthM ?? 0,
+  };
+}

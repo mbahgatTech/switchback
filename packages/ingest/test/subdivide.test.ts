@@ -105,16 +105,20 @@ describe('canSubdivide', () => {
 });
 
 describe('subdivideMaxZoom', () => {
+  const CLAIM = { INGEST_TRAIL_IDENTITY: 'claim' };
+
   it('reads the ceiling from the environment', () => {
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: String(INGEST_ZOOM) })).toBe(INGEST_ZOOM);
+    expect(subdivideMaxZoom({ ...CLAIM, INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
+    expect(subdivideMaxZoom({ ...CLAIM, INGEST_SUBDIVIDE_MAX_ZOOM: String(INGEST_ZOOM) })).toBe(
+      INGEST_ZOOM,
+    );
   });
 
   it('refuses a value outside the range rather than trusting it', () => {
     // Below `INGEST_ZOOM` there is no tile to split; above the floor is unbounded recursion,
     // and both are one typo away in a portal field.
     for (const value of ['8', '99', 'deep', '', '10.5']) {
-      expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: value })).toBe(INGEST_ZOOM);
+      expect(subdivideMaxZoom({ ...CLAIM, INGEST_SUBDIVIDE_MAX_ZOOM: value })).toBe(INGEST_ZOOM);
     }
   });
 
@@ -124,6 +128,21 @@ describe('subdivideMaxZoom', () => {
     // without anyone choosing it.
     expect(subdivideMaxZoom({})).toBe(INGEST_ZOOM);
     expect(canSubdivide(INGEST_ZOOM, subdivideMaxZoom({}))).toBe(false);
+  });
+
+  it('holds the ceiling down until trail identity resolves through claims', () => {
+    // Subdividing cuts fresh interior seam. Without `TrailWay` deciding identity, a trail
+    // crossing that seam is assembled twice under two different `min(wayId)` keys, and
+    // `commitTrail` only ever upserts — so lowering the ceiling again does not undo it.
+    for (const zoom of ['10', '11']) {
+      expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: zoom })).toBe(INGEST_ZOOM);
+      expect(
+        subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: zoom, INGEST_TRAIL_IDENTITY: 'osm-id' }),
+      ).toBe(INGEST_ZOOM);
+      expect(
+        subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: zoom, INGEST_TRAIL_IDENTITY: 'claim' }),
+      ).toBe(Number(zoom));
+    }
   });
 });
 

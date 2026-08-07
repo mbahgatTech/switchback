@@ -319,9 +319,33 @@ describe('the drain-failure alert, from the template', () => {
     // Literals rather than `subdivideMaxZoom`'s own fallback: the fallback is what every
     // *invalid* input returns, so comparing the two would hold for an implementation that
     // ignored its argument entirely.
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11' })).toBe(11);
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
-    expect(subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '9' })).toBe(9);
+    const claim = { INGEST_TRAIL_IDENTITY: 'claim' };
+    expect(subdivideMaxZoom({ ...claim, INGEST_SUBDIVIDE_MAX_ZOOM: '11' })).toBe(11);
+    expect(subdivideMaxZoom({ ...claim, INGEST_SUBDIVIDE_MAX_ZOOM: '10' })).toBe(10);
+    expect(subdivideMaxZoom({ ...claim, INGEST_SUBDIVIDE_MAX_ZOOM: '9' })).toBe(9);
     expect(MAX_INGEST_ZOOM).toBeGreaterThanOrEqual(11);
+  });
+
+  it('ships both halves of the pairing, so a deployed ceiling cannot act alone', () => {
+    // The template setting the ceiling without the identity flag would read as subdivision
+    // enabled while `subdivideMaxZoom` silently held it at 9 — or, once someone "fixed" that,
+    // would split tiles with the identity defect still live.
+    const identity = /name: 'INGEST_TRAIL_IDENTITY'\s*\r?\n\s*value: ([^\s]+)/.exec(bicep)?.[1];
+    expect(identity).toBe('ingestTrailIdentity');
+    expect(bicep).toContain('param ingestTrailIdentity string');
+    expect(bicep).not.toContain('param ingestTrailIdentity string =');
+
+    const params = readFileSync(
+      resolve(__dirname, '../../../infra/azure/ingest.bicepparam'),
+      'utf8',
+    );
+    expect(params).toContain(
+      "param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')",
+    );
+
+    // Deployed as committed, the ceiling is inert whatever it says.
+    expect(
+      subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11', INGEST_TRAIL_IDENTITY: 'osm-id' }),
+    ).toBe(9);
   });
 });

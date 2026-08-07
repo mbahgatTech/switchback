@@ -12,6 +12,7 @@ import {
   PhotoSource,
   TileStatus,
   backgroundPrisma,
+  mergeTrailGeometry,
   writeTrailGeometry,
   writeWaypointPoints,
 } from '@switchback/db';
@@ -19,6 +20,7 @@ import type { Prisma, PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
   MAX_INGEST_ZOOM,
+  bboxOf,
   lineLengthM,
   lngLatToTile,
   quadkeyToBBox,
@@ -54,6 +56,12 @@ import {
 } from './overpass';
 import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
+import {
+  claimWays,
+  mergeTrails,
+  resolveTrail as resolveClaims,
+  trailIdentityMode,
+} from './identity';
 import {
   CHILDREN_PER_TILE,
   SUBTREE_STUCK_MARKER,
@@ -801,6 +809,64 @@ interface CommitContext {
 }
 
 /**
+ * The line this commit should derive from, and the row it belongs to. Null when the trail is
+ * already accounted for and this tile's copy adds nothing.
+ */
+interface ResolvedTrail {
+  trailId: string | null;
+  retiredIds: string[];
+  coords: LngLat[];
+  bbox: BBox;
+  lengthM: number;
+}
+
+/**
+ * Settle identity and geometry before anything expensive runs.
+ *
+ * The union has to happen here, not at the write: every stat, the elevation profile and each
+ * waypoint's `distM` are computed from the coordinate array further down, so a merge applied at
+ * the end would leave all of them describing one fragment of the trail.
+ */
+async function resolveIdentity(
+  db: PrismaClient,
+  trail: AssembledTrail,
+): Promise<ResolvedTrail | null> {
+  const fallback: ResolvedTrail = {
+    trailId: null,
+    retiredIds: [],
+    coords: trail.coords,
+    bbox: trail.bbox,
+    lengthM: trail.lengthM,
+  };
+  if (trailIdentityMode() !== 'claim') return fallback;
+
+  const resolution = await resolveClaims(db, {
+    osmType: trail.osmType,
+    memberWayIds: trail.memberWayIds,
+  });
+  if (resolution.kind === 'skip') return null;
+  if (resolution.kind === 'create') return fallback;
+
+  const merged = await mergeTrailGeometry(db, {
+    trailId: resolution.trailId,
+    incoming: { type: 'LineString', coordinates: [...trail.coords] },
+  });
+  if (!merged) return { ...fallback, trailId: resolution.trailId };
+
+  // A child tile re-reading a trail its parent already committed contributes nothing but a
+  // full DEM pass and a transaction. This is the only skip-if-fresh the pipeline has.
+  if (merged.mergedLengthM <= merged.existingLengthM) return null;
+
+  return {
+    trailId: resolution.trailId,
+    retiredIds: resolution.kind === 'merge' ? resolution.retiredIds : [],
+    coords: merged.coords,
+    bbox: bboxOf(merged.coords),
+    lengthM: merged.mergedLengthM,
+  };
+}
+
+/**
  * One trail, committed or skipped. The transaction covers the trail row, its geometry, its
  * profile and its waypoints: a trail row whose `geom` write failed is invisible to every
  * spatial query while still appearing in search, and nothing about it looks broken.
@@ -810,8 +876,11 @@ async function commitTrail(
   trail: AssembledTrail,
   ctx: CommitContext,
 ): Promise<'committed' | 'skipped'> {
-  const spacingM = profileSpacingFor(trail.lengthM);
-  const resampled = resampleLine(trail.coords, spacingM);
+  const resolved = await resolveIdentity(db, trail);
+  if (!resolved) return 'skipped';
+
+  const spacingM = profileSpacingFor(resolved.lengthM);
+  const resampled = resampleLine(resolved.coords, spacingM);
   if (resampled.length < 2) return 'skipped';
 
   /*
@@ -822,7 +891,7 @@ async function commitTrail(
    */
   const { points, gapCount } = await elevateLine(resampled, ctx.terrain, {
     spacingM,
-    alongLengthM: trail.lengthM,
+    alongLengthM: resolved.lengthM,
     deadlineAt: ctx.deadlineAt,
   });
 
@@ -831,13 +900,13 @@ async function commitTrail(
   if (gapCount === points.length) return 'skipped';
 
   const derived = deriveTrail({
-    coords: trail.coords,
+    coords: resolved.coords,
     profile: points,
-    bbox: trail.bbox,
+    bbox: resolved.bbox,
     tags: trail.tags,
     // Read off the un-oriented line, before `deriveTrail` may flip it — see
     // `terminusFeatures` for why that is safe.
-    termini: ctx.features.length ? terminusFeatures(trail.coords, ctx.features) : undefined,
+    termini: ctx.features.length ? terminusFeatures(resolved.coords, ctx.features) : undefined,
   });
 
   // `derived.coords` and `derived.profile`, never `trail.coords` and `points`. OSM stores
@@ -878,6 +947,10 @@ async function commitTrail(
   const osmId = BigInt(trail.osmId);
 
   const trailId = await commitWithSlugRetry(db, async (tx) => {
+    if (resolved.trailId && resolved.retiredIds.length > 0) {
+      await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
+    }
+
     const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
 
     const row = {
@@ -917,13 +990,25 @@ async function commitTrail(
       parkingCapacity: parkingCapacity(allWaypoints),
     };
 
-    const saved = await tx.trail.upsert({
-      where: { osmType_osmId: { osmType, osmId } },
-      create: row,
-      // `slug` is omitted from the update on purpose: it is a public URL from the moment
-      // the trail is first indexed, and a rename in OSM must not 404 every link to it.
-      update: { ...row, slug: undefined },
-    });
+    // `osmType`/`osmId` are never rewritten on an existing row. For a way-derived trail they are
+    // one member id out of many, and moving them would shift the unique key a concurrent tile is
+    // upserting against — `TrailWay` is the identity now, not `min(wayId)`.
+    const saved = resolved.trailId
+      ? await tx.trail.update({
+          where: { id: resolved.trailId },
+          data: { ...row, slug: undefined, osmType: undefined, osmId: undefined },
+        })
+      : await tx.trail.upsert({
+          where: { osmType_osmId: { osmType, osmId } },
+          create: row,
+          // `slug` is omitted from the update on purpose: it is a public URL from the moment
+          // the trail is first indexed, and a rename in OSM must not 404 every link to it.
+          update: { ...row, slug: undefined },
+        });
+
+    // Written whatever `INGEST_TRAIL_IDENTITY` says, so switching it on needs no backfill and
+    // switching it off leaves a populated table that simply stops being consulted.
+    await claimWays(tx, saved.id, trail.memberWayIds);
 
     await writeTrailGeometry(tx, {
       trailId: saved.id,

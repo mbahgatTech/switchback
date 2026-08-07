@@ -46,9 +46,10 @@ param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 // the driver above, only one direction of this flag is dangerous. A split cuts fresh interior
 // seam through tiles that are currently whole, and a multi-way trail crossing one is written back
 // truncated plus a duplicate — permanently, because `commitTrail` only upserts. Deleting the
-// setting stops new splits and does not undo that, so subdivision stays off here until task #228
-// fixes trail identity across a seam.
+// setting stops new splits and does not undo that, so both of these default off and the ceiling
+// is inert on its own: `subdivideMaxZoom` reads it as 9 unless identity is `claim`.
 param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')
+param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')
 
 // The two halves of the Vercel OIDC subject the publisher credential trusts. Renaming either on
 // Vercel breaks the token exchange silently — the claim follows the new name and the credential
