@@ -21,6 +21,12 @@ import { enqueue, tileJobKey } from './jobs';
 export const CHILDREN_PER_TILE = 4;
 
 /**
+ * The `lastError` a split leaves on the parent, and the predicate `reconcileOrphanedSplits`
+ * sweeps on. One constant so the writer and the reader cannot drift apart.
+ */
+export const SPLIT_MARKER_PREFIX = 'split into ';
+
+/**
  * Priority a child inherits. Above the 0 a background refresh uses and level with a live
  * viewport, because a split tile is one somebody has already waited a whole invocation for —
  * and the parent cannot complete until the last child does, so demoting one demotes all four.
@@ -196,7 +202,7 @@ export async function splitTile(
     where: { quadkey },
     data: {
       status: servesData ? previous.status : TileStatus.pending,
-      lastError: `split into ${children.length} tiles at z${quadkey.length + 1}`,
+      lastError: `${SPLIT_MARKER_PREFIX}${children.length} tiles at z${quadkey.length + 1}`,
       ...(options.fetchMs === undefined ? {} : { fetchMs: options.fetchMs }),
     },
   });
@@ -298,4 +304,94 @@ export async function rollUpAncestors(db: PrismaClient, quadkey: string): Promis
   const parent = parentQuadkey(quadkey);
   if (parent === null || parent.length < INGEST_ZOOM) return [];
   return promoteFrom(db, parent);
+}
+
+/** What the sweep did to one parent. `status` is what the row holds afterwards. */
+export interface OrphanedSplitRepair {
+  quadkey: string;
+  status: TileStatus;
+}
+
+/**
+ * How many marked parents the repair below would actually act on.
+ *
+ * The predicate is orphanhood — the marker *and* an incomplete set of children — not the marker
+ * alone. A parent midway through a legitimate subdivision carries the marker for as long as its
+ * four children take, and counting those as distress would make the health gauge read dozens of
+ * wedged tiles on a system doing exactly what it should. `quadkey || '_'` is the child set: a
+ * quadkey is digits `0`–`3`, so it carries no `LIKE` metacharacter of its own.
+ */
+export async function countOrphanedSplits(db: PrismaClient): Promise<number> {
+  const [row] = await db.$queryRaw<Array<{ count: number }>>`
+    SELECT count(*)::int AS count
+      FROM ingest_tiles parent
+     WHERE parent."lastError" LIKE ${`${SPLIT_MARKER_PREFIX}%`}
+       AND (SELECT count(*) FROM ingest_tiles child
+             WHERE child.quadkey LIKE parent.quadkey || '_') < ${CHILDREN_PER_TILE}
+  `;
+  return row?.count ?? 0;
+}
+
+/**
+ * Clear the split marker from any parent whose children do not exist, and put it back on the
+ * queue.
+ *
+ * A parent carrying the marker with no children on the ground is a row saying it was subdivided
+ * when nothing of the subdivision remains. Six such rows are in production, written 2026-08-05
+ * 21:03 to 2026-08-06 00:54 UTC by a build that was not merged until 2026-08-07 10:10; all 483
+ * tile rows are z9 and those six parents have no descendants at all. Nothing else repairs them:
+ * `promoteFrom` needs four children to read, `queueStaleChildren` needs children to queue, and
+ * `processTile` only reaches its roll-up branch when `childTiles` returns four.
+ *
+ * **The split itself cannot leave this state**, and reading it as a crash window sends the next
+ * reader hunting for one that does not exist. `splitTile` upserts all four children *before* it
+ * writes the parent's marker, so a run that dies between the two leaves no marker at all. Marker
+ * with no children is what a *later* deletion of the subtree leaves behind — which is what
+ * production holds, having had its stranded z10 rows cleared after the splits completed. The
+ * hazard to carry forward: anything that deletes a subtree must clear its parent's marker in the
+ * same pass, or it wedges the parent exactly this way.
+ *
+ * That same ordering is why this is safe to run beside a live split rather than merely tidy after
+ * a dead one: a split that has got as far as writing the marker has already written four
+ * children, so `childTiles` returns four and the parent is left alone.
+ *
+ * The repair writes `status` and `lastError` and nothing else. `trailCount`, `fetchedAt`,
+ * `fetchMs` and every trail, waypoint and photograph the tile has ever produced are untouched —
+ * a parent that was serving data keeps serving it, and only a parent that has nothing to show
+ * drops back to `pending`, which is what it honestly is.
+ *
+ * Idempotent: the predicate is the marker, which the repair removes, so a second pass over the
+ * same rows finds nothing. `enqueue` dedupes on the tile's job key.
+ */
+export async function reconcileOrphanedSplits(
+  db: PrismaClient,
+  limit = 64,
+): Promise<OrphanedSplitRepair[]> {
+  const marked = await db.ingestTile.findMany({
+    where: { lastError: { startsWith: SPLIT_MARKER_PREFIX } },
+    select: { quadkey: true, status: true },
+    take: limit,
+  });
+  if (marked.length === 0) return [];
+
+  const repaired: OrphanedSplitRepair[] = [];
+  for (const parent of marked) {
+    const children = await childTiles(db, parent.quadkey);
+    if (children.length === CHILDREN_PER_TILE) continue;
+
+    const status = isTileSettled(parent.status) ? parent.status : TileStatus.pending;
+    await db.ingestTile.update({
+      where: { quadkey: parent.quadkey },
+      data: { status, lastError: null },
+    });
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey(parent.quadkey),
+      payload: { quadkey: parent.quadkey },
+      priority: SPLIT_PRIORITY,
+    });
+    repaired.push({ quadkey: parent.quadkey, status });
+  }
+
+  return repaired;
 }

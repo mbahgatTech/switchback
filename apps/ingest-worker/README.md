@@ -23,6 +23,12 @@ The full chain, so it can be checked rather than believed:
 `test/drain.test.ts` reads all four out of `infra/azure/ingest.bicep` and asserts them, so the table
 is checked rather than believed — the failure of any row costs the egress IP, not one invocation.
 
+**Four rows about this app, which drains nothing while `INGEST_QUEUE_DRIVER` is `postgres`.** The
+drainer that runs is Vercel, where every lambda is a process with its own client, so rows one to
+three do not apply to it and row four bounds a fraction of it. `INGEST_MAX_DRAINERS = 1`, enforced
+across processes by an advisory lock in `packages/ingest/src/drain-slot.ts`, is what makes the
+fleet-wide figure true; `docs/architecture.md` is the one place that states it.
+
 The first two rows are a template property and an app setting that this workspace does not own —
 both live in `infra/azure/ingest.bicep`, alongside
 `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1`. Changing either breaks the arithmetic, which is
@@ -155,6 +161,7 @@ dead worker, so wait the window out or expect one empty tick.
 | `INGEST_OVERPASS_DEADLINE_MS`                   | `300000`      | `runIngestSignal`, for the Overpass view only  |
 | `OVERPASS_MAX_TOTAL_MS`                         | `240000`      | `getOverpass`, per query                       |
 | `OVERPASS_MAX_CONCURRENT`                       | `2`           | `getOverpass`, per client                      |
+| `INGEST_MAX_DRAINERS`                           | `1`           | `drainSlotGate`, per fleet                     |
 | `OVERPASS_USER_AGENT`                           | —             | required — `OverpassClient` refuses without it |
 
 Managed identity carries the Service Bus connection, and the grant is **Data Sender + Data

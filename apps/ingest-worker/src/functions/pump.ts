@@ -2,6 +2,7 @@ import { app } from '@azure/functions';
 import type { InvocationContext, Timer } from '@azure/functions';
 import { backgroundPrisma } from '@switchback/db';
 import { ingestQueueDriver } from '@switchback/ingest';
+import { reportQueueHealth } from '../health';
 import { runPump } from '../pump';
 import { serviceBusQueue } from '../service-bus';
 
@@ -26,6 +27,10 @@ function braked(): boolean {
 app.timer('ingestPump', {
   schedule: '0 */2 * * * *',
   handler: async (_timer: Timer, context: InvocationContext): Promise<void> => {
+    // Ahead of every guard below, because the driver this tick is *not* serving is the one whose
+    // drainer has no telemetry of its own. See `reportQueueHealth`.
+    await reportQueueHealth(backgroundPrisma, context);
+
     if (ingestQueueDriver() !== 'servicebus') {
       context.warn('ingest pump: INGEST_QUEUE_DRIVER is not servicebus — Postgres owns the drain');
       return;

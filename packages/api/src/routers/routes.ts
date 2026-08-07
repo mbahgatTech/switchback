@@ -11,6 +11,7 @@
  * The on-demand coverage pattern is `trails.ts`'s, unchanged.
  */
 
+import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import {
@@ -96,6 +97,9 @@ const PLAN_PAD_M = 1_000;
 /** How many queued routing tiles one request will drain on its response's coattails. */
 const MAX_INLINE_DRAIN = 3;
 
+/** This lambda's name on the queue — see `INLINE_WORKER_ID` in `trails.ts`, same reason. */
+const NETWORK_WORKER_ID = `inline-network-${randomUUID().slice(0, 8)}`;
+
 /**
  * The built-graph cache. Dragging one waypoint replans the whole route, and rebuilding a
  * nine-tile graph each frame would make the planner feel like a batch job. The key is the
@@ -113,8 +117,14 @@ const MAX_ROUTES_LISTED = 200;
 const inlineDrain = createInlineDrain((keys) =>
   drainIngest({
     limit: Math.min(keys.length, MAX_INLINE_DRAIN),
-    workerId: 'inline-network',
+    // Random per process. `drainSlotGate` counts drainers with `count(distinct "lockedBy")`, so
+    // the fixed string this used to send made a fleet of any size read as one drainer.
+    workerId: NETWORK_WORKER_ID,
     dedupeKeys: keys,
+    // The Overpass bound comes from `drainIngest`'s default gate. Nothing here may opt out:
+    // `ingest_network` runs `fetchNetwork`, a real Overpass query, and `routes.coverage` fires
+    // it from a public procedure on every viewport settle.
+    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
   }),
 );
 

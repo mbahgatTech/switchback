@@ -415,17 +415,11 @@ jobs:
           # Local, pinned and already installed by `npm ci`. `npx --yes` would resolve tsx and
           # its whole dependency closure from the registry at job time, unpinned, into a process
           # holding an administrator credential for the production database.
-          ./node_modules/.bin/tsx -e '
-            import pg from "pg";
-            const c = new pg.Client({ connectionString: process.env.DIRECT_DATABASE_URL,
-                                      ssl: { rejectUnauthorized: true } });
-            await c.connect();
-            const { rows } = await c.query(
-              "select current_user, pg_has_role(current_user, \x27azure_pg_admin\x27, \x27member\x27) as is_admin");
-            console.log(`current_user=${rows[0].current_user} is_admin=${rows[0].is_admin}`);
-            await c.end();
-            if (!rows[0].is_admin) { console.error("::error::not an administrator; db push will fail"); process.exit(1); }
-          '
+          #
+          # A file, never `tsx -e`. Inline, esbuild's output format is CommonJS and the probe's
+          # `await`s are rejected before a line of it runs; `scripts/assert-pg-admin.ts` explains
+          # the whole trap, and `test/ci-steps-runnable.test.ts` executes what this line invokes.
+          ./node_modules/.bin/tsx scripts/assert-pg-admin.ts
 
       - if: steps.schema.outputs.changed == 'true'
         run: npm run db:generate

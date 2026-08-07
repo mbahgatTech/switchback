@@ -93,6 +93,14 @@ export async function runIngestSignal(
       derivedLimit: 0,
       dedupeKeys: [signal.dedupeKey],
       workerId: options.workerId,
+      /*
+       * The one caller entitled to opt out of `drainSlotGate`. Here the process *is* the fleet:
+       * `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1` leave one host, whose
+       * invocations share the one `OverpassClient` singleton and so are already bounded by
+       * `OVERPASS_MAX_CONCURRENT`. A cross-process lock here would serialise invocations that
+       * the platform has already made safe, and halve the throughput the clamp was sized for.
+       */
+      gate: null,
       deps: { overpass, deadlineAt: startedAt + handlerDeadlineMs(), logger: pipelineLogger(log) },
     });
   } catch (error) {
