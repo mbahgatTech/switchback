@@ -15,6 +15,7 @@ import {
 } from '@switchback/geo';
 import type { Prisma } from '@switchback/db';
 import { ActivityType, PhotoSource, RouteType, prisma, writeTrailGeometry } from '@switchback/db';
+import { looksLikeHostedDatabase } from './local-database';
 
 /**
  * WHY THERE IS INVENTED GEOMETRY HERE, when `seed.ts` refuses to invent any.
@@ -118,12 +119,8 @@ function assertNotProduction(): void {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
   // Invented trails are the one kind of seed row that would be indistinguishable from a pipeline
-  // failure if it reached a live database. `postgres.database.azure.com` is production; the other
-  // three are managed-host shapes this repository has used or could plausibly point at.
-  if (
-    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u.test(url) &&
-    !process.env.SEED_ALLOW_REMOTE
-  ) {
+  // failure if it reached a live database.
+  if (looksLikeHostedDatabase(url) && !process.env.SEED_ALLOW_REMOTE) {
     throw new Error(
       `refusing to seed fixtures into what looks like a hosted database (${url.replace(
         /:[^:@]*@/u,

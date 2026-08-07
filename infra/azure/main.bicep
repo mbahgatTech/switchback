@@ -1,9 +1,8 @@
 // Switchback's production database, as infrastructure.
 //
 // One resource group holding one Azure Database for PostgreSQL Flexible Server, its
-// database, its firewall rule and its server parameters. Nothing else moves: the app stays
-// on Vercel, photographs stay in Cloudflare R2, CI stays on GitHub Actions. This file
-// replaces Neon and only Neon.
+// database, its firewall rule and its server parameters. Nothing else is in scope: the app
+// runs on Vercel, photographs live in Cloudflare R2, CI runs on GitHub Actions.
 //
 // Deployed at subscription scope because it creates its own resource group. A dedicated
 // group is worth the extra scope: `az group delete` then becomes a complete, unambiguous
@@ -235,22 +234,20 @@ param storageTier string = 'P6'
 @maxValue(35)
 param backupRetentionDays int = 14
 
-@description('PostgreSQL major version. 17 matches Neon and the CI/local Postgres image.')
+@description('PostgreSQL major version. 17 matches the CI and local Postgres image.')
 param postgresVersion string = '17'
 
-@description('Database name. `switchback`, not Neon\'s `neondb` — see README.md.')
+@description('Database name — see README.md.')
 param databaseName string = 'switchback'
 
 @description('''
-Database collation and ctype. MUST match Neon\'s, which the migration workflow reads with
-`SELECT datcollate FROM pg_database` and refuses to proceed on a mismatch. Restore succeeds
-either way, which is the danger: a different collation silently reorders every `ORDER BY
-name` and rebuilds `trail_lists_one_system_list_per_user` under different rules.
+Database collation and ctype. `C.UTF-8` — byte order — not the `en_US.utf8` that Azure creates a
+server with by default. A different collation silently reorders every `ORDER BY name` and rebuilds
+`trail_lists_one_system_list_per_user` under different rules.
 
-Neon reports `C.UTF-8` — byte order — not the `en_US.utf8` that Azure creates a server with by
-default. Azure stores this spelling verbatim; do not substitute the `C.utf8` alias it also
-offers, because the verifier compares the two strings literally. Immutable after
-CREATE DATABASE, so a change here means recreating the database rather than redeploying.
+Azure stores this spelling verbatim; do not substitute the `C.utf8` alias it also offers, because
+comparisons against it are literal. Immutable after CREATE DATABASE, so a change here means
+recreating the database rather than redeploying.
 ''')
 param databaseCollation string = 'C.UTF-8'
 
@@ -275,11 +272,10 @@ Login for the least-privilege application role — the credential Vercel carries
 This role is **not** created by this template. ARM cannot run SQL, so a Bicep file can name
 the role but cannot bring it into existence, and a security control that only exists in a
 comment is worse than a shorter honest list. It is created by hand, by the
-`Create the least-privilege application role` step of the runbook in infra/azure/README.md,
-which carries the exact SQL; `scripts/verify-migration.ts` then asserts that it exists, that
-it is not a member of `azure_pg_admin`, and that it cannot create a table. That assertion is
-what makes this comment a claim rather than an intention, and it has been run: 72 checks,
-72 passed.
+`The least-privilege application role` step of the runbook in infra/azure/README.md, which
+carries the exact SQL and the two checks that turn this comment into a claim: the catalogue
+query proving it is not a member of `azure_pg_admin`, and a `CREATE TABLE` attempt made as
+the role itself, which must be refused.
 
 The point of it: with a firewall spanning the whole internet the perimeter is a credential,
 and the credential handed to every Vercel serverless function should be able to read and
@@ -316,8 +312,8 @@ param administratorLoginPassword string = ''
 Minimum TLS version the server will negotiate.
 
 TLSv1.2 rather than TLSv1.3, deliberately, and stated as a parameter so raising it is one
-value. TLS 1.2 with modern ciphers is not a weak setting; it is Azure\'s own default and it
-is what Neon serves today. What holds the floor is the client side: if Prisma\'s Rust query
+value. TLS 1.2 with modern ciphers is not a weak setting; it is Azure\'s own default. What holds
+the floor is the client side: if Prisma\'s Rust query
 engine cannot negotiate 1.3 from wherever Vercel is running, the connection fails in a way
 that reads like a firewall or a credential problem, and nothing here establishes that it can.
 
@@ -465,11 +461,10 @@ param workloadBudgetUsd int = 150
 Tags applied to the resource group and restated on the server.
 
 `rollback` is here so that someone reading the portal — with no access to the pull request
-that created this — learns what the recovery actually is, without having to ask anyone. It
-carried `neon-us-east-1-retained` while a second live copy of the data existed; that project
-was deleted on 2026-08-07 and the only recovery now is Azure point-in-time restore, locally
-redundant, into a **new** server. `.github/workflows/infrastructure.yml` restates this value
-in its `TAGS` environment variable and the two must agree.
+that created this — learns what the recovery actually is, without having to ask anyone: Azure
+point-in-time restore, locally redundant, into a **new** server.
+`.github/workflows/infrastructure.yml` restates this value in its `TAGS` environment variable
+and the two must agree.
 ''')
 param tags object = {
   app: 'switchback'
@@ -503,8 +498,8 @@ var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 // server holds every user account, every recorded GPS track, and 19,157 trails. Deleting a
 // Flexible Server takes its automated backups with it: there is no recycle bin, no soft
 // delete, and no "restore the server I deleted yesterday". There is no second copy of this
-// data anywhere — no geo-redundancy, no standby, no logical dump, and the Neon project that
-// used to be the answer was deleted on 2026-08-07. A deleted server is the end of the data.
+// data anywhere — no geo-redundancy, no standby, no logical dump. A deleted server is the end
+// of the data.
 //
 // The realistic ways it goes:
 //

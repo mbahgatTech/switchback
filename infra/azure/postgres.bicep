@@ -196,22 +196,16 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
       // be noticed and rewound.
       backupRetentionDays: backupRetentionDays
 
-      // Immutable after creation, so this is decided now or never. Disabled, and not on
-      // cost — at this ratio geo-redundancy would in fact be free. It buys nothing this
-      // migration does not already have: Neon stays intact and populated as the rollback,
-      // and "point DATABASE_URL back at Neon and redeploy" restores service in minutes with
-      // no data loss up to cutover. Geo-restore is documented as taking minutes to hours,
-      // has up to an hour of RPO, and cannot do point-in-time restore at all. A live copy
-      // strictly dominates it.
-      //
-      // If Neon is ever decommissioned this becomes the weak point, and changing it means
-      // rebuilding the server. Say so out loud at that time.
+      // Immutable after creation, so this is decided now or never. Disabled — and this is the
+      // weak point rather than a saving: at this ratio geo-redundancy would in fact be free.
+      // What is left is locally-redundant point-in-time restore into a new server inside the
+      // same subscription, so a region-level failure takes the recovery with the original.
+      // Closing it means rebuilding the server and moving the data.
       geoRedundantBackup: 'Disabled'
     }
 
     // Burstable does not support high availability, this region reports zone-redundant HA as
     // unavailable for this subscription regardless, and HA would double the compute bill.
-    // Neon is the availability story until it is not.
     highAvailability: {
       mode: 'Disabled'
     }
@@ -269,10 +263,6 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     // strings live in exactly two places, GitHub Actions repository secrets and Vercel
     // production environment variables, and nowhere else. Not in .env, not in a parameter
     // file, not in a runbook, not in a commit.
-    //
-    // Worth stating plainly: this is not a regression. Neon's endpoints are public and
-    // credential-only today with precisely the same exposure model. The migration moves an
-    // already-open door; it does not open a closed one.
     // ---------------------------------------------------------------------------------
     network: {
       publicNetworkAccess: 'Enabled'
@@ -442,20 +432,17 @@ resource logDisconnections 'Microsoft.DBforPostgreSQL/flexibleServers/configurat
 }
 
 // ---------------------------------------------------------------------------------------
-// Text search configuration, matched to the source rather than left at the Azure default.
+// Text search configuration, pinned rather than left at the Azure provider default.
 //
-// Neon runs `default_text_search_config = pg_catalog.simple`; a Flexible Server starts on
-// `pg_catalog.english`. Every `to_tsvector` and `websearch_to_tsquery` call in this codebase
-// names `'english'` explicitly — packages/db/src/spatial.ts writes the vector, packages/api/
-// src/routers/trails.ts reads it — so no current query consults this GUC and search behaviour
-// is identical either way today.
+// `pg_catalog.simple`, where a Flexible Server starts on `pg_catalog.english`. Every
+// `to_tsvector` and `websearch_to_tsquery` call in this codebase names `'english'` explicitly
+// — packages/db/src/spatial.ts writes the vector, packages/api/src/routers/trails.ts reads it
+// — so no current query consults this GUC and search behaviour is identical either way today.
 //
-// It is set anyway, for two reasons. The migration's job is to produce a faithful copy, and
-// scripts/verify-migration.ts compares this setting between the two servers precisely so that
-// an unexplained difference is surfaced rather than shrugged at. And the protection is
-// forward-looking: the day someone writes `to_tsvector(name)` without a configuration
-// argument, it would tokenise differently here than it did on Neon, and the symptom would be
-// a trail that quietly stops being findable rather than an error.
+// It is pinned anyway, and the reason is forward-looking: the day someone writes
+// `to_tsvector(name)` without a configuration argument, this GUC silently decides the
+// tokenisation, and the symptom of it changing under them is a trail that stops being
+// findable rather than an error.
 // ---------------------------------------------------------------------------------------
 
 resource textSearchConfig 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = {
@@ -595,14 +582,10 @@ resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@
   dependsOn: [connectionsAlert]
 }
 
-// Named `switchback`, not Neon's `neondb`. A migration is the free moment to drop an
-// accidental name — both connection strings are being rewritten anyway.
-//
-// The collation is not cosmetic and must match Neon's. Restore succeeds under either, which
-// is exactly what makes a mismatch dangerous: `ORDER BY name` silently reorders every trail
-// list and the partial unique index on `trail_lists` is built under different rules. The
-// migration workflow reads Neon's `datcollate` and refuses to run on a mismatch rather than
-// discovering it later.
+// The collation is not cosmetic. `C.UTF-8` is byte order; Azure's server default `en_US.utf8`
+// is dictionary order. A restore succeeds under either, which is exactly what makes a mismatch
+// dangerous: `ORDER BY name` silently reorders every trail list and the partial unique index
+// on `trail_lists` is built under different equality rules.
 //
 // **Create-only, hence the flag — and that is Azure's constraint, not a preference.** Charset
 // and collation are fixed by `CREATE DATABASE` and cannot be altered afterwards, so there is
@@ -752,7 +735,8 @@ output pooledPort int = pooledPort
 // on DATABASE_URL silently shrinks the *background* pool too — while `COMMIT_CONCURRENCY` in
 // packages/ingest/src/pipeline.ts still derives 6 concurrent commits from the constant. Six
 // commits against five connections is a pool timeout on every drain. Leaving it unset keeps
-// the pool sizes exactly as they are on Neon today, which is what a migration should do.
+// the background pool at the 10 `backgroundUrl()` injects, which is what that constant is
+// sized against.
 var sslArgs = 'sslmode=verify-full&sslaccept=strict'
 
 // The two administrator templates. These are the *migration and CI* credential: they belong
