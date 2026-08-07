@@ -101,11 +101,16 @@ which would exhaust a serverless pool. Admission control (`ingest/backpressure.t
 `queueTiles` — the choke point every writing path crosses — rather than at the one button that has a
 person behind it.
 
-**One inline drain per instance, and a kick is never dropped.** The Overpass client caps itself at
-two concurrent requests, so a second drain running alongside the first would only pile claimed work
-behind it and sink the tile someone is waiting on. `api/inline-drain.ts` serialises them and carries
-the tile keys of anything asked for meanwhile into a single follow-up pass, because a drain is
-scoped to its caller's keys: dropped, the next reader's tile waits on a poll or on the cron.
+**One inline drain per instance, and a kick is carried rather than dropped.** The Overpass client
+caps itself at two concurrent requests, so a second drain running alongside the first would only
+pile claimed work behind it and sink the tile someone is waiting on. `api/inline-drain.ts`
+serialises them and carries the tile keys of anything asked for meanwhile into a single follow-up
+pass, because a drain is scoped to its caller's keys: dropped, the next reader's tile waits on a
+poll or on the cron. Two edges of that: keys past `MAX_PENDING_KEYS` are left to the cron, and the
+follow-up claims only its four oldest jobs, so a late key is asked for in the next pass and served
+within a few. The cost is that every poll landing mid-drain now holds its invocation open until the
+follow-up ends — 25 held invocations against 1 across a 60 s pass at the 2.5 s poll below — which is
+what buys the follow-up enough `after()` budget to finish.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection
