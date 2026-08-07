@@ -1,5 +1,5 @@
 /**
- * Republishes the ingest queue's distress into Application Insights.
+ * Republishes the ingest queue's state into Application Insights, on every reading.
  *
  * The drainer that actually runs is on Vercel, which has no Application Insights, so
  * `switchback-ingest-tile-split`, `switchback-ingest-subtree-stuck` and a mirror's 429 reach a
@@ -11,12 +11,27 @@
  * setting under which the drainer is invisible.
  */
 
-import { QUEUE_DISTRESS_MARKER, isDistressed, queueHealth } from '@switchback/ingest';
+import {
+  QUEUE_DISTRESS_MARKER,
+  QUEUE_HEALTH_MARKER,
+  formatQueueHealth,
+  isDistressed,
+  queueHealth,
+} from '@switchback/ingest';
 import type { QueueHealth } from '@switchback/ingest';
 import type { PrismaClient } from '@switchback/db';
+import { BUILD_COMMIT } from './build';
 import type { WorkerLog } from './log';
 
-/** Reads the queue and logs `QUEUE_DISTRESS_MARKER` when anything is wrong. */
+/**
+ * Reads the queue, logs `QUEUE_HEALTH_MARKER` every time and `QUEUE_DISTRESS_MARKER` as well
+ * when anything is wrong.
+ *
+ * The heartbeat is unconditional so that its absence means something, and it carries the commit
+ * the bundle was built from so that its *presence* means one particular package is mounted. A
+ * read failure is the one case that emits neither, which is correct: this process cannot report
+ * a queue it cannot see, and `switchback-ingest-worker-silent` is the rule that notices.
+ */
 export async function reportQueueHealth(
   db: PrismaClient,
   log: WorkerLog,
@@ -30,12 +45,8 @@ export async function reportQueueHealth(
     return null;
   }
 
-  if (!isDistressed(health)) return health;
-
-  log.warn(
-    `${QUEUE_DISTRESS_MARKER} dead=${health.dead} staleLeases=${health.staleLeases} ` +
-      `rateLimited=${health.rateLimited} orphanedSplits=${health.orphanedSplits} ` +
-      `stuckSubtrees=${health.stuckSubtrees}`,
-  );
+  const counts = formatQueueHealth(health);
+  log.info(`${QUEUE_HEALTH_MARKER} build=${BUILD_COMMIT} ${counts}`);
+  if (isDistressed(health)) log.warn(`${QUEUE_DISTRESS_MARKER} ${counts}`);
   return health;
 }

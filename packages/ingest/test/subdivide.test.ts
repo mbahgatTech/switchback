@@ -16,6 +16,7 @@ import {
   rollUp,
   splitTile,
   subdivideMaxZoom,
+  unsplitTile,
 } from '../src/subdivide';
 import type { ChildTile } from '../src/subdivide';
 import { TILE_TTL_MS } from '../src/freshness';
@@ -337,5 +338,169 @@ describe('promoteFrom', () => {
     const { db, recorded } = fakeDb(siblings());
     await promoteFrom(db, PARENT);
     expect(recorded.tileUpdates.map((update) => update.quadkey)).toEqual([PARENT]);
+  });
+});
+
+/**
+ * The rollback for `INGEST_SUBDIVIDE_MAX_ZOOM`, which the flag itself does not provide: lowering
+ * the ceiling stops new splits, and `processTile` still routes any tile with four children to the
+ * roll-up with no flag to read. Undoing one by hand is what wedged six parents for 39 hours, so
+ * both halves have to happen together or not at all.
+ */
+describe('unsplitTile', () => {
+  const CHILDREN = childQuadkeys(PARENT);
+  const GRANDCHILDREN = childQuadkeys(CHILDREN[0]);
+
+  interface UnsplitRecorded {
+    transactions: number;
+    /** Every operation the transaction body performed, in order, for the fence assertions. */
+    steps: string[];
+    deletedJobKeys: string[];
+    deletedTiles: string[];
+    parentUpdate: Record<string, unknown> | null;
+    enqueued: string[];
+  }
+
+  function unsplitDb(
+    tiles: string[],
+    parentStatus: TileStatus | null = TileStatus.pending,
+    runningJobs = 0,
+  ): { db: PrismaClient; recorded: UnsplitRecorded } {
+    const recorded: UnsplitRecorded = {
+      transactions: 0,
+      steps: [],
+      deletedJobKeys: [],
+      deletedTiles: [],
+      parentUpdate: null,
+      enqueued: [],
+    };
+    const db = {
+      $transaction: (body: (tx: PrismaClient) => Promise<unknown>) => {
+        recorded.transactions += 1;
+        return body(db);
+      },
+      $executeRaw: (strings: TemplateStringsArray) => {
+        recorded.steps.push(strings.join('?').includes('pg_advisory_xact_lock') ? 'lock' : 'raw');
+        return Promise.resolve(1);
+      },
+      ingestTile: {
+        findUnique: () => {
+          recorded.steps.push('readParent');
+          return Promise.resolve(parentStatus === null ? null : { status: parentStatus });
+        },
+        findMany: ({ where }: { where: { quadkey: { startsWith: string } } }) =>
+          Promise.resolve(
+            tiles
+              .filter((key) => key.startsWith(where.quadkey.startsWith) && key !== PARENT)
+              .map((quadkey) => ({ quadkey })),
+          ),
+        deleteMany: ({ where }: { where: { quadkey: { in: string[] } } }) => {
+          recorded.steps.push('deleteTiles');
+          recorded.deletedTiles.push(...where.quadkey.in);
+          return Promise.resolve({ count: where.quadkey.in.length });
+        },
+        update: (args: { data: Record<string, unknown> }) => {
+          recorded.steps.push('updateParent');
+          recorded.parentUpdate = args.data;
+          return Promise.resolve({});
+        },
+      },
+      ingestJob: {
+        count: () => {
+          recorded.steps.push('countRunning');
+          return Promise.resolve(runningJobs);
+        },
+        updateMany: () => Promise.resolve({ count: 0 }),
+        deleteMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) => {
+          recorded.steps.push('deleteJobs');
+          recorded.deletedJobKeys.push(...where.dedupeKey.in);
+          return Promise.resolve({ count: where.dedupeKey.in.length });
+        },
+        upsert: (args: { where: { dedupeKey: string } }) => {
+          recorded.enqueued.push(args.where.dedupeKey);
+          return Promise.resolve({});
+        },
+      },
+    } as unknown as PrismaClient;
+    return { db, recorded };
+  }
+
+  it('removes the whole subtree, not only the four children', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN, ...GRANDCHILDREN]);
+
+    const result = await unsplitTile(db, PARENT);
+
+    expect(result.descendantsRemoved).toBe(CHILDREN.length + GRANDCHILDREN.length);
+    expect(recorded.deletedTiles).toEqual(expect.arrayContaining([...CHILDREN, ...GRANDCHILDREN]));
+    expect(recorded.deletedTiles).not.toContain(PARENT);
+  });
+
+  /*
+   * The wedge this exists to prevent: children gone, marker left behind. A parent claiming a
+   * subdivision with nothing under it never fetches again until `reconcileOrphanedSplits`
+   * happens to run.
+   */
+  it('clears the parent marker in the same transaction that deletes the children', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN]);
+
+    await unsplitTile(db, PARENT);
+
+    expect(recorded.transactions).toBe(1);
+    expect(recorded.parentUpdate).toMatchObject({ lastError: null });
+  });
+
+  it('re-queues the parent so the box is fetched whole again', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN]);
+
+    await unsplitTile(db, PARENT);
+
+    expect(recorded.enqueued).toEqual([`ingest_tile:${PARENT}`]);
+    expect(recorded.deletedJobKeys).toEqual(CHILDREN.map((key) => `ingest_tile:${key}`));
+  });
+
+  it('keeps a parent that is already serving data on the status it has', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN], TileStatus.ready);
+
+    const result = await unsplitTile(db, PARENT);
+
+    expect(result.status).toBe(TileStatus.ready);
+    expect(recorded.parentUpdate).toMatchObject({ status: TileStatus.ready });
+  });
+
+  it('refuses while a descendant is mid-drain, rather than racing its upsert', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN], TileStatus.pending, 1);
+
+    await expect(unsplitTile(db, PARENT)).rejects.toThrow(/still running/);
+    expect(recorded.deletedTiles).toEqual([]);
+    expect(recorded.deletedJobKeys).toEqual([]);
+  });
+
+  /*
+   * The refusal is only worth anything if nothing can start between reading it and acting on it.
+   * Every claim of a tile job is made under `DRAIN_ADMISSION_KEY`, so the count has to be taken
+   * after this transaction holds that lock — a count outside it describes the moment before the
+   * cron fired, and the operator does not control the cron's schedule.
+   *
+   * The parent's status is under the same rule and for the same reason: it is read here and
+   * written back at the end, so a drain that changed it in between would have that change
+   * silently overwritten with the value from before.
+   */
+  it('reads the running count and the parent status under the lock the drain claims through', async () => {
+    const { db, recorded } = unsplitDb([PARENT, ...CHILDREN]);
+
+    await unsplitTile(db, PARENT);
+
+    expect(recorded.steps[0]).toBe('lock');
+    expect(recorded.steps.indexOf('countRunning')).toBeGreaterThan(recorded.steps.indexOf('lock'));
+    expect(recorded.steps.indexOf('readParent')).toBeGreaterThan(recorded.steps.indexOf('lock'));
+    expect(recorded.steps.indexOf('countRunning')).toBeLessThan(
+      recorded.steps.indexOf('deleteJobs'),
+    );
+  });
+
+  it('refuses a quadkey with no tile row at all', async () => {
+    const { db } = unsplitDb([], null);
+
+    await expect(unsplitTile(db, PARENT)).rejects.toThrow(/no ingest_tiles row/);
   });
 });

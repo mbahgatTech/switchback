@@ -13,9 +13,10 @@ import {
   quadkeyToBBox,
   quadkeyToTile,
 } from '@switchback/geo';
+import { DRAIN_ADMISSION_KEY } from './drain-slot';
 import { isTileFresh, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
-import { enqueue, tileJobKey } from './jobs';
+import { LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
 
 /** How many children a quadkey has. Four, always — that is what "quad" means. */
 export const CHILDREN_PER_TILE = 4;
@@ -394,4 +395,93 @@ export async function reconcileOrphanedSplits(
   }
 
   return repaired;
+}
+
+/** What `unsplitTile` took apart. */
+export interface UnsplitResult {
+  quadkey: string;
+  /** Descendant tile rows deleted, at every depth below the parent. */
+  descendantsRemoved: number;
+  /** The status the parent was left in — its own if it had one worth keeping, else `pending`. */
+  status: TileStatus;
+}
+
+/**
+ * Undo a subdivision: delete the tile's descendants and put the parent back on the queue.
+ *
+ * `INGEST_SUBDIVIDE_MAX_ZOOM` stops *new* splits and nothing else. `processTile` routes any tile
+ * with four children straight to the roll-up with no flag to read, so a tile already split stays
+ * split however the ceiling is set, and lowering the ceiling is therefore not a rollback for
+ * anything that has already happened. This is the rollback, and it exists in code because the
+ * obvious manual version wedges the tile: deleting the subtree without clearing the parent's
+ * marker leaves a row claiming a subdivision that is not there, which only
+ * `reconcileOrphanedSplits` repairs and only on its own schedule.
+ *
+ * **Trails are not deleted with the tiles.** A trail belongs to the corpus, not to the tile that
+ * fetched it, so the corpus survives this whether or not the parent's re-ingest completes. What is
+ * lost is the record of which box fetched what, which nothing reads.
+ *
+ * **The parent is unlikely to complete.** A tile splits because it did not fit one invocation, so
+ * with the ceiling down the re-queued parent runs out of clock again and `processTile` writes it
+ * `failed` and throws to `dead`. That is the pre-subdivision state, restored faithfully enough to
+ * include its failure. Callers reach for this when a split is the problem, not when the area is.
+ *
+ * Refuses while any descendant job is `running`. That job's handler would upsert its tile row back
+ * after this deleted it — re-wedging the parent — and a lease is at most `LEASE_TIMEOUT_MS` old, so
+ * waiting is a bounded instruction rather than an open one.
+ *
+ * Every read this depends on is taken **inside** the transaction, under `DRAIN_ADMISSION_KEY` —
+ * the refusal count and the parent's own status alike. Every claim of a tile job is made under
+ * that same lock, so a reading taken outside it dates from before the drain that is about to
+ * start: the cron fires on a schedule the operator does not control, and `INGEST_MAX_DRAINERS=1`
+ * narrows the window without closing it.
+ */
+export async function unsplitTile(db: PrismaClient, quadkey: string): Promise<UnsplitResult> {
+  // One transaction, because a parent whose marker survives its children is precisely the wedged
+  // state this exists to prevent. The parent's own status is read inside it for the same reason
+  // the refusal count is: a drain admitted between an outside read and this write would have its
+  // status silently overwritten by whatever was true beforehand.
+  const { descendantsRemoved, status } = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`select pg_advisory_xact_lock(${DRAIN_ADMISSION_KEY})`;
+
+    const parent = await tx.ingestTile.findUnique({
+      where: { quadkey },
+      select: { status: true },
+    });
+    if (!parent) throw new Error(`no ingest_tiles row for ${quadkey}`);
+    const restored = isTileSettled(parent.status) ? parent.status : TileStatus.pending;
+
+    // Quadkeys are hierarchical prefixes, so every descendant at every depth starts with the
+    // parent's — which the parent itself also does, hence the exclusion.
+    const descendants = await tx.ingestTile.findMany({
+      where: { quadkey: { startsWith: quadkey }, NOT: { quadkey } },
+      select: { quadkey: true },
+    });
+    const keys = descendants.map((tile) => tile.quadkey);
+    const jobKeys = keys.map(tileJobKey);
+
+    const running = await tx.ingestJob.count({
+      where: { dedupeKey: { in: jobKeys }, status: JobStatus.running },
+    });
+    if (running > 0) {
+      throw new Error(
+        `${quadkey}: ${running} descendant job(s) still running. Wait for the lease to expire ` +
+          `(at most ${Math.round(LEASE_TIMEOUT_MS / 60_000)} min) and run this again.`,
+      );
+    }
+
+    await tx.ingestJob.deleteMany({ where: { dedupeKey: { in: jobKeys } } });
+    await tx.ingestTile.deleteMany({ where: { quadkey: { in: keys } } });
+    await tx.ingestTile.update({ where: { quadkey }, data: { status: restored, lastError: null } });
+    return { descendantsRemoved: keys.length, status: restored };
+  });
+
+  await enqueue(db, {
+    kind: JobKind.ingest_tile,
+    dedupeKey: tileJobKey(quadkey),
+    payload: { quadkey },
+    priority: SPLIT_PRIORITY,
+  });
+
+  return { quadkey, descendantsRemoved, status };
 }

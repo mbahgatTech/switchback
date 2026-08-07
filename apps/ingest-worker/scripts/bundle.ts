@@ -30,6 +30,15 @@ interface Manifest {
 
 const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as Manifest;
 
+/*
+ * The commit this bundle is built from, substituted into `src/build.ts` below and emitted with
+ * every heartbeat. `.github/scripts/deploy-worker.sh` waits for a heartbeat carrying this exact
+ * value, which is what makes the deploy proof about *this* package rather than about the host
+ * being alive: without it, any build already carrying the current `health.ts` satisfies the check,
+ * so a package that failed to mount would pass on the previous build's telemetry.
+ */
+const buildCommit = (process.env.GITHUB_SHA ?? gitHead()).trim();
+
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
@@ -44,6 +53,7 @@ await build({
   // loads the entry point with `require` unless told otherwise.
   format: 'cjs',
   sourcemap: true,
+  define: { 'process.env.INGEST_BUILD_COMMIT': JSON.stringify(buildCommit) },
   external: [...EXTERNAL, ...PRISMA_EXTERNAL],
   logLevel: 'info',
 });
@@ -101,7 +111,16 @@ for (const name of ['.prisma', '@prisma/client']) {
   await cp(from, path.join(dist, 'node_modules', name), { recursive: true });
 }
 
-console.log(`bundled to ${dist}`);
+console.log(`bundled to ${dist} at ${buildCommit}`);
+
+/** The working tree's commit, for a build made outside CI. `unknown` rather than a failure. */
+function gitHead(): string {
+  try {
+    return execSync('git rev-parse HEAD', { cwd: root, encoding: 'utf8' });
+  } catch {
+    return 'unknown';
+  }
+}
 
 /**
  * Walk up for an installed package the way Node resolves one, rather than assuming it sits at

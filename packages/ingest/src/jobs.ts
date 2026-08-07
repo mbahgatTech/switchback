@@ -178,11 +178,17 @@ type Lease = Pick<ClaimedJob, 'id' | 'lockedAt' | 'lockedBy'>;
  * guards. A late `failJob` would requeue work that has since finished and null a lock a live
  * worker is holding, letting a third worker run the job alongside it.
  *
- * `(lockedBy, lockedAt)` names one lease. Every exit from `running` nulls both and every entry
- * stamps a fresh pair, so a stale worker matches no row the moment anything else touches it —
- * and `lockedBy` alone would not do, since `'cron'` and `'inline'` are fixed strings. The two
- * timestamps cannot collide either: a re-claim can only follow a reclaim, which needs the first
- * lease to be a whole `LEASE_TIMEOUT_MS` old.
+ * `(status, lockedBy, lockedAt)` names one lease. `status` is what releases it: every exit from
+ * `running` writes a different status, so a stale worker matches nothing the moment anything else
+ * has touched the row — including the case the other two cannot see, where a reclaim requeued the
+ * job and left the same pair behind. The pair then distinguishes two *running* leases, and
+ * `lockedBy` alone would not do, since `'cron'` and `'inline'` are fixed strings.
+ *
+ * **The lease columns survive the outcome, and that is deliberate.** Nulling them on the way out
+ * is the obvious way to release a lease and it erases the only record of which process ran the
+ * job — see `lockedBy` in `packages/db/prisma/schema.prisma` for the forensic queries that
+ * depend on their surviving, and `docs/architecture.md` for why `INGEST_MAX_DRAINERS` is
+ * otherwise unobservable.
  */
 async function writeOutcome(
   db: Db,
@@ -190,7 +196,12 @@ async function writeOutcome(
   data: Prisma.IngestJobUpdateManyMutationInput,
 ): Promise<boolean> {
   const { count } = await db.ingestJob.updateMany({
-    where: { id: lease.id, lockedBy: lease.lockedBy, lockedAt: lease.lockedAt },
+    where: {
+      id: lease.id,
+      status: JobStatus.running,
+      lockedBy: lease.lockedBy,
+      lockedAt: lease.lockedAt,
+    },
     data,
   });
   return count > 0;
@@ -201,8 +212,6 @@ export async function completeJob(db: Db, job: Lease, now = new Date()): Promise
   return writeOutcome(db, job, {
     status: JobStatus.done,
     completedAt: now,
-    lockedAt: null,
-    lockedBy: null,
     lastError: null,
   });
 }
@@ -225,8 +234,6 @@ export async function failJob(
   return writeOutcome(db, job, {
     status: exhausted ? JobStatus.dead : JobStatus.queued,
     runAfter: exhausted ? undefined : new Date(now.getTime() + delay),
-    lockedAt: null,
-    lockedBy: null,
     lastError: message.slice(0, 1000),
     completedAt: exhausted ? now : undefined,
   });
@@ -250,8 +257,6 @@ export async function deferJob(
     status: JobStatus.queued,
     attempts: Math.max(job.attempts - 1, 0),
     runAfter: new Date(now.getTime() + delayMs),
-    lockedAt: null,
-    lockedBy: null,
     lastError: reason.slice(0, 1000),
   });
 }
@@ -291,6 +296,9 @@ export async function reclaimExpiredJobs(
   // `attempts + 1` here reads the *old* row — Postgres evaluates the whole SET against the row
   // as it was — so the retirement test and the new count are the same number. `RETURNING`
   // reports the new status, which is how the two dispositions are counted apart.
+  //
+  // `lockedAt` and `lockedBy` are left alone: the status change is what releases the lease, and
+  // they are the record of which process held it when it died.
   const rows = await db.$queryRaw<Array<{ status: JobStatus }>>`
     UPDATE ingest_jobs SET
       attempts      = attempts + 1,
@@ -298,8 +306,6 @@ export async function reclaimExpiredJobs(
                            THEN 'dead'::"JobStatus" ELSE 'queued'::"JobStatus" END,
       "completedAt" = CASE WHEN attempts + 1 >= "maxAttempts"
                            THEN ${now} ELSE "completedAt" END,
-      "lockedAt"    = NULL,
-      "lockedBy"    = NULL,
       "lastError"   = ${reason}
     WHERE status = 'running' AND "lockedAt" < ${cutoff}
     RETURNING status

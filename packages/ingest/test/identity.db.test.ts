@@ -438,54 +438,64 @@ describe.skipIf(!IS_LOCAL).sequential('a slug a retired trail still answers on',
   beforeEach(reset);
   afterAll(reset);
 
-  it('is not handed to a different trail', async () => {
-    // `trails.bySlug` reads the trail table first and falls back to the alias, so a squatter on
-    // an aliased slug silently redirects a permanent public URL to somebody else's trail.
-    const alias = `${PREFIX.toLowerCase().replace(/\s+/g, '-')}-ridge`;
-    const held = await prisma.trail.create({
-      data: {
-        slug: `${alias}-holder`,
-        name: `${PREFIX} Holder`,
-        osmType: 'way',
-        osmId: BigInt(WAY_IDS[4]!),
-        quadkey: WEST,
-        geometryJson: {
-          type: 'LineString',
-          coordinates: [
-            [SEAM_LNG, LAT],
-            [SEAM_LNG + 0.01, LAT],
-          ],
+  /*
+   * Both modes, because the rollback state is `osm-id` and the alias it has to respect was
+   * written by a merge made while the flag was on. Gating this read on `claim` — which it was —
+   * meant an operator who rolled the flag back handed retired public URLs to unrelated trails on
+   * the next ingest, while `trails.bySlug` still resolved them: the redirect and the squatter
+   * disagreeing about who owns the URL.
+   */
+  it.each(['claim', 'osm-id'] as const)(
+    'is not handed to a different trail under %s',
+    async (mode) => {
+      // `trails.bySlug` reads the trail table first and falls back to the alias, so a squatter on
+      // an aliased slug silently redirects a permanent public URL to somebody else's trail.
+      const alias = `${PREFIX.toLowerCase().replace(/\s+/g, '-')}-ridge`;
+      const held = await prisma.trail.create({
+        data: {
+          slug: `${alias}-holder`,
+          name: `${PREFIX} Holder`,
+          osmType: 'way',
+          osmId: BigInt(WAY_IDS[4]!),
+          quadkey: WEST,
+          geometryJson: {
+            type: 'LineString',
+            coordinates: [
+              [SEAM_LNG, LAT],
+              [SEAM_LNG + 0.01, LAT],
+            ],
+          },
+          centroidLng: SEAM_LNG,
+          centroidLat: LAT,
+          bboxW: SEAM_LNG,
+          bboxS: LAT,
+          bboxE: SEAM_LNG + 0.01,
+          bboxN: LAT,
+          lengthM: 1,
+          gainM: 0,
+          lossM: 0,
+          minEleM: 0,
+          maxEleM: 0,
+          estimatedTimeS: 1,
+          difficulty: 'easy',
+          difficultyScore: 0,
+          routeType: 'point_to_point',
         },
-        centroidLng: SEAM_LNG,
-        centroidLat: LAT,
-        bboxW: SEAM_LNG,
-        bboxS: LAT,
-        bboxE: SEAM_LNG + 0.01,
-        bboxN: LAT,
-        lengthM: 1,
-        gainM: 0,
-        lossM: 0,
-        minEleM: 0,
-        maxEleM: 0,
-        estimatedTimeS: 1,
-        difficulty: 'easy',
-        difficultyScore: 0,
-        routeType: 'point_to_point',
-      },
-      select: { id: true },
-    });
-    await prisma.trailSlugAlias.create({ data: { slug: alias, trailId: held.id } });
+        select: { id: true },
+      });
+      await prisma.trailSlugAlias.create({ data: { slug: alias, trailId: held.id } });
 
-    await processTile(WEST, deps([W1, W2]));
+      await processTile(WEST, deps([W1, W2], { trailIdentity: mode }));
 
-    const [trail] = await prisma.trail.findMany({
-      where: { name: `${PREFIX} Ridge` },
-      select: { slug: true },
-    });
-    expect(trail?.slug).toBeDefined();
-    expect(trail!.slug).not.toBe(alias);
+      const trails = await prisma.trail.findMany({
+        where: { name: `${PREFIX} Ridge` },
+        select: { slug: true },
+      });
+      expect(trails.length).toBeGreaterThan(0);
+      expect(trails.map((trail) => trail.slug)).not.toContain(alias);
 
-    const resolved = await prisma.trailSlugAlias.findUnique({ where: { slug: alias } });
-    expect(resolved?.trailId).toBe(held.id);
-  });
+      const resolved = await prisma.trailSlugAlias.findUnique({ where: { slug: alias } });
+      expect(resolved?.trailId).toBe(held.id);
+    },
+  );
 });

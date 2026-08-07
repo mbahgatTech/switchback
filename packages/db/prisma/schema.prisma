@@ -792,6 +792,13 @@ model IngestJob {
   maxAttempts Int       @default(5)
   /// Earliest time this job may run. Backoff sets it forward rather than sleeping.
   runAfter    DateTime  @default(now())
+  /// When the lease that is running — or that last ran — this job was granted, and to which
+  /// process. They are *not* cleared when the job leaves `running`: `writeOutcome` fences on
+  /// `status` as well as this pair, so the status change alone releases the lease, and the pair
+  /// survives as the record of who ran the work. That is what makes `INGEST_MAX_DRAINERS`
+  /// observable after the fact — `lockedAt` and `completedAt` bound one drain, so overlapping
+  /// intervals over a window give the concurrency actually achieved rather than the number of
+  /// invocations. `docs/architecture.md` carries the query.
   lockedAt    DateTime?
   lockedBy    String?
   lastError   String?

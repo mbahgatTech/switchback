@@ -186,8 +186,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # `id-token` for the subject check below, which asks GitHub for a token and reads its `sub`.
+    # Naming any permission replaces the default set, so `contents` is restated for the checkout.
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - uses: actions/checkout@v4
+
+      # Before anything expensive, and on every push and pull request rather than only on the
+      # deploys that need it. The `deploy ingest worker` job below is gated on master, so a
+      # subject that stops matching would first appear as a red master with the Function App
+      # still on the last build a human pushed — which is the whole of B1, restored.
+      - name: The deploy credential still matches the subject GitHub issues
+        run: bash .github/scripts/assert-oidc-subject.sh
 
       - uses: actions/setup-node@v4
         with:
@@ -273,6 +286,80 @@ jobs:
           name: ingest-worker
           path: ${{ runner.temp }}/ingest-worker.zip
           retention-days: 14
+
+  # The job above builds a bundle and proves it loads. Until this one existed, nothing published
+  # it: `WEBSITE_RUN_FROM_PACKAGE` was written only by a workstation, so master could move for
+  # weeks while the Function App served whatever zip a human last pushed — with every gate green,
+  # because a green gate is a statement about a build and not about production.
+  #
+  # `needs` lists all three. `gates` so a bundle that compiles but fails the unit suite does not
+  # ship; `worker` for the artifact; `migrate` because the worker reads the same schema the web app
+  # does, so a column it expects has to exist before the code expecting it runs. That ordering is
+  # pinned by `test/worker-deploy-path.test.ts` — dropping `migrate` from this list is how code
+  # reaches production ahead of the schema it needs.
+  #
+  # **No `environment:`.** Naming one replaces the `:ref:refs/heads/master` suffix of the OIDC
+  # subject with `:environment:<name>`, which this job's federated credential does not match — and
+  # the `production` environment carries no protection rules (`gh api
+  # repos/mbahgatTech/switchback/environments` returns `protection_rules: []`), so it would have
+  # bought a deployment record at the cost of the credential. The gate that matters here is the
+  # `if:` below plus the deploy check in ci.yml's `deploy` job: nothing reaches master except
+  # through a pull request.
+  worker-deploy:
+    name: deploy ingest worker
+    needs: [gates, worker, migrate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ingest-worker
+          path: ${{ runner.temp }}
+
+      # A distinct identity from the two this repository already federates. `id-switchback-postgres-ci`
+      # holds no Azure RBAC by design and could not deploy anything; the infrastructure identity is
+      # Contributor on the whole resource group. This one is Website Contributor on the one site
+      # and Monitoring Reader on the one Application Insights component — enough to push a package
+      # and to read back whether the host is running it, and nothing else.
+      #
+      # Declared in `infra/azure/ingest.bicep` as `workerDeployer`, whose `workerDeployerClientId`
+      # output is what belongs in this variable.
+      - name: Fail loudly rather than skip
+        if: vars.AZURE_WORKER_DEPLOY_CLIENT_ID == '' || vars.AZURE_SUBSCRIPTION_ID == ''
+        run: |
+          echo "::error::AZURE_WORKER_DEPLOY_CLIENT_ID or AZURE_SUBSCRIPTION_ID is unset, so this"
+          echo "::error::push builds a worker bundle that reaches nothing. Deploy ingest.bicep and"
+          echo "::error::set both repository variables from its outputs. A skipped deploy job is"
+          echo "::error::how the Function App came to run a build five weeks older than master."
+          exit 1
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_WORKER_DEPLOY_CLIENT_ID }}
+          tenant-id: f0f92920-ce90-42c9-b87f-3ea8644bccd8
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Not preinstalled on `ubuntu-latest`, and the deploy proof is an Application Insights query.
+      # Installing it explicitly rather than letting `az` offer a dynamic install: that prompt is
+      # declined in a non-interactive shell, and the query would then fail in a way the script
+      # cannot distinguish from a host that never started.
+      - name: Install the Application Insights CLI extension
+        run: az extension add --name application-insights --only-show-errors
+
+      # Publishes, syncs the trigger cache, and then waits for the running host to emit a heartbeat
+      # carrying *this commit's* SHA. It fails if the package did not change or if that line does
+      # not arrive — an exit code from the push alone reported every stale deploy as a success, and
+      # a marker without the SHA would pass on any build that already had the current health.ts.
+      - name: Publish the bundle and prove the host is running it
+        run: bash .github/scripts/deploy-worker.sh "$RUNNER_TEMP/ingest-worker.zip" "$GITHUB_SHA"
 
   browser:
     name: browser suite

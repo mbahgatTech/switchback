@@ -118,10 +118,12 @@ How a way-derived trail is identified. `claim` resolves it through the `trail_wa
 what keeps one trail one row when two tiles each assemble part of it. `osm-id` keeps the
 `(osmType, osmId)` upsert, where the id is the lowest way id the tile happened to see.
 
-`osm-id` neither reads nor writes `trail_ways` and `trail_slug_aliases`, so switching to it stops
-every future merge and restores the previous behaviour on the next tile. It does not undo a merge
-that has already run: that deleted the loser `Trail` row, and no setting brings it back. Turning
-this on is reversible; the rows it has already retired are not.
+`osm-id` never writes `trail_ways` or `trail_slug_aliases` and never reads `trail_ways`, so
+switching to it stops every future merge and restores the previous behaviour on the next tile. It
+still reads `trail_slug_aliases`, so a slug a merge retired is not handed to some other trail, and
+tolerates that table being absent. It does not undo a merge that has already run: that deleted the
+loser `Trail` row, and no setting brings it back. Turning this on is reversible; the rows it has
+already retired are not.
 
 `claim` requires both tables to exist. Apply the schema before deploying a worker package that can
 run with this set — CI's `migrate` job does that on a push to `master` only.
@@ -172,6 +174,28 @@ var storageAccountName = 'stsbingest${uniqueString(resourceGroup().id)}'
 // the very queue it drains. Sender and Receiver cannot.
 var serviceBusDataSenderRoleId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
+
+// Website Contributor and Monitoring Reader — the two grants `.github/scripts/deploy-worker.sh`
+// needs, and the ceiling on what a compromised CI run could do with them. Website Contributor
+// carries `Microsoft.Web/sites/*`, which is the package push and the trigger sync; it reaches no
+// other resource type. Monitoring Reader is read-only across the component it is scoped to.
+var websiteContributorRoleId = 'de139f84-1756-47ae-9be6-808fbbe84772'
+var monitoringReaderRoleId = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
+
+@description('''
+The `sub` prefix GitHub actually stamps on this repository's OIDC tokens.
+
+**Not `repo:<owner>/<repo>`.** GitHub issues an immutable subject built from the numeric account
+and repository ids, and a credential written against the human-readable form matches nothing —
+`azure/login` fails with AADSTS70021 and the deploy job that was meant to close the stale-build
+loop reopens it. Read the live value back with:
+
+    gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix
+
+`id-switchback-postgres-ci` — the one federated credential in this estate observed to work, in
+CI run 31183187247 — carries exactly this prefix.
+''')
+param workerDeploySubjectPrefix string = 'repo:mbahgatTech@81331884/switchback@1316632119'
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
@@ -560,8 +584,8 @@ instances, each with its own client at 2. The chain that stops it, every link tr
 
 **Every line of that arithmetic is about this app, and this app performs no Overpass work.**
 `INGEST_QUEUE_DRIVER` is `postgres` in production, the host's own log reads `INGEST_QUEUE_DRIVER is
-not servicebus — Postgres owns the drain`, and `ingestDrain` records no invocations over the last
-24 hours. The drainer that
+not servicebus — Postgres owns the drain`, and `ingestDrain`'s most recent invocation is
+2026-08-06T00:44:04Z, the tail of the last flag-on proof. The drainer that
 runs is Vercel, where a lambda is a process and the platform starts as many as the traffic asks for,
 so the singleton on the fourth line bounds a fraction of it and the first three lines do not apply at
 all. `INGEST_MAX_DRAINERS` below, enforced by an advisory lock in
@@ -796,13 +820,11 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
           // this on `claim` is the combination that fragments trails across the new seam.
           //
-          // Declared here and *absent from the deployed app*: `az functionapp config appsettings
-          // list` returned 26 settings on 2026-08-07 and this was not among them, because the
-          // live configuration predates this entry. The interlock holds regardless —
-          // `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
-          // `claim`, and an absent variable is not — so the drift costs nothing until a
-          // deployment of this template closes it, which no workflow performs. No report may
-          // describe this value as measured from deployed configuration.
+          // Deployed and readable: `az functionapp config appsettings list` returns 28 settings on
+          // the live app and this one reads `osm-id`, matching `ingest.bicepparam`. Reading it back
+          // is the check an operator should use, because `identity.ts` treats an absent variable
+          // and `osm-id` identically — so an app whose settings collection was replaced without
+          // this entry looks safe and is, but says nothing about which template last converged it.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
@@ -924,6 +946,87 @@ resource publisherReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 }
 
 @description('''
+**The identity that publishes the worker bundle, and the reason there is one at all.**
+
+`ingest.bicep` cannot declare `WEBSITE_RUN_FROM_PACKAGE` — an ARM application-settings write
+replaces the collection whole and would erase whatever the last zip push put there — so the code
+the Function App runs arrives by a path outside this template. That path was a workstation, which
+is to say it was one person remembering. Master then moves and the site does not, with every CI
+gate green, because the gates describe a build and nothing was asserting anything about production.
+
+This identity is what lets `.github/workflows/ci.yml` close that loop on every push to master. Its
+`workerDeployerClientId` output is the `AZURE_WORKER_DEPLOY_CLIENT_ID` repository variable; without
+it the deploy job fails rather than skips, on the principle that a skipped deploy is the failure it
+exists to prevent wearing a green tick.
+
+**Two narrow grants, both below.** Website Contributor scoped to the one site, Monitoring Reader
+scoped to the one Application Insights component — enough to push a package, sync the trigger cache
+and read back whether the host is running it. Neither reaches Postgres, Service Bus, storage or any
+other resource group. The infrastructure identity in `infra-identity.bicep` is Contributor on
+everything and is deliberately *not* reused here: this credential is exercised by every merge, so it
+is the one whose blast radius is worth minimising.
+''')
+resource workerDeployer 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'id-switchback-worker-deploy'
+  location: location
+  tags: tags
+}
+
+@description('''
+The `master` branch of this repository, and nothing else.
+
+Every field is matched exactly and case-sensitively, so a pull request — whose subject ends
+`:pull_request` — cannot assume this identity. That matters more here than for the identities
+above: this repository is public, so a fork's pull request runs workflow code the fork controls,
+and a credential a fork could assume is a credential that can rewrite production.
+
+**The suffix is `ref:`, which constrains the workflow that may use it.** A job that names a
+GitHub `environment` presents `:environment:<name>` in place of the ref, so declaring one on
+`deploy ingest worker` silently stops this credential matching. `.github/scripts/assert-oidc-subject.sh`
+runs on every push and compares the token GitHub actually issues against this value, so the two
+cannot drift apart unobserved again.
+''')
+resource workerDeployerMaster 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: workerDeployer
+  name: 'github-switchback-master'
+  properties: {
+    issuer: 'https://token.actions.githubusercontent.com'
+    subject: '${workerDeploySubjectPrefix}:ref:refs/heads/master'
+    audiences: [
+      'api://AzureADTokenExchange'
+    ]
+  }
+}
+
+resource workerDeployerSite 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: functionApp
+  name: guid(functionApp.id, workerDeployer.id, websiteContributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      websiteContributorRoleId
+    )
+    principalId: workerDeployer.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Read-only, and the deploy fails without it: the push is only half the job, and the half that
+// proves the host is running the package is an Application Insights query.
+resource workerDeployerTelemetry 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: appInsights
+  name: guid(appInsights.id, workerDeployer.id, monitoringReaderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      monitoringReaderRoleId
+    )
+    principalId: workerDeployer.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+@description('''
 **A failed drain has to page somebody, and neither of the obvious signals sees one.**
 
 `switchback-ingest-deadletter` fires on `DeadletteredMessages`, and a drain the host kills never
@@ -1012,21 +1115,26 @@ which has no Application Insights at all. Its split markers, its stuck-subtree m
 a mirror returns go to a console with no alerting on it, so "no 429s observed" was a statement
 about what could be seen rather than about what happened.
 
-Every one of those conditions is a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
+Five of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
 `lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck.
+The sixth is the absence of rows changing — a drain that has stopped leaves no error behind, so
+`stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`.
 `ingestPump` already runs here every two minutes and already reads that database, so
-`apps/ingest-worker/src/health.ts` reads the five counts and logs `switchback-ingest-queue-distress`
+`apps/ingest-worker/src/health.ts` reads the six counts and logs `switchback-ingest-queue-distress`
 when any is non-zero. That log line is what this rule watches — a condition the running code
 emits, on a schedule that does not depend on which side owns the drain. The report is deliberately
 ahead of the `INGEST_QUEUE_DRIVER` guard in `functions/pump.ts`: `postgres` is exactly the setting
 under which it matters.
 
-**Each of the five can return to zero, which is what makes this a rule rather than a light left
-on.** Two of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
+**Each of the six can return to zero, which is what makes this a rule rather than a light left
+on.** Three of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
 `pruneFinishedJobs` keeps that row for thirty days, so an unwindowed count reads the same
-seventeen for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
+twenty-five for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
 `packages/ingest/src/maintenance.ts` bounds `dead` and `rateLimited` to the last hour — longer than
-this rule's fifteen-minute window, so nothing falls between evaluations. `orphanedSplits` counts
+this rule's fifteen-minute window, so nothing falls between evaluations. The third is `stalledDrain`,
+which measures silence rather than depth for the same reason: 44,884 jobs are queued and overdue and
+will be for months, so a gauge counting them is a light left on by construction.
+`orphanedSplits` counts
 only parents whose children are actually missing, not every parent midway through a legitimate
 subdivision.
 
@@ -1038,12 +1146,10 @@ resolved condition open. Severity 3 for the same reason: it is a backlog, not an
 `apps/ingest-worker/test/health.test.ts` asserts this query and the marker the code logs agree, so
 a reworded log line fails the build instead of silently disarming the rule.
 
-**Declared here is not deployed.** `az monitor scheduled-query list -g
-rg-switchback-prod-northcentralus -o json` returned one rule on 2026-08-07,
-`switchback-ingest-drain-failed`; this one does not exist in Azure yet. No workflow deploys this
-template — `infrastructure.yml` builds every template and deploys only `main.bicep` and
-`runtime-identity.bicep` — so this rule arrives on a human-run `az deployment group create` against
-this file, alongside the two app settings above that are in the same position.
+**This rule cannot fire from a worker that is not running, which is why it is not the only one.**
+Its whole firing condition is a log line, so a host that is down, wedged, or serving a build with no
+`health.ts` in it produces exactly the telemetry a healthy queue does. `switchback-ingest-worker-silent`
+below reads the heartbeat's absence and closes that gap.
 ''')
 resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-queue-distress'
@@ -1082,6 +1188,66 @@ resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
   }
 }
 
+@description('''
+**The rule that catches a worker which has stopped shipping.**
+
+Every other rule in this file is armed by something the Function App emits, so all of them read a
+host that is down, wedged, or running a build that predates the code they watch as an estate with
+nothing wrong. That is not a hypothetical: `WEBSITE_RUN_FROM_PACKAGE` is set by
+`.github/scripts/deploy-worker.sh` and by nothing else, so any failure of that path leaves the app
+serving whatever zip it last received, indefinitely and silently.
+
+`reportQueueHealth` logs `switchback-ingest-queue-health` on **every** reading — the first statement
+in the `ingestPump` handler, ahead of the `INGEST_QUEUE_DRIVER` guard, on a two-minute timer that
+does not depend on which side owns the drain. Fifteen lines are expected per window. Zero means the
+pump did not run, or ran a build with no `health.ts` in it, and there is no third reading.
+
+**The query returns a row even when nothing matches**, which is what makes a count of zero
+alertable: `summarize` with no `by` clause yields exactly one row holding `0`, where the bare
+`| project timestamp` form used above yields none and leaves the platform's empty-result handling to
+decide the verdict.
+
+Severity 2 and `autoMitigate` on: a drainer nobody can see is worse than a queue in distress, and
+the condition clears by itself the moment a heartbeat lands.
+''')
+resource workerSilentAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-worker-silent'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-worker-silent'
+    description: 'ingestPump has published no queue-health reading for 30 minutes. The worker is down, or it is running a build that predates health.ts — in both cases every other ingest alert is reading a process that cannot arm it.'
+    severity: 2
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT30M'
+    criteria: {
+      allOf: [
+        {
+          query: 'traces | where message has "switchback-ingest-queue-health" | summarize heartbeats = count()'
+          metricMeasureColumn: 'heartbeats'
+          timeAggregation: 'Total'
+          operator: 'LessThan'
+          threshold: 1
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------------
 // Outputs. No keys and no connection strings, because there are none: the three values Vercel
 // needs are a hostname, a tenant id and a client id, and none of them authenticates anything on
@@ -1098,3 +1264,6 @@ output applicationInsightsName string = appInsights.name
 output publisherClientId string = publisher.properties.clientId
 output publisherPrincipalId string = publisher.properties.principalId
 output publisherTenantId string = publisher.properties.tenantId
+
+@description('Set as the AZURE_WORKER_DEPLOY_CLIENT_ID repository variable. Without it CI cannot publish the worker.')
+output workerDeployerClientId string = workerDeployer.properties.clientId

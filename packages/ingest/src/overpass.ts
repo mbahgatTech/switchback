@@ -11,7 +11,8 @@
  *   callers fail soft to cached data.
  * - A descriptive User-Agent carrying a contact URL, validated and never defaulted.
  *
- * The app uses one shared instance (`defaultOverpass`) — a queue that isn't shared isn't one.
+ * The app uses one shared instance, memoised by `getOverpass()` in `config.ts` — a queue that
+ * isn't shared isn't one.
  */
 
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -110,7 +111,25 @@ export interface OverpassOptions {
   /** Injected in tests so backoff is instant rather than actually waiting 30 s. */
   sleepImpl?: (ms: number) => Promise<unknown>;
   now?: () => number;
+  /** Where strain is reported. Injected in tests; `console.warn` everywhere else. */
+  logImpl?: (line: string) => void;
 }
+
+/**
+ * The literal an operator greps for when a mirror refuses, a failover happens or the breaker
+ * moves.
+ *
+ * Overpass etiquette is a correctness requirement — the failure mode is an IP block that takes
+ * the product down — and none of the three events above leaves a row anywhere. A retry that
+ * eventually succeeds never reaches `ingest_jobs.lastError`, so without a line here the only
+ * record of a mirror rate-limiting this client is that nothing appeared to go wrong.
+ *
+ * What an alert can watch is the subset that *does* leave a row: a 429 that outlives the retry
+ * budget fails the job, and `queueHealth`'s `rateLimited` counts it. These lines are for the
+ * reader of whichever platform log the drainer writes to, which on `INGEST_QUEUE_DRIVER=postgres`
+ * is Vercel's.
+ */
+export const OVERPASS_STRAIN_MARKER = 'switchback-ingest-overpass-strain';
 
 /**
  * Public instances, tried in this order. Two rules govern the list. A mirror must serve the
@@ -221,6 +240,7 @@ export class OverpassClient implements OverpassQuerier {
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<unknown>;
   private readonly now: () => number;
+  private readonly logImpl: (line: string) => void;
 
   /** Slots currently in flight, and everyone waiting for one. */
   private active = 0;
@@ -228,6 +248,8 @@ export class OverpassClient implements OverpassQuerier {
 
   private consecutiveFailures = 0;
   private breakerOpenedAt: number | null = null;
+  /** True between the half-open probe being admitted and its outcome, so the close is reportable. */
+  private probing = false;
 
   /**
    * Where the next request goes. An instance field, not a per-call local, so a dead primary
@@ -257,6 +279,7 @@ export class OverpassClient implements OverpassQuerier {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.sleepImpl = options.sleepImpl ?? ((ms) => sleep(ms));
     this.now = options.now ?? (() => Date.now());
+    this.logImpl = options.logImpl ?? ((line) => console.warn(line));
 
     assertUsableUserAgent(this.userAgent);
   }
@@ -302,6 +325,8 @@ export class OverpassClient implements OverpassQuerier {
     // Half-open: let exactly one request through. `recordFailure` re-opens it for a full
     // window if that one fails.
     this.breakerOpenedAt = null;
+    this.probing = true;
+    this.reportStrain('breaker=half-open, admitting one probe');
   }
 
   private async attempt(ql: string): Promise<OverpassResponse> {
@@ -333,6 +358,10 @@ export class OverpassClient implements OverpassQuerier {
       const retry = async (): Promise<void> => {
         this.cursor = (this.cursor + 1) % this.endpoints.length;
         const next = this.endpoints[this.cursor] ?? endpoint;
+        // Named rather than left to be reconstructed by diffing `endpoint=` across consecutive
+        // lines: a failover is the response to a mirror refusing this client, and it is the event
+        // an operator investigating an IP block is looking for.
+        if (next !== endpoint) this.reportStrain(`failover=${endpoint} -> ${next}`);
         if (tried.has(next)) {
           await this.sleepImpl(
             Math.min(this.backoffMs(attempt, retryAfter), Math.max(remaining(), 0)),
@@ -363,12 +392,20 @@ export class OverpassClient implements OverpassQuerier {
 
         lastError = new Error(`Overpass ${answer.status} from ${endpoint}`);
         retryAfter = answer.retryAfter;
+        this.reportStrain(
+          `status=${answer.status} endpoint=${endpoint} attempt=${attempt}` +
+            (answer.retryAfter === null ? '' : ` retryAfter=${answer.retryAfter}`),
+        );
         if (attempt < this.maxAttempts) await retry();
       } catch (error) {
         if (error instanceof OverpassFatalError) throw error;
         // The case mirrors exist for: an IP-level block arrives as a reset with no status,
         // and no amount of waiting makes this host answer.
         lastError = error instanceof Error ? new Error(`${endpoint}: ${error.message}`) : error;
+        this.reportStrain(
+          `transport endpoint=${endpoint} attempt=${attempt} ` +
+            `error=${error instanceof Error ? error.message : String(error)}`,
+        );
         if (attempt < this.maxAttempts) await retry();
       }
     }
@@ -427,16 +464,37 @@ export class OverpassClient implements OverpassQuerier {
     return Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
   }
 
+  /** One line per strain event, prefixed so a log search finds all of them together. */
+  private reportStrain(detail: string): void {
+    this.logImpl(`${OVERPASS_STRAIN_MARKER} ${detail}`);
+  }
+
   private recordSuccess(): void {
+    // `assertBreakerClosed` has already cleared `breakerOpenedAt` to admit this probe, so the
+    // flag is the only thing that still knows the breaker was open a moment ago.
+    if (this.probing) this.reportStrain('breaker=closed');
+    this.probing = false;
     this.consecutiveFailures = 0;
     this.breakerOpenedAt = null;
   }
 
   private recordFailure(): void {
+    // A failed probe re-opens the breaker for a full window immediately, rather than spending
+    // `failureThreshold` more requests against a service that has just refused one.
+    if (this.probing) {
+      this.probing = false;
+      this.consecutiveFailures = 0;
+      this.breakerOpenedAt = this.now();
+      this.reportStrain(`breaker=open for ${this.openMs}ms after a failed probe`);
+      return;
+    }
     this.consecutiveFailures += 1;
     if (this.consecutiveFailures >= this.failureThreshold) {
       this.breakerOpenedAt = this.now();
       this.consecutiveFailures = 0;
+      this.reportStrain(
+        `breaker=open for ${this.openMs}ms after ${this.failureThreshold} failures`,
+      );
     }
   }
 

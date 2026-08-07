@@ -16,7 +16,8 @@ import {
   writeTrailGeometry,
   writeWaypointPoints,
 } from '@switchback/db';
-import type { Prisma, PrismaClient } from '@switchback/db';
+import { Prisma } from '@switchback/db';
+import type { PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
   MAX_INGEST_ZOOM,
@@ -1057,14 +1058,7 @@ async function attemptCommit(
       await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
     }
 
-    const slug = await uniqueSlug(
-      tx,
-      trail.name,
-      ctx.region.regionName,
-      osmType,
-      osmId,
-      ctx.identity,
-    );
+    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
 
     const row = {
       slug,
@@ -1254,13 +1248,12 @@ function elevationAt(
  * is what somebody would guess; then region-qualified, which says which Eagle Peak Trail this
  * is; then the OSM id, unlovely but unique and stable.
  */
-async function uniqueSlug(
+export async function uniqueSlug(
   tx: Prisma.TransactionClient,
   name: string,
   regionName: string | null,
   osmType: OsmElementType,
   osmId: bigint,
-  identity: TrailIdentityMode,
 ): Promise<string> {
   const candidates = [slugify(name)];
   if (regionName) candidates.push(slugify(name, regionName));
@@ -1278,12 +1271,26 @@ async function uniqueSlug(
     }
     // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
     // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
-    // Only merges retire a slug, and only `claim` merges, so only `claim` reads the table.
-    if (identity !== 'claim') return candidate;
-    const alias = await tx.trailSlugAlias.findUnique({
-      where: { slug: candidate },
-      select: { slug: true },
-    });
+    // Read in every mode, not only `claim`: a merge made while the flag was on retires a slug
+    // permanently, and the rollback that turns the flag off is exactly when an unrelated trail
+    // would otherwise be free to take it.
+    //
+    // P2021 only, and it is what keeps `osm-id` free of any dependency on this table: a database
+    // the DDL has not reached has no aliases, so no candidate is retired and the bare name is
+    // free. Vercel Preview builds run branch code against whichever database they are pointed at
+    // while `ci.yml`'s `migrate` job runs on `master` alone, so that gap is reachable. Any other
+    // error is a real failure and has to keep failing the commit.
+    const alias = await tx.trailSlugAlias
+      .findUnique({
+        where: { slug: candidate },
+        select: { slug: true },
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2021') {
+          return null;
+        }
+        throw error;
+      });
     if (!alias) return candidate;
   }
   return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
