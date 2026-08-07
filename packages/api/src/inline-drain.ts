@@ -47,8 +47,9 @@ function newPass(keys: readonly string[]): Pass {
  * concurrent requests, so a second drain alongside the first only piles claimed work behind it
  * and sinks the tile someone is waiting on, with nothing reporting an error.
  *
- * A caller waits for the pass carrying its own keys and no further, so a steady stream of
- * requests cannot hold any one response open indefinitely.
+ * A caller waits for the pass carrying its own keys and no further: at most one pass ahead of its
+ * own, so a steady stream of requests cannot hold any one response open indefinitely. Past that
+ * the platform's `waitUntil` budget bounds it, and work cut short is still queued for the cron.
  */
 export function createInlineDrain(run: (keys: readonly string[]) => Promise<unknown>): InlineDrain {
   let running: Pass | null = null;
