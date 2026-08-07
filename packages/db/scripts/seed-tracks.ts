@@ -14,6 +14,7 @@ import { ActivityType, Visibility, prisma, writeActivityGeometry } from '@switch
 import { HEATMAP_MIN_HIKERS } from '@switchback/core';
 import type { LngLat } from '@switchback/core';
 import { cumulativeDistancesM, lineLengthM, resampleLine } from '@switchback/geo';
+import { looksLikeHostedDatabase } from './local-database';
 
 /** Stamped on every row this script writes, so `--reset` can find them and nothing else. */
 const DEVICE = 'seed-tracks';
@@ -89,13 +90,8 @@ function assertNotProduction(): void {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
   // These rows are *public* recordings attributed to named accounts — the one kind of seed data
-  // strangers would see if it reached a live database. `postgres.database.azure.com` is
-  // production; the other three are managed-host shapes this repository has used or could
-  // plausibly point at.
-  if (
-    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u.test(url) &&
-    !process.env.SEED_ALLOW_REMOTE
-  ) {
+  // strangers would see if it reached a live database.
+  if (looksLikeHostedDatabase(url) && !process.env.SEED_ALLOW_REMOTE) {
     throw new Error(
       `refusing to seed activity into what looks like a hosted database (${url.replace(
         /:[^:@]*@/u,

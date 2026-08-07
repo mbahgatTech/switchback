@@ -196,22 +196,20 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
       // be noticed and rewound.
       backupRetentionDays: backupRetentionDays
 
-      // Immutable after creation, so this is decided now or never. Disabled, and not on
-      // cost — at this ratio geo-redundancy would in fact be free. It buys nothing this
-      // migration does not already have: Neon stays intact and populated as the rollback,
-      // and "point DATABASE_URL back at Neon and redeploy" restores service in minutes with
-      // no data loss up to cutover. Geo-restore is documented as taking minutes to hours,
-      // has up to an hour of RPO, and cannot do point-in-time restore at all. A live copy
-      // strictly dominates it.
-      //
-      // If Neon is ever decommissioned this becomes the weak point, and changing it means
-      // rebuilding the server. Say so out loud at that time.
+      // Immutable after creation, so this is decided now or never — and it is off. That is a
+      // gap rather than a saving: the region supports it (`az postgres flexible-server
+      // list-skus --location northcentralus -o json` reports `geoBackupSupported: Enabled`,
+      // measured 2026-08-07) and at this ratio it would be free, and nothing in this
+      // repository records a reason. A from-scratch deployment that wants geo-redundancy has
+      // to set this Enabled here, before the first create. What the current value leaves is
+      // locally-redundant point-in-time restore into a new server inside the same
+      // subscription, so a region-level failure takes the recovery with the original, and
+      // closing it on the live server means rebuilding it and moving the data.
       geoRedundantBackup: 'Disabled'
     }
 
     // Burstable does not support high availability, this region reports zone-redundant HA as
     // unavailable for this subscription regardless, and HA would double the compute bill.
-    // Neon is the availability story until it is not.
     highAvailability: {
       mode: 'Disabled'
     }
@@ -250,10 +248,12 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     //   - A least-privilege application role (`applicationLogin`, `sbapp` by default). This
     //     one is *not* created by this template — ARM has no way to run SQL — so it would be
     //     easy for this list to claim a boundary that does not exist. It is created by hand,
-    //     by the `Create the least-privilege application role` step of the runbook in
-    //     infra/azure/README.md, and the verification step asserts afterwards that the role
-    //     exists and that it cannot execute DDL. The credential Vercel carries is that role;
-    //     `administratorLogin` never leaves the GitHub repository secrets.
+    //     by the `The least-privilege application role` step of the runbook in
+    //     infra/azure/README.md, which also carries the two checks that turn this bullet into
+    //     a claim: a catalogue query proving the role is not a member of `azure_pg_admin`, and
+    //     a `CREATE TABLE` attempt made as the role itself, which must be refused. The
+    //     credential Vercel carries is that role; `administratorLogin` never leaves the GitHub
+    //     repository secrets.
     //   - Full certificate verification on every client (`sslmode=verify-full` for libpq,
     //     `sslaccept=strict` for Prisma — see the connection-string outputs at the foot of
     //     this file). Encryption alone would not authenticate the *server*, which on an
@@ -269,10 +269,6 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     // strings live in exactly two places, GitHub Actions repository secrets and Vercel
     // production environment variables, and nowhere else. Not in .env, not in a parameter
     // file, not in a runbook, not in a commit.
-    //
-    // Worth stating plainly: this is not a regression. Neon's endpoints are public and
-    // credential-only today with precisely the same exposure model. The migration moves an
-    // already-open door; it does not open a closed one.
     // ---------------------------------------------------------------------------------
     network: {
       publicNetworkAccess: 'Enabled'
@@ -442,20 +438,17 @@ resource logDisconnections 'Microsoft.DBforPostgreSQL/flexibleServers/configurat
 }
 
 // ---------------------------------------------------------------------------------------
-// Text search configuration, matched to the source rather than left at the Azure default.
+// Text search configuration, pinned rather than left at the Azure provider default.
 //
-// Neon runs `default_text_search_config = pg_catalog.simple`; a Flexible Server starts on
-// `pg_catalog.english`. Every `to_tsvector` and `websearch_to_tsquery` call in this codebase
-// names `'english'` explicitly — packages/db/src/spatial.ts writes the vector, packages/api/
-// src/routers/trails.ts reads it — so no current query consults this GUC and search behaviour
-// is identical either way today.
+// Pinned to `pg_catalog.simple`; a Flexible Server starts on `pg_catalog.english`. Every
+// `to_tsvector` and `websearch_to_tsquery` call in this codebase names `'english'` explicitly
+// — packages/db/src/spatial.ts writes the vector, packages/api/src/routers/trails.ts reads it
+// — so no current query consults this GUC and search behaviour is identical either way today.
 //
-// It is set anyway, for two reasons. The migration's job is to produce a faithful copy, and
-// scripts/verify-migration.ts compares this setting between the two servers precisely so that
-// an unexplained difference is surfaced rather than shrugged at. And the protection is
-// forward-looking: the day someone writes `to_tsvector(name)` without a configuration
-// argument, it would tokenise differently here than it did on Neon, and the symptom would be
-// a trail that quietly stops being findable rather than an error.
+// It is pinned anyway, and the reason is forward-looking: the day someone writes
+// `to_tsvector(name)` without a configuration argument, this GUC silently decides the
+// tokenisation, and the symptom of it changing under them is a trail that stops being
+// findable rather than an error.
 // ---------------------------------------------------------------------------------------
 
 resource textSearchConfig 'Microsoft.DBforPostgreSQL/flexibleServers/configurations@2025-08-01' = {
@@ -595,14 +588,10 @@ resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@
   dependsOn: [connectionsAlert]
 }
 
-// Named `switchback`, not Neon's `neondb`. A migration is the free moment to drop an
-// accidental name — both connection strings are being rewritten anyway.
-//
-// The collation is not cosmetic and must match Neon's. Restore succeeds under either, which
-// is exactly what makes a mismatch dangerous: `ORDER BY name` silently reorders every trail
-// list and the partial unique index on `trail_lists` is built under different rules. The
-// migration workflow reads Neon's `datcollate` and refuses to run on a mismatch rather than
-// discovering it later.
+// The collation is not cosmetic. `C.UTF-8` is byte order; Azure's server default `en_US.utf8`
+// is dictionary order. A restore succeeds under either, which is exactly what makes a mismatch
+// dangerous: `ORDER BY name` silently reorders every trail list and the partial unique index
+// on `trail_lists` is built under different equality rules.
 //
 // **Create-only, hence the flag — and that is Azure's constraint, not a preference.** Charset
 // and collation are fixed by `CREATE DATABASE` and cannot be altered afterwards, so there is
@@ -752,12 +741,13 @@ output pooledPort int = pooledPort
 // on DATABASE_URL silently shrinks the *background* pool too — while `COMMIT_CONCURRENCY` in
 // packages/ingest/src/pipeline.ts still derives 6 concurrent commits from the constant. Six
 // commits against five connections is a pool timeout on every drain. Leaving it unset keeps
-// the pool sizes exactly as they are on Neon today, which is what a migration should do.
+// the background pool at the 10 `backgroundUrl()` injects, which is what that constant is
+// sized against.
 var sslArgs = 'sslmode=verify-full&sslaccept=strict'
 
-// The two administrator templates. These are the *migration and CI* credential: they belong
-// in GitHub repository secrets and nowhere else. `sbadmin` is a member of `azure_pg_admin`
-// and can execute DDL, which `prisma db push` needs and a web request never does.
+// The two administrator templates. They belong in GitHub repository secrets and nowhere else:
+// `sbadmin` is a member of `azure_pg_admin` and can execute DDL, which `prisma db push` needs
+// and a web request never does.
 output databaseUrlTemplate string = 'postgresql://${administratorLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:${pooledPort}/${databaseName}?${sslArgs}${pgBouncerEnabled ? '&pgbouncer=true' : ''}'
 
 output directDatabaseUrlTemplate string = 'postgresql://${administratorLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:5432/${databaseName}?${sslArgs}'
@@ -768,8 +758,9 @@ output directDatabaseUrlTemplate string = 'postgresql://${administratorLogin}:<P
 // so the web app has no use for a DDL-capable credential and should not carry one.
 //
 // The role behind it does not exist yet at deployment time — ARM cannot run SQL. It is
-// created by hand, by the `Create the least-privilege application role` step of the runbook
-// in infra/azure/README.md, from the connection string built out of this template, and the
-// verification step then asserts that the role exists, that it is not a member of
-// azure_pg_admin, and that it cannot create a table.
+// created by hand, by the `The least-privilege application role` step of the runbook in
+// infra/azure/README.md, from the connection string built out of this template. That step
+// also carries the two checks that assert the boundary: a catalogue query showing the role is
+// not a member of azure_pg_admin, and a `CREATE TABLE` attempt made as the role, which must
+// be refused.
 output applicationDatabaseUrlTemplate string = 'postgresql://${applicationLogin}:<PASSWORD>@${server.properties.fullyQualifiedDomainName}:${pooledPort}/${databaseName}?${sslArgs}${pgBouncerEnabled ? '&pgbouncer=true' : ''}'

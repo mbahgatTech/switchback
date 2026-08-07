@@ -8,6 +8,7 @@
  * delegated, so these rows cannot collide with a real sign-in or send mail anywhere.
  */
 import { ActivityType, TrailCondition, prisma } from '@switchback/db';
+import { looksLikeHostedDatabase } from './local-database';
 
 /** Deterministic (mulberry32), so two runs produce the same reviews and screenshots compare. */
 function rng(seed: number): () => number {
@@ -137,12 +138,8 @@ function assertNotProduction(): void {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
   // Stricter than the trail seed because this *writes user rows*: made-up accounts in a live
-  // users table are not a tidy mistake. `postgres.database.azure.com` is production; the other
-  // three are managed-host shapes this repository has used or could plausibly point at.
-  if (
-    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
-    !process.env.SEED_ALLOW_REMOTE
-  ) {
+  // users table are not a tidy mistake.
+  if (looksLikeHostedDatabase(url) && !process.env.SEED_ALLOW_REMOTE) {
     throw new Error(
       `refusing to seed accounts into what looks like a hosted database (${url.replace(
         /:[^:@]*@/,

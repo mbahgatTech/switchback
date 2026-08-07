@@ -30,7 +30,6 @@
     "ingest:tile": "tsx --env-file-if-exists=.env scripts/ingest.ts tile",
     "ingest:route": "tsx --env-file-if-exists=.env scripts/ingest.ts route",
     "ingest:requeue": "tsx --env-file-if-exists=.env scripts/requeue-jobs.ts",
-    "verify:migration": "tsx scripts/verify-migration.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",

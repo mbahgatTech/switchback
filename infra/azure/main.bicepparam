@@ -156,20 +156,15 @@ param postgresVersion = '17'
 
 param databaseName = 'switchback'
 
-// Must equal Neon's `datcollate`/`datctype`. The migration preflight checked this and refused
-// to proceed on a mismatch rather than silently reordering every `ORDER BY name` in the app.
+// **`C.UTF-8`, not `en_US.utf8`.** Azure's server-default is `en_US.utf8`, and the two sort
+// differently: `C` is byte order, `en_US` is dictionary order, so `ORDER BY name` returns a
+// different sequence and the partial unique index `trail_lists_one_system_list_per_user` is
+// built under different equality rules. A restore succeeds under either, which is exactly what
+// makes the difference dangerous.
 //
-// **`C.UTF-8`, not `en_US.utf8`.** Measured on the live source rather than assumed — Neon
-// reports `C.UTF-8` for both `datcollate` and `datctype`, while Azure's server-default (and
-// what this parameter said until the first real migration run) is `en_US.utf8`. Those two
-// sort differently: `C` is byte order, `en_US` is dictionary order, so `ORDER BY name`
-// returns a different sequence and the partial unique index
-// `trail_lists_one_system_list_per_user` is built under different equality rules. A restore
-// succeeds under either, which is exactly what makes the difference dangerous.
-//
-// Azure accepts the `C.UTF-8` spelling and stores it verbatim, which matters because the
-// verifier compares the two `datcollate` strings literally: the server also offers a `C.utf8`
-// alias, and that would be the same locale under a name that fails the comparison.
+// Azure accepts the `C.UTF-8` spelling and stores it verbatim, which matters because any
+// comparison against `datcollate` is literal: the server also offers a `C.utf8` alias, and that
+// would be the same locale under a name that fails the comparison.
 //
 // Collation is fixed at CREATE DATABASE and cannot be altered afterwards, so changing this
 // value means dropping and recreating the database, not redeploying over it.
@@ -187,7 +182,8 @@ param deployDatabase = bool(readEnvironmentVariable('DEPLOY_DATABASE', 'true'))
 param administratorLogin = 'sbadmin'
 
 // The least-privilege role Vercel connects as. Created by hand from the runbook in README.md,
-// not by the template — ARM cannot run SQL — and asserted by scripts/verify-migration.ts.
+// not by the template — ARM cannot run SQL — and checked there by connecting as it and
+// requiring `CREATE TABLE` to be refused.
 // `sbadmin` above can DROP TABLE and manage roles and stays in the GitHub secrets that CI
 // uses; `sbapp` can only read and write rows, and is the credential that sits on an
 // internet-reachable endpoint being used by every web request.
@@ -231,10 +227,9 @@ param budgetStartDate = '2026-07-01T00:00:00Z'
 param workloadBudgetStartDate = '2026-08-01T00:00:00Z'
 param budgetEndDate = '2036-07-01T00:00:00Z'
 
-// TLSv1.2 is Azure's default and what Neon serves today. Raise to 'TLSv1.3' only after a
-// negotiated TLS 1.3 session has actually been observed against this server from the machine
-// that will hold the connection — the migration preflight printed the negotiated version for
-// exactly this reason. See the parameter description in main.bicep.
+// TLSv1.2 is Azure's default. Raise to 'TLSv1.3' only after a negotiated TLS 1.3 session has
+// actually been observed against this server from the machine that will hold the connection.
+// See the parameter description in main.bicep.
 param minTlsVersion = 'TLSv1.2'
 
 // Entra authentication, on alongside the password login while consumers are moved across.

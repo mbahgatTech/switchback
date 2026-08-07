@@ -31,3 +31,18 @@ export function isLocalDatabase(url: string): boolean {
   if (host.startsWith('/')) return true;
   return LOCAL_HOSTS.has(host) || host.endsWith('.localhost');
 }
+
+/**
+ * Managed-provider host shapes. `postgres.database.azure.com` is production; the other two are
+ * shapes a checkout could plausibly be pointed at. Matched against the whole connection string,
+ * so a provider host reached through any username, port or database still trips it.
+ */
+const HOSTED_DATABASE = /amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/u;
+
+/**
+ * Does this connection string name a managed provider? A deny-list, and therefore only sound in
+ * the refusing direction: false means *unrecognised*, never *safe*.
+ */
+export function looksLikeHostedDatabase(url: string): boolean {
+  return HOSTED_DATABASE.test(url);
+}

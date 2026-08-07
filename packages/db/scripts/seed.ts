@@ -8,6 +8,7 @@
  */
 import { INGEST_ZOOM, lngLatToTile, quadkeyToBBox, tileToQuadkey } from '@switchback/geo';
 import { JobKind, TileStatus, prisma } from '@switchback/db';
+import { looksLikeHostedDatabase } from './local-database';
 
 interface StarterArea {
   name: string;
@@ -36,12 +37,7 @@ function assertNotProduction(): void {
     throw new Error('refusing to seed with NODE_ENV=production');
   }
   // A guard's job is to stop the run before you find out which kind of script it was.
-  // `postgres.database.azure.com` is production; the other three are managed-host shapes this
-  // repository has used or could plausibly point at.
-  if (
-    /neon\.tech|amazonaws\.com|supabase\.co|postgres\.database\.azure\.com/.test(url) &&
-    !process.env.SEED_ALLOW_REMOTE
-  ) {
+  if (looksLikeHostedDatabase(url) && !process.env.SEED_ALLOW_REMOTE) {
     throw new Error(
       `refusing to seed what looks like a hosted database (${url.replace(/:[^:@]*@/, ':***@')}). ` +
         'Set SEED_ALLOW_REMOTE=1 if you really mean it.',

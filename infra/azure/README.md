@@ -1,11 +1,11 @@
 # Switchback's production database, on Azure
 
 One **Azure Database for PostgreSQL Flexible Server** — PostgreSQL 17 with PostGIS, in its own
-resource group, described entirely in Bicep. It replaced **Neon** and nothing else: the app stays
-on Vercel, photographs stay in Cloudflare R2, CI stays on GitHub Actions.
+resource group, described entirely in Bicep. It is the whole of Switchback's persistence: the app
+runs on Vercel, photographs live in Cloudflare R2, CI runs on GitHub Actions.
 
 **Production has served from Azure since 2026-07-30, about 20:09 UTC.** It is the only copy of
-this data. The Neon project that used to be the rollback was deleted on 2026-08-07.
+this data.
 
 ```mermaid
 flowchart LR
@@ -53,11 +53,9 @@ flowchart LR
   of 2026-08-05 applied them. The resource-group budget needed its own start date — ARM will not
   create a monthly budget beginning before the current month — which is why `budgetStartDate` and
   `workloadBudgetStartDate` are two parameters rather than one.
-- **There is no second copy of this data, and no rollback target.** Neon was deleted on
-  2026-08-07 — the Vercel↔Neon marketplace resource was removed, and the endpoint stopped
-  answering minutes later. Everything that used to say "roll back to Neon" now resolves to
-  point-in-time restore into a **new** Azure server, and nothing else. See
-  [Backups](#backups) and [If this server is lost](#if-this-server-is-lost).
+- **There is no second copy of this data, and no rollback target.** Recovery is point-in-time
+  restore into a **new** Azure server, and nothing else. See [Backups](#backups) and
+  [If this server is lost](#if-this-server-is-lost).
 - **The portable backup has been proven and is not retained.** Run 31043403970 dumped production,
   restored it and compared it row for row, so the mechanism works. But the dump artifact it
   published was deleted the same day, and the workflow now withholds the dump while the repository
@@ -210,7 +208,7 @@ ground, not a home.
 | Storage           | 64 GiB Premium SSD (240 IOPS), autogrow on                      |
 | Backups           | 14 days, locally redundant, no geo-redundancy                   |
 | High availability | None                                                            |
-| Database          | `switchback`, collation `C.UTF-8` (matched to Neon)             |
+| Database          | `switchback`, collation `C.UTF-8`                               |
 | Admin login       | `sbadmin`, password, unused by CI; app connects as `sbapp`      |
 | Network           | Public, one firewall rule spanning the internet                 |
 | Extensions        | `postgis`, `pg_trgm`, `btree_gist` allow-listed                 |
@@ -399,10 +397,10 @@ drifted.
 subscription: `az postgres flexible-server list-skus --location eastus2` returns zero supported
 editions and the reason "Subscriptions are restricted from provisioning in this region", and
 `eastus` says the same. Of the four regions available — North Central US, Central US, Canada
-Central, West US 3 — Chicago is closest to Vercel's `iad1` and Neon's AWS `us-east-1`. So the
-database is roughly **20 ms further** from the application than Virginia would have been, and a
-tRPC call pays that round trip several times. Pricing is identical, so the $57.00 total is
-unaffected. A Flexible Server cannot be moved between regions afterwards.
+Central, West US 3 — Chicago is closest to Vercel's `iad1`. So the database is roughly
+**20 ms further** from the application than Virginia would have been, and a tRPC call pays that
+round trip several times. Pricing is identical, so the $57.00 total is unaffected. A Flexible
+Server cannot be moved between regions afterwards.
 
 **Burstable, which means no PgBouncer.** Azure's pooler is not available on this tier. That is a
 real loss, bought deliberately: General Purpose `Standard_D2ds_v5` plus this storage is about
@@ -438,8 +436,9 @@ So the perimeter is a credential, and these are the compensating controls:
 - `log_connections` / `log_disconnections` shipping to Log Analytics, so an unexpected login leaves
   a record.
 - The one that bounds the blast radius: **the credential Vercel carries is `sbapp`, not
-  `sbadmin`**. It can read and write rows and is refused `CREATE TABLE`, which
-  `scripts/verify-migration.ts` asserts by connecting as it and trying.
+  `sbadmin`**. It can read and write rows and is refused `CREATE TABLE` — see
+  [The least-privilege application role](#the-least-privilege-application-role) for the check that
+  proves it rather than assuming it.
 
 The residual risk is therefore _leakage_ rather than brute force, which makes the credential
 inventory the thing to keep honest:
@@ -449,13 +448,10 @@ inventory the thing to keep honest:
 | GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                 |
 | GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin` |
 | Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`    |
-| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | separate entries, added after the cutover        |
+| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | own entries, separate from Production            |
 
-The three `AZURE_*` GitHub secrets are gone, and so are the seventeen `POSTGRES_*` / `PG*` /
-`NEON_*` variables the Vercel↔Neon marketplace integration had put into the project — five of them
-complete Neon connection strings, two the bare password, one (`POSTGRES_URL_NO_SSL`) a connection
-string with TLS switched off, all scoped to Production **and Preview**. The integration itself is
-disconnected, so they do not come back. Verify rather than trust this paragraph:
+That table is the whole inventory, and the three `AZURE_*` GitHub secrets are gone. Verify rather
+than trust this paragraph:
 
 ```bash
 gh secret list --repo mbahgatTech/switchback
@@ -466,11 +462,7 @@ GitHub's values cannot be read back, so the `Notes` column is design intent plus
 demonstrably requires, not a readback. If you need to know what a secret contains, the only honest
 answer is to set it again from a source you trust.
 
-**No geo-redundant backup, no high availability — and, since 2026-08-07, no warm standby either.**
-Both settings were chosen when the disaster procedure was "point `DATABASE_URL` back at Neon and
-redeploy": minutes to restore, no data loss up to the cutover, so paying for geo-restore (minutes
-to hours, up to an hour of RPO, no point-in-time) bought nothing. Neon is now deleted, and that
-argument went with it.
+**No geo-redundant backup, no high availability, no warm standby.** All three are off.
 
 This is the weak point, said out loud rather than discovered. What is left is locally-redundant
 point-in-time restore into a new server, inside the same subscription — so a region-level failure,
@@ -757,9 +749,7 @@ compares declared properties, not just existence, so notes that differ read as a
 ## The least-privilege application role
 
 `sbapp` is the credential Vercel carries. ARM cannot run SQL, so `postgres.bicep` names the role
-but cannot create it. This step does, and `scripts/verify-migration.ts` turns it from an intention
-into a checked claim. It has been run; it is written out because it has to be run again against any
-rebuilt server.
+but cannot create it. This step does, and has to be run again against any rebuilt server.
 
 Pick a _different_ password from `sbadmin`'s — the whole point is that a leak of the web credential
 is not a leak of the admin one. Connect as `sbadmin` with `psql`, then:
@@ -799,86 +789,21 @@ SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls,
 FROM pg_roles WHERE rolname = 'sbapp';
 ```
 
-All six should be false. `verify:migration` asserts the same thing from the other side, by
-connecting _as_ `sbapp` and requiring `CREATE TABLE` to be refused, which is the version that
-cannot be fooled by a misread catalogue.
-
----
-
-## Verifying
-
-`scripts/verify-migration.ts` compares a source and a target and prints a table of pass/fail. Worth
-re-running after any restore, any rebuild, and any cutover. It prints no connection string and no
-row of user data, and exits non-zero on any failure. `NEON_*` in the variable names is where the
-source happened to be the first time; the script reads any two PostgreSQL URLs, and the Neon
-project itself is gone.
+All six should be false. Then assert it from the other side, by connecting _as_ `sbapp` and trying
+the thing it must not be able to do — the version that a misread catalogue cannot fool. Run it
+against any rebuilt server; **it is supposed to fail**:
 
 ```bash
-export NEON_VERIFY_URL='postgresql://…@…neon.tech/switchback?sslmode=verify-full'
-export AZURE_VERIFY_URL='postgresql://sbadmin:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
-export AZURE_APP_VERIFY_URL='postgresql://sbapp:…@…postgres.database.azure.com:5432/switchback?sslmode=verify-full&sslaccept=strict'
-export NEON_CHECKSUMS="$TMP/neon-checksums.txt"
-export AZURE_CHECKSUMS="$TMP/azure-checksums.txt"
-npm run verify:migration
+psql "postgresql://sbapp:PASSWORD@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full" \
+  -v ON_ERROR_STOP=1 -c 'CREATE TABLE least_privilege_probe (id int)'
 ```
 
-| Variable                       | If omitted                                                              |
-| ------------------------------ | ----------------------------------------------------------------------- |
-| `NEON_VERIFY_URL`              | The script prints a usage error and exits 1 before connecting           |
-| `AZURE_VERIFY_URL`             | Same                                                                    |
-| `AZURE_APP_VERIFY_URL`         | Recorded as a **failure**, not a skip                                   |
-| `NEON_CHECKSUMS`               | Recorded as a **failure** (`checksums · source file not found at`)      |
-| `AZURE_CHECKSUMS`              | Same, for the target                                                    |
-| `CHECKSUM_SNAPSHOT_CONSISTENT` | Treated as not `1`, which loosens the ingest-derived tables to warnings |
-
-**None of the first five is optional.** Omitting one produces a red run, not a shorter one: the
-least-privilege role is listed by `postgres.bicep` as a compensating control for a firewall
-spanning the whole internet, and silently skipping its check would turn a missing environment
-variable into a clean bill of health. A green run means every check ran.
-
-Checksum files are `table|rows|md5` per line, computed in SQL on each side. On the source they must
-be taken from _inside the transaction snapshot `pg_dump` used_, and `CHECKSUM_SNAPSHOT_CONSISTENT=1`
-is the assertion that they were. Without it the ingest-derived tables (trails, waypoints, tiles,
-jobs, sessions) are compared against a source that keeps taking writes, so a difference in those
-is a warning rather than a failure. `photos` is deliberately not on the forgiving list: it holds
-user uploads as well as ingest-derived hero images, and treating somebody's lost photograph as
-expected churn is the wrong default.
-
-### What each check catches
-
-`pg_restore` exiting 0 proves that a program finished. This proves rather more, and every check
-exists because there is a specific way a migration can look complete and not be:
-
-| Check                                                 | Catches                                                                             |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| Source and target hosts differ                        | A run comparing a database to itself, which otherwise passes everything             |
-| Per-table `count(*)` + `md5` of every row, both sides | A missing table, a short table, a corrupted row, a lost geometry or tsvector        |
-| Absolute row-count floors                             | A restore that loaded nothing — two empty databases match perfectly                 |
-| Every table from `schema.prisma` present              | A table that never arrived                                                          |
-| All 8 indexes from `spatial.sql`, by name             | An index that did not rebuild                                                       |
-| `trails_centroid_gist` **absent**                     | The one index `spatial.sql` deliberately drops                                      |
-| `pg_index.indisvalid`                                 | An index that rebuilt broken                                                        |
-| Foreign-key count matches source                      | A `post-data` section that never ran                                                |
-| `default_text_search_config`, collation               | Future ingest tokenising differently from the rows that arrived                     |
-| `sum(ST_Length(geom::geography))`, `sum(ST_NPoints)`  | Truncated or altered geometry                                                       |
-| `DISTINCT ST_SRID = {4326}` exactly                   | A lost SRID — every row count stays perfect and every distance goes wrong           |
-| NULL-geometry counts per column                       | Rows arriving without their geometry                                                |
-| Two named trails compared by WKB hash                 | Truncation on the longest line in the corpus                                        |
-| `trailIdsNear` id set, both sides                     | Different answers to the query the product runs                                     |
-| `EXPLAIN` names `trails_geom_geography_gist`          | An index that is present, valid, and _unused_ — 3,850 ms versus 178 ms on `/nearby` |
-
-The last migration run reported **72 checks, 72 passed, 0 warnings, 0 failed**, with source and
-target checksum files byte identical.
+A `permission denied` error and a non-zero exit is the pass. A created table is the failure: drop
+it, and re-run the `REVOKE`/`GRANT` block above.
 
 ---
 
-## Cutting over
-
-**Already done.** Kept because the same steps apply to any rebuild. Read it as a procedure, not as a
-description of the estate: the source database it repeatedly tells you to preserve was deleted on
-2026-08-07, and what replaced the rollback is [If this server is lost](#if-this-server-is-lost).
-
-### Taking the password out
+## Taking the password out
 
 A separate cutover, not yet run, and its order is not negotiable — turning `passwordAuth` off while
 any consumer still needs one takes the site down, and the way back is an ARM write that itself
@@ -968,110 +893,14 @@ children alone, so the `administrators` entries survive a run with an accidental
 `entraAdministrators`. Complete mode would remove both administrators in one operation, and with
 passwords off that is a total lockout with no way to grant anything back.
 
-### Cutting over from Neon
+---
 
-Preconditions: verification green, and a low-traffic hour. Avoid 04:17 UTC —
-`apps/web/vercel.json` runs the ingest drain cron then.
-
-1. **Record the moment.** Note `T0` in UTC. Anything written to Neon after this exists only there.
-
-2. **Save the way back — somewhere you can read it.** Not a GitHub Actions secret: those are
-   write-only, so a rollback copy in one is not a copy. Put the Neon pooled and direct strings
-   where a human can read them at 2am — here, `~/.sb-neon.url` and `~/.sb-neon-pooled.url`, plus
-   the password-manager entry that holds the database credentials.
-
-3. **Repoint production.** Change `DATABASE_URL` and `DIRECT_DATABASE_URL` in Vercel to the Azure
-   values. Decide deliberately whether Preview moves too; leaving Preview on Neon doubles as a live
-   rollback rehearsal. If the edit is refused or the value reverts, an integration owns the
-   variable — disconnect the Neon _storage integration_ first (that does not delete the Neon
-   database, so the rollback survives), then set it by hand. This is where a cutover stalls.
-
-4. **Redeploy.** An environment-variable change does nothing to a running deployment, which is the
-   single most common way a cutover appears to have done nothing. Fire the deploy hook, or press
-   Redeploy in the dashboard.
-
-5. **Wait for the alias**, exactly as `ci.yml`'s deploy job does: poll
-   `https://switchback-three.vercel.app/api/version` until `.commit` matches and `.environment` is
-   `production`.
-
-6. **Smoke-test the six routes** from `ci.yml`: `/`, `/explore`, `/nearby`,
-   `/trails/llanberis-path`, `/attribution`, `/manifest.webmanifest`. All 200, no redirects.
-
-7. **Prove it is actually on Azure**, which none of the above does. Two checks:
-
-   - `SELECT count(*) FROM pg_stat_activity WHERE datname = 'switchback'` on Azure should go from
-     ~0 to non-zero, while Neon's connection count falls to zero.
-   - Post a review through the UI and confirm the row lands in Azure's `reviews` and **not** in
-     Neon's. That is the definitive test and it takes thirty seconds.
-
-8. **Update the repository secrets** `DATABASE_URL` and `DIRECT_DATABASE_URL` to the Azure values,
-   so `ci.yml`'s `migrate` job pushes schema to the live database.
-
-9. **Delete any migration-scoped secrets.** Two of the three `AZURE_*` secrets carried `sbadmin`, a
-   member of `azure_pg_admin` that can execute DDL against production. Before cutover they
-   addressed a database nothing depended on; afterwards they addressed the live one, readable by
-   any workflow anyone adds later. That is the blast-radius argument being quietly given up.
-
-   **Done — and the caveat is which half of it is provable.** Only the deletion is:
-
-   ```bash
-   gh secret list --repo mbahgatTech/switchback | grep AZURE_
-   ```
-
-   No output means the deletion happened. **What it cannot tell you is whether the step ran in the
-   right order.** Those two secrets were also the last remaining copy of the admin password. The
-   instruction was to give it a home a human can read _before_ deleting them, precisely because
-   deleting first converts "an unreadable copy exists" into "no copy exists at all" — and a
-   password manager leaves no evidence anything here can query. **Treat the admin password as
-   unconfirmed rather than safe** until someone who ran the step says otherwise.
-
-### What can be lost, honestly
-
-**Downtime: effectively zero.** The dump is a consistent snapshot that does not block writers, the
-restore happens on a database nobody is using, and Vercel switches the alias atomically.
-
-**Data loss: bounded by the window, not by the dump.** Anything written to Neon between the
-snapshot and the moment Vercel starts talking to Azure exists only in Neon. Three sources:
-
-- the drain cron, once a day at 04:17 UTC — just do not migrate in that minute;
-- viewport ingest, which is **self-healing**: it is derived from OpenStreetMap and re-queueing the
-  tiles regenerates it;
-- human writes — `users`, `accounts`, `sessions`, `reviews`, `photos`, `activities`,
-  `activity_samples`, `trail_lists`, `trail_list_items`, `completions`, `planned_routes`,
-  `lifeline_sessions`, `mobile_refresh_tokens`. **This is the irreplaceable set.** A lost
-  `activities` + `activity_samples` pair is somebody's recorded walk; a lost `photos` row leaves an
-  orphaned object in R2 that nothing will ever reference. Losing `sessions` rows signs everyone out
-  — cosmetic, self-healing, and the first thing anyone notices.
-
-The web app's offline write queue (`apps/web/src/offline/`) replays some in-flight writes after
-cutover, which partly cushions this.
-
-**Closing the window is a manual job and no script here does it.** `verify:migration` only reads,
-and no `reconcile` script exists. Replaying means `WHERE "createdAt" >= T0` on the human-authored
-tables above, inserted `ON CONFLICT (id) DO NOTHING` — every id in `schema.prisma` is a `cuid()`
-and there is not one `autoincrement()`, so there are no sequences to resync and no collisions. It
-covers **inserts only**; updates and deletes made in the window are not recoverable this way. So
-plan any cutover on the assumption that **writes in the window are not automatically recovered** —
-tolerable because the window is minutes, ingest is self-healing and the irreplaceable set is small,
-not because the recovery exists. That last clause used to be softened by the source database being
-kept: anything stranded there could still be read and replayed by hand. Neon was deleted on
-2026-08-07, so on any future move the window is the loss, and the only way to shrink it is to keep
-it short.
-
-### If you ever have to move the data again
+## Loading bulk data into this server
 
 The local route to Azure **corrupts TLS records under sustained `COPY`**
-(`SSL error: sslv3 alert bad record mac`), which killed both a 4-way parallel restore and a
-single-stream one part way through. The data was loaded table by table with retries, the largest
-table in 13 chunks. A runner does not have this problem; plan for it if you are on a workstation.
-
-Two things the preflight caught before any data moved, both now fixed in these files:
-
-- **Collation.** Neon is `C.UTF-8`; this template said `en_US.utf8`, which is Azure's default. Byte
-  order against dictionary order — every `ORDER BY name` would have silently reordered.
-- **`default_text_search_config`.** Neon is `pg_catalog.simple`; Azure defaults to
-  `pg_catalog.english`. No current query consults it (every `to_tsvector` /
-  `websearch_to_tsquery` in the codebase names `'english'` explicitly), but it is matched anyway.
+(`SSL error: sslv3 alert bad record mac`), which has killed both a 4-way parallel `pg_restore` and a
+single-stream one part way through. A GitHub-hosted runner does not have this problem. From a
+workstation, load table by table with retries and split the largest table into chunks.
 
 ---
 
