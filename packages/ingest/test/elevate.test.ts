@@ -1,31 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { PNG } from 'pngjs';
 import { NO_DATA_ELEVATION, lineLengthM, resampleLine } from '@switchback/geo';
 import { TerrainSource, decodeTerrarium, elevateLine, fillGaps } from '../src/elevate';
-
-/**
- * A terrarium tile where every pixel encodes the same elevation.
- * `elev = R*256 + G + B/256 - 32768`, so 1000 m is R=131, G=232, B=0.
- */
-function flatTile(elevationM: number, size = 64): Buffer {
-  const encoded = elevationM + 32768;
-  const r = Math.floor(encoded / 256);
-  const g = Math.floor(encoded - r * 256);
-  const b = Math.round((encoded - r * 256 - g) * 256);
-
-  const png = new PNG({ width: size, height: size });
-  for (let i = 0; i < size * size; i++) {
-    png.data[i * 4] = r;
-    png.data[i * 4 + 1] = g;
-    png.data[i * 4 + 2] = b;
-    png.data[i * 4 + 3] = 255;
-  }
-  return PNG.sync.write(png);
-}
-
-function pngResponse(buffer: Buffer): Response {
-  return new Response(new Uint8Array(buffer), { status: 200 });
-}
+import { IngestDeadlineError } from '../src/deadline';
+import { flatTile, pngResponse } from './fixtures/terrarium';
 
 describe('decodeTerrarium', () => {
   it('round-trips a known elevation through the RGB encoding', () => {
@@ -136,6 +113,62 @@ describe('TerrainSource', () => {
 
     await Promise.all(Array.from({ length: 20 }, (_, i) => source.tile(13, i, i)));
     expect(peak).toBeLessThanOrEqual(3);
+  });
+
+  it('gives every request a timeout, so a stalled socket cannot outlive the invocation', async () => {
+    let signal: AbortSignal | undefined;
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      requestTimeoutMs: 50,
+      fetchImpl: ((_url: string, init: RequestInit) => {
+        signal = init.signal ?? undefined;
+        return Promise.resolve(pngResponse(flatTile(500, 8)));
+      }) as unknown as typeof fetch,
+    });
+
+    await source.tile(13, 1, 1);
+    // Node's `fetch` imposes none of its own: without this the handler had no upper bound at
+    // all on a tile fetch, which is how an invocation reached 615,938 ms.
+    expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('refuses to start a fetch past the deadline, and does not retry it', async () => {
+    let requests = 0;
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      fetchImpl: (async () => {
+        requests += 1;
+        return pngResponse(flatTile(500, 8));
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(source.tile(13, 1, 1, Date.now() - 1)).rejects.toBeInstanceOf(IngestDeadlineError);
+    // Not once, and not three times on the retry ladder — a deadline is not a transient fault.
+    expect(requests).toBe(0);
+  });
+
+  it('still answers from cache once the deadline has passed', async () => {
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+    });
+
+    await source.tile(13, 1, 1);
+    // Free, and refusing it would fail a trail over terrain already in hand.
+    await expect(source.tile(13, 1, 1, Date.now() - 1)).resolves.not.toBeNull();
+  });
+
+  it('releases its concurrency slot when the deadline strikes mid-queue', async () => {
+    // The slot is taken before the second check and has to come back, or one expired caller
+    // would shrink the semaphore for every caller after it.
+    const source = new TerrainSource({
+      urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
+      maxConcurrent: 1,
+      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+    });
+
+    await expect(source.tile(13, 9, 9, Date.now() - 1)).rejects.toBeInstanceOf(IngestDeadlineError);
+    await expect(source.tile(13, 1, 1)).resolves.not.toBeNull();
   });
 });
 

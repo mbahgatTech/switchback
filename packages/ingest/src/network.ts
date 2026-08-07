@@ -185,6 +185,7 @@ export async function elevateSegments(
   segments: readonly PathSegment[],
   terrain: TerrainSource,
   zoom = TERRARIUM_ZOOM,
+  deadlineAt?: number,
 ): Promise<{ segments: PathSegment[]; gapCount: number }> {
   const all: LngLat[] = [];
   for (const segment of segments) {
@@ -194,7 +195,7 @@ export async function elevateSegments(
   }
   if (all.length === 0) return { segments: [], gapCount: 0 };
 
-  const tiles = await terrain.tilesFor(all, zoom);
+  const tiles = await terrain.tilesFor(all, zoom, deadlineAt);
   const { filled, gapCount } = fillGaps(sampleElevations(all, tiles, zoom));
 
   let cursor = 0;
@@ -388,7 +389,12 @@ export async function processNetworkTile(
     };
   }
 
-  const { segments, gapCount } = await elevateSegments(budgeted, terrain);
+  const { segments, gapCount } = await elevateSegments(
+    budgeted,
+    terrain,
+    TERRARIUM_ZOOM,
+    deps.deadlineAt,
+  );
   const nodeCount = countNodes(segments);
 
   /**

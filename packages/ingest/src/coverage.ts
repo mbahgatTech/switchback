@@ -17,7 +17,7 @@ import type { BBox } from '@switchback/core';
 import { admitIngest } from './backpressure';
 import type { IngestRefusal } from './backpressure';
 import { enqueue, tileJobKey } from './jobs';
-import { isTileFresh } from './pipeline';
+import { isTileFresh } from './freshness';
 
 /** Priority for a tile someone is looking at, above the 0 a scheduled refresh enqueues with. */
 export const VIEWPORT_PRIORITY = 5;

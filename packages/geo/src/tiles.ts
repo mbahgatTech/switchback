@@ -10,6 +10,16 @@ import type { BBox, LngLat } from '@switchback/core';
 /** Zoom level at which ingest coverage is tracked. */
 export const INGEST_ZOOM = 9;
 
+/**
+ * Deepest zoom a tile may be subdivided to when z9 will not fit in one invocation.
+ *
+ * Sixteen z11 tiles cover one z9, and each level quadruples the fixed per-tile cost — a region
+ * lookup and a waypoint query that a smaller box does not make cheaper. Measured against the
+ * densest tile we have (`120221203`, 6,440 elements at z9, 1,641 in its first z10 child), z10 is
+ * already inside the budget and z11 is the margin rather than the expectation.
+ */
+export const MAX_INGEST_ZOOM = 11;
+
 /** Refuse to cover more than this many tiles in one request — beyond it, the ask is a continent. */
 export const MAX_TILES_PER_REQUEST = 12;
 
@@ -117,6 +127,19 @@ export function quadkeyToTile(quadkey: string): Tile {
 
 export function quadkeyToBBox(quadkey: string): BBox {
   return tileToBBox(quadkeyToTile(quadkey));
+}
+
+/**
+ * The four z+1 quadkeys covering the same ground. A quadkey is a prefix code, so this is the
+ * whole of the subdivision maths — no projection, no rounding, no zoom-dependent special case.
+ */
+export function childQuadkeys(quadkey: string): [string, string, string, string] {
+  return [`${quadkey}0`, `${quadkey}1`, `${quadkey}2`, `${quadkey}3`];
+}
+
+/** The z-1 quadkey containing this one, or null at z0. */
+export function parentQuadkey(quadkey: string): string | null {
+  return quadkey.length > 0 ? quadkey.slice(0, -1) : null;
 }
 
 export interface CoverResult {

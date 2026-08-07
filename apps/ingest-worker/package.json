@@ -1,0 +1,24 @@
+{
+  "name": "@switchback/ingest-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Azure Functions host for the ingest queue: a Service Bus trigger that drains one job per message.",
+  "//concurrency": "Two concurrent Overpass requests per host instance, one instance except across a recycle. The ceiling rests on the scale limit in ingest.bicep times the one OverpassClient singleton in packages/ingest/src/config.ts, which caps itself at 2 — not on host.json's maxConcurrentCalls, which the host multiplies by the instance's core count. README.md traces the whole chain, including the app settings this workspace does not own.",
+  "//timeout": "host.json's functionTimeout is 10 minutes and Consumption will not raise it. OVERPASS_MAX_TOTAL_MS, set in ingest.bicep, is what keeps one query's retry budget under that; see the reconciliation in infra/azure/ingest.bicep.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsx scripts/bundle.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.16.2",
+    "@azure/identity": "^4.13.1",
+    "@azure/service-bus": "^7.9.5",
+    "@switchback/db": "*",
+    "@switchback/ingest": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

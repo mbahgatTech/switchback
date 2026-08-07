@@ -12,12 +12,15 @@ import {
   PhotoSource,
   TileStatus,
   backgroundPrisma,
+  mergeTrailGeometry,
   writeTrailGeometry,
   writeWaypointPoints,
 } from '@switchback/db';
 import type { Prisma, PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
+  MAX_INGEST_ZOOM,
+  bboxOf,
   lineLengthM,
   lngLatToTile,
   quadkeyToBBox,
@@ -39,7 +42,9 @@ import {
 } from './enrich';
 import type { EnrichedWaypoint } from './enrich';
 import { TerrainSource, elevateLine } from './elevate';
+import { IngestDeadlineError, assertBefore } from './deadline';
 import {
+  OverpassDeadlineError,
   OverpassUnavailableError,
   buildFeatureQuery,
   buildParentRouteQuery,
@@ -49,8 +54,30 @@ import {
   buildTileQuery,
   buildWayGeometryQuery,
 } from './overpass';
-import type { OverpassClient, OverpassElement, OverpassRelation } from './overpass';
+import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
+import {
+  ClaimConflictError,
+  canMergeTrails,
+  claimWays,
+  mergeTrails,
+  resolveTrail as resolveClaims,
+  trailIdentityMode,
+} from './identity';
+import type { ClaimPolicy, TrailIdentityMode } from './identity';
+import {
+  CHILDREN_PER_TILE,
+  SUBTREE_STUCK_MARKER,
+  TILE_SPLIT_MARKER,
+  canSubdivide,
+  childTiles,
+  promoteFrom,
+  queueStaleChildren,
+  rollUpAncestors,
+  splitTile,
+  subdivideMaxZoom,
+} from './subdivide';
+import type { ChildTile } from './subdivide';
 import { Gate, forEachConcurrent } from './pool';
 
 /** Resample interval for the elevation profile. Matches `ElevationProfile.spacingM`. */
@@ -108,16 +135,34 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
   return rendered;
 }
 
-/**
- * A tile is re-fetched when its data is older than this. Weekly would be mostly wasted
- * Overpass load; a season would let a rerouted path go unnoticed. See `docs/architecture.md`.
- */
-export const TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** Re-exported from their own module so subdivision can ask the same question without a cycle. */
+export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
 
 export interface PipelineDeps {
   db?: PrismaClient;
-  overpass: OverpassClient;
+  /** The shared client, or a `withDeadline` view of it — never a second client. */
+  overpass: OverpassQuerier;
   terrain?: TerrainSource;
+  /**
+   * Epoch milliseconds after which this handler stops doing work. Overpass has its own budget
+   * (`withDeadline`); this is the outer bound covering terrain and the per-trail commits, so
+   * the invocation ends on a caught error rather than on the host killing the process. Unset
+   * on the Vercel path, where the platform's own timeout is the bound.
+   */
+  deadlineAt?: number;
+  /**
+   * Deepest zoom a tile may split to. Resolved once in `pipelineDeps` rather than read from
+   * `process.env` here, so the value a process will actually use is visible at the seam and a
+   * test can set it without touching the environment. `INGEST_ZOOM` disables subdivision.
+   */
+  subdivideMaxZoom?: number;
+  /**
+   * Whether a way-derived trail is identified by its `TrailWay` claims or by `(osmType, osmId)`.
+   * Resolved once in `pipelineDeps` for the same reason as `subdivideMaxZoom`: the value a process
+   * will actually use is visible at the seam, and a test can drive the claim path without setting
+   * an environment variable.
+   */
+  trailIdentity?: TrailIdentityMode;
   now?: () => Date;
   mapillaryToken?: string;
   userAgent?: string;
@@ -134,36 +179,56 @@ export interface ProcessTileResult {
   skipped: number;
   failed: number;
   fetchMs: number;
-}
-
-/** Whether a tile's cached data is still good enough to serve without re-fetching. */
-export function isTileFresh(
-  tile: { status: TileStatus; fetchedAt: Date | null } | null,
-  now: Date,
-  ttlMs = TILE_TTL_MS,
-): boolean {
-  if (!tile?.fetchedAt) return false;
-  if (tile.status !== TileStatus.ready && tile.status !== TileStatus.empty) return false;
-  return now.getTime() - tile.fetchedAt.getTime() < ttlMs;
+  /** The z+1 quadkeys this run put in play. Empty unless the tile is subdivided. */
+  children: string[];
 }
 
 /**
- * Fetch, assemble and commit every trail in one z9 tile. Returns rather than throws for the
+ * Fetch, assemble and commit every trail in one tile. Returns rather than throws for the
  * ordinary failure modes — the caller is a job handler that records the outcome either way —
  * but throws when Overpass is unavailable, so the queue backs off instead of burning attempts.
+ *
+ * A tile that already has children is never fetched: subdivision has moved the work down a
+ * level, so this becomes the roll-up — queue whatever child is stale, promote the parent once
+ * all four are in. See `subdivide.ts`.
  */
 export async function processTile(quadkey: string, deps: PipelineDeps): Promise<ProcessTileResult> {
   const db = deps.db ?? backgroundPrisma;
   const now = deps.now ?? (() => new Date());
   const log = deps.logger ?? (() => {});
   const terrain = deps.terrain ?? new TerrainSource({ fetchImpl: deps.fetchImpl });
+  const maxZoom = deps.subdivideMaxZoom ?? subdivideMaxZoom();
+  const identity = deps.trailIdentity ?? trailIdentityMode();
 
   const tile = quadkeyToTile(quadkey);
-  if (tile.z !== INGEST_ZOOM) {
-    throw new Error(`processTile expects a z${INGEST_ZOOM} quadkey, got z${tile.z} (${quadkey})`);
+  if (tile.z < INGEST_ZOOM || tile.z > MAX_INGEST_ZOOM) {
+    throw new Error(
+      `processTile expects a z${INGEST_ZOOM}-z${MAX_INGEST_ZOOM} quadkey, got z${tile.z} (${quadkey})`,
+    );
   }
   const bbox = quadkeyToBBox(quadkey);
   const startedAt = Date.now();
+
+  /*
+   * Read before the `running` write below, because that write destroys the answer. Whether this
+   * tile is already serving trails decides what a split leaves behind, and after the upsert every
+   * tile looks like `running` — see `splitTile`, whose preservation was dead code for exactly as
+   * long as it re-read the row itself.
+   */
+  const previous = await db.ingestTile.findUnique({
+    where: { quadkey },
+    select: { status: true, fetchedAt: true, lastError: true },
+  });
+
+  const children = await childTiles(db, quadkey);
+  if (children.length === CHILDREN_PER_TILE) {
+    return rollUpSplitTile(db, quadkey, children, {
+      now: now(),
+      log,
+      startedAt,
+      lastError: previous?.lastError ?? null,
+    });
+  }
 
   await db.ingestTile.upsert({
     where: { quadkey },
@@ -187,6 +252,33 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     const response = await deps.overpass.query(buildTileQuery(bbox));
     elements = response.elements ?? [];
   } catch (error) {
+    /*
+     * Running out of clock on the tile query is the same verdict as running out of it in the
+     * commit loop — the box is too big to serve — so it splits rather than fails. The two are
+     * kept apart from every other Overpass error deliberately: a breaker that is open, a mirror
+     * answering 504, a malformed query are all "come back later", and subdividing on those would
+     * quadruple the load on a service that is already refusing.
+     */
+    if (error instanceof OverpassDeadlineError && canSubdivide(tile.z, maxZoom)) {
+      const fetchMs = Date.now() - startedAt;
+      const split = await splitTile(db, quadkey, { previous, fetchMs });
+      log(`${TILE_SPLIT_MARKER} ${quadkey}: Overpass could not answer the tile query in time`, {
+        quadkey,
+        phase: 'tile query',
+        children: split,
+        fetchMs,
+      });
+      return {
+        quadkey,
+        status: TileStatus.pending,
+        trailCount: 0,
+        skipped: 0,
+        failed: 0,
+        fetchMs,
+        children: split,
+      };
+    }
+
     const message = error instanceof Error ? error.message : String(error);
     await db.ingestTile.update({
       where: { quadkey },
@@ -214,6 +306,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
         fetchMs: Date.now() - startedAt,
       },
     });
+    await rollUpAncestors(db, quadkey);
     return {
       quadkey,
       status: TileStatus.empty,
@@ -221,6 +314,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       skipped: 0,
       failed: 0,
       fetchMs: Date.now() - startedAt,
+      children: [],
     };
   }
 
@@ -245,11 +339,20 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   let committed = 0;
   let skipped = 0;
   let failed = 0;
+  /** Trails the deadline refused outright. The only count that justifies a split. */
+  let refused = 0;
+  /*
+   * Retiring a trail row is the one thing this pipeline does that no setting reverses, and a
+   * refused union is the one thing that leaves a seam fragmented. Both are counted per tile so an
+   * operator who turns `INGEST_TRAIL_IDENTITY` on can measure what it did.
+   */
+  const identityOutcomes = new Map<IdentityOutcome, number>();
 
   // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
   // throws must cost its tile one row, not the rest of the tile.
   await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
     try {
+      assertBefore(deps.deadlineAt, 'commit');
       const outcome = await commitGate.run(() =>
         commitTrail(db, trail, {
           quadkey,
@@ -257,11 +360,15 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           region,
           terrain,
           now: now(),
+          identity,
+          deadlineAt: deps.deadlineAt,
+          onIdentity: (kind) => identityOutcomes.set(kind, (identityOutcomes.get(kind) ?? 0) + 1),
         }),
       );
       if (outcome === 'committed') committed += 1;
       else skipped += 1;
     } catch (error) {
+      if (error instanceof IngestDeadlineError) refused += 1;
       failed += 1;
       log('trail failed', {
         quadkey,
@@ -270,6 +377,63 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       });
     }
   });
+
+  if (identityOutcomes.size > 0) {
+    log('identity resolved', { quadkey, ...Object.fromEntries(identityOutcomes) });
+  }
+
+  /*
+   * The per-trail catch above is what keeps one bad trail from costing its tile, and it
+   * swallows the deadline too — so re-check it here and decide deliberately.
+   *
+   * The clock alone is not the test, and `failed` is not either. `forEachConcurrent` visits
+   * every trail, so a tile is only short of work when the deadline *refused* one: a tile whose
+   * last commit landed a millisecond late is finished, and splitting it would discard the
+   * `ready` write and queue four children to redo work already in `trails`. `refused` counts
+   * only `IngestDeadlineError`, so a trail that threw for its own reasons costs its row and
+   * nothing else — as it always did.
+   *
+   * Running out of clock with trails unattempted is what "this tile is too big" looks like from
+   * inside, so this is where subdivision is triggered rather than at the top: nothing before
+   * the commit loop knows how much of the handler's budget a tile will want. Below the zoom
+   * floor there is nowhere left to go, so the tile fails as it always did.
+   */
+  if (refused > 0) {
+    const fetchMs = Date.now() - startedAt;
+
+    if (canSubdivide(tile.z, maxZoom)) {
+      const split = await splitTile(db, quadkey, { previous, fetchMs });
+      log(
+        `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted`,
+        {
+          quadkey,
+          phase: 'commit',
+          committed,
+          skipped,
+          failed,
+          refused,
+          children: split,
+          fetchMs,
+        },
+      );
+      return {
+        quadkey,
+        status: TileStatus.pending,
+        trailCount: committed,
+        skipped,
+        failed,
+        fetchMs,
+        children: split,
+      };
+    }
+
+    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt!);
+    await db.ingestTile.update({
+      where: { quadkey },
+      data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
+    });
+    throw error;
+  }
 
   const fetchMs = Date.now() - startedAt;
   await db.ingestTile.update({
@@ -284,8 +448,73 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   });
 
   await discoverParentRoutes(db, assembled, deps);
+  await rollUpAncestors(db, quadkey);
 
-  return { quadkey, status: TileStatus.ready, trailCount: committed, skipped, failed, fetchMs };
+  return {
+    quadkey,
+    status: TileStatus.ready,
+    trailCount: committed,
+    skipped,
+    failed,
+    fetchMs,
+    children: [],
+  };
+}
+
+/**
+ * A tile that has been subdivided, revisited. It fetches nothing: the children own the ground
+ * now, so all this does is put back whatever child has gone stale and promote the parent once
+ * all four are in. Cheap by design — every viewport over a split tile lands here, because
+ * `ensureCoverage` still queues the z9 parent and knows nothing about the split.
+ */
+async function rollUpSplitTile(
+  db: PrismaClient,
+  quadkey: string,
+  children: readonly ChildTile[],
+  context: {
+    now: Date;
+    log: (message: string, detail?: Record<string, unknown>) => void;
+    startedAt: number;
+    /** The parent's stored `lastError`, which is what makes the report below edge-triggered. */
+    lastError: string | null;
+  },
+): Promise<ProcessTileResult> {
+  const { queued, waiting, exhausted } = await queueStaleChildren(db, children, context.now);
+  const promoted = await promoteFrom(db, quadkey);
+  const settled = promoted.includes(quadkey);
+
+  /*
+   * A descendant out of retries is the one state nothing else reports: `ingest-job-failed` names
+   * the leaf, and the z9 a reader is actually polling stays `pending` with nothing said about it.
+   *
+   * Written once per transition, not once per drain. A blocked parent is `pending`, so
+   * `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
+   * pending — a line per drain would page every fifteen minutes for as long as anyone left that
+   * map open, on the same rule as the genuine failure signal. The parent's stored `lastError` is
+   * the edge, and it survives a restart where a module-level flag would not. Clearing it is
+   * `promoteFrom`'s job, which nulls it the moment the roll-up lands.
+   */
+  const stalled = `blocked by exhausted descendant(s): ${exhausted.join(', ')}`.slice(0, 1000);
+  if (exhausted.length > 0 && !settled && stalled !== context.lastError) {
+    context.log(`${SUBTREE_STUCK_MARKER} ${quadkey}: ${stalled} — requeued after five failures`, {
+      quadkey,
+      exhausted,
+      // Whether anything else is still moving is the difference between "wait" and "intervene".
+      queued,
+      waiting,
+    });
+    await db.ingestTile.update({ where: { quadkey }, data: { lastError: stalled } });
+  }
+
+  return {
+    quadkey,
+    status: settled ? TileStatus.ready : TileStatus.pending,
+    trailCount: children.reduce((sum, child) => sum + child.trailCount, 0),
+    skipped: 0,
+    failed: 0,
+    fetchMs: Date.now() - context.startedAt,
+    children: children.map((child) => child.quadkey),
+  };
 }
 
 /**
@@ -579,6 +808,8 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
     region,
     terrain,
     now: now(),
+    identity: deps.trailIdentity ?? trailIdentityMode(),
+    deadlineAt: deps.deadlineAt,
   });
 
   const fetchMs = Date.now() - startedAt;
@@ -598,20 +829,164 @@ interface CommitContext {
   region: RegionInfo;
   terrain: TerrainSource;
   now: Date;
+  identity: TrailIdentityMode;
+  deadlineAt?: number;
+  onIdentity?: (outcome: IdentityOutcome) => void;
 }
 
 /**
- * One trail, committed or skipped. The transaction covers the trail row, its geometry, its
- * profile and its waypoints: a trail row whose `geom` write failed is invisible to every
- * spatial query while still appearing in search, and nothing about it looks broken.
+ * The line this commit should derive from, and the row it belongs to. Null when the trail is
+ * already accounted for and this tile's copy adds nothing.
+ */
+interface ResolvedTrail {
+  trailId: string | null;
+  retiredIds: string[];
+  claim: ClaimPolicy;
+  conceded: readonly number[];
+  coords: LngLat[];
+  bbox: BBox;
+  lengthM: number;
+}
+
+/** What claim resolution did with one assembly, counted per tile so the flag is measurable. */
+export type IdentityOutcome =
+  'adopted' | 'merged' | 'refused-geometry' | 'refused-review' | 'yielded-to-relation';
+
+/**
+ * Settle identity and geometry before anything expensive runs.
+ *
+ * The union has to happen here, not at the write: every stat, the elevation profile and each
+ * waypoint's `distM` are computed from the coordinate array further down, so a merge applied at
+ * the end would leave all of them describing one fragment of the trail.
+ *
+ * A resolution the geometry refuses is abandoned whole rather than half-applied. The assembly
+ * keeps its own row, its own line and its own free ways, which is what the `osm-id` default would
+ * have given it — adopting a winner whose line cannot contain this one would store the incoming
+ * geometry nowhere while claiming the ways it was drawn from.
+ */
+async function resolveIdentity(
+  db: PrismaClient,
+  trail: AssembledTrail,
+  mode: TrailIdentityMode,
+  report: (outcome: IdentityOutcome) => void,
+): Promise<ResolvedTrail | null> {
+  const fallback: ResolvedTrail = {
+    trailId: null,
+    retiredIds: [],
+    claim: 'fail',
+    conceded: [],
+    coords: trail.coords,
+    bbox: trail.bbox,
+    lengthM: trail.lengthM,
+  };
+  if (mode !== 'claim') return fallback;
+
+  const resolution = await resolveClaims(db, {
+    osmType: trail.osmType,
+    name: trail.name,
+    memberWayIds: trail.memberWayIds,
+  });
+  if (resolution.kind === 'skip') return null;
+
+  const conceded = resolution.conceded;
+  if (resolution.kind === 'create') {
+    if (conceded.length > 0) report('yielded-to-relation');
+    return { ...fallback, claim: resolution.claim, conceded };
+  }
+
+  /*
+   * Settled before the union, because the union is computed over whatever it is told to absorb.
+   * A merge refused here has to stand down whole: retiring nothing while still unioning the
+   * losers in would leave the winner holding line that the losers' own rows still serve, and
+   * every stat, the profile and each waypoint's `distM` are derived from these coordinates.
+   */
+  if (
+    resolution.kind === 'merge' &&
+    !(await canMergeTrails(db, resolution.trailId, resolution.retiredIds))
+  ) {
+    report('refused-review');
+    return { ...fallback, conceded };
+  }
+  const retiredIds = resolution.kind === 'merge' ? resolution.retiredIds : [];
+
+  const merged = await mergeTrailGeometry(db, {
+    trailId: resolution.trailId,
+    // Exactly the lines that are about to be retired, so `unioned` is also the proof that
+    // retiring them keeps their geometry: a loser the union cannot absorb makes the result branch.
+    alsoTrailIds: retiredIds,
+    incoming: { type: 'LineString', coordinates: [...trail.coords] },
+  });
+  // The winner was deleted between the claim read and here. Drop the whole resolution rather
+  // than keep half of it, and let the `(osmType, osmId)` upsert give this assembly a row.
+  if (!merged) return { ...fallback, conceded };
+
+  // One line cannot hold a fork, a lollipop or two halves that do not touch. Standing down here
+  // leaves both shapes stored under their own rows, fragmented exactly as `osm-id` leaves them —
+  // one trail unrepresented is a worse corpus than two rows that each hold their own geometry.
+  if (!merged.unioned) {
+    report('refused-geometry');
+    return { ...fallback, conceded };
+  }
+
+  report(retiredIds.length > 0 ? 'merged' : 'adopted');
+
+  return {
+    trailId: resolution.trailId,
+    retiredIds,
+    claim: resolution.claim,
+    conceded,
+    coords: merged.coords,
+    bbox: bboxOf(merged.coords),
+    // Measured here rather than taken off PostGIS: `lineLengthM` is what the assembler and
+    // `deriveDisplayName` use, and a trail must not change length by 0.3% because a second tile
+    // touched it.
+    lengthM: lineLengthM(merged.coords),
+  };
+}
+
+/**
+ * Attempts a trail gets when it loses a race for the ways it is made of. Each one re-reads the
+ * claims, so a second pass sees the winner the first pass collided with and adopts it. Two, not
+ * more: a third would be re-running a full elevation pass on a contention that is already rare.
+ */
+const MAX_CLAIM_ATTEMPTS = 2;
+
+/**
+ * One trail, committed or skipped. Retried when another committer claims a way underneath this
+ * one — that conflict invalidates the resolution the line and every derived stat were built from,
+ * so the whole commit is re-run rather than the transaction alone. A trail that loses twice
+ * concedes: the ways belong to the winner, and this tile's copy of them is a fragment of it.
  */
 async function commitTrail(
   db: PrismaClient,
   trail: AssembledTrail,
   ctx: CommitContext,
 ): Promise<'committed' | 'skipped'> {
-  const spacingM = profileSpacingFor(trail.lengthM);
-  const resampled = resampleLine(trail.coords, spacingM);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await attemptCommit(db, trail, ctx);
+    } catch (error) {
+      if (!(error instanceof ClaimConflictError)) throw error;
+      if (attempt >= MAX_CLAIM_ATTEMPTS) return 'skipped';
+    }
+  }
+}
+
+/**
+ * The transaction covers the trail row, its geometry, its profile and its waypoints: a trail row
+ * whose `geom` write failed is invisible to every spatial query while still appearing in search,
+ * and nothing about it looks broken.
+ */
+async function attemptCommit(
+  db: PrismaClient,
+  trail: AssembledTrail,
+  ctx: CommitContext,
+): Promise<'committed' | 'skipped'> {
+  const resolved = await resolveIdentity(db, trail, ctx.identity, ctx.onIdentity ?? (() => {}));
+  if (!resolved) return 'skipped';
+
+  const spacingM = profileSpacingFor(resolved.lengthM);
+  const resampled = resampleLine(resolved.coords, spacingM);
   if (resampled.length < 2) return 'skipped';
 
   /*
@@ -622,7 +997,8 @@ async function commitTrail(
    */
   const { points, gapCount } = await elevateLine(resampled, ctx.terrain, {
     spacingM,
-    alongLengthM: trail.lengthM,
+    alongLengthM: resolved.lengthM,
+    deadlineAt: ctx.deadlineAt,
   });
 
   // An all-gap profile means every terrain tile under this line failed or does not exist.
@@ -630,13 +1006,13 @@ async function commitTrail(
   if (gapCount === points.length) return 'skipped';
 
   const derived = deriveTrail({
-    coords: trail.coords,
+    coords: resolved.coords,
     profile: points,
-    bbox: trail.bbox,
+    bbox: resolved.bbox,
     tags: trail.tags,
     // Read off the un-oriented line, before `deriveTrail` may flip it — see
     // `terminusFeatures` for why that is safe.
-    termini: ctx.features.length ? terminusFeatures(trail.coords, ctx.features) : undefined,
+    termini: ctx.features.length ? terminusFeatures(resolved.coords, ctx.features) : undefined,
   });
 
   // `derived.coords` and `derived.profile`, never `trail.coords` and `points`. OSM stores
@@ -677,7 +1053,18 @@ async function commitTrail(
   const osmId = BigInt(trail.osmId);
 
   const trailId = await commitWithSlugRetry(db, async (tx) => {
-    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
+    if (resolved.trailId && resolved.retiredIds.length > 0) {
+      await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
+    }
+
+    const slug = await uniqueSlug(
+      tx,
+      trail.name,
+      ctx.region.regionName,
+      osmType,
+      osmId,
+      ctx.identity,
+    );
 
     const row = {
       slug,
@@ -716,13 +1103,38 @@ async function commitTrail(
       parkingCapacity: parkingCapacity(allWaypoints),
     };
 
-    const saved = await tx.trail.upsert({
-      where: { osmType_osmId: { osmType, osmId } },
-      create: row,
-      // `slug` is omitted from the update on purpose: it is a public URL from the moment
-      // the trail is first indexed, and a rename in OSM must not 404 every link to it.
-      update: { ...row, slug: undefined },
-    });
+    // `osmType`/`osmId` are never rewritten on an existing row. For a way-derived trail they are
+    // one member id out of many, and moving them would shift the unique key a concurrent tile is
+    // upserting against — `TrailWay` is the identity now, not `min(wayId)`.
+    //
+    // `quadkey` is held for the same reason: a trail spanning a seam is committed by both tiles,
+    // and rewriting it each time would make "trails owned by tile X" answer differently depending
+    // on which sibling drained last.
+    const saved = resolved.trailId
+      ? await tx.trail.update({
+          where: { id: resolved.trailId },
+          data: {
+            ...row,
+            slug: undefined,
+            osmType: undefined,
+            osmId: undefined,
+            quadkey: undefined,
+          },
+        })
+      : await tx.trail.upsert({
+          where: { osmType_osmId: { osmType, osmId } },
+          create: row,
+          // `slug` is omitted from the update on purpose: it is a public URL from the moment
+          // the trail is first indexed, and a rename in OSM must not 404 every link to it.
+          update: { ...row, slug: undefined },
+        });
+
+    // Gated with resolution, not written unconditionally: `osm-id` must stay a complete rollback,
+    // and a runtime that reaches a database without `trail_ways` must still ingest rather than
+    // fail every trail and record the tile covered.
+    if (ctx.identity === 'claim') {
+      await claimWays(tx, saved.id, trail.memberWayIds, resolved.claim, resolved.conceded);
+    }
 
     await writeTrailGeometry(tx, {
       trailId: saved.id,
@@ -848,6 +1260,7 @@ async function uniqueSlug(
   regionName: string | null,
   osmType: OsmElementType,
   osmId: bigint,
+  identity: TrailIdentityMode,
 ): Promise<string> {
   const candidates = [slugify(name)];
   if (regionName) candidates.push(slugify(name, regionName));
@@ -859,8 +1272,19 @@ async function uniqueSlug(
       select: { osmType: true, osmId: true },
     });
     // Free, or already ours — a re-ingest of the same trail keeps its URL.
-    if (!existing) return candidate;
-    if (existing.osmType === osmType && existing.osmId === osmId) return candidate;
+    if (existing) {
+      if (existing.osmType !== osmType || existing.osmId !== osmId) continue;
+      return candidate;
+    }
+    // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
+    // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
+    // Only merges retire a slug, and only `claim` merges, so only `claim` reads the table.
+    if (identity !== 'claim') return candidate;
+    const alias = await tx.trailSlugAlias.findUnique({
+      where: { slug: candidate },
+      select: { slug: true },
+    });
+    if (!alias) return candidate;
   }
   return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
 }

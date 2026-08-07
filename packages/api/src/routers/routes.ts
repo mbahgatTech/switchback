@@ -58,8 +58,11 @@ import {
   elevateLine,
   ensureNetworkCoverage,
   getTerrain,
+  ingestQueueDriver,
   loadNetworkSegments,
   networkJobKey,
+  publishIngestSignals,
+  VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { IngestRefusal } from '@switchback/ingest';
 import { createInlineDrain } from '../inline-drain';
@@ -115,8 +118,29 @@ const inlineDrain = createInlineDrain((keys) =>
   }),
 );
 
+/**
+ * Start the queued routing tiles, the same way `trails.ts` starts viewport tiles.
+ *
+ * `ingest_network` jobs run a real Overpass query (`network.ts`, `fetchNetwork`), and this is
+ * reached from `routes.coverage`, a public procedure the planner fires on every viewport
+ * settle. So it has to answer to `INGEST_QUEUE_DRIVER` exactly as `kickIngest` does: on
+ * `servicebus` this process publishes and makes no Overpass request, which is the other half of
+ * the claim that the worker's clamp is the only ceiling. Leaving it inline would have been
+ * worse than the old path, not better — the pump also publishes `ingest_network`, so the kind
+ * would have had two independent drainers.
+ */
 function kickNetwork(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil) return;
+  if (!ctx.waitUntil || queued.length === 0) return;
+
+  if (ingestQueueDriver() === 'servicebus') {
+    ctx.waitUntil(
+      publishIngestSignals(queued.map(networkJobKey), {
+        oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
+      }),
+    );
+    return;
+  }
+
   const work = inlineDrain.request(queued.map(networkJobKey));
   if (work) ctx.waitUntil(work);
 }

@@ -28,9 +28,13 @@ import { encodeBase64, toFitCourse, toRouteGpx } from '@switchback/geo';
 import {
   drainIngest,
   ensureCoverage,
+  ingestQueueDriver,
+  publishIngestSignals,
   requestArea,
   surveyArea,
   tileJobKey,
+  trailIdentityMode,
+  VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
 import { decodeCursor, encodeCursor } from '../cursor';
@@ -387,6 +391,9 @@ const inlineDrain = createInlineDrain((keys) =>
     limit: Math.min(keys.length, MAX_INLINE_DRAIN),
     workerId: 'inline',
     dedupeKeys: keys,
+    // Vercel has no Application Insights, so `TILE_SPLIT_MARKER` and `SUBTREE_STUCK_MARKER`
+    // would go nowhere on the drainer that is actually running. Console is where they land.
+    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
   }),
 );
 
@@ -402,9 +409,27 @@ const inlineDrain = createInlineDrain((keys) =>
  * `drainIngest` reserves a derived share on top; a tile-key list cannot reach an
  * `enrich_trail` row, so the fan-out these tiles produce had no drainer in the request path
  * at all. See `drainJobs` and `DERIVED_QUEUE_WARN_DEPTH`.
+ *
+ * Under `INGEST_QUEUE_DRIVER=servicebus` the kick is a published signal instead and this
+ * process makes no Overpass call at all — which is what lets the worker's clamp be the only
+ * ceiling that matters. The tiles are already on `ingest_jobs` either way: `ensureCoverage`
+ * wrote them before this ran, so a broker that refuses the signal costs the wake-up and
+ * nothing else.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil) return;
+  if (!ctx.waitUntil || queued.length === 0) return;
+
+  if (ingestQueueDriver() === 'servicebus') {
+    // Not gated on `inlineDrain`: that scheduler bounds this process's Overpass concurrency, and
+    // publishing has none to bound.
+    ctx.waitUntil(
+      publishIngestSignals(queued.map(tileJobKey), {
+        oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
+      }),
+    );
+    return;
+  }
+
   const work = inlineDrain.request(queued.map(tileJobKey));
   if (work) ctx.waitUntil(work);
 }
@@ -570,8 +595,26 @@ export const trailsRouter = router({
         where: { slug: input.slug },
         select: detailSelect,
       });
-      if (!row) throw notFound();
-      return toDetail(row);
+      if (row) return toDetail(row);
+
+      /*
+       * A merge retires one of two slugs, and both were public URLs from first index, so the
+       * alias table is what keeps the retired one answering rather than 404ing every inbound
+       * link — see `mergeTrails` in @switchback/ingest, which writes it.
+       *
+       * Gated on the flag that writes it, as `uniqueSlug` and `claimWays` are. Only a merge
+       * creates an alias and only `claim` merges, so under the default the table holds nothing
+       * and need not exist — and querying a relation that does not exist would turn every
+       * genuine 404 into a 500, on the not-found page and on every stale inbound link.
+       */
+      if (trailIdentityMode() !== 'claim') throw notFound();
+
+      const alias = await ctx.db.trailSlugAlias.findUnique({
+        where: { slug: input.slug },
+        select: { trail: { select: detailSelect } },
+      });
+      if (!alias) throw notFound();
+      return toDetail(alias.trail);
     }),
 
   byId: publicProcedure

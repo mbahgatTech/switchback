@@ -7,20 +7,54 @@
 
 import { OverpassClient } from './overpass';
 import { TerrainSource } from './elevate';
+import { subdivideMaxZoom } from './subdivide';
+import { trailIdentityMode } from './identity';
 import type { PipelineDeps } from './pipeline';
 
 let overpassClient: OverpassClient | null = null;
 let terrainSource: TerrainSource | null = null;
+
+/**
+ * Wall clock one `query()` may spend here when `OVERPASS_MAX_TOTAL_MS` does not say otherwise.
+ *
+ * The client's own default is no ceiling, which is the right default for a library and the wrong
+ * one for every process this repo deploys: on the retry ladder an unbounded query is ~24 minutes,
+ * longer than the Functions host will let an invocation live. It used to be supplied only by the
+ * `appSettings` array in `infra/azure/ingest.bicep`, and an ARM application-settings write replaces
+ * that collection whole — so dropping one entry silently restored the unbounded case. Paired with
+ * `OVERPASS_DEADLINE_MS` in `apps/ingest-worker/src/drain.ts`, which is where the two are added up.
+ */
+export const OVERPASS_MAX_TOTAL_MS = 240_000;
+
+/**
+ * Requests one `OverpassClient` will have in flight when `OVERPASS_MAX_CONCURRENT` does not say
+ * otherwise. Overpass allots slots per client IP and two is the documented-safe figure.
+ *
+ * It goes through `positive()` for the same reason `maxTotalMs` does, but the failure is worse:
+ * `Math.max(1, NaN)` is `NaN`, `active < NaN` is always false, so every caller parks in the
+ * semaphore's wait list and nothing ever releases. Not a leaked IP — a silent, untimed stall of
+ * the whole worker, and the variable is hand-settable in both the Azure portal and Vercel.
+ */
+export const OVERPASS_MAX_CONCURRENT = 2;
 
 export function getOverpass(): OverpassClient {
   if (!overpassClient) {
     overpassClient = new OverpassClient({
       url: splitList(process.env.OVERPASS_URL),
       userAgent: process.env.OVERPASS_USER_AGENT ?? '',
-      maxConcurrent: Number(process.env.OVERPASS_MAX_CONCURRENT ?? 2),
+      maxConcurrent: positive(process.env.OVERPASS_MAX_CONCURRENT) ?? OVERPASS_MAX_CONCURRENT,
+      maxTotalMs: positive(process.env.OVERPASS_MAX_TOTAL_MS) ?? OVERPASS_MAX_TOTAL_MS,
     });
   }
   return overpassClient;
+}
+
+/** A variable's number, or `undefined` when it is absent, blank, mistyped or not positive. */
+function positive(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return value !== undefined && value.trim() !== '' && Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : undefined;
 }
 
 /**
@@ -48,6 +82,8 @@ export function pipelineDeps(overrides: Partial<PipelineDeps> = {}): PipelineDep
     terrain: getTerrain(),
     mapillaryToken: process.env.MAPILLARY_TOKEN,
     userAgent: process.env.OVERPASS_USER_AGENT,
+    subdivideMaxZoom: subdivideMaxZoom(),
+    trailIdentity: trailIdentityMode(),
     ...overrides,
   };
 }

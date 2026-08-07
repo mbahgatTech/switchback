@@ -53,9 +53,9 @@ export function wayToCoords(way: OverpassWay): LngLat[] | null {
   if (!way.geometry || way.geometry.length < 2) return null;
   const coords: LngLat[] = [];
   for (const point of way.geometry) {
-    // Overpass omits positions for nodes outside the query bbox. A way clipped that way has
-    // holes, and interpolating across one invents geometry — better to drop it and let the
-    // neighbouring tile contribute the whole way.
+    // A member without a position is a truncated or malformed response, not a clipped way:
+    // `buildTileQuery` filters per statement and sets no global `[bbox:]`, so Overpass returns
+    // every intersecting way whole. Interpolating across the hole would invent geometry.
     if (typeof point.lat !== 'number' || typeof point.lon !== 'number') return null;
     coords.push([point.lon, point.lat]);
   }
@@ -375,7 +375,7 @@ export function assembleTrails(
  * "North Ridge Trail" and "South Ridge Trail" are two trails, and punctuation-stripping
  * clever enough to merge names is clever enough to merge those.
  */
-function normalizeName(name: string): string {
+export function normalizeName(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 

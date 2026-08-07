@@ -190,13 +190,15 @@ ground, not a home.
 
 ## What it provisions
 
-| File               | What it is                                                                                     |
-| ------------------ | ---------------------------------------------------------------------------------------------- |
-| `main.bicep`       | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname. |
-| `postgres.bicep`   | The server: compute, storage, backups, firewall, server parameters, the database.              |
-| `monitoring.bicep` | Log Analytics workspace, the alert action group, and the workload budget.                      |
-| `lock.bicep`       | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.    |
-| `main.bicepparam`  | Every non-secret parameter. Committed. The password is **not** here and never may be.          |
+| File                | What it is                                                                                      |
+| ------------------- | ----------------------------------------------------------------------------------------------- |
+| `main.bicep`        | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname.  |
+| `postgres.bicep`    | The server: compute, storage, backups, firewall, server parameters, the database.               |
+| `monitoring.bicep`  | Log Analytics workspace, the alert action group, and the workload budget.                       |
+| `lock.bicep`        | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.     |
+| `main.bicepparam`   | Every non-secret parameter. Committed. The password is **not** here and never may be.           |
+| `ingest.bicep`      | The ingest queue and its worker. Resource-group scoped, deployed **separately**. See below.     |
+| `ingest.bicepparam` | Its non-secret parameters. The connection string is read from the environment, not stored here. |
 
 | Resource          | Value                                                           |
 | ----------------- | --------------------------------------------------------------- |
@@ -903,10 +905,12 @@ side and stays `true` until every consumer has been proved on a token.
 
    The grant is inert while no Service Bus receive code exists in this repository, and it becomes
    real capability — for every Vercel deployment, preview included, because the shared identity is
-   also Vercel's — the moment the worker's code merges. So it is **revoked before PR #42 merges**,
-   or `ingest.bicep` adopts it in the change that moves the worker: the `guid()` inputs are
-   identical, so the assignment that template would create is this one. Both phases keep every
-   grant the worker already has.
+   also Vercel's — the moment the worker's code merges. Revocation being locked, `ingest.bicep`
+   adopts it instead: resource `publisherReceiver`, named by the literal assignment id rather than
+   `guid(...)`, so the template converges on this assignment rather than proposing a second grant of
+   the same role to the same principal at the same scope. Adoption records the grant; it does not
+   reduce it. Revoking still requires lifting `switchback-prod-no-delete` first, and that stays open
+   as an Owner action.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
@@ -1068,6 +1072,243 @@ Two things the preflight caught before any data moved, both now fixed in these f
 - **`default_text_search_config`.** Neon is `pg_catalog.simple`; Azure defaults to
   `pg_catalog.english`. No current query consults it (every `to_tsvector` /
   `websearch_to_tsquery` in the codebase names `'english'` explicitly), but it is matched anyway.
+
+---
+
+## The ingest queue and its worker
+
+`ingest.bicep` adds a Service Bus queue and an Azure Functions worker that drains `ingest_jobs`
+continuously, replacing a once-daily Vercel cron that claimed four tiles a run against a backlog of
+14,320.
+
+**It is a separate template, at resource-group scope, and that is the point.** It never declares the
+server, its database, its firewall rules or its parameters. `administratorLoginPassword` is
+`@secure()` with no default and ARM cannot read the current value back, so any deployment that
+includes `postgres.bicep` writes whatever it is handed — and the live password is unconfirmed (see
+[Read this first](#read-this-first)). Shipping a queue must not be the same operation as rotating the
+production password. `main.bicep` is not modified by this work and is not redeployed by it. There is
+no lock resource here either: the group's existing `CanNotDelete` does not block creates.
+
+| Resource        | Value                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------- |
+| Namespace       | `sb-switchback-prod-37ywppu5p7fri`, **Standard**, `disableLocalAuth: true` — no SAS    |
+| Queue           | `ingest-jobs`, `lockDuration PT5M`, `maxDeliveryCount 5`, TTL `PT1H`, no sessions      |
+| Publisher       | `id-switchback-vercel-publisher`, user-assigned, two Vercel federated credentials      |
+| Publisher creds | Vercel OIDC token exchanged for an Entra token — **no key anywhere**                   |
+| Worker          | `func-switchback-ingest-37ywppu5p7fri`, Linux Consumption (Y1), Node 22                |
+| Worker creds    | System-assigned identity, **Data Sender + Data Receiver scoped to the queue**          |
+| Plan            | `plan-switchback-ingest`, Y1 Dynamic, `functionAppScaleLimit: 1`                       |
+| Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
+| Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
+| Cost            | ~$10/month Standard namespace; Consumption and the storage account are inside the free |
+
+### The Overpass clamp — the thing to check in review
+
+Overpass allots request slots per client IP and `packages/ingest/src/overpass.ts` serializes at two
+because exceeding that is what gets an IP blocked. Functions Consumption auto-scales, which fights
+that directly. Every link in the chain that stops it is readable from configuration:
+
+| Factor               | Set by                                                                             | Value |
+| -------------------- | ---------------------------------------------------------------------------------- | ----- |
+| Host instances       | `siteConfig.functionAppScaleLimit` (+ `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT`) | 1     |
+| Node processes       | `FUNCTIONS_WORKER_PROCESS_COUNT`                                                   | 1     |
+| `OverpassClient`s    | module singleton, `packages/ingest/src/config.ts`                                  | 1     |
+| Requests per client  | `OVERPASS_MAX_CONCURRENT`                                                          | 2     |
+| **In flight, total** | per host instance                                                                  | **2** |
+
+`host.json`'s `maxConcurrentCalls: 1` is set too, but the argument does not rest on it — the host
+multiplies that by the instance's core count. The load-bearing property is that Consumption runs one
+host instance for the whole app, so every invocation shares one Node process and one client.
+
+**`functionAppScaleLimit` caps scale-out, not instance count.** Consumption still replaces instances,
+and for a few seconds around a replacement two hosts of this app run at once with a client each — the
+17:32 trace on 2026-08-03 has instance `0--f7e39076-13` taking sequence 1 and `0--3f3e4037-7d`
+starting 13 s later and taking sequence 2, with no evidence the first had stopped fetching. So: 2
+sustained, up to 4 across a recycle. Fair use is about sustained load, so that is the honest number to
+quote rather than an unqualified deployment-wide 2.
+
+Vercel makes **zero** Overpass requests in an environment where `INGEST_QUEUE_DRIVER=servicebus`.
+Three call sites in a Vercel process can reach Overpass — `/api/cron/drain`, `trails.kickIngest` and
+`routes.kickNetwork` — and all three branch on the flag.
+
+**That is per Vercel environment, not per deployment, and the difference is the whole number.** The
+flag is an environment variable and Production and Preview hold it independently, while both resolve
+`DATABASE_URL` to `psql-switchback-prod-37ywppu5p7fri` — the production server. So an environment on
+`postgres`, or with the variable simply absent (`ingestQueueDriver()` reads anything unrecognised as
+`postgres`), is a second drainer against the same `ingest_jobs`, with its own `OverpassClient` at 2
+on every warm lambda. At 2026-08-03T23:26Z Production read `postgres` and Preview had no
+`INGEST_QUEUE_DRIVER` at all, so the flag-on ceiling then was 2 + 2N, not 2. Check it, do not assume
+it:
+
+```bash
+vercel env ls production | grep INGEST_QUEUE_DRIVER
+vercel env ls preview    | grep INGEST_QUEUE_DRIVER   # absent is the failure mode, and looks like nothing
+```
+
+With both environments on `servicebus` the deployment-wide figure is the Azure one: 2 sustained, up
+to 4 across a recycle. Raising any row in the table above is not a throughput knob.
+
+### Deploying it
+
+```bash
+az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered by default
+
+export INGEST_DATABASE_URL="…"                       # the sbapp connection string
+export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
+export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
+
+az deployment group create \
+  --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
+  --template-file infra/azure/ingest.bicep \
+  --parameters infra/azure/ingest.bicepparam
+
+unset INGEST_DATABASE_URL
+```
+
+Both exported strings are load-bearing and both have bitten. `INGEST_OVERPASS_USER_AGENT` must carry
+an `http(s)://` contact URL that reaches _this_ project — `assertUsableUserAgent` in
+`packages/ingest/src/overpass.ts` throws inside the handler on a placeholder or on a host it knows is
+not ours, so the worker dead-letters every tile after five deliveries with a message that names the
+database rather than the user agent. `switchback.app` is on that rejected list by name: it reads like
+ours, is registered to somebody else, and was what the Function App actually sent on every Overpass
+request until 2026-08-03. Only the shape can be checked in code — that a URL reaches you is the one
+thing the operator has to get right.
+`INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
+with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
+Postgres/Service Bus fan-out that an operator had just rolled back.
+
+**The template deploy and the zip push always run together, template first — and then a trigger
+sync.** Linux Consumption runs the code from a package URL that
+`az functionapp deployment source config-zip` writes into the same application-settings collection an
+ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
+— and a Bicep deployment on its own leaves the app codeless until the next zip. For the same reason,
+a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
+the template.
+
+The third step is not optional and cost half an hour to find. After an ARM deployment has removed
+`WEBSITE_RUN_FROM_PACKAGE` and the zip push has put it back, the host comes up reporting
+`0 functions loaded` / "No functions were found", `az functionapp function list` returns `[]`, and
+nothing ever wakes it — a Consumption app with no registered triggers has nothing to scale on, so it
+sits there indefinitely and a restart does not help. The scale controller's trigger cache has to be
+told:
+
+```bash
+az rest --method POST --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Web/sites/func-switchback-ingest-37ywppu5p7fri/syncfunctiontriggers?api-version=2023-12-01"
+```
+
+Within a minute `az functionapp function list` shows `ingestDrain` and `ingestPump`. Verified
+2026-08-03T18:47Z.
+
+**Zip the bundle with forward slashes.** Windows PowerShell 5.1's `Compress-Archive` writes entry
+names with `\`, which the Linux host reads as one long filename rather than a path — so `node_modules`
+never lands in `wwwroot` and the worker dies indexing with `Cannot find module '@azure/functions'`,
+under a `0 functions found (Custom)` that looks identical to a package that never mounted.
+`[IO.Compression.ZipFile]::CreateFromDirectory` from `pwsh` normalises them. Observed 2026-08-05.
+
+**`az functionapp function list` lags the host.** It returned `[]` for ten minutes after a deploy the
+host had already indexed. `curl -H "x-functions-key: <master>" https://<app>.azurewebsites.net/admin/functions`
+asks the host itself and is the answer to trust. So is the queue depth: `az servicebus queue show …
+--query countDetails` moved to 8 while Application Insights was still a tick behind.
+
+`what-if` is safe and is the check worth running before any deploy — nothing under
+`Microsoft.DBforPostgreSQL` may appear as a create or a modify.
+
+**Role assignments are in the template now.** They used to be conditional on
+`DEPLOY_ROLE_ASSIGNMENTS`, with an `az role assignment create` in this file for an Owner to run,
+because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`. The
+deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
+Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
+group, on 2026-08-03 (assignment `8baf9393-029a-4226-a882-992a8146d775`). The parameter, the flag and
+the runbook step are all gone: the four queue role assignments are ordinary resources in
+`ingest.bicep` and nothing grants access by hand.
+
+**Deleting a `roleAssignment` from Bicep is not a revocation.** Resource-group deployments are
+Incremental — ARM never removes a resource merely because the template stopped declaring it, and
+`what-if` shows nothing, because from ARM's point of view nothing changed. An earlier revision of
+`ingest.bicep` granted the worker **Azure Service Bus Data Owner**; that resource was deleted from
+the file and the assignment stayed live for a day, which is a wildcard over `Microsoft.ServiceBus` in
+`actions` as well as `dataActions` on the queue the worker drains. Removing it took an explicit
+delete, and the resource-group `CanNotDelete` lock refuses one at any scope inside the group, so it
+took three steps as an Owner:
+
+```bash
+LOCK=/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Authorization/locks/switchback-prod-no-delete
+QUEUE=/subscriptions/$SUB/resourcegroups/rg-switchback-prod-northcentralus/providers/Microsoft.ServiceBus/namespaces/sb-switchback-prod-37ywppu5p7fri/queues/ingest-jobs
+
+az rest --method DELETE --url "https://management.azure.com$LOCK?api-version=2020-05-01"
+az rest --method DELETE --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments/74ca4647-7b88-50e2-b472-8f3daa7c7a42?api-version=2022-04-01"
+az rest --method PUT    --url "https://management.azure.com$LOCK?api-version=2020-05-01" --body @lock.json
+```
+
+Done on 2026-08-03T18:10Z, along with the dead `vercel-send` SAS rule on the queue, which
+`disableLocalAuth: true` had already made unusable but which the template also does not declare.
+`az role assignment list` and `az role assignment delete` both fail here with a spurious
+`MissingSubscription`; ARM REST is the working path.
+
+That first re-PUT put back a 178-character paraphrase, not `main.bicep`'s body — so for eight hours
+the only text an operator met when the lock blocked them was missing the sentence demanding a pull
+request, and production drifted from the template in the one resource guarding irreversible data
+loss. Re-PUT verbatim at 2026-08-03T20:07Z from `lockNotes` in `main.bicep`, now 445 characters and
+byte-identical; `az rest --method GET .../locks` is how to check. Read `lock.json` out of the
+template rather than typing it, which is what went wrong the first time.
+
+**A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
+gets exactly the four assignments the template declares. This step existed only to converge the
+environment that had already run the older template. To check any environment:
+
+```bash
+az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=atScope()" \
+  --query "value[?contains(properties.scope,'queues/ingest-jobs')].{assignment:name, principal:properties.principalId, role:properties.roleDefinitionId}" -o tsv
+```
+
+`atScope()` also returns what the subscription and the resource group grant — ten rows against this
+estate — so the filter on `properties.scope` is what narrows it to the queue's own. Four rows:
+Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and the
+same pair for the publisher `c9bfba39-…`. `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner) must
+not be among them. The publisher's Receiver, assignment `0090d328-0cee-592f-8359-e4cc64940694`, is
+the over-grant `ingest.bicep` adopts by literal id, and the resource group's delete lock is what
+prevents revoking it.
+
+### The two things Bicep cannot express
+
+Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
+template, and a reader would otherwise conclude the template is the whole story.
+
+1. **CI's deployment identity.** Entra app registrations and federated credentials on an _app_ are
+   Microsoft Graph objects, not ARM, and Bicep cannot declare them. One time, as an Owner:
+   `az ad app create` / `az ad sp create`, an `az ad app federated-credential create` scoped to
+   `repo:mbahgatTech/switchback:ref:refs/heads/master`, `Contributor` **and** `Role Based Access
+Control Administrator` on this resource group, then `gh secret set AZURE_CLIENT_ID` /
+   `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`. No long-lived secret is stored.
+
+   The Vercel publisher deliberately does **not** work this way. A federated credential on a
+   _user-assigned managed identity_ is an ARM resource, so it is in `ingest.bicep` with everything
+   else — see `publisherProduction` and `publisherPreview` there.
+
+2. **Managed identity to Postgres is not done, deliberately.** The worker connects with
+   `DATABASE_URL` the way the web app already does. Measured on the server: `activeDirectoryAuth:
+Disabled`, `passwordAuth: Enabled`, `tenantId: null`. Turning it on means setting
+   `authConfig.activeDirectoryAuth` and `tenantId`, creating an Entra administrator, running
+   `pgaadauth_create_principal` for the worker's principal, and swapping the driver to token auth —
+   and the first two are writes to the server resource, which is the password hazard at the top of
+   this section. Service Bus needs no server change, so both Service Bus connections are keyless
+   today and the database connection is not.
+
+### Vercel's three variables
+
+None of these is a secret; the credential is the per-deployment OIDC token, which is minted by
+Vercel and never stored. Read them off the deployment outputs:
+
+```bash
+az deployment group show -g rg-switchback-prod-northcentralus -n switchback-ingest \
+  --query "properties.outputs.{namespace:serviceBusFullyQualifiedNamespace.value,\
+client:publisherClientId.value,tenant:publisherTenantId.value}" -o json
+```
+
+→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` on the Vercel project, plus
+`INGEST_QUEUE_DRIVER=servicebus`. The exchange fails silently at Entra if the Vercel **team or
+project is renamed** — the `sub` claim follows the new name and the federated credential does not.
+Fixing that is a one-parameter redeploy of this template.
 
 ---
 

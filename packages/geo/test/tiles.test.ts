@@ -3,9 +3,11 @@ import {
   INGEST_ZOOM,
   MAX_TILES_PER_REQUEST,
   MERCATOR_MAX_LAT,
+  childQuadkeys,
   coverBBox,
   coverBBoxFromCentre,
   lngLatToTile,
+  parentQuadkey,
   quadkeyToBBox,
   quadkeyToTile,
   tileToBBox,
@@ -51,6 +53,42 @@ describe('tileToQuadkey / quadkeyToTile', () => {
 
   it('rejects an invalid digit rather than returning a plausible tile', () => {
     expect(() => quadkeyToTile('2143')).toThrow(/invalid digit/);
+  });
+});
+
+describe('childQuadkeys / parentQuadkey', () => {
+  const PARENT = '120221203';
+
+  it('names the four z+1 tiles by appending a digit', () => {
+    expect(childQuadkeys(PARENT)).toEqual(['1202212030', '1202212031', '1202212032', '1202212033']);
+  });
+
+  it('covers exactly the parent, with no gap and no overlap', () => {
+    const [w, s, e, n] = quadkeyToBBox(PARENT);
+    const boxes = childQuadkeys(PARENT).map(quadkeyToBBox);
+
+    expect(Math.min(...boxes.map((b) => b[0]))).toBeCloseTo(w, 10);
+    expect(Math.min(...boxes.map((b) => b[1]))).toBeCloseTo(s, 10);
+    expect(Math.max(...boxes.map((b) => b[2]))).toBeCloseTo(e, 10);
+    expect(Math.max(...boxes.map((b) => b[3]))).toBeCloseTo(n, 10);
+
+    // The seam: each child's far edge is the midpoint of the parent, shared exactly, so a
+    // trail cannot fall between two siblings.
+    const midLng = boxes[0]![2];
+    expect(boxes[1]![0]).toBe(midLng);
+    expect(boxes[2]![2]).toBe(midLng);
+  });
+
+  it('round-trips against parentQuadkey at every child', () => {
+    for (const child of childQuadkeys(PARENT)) {
+      expect(parentQuadkey(child)).toBe(PARENT);
+      expect(quadkeyToTile(child).z).toBe(quadkeyToTile(PARENT).z + 1);
+    }
+  });
+
+  it('has no parent above the whole world', () => {
+    expect(parentQuadkey('0')).toBe('');
+    expect(parentQuadkey('')).toBeNull();
   });
 });
 

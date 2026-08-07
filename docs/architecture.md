@@ -61,16 +61,26 @@ sequenceDiagram
   participant B as trails.browse
   participant V as ensureCoverage
   participant DB as Postgres
+  participant SB as Service Bus
+  participant W as Functions worker
   participant P as processTile
   participant O as Overpass
 
   C->>B: bbox
-  B->>V: cover with z9 quadkeys (12 max per request)
+  B->>V: cover with z9 quadkeys, 12 max per request
   V->>DB: read ingest_tiles, upsert missing + deduped ingest_jobs
   V-->>B: ready / refreshing / pending / queued
   B->>DB: trails whose bbox overlaps the viewport
   B-->>C: partial results now + the pending quadkeys
-  B->>P: waitUntil(drainIngest) — same handler the cron runs
+
+  alt INGEST_QUEUE_DRIVER is servicebus
+    B->>SB: waitUntil publish, one dedupeKey per queued tile
+    W->>SB: queue trigger, one message at a time
+    W->>P: drainIngest limit 1, scoped to that dedupeKey
+  else postgres, the default
+    B->>P: waitUntil drainIngest, the same handler the cron runs
+  end
+
   P->>O: one tile query, plus one tile-wide waypoint query
   O-->>P: ways and relations
   P->>DB: one transaction per trail, then tile status
@@ -111,6 +121,615 @@ follow-up claims only its four oldest jobs, so a late key is asked for in the ne
 within a few. The cost is that every poll landing mid-drain now holds its invocation open until the
 follow-up ends — 25 held invocations against 1 across a 60 s pass at the 2.5 s poll below — which is
 what buys the follow-up enough `after()` budget to finish.
+
+**Which queue drives it is `INGEST_QUEUE_DRIVER`**, read in `apps/web/src/env.ts` and branched on in
+`kickIngest`, `kickNetwork` and the drain cron — **and, on the Azure side, by the worker's own timer
+pump and queue trigger.** That last part is what makes the flag a rollback rather than a fan-out:
+set it to `postgres` on both sides and Vercel drains `ingest_jobs` again while the pump stops
+publishing and the trigger drops whatever is still in flight. Setting one side only leaves two
+drainers on the same table, which is worse than either alone.
+
+Unset or `postgres` is the original path, unchanged. On `servicebus` the request publishes one
+`{dedupeKey}` message per queued tile and makes no Overpass call at all, and an Azure Functions
+worker drains one job per message. `ingest_jobs` stays the queue of record either way — a message
+names work, it never carries it, so a lost message costs a wait rather than a tile. A timer pump in
+the worker re-derives the runnable head of `ingest_jobs` every two minutes and tops the queue back
+up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker. The cron still runs
+on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining: lease recovery lives
+inside `drainJobs`, so skipping the drain would otherwise take it too.
+
+**Turning it on. The order is the mirror of the rollback below, and it matters for the same
+reason.** Vercel first, worker last:
+
+```
+vercel env add INGEST_QUEUE_DRIVER production --value servicebus --no-sensitive --yes
+vercel env add INGEST_QUEUE_DRIVER preview "" --value servicebus --no-sensitive --yes
+                                                  # 1. both environments, plus the three
+                                                  #    identifiers beside them; then redeploy — minutes
+curl -s https://<deployment>/api/version          # 2. confirm the deploy carrying the flag is live
+az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=servicebus
+                                                  # 3. the worker starts draining, seconds
+```
+
+**Two things about those two commands, both learned the hard way.** `--no-sensitive` is not
+cosmetic: `vercel env add` marks Production and Preview values sensitive by default, and a sensitive
+variable reads back from `vercel env pull` as `INGEST_QUEUE_DRIVER=""` — indistinguishable from
+unset, which is the exact failure this runbook is trying to make visible. And the empty `""`
+positional in the Preview line is the git-branch argument: without it the CLI answers
+`git_branch_required` and suggests the command you just ran, in a loop. Passing the value on stdin
+instead of `--value` sets it to the empty string silently.
+
+**Both** Vercel environments, in step 1. The flag is per environment and Preview's `DATABASE_URL`
+resolves to `psql-switchback-prod-37ywppu5p7fri` — the production server — so a Preview left on
+`postgres` (or, as it was until this branch, left unset, which resolves to `postgres`) is a second
+drainer against the same `ingest_jobs` with its own `OverpassClient` on every warm preview lambda.
+`vercel env ls preview` is the check; the absence of the variable is the failure mode, and it does
+not look like one.
+
+Between 1 and 3 **nothing drains at all**, and it is worth being exact about that because the
+reassuring version is wrong: the tiles do not wait for a pump tick, because the pump is the worker's
+and returns early — `INGEST_QUEUE_DRIVER is not servicebus` — for as long as step 3 is outstanding.
+Vercel has stopped draining and the worker has not started, so `ingest_jobs` accumulates and the
+first thing to touch it is step 3. Rows are safe; the wait is however long step 3 takes. Doing 3
+first is the state this design exists to prevent — Vercel still draining `ingest_jobs` inline while
+the worker drains the same table — and it is worth naming that it happened here: the flag was set on
+the Function App while production Vercel still served a commit whose `kickIngest` drained
+unconditionally, and the first end-to-end run was collected in that state.
+
+**At 3am.** Two brakes, neither of which is a deploy, and **the order is not arbitrary**:
+
+```
+az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
+  -n <function app> --settings INGEST_PUMP_ENABLED=false        # 1. stop new work reaching the queue
+az functionapp config appsettings set ... INGEST_QUEUE_DRIVER=postgres
+                                                                # 2. the worker stands down, seconds
+vercel env rm INGEST_QUEUE_DRIVER production && vercel env add INGEST_QUEUE_DRIVER production
+                                                                # 3. redeploy: Vercel drains again
+                                                                #    do preview too, or it stays a
+                                                                #    publisher with nothing draining
+```
+
+Step 1 is instant and reversible and stops the queue filling — but it stops _new_ publishes, not the
+up-to-eight messages already on the queue, which the trigger keeps working. So the worker has to be
+the side that stands down first. Its setting is an app-settings write that restarts the host in
+seconds; Vercel's needs a redeploy of the project, minutes. Doing Vercel first means the interval
+between the two has Vercel draining `ingest_jobs` inline while the worker is still on `servicebus`
+and still finishing in-flight messages — the two-drainer state this flag exists to prevent, entered
+by following the runbook. Doing the worker first means the interval has neither side draining, which
+costs a wait and nothing else.
+
+**"Seconds" means the queue trigger, not the timer.** An app-settings write restarts the host, but a
+timer tick already scheduled on the outgoing process can still run once holding the old value.
+Observed standing the worker down at 21:21:56Z on 2026-08-03: the 21:24:00 pump published seven more
+signals while the restarted trigger, in the same second, logged
+`INGEST_QUEUE_DRIVER is not servicebus — dropping the signal` for each. Harmless — a published
+signal makes no Overpass request and the rows stay `queued` for Postgres — but it is why step 1
+exists and why "the worker stands down in seconds" is a statement about the drain, not the pump.
+
+Between steps 2 and 3 nothing drains either, for the mirror-image reason: the trigger drops the
+message it receives and the Vercel cron does not drain until step 3's redeploy carries the new value
+into `drainOrReclaim`. A message that arrives is discarded and its `ingest_jobs` row waits for step 3. Nothing is lost either way, because a message names work and never carries it.
+
+**Do not re-flip to `servicebus` within ten minutes of rolling back.** The queue carries
+`duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
+`messageId`. Every signal dropped during the rollback was published under a `messageId` the broker
+still remembers, so a re-flip inside that window has those republished signals silently discarded —
+the rows are safe and the two-minute pump picks them up on the next tick, but the first tick after
+the re-flip does nothing and looks like a broken worker. Wait out the window, or expect one dead
+tick.
+
+**The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
+it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as
+a `client_assertion` and gets back an access token for Service Bus. What makes Entra accept it is a
+federated identity credential on a user-assigned managed identity, declared in `ingest.bicep`,
+pinned to issuer `https://oidc.vercel.com/<team>` and subject
+`owner:<team>:project:<project>:environment:production` — a second credential covers `preview`,
+because Entra matches those fields exactly and allows no wildcard. The namespace has
+`disableLocalAuth: true`, so no SAS key would work even if one existed. The three variables Vercel
+holds — namespace host, tenant id, client id — are identifiers, not secrets.
+
+The access token is cached in module scope, so a warm lambda pays one exchange rather than one per
+request and a cold one pays a single extra round trip before the send. When the exchange fails the
+publisher logs and returns a failure count; it never throws. That is deliberate and load-bearing:
+the `ingest_jobs` rows were written before the publish, so an Entra or Service Bus incident costs the
+wake-up and the pump re-derives the same rows within two minutes. A broker outage must not empty the
+map, and it cannot.
+
+**Two concurrent Overpass requests per host instance, and no scale-out.** `packages/ingest/src/overpass.ts`
+serializes at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that
+directly. The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1`
+for one host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
+`OverpassClient` in that process, and `OVERPASS_MAX_CONCURRENT: 2` inside it — all declared in
+`infra/azure/ingest.bicep`. The queue sets `requiresSession: false` so session count is not a second
+multiplier. The other half is that Vercel fetches nothing: **three** call sites reach Overpass from a
+Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` — and all three are
+gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline from a public
+procedure the planner fires on every viewport settle, and since the pump publishes that kind too, it
+had two drainers.
+
+**"Vercel fetches nothing" is per Vercel environment, not per deployment.** Production and Preview
+hold `INGEST_QUEUE_DRIVER` independently, and both point at the production database, so an
+environment left on `postgres` is a second drainer against the same `ingest_jobs` — with its own
+`OverpassClient` on every warm lambda. That is not a hypothetical: measured at 2026-08-03T23:26Z,
+Production read `postgres` and Preview had no `INGEST_QUEUE_DRIVER` at all (17 variables, and it
+was not among them), which `ingestQueueDriver()` resolves to `postgres` — so the flag-on ceiling at
+that moment was 2 from Azure **plus 2 per warm Vercel lambda in each environment**, not 2. Both are
+now set explicitly, to `servicebus`, and `vercel env ls <environment>` is how you check rather than
+assume. The residue is branches cut before this flag existed: their code has no `ingestQueueDriver`
+call to make, so their previews drain inline whatever the environment says, until they rebase onto
+master.
+
+**The client's retry budget has to fit inside `functionTimeout` — and fitting it is not enough.**
+Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
+case on the defaults is six attempts of 190 s plus backoff — about 24 minutes for one query, and
+`processTile` makes several. That is not theoretical: `ingest_tile:120221221` ran 600008 ms on
+2026-08-03 and the host killed the worker mid-tile. Two numbers bound the Overpass part of it, both
+set in `ingest.bicep`: `INGEST_OVERPASS_DEADLINE_MS` (300 s) is the last moment the worker will
+_start_ a query, and `OVERPASS_MAX_TOTAL_MS` (240 s) is the most one query may then spend across
+every retry — 540 s worst case inside 600 s. Past the deadline the Overpass view throws, `drainJobs`
+catches it per job, writes `lastError` and releases the lease, which is a far cheaper failure than
+the host killing the process. And the pump calls `reclaimExpiredJobs` on its two-minute tick, so a
+lease that _is_ stranded comes back in minutes rather than waiting for the daily cron.
+
+**540 s bounds Overpass. `INGEST_DEADLINE_MS` bounds the invocation, and it had to.** Overpass was
+never the handler's only wall clock. `TerrainSource` fetched a terrarium tile per DEM sample with a
+bare `fetch` — no signal, no per-request timeout, no budget — and the per-trail writes are their own
+time; neither was inside the 540 s. Measured on 2026-08-03 with the flag on, five tiles through the
+worker: 021212220 at 205 s, 031313102 at 415 s, 031313120 at 491 s — then 120221230 and 120221203,
+both dense alpine tiles, killed at 612,947 ms and 615,938 ms. The same window has
+`[HostMonitor] Host CPU threshold exceeded (99 >= 80)` repeating from 22:24 to 23:04 and
+`ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so a saturated single instance
+with the timer contending against the queue trigger is a second, independent term — and one
+`maxConcurrentCalls: 1` does not cover, because the pump is not a queue message.
+
+So there is now one wall clock rather than one per subsystem: `INGEST_DEADLINE_MS` (540 s) is passed
+to every phase as `PipelineDeps.deadlineAt`. Past it terrain refuses to start a fetch, the commit
+loop refuses to start a trail, and `processTile` marks the tile `failed` and throws — the same
+cheap, caught, lease-releasing failure the Overpass deadline already produced, 60 s before the host
+would kill the process. Each terrarium request also carries its own 20 s `AbortSignal.timeout`,
+because Node's `fetch` imposes none and a stalled socket is how you reach 615,938 ms without any
+phase ever _starting_ late.
+
+**And it now alerts — on the job, which is where the failure actually lands.** A killed invocation
+does not dead-letter: the redelivery finds the row still under the killed invocation's lease, logs
+"nothing claimable" and _completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2 and
+`switchback-ingest-deadletter` — which fires on `DeadletteredMessages` — structurally cannot see it.
+`deadLetterMessageCount` was 0 for the whole run while this happened twice.
+
+The first version of `switchback-ingest-drain-failed` read `requests | where success == false`, and
+that was blind to the failure mode it was written for. `drainJobs` catches every handler error,
+writes it to the job row and returns normally, so the 2026-08-04 run was 14/14 successful
+invocations while six Alps tiles were failing — the failure existed only as six `traces` lines. The
+rule now unions the request arm with a `traces` arm keyed on the literal `ingest-job-failed` that
+`runIngestSignal` logs beside every job-level failure. Matching a token rather than a sentence is
+deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code and the template still
+agree on it. Severity 2, onto the same action group, `autoMitigate: false` — the condition is "this
+happened", not "this is happening".
+
+**What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
+plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
+543,653.9 ms against a 600,000 ms `functionTimeout`, where the previous run's longest was
+615,938 ms and `FAILED`. Five of the ten were alpine z9 tiles (`120221203`, `120221212`,
+`120221213`, `120221223`, `120213322`); every one of them spent its whole 540 s and ended on
+`IngestDeadlineError`, written to `lastError`, lease released, retry scheduled off the backoff
+ladder — and one job reached the end of that ladder and was `retired`. Two tiles finished:
+`120221232` at 448,188.0 ms and `031313103` at 347,561.9 ms. The Consumption instance was over its
+CPU threshold for the entire window (75 `[HostMonitor] Host CPU threshold exceeded` lines,
+00:17:37Z to 01:22:19Z) with `ingestPump` ticks up to 30,941 ms in the same process, so the drain
+was never running alone.
+
+So the honest statement is: a z9 tile in dense alpine terrain does not fit in one Consumption
+invocation, and no bound on the handler can change that — the bound only decides whether the
+failure is clean and visible or a silent ten-minute kill loop.
+
+### Subdivision: a tile that will not fit is replaced by its four children
+
+A quadkey is a prefix code, so the four z10 tiles covering `120221203` are that string with `0`,
+`1`, `2` and `3` appended, and `IngestTile` already stores `z`/`x`/`y` per row. Splitting therefore
+needs no schema change and no new geometry — `childQuadkeys` in `packages/geo/src/tiles.ts` is the
+whole of the maths.
+
+```mermaid
+stateDiagram-v2
+  [*] --> running: claimed
+  running --> ready: committed inside 540 s
+  running --> pending: out of clock, z &lt; 11
+  running --> failed: out of clock at z11, or Overpass unavailable
+  pending --> pending: children outstanding
+  pending --> ready: all four children ready
+  note right of pending
+    four child rows written at z+1,
+    one ingest_tile job each
+  end note
+```
+
+**Out of clock has two shapes and both split.** The commit loop can exhaust `deadlineAt`, which is
+the failure the 2026-08-04 run measured; and the tile's own Overpass query can exhaust the Overpass
+budget, in which case `processTile` never reaches the commit loop at all. Both mean the same thing —
+this box cannot be served in one invocation — so both subdivide. Every other Overpass failure is
+kept apart deliberately: a breaker that is open, a mirror answering 504 and a malformed query all
+mean come back later, and subdividing on those would quadruple the load on a service already
+refusing.
+
+**Split on failure, not up front.** Pre-sizing every tile with an Overpass `out count` costs one
+query per tile forever — measured at 3.2 s and one request for `120221203` — to save a wasted run on
+the small minority that are dense. Deadline exhaustion is free and it is the exact signal: the tile
+that could not be finished is the tile that has to be split. What a post-hoc split costs is one
+ten-minute invocation per dense tile per TTL, and not even that is wasted, because every trail the
+run committed before the clock ran out is already in `trails` and the children only re-upsert it.
+
+**Splitting is a status, not a flag.** `splitTile` writes the four child rows, enqueues one
+`ingest_tile` job each at viewport priority, and leaves the parent out of `readyTiles` while the
+children run — `pending` for a parent with nothing to serve, and its existing `ready`/`empty` and
+`fetchedAt` for one that was already serving trails, for the reason given four paragraphs down. What
+it never writes is `failed`, because a split is no longer a failure. Admission control is
+deliberately not consulted: this is ground already admitted and already paid for, and a refusal here
+would strand a parent with no children and no route to ready.
+
+**A parent is ready only when every descendant is.** `rollUp` takes the four child rows and returns
+the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
+`fetchedAt` is the _oldest_ child's, so the parent leaves the TTL when its stalest quarter does —
+taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
+sweep for another month. `trailCount` sums. A parent whose children are all `empty` is `empty`; one
+child with trails in it makes the parent `ready`, because that is a place worth re-querying.
+
+**Nothing in `coverage.ts` changed, and that is the design.** `ensureCoverage` still covers a
+viewport with z9 quadkeys and still reads the z9 row, so `readyTiles`, `pendingTiles` and the TTL
+all keep working with no knowledge of the split — precisely because the roll-up writes the answer
+onto the z9 row. A parent being ingested for the first time reads `pending` while children are
+outstanding, the client keeps polling, and the trails the finished children committed are already on
+the map: `browse` selects by bounding box, not by tile status, so three-quarters done looks like
+three-quarters of the map.
+
+**A parent that was already serving trails keeps serving them.** `splitTile` preserves a
+`ready`/`empty` status and its `fetchedAt` instead of writing `pending`. `ensureCoverage` classifies
+a settled-but-stale tile as ready-and-refreshing and everything else as pending, so demoting a tile
+that split on a TTL refresh would flip a reader from "here are your trails" back to "still loading"
+for however long four children sit in the drain queue — which is not a length anybody is watching.
+A parent with no `fetchedAt` has nothing to serve and still reads `pending`.
+
+**That status is passed in, not read back, and the difference was a live bug.** `processTile` writes
+`running` to the parent before it fetches, so a `splitTile` that re-read the row saw `running` for
+every caller, decided the parent had never served anything, and wrote `pending` — on every
+production path. It passed its unit test because the test called `splitTile` directly with a
+hand-built `ready` row that `processTile` cannot produce. `previous` is now a required parameter and
+`packages/ingest/test/pipeline.test.ts` proves the behaviour through `processTile` against a fake
+that stores rows rather than replaying a fixed answer.
+
+Because coverage is unchanged, a viewport over split ground keeps queueing the z9 parent. That path
+is cheap and useful rather than wasteful: `processTile` sees four child rows, makes no Overpass call
+at all, re-queues any child that is not fresh, and promotes the parent if it can. It is also how a
+split tile refreshes — the parent goes stale when its oldest child does, `ensureCoverage` queues the
+parent, and the parent re-queues exactly the stale children.
+
+**Whether to re-queue a child is a question about its job, not about its tile.** `IngestTile.status`
+reads `failed` both for a child thirty seconds from its next attempt and for one that has given up,
+and `enqueue` clears `attempts` — so deciding on the tile row resets the backoff ladder of a child
+that was already coming back, on every viewport poll, which is how a rate-limited tile becomes one
+we hammer once per render. `failJob` writes the _job_ `queued` with a future `runAfter` while
+attempts remain and `dead` only when they are gone, and that is what `queueStaleChildren` reads: a
+`queued` or `running` child is left alone, anything else is enqueued.
+
+**A `dead` child is revived, because nothing else can revive it.** `splitTile` enqueues each child
+exactly once, `ensureCoverage` covers z9 alone (`coverBBox(bbox, INGEST_ZOOM)`), `JobKind.refresh_tile`
+has no producer, and `reclaimExpiredJobs` does not touch a dead row. Skipping dead children — which
+an earlier revision of this section described as deliberate — left a subtree that could never finish
+and a z9 ancestor permanently `pending`, with no documented manual recovery. Reviving from the
+parent's drain restores exactly the recovery a z9 tile had before subdivision, where a viewport poll
+revived a dead job through `ensureCoverage`, and it is bounded the same way: the revived child gets a
+five-attempt ladder, and while it is `queued` the next drain leaves it alone.
+
+**Five failed attempts is still worth a human, and it is reported once.** `queueStaleChildren`
+returns the revived-from-dead children as `exhausted`; `rollUpSplitTile` writes them to the parent's
+`lastError` and logs `switchback-ingest-subtree-stuck` — but only when that message differs from what
+the row already says. Edge-triggering is load-bearing rather than tidy: a blocked parent is `pending`,
+so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
+pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
+would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
+genuine failure signal — which trains an operator to ignore the signal round 5 was convened to create.
+`promoteFrom` nulls `lastError` when the roll-up lands, so the edge re-arms itself.
+
+**The floor is a parameter and it fails honestly at the bottom.** `INGEST_SUBDIVIDE_MAX_ZOOM` is the
+deepest zoom a tile may reach; at the floor a tile that still exhausts its budget is marked `failed`
+and throws, exactly as before. Sixteen z11 tiles cover one z9, and each level quadruples the fixed
+per-tile cost — a region lookup and a tile-wide waypoint query that a smaller box does not make
+cheaper — so deeper than z11 the overhead, not the work, is what fills the invocation.
+
+**It ships off, and turning it on takes two settings, not one.** `ingest.bicepparam` resolves
+`ingestSubdivideMaxZoom` to `9` — subdivision disabled — and `ingestTrailIdentity` to `osm-id`,
+unless the deploying shell exports otherwise. The two are coupled in code as well as in the
+template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTITY` is not `claim`,
+whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
+`min(wayId)` cannot be reached by setting one variable.
+
+**Both settings have to be set on the process that is actually draining.** In the resting
+configuration `INGEST_QUEUE_DRIVER` is `postgres`, the Function App drops every signal it receives,
+and Vercel owns the drain — so setting either variable on the Function App alone changes nothing.
+Both are declared in `apps/web/src/env.ts` as well as in `ingest.bicep`, each defaulting to off, so a
+value set on one side and not the other is a difference an operator can see rather than a flag that
+appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
+of a silent fallback, which is why they exist at all: `@switchback/ingest` reads both from
+`process.env` itself.
+
+**The ceiling stays at 9 even though the seam is fixed, and the reason is arithmetic rather than
+correctness.** Every split observed in production ran out of clock in the _commit_ phase, never the
+query: four `switchback-ingest-tile-split` events, all `"phase":"commit"`, having already assembled
+989–2,160 trails. Dividing each tile's own measured commit rate by four puts every z10 child between
+554 s and 2,306 s against a 540 s wall, so no child of any observed tile fits; at z11 the densest
+still needs 577 s with nowhere left to split. Subdivision spends Overpass — the one resource under a
+hard etiquette bound — 4× and 16× over to relieve DEM and database time, which is under none.
+
+**Off is one setting and no deploy: `az functionapp config appsettings set … INGEST_SUBDIVIDE_MAX_ZOOM=9`.**
+No tile splits, a dense tile fails exactly as it did before, and children already created still
+ingest and still roll up, so the switch is safe to throw mid-flight. **Deleting the setting turns it
+off too** — an absent or unusable value resolves to `INGEST_ZOOM`, not to the ceiling — and so does
+the next template deploy, because the committed parameter is `9`. That last point is the one that
+matters: an ARM application-settings write replaces the collection whole, so a hand-set value does
+not survive a deploy. `ingestQueueDriver` has no default at all for the same reason and the opposite
+polarity — both of its values are dangerous if guessed, whereas the only dangerous direction here is
+_on_, so a forgotten `export` has to land on off. Turning subdivision on for an experiment is
+therefore a hand-set app setting that the next deploy will revoke, which is the correct asymmetry.
+
+**A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
+its deadline threw, `drainJobs` recorded a failure, and the drain-failure alert armed. Now it
+returns normally and `report()` logs `done`, so an operator would read 8/8 tiles succeeded while
+two of them ingested nothing. `switchback-ingest-drain-failed` therefore has a third arm matching
+`switchback-ingest-tile-split` and `switchback-ingest-subtree-stuck`.
+
+That alert is scoped to `appi-switchback-ingest`, which is the Function App drainer. In the resting
+configuration `INGEST_QUEUE_DRIVER` is `postgres`, so Vercel drains, and Vercel has no Application
+Insights — `packages/api/src/routers/trails.ts` and `apps/web/app/api/cron/drain/route.ts` both send
+the markers to `console` because there is nowhere else for them to go. Both subdivision flags are
+declared in `apps/web/src/env.ts`, so subdivision _can_ be turned on for that drainer, and on that
+drainer nothing is watching — including `switchback-ingest-subtree-stuck`, which is the
+edge-triggered "five failures, a human is needed" signal. Enabling subdivision therefore means
+either moving the drain to the worker first, or accepting that the split and stuck markers land only
+in the Vercel log stream. There is no Vercel log drain in the estate or in any template.
+
+**The split gate is unattempted work, not the clock.** `forEachConcurrent` visits every assembled
+trail, so a tile is only short when the deadline _refused_ one — `processTile` counts
+`IngestDeadlineError` separately from ordinary per-trail failures and splits on that count alone. A
+tile whose last commit lands a millisecond past the wall is finished; splitting it would throw away
+the `ready` write and queue four children over rows already in `trails`.
+
+**Children wait for the backlog, and that is the pump's shape rather than subdivision's.** They are
+enqueued at `SPLIT_PRIORITY` — level with a live viewport — but the pump only refills the broker
+when fewer than `INGEST_PUMP_LOW_WATER` (4) messages are in flight, and at equal priority
+`claimJobs` and the pump both order by `runAfter ASC`, so a child created now sorts behind every
+tile already queued. With eight dense tiles ahead of it and one message worked at a time, a child
+can wait the better part of an hour before its signal is published. Nothing is lost — the row is
+durable and the parent stays `pending` — but "the tile splits" and "the tile is ready" are separated
+by the queue, not by the split.
+
+**Overpass budget.** A split z9 costs four tile queries, four waypoint queries and four region
+lookups where it cost one of each, so roughly 4x for the tiles that split and nothing at all for the
+tiles that do not. The 2-concurrent bound is untouched: children are ordinary jobs, the host takes
+one message at a time, and the ceiling is the shared `OverpassClient`'s queue, not the number of
+tiles in play.
+
+**Boundary trails cost a duplicate fetch, not a duplicate row.** A way crossing a child seam is
+returned by both children's bbox queries: `buildTileQuery` filters per statement and declares no
+global `[bbox:]`, so Overpass returns each intersecting way whole to both tiles rather than clipped.
+That shared way is what makes identity recoverable.
+
+**A multi-way trail spanning a seam keeps one row, because `trail_ways` decides identity.**
+`assembleTrails` still labels a standalone way-trail `Math.min(...line.wayIds)` over only the ways
+that tile's query returned, so the same trail cut by a seam still arrives under two different labels
+— ways 10/20/30/40 become `(way, 10)` in one child and `(way, 30)` in the other. What changed is that
+the label is no longer the identity. Every commit claims its member ways in `trail_ways`, whose
+primary key is the way id; the second tile's assembly finds its ways already claimed and resolves
+onto the existing row instead of creating a second one.
+
+The two fragments overlap rather than butt-join, so the halves are unioned geometrically —
+`ST_LineMerge(ST_UnaryUnion(ST_Collect(…)))` in `mergeTrailGeometry` — and never concatenated.
+Across the 269 fragmented pairs measurable in production today, concatenation overstates length by a
+mean 4,358 m; on `Hastings Heritage Trail` it overstates by 13,138 m against a true union of 62,110 m.
+The union happens before `elevateLine`, because every statistic, the elevation profile and each
+waypoint's `distM` are derived from the coordinate array — a merge applied at the write would leave
+all of them describing one fragment.
+
+**A union that is still a MultiLineString is refused, and the whole resolution goes with it.** 53 of
+those 269 pairs fork or do not touch, and `Trail.geom` is `geometry(LineString, 4326)`, so no single
+line represents them. The assembly therefore keeps its own row, its own line and the member ways
+nobody else holds, exactly as the `osm-id` default would give it — `resolveIdentity` returns the
+unresolved fallback rather than the winner's id.
+
+Adopting the winner on a refusal is what the earlier shape of this code did, and it is not a no-op:
+the winner's stored line comes back unchanged, so the incoming arm is written nowhere, while its ways
+are still claimed for the winner — after which no later ingest can restore it, because resolution
+keeps finding those ways claimed and keeps refusing the same union. Standing down leaves that trail
+fragmented across two rows, which is a worse corpus than one row but a strictly better one than a
+trail that has been deleted with no way back. `packages/ingest/test/identity.db.test.ts` asserts both
+halves against a real PostGIS: the arm's northern tip is on the arm's own line, and way `900005` is
+claimed by the arm rather than by the ridge.
+
+Where two rows already exist, the older wins and the younger is folded into it: reviews, photos,
+activities, completions, list items, lifeline sessions and way claims are re-pointed. Two of those
+carry a uniqueness that spans `trailId`, and a collision there is a duplicate rather than a loss — a
+`(source, sourceId)` photo is the same upstream photograph attached to both halves, and a list must
+not hold the merged trail twice — so the loser's row is dropped. Busyness buckets are a derived prior
+recomputed from activity, so the losers' are dropped whole. A `Review` collision is none of those: it
+is one person who reported both halves, and `canMergeTrails` refuses the entire merge rather than
+delete either report. The retired slug is written to `trail_slug_aliases`, and `trails.bySlug` falls
+back to it, so the public URL the loser was indexed under keeps answering.
+
+Relation-derived trails never resolve through claims — a relation id is the same in every tile, so
+`(osmType, osmId)` already identifies them — but they do claim their member ways, which is how a
+way-assembly in a neighbouring tile learns to stand down rather than shadow the route. It stands down
+only when it also carries the relation's name: both halves of the rule `assembleTrails` applies
+inside one tile. A way a relation claims under a _different_ name — the Mist Trail inside the John
+Muir Trail — is a trail in its own right, keeps its own row, and yields the contested way rather than
+fighting for it on every ingest.
+
+**The primary key on `trail_ways.wayId` is the concurrency control.** Two tiles racing for one way is
+the expected case: `COMMIT_CONCURRENCY` is 6 inside each drainer and there are two drainers. The
+loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because the
+line and every statistic derived from it were built on a resolution that is now stale — and the
+retry re-reads the claims and adopts the row the winner created.
+
+**The rollback is one setting, and it is a rollback of behaviour, not of state.** `osm-id` touches
+`trail_ways` and `trail_slug_aliases` not at all — it neither reads nor writes them — so the default
+path has no dependency on either table, and a runtime that reaches a database where the DDL has not
+been applied still ingests. That matters because Vercel Preview builds run branch code against the
+production database automatically, and `ci.yml`'s `migrate` job only runs on a push to `master`.
+Setting the flag to `claim` needs no backfill: claims fill in as tiles re-ingest on the 30-day TTL,
+and until a trail's ways are claimed it resolves exactly as it does today. Setting it back to
+`osm-id` returns behaviour to the `(osmType, osmId)` upsert with a populated table sitting unread.
+
+What it does not do is un-merge: a merge that has already run has deleted the loser `Trail` row, and
+no setting brings it back. The merge is built so that this costs nothing a reader wrote — everything
+user-authored moves, and the one case that cannot move refuses the merge — but an operator turning
+the flag off is stopping future merges, not reversing past ones. `trail_slug_aliases` is the residue
+that says a merge happened, and `processTile` logs `identity resolved` per tile with a count for each
+of `adopted`, `merged`, `refused-geometry`, `refused-review` and `yielded-to-relation`, so the
+irreversible half is measurable while it is happening rather than only afterwards. Existing fragments
+heal on their own as tiles re-ingest — no Overpass backfill run, no hours of mirror load.
+
+**Observed in production, 2026-08-06**, and re-read from App Insights on 2026-08-07. Subdivision
+fires, and the trace that says so is the one this round wired. Four dense alpine z9 tiles reached the
+wall and split rather than failing. `appi-switchback-ingest` retains `traces` for 90 days, so this
+table stops being reproducible after 2026-11-04 — the rows below are the record after that.
+
+| tile        | at (UTC) | elapsed    | committed | unattempted | children      |
+| ----------- | -------- | ---------- | --------- | ----------- | ------------- |
+| `120230202` | 00:00:25 | 542,349 ms | 127       | 2,032       | `1202302020…` |
+| `120230220` | 00:09:25 | 540,513 ms | 160       | 1,488       | `1202302200…` |
+| `120230203` | 00:21:45 | 540,582 ms | 196       | 793         | `1202302030…` |
+| `120230212` | 00:37:11 | 540,244 ms | 241       | 748         | `1202302120…` |
+
+```
+switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unattempted
+  {"phase":"commit","committed":127,"failed":2033,"refused":2032,
+   "children":["1202302020","1202302021","1202302022","1202302023"],"fetchMs":542349}
+```
+
+All four are the commit-loop shape: the tile query returned, the deadline refused the rest,
+`refused > 0` selected the split, and each invocation returned normally between 540,244 ms and
+542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought.
+Two thousand unattempted trails is the size of the problem stated plainly: these boxes are an order
+of magnitude past what one invocation can commit. Overpass was healthy throughout: no 429, no
+`Retry-After`, no breaker trip in `traces` between 23:00Z and 00:45Z, and `ingest-jobs` held 0
+dead-lettered messages.
+
+**No child ran, and the reason is the queue rather than the split.** Children are enqueued at
+`SPLIT_PRIORITY`, level with a live viewport, but `claimJobs` and the pump break a priority tie on
+`runAfter ASC` — so a child created at 00:00 sorts behind every tile queued before it, and the
+alpine backlog ahead of these was itself made of nine-minute tiles. Twenty-four z10 rows across six
+parents were `pending` with durable jobs behind them; none was ever claimed. **So the chain is
+proven as far as the split and no further: no `done` at z10, no roll-up, and no z9 that
+`trails.browse` calls ready because it subdivided.** The deepest zoom reached is z10, as rows, not as
+work.
+
+**Earlier rounds' account of this is now settled, and both halves of it were wrong.** Round 1 said
+`splitTile` was never reached; a reviewer said subdivision had fired twice on 2026-08-05. Neither was
+supported then and neither is now: the 2026-08-05 over-deadline invocations logged `done` with no
+token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
+path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
+
+**The seam baseline, measured against the tiles that actually split.** Re-taken 2026-08-07. It is
+still a true "before": no tile below z9 exists, no trail is owned by a quadkey longer than nine
+characters, and neither parent has a `fetchedAt`, so nothing beneath either tile has ever ingested.
+
+| tile        | trails | distinct names | way / relation | total `lengthM` |
+| ----------- | ------ | -------------- | -------------- | --------------- |
+| `120230203` | 477    | 425            | 289 / 188      | 2,901,784       |
+| `120230212` | 232    | 231            | 6 / 226        | 2,644,035       |
+
+Two names already span the seam between those two tiles. Corpus-wide, 503 way-trails — 1.1% of
+47,279 — have a same-name way-trail in another quadkey whose line comes within 50 m of their own.
+That proximity test is the point: a shared name alone puts 6,296 rows (13.3%) in the set, and most of
+those are unrelated "Ridge Trail"s in different ranges that share no way and no claim table will ever
+merge. `scripts/baseline-228.sql` reports both figures side by side, the second labelled as the upper
+bound it is; the 50 m predicate is the one `scripts/verify-merge.sql` uses to select the pairs the
+merge primitive was measured on. Re-run it to watch the first number fall as tiles re-ingest.
+
+**Direct Postgres is reachable from a maintainer workstation with ProtonVPN disconnected**, using an
+Entra access token as the password — `scripts/pgenv.sh` assembles the session and never prints the
+token. The earlier finding that only HTTPS egress was permitted described the sandbox of the day, not
+the server.
+
+**How this was run before the branch was merged, and what it cost.** The worker is deployed from a
+zip, so it can carry this branch's `processTile` while Vercel still serves `master`. Setting
+`INGEST_QUEUE_DRIVER=servicebus` on the worker alone therefore gets subdivision into production
+without a merge — but it leaves two drainers on one `ingest_jobs` table, because `master` has no
+such flag. That is survivable for a bounded experiment and wrong as a resting state:
+
+- `claimJobs` uses `FOR UPDATE SKIP LOCKED`, so the two never work the same row.
+- `master`'s inline drain is scoped to `coverage.queued`, which is `coverBBox(bbox, INGEST_ZOOM)` —
+  z9 keys only. It structurally cannot claim a z10 child, which is what makes the arrangement safe
+  enough to try. `master`'s daily `/api/cron/drain` at 04:17 UTC is not scoped and can.
+- The Overpass ceiling during the window is 2 per drainer, not 2 overall.
+- Reviving one of the six failed tiles needs `ensureCoverage`, which only `trails.browse` reaches —
+  and the same request kicks `master`'s inline drain, which claims the tile for the full 30-minute
+  `LEASE_TIMEOUT_MS` and dies at Vercel's function limit with nothing written. The tile is then
+  invisible until `reclaimExpiredJobs`. Budget half an hour for that before the worker sees it.
+
+Merging removes all four, which is the argument for merging before the next run rather than a reason
+the run cannot happen.
+
+**Live production state, 2026-08-06.** `INGEST_QUEUE_DRIVER` is back to `postgres` and
+`INGEST_SUBDIVIDE_MAX_ZOOM` back to `9` on the worker: the worker drops every signal it receives,
+Vercel owns the drain, and no further tile can split. Six z9 tiles had split — `031313112`,
+`120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four z10 child
+rows and twenty-four queued `ingest_tile` jobs.
+
+**Those children are retired, not finished, and the reason is the arithmetic above.** None had ever
+run: every row was `pending` with `fetchedAt` NULL, `attempts` 0 and `trailCount` 0, and no trail in
+the corpus was ever owned by a z10 quadkey. They could not have finished either — each sits between
+554 s and 2,306 s of commit work against a 540 s wall — and nothing would have rolled them up, since
+the ceiling stays at `9`. Leaving twenty-four claimable jobs pointed at work that cannot complete
+spends Overpass, which is the one budget under a hard etiquette bound. `scripts/retire-244.sql`
+deletes them in one transaction, guarded on the never-ingested predicate so a child that had really
+run would survive and show up in the after-count. The six parents keep their own rows and their own
+jobs, and `childTiles` now reports zero for each, so each re-fetches at z9 exactly as it did before
+subdivision existed.
+
+Two residues are left deliberately, because neither is debris subdivision created and repairing
+production state by hand is not a rollback anybody could audit. `120230212`'s tile row is `pending`
+while its `ingest_tile` job is `done`; it predates the splits. And three of the six parents —
+`120221231`, `120230202`, `120230203` — read `running` with `fetchedAt` NULL and no lease holder,
+which is what a tile row looks like after an invocation was killed mid-write. Neither state is
+visible to a reader: `isTileFresh` refuses `pending` and `running` alike, so both areas serve as cold
+and are re-queried, which is the correct outcome for a tile that never finished. Until they are
+re-attempted, what each of the six serves is every trail carrying its quadkey, accumulated over all
+of its attempts — 38, 134, 119, 477, 232 and 158 for `031313112`, `120221231`, `120230202`,
+`120230203`, `120230212` and `120230220`, read on 2026-08-07. The 127, 160, 196 and 241 in the split
+table above are what each _split run_ committed before the wall, which is a smaller and different
+number; do not read either as the other.
+
+**Say "no scale-out", not "deployment-wide ceiling of 2".** `functionAppScaleLimit` caps how many
+instances the scale controller adds; it does not stop Consumption _replacing_ an instance, and for a
+few seconds around a recycle two host instances of the same app are alive. Telemetry from
+2026-08-03T17:32 shows exactly that: `0--f7e39076-13` took sequence 1 at 17:32:00.884, `0--3f3e4037-7d`
+logged "Starting Host" at 17:32:13.797 and took sequence 2 at 17:32:15.175. Nothing in the telemetry
+proves the first instance's Overpass client had quiesced, so the honest ceiling during a recycle
+window is 4, not 2. It is brief, it is not sustained, and Overpass's fair-use limit is about sustained
+load — but the number to put in a review is "2 per instance, one instance except across a recycle".
+
+The same trace exposes the cost of a mid-drain recycle, which is worth knowing before you see it: the
+evicted instance never releases its message lock, so the message sits invisible for the full `PT5M`
+`lockDuration` and then redelivers with `DeliveryCount 2` — and the `ingest_jobs` row it names is
+still under the dead lease it took on the first attempt, so the redelivery logs "nothing claimable"
+and the tile waits for `reclaimExpiredJobs`. That is a slower path than #172 promised, and it is the
+argument for keeping the cron's `reclaimExpiredJobs` call on the `servicebus` branch rather than
+skipping the cron entirely.
+
+**Least privilege on the queue.** Four role assignments, all queue-scoped, all in the template: the
+worker holds Data Sender and Data Receiver, and so does the publisher. Data Owner was the earlier
+choice because reading the queue depth looked like an administration operation — it is, for
+`ServiceBusAdministrationClient`, but both data roles already carry the control-plane `queues/read`
+action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth through ARM
+and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite or delete
+the queue it drains.
+
+The publisher's Data Receiver is the exception to that heading, and it is the answer to who can
+drain the production ingest queue. `id-switchback-vercel-publisher` is the shared runtime identity
+that every Vercel deployment carries, previews included, so the grant reaches all of them — over the
+same REST surface `packages/ingest/src/publish.ts` already uses to send. It is declared by its
+literal assignment id, `0090d328-0cee-592f-8359-e4cc64940694`, because it predates the template and
+is adopted rather than created. Revoking it returns `ScopeLocked` naming `switchback-prod-no-delete`,
+the resource group's `CanNotDelete` lock, so revocation needs the lock lifted first — an Owner
+action, tracked separately.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection
@@ -305,25 +924,24 @@ the identity and its two federated credentials. What is not:
   carries the `ALTER ROLE sbapp_vercel RENAME TO sbapp_runtime` that creates it, and that has run
   nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
   provisioning workflow cannot execute from a branch.
-- The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and still holds
-  both Service Bus grants under it. Moving it is a change to `infra/azure/ingest.bicep`, which
-  lives on `feat/servicebus-ingest` rather than here.
-- Neither Service Bus grant is declared by any template on this branch. `ingest.bicep` owns the
-  namespace and the queue, and therefore the grants scoped to them, and it lives on
-  `feat/servicebus-ingest` rather than here. Live today, read with `az role assignment list --all`,
-  the shared identity holds **both** Data Sender (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data
-  Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) on `ingest-jobs`. So the IaC in this branch
-  understates what the principal can do on that queue, and an audit run from the repository alone
-  reaches the wrong answer — which is why it is written here.
+- The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
+  Service Bus grants under it. Moving it onto the shared identity is a change to
+  `infra/azure/ingest.bicep`, which declares that identity, the queue and every assignment on it.
+- The shared identity's Data Receiver on `ingest-jobs` is not revoked. `ingest.bicep` declares all
+  four queue assignments, and of them the shared identity holds **both** Data Sender
+  (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data Receiver
+  (`0090d328-0cee-592f-8359-e4cc64940694`). Receiver is the half that matters: it is standing
+  authority to drain the production ingest queue, on an identity every Vercel deployment carries,
+  previews included.
 
-  Receiver is the half that matters. It was deployed before the grant moved out of this template,
-  and incremental ARM does not delete what a template stops declaring, so removing it from Bicep is
-  not a revocation. Revoking it was attempted and refused: the delete returns `ScopeLocked` naming
-  `switchback-prod-no-delete`, the resource group's `CanNotDelete` lock, and lifting that is an
-  Owner action. It is inert while no Service Bus receive code exists in this repository, and it
-  becomes real capability — for every Vercel deployment, preview included — the moment the worker's
-  code merges. Either revoke it before then, or let `ingest.bicep` adopt it in the change that moves
-  the worker: the `guid()` inputs are identical, so the assignment it would create is this one.
+  It was deployed before the grant moved out of this template, and incremental ARM does not delete
+  what a template stops declaring, so removing it from Bicep would not revoke it. Revoking it was
+  attempted and refused: the delete returns `ScopeLocked` naming `switchback-prod-no-delete`, the
+  resource group's `CanNotDelete` lock, and lifting that is an Owner action. `ingest.bicep` adopts
+  it in the meantime, declared by its literal assignment id rather than by the `guid()` expression
+  its three siblings use — a role assignment's resource name is its GUID, so the literal is the
+  only form that provably converges on the assignment already in the estate, where a `guid()`
+  resolving to anything else would attempt a second grant of the same role to the same principal.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
 because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
@@ -606,11 +1224,11 @@ order, each proved with passwords still enabled:
    `refs/heads/master` alone, so this executes on merge.
 2. **The Function App.** `DATABASE_AUTH=entra`, `AZURE_CLIENT_ID` for the shared identity, and a
    `DATABASE_URL` with the password removed. Its app setting still carries `sbapp`. Its identity
-   block lives in `infra/azure/ingest.bicep`, on `feat/servicebus-ingest` (PR #42) rather than
-   here, so the move cannot be made from this branch at all. Its Service Bus Data Receiver grant
-   moves in that same change, and the shared identity already holds a Receiver assignment of its
-   own on `ingest-jobs` — the over-grant described above, which is either revoked before PR #42
-   merges or adopted by `ingest.bicep` in it.
+   block lives in `infra/azure/ingest.bicep`, which also declares the queue and its four role
+   assignments, so the move and the Service Bus grant that follows it are one change to that file.
+   The shared identity already holds a Receiver assignment of its own on `ingest-jobs` — the
+   over-grant described above, which `ingest.bicep` adopts until the lock is lifted and it can be
+   revoked.
 3. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.

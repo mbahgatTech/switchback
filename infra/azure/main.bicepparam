@@ -93,8 +93,8 @@ param serverNamePrefix = 'psql-switchback-prod'
 // `Microsoft.Support/*`, with empty `notActions` — and **no condition**, on the role definition
 // (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) or on the assignment
 // (`8baf9393-029a-4226-a882-992a8146d775`). It exists because a Contributor cannot write the role
-// assignments the templates declare; `infraContributor` in main.bicep is one, and the queue grants
-// on branch `feat/servicebus-ingest` are more. It was created by the owner's own object id,
+// assignments the templates declare; `infraContributor` in main.bicep is one, and the four queue
+// grants in `infra/azure/ingest.bicep` are more. It was created by the owner's own object id,
 // `8c682736-…`, the same one declared as the Entra administrator below.
 //
 // **State the consequence rather than let it be inferred.** Role Based Access Control

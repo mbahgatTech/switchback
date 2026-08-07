@@ -31,23 +31,39 @@ describe('OverpassClient construction', () => {
     expect(() => new OverpassClient({ userAgent: UA })).not.toThrow();
   });
 
-  it('refuses a placeholder contact address', () => {
+  it('refuses a contact address that does not reach us', () => {
     // Not hypothetical. `contact@example.com` shipped in .env and overpass-api.de answered
     // every single tile with `406 Not Acceptable` — an Apache content-negotiation page that
     // says nothing about the User-Agent. This check is what turns that into a startup
     // error naming the actual cause.
     expect(
       () => new OverpassClient({ userAgent: 'Switchback/0.1 (+https://example.com)' }),
-    ).toThrow(/placeholder "example\.com"/);
+    ).toThrow(/names "example\.com"/);
     expect(
       () =>
         new OverpassClient({
-          userAgent: 'Switchback/0.1 (+https://switchback.app; a@example.org)',
+          userAgent: 'Switchback/0.1 (+https://switchback.test; a@example.org)',
         }),
-    ).toThrow(/placeholder/);
+    ).toThrow(/does not reach this project/);
     expect(
       () => new OverpassClient({ userAgent: 'Switchback/0.1 (+http://localhost:3000)' }),
-    ).toThrow(/placeholder/);
+    ).toThrow(/does not reach this project/);
+  });
+
+  it('refuses switchback.app, which is somebody else and was deployed once', () => {
+    // The value that reached the Function App and every Overpass request it made. It passes
+    // every shape rule — real-looking host, no placeholder, a URL — and resolves to an
+    // unrelated third party, so an operator who followed it reached a stranger. The only way
+    // a constructor can catch this class is by name.
+    expect(
+      () => new OverpassClient({ userAgent: 'Switchback/0.1 (+https://switchback.app)' }),
+    ).toThrow(/names "switchback\.app"/);
+    expect(
+      () =>
+        new OverpassClient({
+          userAgent: 'Switchback/0.1 (+https://switchback-three.vercel.app/attribution)',
+        }),
+    ).not.toThrow();
   });
 
   it('explains a 406 where the operator will read it', () => {
@@ -155,6 +171,91 @@ describe('OverpassClient backoff', () => {
     await expect(client.query('nonsense')).rejects.toBeInstanceOf(OverpassFatalError);
     expect(calls).toBe(1);
   });
+
+  it('stops retrying once maxTotalMs is spent, whatever maxAttempts says', async () => {
+    // Why the option exists: on the defaults one query can spend ~24 minutes across six
+    // attempts, and the Functions Consumption host kills the invocation at ten. The attempt
+    // count is the wrong unit — wall clock is the one the host measures in.
+    let now = 0;
+    let calls = 0;
+
+    const client = new OverpassClient({
+      url: ONLY,
+      userAgent: UA,
+      maxAttempts: 6,
+      requestTimeoutMs: 60_000,
+      maxTotalMs: 150_000,
+      now: () => now,
+      // Both a request and a backoff advance the clock the caller is being charged for.
+      sleepImpl: async (ms) => {
+        now += ms;
+      },
+      fetchImpl: (async () => {
+        calls += 1;
+        now += 60_000;
+        return status(504);
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(client.query('[out:json];')).rejects.toThrow();
+
+    // Three requests would already be 180 s. It gives up inside the budget instead.
+    expect(calls).toBeLessThanOrEqual(3);
+    expect(now).toBeLessThanOrEqual(210_000);
+  });
+
+  it('leaves the budget unset by default, so nothing else changes shape', async () => {
+    let calls = 0;
+    const client = new OverpassClient({
+      url: ONLY,
+      userAgent: UA,
+      maxAttempts: 4,
+      sleepImpl: async () => {},
+      fetchImpl: (async () => {
+        calls += 1;
+        return status(504);
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(calls).toBe(4);
+  });
+
+  it('holds the abort open across the body, not only to the first byte', async () => {
+    // `fetch` resolves at the headers. Clearing the timeout there leaves the download with no
+    // ceiling and no live signal, and `buildRouteQuery` permits `[maxsize:1073741824]` — so a
+    // mirror answering instantly and then dribbling is unbounded wall clock on a host that
+    // kills the process at ten minutes. A regression here does not fail this assertion, it
+    // hangs: nothing would ever abort the read.
+    let abortedMidBody = false;
+
+    const client = new OverpassClient({
+      url: ONLY,
+      userAgent: UA,
+      maxAttempts: 1,
+      requestTimeoutMs: 50,
+      sleepImpl: async () => {},
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        const signal = init.signal;
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              // A plausible beginning, and then nothing — as a stalled transfer looks.
+              controller.enqueue(new TextEncoder().encode('{"elements":['));
+              signal?.addEventListener('abort', () => {
+                abortedMidBody = true;
+                controller.error(new DOMException('aborted', 'AbortError'));
+              });
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(client.query('[out:json];')).rejects.toThrow();
+    expect(abortedMidBody).toBe(true);
+  }, 5_000);
 });
 
 describe('OverpassClient mirror failover', () => {

@@ -40,8 +40,9 @@ describe('wayToCoords', () => {
     ]);
   });
 
-  it('drops a way clipped by the query bbox rather than inventing the missing span', () => {
-    // Overpass omits positions for nodes outside the bbox. The neighbouring tile has them.
+  it('drops a way with a hole in it rather than inventing the missing span', () => {
+    // Not a bbox clip — the tile query returns intersecting ways whole. A missing position is a
+    // truncated response, and the way is dropped rather than interpolated across.
     const clipped = {
       type: 'way' as const,
       id: 1,

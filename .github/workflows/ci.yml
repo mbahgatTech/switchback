@@ -181,6 +181,99 @@ jobs:
       - run: npm run lint
       - run: npm test
 
+  worker:
+    name: ingest worker bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The bundle copies the generated client out of node_modules rather than regenerating it,
+      # so this is a prerequisite and not a convenience — `scripts/bundle.ts` throws by name
+      # without it. `binaryTargets` in the schema is what puts the Linux engine in that copy.
+      - run: npm run db:generate
+
+      # Produces `dist/` complete: bundle, `dist/package.json`, `npm install --omit=dev`, and
+      # only then the generated Prisma client. That order is the fix for the artefact that
+      # mounted perfectly and reported "0 functions found"; see the note in scripts/bundle.ts.
+      - run: npm run build --workspace=@switchback/ingest-worker
+
+      - name: Package
+        working-directory: apps/ingest-worker/dist
+        run: zip -qr "$RUNNER_TEMP/ingest-worker.zip" .
+
+      # **Loaded from an extracted copy of the zip, outside the repository.** The previous
+      # version of this step ran `require('./index.js')` in `apps/ingest-worker/dist`, which is
+      # inside the monorepo — so Node walked up to the workspace root's `node_modules` and
+      # resolved every external from there. It passed against an artefact whose
+      # `node_modules/@prisma/` was an empty directory. Nothing up the tree from `$RUNNER_TEMP`
+      # holds a `node_modules`, which the loop below asserts rather than assumes, so this can
+      # only resolve what the zip actually contains.
+      - name: Load the packaged entry point from outside the monorepo
+        run: |
+          rm -rf "$RUNNER_TEMP/verify"
+          mkdir -p "$RUNNER_TEMP/verify"
+          unzip -q "$RUNNER_TEMP/ingest-worker.zip" -d "$RUNNER_TEMP/verify"
+
+          dir="$RUNNER_TEMP/verify"
+          while [ "$dir" != "/" ]; do
+            parent=$(dirname "$dir")
+            if [ -d "$parent/node_modules" ]; then
+              echo "::error::$parent/node_modules could rescue a missing dependency — this check would prove nothing."
+              exit 1
+            fi
+            dir="$parent"
+          done
+
+          test -f "$RUNNER_TEMP/verify/node_modules/@prisma/client/package.json" || {
+            echo "::error::the zip has no @prisma/client — the bundle pruned it again."
+            exit 1
+          }
+
+          ls "$RUNNER_TEMP"/verify/node_modules/.prisma/client/libquery_engine-*.so.node >/dev/null || {
+            echo "::error::the zip has no Linux query engine — @prisma/client is present but cannot run."
+            exit 1
+          }
+
+          cd "$RUNNER_TEMP/verify"
+          node -e "require('./index.js'); console.log('worker entry point loaded from the zip')"
+
+          # `require` alone never asks Prisma for its engine, so a bundle carrying the wrong
+          # platform's binary would pass the line above and die on the worker's first query.
+          # `$connect` against a closed port loads the engine and then fails on the network,
+          # which is the one failure this step accepts.
+          node -e "
+            const { PrismaClient } = require('@prisma/client');
+            new PrismaClient({ datasources: { db: { url: 'postgresql://u:p@127.0.0.1:1/none' } } })
+              .\$connect()
+              .then(
+                () => { console.error('unexpected: connected to a closed port'); process.exit(1); },
+                (error) => {
+                  const message = String(error && error.message);
+                  if (/engine|\.so\.node|platform/i.test(message)) {
+                    console.error('::error::Prisma could not load its query engine from the zip');
+                    console.error(message);
+                    process.exit(1);
+                  }
+                  console.log('PrismaClient loaded its query engine from the zip');
+                },
+              );
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ingest-worker
+          path: ${{ runner.temp }}/ingest-worker.zip
+          retention-days: 14
+
   browser:
     name: browser suite
     # Nightly and on demand only — see the note at the top of this file.
@@ -268,8 +361,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # One commit of history, so the step below can ask what this push actually changed.
-          fetch-depth: 2
+          # Full history, because the step below compares against the commit master was at
+          # before this push. A shallow clone has that commit only when the push was one deep.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -278,27 +372,14 @@ jobs:
 
       - run: npm ci
 
-      # There are no migration files in this repository — `db push` reconciles the database
-      # to `schema.prisma` — so there is no filename to key off and the question has to be
-      # asked of the diff. Anything unreadable counts as changed: `db push` against a matching
-      # schema is a few seconds and a no-op, and `spatial.sql` is written `IF NOT EXISTS`
-      # throughout, so the cost of a false positive is nil and the cost of a false negative is
-      # a deployment whose code expects a column that is not there.
+      # `github.event.before`, not `HEAD^`: a push carries however many commits its merge
+      # strategy produced, and a rebase merge lands every commit of a pull request. `HEAD^ HEAD`
+      # would then see only the last of them and miss a schema change made in any other, which
+      # ships code expecting a column the database was never given. Logic and its cases are in
+      # `scripts/schema-changed.ts` and `test/schema-changed.test.ts`.
       - name: Did the schema change?
         id: schema
-        run: |
-          if ! git rev-parse HEAD^ >/dev/null 2>&1; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "No previous commit to compare against — running the push."
-            exit 0
-          fi
-          if git diff --name-only HEAD^ HEAD | grep -q '^packages/db/prisma/'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            git diff --name-only HEAD^ HEAD | grep '^packages/db/prisma/' | sed 's/^/  /'
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No change under packages/db/prisma — leaving production alone."
-          fi
+        run: npx tsx scripts/schema-changed.ts "${{ github.event.before }}" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
       - if: steps.schema.outputs.changed == 'true'
         uses: azure/login@v2

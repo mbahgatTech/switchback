@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { INGEST_ZOOM, MAX_INGEST_ZOOM } from '@switchback/geo';
 
 /**
  * The single server-side allowlist for environment variables, parsed once at module load so a
@@ -51,6 +52,54 @@ const base = z.object({
   CRON_SECRET: z.string().min(16).optional(),
 
   /**
+   * Which queue drives ingest. `postgres` drains inline and on the cron; `servicebus` publishes
+   * a wake-up signal per queued tile and leaves the drain to the Function App. Read at the point
+   * of use by `@switchback/ingest`'s `ingestQueueDriver`, which treats anything unrecognised as
+   * `postgres` — the enum here is what turns a typo into a startup error instead.
+   */
+  INGEST_QUEUE_DRIVER: z.enum(['postgres', 'servicebus']).default('postgres'),
+  /**
+   * Where and as whom to publish. All three are public identifiers, which is the point: the
+   * publisher authenticates with the deployment's Vercel OIDC token, exchanged for an Entra
+   * access token against a federated identity credential — there is no key to hold.
+   * `AZURE_CLIENT_ID` is the publisher managed identity's client id, not an app registration.
+   */
+  SERVICE_BUS_NAMESPACE: z.string().min(1).optional(),
+  AZURE_TENANT_ID: z.string().uuid().optional(),
+  AZURE_CLIENT_ID: z.string().uuid().optional(),
+  SERVICE_BUS_QUEUE: z.string().min(1).default('ingest-jobs'),
+
+  /**
+   * Overpass etiquette, read from `process.env` by `@switchback/ingest`'s own singleton rather
+   * than from here — so these two entries buy nothing but the startup error, which is the whole
+   * point. `getOverpass` falls back to a sane default on a mistyped value, and a fail-safe
+   * default is not the same as being told: `OVERPASS_MAX_CONCURRENT=two` silently halves nothing
+   * and doubles nothing, it just is not what the operator typed. Both are hand-set in the Vercel
+   * dashboard and the Azure portal, which is where typos come from.
+   */
+  OVERPASS_MAX_CONCURRENT: z.coerce.number().int().positive().optional(),
+  OVERPASS_MAX_TOTAL_MS: z.coerce.number().int().positive().optional(),
+
+  /**
+   * How ingest decides what a trail is, and how deep a dense tile may split. Declared here for
+   * the same reason as the two above — `@switchback/ingest` reads both from `process.env` itself
+   * and each defaults to off — but they matter more, because Vercel drains `ingest_jobs` whenever
+   * `INGEST_QUEUE_DRIVER` is `postgres`, which it is. Setting either on the Function App alone
+   * changes nothing about the process actually doing the work.
+   *
+   * The ceiling is inert without `INGEST_TRAIL_IDENTITY=claim`: `subdivideMaxZoom` clamps it to
+   * `INGEST_ZOOM` rather than refusing to start, because a fail-safe clamp beats taking the site
+   * down over a variable that only makes ingest slower when it is wrong.
+   */
+  INGEST_TRAIL_IDENTITY: z.enum(['claim', 'osm-id']).default('osm-id'),
+  INGEST_SUBDIVIDE_MAX_ZOOM: z.coerce
+    .number()
+    .int()
+    .min(INGEST_ZOOM)
+    .max(MAX_INGEST_ZOOM)
+    .optional(),
+
+  /**
    * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
    * so uploads work with no Cloudflare account. Filling in *some* of them is refused below.
    */
@@ -99,6 +148,23 @@ const schema = base.superRefine((env, ctx) => {
           code: z.ZodIssueCode.custom,
           path: [key],
           message: `${key} is required once any R2_* variable is set — a half-configured bucket falls back to local disk and loses every upload.`,
+        });
+      }
+    }
+  }
+
+  /*
+   * The flag on its own publishes nowhere: `publishIngestSignals` would log and give up, every
+   * tile falling to the once-a-day cron with nothing on the map saying so. Naming the variables
+   * at startup is the difference between a misconfiguration and a slow leak.
+   */
+  if (env.INGEST_QUEUE_DRIVER === 'servicebus') {
+    for (const key of ['SERVICE_BUS_NAMESPACE', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID'] as const) {
+      if (!env[key]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} is required when INGEST_QUEUE_DRIVER=servicebus — without it every queued tile is published nowhere.`,
         });
       }
     }

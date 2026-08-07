@@ -79,10 +79,10 @@
 //    storage account, `appi-switchback-ingest`, `func-switchback-ingest-37ywppu5p7fri` and its
 //    plan, and the two ingest alerts, plus the Smart Detection action group Application Insights
 //    creates for itself. `Ignore` is what an incremental deployment does to a resource it does
-//    not declare: it leaves it alone. **Seven of the eight are declared by no file in this
-//    repository** — they live in `infra/azure/ingest.bicep` on branch `feat/servicebus-ingest`
-//    and were deployed from there at resource-group scope. So a third of this resource group is
-//    outside the IaC on this branch until that branch merges.
+//    not declare: it leaves it alone. **Seven of the eight are declared by `infra/azure/
+//    ingest.bicep`**, which is deployed separately at resource-group scope, so this
+//    subscription-scope template neither declares nor disturbs them. The eighth, the Smart
+//    Detection action group, is declared by nothing and belongs to Application Insights.
 //
 // Creating the server, or rotating the credential on purpose:
 //
