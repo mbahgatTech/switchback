@@ -1,0 +1,97 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
+import { QUEUE_DISTRESS_MARKER } from '@switchback/ingest';
+import type { PrismaClient } from '@switchback/db';
+import { reportQueueHealth } from '../src/health';
+
+const here = fileURLToPath(new URL('.', import.meta.url));
+
+/** Counts returned in the order `queueHealth` asks for them. */
+function fakeDb(counts: number[]): PrismaClient {
+  let call = 0;
+  const next = async () => counts[call++] ?? 0;
+  return {
+    ingestJob: { count: next },
+    ingestTile: { count: next },
+  } as unknown as PrismaClient;
+}
+
+function silentLog() {
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+}
+
+describe('the queue health report', () => {
+  it('logs the marker, with the counts, when the queue is in distress', async () => {
+    const log = silentLog();
+
+    await reportQueueHealth(fakeDb([17, 10, 0, 6, 0]), log);
+
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    const [line] = log.warn.mock.calls[0] as [string];
+    expect(line).toContain(QUEUE_DISTRESS_MARKER);
+    expect(line).toContain('dead=17');
+    expect(line).toContain('staleLeases=10');
+    expect(line).toContain('orphanedSplits=6');
+  });
+
+  it('says nothing when the queue is clean', async () => {
+    const log = silentLog();
+
+    await reportQueueHealth(fakeDb([0, 0, 0, 0, 0]), log);
+
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('survives a database it cannot read, because the pump hangs off it', async () => {
+    const log = silentLog();
+    const broken = {
+      ingestJob: {
+        count: async () => {
+          throw new Error('terminating connection due to administrator command');
+        },
+      },
+      ingestTile: { count: async () => 0 },
+    } as unknown as PrismaClient;
+
+    await expect(reportQueueHealth(broken, log)).resolves.toBeNull();
+    expect(log.error).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The alert cannot be read by the code and the code cannot be read by the alert, so the token
+ * between them is asserted here. Without this a reworded log line disarms
+ * `switchback-ingest-queue-distress` silently, which is the failure the rule beside it was
+ * created for in the first place.
+ */
+describe('the alert that watches it', () => {
+  const bicep = readFileSync(resolve(here, '../../../infra/azure/ingest.bicep'), 'utf8');
+
+  it('queries the marker the code logs', () => {
+    expect(bicep).toContain(`traces | where message has "${QUEUE_DISTRESS_MARKER}"`);
+  });
+
+  it('is declared, enabled and pointed at the action group', () => {
+    expect(bicep).toContain(`name: '${QUEUE_DISTRESS_MARKER}'`);
+    expect(bicep).toMatch(/switchback-ingest-queue-distress'\n[\s\S]{0,600}?enabled: true/);
+  });
+});
+
+/**
+ * `ingestPump` is the only process inside the alert's scope that runs on a schedule, and it
+ * returns early unless `INGEST_QUEUE_DRIVER` is `servicebus` — which production is not. The report
+ * has to be ahead of that guard or it never runs on the configuration that needs it.
+ */
+describe('where the report is called from', () => {
+  const pump = readFileSync(resolve(here, '../src/functions/pump.ts'), 'utf8');
+
+  it('runs before the driver guard returns', () => {
+    const reported = pump.indexOf('reportQueueHealth(backgroundPrisma');
+    const guard = pump.indexOf("ingestQueueDriver() !== 'servicebus'");
+    expect(reported).toBeGreaterThan(-1);
+    expect(guard).toBeGreaterThan(-1);
+    expect(reported).toBeLessThan(guard);
+  });
+});

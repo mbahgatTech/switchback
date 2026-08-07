@@ -1,5 +1,6 @@
-import { drainIngest, pruneFinishedJobs, reclaimExpiredJobs } from '@switchback/ingest';
-import type { DrainResult } from '@switchback/ingest';
+import { randomUUID } from 'node:crypto';
+import { drainIngest, drainSlotGate, pruneFinishedJobs, sweepQueue } from '@switchback/ingest';
+import type { DrainResult, SweepResult as QueueSweep } from '@switchback/ingest';
 import { pruneExpiredAuthRequests } from '@switchback/api/mobile-auth';
 import { pruneExpiredRefreshTokens } from '@switchback/api/tokens';
 import { type OverdueSweep, sweepOverdueLifelines } from '@switchback/api/lifeline';
@@ -109,36 +110,50 @@ async function sweepFinishedJobs(): Promise<{ done: number; failed: number } | n
 }
 
 /**
- * The drain half of this route, or its replacement when the worker owns ingest.
+ * The drain half of this route, or nothing when the worker owns ingest.
  *
  * On `servicebus` this must not call `drainIngest`: Vercel making Overpass requests alongside the
  * worker is exactly what breaks the two-concurrent guarantee the Function App's scale limit buys.
- * But reclaim only runs *inside* `drainJobs`, so skipping the drain would silently take lease
- * recovery with it — the failure #163 was about. Hence the direct call: no Overpass, still swept.
+ * Lease recovery does not ride along with the decision any more — `sweepQueue` runs beside this,
+ * on both drivers, and `GET` counts what it did.
  */
-async function drainOrReclaim(): Promise<DrainResult> {
-  if (env.INGEST_QUEUE_DRIVER !== 'servicebus') {
-    return drainIngest({
-      limit: BATCH,
-      derivedLimit: DERIVED_BATCH,
-      workerId: 'cron',
-      // Subdivision's only voice. Without it a tile that defers to four children is
-      // indistinguishable in the log from one that ingested — see `TILE_SPLIT_MARKER`.
-      deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
-    });
-  }
+async function drainIfOwned(): Promise<DrainResult> {
+  if (env.INGEST_QUEUE_DRIVER === 'servicebus') return IDLE_DRAIN;
 
-  const { requeued, retired } = await reclaimExpiredJobs(prisma);
-  return {
-    claimed: 0,
-    succeeded: 0,
-    failed: 0,
-    deferred: 0,
-    lost: 0,
-    derived: 0,
-    requeued,
-    retired,
-  };
+  return drainIngest({
+    limit: BATCH,
+    derivedLimit: DERIVED_BATCH,
+    // Unique per invocation, because `drainSlotGate` counts drainers by distinct `lockedBy` and
+    // the fixed string `cron` would have collided with any other tick still holding work.
+    workerId: `cron-${randomUUID().slice(0, 8)}`,
+    gate: drainSlotGate(),
+    // Subdivision's only voice. Without it a tile that defers to four children is
+    // indistinguishable in the log from one that ingested — see `TILE_SPLIT_MARKER`.
+    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
+  });
+}
+
+/** What a tick that drained nothing reports. The sweep's counts are reported separately. */
+const IDLE_DRAIN: DrainResult = {
+  claimed: 0,
+  succeeded: 0,
+  failed: 0,
+  deferred: 0,
+  lost: 0,
+  derived: 0,
+  requeued: 0,
+  retired: 0,
+};
+
+/**
+ * Take back expired leases and clear orphaned split markers, whatever the drain decided.
+ *
+ * Its own call rather than a step inside the drain: this tick's own claims die with it on the
+ * 60 s wall clock, and while reclaim lived inside `drainJobs` the only thing that could take
+ * them back was the next drain — the following day.
+ */
+async function sweepIngestQueue(): Promise<QueueSweep> {
+  return sweepQueue(prisma);
 }
 
 export async function GET(req: Request): Promise<Response> {
@@ -150,8 +165,14 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const started = Date.now();
+
+  // Before the drain, not beside it: both take back expired leases, and the gate does it inside
+  // the transaction that decides admission. Serialising them keeps two writers off the same rows
+  // and lets the drain see a queue that has already been swept.
+  const sweep = await sweepIngestQueue();
+
   const [result, swept, orphans, lifelines, jobs] = await Promise.all([
-    drainOrReclaim(),
+    drainIfOwned(),
     sweepCredentials(),
     sweepOrphans(),
     sweepLifelines(),
@@ -175,12 +196,22 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
-  // A dead worker's jobs, taken back and either requeued or finally buried. Worth a line each
-  // time: `requeued` is how many function invocations died holding work, and a `retired` job is
-  // one that has now killed its worker repeatedly and will not be tried again.
-  if (result.requeued > 0 || result.retired > 0) {
+  // A dead worker's jobs, taken back and either requeued or finally buried. Counted across both
+  // the standalone sweep and the drain's own, because either may be the one that reached them:
+  // `requeued` is how many function invocations died holding work, and a `retired` job is one
+  // that has now killed its worker repeatedly and will not be tried again.
+  const requeued = sweep.requeued + result.requeued;
+  const retired = sweep.retired + result.retired;
+  if (requeued > 0 || retired > 0) {
+    console.warn(`ingest drain: reclaimed ${requeued} expired lease(s), retired ${retired}`);
+  }
+
+  // Parents that claimed a subdivision which produced nothing, put back on the queue. Named one
+  // by one: six of these have sat in production since 2026-08-05 with no route out.
+  if (sweep.unsplit.length > 0) {
     console.warn(
-      `ingest drain: reclaimed ${result.requeued} expired lease(s), retired ${result.retired}`,
+      `ingest drain: cleared ${sweep.unsplit.length} orphaned split marker(s): ` +
+        sweep.unsplit.map((repair) => repair.quadkey).join(', '),
     );
   }
 
@@ -199,5 +230,5 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
-  return Response.json({ ...result, swept, orphans, lifelines, jobs, durationMs });
+  return Response.json({ ...result, sweep, swept, orphans, lifelines, jobs, durationMs });
 }

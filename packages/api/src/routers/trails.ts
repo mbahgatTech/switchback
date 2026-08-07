@@ -4,6 +4,7 @@
  * Lazy ingest and the indexed-bbox viewport predicate are in `docs/architecture.md`.
  */
 
+import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import {
@@ -26,7 +27,9 @@ import type {
 import { Prisma, trailIdsNear } from '@switchback/db';
 import { encodeBase64, toFitCourse, toRouteGpx } from '@switchback/geo';
 import {
+  createThrottledSweep,
   drainIngest,
+  drainSlotGate,
   ensureCoverage,
   ingestQueueDriver,
   publishIngestSignals,
@@ -381,21 +384,42 @@ async function surveyIfWide(ctx: Context, bbox: BBox, coverage: CoverageResult) 
 }
 
 /**
- * The process's one inline drain. Module state is the right scope: it guards this process's
- * Overpass concurrency, and what keeps separate instances from duplicating work is the lock in
- * Postgres. `coverage.queued` reports every outstanding tile rather than only newly enqueued
- * ones, so without the serialisation every poll would start another drain.
+ * This lambda's name on the queue. Random per process, because `drainSlotGate` counts drainers
+ * with `count(distinct "lockedBy")` — the fixed string `inline` made a fleet of any size read as
+ * one drainer, which is the bound it is there to enforce.
+ */
+const INLINE_WORKER_ID = `inline-${randomUUID().slice(0, 8)}`;
+
+/**
+ * The process's one inline drain. Module state is the right scope for the *serialisation*: it
+ * keeps this process from starting a second drain on every poll, since `coverage.queued` reports
+ * every outstanding tile rather than only newly enqueued ones.
+ *
+ * It is not the Overpass bound, and treating it as one is what left Vercel unbounded. Each lambda
+ * has its own module state and its own `OverpassClient`, so the fleet's concurrency was
+ * instances × `OVERPASS_MAX_CONCURRENT`. `drainSlotGate` is the bound that crosses processes.
  */
 const inlineDrain = createInlineDrain((keys) =>
   drainIngest({
     limit: Math.min(keys.length, MAX_INLINE_DRAIN),
-    workerId: 'inline',
+    workerId: INLINE_WORKER_ID,
     dedupeKeys: keys,
+    gate: drainSlotGate(),
     // Vercel has no Application Insights, so `TILE_SPLIT_MARKER` and `SUBTREE_STUCK_MARKER`
-    // would go nowhere on the drainer that is actually running. Console is where they land.
+    // would go nowhere on the drainer that is actually running. Console is where they land, and
+    // `queueHealth` is what makes the same distress reach an alert.
     deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
   }),
 );
+
+/**
+ * Lease recovery and split-marker repair, hung off request traffic rather than off a drain.
+ *
+ * Throttled to one sweep per `SWEEP_INTERVAL_MS` per process — see `createThrottledSweep`. It has
+ * to be here rather than inside `kickIngest`'s work: a viewport with nothing outstanding queues
+ * nothing and drains nothing, and those are exactly the hours in which a dead worker's leases sat.
+ */
+const sweepIngestQueue = createThrottledSweep();
 
 /**
  * Start the queued work now, if the platform will let us. An optimisation over the cron,
@@ -417,7 +441,15 @@ const inlineDrain = createInlineDrain((keys) =>
  * nothing else.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil || queued.length === 0) return;
+  if (!ctx.waitUntil) return;
+
+  // Before the early return below, deliberately: the sweep's whole point is that it happens on
+  // ticks that drain nothing.
+  const sweep = sweepIngestQueue();
+  if (sweep)
+    ctx.waitUntil(sweep.catch((error: unknown) => console.warn('queue sweep failed', error)));
+
+  if (queued.length === 0) return;
 
   if (ingestQueueDriver() === 'servicebus') {
     // Not gated on `inlineDrain`: that scheduler bounds this process's Overpass concurrency, and

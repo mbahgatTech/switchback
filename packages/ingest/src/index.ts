@@ -16,6 +16,8 @@ export * from './backpressure';
 export * from './pool';
 export * from './subdivide';
 export * from './coverage';
+export * from './drain-slot';
+export * from './maintenance';
 export * from './pipeline';
 export * from './publish';
 export * from './network';

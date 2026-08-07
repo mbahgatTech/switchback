@@ -73,14 +73,16 @@ function inlineEvals(): Invocation[] {
 }
 
 /** Run a workflow fragment through the shell that would run it, with nothing to reach. */
-function runFragment(command: string, env: NodeJS.ProcessEnv): ReturnType<typeof spawnSync> {
-  return spawnSync('bash', ['-c', command], {
+function runFragment(command: string, env: NodeJS.ProcessEnv): { output: string; status: number } {
+  const result = spawnSync('bash', ['-c', command], {
     cwd: repoRoot,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 60_000,
     env,
   });
+  if (result.error) throw result.error;
+  return { output: `${result.stdout}${result.stderr}`, status: result.status ?? -1 };
 }
 
 /** The ambient environment minus anything that would let a fragment reach a real service. */
@@ -103,9 +105,7 @@ describe('every inline eval a workflow runs', () => {
   it.each(evals.map((invocation, index) => ({ ...invocation, index })))(
     '$workflow › $step ($index) starts',
     ({ command }) => {
-      const result = runFragment(command, sandboxEnv());
-      expect(result.error, String(result.error)).toBeUndefined();
-      expect(`${result.stdout}${result.stderr}`).toContain(STARTED);
+      expect(runFragment(command, sandboxEnv()).output).toContain(STARTED);
     },
   );
 });
@@ -130,12 +130,10 @@ function administratorProbe(): Invocation {
 
 describe('the administrator probe the migrate job runs', () => {
   it('executes, and says which variable it wanted', () => {
-    const probe = administratorProbe();
-    const result = runFragment(probe.command, sandboxEnv());
-    const output = `${result.stdout}${result.stderr}`;
+    const { output, status } = runFragment(administratorProbe().command, sandboxEnv());
 
     // Its own first branch, reached: proof the probe ran rather than failing in the transform.
     expect(output).toContain('DIRECT_DATABASE_URL is not set');
-    expect(result.status).toBe(1);
+    expect(status).toBe(1);
   });
 });

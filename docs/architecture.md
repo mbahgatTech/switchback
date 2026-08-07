@@ -134,9 +134,30 @@ Unset or `postgres` is the original path, unchanged. On `servicebus` the request
 worker drains one job per message. `ingest_jobs` stays the queue of record either way — a message
 names work, it never carries it, so a lost message costs a wait rather than a tile. A timer pump in
 the worker re-derives the runnable head of `ingest_jobs` every two minutes and tops the queue back
-up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker. The cron still runs
-on `servicebus`, but calls `reclaimExpiredJobs` directly instead of draining: lease recovery lives
-inside `drainJobs`, so skipping the drain would otherwise take it too.
+up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker. The cron runs on
+either driver and drains on neither by accident: it sweeps first and drains only when this side owns
+the queue.
+
+**Lease recovery does not depend on a drain happening.** It used to: `reclaimExpiredJobs` ran only
+inside `drainJobs`, and a drain is a side effect of traffic on cold ground plus a cron that Hobby
+allows to fire once a day. So a cron tick that claimed ten jobs at 04:51 UTC on 2026-08-07, then
+died on Vercel's 60 s wall clock still holding them, left ten leases 5.9 h old against a 30-minute
+lease — four of them at their last attempt, so the next reclaim would have buried them.
+`sweepQueue` in `packages/ingest/src/maintenance.ts` is that reclaim plus the split-marker repair
+below, run from three places that do not require a drain: the cron route unconditionally,
+`trails.kickIngest` off any request traffic at most once per fifteen minutes per process, and
+`drainSlotGate` inside the transaction that admits a drainer.
+
+**A split that produced no children leaves a parent claiming it was subdivided.** `splitTile`
+upserts four child rows, enqueues four jobs and then marks the parent; a process that dies between
+the first step and the last leaves the marker with nothing behind it, and nothing else repairs that
+— `promoteFrom` needs four children to read, `queueStaleChildren` needs children to queue, and
+`processTile` only reaches its roll-up branch when `childTiles` returns four. Six such rows are in
+production, written 2026-08-05 21:03 to 2026-08-06 00:54 UTC, with no z10 rows anywhere in the
+table. `reconcileOrphanedSplits` clears the marker and re-queues the parent, writing `status` and
+`lastError` and nothing else: `trailCount`, `fetchedAt`, `fetchMs` and every trail the tile ever
+produced are untouched, and a parent still serving trails keeps the status it is serving them
+under. The predicate is the marker the repair removes, so a second pass finds nothing.
 
 **Turning it on. The order is the mirror of the rollback below, and it matters for the same
 reason.** Vercel first, worker last:
@@ -235,29 +256,63 @@ the `ingest_jobs` rows were written before the publish, so an Entra or Service B
 wake-up and the pump re-derives the same rows within two minutes. A broker outage must not empty the
 map, and it cannot.
 
-**Two concurrent Overpass requests per host instance, and no scale-out.** `packages/ingest/src/overpass.ts`
-serializes at 2 because Overpass allots slots per client IP, and Consumption auto-scaling fights that
-directly. The chain is `functionAppScaleLimit: 1` and `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1`
-for one host instance, `FUNCTIONS_WORKER_PROCESS_COUNT: 1` for one Node process, one module-level
-`OverpassClient` in that process, and `OVERPASS_MAX_CONCURRENT: 2` inside it — all declared in
-`infra/azure/ingest.bicep`. The queue sets `requiresSession: false` so session count is not a second
-multiplier. The other half is that Vercel fetches nothing: **three** call sites reach Overpass from a
-Vercel process — the drain cron, `trails.kickIngest` and `routes.kickNetwork` — and all three are
-gated on the flag. `kickNetwork` was the one missed; it drained `ingest_network` inline from a public
-procedure the planner fires on every viewport settle, and since the pump publishes that kind too, it
-had two drainers.
+**Two concurrent Overpass requests, fleet-wide, and `packages/ingest/src/drain-slot.ts` is what
+makes that true.** This paragraph is the one statement of the bound; everything else that quotes a
+number points here.
 
-**"Vercel fetches nothing" is per Vercel environment, not per deployment.** Production and Preview
-hold `INGEST_QUEUE_DRIVER` independently, and both point at the production database, so an
-environment left on `postgres` is a second drainer against the same `ingest_jobs` — with its own
-`OverpassClient` on every warm lambda. That is not a hypothetical: measured at 2026-08-03T23:26Z,
-Production read `postgres` and Preview had no `INGEST_QUEUE_DRIVER` at all (17 variables, and it
-was not among them), which `ingestQueueDriver()` resolves to `postgres` — so the flag-on ceiling at
-that moment was 2 from Azure **plus 2 per warm Vercel lambda in each environment**, not 2. Both are
-now set explicitly, to `servicebus`, and `vercel env ls <environment>` is how you check rather than
-assume. The residue is branches cut before this flag existed: their code has no `ingestQueueDriver`
-call to make, so their previews drain inline whatever the environment says, until they rebase onto
-master.
+Overpass allots slots per client IP and exceeding the allowance gets the IP blocked, which takes
+ingest down for the product rather than for one job. So the bound is a correctness requirement, and
+it is the product of two factors:
+
+| Factor                                 | Value | Enforced by                                                            |
+| -------------------------------------- | ----- | ---------------------------------------------------------------------- |
+| Processes holding Overpass-making work | 1     | `INGEST_MAX_DRAINERS`, via a Postgres advisory lock in `drainSlotGate` |
+| Requests in flight per process         | 2     | `OVERPASS_MAX_CONCURRENT`, inside one module-level `OverpassClient`    |
+| **Concurrent Overpass requests**       | **2** |                                                                        |
+
+The second factor alone was the whole argument until now, and it bounds a _process_. On the Function
+App that is the fleet — `functionAppScaleLimit: 1` and
+`WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT: 1` give one host instance,
+`FUNCTIONS_WORKER_PROCESS_COUNT: 1` one Node process, and `getOverpass()` one client inside it, all
+declared in `infra/azure/ingest.bicep`. On Vercel it is one lambda. The platform starts as many
+lambdas as the traffic asks for, each with its own module scope and its own client, and they share
+one egress IP — so a per-process singleton bounded a fraction of the drainer and nothing bounded the
+fleet. `packages/ingest/src/config.ts` had said as much since it was written: _two clients at
+`maxConcurrent: 2` are one client at 4_.
+
+**Vercel is the drainer that runs.** `INGEST_QUEUE_DRIVER` is `postgres` in production, the Function
+App's own log says `INGEST_QUEUE_DRIVER is not servicebus → Postgres owns the drain`, and
+`ingestDrain` has zero invocations. The Azure clamp above therefore bounds a process that performs
+no Overpass work. The first factor is what bounds the one that does.
+
+The first factor is enforced where it has to be — across processes, in the database.
+`drainSlotGate` takes `pg_advisory_xact_lock`, reclaims expired leases, counts
+`count(distinct "lockedBy")` over `running` jobs, and claims, all in one transaction. Check and
+claim cannot be two statements: under `READ COMMITTED` two lambdas both read "nobody is draining"
+before either commits. Every caller passes a `workerId` unique to its process, because a fleet
+sharing the string `inline` counts as one drainer however many lambdas are running.
+
+The cost is honest and deliberate: a drainer that dies holding claims keeps the slot shut until its
+lease expires. That is why the gate sweeps inside its own transaction, and why `sweepQueue` runs off
+request traffic as well — `LEASE_TIMEOUT_MS`, not a day. Throughput is the thing traded, and an IP
+block is the thing bought off.
+
+The queue sets `requiresSession: false` so session count is not a third multiplier. Around a
+Consumption instance replacement two host instances of the worker are briefly alive at once, so the
+worker's own contribution can reach 4 for the seconds of a recycle — measured, and recorded under
+the clamp section of `infra/azure/ingest.bicep`.
+
+**"Vercel fetches nothing" was only ever a statement about `INGEST_QUEUE_DRIVER=servicebus`, and it
+is per Vercel environment rather than per deployment.** Production and Preview hold the flag
+independently and both point at the production database, so an environment left on `postgres` is a
+second drainer against the same `ingest_jobs`. Measured at 2026-08-03T23:26Z, Production read
+`postgres` and Preview had no `INGEST_QUEUE_DRIVER` at all (17 variables, and it was not among
+them), which `ingestQueueDriver()` resolves to `postgres`. Both are now set explicitly, and
+`vercel env ls <environment>` is how you check rather than assume. Under the drain slot a second
+environment no longer multiplies the bound — it contends for the same slot against the same
+database — but it does halve the drain rate, so it is still worth knowing. The residue is branches
+cut before the flag existed: their code has no `ingestQueueDriver` call to make, and none has a
+`drainSlotGate` either, so their previews drain inline and unbounded until they rebase onto master.
 
 **The client's retry budget has to fit inside `functionTimeout` — and fitting it is not enough.**
 Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
@@ -305,6 +360,23 @@ rule now unions the request arm with a `traces` arm keyed on the literal `ingest
 deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code and the template still
 agree on it. Severity 2, onto the same action group, `autoMitigate: false` — the condition is "this
 happened", not "this is happening".
+
+**Every arm of that rule reads telemetry the Function App emits, and the Function App is not the
+drainer.** `INGEST_QUEUE_DRIVER` is `postgres`, its own log says `INGEST_QUEUE_DRIVER is not
+servicebus — Postgres owns the drain`, and `ingestDrain` has zero invocations. The drain runs on
+Vercel, which has no Application Insights, so a split marker, a stuck-subtree marker and a 429 from
+a mirror all reach a console with no rule able to query it. "No 429s observed" was a statement about
+what could be seen.
+
+What closes that is `switchback-ingest-queue-distress`. Every one of those conditions is a row —
+a `dead` job, a lease past `LEASE_TIMEOUT_MS`, a `lastError` naming a 429, a tile carrying a split
+marker with no children, a subtree marked stuck — and `ingestPump` runs inside the alert's own
+subscription every two minutes and already reads that database. `apps/ingest-worker/src/health.ts`
+counts the five and logs the token when any is non-zero, ahead of the pump's `INGEST_QUEUE_DRIVER`
+guard, because `postgres` is exactly the setting under which it matters.
+`apps/ingest-worker/test/health.test.ts` asserts the token, the query and that ordering. Severity 3
+and `autoMitigate: true`, unlike the rule above: this is a gauge re-read every two minutes, so a
+queue that has been repaired should clear it rather than leave a resolved condition open.
 
 **What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
 plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
@@ -1270,6 +1342,30 @@ only `disable`/`prefer`/`require` for that key. In `password` mode Prisma still 
 `sslmode=verify-full` alone — a key it reads at a value it does not recognise, which leaves it at
 the default — so until a consumer moves its TLS is unverified. Measured against Prisma 6.19.3 and
 node-postgres 8.22.0; the full matrix is at the foot of `infra/azure/postgres.bicep`.
+
+**Two data conditions are open, both measured against production on 2026-08-07.**
+
+`trail_ways` and `trail_slug_aliases` do not exist. The schema has never been pushed, because the
+migrate job's administrator probe could not run — see the note under `scripts/assert-pg-admin.ts` —
+so `db push` was unreachable and no deploy has carried a schema since. Every claim-identity read is
+already gated on `INGEST_TRAIL_IDENTITY`, which is `osm-id`, so nothing reaches the absent tables.
+
+**102 groups — 204 trail rows — share byte-identical geometry**, by `md5(st_asbinary(geom))`, and 85
+of those pairs are a relation against a way. Kibbie Lake Trail is one: way `162652736` and relation
+`19086356`, same hash, same 634 points, same 13,472.3 m, two live slugs both serving 200. This is
+exactly the duplication claim identity exists to prevent, and it predates that work — the rows were
+written under `(osmType, osmId)` upserts, which cannot see that two ids describe one trail. Turning
+`INGEST_TRAIL_IDENTITY` to `claim` stops new pairs; it does not merge the existing ones, which needs
+a backfill that picks a winner per hash, moves user content onto it and retires the loser's slug
+through `trail_slug_aliases`. Neither table exists yet, so the backfill is blocked on the schema
+push, which is blocked on the deploy.
+
+`INGEST_TRAIL_IDENTITY` is also drifted: `infra/azure/ingest.bicep` declares it and
+`az functionapp config appsettings list` returned 26 settings on 2026-08-07 without it. The effect
+is nil — `packages/ingest/src/identity.ts` returns `osm-id` for anything that is not exactly
+`claim`, and an absent variable is not — and the next deployment of that template closes it. No
+report may describe that value as measured from deployed configuration; the two that did were
+unsupported.
 
 ## Design decisions, recorded once
 
