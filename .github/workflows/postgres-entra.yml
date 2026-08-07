@@ -69,8 +69,9 @@ jobs:
   # ---------------------------------------------------------------------------------------
   # The break-glass path, and the only read-only one that needs no password.
   #
-  # infra/azure/README.md sends an operator here when the local network path to 5432 is dead,
-  # which is the state the owner's workstation is permanently in. It must therefore never
+  # infra/azure/README.md sends an operator here when the local path to 5432 will not work,
+  # usually because ProtonVPN is connected. The owner's own machine is the faster door and does
+  # reach the server; this is the one that works from anywhere. It must therefore never
   # acquire a stored credential: everything below authenticates with the federated token.
   # ---------------------------------------------------------------------------------------
   inspect:

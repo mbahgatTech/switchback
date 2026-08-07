@@ -210,8 +210,9 @@ people's memory.
 ### Who trusts whom
 
 Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
-Dashed edges still carry a stored password. There are three of them, and one — `sbadmin` — holds
-full DDL.
+Dashed edges are not. Two of the three carry the stored `sbapp` password; the third is a move not
+yet made and carries no credential at all. `sbadmin`, which holds full DDL, is not drawn: it
+reaches this server by password too, but the secret holding that password has no consumer left.
 
 ```mermaid
 graph LR
@@ -223,7 +224,6 @@ graph LR
     VERCEL[Vercel functions<br/>production and preview]
     FUNC[Function App<br/>system-assigned identity]
     RUNTIME[id-switchback-vercel-publisher<br/>shared runtime identity]
-    GHA[GitHub Actions<br/>ci.yml deploy]
     CI[GitHub Actions<br/>id-switchback-postgres-ci]
     SP[Deploying service principal]
   end
@@ -458,9 +458,10 @@ The URL is split into discrete fields rather than passed through as `connectionS
 not a style choice. `pg` merges a parsed connection string **over** the explicit config, so a URL
 carrying no password replaces the password callback with `null` — every connection would then
 authenticate with nothing and the token would never be requested. Measured on `pg` 8.22.0 and
-asserted in both directions. Splitting it also means `sslmode` is finally read: the deployed URLs
-have carried `verify-full` all along and Prisma ignores parameters it does not recognise, so under
-the adapter it becomes a real `rejectUnauthorized` plus hostname check for the first time.
+asserted in both directions. Splitting it also means `sslmode` is finally honoured: the deployed
+URLs have carried `verify-full` all along, but Prisma's engines understand only
+`disable`/`prefer`/`require` for that key, so the value leaves them at their default. Under the
+adapter it becomes a real `rejectUnauthorized` plus hostname check for the first time.
 
 **Where each consumer's token comes from.** `DATABASE_AUTH=entra` uses `DefaultAzureCredential`,
 which covers the Function App's managed identity, a workload identity and an operator's `az login`
@@ -628,8 +629,9 @@ Under `DATABASE_AUTH=entra` the pool is given a real `rejectUnauthorized` and ho
 CI's schema push gets `sslaccept=strict` alongside `sslmode=verify-full` from
 `.github/scripts/pg-token-url.sh` — both parameters, because the two readers honour different
 ones. `sslaccept=strict` is Prisma's half and is what verifies the chain and the hostname;
-`sslmode=verify-full` is libpq's, and is inert for Prisma, whose engines understand only
-`disable`/`prefer`/`require` for that key. In `password` mode Prisma still receives
+`sslmode=verify-full` is node-postgres's — the `pg.Client` that proves the token in the same job
+reads it and verifies chain and hostname on it — and is inert for Prisma, whose engines understand
+only `disable`/`prefer`/`require` for that key. In `password` mode Prisma still receives
 `sslmode=verify-full` alone — a key it reads at a value it does not recognise, which leaves it at
 the default — so until a consumer moves its TLS is unverified. Measured against Prisma 6.19.3 and
 node-postgres 8.22.0; the full matrix is at the foot of `infra/azure/postgres.bicep`.

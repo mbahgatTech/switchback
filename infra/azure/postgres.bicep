@@ -740,10 +740,10 @@ output pooledPort int = pooledPort
 // should be assumed to be in the same state. Closing this means rewriting those settings to
 // carry both parameters and re-reading them; it is listed in infra/azure/README.md.
 //
-// The migration workflow's preflight asserts this rather than assuming it — it connects with
+// `Postgres identity` → `inspect` asserts this rather than assuming it — it connects with
 // PGSSLMODE=verify-full and prints pg_stat_ssl, and a connection that could not verify the
-// chain fails there, from a runner, before any data moves. That covers libpq, which is what
-// the workflow uses; it says nothing about the Prisma clients above.
+// chain fails there, from a runner, before anything else in that job runs. That covers libpq,
+// which is what the workflow uses; it says nothing about the Prisma clients above.
 // ---------------------------------------------------------------------------------------
 //
 // Deliberately no `connection_limit` on either template. It looks like a sensible thing to

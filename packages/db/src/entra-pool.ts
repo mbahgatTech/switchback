@@ -18,8 +18,8 @@ export interface EntraPoolOptions {
 /**
  * `sslmode` as libpq spells it, mapped onto what `pg` accepts.
  *
- * Prisma silently ignores connection parameters it does not recognise, so the `verify-full`
- * already in the deployed URLs has never actually been enforced. Here it is read.
+ * Prisma's engines read `sslmode` but understand only `disable`/`prefer`/`require`, so the
+ * `verify-full` already in the deployed URLs leaves them at their default. Here it is honoured.
  */
 function tlsFor(sslmode: string | null, host: string): PoolConfig['ssl'] {
   switch (sslmode) {

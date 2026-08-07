@@ -323,9 +323,10 @@ the session down above TCP, which reads as unreachability and is not. So a raise
 a client can be told apart from a firewall or credential failure, and rolled back, from a
 second door.
 
-What is still missing is a measurement from the runtime that matters. The migration workflow
-prints the negotiated TLS version from a runner; raise this to TLSv1.3 once that output says
-1.3 and a Vercel deployment has been shown to connect, with evidence rather than optimism.
+What is still missing is a measurement from the runtime that matters. `Postgres identity` →
+`inspect` in .github/workflows/postgres-entra.yml reads `pg_stat_ssl` and prints the negotiated
+version and cipher from a runner; raise this to TLSv1.3 once that output says 1.3 and a Vercel
+deployment has been shown to connect, with evidence rather than optimism.
 ''')
 @allowed([
   'TLSv1.2'

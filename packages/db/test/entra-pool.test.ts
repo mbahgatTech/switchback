@@ -39,7 +39,7 @@ describe('entraPoolConfig', () => {
     ).toThrow(/carries a password/);
   });
 
-  it('reads sslmode, which Prisma silently ignored', () => {
+  it('maps sslmode onto real certificate verification', () => {
     const verify = entraPoolConfig(URL_WITHOUT_PASSWORD, { ...sizing, password });
     expect(verify.ssl).toEqual({
       rejectUnauthorized: true,

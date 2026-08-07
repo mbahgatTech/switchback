@@ -19,14 +19,17 @@ echo "::add-mask::$_token"
 _encoded="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read().strip(), safe=""))' <<< "$_token")"
 echo "::add-mask::$_encoded"
 
-# Both TLS parameters, because the two readers of this string honour different ones. Prisma —
-# `db push` and `apply-spatial.ts`, the only consumers here — reads `sslaccept`, and
-# `sslaccept=strict` is what makes it verify the server certificate: chain against the platform
-# trust store, and hostname. It does read `sslmode`, but only understands disable/prefer/require;
-# `verify-full` is not a value it recognises, so that half is inert for Prisma and present for
-# libpq, which needs it and rejects `sslaccept`. Neither parameter makes TLS mandatory for
-# Prisma — `require_secure_transport = ON` on the server does. See the measurement in
-# infra/azure/postgres.bicep.
+# Both TLS parameters, because the two readers of this string honour different ones. Three
+# consumers read it, all in ci.yml: a node-postgres `pg.Client`, `prisma db push`, and
+# `apply-spatial.ts`, which builds a `PrismaClient`. No libpq process reads this URL — the
+# libpq callers elsewhere are driven by PG* variables and PGSSLROOTCERT.
+#
+# Prisma's engines read `sslmode` but understand only disable/prefer/require, so `verify-full`
+# leaves them at their default; `sslaccept=strict` is the key they verify on, and it is chain
+# plus hostname. node-postgres is the mirror image: `verify-full` makes it verify chain and
+# hostname, and it ignores `sslaccept` entirely, sending no SSLRequest when that is all it is
+# given. Neither parameter makes TLS mandatory for a Prisma engine — `require_secure_transport
+# = ON` on the server does. See the measurement in infra/azure/postgres.bicep.
 _url="postgresql://${PGUSER}:${_encoded}@${PGHOST}:5432/${PGDATABASE}?sslmode=verify-full&sslaccept=strict"
 echo "::add-mask::$_url"
 

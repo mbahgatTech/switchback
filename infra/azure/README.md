@@ -30,13 +30,12 @@ flowchart LR
   It now lives in **two** verified places: `~/.switchback/pg-sbadmin-password` on the owner's
   machine, readable only by the owner (`LOQ\mazen:(R,W)`, inheritance stripped), and the
   `DIRECT_DATABASE_URL` repository secret. **Nothing reads that secret any more** — the `migrate`
-  job mints an Entra token instead,
-  and the backup workflow it also fed has been deleted — so it is now a stored production
-  administrator credential with no consumer. It still sets the blast radius while it exists:
-  anyone with write access to this repository can add a workflow step that prints it, so
-  compromise of repository write access is compromise of the database administrator. Delete it and
-  `DATABASE_URL` at step 7 of the cutover, not before — until then they are the way back if the
-  token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
+  job mints an Entra token instead, and the backup workflow it also fed has been deleted — so it is
+  now a stored production administrator credential with no consumer. It still sets the blast radius
+  while it exists: anyone with write access to this repository can add a workflow step that prints
+  it, so compromise of repository write access is compromise of the database administrator. Delete
+  it and `DATABASE_URL` at step 7 of the cutover, not before — until then they are the way back if
+  the token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
   given the same value. A copy in the owner's
   password manager was claimed here previously; nobody observed it being made, so it is not counted.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
@@ -381,8 +380,8 @@ second, resource-group-scoped budget.
 ### The two budgets, converged
 
 Both drifts were fixed by the deployment of 2026-08-05, which was possible because the admin
-password is known again — a redeploy writes `administratorLoginPassword` to whatever
-`PGADMIN_PASSWORD` holds, so it could not be attempted while the value was lost.
+password is known again — the deploy path required `PGADMIN_PASSWORD` at the time, so it could not
+be attempted while the value was lost. Supplying it is optional now; see [Redeploying](#redeploying).
 
 | Budget                      | Was      | Now                                                                         |
 | --------------------------- | -------- | --------------------------------------------------------------------------- |
@@ -728,12 +727,14 @@ that can write locks maintains it:
 
 ```bash
 unset DEPLOY_DELETE_LOCK          # or export DEPLOY_DELETE_LOCK=true
-# …then deploy exactly as under "Deploy", passing the *same* admin password
+unset PGADMIN_PASSWORD            # this deployment has no reason to write the credential
+# …then deploy exactly as under "Deploy"
 ```
 
-The password caveat above applies in full: this is a deployment, so it writes
-`administratorLoginPassword`. Placing the lock through the template and changing the admin
-credential by accident is one command, not two.
+Placing the lock needs no admin password. With `PGADMIN_PASSWORD` unset, `main.bicepparam` falls
+back to empty and `postgres.bicep` omits `administratorLoginPassword` entirely, so the live
+credential is untouched. Export it here only if you also mean to rotate — and rotating breaks every
+connection string carrying the old value, including the ones Vercel is serving the site with.
 
 If the lock has to be replaced by hand instead — by an Owner who is not running the deployment —
 the name must match the template **exactly**, or the next deployment adds a second lock beside the
