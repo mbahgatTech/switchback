@@ -894,11 +894,26 @@ async function resolveIdentity(
     return { ...fallback, claim: resolution.claim, conceded };
   }
 
+  /*
+   * Settled before the union, because the union is computed over whatever it is told to absorb.
+   * A merge refused here has to stand down whole: retiring nothing while still unioning the
+   * losers in would leave the winner holding line that the losers' own rows still serve, and
+   * every stat, the profile and each waypoint's `distM` are derived from these coordinates.
+   */
+  if (
+    resolution.kind === 'merge' &&
+    !(await canMergeTrails(db, resolution.trailId, resolution.retiredIds))
+  ) {
+    report('refused-review');
+    return { ...fallback, conceded };
+  }
+  const retiredIds = resolution.kind === 'merge' ? resolution.retiredIds : [];
+
   const merged = await mergeTrailGeometry(db, {
     trailId: resolution.trailId,
-    // The losers' lines are unioned in as well, so `unioned` is also the proof that retiring
-    // them keeps their geometry: a loser the union cannot absorb makes the result branch.
-    alsoTrailIds: resolution.kind === 'merge' ? resolution.retiredIds : [],
+    // Exactly the lines that are about to be retired, so `unioned` is also the proof that
+    // retiring them keeps their geometry: a loser the union cannot absorb makes the result branch.
+    alsoTrailIds: retiredIds,
     incoming: { type: 'LineString', coordinates: [...trail.coords] },
   });
   // The winner was deleted between the claim read and here. Drop the whole resolution rather
@@ -913,13 +928,7 @@ async function resolveIdentity(
     return { ...fallback, conceded };
   }
 
-  const retiredIds =
-    resolution.kind === 'merge' &&
-    (await canMergeTrails(db, resolution.trailId, resolution.retiredIds))
-      ? resolution.retiredIds
-      : [];
-  if (resolution.kind === 'merge' && retiredIds.length === 0) report('refused-review');
-  else report(retiredIds.length > 0 ? 'merged' : 'adopted');
+  report(retiredIds.length > 0 ? 'merged' : 'adopted');
 
   return {
     trailId: resolution.trailId,

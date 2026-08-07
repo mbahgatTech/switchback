@@ -33,6 +33,7 @@ import {
   requestArea,
   surveyArea,
   tileJobKey,
+  trailIdentityMode,
   VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
@@ -590,19 +591,30 @@ export const trailsRouter = router({
   bySlug: publicProcedure
     .input(z.object({ slug: z.string().min(1).max(200) }))
     .query(async ({ ctx, input }) => {
-      const row =
-        (await ctx.db.trail.findUnique({ where: { slug: input.slug }, select: detailSelect })) ??
-        // A merge retires one of two slugs, and both were public URLs from first index. The
-        // alias table is what keeps the retired one answering rather than 404ing every inbound
-        // link — see `mergeTrails` in @switchback/ingest, which writes it.
-        (
-          await ctx.db.trailSlugAlias.findUnique({
-            where: { slug: input.slug },
-            select: { trail: { select: detailSelect } },
-          })
-        )?.trail;
-      if (!row) throw notFound();
-      return toDetail(row);
+      const row = await ctx.db.trail.findUnique({
+        where: { slug: input.slug },
+        select: detailSelect,
+      });
+      if (row) return toDetail(row);
+
+      /*
+       * A merge retires one of two slugs, and both were public URLs from first index, so the
+       * alias table is what keeps the retired one answering rather than 404ing every inbound
+       * link — see `mergeTrails` in @switchback/ingest, which writes it.
+       *
+       * Gated on the flag that writes it, as `uniqueSlug` and `claimWays` are. Only a merge
+       * creates an alias and only `claim` merges, so under the default the table holds nothing
+       * and need not exist — and querying a relation that does not exist would turn every
+       * genuine 404 into a 500, on the not-found page and on every stale inbound link.
+       */
+      if (trailIdentityMode() !== 'claim') throw notFound();
+
+      const alias = await ctx.db.trailSlugAlias.findUnique({
+        where: { slug: input.slug },
+        select: { trail: { select: detailSelect } },
+      });
+      if (!alias) throw notFound();
+      return toDetail(alias.trail);
     }),
 
   byId: publicProcedure

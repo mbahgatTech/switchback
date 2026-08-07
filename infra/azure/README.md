@@ -1219,7 +1219,7 @@ because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `not
 deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
 Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
 group, on 2026-08-03 (assignment `8baf9393-029a-4226-a882-992a8146d775`). The parameter, the flag and
-the runbook step are all gone: the three queue role assignments are ordinary resources in
+the runbook step are all gone: the four queue role assignments are ordinary resources in
 `ingest.bicep` and nothing grants access by hand.
 
 **Deleting a `roleAssignment` from Bicep is not a revocation.** Resource-group deployments are
@@ -1253,14 +1253,21 @@ byte-identical; `az rest --method GET .../locks` is how to check. Read `lock.jso
 template rather than typing it, which is what went wrong the first time.
 
 **A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
-gets exactly the three assignments the template declares. This step existed only to converge the
+gets exactly the four assignments the template declares. This step existed only to converge the
 environment that had already run the older template. To check any environment:
 
 ```bash
-az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=atScope()"
+az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=atScope()" \
+  --query "value[?contains(properties.scope,'queues/ingest-jobs')].{assignment:name, principal:properties.principalId, role:properties.roleDefinitionId}" -o tsv
 ```
 
-Three rows, and `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner) must not be one of them.
+`atScope()` also returns what the subscription and the resource group grant — ten rows against this
+estate — so the filter on `properties.scope` is what narrows it to the queue's own. Four rows:
+Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and the
+same pair for the publisher `c9bfba39-…`. `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner) must
+not be among them. The publisher's Receiver, assignment `0090d328-0cee-592f-8359-e4cc64940694`, is
+the over-grant `ingest.bicep` adopts by literal id, and the resource group's delete lock is what
+prevents revoking it.
 
 ### The two things Bicep cannot express
 

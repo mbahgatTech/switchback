@@ -714,13 +714,22 @@ and the tile waits for `reclaimExpiredJobs`. That is a slower path than #172 pro
 argument for keeping the cron's `reclaimExpiredJobs` call on the `servicebus` branch rather than
 skipping the cron entirely.
 
-**Least privilege on the queue.** Three role assignments, all queue-scoped, all in the template: the
-worker holds Data Sender and Data Receiver, the publisher holds Data Sender. Data Owner was the
-earlier choice because reading the queue depth looked like an administration operation — it is, for
+**Least privilege on the queue.** Four role assignments, all queue-scoped, all in the template: the
+worker holds Data Sender and Data Receiver, and so does the publisher. Data Owner was the earlier
+choice because reading the queue depth looked like an administration operation — it is, for
 `ServiceBusAdministrationClient`, but both data roles already carry the control-plane `queues/read`
 action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth through ARM
 and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite or delete
 the queue it drains.
+
+The publisher's Data Receiver is the exception to that heading, and it is the answer to who can
+drain the production ingest queue. `id-switchback-vercel-publisher` is the shared runtime identity
+that every Vercel deployment carries, previews included, so the grant reaches all of them — over the
+same REST surface `packages/ingest/src/publish.ts` already uses to send. It is declared by its
+literal assignment id, `0090d328-0cee-592f-8359-e4cc64940694`, because it predates the template and
+is adopted rather than created. Revoking it returns `ScopeLocked` naming `switchback-prod-no-delete`,
+the resource group's `CanNotDelete` lock, so revocation needs the lock lifted first — an Owner
+action, tracked separately.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection
@@ -915,25 +924,24 @@ the identity and its two federated credentials. What is not:
   carries the `ALTER ROLE sbapp_vercel RENAME TO sbapp_runtime` that creates it, and that has run
   nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
   provisioning workflow cannot execute from a branch.
-- The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and still holds
-  both Service Bus grants under it. Moving it is a change to `infra/azure/ingest.bicep`, which
-  lives on `feat/servicebus-ingest` rather than here.
-- Neither Service Bus grant is declared by any template on this branch. `ingest.bicep` owns the
-  namespace and the queue, and therefore the grants scoped to them, and it lives on
-  `feat/servicebus-ingest` rather than here. Live today, read with `az role assignment list --all`,
-  the shared identity holds **both** Data Sender (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data
-  Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) on `ingest-jobs`. So the IaC in this branch
-  understates what the principal can do on that queue, and an audit run from the repository alone
-  reaches the wrong answer — which is why it is written here.
+- The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
+  Service Bus grants under it. Moving it onto the shared identity is a change to
+  `infra/azure/ingest.bicep`, which declares that identity, the queue and every assignment on it.
+- The shared identity's Data Receiver on `ingest-jobs` is not revoked. `ingest.bicep` declares all
+  four queue assignments, and of them the shared identity holds **both** Data Sender
+  (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data Receiver
+  (`0090d328-0cee-592f-8359-e4cc64940694`). Receiver is the half that matters: it is standing
+  authority to drain the production ingest queue, on an identity every Vercel deployment carries,
+  previews included.
 
-  Receiver is the half that matters. It was deployed before the grant moved out of this template,
-  and incremental ARM does not delete what a template stops declaring, so removing it from Bicep is
-  not a revocation. Revoking it was attempted and refused: the delete returns `ScopeLocked` naming
-  `switchback-prod-no-delete`, the resource group's `CanNotDelete` lock, and lifting that is an
-  Owner action. It is inert while no Service Bus receive code exists in this repository, and it
-  becomes real capability — for every Vercel deployment, preview included — the moment the worker's
-  code merges. Either revoke it before then, or let `ingest.bicep` adopt it in the change that moves
-  the worker: the `guid()` inputs are identical, so the assignment it would create is this one.
+  It was deployed before the grant moved out of this template, and incremental ARM does not delete
+  what a template stops declaring, so removing it from Bicep would not revoke it. Revoking it was
+  attempted and refused: the delete returns `ScopeLocked` naming `switchback-prod-no-delete`, the
+  resource group's `CanNotDelete` lock, and lifting that is an Owner action. `ingest.bicep` adopts
+  it in the meantime, declared by its literal assignment id rather than by the `guid()` expression
+  its three siblings use — a role assignment's resource name is its GUID, so the literal is the
+  only form that provably converges on the assignment already in the estate, where a `guid()`
+  resolving to anything else would attempt a second grant of the same role to the same principal.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
 because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
@@ -1216,11 +1224,11 @@ order, each proved with passwords still enabled:
    `refs/heads/master` alone, so this executes on merge.
 2. **The Function App.** `DATABASE_AUTH=entra`, `AZURE_CLIENT_ID` for the shared identity, and a
    `DATABASE_URL` with the password removed. Its app setting still carries `sbapp`. Its identity
-   block lives in `infra/azure/ingest.bicep`, on `feat/servicebus-ingest` (PR #42) rather than
-   here, so the move cannot be made from this branch at all. Its Service Bus Data Receiver grant
-   moves in that same change, and the shared identity already holds a Receiver assignment of its
-   own on `ingest-jobs` — the over-grant described above, which is either revoked before PR #42
-   merges or adopted by `ingest.bicep` in it.
+   block lives in `infra/azure/ingest.bicep`, which also declares the queue and its four role
+   assignments, so the move and the Service Bus grant that follows it are one change to that file.
+   The shared identity already holds a Receiver assignment of its own on `ingest-jobs` — the
+   over-grant described above, which `ingest.bicep` adopts until the lock is lifted and it can be
+   revoked.
 3. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.

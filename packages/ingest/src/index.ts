@@ -21,3 +21,8 @@ export * from './publish';
 export * from './network';
 export * from './config';
 export * from './handlers';
+
+// The flag, not the mechanism: `trails.bySlug` has to gate its `trail_slug_aliases` read on the
+// same setting that writes the table, and nothing outside ingest resolves a claim itself.
+export { trailIdentityMode } from './identity';
+export type { TrailIdentityMode } from './identity';

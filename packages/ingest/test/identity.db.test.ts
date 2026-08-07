@@ -228,20 +228,75 @@ describe.skipIf(!IS_LOCAL).sequential('merging two rows that turned out to be on
     expect(alias?.trailId).toBe(winner!.id);
   });
 
-  it('refuses the merge rather than delete a review, and leaves both rows intact', async () => {
-    const [winner, loser] = await fragmentThenBridge();
+  /** The line, its extent and its measured length — what a refused merge must leave alone. */
+  async function geometryOf(id: string) {
+    return prisma.trail.findUniqueOrThrow({
+      where: { id },
+      select: {
+        lengthM: true,
+        bboxW: true,
+        bboxS: true,
+        bboxE: true,
+        bboxN: true,
+        geometryJson: true,
+      },
+    });
+  }
+
+  /** One person reporting both halves — the collision `canMergeTrails` exists to refuse. */
+  async function reviewBothHalves(winnerId: string, loserId: string): Promise<string> {
     const user = await prisma.user.create({ data: { name: `${PREFIX} Reviewer` } });
     await prisma.review.createMany({
       data: [
-        { trailId: winner!.id, userId: user.id, rating: 5, body: 'north half' },
-        { trailId: loser!.id, userId: user.id, rating: 3, body: 'south half' },
+        { trailId: winnerId, userId: user.id, rating: 5, body: 'north half' },
+        { trailId: loserId, userId: user.id, rating: 3, body: 'south half' },
       ],
     });
+    return user.id;
+  }
+
+  it('refuses the merge rather than delete a review, and leaves both lines untouched', async () => {
+    const [winner, loser] = await fragmentThenBridge();
+    const before = [await geometryOf(winner!.id), await geometryOf(loser!.id)];
+    const userId = await reviewBothHalves(winner!.id, loser!.id);
 
     await processTile(WEST, deps([W2, W3]));
 
-    expect(await fixtureTrails()).toHaveLength(2);
-    expect(await prisma.review.count({ where: { userId: user.id } })).toBe(2);
+    /*
+     * The union is computed over winner, losers and incoming together, so a refusal that only
+     * cancels the retire still leaves the winner holding the loser's line. Every derived value —
+     * the profile, `gainM`, `estimatedTimeS`, `routeType`, each waypoint's `distM` — is computed
+     * from these coordinates, so the winner would describe ground the loser's own page still
+     * describes, and the map would draw it twice.
+     */
+    expect(await geometryOf(winner!.id)).toEqual(before[0]);
+    expect(await geometryOf(loser!.id)).toEqual(before[1]);
+
+    // Nothing a reader wrote is moved or dropped, and the loser keeps answering on its own slug
+    // rather than being aliased onto a merge that never happened.
+    expect(await prisma.review.count({ where: { userId } })).toBe(2);
+    expect(await prisma.trailSlugAlias.findUnique({ where: { slug: loser!.slug } })).toBeNull();
+  });
+
+  it('matches what the shipped default does with the same three passes', async () => {
+    // The refusal is only safe if it is no worse than the mode it can roll back to. Same fixture
+    // under `osm-id`: the bridging assembly is a third row, and neither half is rewritten.
+    const [winner, loser] = await fragmentThenBridge();
+    const before = [await geometryOf(winner!.id), await geometryOf(loser!.id)];
+    await reviewBothHalves(winner!.id, loser!.id);
+
+    await processTile(WEST, deps([W2, W3], { trailIdentity: 'osm-id' }));
+    const control = await fixtureTrails();
+
+    await reset();
+    const [claimWinner, claimLoser] = await fragmentThenBridge();
+    await reviewBothHalves(claimWinner!.id, claimLoser!.id);
+
+    await processTile(WEST, deps([W2, W3]));
+
+    expect(await fixtureTrails()).toHaveLength(control.length);
+    expect(await geometryOf(claimWinner!.id)).toEqual(before[0]);
+    expect(await geometryOf(claimLoser!.id)).toEqual(before[1]);
   });
 
   it('moves a review that does not collide, and settles the count it lands on', async () => {
