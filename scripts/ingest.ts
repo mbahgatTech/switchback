@@ -6,6 +6,7 @@
  *   npm run ingest:tile -- 12020210      -- fetch one z9 tile now, ignoring the queue
  *   npm run ingest:tile -- --at 53.07,-4.07
  *   npm run ingest:route -- 1225378    -- fetch one long-distance route by relation id
+ *   npm run ingest:unsplit -- 120230202  -- undo a subdivision and re-queue the parent
  *
  * `--watch` is the minute-hand local development has no Vercel cron for; `tile` is the smoke
  * test. Everything goes through the same `pipelineDeps` singletons the server uses, so the
@@ -16,7 +17,13 @@
  * supplies the environment and no file exists.
  */
 
-import { drainIngest, pipelineDeps, processRoute, processTile } from '@switchback/ingest';
+import {
+  drainIngest,
+  pipelineDeps,
+  processRoute,
+  processTile,
+  unsplitTile,
+} from '@switchback/ingest';
 import { INGEST_ZOOM, lngLatToTile, tileToQuadkey } from '@switchback/geo';
 import { prisma } from '@switchback/db';
 import { randomUUID } from 'node:crypto';
@@ -114,6 +121,21 @@ async function route(argv: string[]): Promise<void> {
   );
 }
 
+/**
+ * Undo a subdivision. The rollback for `INGEST_SUBDIVIDE_MAX_ZOOM`, which on its own only stops
+ * splits that have not happened yet — see `unsplitTile`.
+ */
+async function unsplit(argv: string[]): Promise<void> {
+  const quadkey = argv.find((arg) => /^[0-3]+$/.test(arg));
+  if (!quadkey) fail('Pass the parent quadkey, e.g. 120230202');
+
+  const result = await unsplitTile(prisma, quadkey);
+  console.log(
+    `${result.quadkey}: removed ${result.descendantsRemoved} descendant tile(s), ` +
+      `parent left ${result.status} and re-queued`,
+  );
+}
+
 async function main(): Promise<void> {
   const [command, ...argv] = process.argv.slice(2);
   switch (command) {
@@ -126,8 +148,11 @@ async function main(): Promise<void> {
     case 'route':
       await route(argv);
       break;
+    case 'unsplit':
+      await unsplit(argv);
+      break;
     default:
-      fail('Usage: tsx scripts/ingest.ts <drain|tile|route> [options]');
+      fail('Usage: tsx scripts/ingest.ts <drain|tile|route|unsplit> [options]');
   }
 }
 

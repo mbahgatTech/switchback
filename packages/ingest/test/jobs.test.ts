@@ -466,6 +466,41 @@ describe('the outcome fence', () => {
 });
 
 /**
+ * `INGEST_MAX_DRAINERS` is enforced by `drainSlotGate` counting `distinct "lockedBy"` over
+ * `running` rows — a reading that exists only while something is mid-drain, and eight samples over
+ * seventy seconds of production caught zero. `drainedBy` is what makes the achieved concurrency
+ * recoverable from finished work instead: `count(distinct "drainedBy")` over a window.
+ */
+describe('which process ran a job', () => {
+  it.each([
+    ['completeJob', (db: Db) => completeJob(db, job(), new Date())],
+    ['failJob', (db: Db) => failJob(db, job(), new Error('nope'), new Date())],
+  ])('survives %s nulling the lease', async (_name, write) => {
+    const { db, recorded } = fakeDb();
+
+    await write(db);
+
+    const data = recorded.updateManys.at(-1)!.data;
+    expect(data.lockedBy).toBeNull();
+    expect(data.drainedBy).toBe('worker-a');
+  });
+
+  it('is captured by the lease sweep from the row it is about to clear', async () => {
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'job-9', lockedAt: new Date(0), attempts: 1, maxAttempts: 5 }],
+    });
+
+    await reclaimExpiredJobs(db, new Date(LEASE_TIMEOUT_MS * 2));
+
+    // Postgres evaluates the whole SET against the pre-update row, so this reads the dead
+    // worker's name rather than the NULL assigned in the same statement.
+    const sweep = recorded.rawSql.find((sql) => sql.includes('RETURNING status'))!;
+    expect(sweep).toContain('"drainedBy"   = "lockedBy"');
+    expect(sweep.indexOf('"lockedBy"    = NULL')).toBeLessThan(sweep.indexOf('"drainedBy"'));
+  });
+});
+
+/**
  * The starvation this share exists to break: `claimJobs` orders `priority DESC` and derived
  * work sits at `-10`, while both inline kicks scope to the tile keys they just queued and so
  * cannot reach a derived row at all.

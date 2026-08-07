@@ -794,6 +794,12 @@ model IngestJob {
   runAfter    DateTime  @default(now())
   lockedAt    DateTime?
   lockedBy    String?
+  /// Which process last held this job's lease. `lockedBy` is nulled on every exit from `running`,
+  /// because a lease has to stop matching the moment it is released; this column is written from
+  /// it on the way out and kept, so a finished job still names the drainer that ran it. It is
+  /// what makes `INGEST_MAX_DRAINERS` measurable after the fact rather than only asserted —
+  /// `count(distinct "drainedBy")` over a window is the concurrency actually achieved.
+  drainedBy   String?
   lastError   String?
 
   createdAt   DateTime  @default(now())

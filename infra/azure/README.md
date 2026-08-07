@@ -1184,27 +1184,36 @@ thing the operator has to get right.
 with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
 Postgres/Service Bus fan-out that an operator had just rolled back.
 
-**The template deploy and the zip push always run together, template first — and then a trigger
-sync.** Linux Consumption runs the code from a package URL that
+**The template deploy and the package push always run together, template first — and the push is a
+script, not a command.** Linux Consumption runs the code from a package URL that
 `az functionapp deployment source config-zip` writes into the same application-settings collection an
 ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
-— and a Bicep deployment on its own leaves the app codeless until the next zip. For the same reason,
+— and a Bicep deployment on its own leaves the app codeless until the next push. For the same reason,
 a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
 the template.
 
-The third step is not optional and cost half an hour to find. After an ARM deployment has removed
-`WEBSITE_RUN_FROM_PACKAGE` and the zip push has put it back, the host comes up reporting
+```bash
+bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip
+```
+
+That script is the whole sequence — push, trigger sync, and a wait for the running host to emit
+`switchback-ingest-queue-health`, which no build without the current
+`apps/ingest-worker/src/health.ts` produces. It fails if the package blob did not change or if no
+heartbeat arrives, so a stale deploy cannot report success. `ci.yml`'s `deploy ingest worker` job
+invokes the same file on every push to master; running it by hand and letting CI run it are the same
+code path, which is the point.
+
+The trigger sync inside it is not optional and cost half an hour to find. After an ARM deployment has
+removed `WEBSITE_RUN_FROM_PACKAGE` and the push has put it back, the host comes up reporting
 `0 functions loaded` / "No functions were found", `az functionapp function list` returns `[]`, and
 nothing ever wakes it — a Consumption app with no registered triggers has nothing to scale on, so it
-sits there indefinitely and a restart does not help. The scale controller's trigger cache has to be
-told:
+sits there indefinitely and a restart does not help. The call the script makes is:
 
 ```bash
 az rest --method POST --url "https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Web/sites/func-switchback-ingest-37ywppu5p7fri/syncfunctiontriggers?api-version=2023-12-01"
 ```
 
-Within a minute `az functionapp function list` shows `ingestDrain` and `ingestPump`. Verified
-2026-08-03T18:47Z.
+Within a minute `az functionapp function list` shows `ingestDrain` and `ingestPump`.
 
 **Zip the bundle with forward slashes.** Windows PowerShell 5.1's `Compress-Archive` writes entry
 names with `\`, which the Linux host reads as one long filename rather than a path — so `node_modules`
