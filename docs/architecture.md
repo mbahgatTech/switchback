@@ -1066,17 +1066,44 @@ version these were exercised against. Newer releases add shorthands that older o
 checks use the plain `--environment` form, whose newest row carries the `Age` the verification
 turns on.
 
-`npm run ingest:unsplit` is the one command here that talks to Postgres rather than to a control
-plane, and it needs `DATABASE_URL`. The credential-free form is under _Connecting without a
-password_ above; there is no password to fetch.
+### And for `npm run ingest:unsplit`: a `DATABASE_URL` with no password in it
+
+`npm run ingest:unsplit` is the one command here that reaches Postgres rather than a control plane,
+and the only one that needs `DATABASE_URL`. `DATABASE_AUTH=entra` is what makes that URL
+credential-free: `entraPoolConfig` in `packages/db/src/entra-pool.ts` refuses a `DATABASE_URL` that
+carries a password, and `DefaultAzureCredential` supplies an access token from your `az login` at
+connect time instead. There is no stored secret to fetch, and no token is placed in the URL or in
+your shell history.
+
+```bash
+# From a fresh clone, once: npm ci && npm run db:generate
+az login
+
+export DATABASE_AUTH=entra
+db_user="$(node -p 'encodeURIComponent(process.argv[1])' \
+  "$(az ad signed-in-user show --query userPrincipalName -o tsv)")"
+export DATABASE_URL="postgresql://${db_user}@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full"
+```
+
+The username is your own UPN, percent-encoded. The database role's _name_ is the UPN — Azure matches
+the token to the role by object id, but `pg` sends the name — and a guest account's carries `#EXT#@`,
+either character of which ends the authority component early if it goes in raw. `sslmode=verify-full`
+is honoured on this path by `pg` against Node's own trust store, so the `PGSSLROOTCERT` a libpq
+client needs has no part in it. An exported `DATABASE_URL` wins over any `.env` in the working tree,
+which `--env-file-if-exists` would otherwise supply.
+
+Disconnect ProtonVPN first: its `ProTUN` adapter lets the TCP connection establish and then tears the
+Postgres session down, which reads as a rejected credential. That and the rest of the break-glass
+diagnosis — in `PG*` form, for `psql` and `pg_dump` — are in
+[infra/azure/README.md](../infra/azure/README.md#connecting-by-hand-with-no-password).
 
 ### `INGEST_QUEUE_DRIVER` → `postgres`
 
 Worker first, Vercel second. Reversing that order has both sides draining `ingest_jobs` at once. The
-five commands and the reasoning are under _Which queue drives it_ above, and the check that matters
-is the same one the other two controls use: `vercel ls --environment production`, because writing
-the variable is not the same as running a deployment built from it. Stopping at the write leaves
-nothing draining while `vercel env ls` reports success.
+five steps and the reasoning are in the **At 3am** block under _Which queue drives it_ above, and the
+check that matters is the same one the other two controls use: `vercel ls --environment production`,
+because writing the variable is not the same as running a deployment built from it. Stopping at the
+write leaves nothing draining while `vercel env ls` reports success.
 
 ### `INGEST_SUBDIVIDE_MAX_ZOOM` → `9`
 
