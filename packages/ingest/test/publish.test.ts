@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ingestQueueDriver, publishIngestSignals, resetPublisherToken } from '../src/publish';
+import { publishIngestSignals, resetPublisherToken } from '../src/publish';
 
 const TOKEN_URL = 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token';
 const SEND_URL = 'https://sb-switchback-prod-abc.servicebus.windows.net/ingest-jobs/messages';
 
 function envWith(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
-    INGEST_QUEUE_DRIVER: 'servicebus',
     SERVICE_BUS_NAMESPACE: 'sb-switchback-prod-abc.servicebus.windows.net',
     AZURE_TENANT_ID: 'tenant-id',
     AZURE_CLIENT_ID: 'client-id',
@@ -51,15 +50,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-});
-
-describe('ingestQueueDriver', () => {
-  it('defaults to postgres and treats anything unrecognised as postgres', () => {
-    expect(ingestQueueDriver({})).toBe('postgres');
-    expect(ingestQueueDriver({ INGEST_QUEUE_DRIVER: '' })).toBe('postgres');
-    expect(ingestQueueDriver({ INGEST_QUEUE_DRIVER: 'servicebuss' })).toBe('postgres');
-    expect(ingestQueueDriver({ INGEST_QUEUE_DRIVER: ' servicebus ' })).toBe('servicebus');
-  });
 });
 
 describe('publishIngestSignals', () => {
@@ -170,7 +160,7 @@ describe('publishIngestSignals', () => {
     await expect(
       publishIngestSignals(['ingest_tile:0'], {
         oidcToken: 'vercel-oidc-token',
-        env: { INGEST_QUEUE_DRIVER: 'servicebus' },
+        env: {},
       }),
     ).resolves.toEqual({ published: 0, failed: 1 });
     expect(fetchMock).not.toHaveBeenCalled();

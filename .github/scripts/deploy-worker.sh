@@ -32,7 +32,7 @@
 #   1. the live setting names the blob this run uploaded — the ARM write landed, on this app;
 #   2. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
 #      timestamp after the deploy began. The marker is emitted by the first statement of the
-#      `ingestPump` handler, on a two-minute timer, ahead of the `INGEST_QUEUE_DRIVER` guard; the
+#      `ingestPump` handler, on a two-minute timer; the
 #      commit is substituted into the bundle by `apps/ingest-worker/scripts/bundle.ts`, so it
 #      travels inside the zip. Without it the check degrades to liveness — any build already
 #      carrying the current `health.ts` satisfies a bare marker, so a package that failed to mount

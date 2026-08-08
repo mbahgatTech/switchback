@@ -3,7 +3,10 @@
  * result means to the broker, which is where the two systems have to agree.
  */
 
-import { drainIngest, getOverpass, withDeadline } from '@switchback/ingest';
+import { JobStatus } from '@switchback/db';
+import type { PrismaClient } from '@switchback/db';
+import { backgroundPrisma } from '@switchback/db';
+import { LEASE_TIMEOUT_MS, drainIngest, getOverpass, withDeadline } from '@switchback/ingest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 import type { IngestSignal } from './message';
@@ -12,79 +15,169 @@ import type { IngestSignal } from './message';
 export type Drain = typeof drainIngest;
 
 /**
- * How long into an invocation this worker will still *start* an Overpass request.
- *
- * `host.json` sets `functionTimeout` to ten minutes and Consumption will not raise it — the host
- * kills the process, which strands the `ingest_jobs` lease and redelivers the message. Against
- * that, two numbers bound the Overpass portion of a handler:
- *
- *     300 s  this deadline — the last moment a query may start
- *   + 240 s  OVERPASS_MAX_TOTAL_MS, the most that one query may then spend
- *   = 540 s  worst case in Overpass, inside the host's 600 s
- *
- * The addition is sound because nothing sits between the two: `host.json` takes one message at a
- * time, so a query never waits for a concurrency slot it is not charged for, and `OverpassClient`
- * clamps each attempt into what is left of the budget — including the body read, which it did not
- * always. `test/drain.test.ts` asserts all three numbers against `host.json` and `ingest.bicep`.
- *
- * **Overpass is not the only wall clock in the handler, so this alone never bounded the
- * invocation.** Measured on 2026-08-03 with the flag on: 021212220 at 205 s, 031313102 at 415 s,
- * 031313120 at 491 s — then 120221230 and 120221203, both dense alpine tiles, killed at
- * 612,947 ms and 615,938 ms with Overpass inside its budget throughout. Elevation was unbounded
- * (`TerrainSource` had no per-request timeout and no budget) and so were the per-trail commits.
- * The same window has `[HostMonitor] Host CPU threshold exceeded (99 >= 80)` repeating from 22:24
- * to 23:04 with `ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so contention
- * on one saturated Consumption instance is a second, independent term — and one the
- * `maxConcurrentCalls: 1` argument above does not cover, because the timer trigger is not a
- * queue message and runs alongside the drain regardless.
- *
- * `INGEST_DEADLINE_MS` is the answer to both: a single wall clock handed to every phase through
- * `PipelineDeps.deadlineAt`, so terrain and commits refuse to start past it just as Overpass
- * does. Overpass keeps its own earlier deadline because it may then spend 240 s more.
- */
-export const OVERPASS_DEADLINE_MS = 300_000;
-
-/**
  * The whole handler's wall clock, measured from the moment the message arrives.
  *
- * 540 s leaves 60 s of the host's 600 s for the phase that was already running when the clock
- * ran out — one terrain fetch (20 s cap), one trail's transaction — plus the job bookkeeping.
- * It is deliberately the same number as the Overpass worst case: past 540 s no phase may
- * *begin*, whichever phase it is.
+ * `host.json` sets `functionTimeout` to ten minutes and Consumption will not raise it — the host
+ * kills the process, which strands the `ingest_jobs` lease and redelivers the message. 540 s
+ * leaves 60 s of the host's 600 s for the phase that was already running when the clock ran out:
+ * one terrain fetch (20 s cap), one trail's transaction, plus the job bookkeeping. Past it no
+ * phase may *begin*, whichever phase it is — `PipelineDeps.deadlineAt` carries the same number to
+ * terrain and to the per-trail commits.
  */
 export const HANDLER_DEADLINE_MS = 540_000;
 
-function deadlineMs(source: NodeJS.ProcessEnv = process.env): number {
-  const value = Number(source.INGEST_OVERPASS_DEADLINE_MS);
-  return Number.isFinite(value) && value > 0 ? value : OVERPASS_DEADLINE_MS;
+/**
+ * Wall clock held back for the commit loop, and the reason a handler can now end by finishing a
+ * tile rather than by expiring.
+ *
+ * Overpass had its own start-by deadline of 300 s and `OVERPASS_MAX_TOTAL_MS` of 240 s, which sum
+ * to the entire 540 s handler budget: a tile whose two queries were slow reached `commitTrail`
+ * with nothing left, every trail threw `IngestDeadlineError`, and the tile subdivided into four
+ * children that each repeated the exercise. Measured 2026-08-08: five invocations of 504,637 ms
+ * to 548,954 ms against a 540,000 ms bound, every one of them reporting success.
+ *
+ * Reserving the tail closes that: the last moment a query may start is
+ * `HANDLER_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS`, so whatever Overpass
+ * does the commit loop still gets this long. A tile that then runs out of clock has run out of it
+ * *committing trails*, which is what "too big for one invocation" actually looks like and what
+ * subdivision is the answer to.
+ */
+export const COMMIT_RESERVE_MS = 150_000;
+
+/** `OVERPASS_MAX_TOTAL_MS` as the deployed template sets it, when the environment is silent. */
+export const OVERPASS_MAX_TOTAL_MS = 240_000;
+
+function positive(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
-  const value = Number(source.INGEST_DEADLINE_MS);
-  return Number.isFinite(value) && value > 0 ? value : HANDLER_DEADLINE_MS;
+/** The handler's own wall clock, from `INGEST_DEADLINE_MS`. */
+export function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
+  return positive(source.INGEST_DEADLINE_MS, HANDLER_DEADLINE_MS);
 }
+
+/**
+ * The last moment this invocation will *start* an Overpass query.
+ *
+ * Derived rather than configured, because the three numbers have to add up and a deployment that
+ * sets them independently is one `az functionapp config appsettings set` away from the budget
+ * arithmetic above being false again. `INGEST_OVERPASS_DEADLINE_MS` may still lower it — an
+ * operator tightening the clamp is always safe — but never raise it past the reserve.
+ */
+export function overpassDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
+  const reserve = positive(source.INGEST_COMMIT_RESERVE_MS, COMMIT_RESERVE_MS);
+  const maxTotal = positive(source.OVERPASS_MAX_TOTAL_MS, OVERPASS_MAX_TOTAL_MS);
+  const derived = handlerDeadlineMs(source) - maxTotal - reserve;
+  const configured = Number(source.INGEST_OVERPASS_DEADLINE_MS);
+  const bound =
+    Number.isFinite(configured) && configured > 0 ? Math.min(configured, derived) : derived;
+  // Never zero or negative: `withDeadline` rejects on `now >= at`, so a misconfigured trio must
+  // still allow the tile query that the whole invocation exists to make.
+  return Math.max(1_000, bound);
+}
+
+/**
+ * What this invocation may tell the broker about the message it was handed.
+ *
+ * The rule the two systems agree on: **no message is completed without its work having been done
+ * or durably re-scheduled.** `settled` and `rescheduled` are the two ways that is true.
+ */
+export type Disposition = 'settled' | 'rescheduled' | 'stranded';
+
+/** The `ingest_jobs` columns a disposition is read from. */
+export interface JobLease {
+  status: JobStatus;
+  lockedAt: Date | null;
+}
+
+/**
+ * What the broker should be told, from the job row as it stands after the drain.
+ *
+ * - **settled** — no row, `done` or `dead`. The work happened or has been given up on deliberately.
+ * - **rescheduled** — `queued`, or `running` under a lease that has not expired. Something will
+ *   pick it up: `runPump` republishes a due row every two minutes, and a live lease belongs to an
+ *   invocation that is going to write an outcome.
+ * - **stranded** — `running` with no reclaimable lease. Nothing in this process is going to do the
+ *   work and the pump cannot see a `running` row, so completing the message here would drop it.
+ *
+ * **A handler killed mid-tile does not reach `stranded`, by design.** `reclaimExpiredJobs` runs
+ * ahead of the claim in both `drainJobs` and `drainSlotGate`, so a redelivery that arrives after
+ * the lease expired finds the row already returned to `queued`, claims it, and re-runs the work —
+ * which is the repair, not a gap. That death is reported by the reaper under
+ * `LEASE_EXPIRED_MARKER`, the only participant that observes it.
+ *
+ * What is left here is the state no reclaim can reach: `running` with `lockedAt` NULL, which
+ * `lockedAt < cutoff` never matches however long it sits. It is rare and it is permanent, so the
+ * message must not be completed on it.
+ */
+export function classifyDisposition(
+  job: JobLease | null,
+  now: number,
+  leaseTimeoutMs = LEASE_TIMEOUT_MS,
+): Disposition {
+  if (!job) return 'settled';
+  if (job.status === JobStatus.done || job.status === JobStatus.dead) return 'settled';
+  if (job.status !== JobStatus.running) return 'rescheduled';
+  if (job.lockedAt === null) return 'stranded';
+  return now - job.lockedAt.getTime() < leaseTimeoutMs ? 'rescheduled' : 'stranded';
+}
+
+/** Thrown so the host abandons the message instead of completing work that did not happen. */
+export class StrandedSignalError extends Error {
+  constructor(dedupeKey: string) {
+    super(`ingest ${dedupeKey}: work neither done nor re-scheduled — abandoning for redelivery`);
+    this.name = 'StrandedSignalError';
+  }
+}
+
+/**
+ * The literal `switchback-ingest-signal-stranded` greps for.
+ *
+ * Written on the delivery that finds a `running` row no reclaim can free — `lockedAt` NULL. It is
+ * not the killed-handler signal; `LEASE_EXPIRED_MARKER` in `packages/ingest/src/jobs.ts` is, and
+ * the two are separate arms of `switchback-ingest-drain-failed` because they are separate faults.
+ */
+export const SIGNAL_STRANDED_MARKER = 'switchback-ingest-signal-stranded';
 
 /**
  * Claim and run the one job a message names.
  *
- * `limit: 1` because the message named one unit of work and a second job claimed alongside it
- * has no message backing it — the pump would republish it anyway, and this invocation's
- * 10-minute budget is sized for one tile.
+ * `limit: 1` because the message named one unit of work and a second job claimed alongside it has
+ * no message backing it — the pump would republish it anyway, and this invocation's budget is
+ * sized for one tile. `derivedLimit: 0` because the pump reserves the derived share already.
  *
- * `derivedLimit: 0` deviates from `DEFAULT_DERIVED_SHARE` on purpose: the pump reserves the
- * derived share now, so claiming two more here would spend the budget twice over and put work
- * in flight that the concurrency reasoning below does not account for.
+ * **The default `drainSlotGate` applies here, and that is the Overpass bound.** It used to be
+ * disabled on the argument that `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1`
+ * make this process the whole fleet, so the one `OverpassClient` singleton's
+ * `OVERPASS_MAX_CONCURRENT: 2` was already the ceiling. The argument holds only while exactly one
+ * host is running: across a recycle two overlap, each with its own singleton, and on 2026-08-08
+ * Overpass answered 25× 504 and 5× 429 across all three mirrors between 16:33 and 18:25 UTC.
+ * Several invocations each honouring "two concurrent" locally is not two concurrent. The gate is
+ * a `pg_advisory_xact_lock` in the database every claim passes through, so the bound holds across
+ * processes however many the platform starts.
+ *
+ * A refused claim is not a failure — it is this invocation declining to be the second drainer —
+ * and the disposition below is what keeps that from costing the message.
  */
 export async function runIngestSignal(
   signal: IngestSignal,
   log: WorkerLog,
-  options: { workerId: string; drain?: Drain; overpass?: OverpassQuerier },
+  options: {
+    workerId: string;
+    deliveryCount?: number;
+    drain?: Drain;
+    overpass?: OverpassQuerier;
+    db?: PrismaClient;
+  },
 ): Promise<DrainResult> {
   const drain = options.drain ?? drainIngest;
+  const db = options.db ?? backgroundPrisma;
   const startedAt = Date.now();
   // A view of the shared client, not a second one: the queue and the breaker stay the
   // singleton's, so the concurrency ceiling is unchanged.
-  const overpass = options.overpass ?? withDeadline(getOverpass(), startedAt + deadlineMs());
+  const overpass =
+    options.overpass ?? withDeadline(getOverpass(), startedAt + overpassDeadlineMs());
 
   let result: DrainResult;
   try {
@@ -93,15 +186,11 @@ export async function runIngestSignal(
       derivedLimit: 0,
       dedupeKeys: [signal.dedupeKey],
       workerId: options.workerId,
-      /*
-       * The one caller entitled to opt out of `drainSlotGate`. Here the process *is* the fleet:
-       * `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1` leave one host, whose
-       * invocations share the one `OverpassClient` singleton and so are already bounded by
-       * `OVERPASS_MAX_CONCURRENT`. A cross-process lock here would serialise invocations that
-       * the platform has already made safe, and halve the throughput the clamp was sized for.
-       */
-      gate: null,
-      deps: { overpass, deadlineAt: startedAt + handlerDeadlineMs(), logger: pipelineLogger(log) },
+      deps: {
+        overpass,
+        deadlineAt: startedAt + handlerDeadlineMs(),
+        logger: pipelineLogger(log),
+      },
     });
   } catch (error) {
     /*
@@ -116,7 +205,44 @@ export async function runIngestSignal(
   }
 
   report(signal, result, log);
+  await assertSettleable(db, signal, result, log, options.deliveryCount ?? 1);
   return result;
+}
+
+/**
+ * Refuse to let the host complete a message whose work is in neither of the two states that mean
+ * something will finish it.
+ *
+ * Only consulted when this invocation claimed nothing: a drain that ran the job has already
+ * written its outcome under its own lease, and re-reading the row would only reintroduce a race.
+ *
+ * Throwing is the whole mechanism. `host.json` sets `autoCompleteMessages: true` and the Node
+ * worker exposes no settlement API, so a handler's only vocabulary is "return" — complete — and
+ * "throw" — abandon. `maxDeliveryCount` is 5, after which the message dead-letters, and a
+ * dead-letter entry for a stranded tile is the honest outcome: the row is still on `ingest_jobs`
+ * for the pump to find once the lease is reclaimed, and somebody has been told.
+ */
+async function assertSettleable(
+  db: PrismaClient,
+  signal: IngestSignal,
+  result: DrainResult,
+  log: WorkerLog,
+  deliveryCount: number,
+): Promise<void> {
+  if (result.claimed > 0) return;
+
+  const job = await db.ingestJob.findUnique({
+    where: { dedupeKey: signal.dedupeKey },
+    select: { status: true, lockedAt: true, lockedBy: true },
+  });
+  const disposition = classifyDisposition(job, Date.now());
+  if (disposition !== 'stranded') return;
+
+  log.error(
+    `${SIGNAL_STRANDED_MARKER} ${signal.dedupeKey}: delivery ${deliveryCount} found the job ` +
+      `${job?.status ?? 'missing'} under a lease held by ${job?.lockedBy ?? 'nobody'} that has expired`,
+  );
+  throw new StrandedSignalError(signal.dedupeKey);
 }
 
 /**
@@ -134,9 +260,7 @@ export const JOB_FAILED_MARKER = 'ingest-job-failed';
 /**
  * Give the pipeline somewhere to log. Until this existed `PipelineDeps.logger` was set on no
  * deployed path — only `scripts/ingest.ts` — so every line subdivision emits went to
- * `deps.logger ?? (() => {})` and a split was indistinguishable from an ordinary `done`. A
- * round was spent inferring "the split path was never reached" from the absence of a trace the
- * code could not emit.
+ * `deps.logger ?? (() => {})` and a split was indistinguishable from an ordinary `done`.
  *
  * Warning rather than information because the events that reach it are all deferrals or
  * blockages, and `host.json` excludes `Trace` from sampling so none of them can be dropped.
@@ -158,7 +282,8 @@ function report(signal: IngestSignal, result: DrainResult, log: WorkerLog): void
 
   if (result.claimed === 0) {
     // Not an error and not a retry: the tile is already ready, another worker holds it, or a
-    // failure pushed `runAfter` into the future. The pump will re-signal it when it is due.
+    // failure pushed `runAfter` into the future. `assertSettleable` decides whether that is a
+    // state the message may be completed on.
     log.info(`ingest ${key}: nothing claimable — done, running elsewhere, or not yet due`);
   } else if (result.succeeded > 0) {
     log.info(`ingest ${key}: done`);

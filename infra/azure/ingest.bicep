@@ -94,28 +94,6 @@ param terrainTileUrl string = ''
 param mapillaryToken string = ''
 
 @description('''
-Whether ingest runs through this queue. Written to the Function App as `INGEST_QUEUE_DRIVER` and
-read by both functions here, exactly as Vercel reads it.
-
-That is what makes the flag a rollback: set both sides to `postgres` and the Vercel cron drains
-`ingest_jobs` again while the pump stops publishing and the trigger drops what is left. Set only
-one and the two drain the same table at once, which is worse than either alone. At 3am the faster
-brake is `az functionapp config appsettings set` on this one setting, which restarts the app and
-takes effect in seconds.
-
-**No default, on purpose.** A template deployment overwrites this setting with whatever the
-parameter says, so a default would let a routine deploy silently undo an operator's rollback —
-and the unsafe direction (`servicebus`) is exactly the one a forgotten `export` would have
-restored. Every deployment must state the driver; `ingest.bicepparam` reads it from
-`INGEST_QUEUE_DRIVER` in the deploying shell and the build fails if it is unset.
-''')
-@allowed([
-  'postgres'
-  'servicebus'
-])
-param ingestQueueDriver string
-
-@description('''
 How deep a tile that outruns `INGEST_DEADLINE_MS` may be subdivided. `9` is off: no tile splits,
 a dense one fails exactly as it did before, and children already created still finish and still
 roll up. `11` allows two levels — six Alps tiles hit the 540 s wall on 2026-08-04, and `120221203`
@@ -125,9 +103,8 @@ expected to be enough and the second is margin.
 **A parameter, not a literal, and `ingest.bicepparam` resolves it to `9` unless the deploying
 shell says otherwise.** An ARM application-settings write replaces the collection whole, so a
 value baked into the template would re-enable subdivision on the next routine deploy after an
-operator had turned it off at 3am. The polarity is the point and it is the opposite of
-`ingestQueueDriver`'s: for the driver both values are dangerous, so it has no fallback at all;
-here the unsafe direction is only ever *on*, so a forgotten `export` must land on off.
+operator had turned it off at 3am. The polarity is the point: the unsafe direction here is only
+ever *on*, so a forgotten `export` must land on off.
 
 Subdivision stays off in the committed parameters until `INGEST_TRAIL_IDENTITY` is `claim`. A new
 interior seam fragments a multi-way trail that crosses it — `assembleTrails` keys a way-trail by
@@ -274,8 +251,9 @@ Basic is a legitimate downgrade if the credit tightens — the only change is th
 `disableLocalAuth: true` is what makes the **Service Bus path** keyless: both sides authenticate with
 an Entra identity — the worker with the Function App's system-assigned one, Vercel with the federated
 user-assigned one below — and with local auth off no SAS key would work even if one leaked. Turning
-it back on is a one-line revert, and the flag rollback does not need it: `INGEST_QUEUE_DRIVER=postgres`
-bypasses the broker entirely.
+it back on is a one-line revert. There is no longer a flag that bypasses the broker: Service Bus is
+the only route a tile takes, so the broker being reachable is a hard dependency rather than an
+optimisation, and `publishIngestSignals` fails loudly rather than falling back.
 
 It is not a claim about this file, but this file is now close to it. **One** long-lived credential
 is deployed from here and a maintainer needs to know it is there to rotate: `DATABASE_URL`, passed
@@ -308,12 +286,32 @@ so a message and a row can never disagree about what to do.
 
 The two settings that carry an argument:
 
-`lockDuration: PT5M` is the service maximum, and is deliberately **shorter** than the 30-minute
-database lease (`LEASE_TIMEOUT_MS`, packages/ingest/src/jobs.ts). A crashed host's message returns
-in five minutes, finds the row still leased, claims nothing and completes as a no-op. The
-`(lockedBy, lockedAt)` compare-and-set fence in `writeOutcome` is the real guard; this is not trying
-to be one. Locks on a message actually being worked are held by the host's auto-renewal, configured
-in `host.json` at `00:30:00` so lock and lease expire together rather than one silently first.
+`lockDuration: PT5M` is the service maximum, and what matters about it is how it composes with the
+handler's clock and the database lease. `host.json` kills the handler at `functionTimeout`
+(`00:10:00`) and `LEASE_TIMEOUT_MS` (packages/ingest/src/jobs.ts) is twelve minutes, which puts
+both bounds the right way round:
+
+  functionTimeout (600 s) < LEASE_TIMEOUT_MS (720 s) <= functionTimeout + lockDuration (900 s)
+
+The **lower** bound stops a live handler's lease expiring underneath it while it is still working —
+another process would claim the tile and the two would commit the same trails twice.
+
+The **upper** bound is what repairs a killed handler. Auto-renewal stops the moment the process
+dies, so the message returns somewhere inside the five minutes after the kill; the lease expires at
+720 s, no later than the end of that window. A redelivery arriving after it finds an expired lease,
+`reclaimExpiredJobs` returns the row to `queued` ahead of the claim, and the work is re-run rather
+than short-circuited. A redelivery arriving *before* it still sees `running` and completes — that
+one is caught by `ingestPump`, whose two-minute reclaim frees the lease and republishes the row.
+Both paths re-run the work; neither drops it.
+
+All three numbers live in different files, and any one of them moving alone breaks the chain, so
+`apps/ingest-worker/test/drain.test.ts` reads `lockDuration` from this template and `functionTimeout`
+from `host.json` and asserts the inequality. Lowering `lockDuration` to `PT1M` is the plausible
+tuning that would break it, and it is the one that reinstates the measured failure: the message
+would come back at 660 s against a lease still live until 720 s, every time.
+
+`maxAutoLockRenewalDuration` in `host.json` is `00:30:00`, well past `functionTimeout`, so a running
+handler never loses its lock to renewal expiry.
 
 `maxDeliveryCount: 5` with `deadLetteringOnMessageExpiration: false` gives the dead-letter queue one
 meaning: **the worker could not reach Postgres five times**. Work errors never redeliver — `drainJobs`
@@ -741,15 +739,12 @@ instances, each with its own client at 2. The chain that stops it, every link tr
     x 2  requests per client    OVERPASS_MAX_CONCURRENT = 2  (below)
     = 2  concurrent Overpass requests per host instance
 
-**Every line of that arithmetic is about this app, and this app performs no Overpass work.**
-`INGEST_QUEUE_DRIVER` is `postgres` in production, the host's own log reads `INGEST_QUEUE_DRIVER is
-not servicebus — Postgres owns the drain`, and `ingestDrain`'s most recent invocation is
-2026-08-06T00:44:04Z, the tail of the last flag-on proof. The drainer that
-runs is Vercel, where a lambda is a process and the platform starts as many as the traffic asks for,
-so the singleton on the fourth line bounds a fraction of it and the first three lines do not apply at
-all. `INGEST_MAX_DRAINERS` below, enforced by an advisory lock in
-`packages/ingest/src/drain-slot.ts`, is what bounds the fleet; this chain remains correct for the
-day the worker owns the drain.
+**This app is now the only thing that performs Overpass work, so every line of that arithmetic is
+load-bearing.** It used to be advisory: the drain ran on Vercel, where a lambda is a process and the
+platform starts as many as traffic asks for, so the singleton on the fourth line bounded a fraction
+of the fleet and the first three lines applied to nothing. With the Vercel path deleted the chain
+above is the deployment, and `INGEST_MAX_DRAINERS` below — enforced by an advisory lock in
+`packages/ingest/src/drain-slot.ts` — is what holds it across host instances rather than within one.
 
 The first two lines are the ones doing the work here, and the fourth is why: however many
 invocations the host starts, they run in one Node process and share one `OverpassClient`, whose own
@@ -778,15 +773,14 @@ that admits a drainer.
 is visible in the portal alongside the scale limit. **Raising it, or `INGEST_MAX_DRAINERS`, breaks
 the fair-use guarantee.** They are not throughput knobs.
 
-Vercel makes zero Overpass requests once `INGEST_QUEUE_DRIVER=servicebus` — but that is a property
-of *a Vercel environment*, not of the deployment, and production is on `postgres`, so it is not the
-operative case today. Production and Preview each carry the flag, or do not, independently, and a
-branch deployed before the flag existed drains inline whatever the environment says because its code
-has no `ingestQueueDriver` call to make. Three call sites reach Overpass from a Vercel process and
-all three are gated on the flag: the cron route's `drainIfOwned`, `trails.ts`'s `kickIngest`, and
-`routes.ts`'s `kickNetwork`. The last was missed once — it drained `ingest_network` inline from a
-public procedure the planner fires on every viewport settle, which the pump also publishes, so that
-kind had two drainers while this comment asserted it had one.
+Vercel makes zero Overpass requests, and that is now a property of the deployment rather than of a
+setting. The three call sites that used to reach Overpass from a Vercel process are deleted, not
+gated: the cron route's `drainIfOwned`, `trails.ts`'s `kickIngest` and `routes.ts`'s `kickNetwork`.
+A Vercel process enqueues and publishes; it has no drain to run and no code path that could start
+one. `kickNetwork` is the reason the distinction matters — it drained `ingest_network` inline from a
+public procedure the planner fires on every viewport settle, so that kind had two drainers while the
+prose here asserted it had one. Deleting the path is what makes the claim checkable instead of
+conditional.
 
 **The host's 10-minute `functionTimeout` bounds the handler, so the client has to be bounded too.**
 `OverpassClient`'s own worst case on the defaults is `maxAttempts` 6 x `requestTimeoutMs` 190 s plus
@@ -924,14 +918,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'SERVICE_BUS_QUEUE_RESOURCE_ID'
             value: queue.id
           }
-          // The same flag Vercel reads, so a rollback stops both drainers rather than one.
-          {
-            name: 'INGEST_QUEUE_DRIVER'
-            value: ingestQueueDriver
-          }
           // The instant brake. Setting this to false stops the pump publishing in seconds with no
-          // deploy anywhere, which is a faster stop than the Vercel-side INGEST_QUEUE_DRIVER flag
-          // (that one needs a redeploy to take effect).
+          // deploy anywhere. It does not stop the drain — in-flight messages finish and the
+          // maintenance sweep keeps running, which is what makes it safe to leave on.
           {
             name: 'INGEST_PUMP_ENABLED'
             value: 'true'
@@ -965,9 +954,22 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // 540 s worst case, inside the 600 s Consumption fixes `functionTimeout` at. Before
           // these, one query's own budget was six attempts of 190 s plus backoff — about 24
           // minutes — and `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
+          //
+          // 300 s is a ceiling now, not the operative number: `overpassDeadlineMs` derives the
+          // start-by moment as INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS
+          // and takes whichever is lower. The three below have to add up, so the derivation owns
+          // the arithmetic and this setting can only tighten it.
           {
             name: 'INGEST_OVERPASS_DEADLINE_MS'
             value: '300000'
+          }
+          // Wall clock held back for the commit loop. Without it the two Overpass queries could
+          // consume the whole handler budget, every trail threw `IngestDeadlineError`, and the
+          // tile subdivided into four children that repeated the exercise — measured 2026-08-08 as
+          // five invocations of 504,637 ms to 548,954 ms against a 540,000 ms bound.
+          {
+            name: 'INGEST_COMMIT_RESERVE_MS'
+            value: '150000'
           }
           {
             name: 'OVERPASS_MAX_TOTAL_MS'
@@ -1225,6 +1227,32 @@ telemetry could take the one line these arms match with it. `excludedTypes` ther
 `Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough. `autoMitigate` is off
 — the condition is "this happened", not "this is happening", and an alert that resolves itself the
 moment the tile stops being retried is an alert nobody reads.
+
+**The fourth arm is the one that sees a killed handler.** A handler the host kills at
+`functionTimeout` writes no request row at all — the process stops between two awaits — so the
+first arm is structurally incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC:
+`Functions.ingestDrain` logged 42 `Executing` against 37 `Executed`, and five invocations of
+504,637 ms to 548,954 ms every one of which recorded `Success=True`.
+
+The three deployed arms are **not** silent over that window — run verbatim they return five
+matches: one `ingest-job-failed` for `ingest_tile:120222201` at 16:56:39, and four
+`switchback-ingest-tile-split` at 17:55:05, 18:04:14, 18:13:20 and 18:22:30. Every one of those is
+a different fault. None is the killed handler, and the `Executing`-minus-`Executed` gap of five is
+invisible to all three.
+
+The signal the fourth arm watches is written by the reaper rather than by the redelivery, because
+the reaper is the only participant that observes the death. `reclaimExpiredJobs` runs ahead of the
+claim in both `drainJobs` and `drainSlotGate`, so by the time a redelivered message is classified
+the row has already been returned to `queued` and that delivery has nothing left to report — which
+is the repair working, not a gap. The reclaim emits `switchback-ingest-lease-expired`, and it fires
+on the real event: inside the same window the pump logged three non-zero reclaims, at 17:45:12,
+17:58:22 and 18:16:20 UTC, plus a retirement at 17:04:00. Each was a lease whose holder had died,
+and none carried a token any rule could match.
+
+**The fifth arm is narrower than it looks, deliberately.** `switchback-ingest-signal-stranded`
+covers the one state no reclaim can free — a `running` row whose `lockedAt` is NULL, which
+`lockedAt < cutoff` never matches however long it sits. That is a different fault from a killed
+handler and it needs its own arm; it is not a second chance at the same one.
 ''')
 resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-failed'
@@ -1243,7 +1271,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -1264,26 +1292,75 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
 }
 
 @description('''
-**The drainer that actually runs has no telemetry of its own, and this is how it gets some.**
+**A 429 from Overpass is the one upstream signal that can take the product down, and nothing read
+it.** The public instances allot slots per client IP; sustained rate limiting is answered with a
+block, and a blocked IP means no tile ingests at all until somebody notices and asks for it back.
 
-`switchback-ingest-drain-failed` above is scoped to this Application Insights resource, and every
-arm of it reads something the Function App emits. With `INGEST_QUEUE_DRIVER` on `postgres` — the
-production setting, and the one `ingestDrain`'s absence of invocations over the last 24 hours
-records — the drain runs on Vercel,
-which has no Application Insights at all. Its split markers, its stuck-subtree markers and any 429
-a mirror returns go to a console with no alerting on it, so "no 429s observed" was a statement
-about what could be seen rather than about what happened.
+`switchback-ingest-queue-distress` has a `rateLimited` gauge, but it counts `ingest_jobs.lastError`
+containing '429' — so it only sees a rate limit that outlived the retry budget and failed a job.
+Failover absorbs most of them before that, and an absorbed 429 touches no job row. Measured on
+2026-08-08: the distress line reported `rateLimited=0` on every tick while `OVERPASS_STRAIN_MARKER`
+recorded five real 429s between 16:37:28 and 18:24:51 UTC, each followed by a failover.
+
+This rule reads the request path directly, where the 429 actually arrives.
+`packages/ingest/src/overpass.ts` logs one line per non-OK response, and the `status=` in it is the
+code the mirror returned. Scoped to 429 rather than to strain generally: a 504 is a slow mirror and
+failover is the designed answer, but a 429 is the upstream telling us we are over our allowance,
+and the correct response is a person deciding whether to back off.
+''')
+resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-overpass-limited'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-overpass-limited'
+    description: 'Overpass answered 429. Sustained rate limiting is answered with an IP block, which stops ingestion entirely.'
+    severity: 2
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'traces | where message has "switchback-ingest-overpass-strain" and message has "status=429" | project timestamp'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: false
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
+@description('''
+**The queue needs a gauge as well as an event stream, and this is it.**
+
+`switchback-ingest-drain-failed` above fires on things that *happened* — a job that failed, a
+handler the host killed, a tile that deferred itself to four children. This rule watches what is
+*true*: conditions that persist, and that nothing would report until somebody went looking.
 
 Five of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
 `lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck.
 The sixth is the absence of rows changing — a drain that has stopped leaves no error behind, so
 `stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`.
-`ingestPump` already runs here every two minutes and already reads that database, so
+`ingestPump` runs every two minutes and already reads that database, so
 `apps/ingest-worker/src/health.ts` reads the six counts and logs `switchback-ingest-queue-distress`
-when any is non-zero. That log line is what this rule watches — a condition the running code
-emits, on a schedule that does not depend on which side owns the drain. The report is deliberately
-ahead of the `INGEST_QUEUE_DRIVER` guard in `functions/pump.ts`: `postgres` is exactly the setting
-under which it matters.
+when any is non-zero. The report runs ahead of the `INGEST_PUMP_ENABLED` brake in
+`functions/pump.ts`: a queue somebody has deliberately stopped feeding is exactly when its depth
+still needs watching.
 
 **Each of the six can return to zero, which is what makes this a rule rather than a light left
 on.** Three of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
@@ -1357,9 +1434,9 @@ nothing wrong. That is not a hypothetical: `WEBSITE_RUN_FROM_PACKAGE` is set by
 serving whatever zip it last received, indefinitely and silently.
 
 `reportQueueHealth` logs `switchback-ingest-queue-health` on **every** reading — the first statement
-in the `ingestPump` handler, ahead of the `INGEST_QUEUE_DRIVER` guard, on a two-minute timer that
-does not depend on which side owns the drain. Fifteen lines are expected per window. Zero means the
-pump did not run, or ran a build with no `health.ts` in it, and there is no third reading.
+in the `ingestPump` handler, ahead of the `INGEST_PUMP_ENABLED` brake, on a two-minute timer.
+Fifteen lines are expected per window. Zero means the pump did not run, or ran a build with no
+`health.ts` in it, and there is no third reading.
 
 **The query returns a row even when nothing matches**, which is what makes a count of zero
 alertable: `summarize` with no `by` clause yields exactly one row holding `0`, where the bare

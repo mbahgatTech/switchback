@@ -7,16 +7,20 @@ import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 
 /**
- * How long a claim holds a job before `reclaimExpiredJobs` may take it back. Sized above the
- * slowest honest run, because reclaiming live work runs it twice: `processTile` may spend the
- * query's own `[timeout:180]` plus 90 s on features and 60 s on the region before it commits
- * anything, and its commit loop measured 88 s over a 144-trail tile with each trail's
- * transaction allowed 30 s. `processRoute` is worse — a continental relation is refetched as
- * thousands of ways, 250 to a request, through a client capped at two concurrent. Ten minutes
- * sat inside that envelope. Thirty is outside it and still bounds a dead worker to half an
- * hour, against the seventy-five hours one managed in production.
+ * How long a claim holds a job before `reclaimExpiredJobs` may take it back.
+ *
+ * **It is bounded by the host, not by the work.** One process claims: the Function App's
+ * `ingestDrain`, whose `host.json` sets `functionTimeout` to ten minutes and whose handler stops
+ * beginning phases at `INGEST_DEADLINE_MS`. So no live lease can be older than ten minutes, and a
+ * lease that is has provably lost its holder — the host killed the process.
+ *
+ * Two minutes of margin above that covers clock skew between the app and Postgres and the
+ * bookkeeping after the last phase. Thirty minutes was sized for a Vercel drainer that could hold
+ * a lease across a whole `processRoute`; with that path removed, thirty minutes is twenty of
+ * pure delay before a killed invocation's tile can be picked up again — which is most of what
+ * "the work was dropped on the floor" measured as.
  */
-export const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
+export const LEASE_TIMEOUT_MS = 12 * 60 * 1000;
 
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -269,7 +273,35 @@ export interface ReclaimResult {
   requeued: number;
   /** Leases whose job was out of attempts and is now `dead`. */
   retired: number;
+  /** The units of work that lost their holder, in the order the reaper found them. */
+  reclaimed: ReclaimedLease[];
 }
+
+/** A lease that expired with no outcome, and the process that held it when it died. */
+export interface ReclaimedLease {
+  dedupeKey: string;
+  /** Where the reaper put it: `queued` to run again, or `dead` if it was out of attempts. */
+  status: JobStatus;
+  lockedBy: string | null;
+}
+
+/**
+ * The literal `switchback-ingest-lease-expired` greps for.
+ *
+ * A handler the host kills mid-tile writes no request row and no error — the invocation stops
+ * between two awaits — so a rule reading `requests | success == false` is structurally incapable
+ * of firing on it. What it does leave behind is a `running` row nothing will renew, and the
+ * reaper below is the process that discovers it.
+ *
+ * The token belongs here rather than on the redelivery that finds the tile busy. By the time a
+ * redelivered message is classified, this reclaim has already run ahead of the claim and returned
+ * the row to `queued` — so the redelivery sees a healthy queue and has nothing to report. The
+ * reaper is the only participant that observes the death itself.
+ */
+export const LEASE_EXPIRED_MARKER = 'switchback-ingest-lease-expired';
+
+/** How many keys the marker line names before it stops; the count is always exact. */
+const MARKER_KEY_LIMIT = 10;
 
 /**
  * Take back every job whose lease has expired: the reaper, and the only route out of `running`
@@ -279,15 +311,16 @@ export interface ReclaimResult {
  *
  * The increment is what makes a job that kills its worker terminate: it costs an attempt per
  * crash, on top of the one the claim spent, so `maxAttempts` retires a reliably fatal job in
- * two crashes rather than five. `runAfter` is deliberately left where it is — a crash is not
- * an upstream saying "slow down", and the lease itself has already spaced the retry by half an
- * hour. `lastError` is set on both paths because these rows carried a null one for seventy-five
- * hours and nothing on them said why.
+ * two crashes rather than five. `runAfter` is deliberately left where it is — a crash is not an
+ * upstream saying "slow down", and `LEASE_TIMEOUT_MS` has already spaced the retry by twelve
+ * minutes. `lastError` is set on both paths because these rows carried a null one for
+ * seventy-five hours and nothing on them said why.
  */
 export async function reclaimExpiredJobs(
   db: Db,
   now = new Date(),
   timeoutMs = LEASE_TIMEOUT_MS,
+  log: (line: string) => void = (line) => console.warn(line),
 ): Promise<ReclaimResult> {
   const cutoff = new Date(now.getTime() - timeoutMs);
   const reason = `lease expired after ${Math.round(timeoutMs / 60_000)} min with no outcome`;
@@ -299,7 +332,7 @@ export async function reclaimExpiredJobs(
   //
   // `lockedAt` and `lockedBy` are left alone: the status change is what releases the lease, and
   // they are the record of which process held it when it died.
-  const rows = await db.$queryRaw<Array<{ status: JobStatus }>>`
+  const rows = await db.$queryRaw<ReclaimedLease[]>`
     UPDATE ingest_jobs SET
       attempts      = attempts + 1,
       status        = CASE WHEN attempts + 1 >= "maxAttempts"
@@ -308,11 +341,20 @@ export async function reclaimExpiredJobs(
                            THEN ${now} ELSE "completedAt" END,
       "lastError"   = ${reason}
     WHERE status = 'running' AND "lockedAt" < ${cutoff}
-    RETURNING status
+    RETURNING status, "dedupeKey", "lockedBy"
   `;
 
+  if (rows.length > 0) {
+    const named = rows
+      .slice(0, MARKER_KEY_LIMIT)
+      .map((row) => `${row.dedupeKey} (held by ${row.lockedBy ?? 'nobody'} -> ${row.status})`)
+      .join('; ');
+    const rest = rows.length > MARKER_KEY_LIMIT ? `; +${rows.length - MARKER_KEY_LIMIT} more` : '';
+    log(`${LEASE_EXPIRED_MARKER} ${rows.length} lease(s) expired with no outcome: ${named}${rest}`);
+  }
+
   const retired = rows.filter((row) => row.status === JobStatus.dead).length;
-  return { requeued: rows.length - retired, retired };
+  return { requeued: rows.length - retired, retired, reclaimed: rows };
 }
 
 export type JobHandler = (job: ClaimedJob) => Promise<void>;

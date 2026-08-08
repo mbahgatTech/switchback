@@ -33,6 +33,7 @@ const CLEAN: QueueHealth = {
   rateLimited: 0,
   orphanedSplits: 0,
   stuckSubtrees: 0,
+  wedgedTiles: 0,
   stalledDrain: 0,
 };
 
@@ -147,18 +148,29 @@ describe('the alert that watches it', () => {
 });
 
 /**
- * `ingestPump` is the only process inside the alert's scope that runs on a schedule, and it
- * returns early unless `INGEST_QUEUE_DRIVER` is `servicebus` — which production is not. The report
- * has to be ahead of that guard or it never runs on the configuration that needs it.
+ * `ingestPump` is the only process inside the alert's scope that runs on a schedule, so the
+ * report and the maintenance sweep both have to sit ahead of `INGEST_PUMP_ENABLED`. That brake is
+ * pulled precisely when something is wrong, which is when a queue nobody is reading and a lease
+ * nobody is reclaiming are least affordable.
  */
 describe('where the report is called from', () => {
   const pump = readFileSync(resolve(here, '../src/functions/pump.ts'), 'utf8');
 
-  it('runs before the driver guard returns', () => {
+  it('reports and sweeps before the pump brake returns', () => {
     const reported = pump.indexOf('reportQueueHealth(backgroundPrisma');
-    const guard = pump.indexOf("ingestQueueDriver() !== 'servicebus'");
+    const maintained = pump.indexOf('maintain(context)');
+    const brake = pump.indexOf('if (braked())');
     expect(reported).toBeGreaterThan(-1);
-    expect(guard).toBeGreaterThan(-1);
-    expect(reported).toBeLessThan(guard);
+    expect(maintained).toBeGreaterThan(-1);
+    expect(brake).toBeGreaterThan(-1);
+    expect(reported).toBeLessThan(brake);
+    expect(maintained).toBeLessThan(brake);
+  });
+
+  it("is the estate's only queue-maintenance schedule", () => {
+    // `sweepQueue` reclaims expired leases and clears orphaned split markers. It ran on Vercel
+    // until the ingestion path there was removed; nothing else calls it on a schedule now.
+    expect(pump).toContain('sweepQueue(backgroundPrisma)');
+    expect(pump).toContain('pruneFinishedJobs(backgroundPrisma)');
   });
 });

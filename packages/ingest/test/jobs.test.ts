@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
 import {
+  LEASE_EXPIRED_MARKER,
   LEASE_TIMEOUT_MS,
   claimJobs,
   completeJob,
@@ -375,10 +376,40 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 1, retired: 0 });
+    expect(result.requeued).toBe(1);
+    expect(result.retired).toBe(0);
     // Back to `queued` with the attempt counted — a job that keeps killing its worker has to
     // move towards its budget, or the sweep that recovers it is also the loop that repeats it.
     expect(recorded.reaped).toEqual([{ id: 'stuck', attempts: 2, status: JobStatus.queued }]);
+  });
+
+  it('names the lease it took back, so the alert has something to match on', async () => {
+    /*
+     * The signal that closes the killed-handler gap. This reaper is the only participant that
+     * observes the death: by the time a redelivered message is classified, the reclaim below has
+     * already returned the row to `queued`, so the delivery sees a healthy queue.
+     */
+    const { db } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+    const lines: string[] = [];
+
+    const result = await reclaimExpiredJobs(db, now, LEASE_TIMEOUT_MS, (line) => lines.push(line));
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(LEASE_EXPIRED_MARKER);
+    expect(result.reclaimed).toHaveLength(1);
+  });
+
+  it('says nothing when no lease had expired, so the alert is not a light left on', async () => {
+    const { db } = fakeDb([], {
+      running: [{ id: 'working', lockedAt: fresh, attempts: 1, maxAttempts: 5 }],
+    });
+    const lines: string[] = [];
+
+    await reclaimExpiredJobs(db, now, LEASE_TIMEOUT_MS, (line) => lines.push(line));
+
+    expect(lines).toEqual([]);
   });
 
   it('leaves a freshly locked job alone', async () => {
@@ -390,13 +421,14 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 0, retired: 0 });
+    expect(result.requeued).toBe(0);
+    expect(result.retired).toBe(0);
     expect(recorded.reaped).toEqual([]);
   });
 
   it('retires a job that has run out of attempts rather than requeueing it forever', async () => {
     // A job whose handler takes the worker down with it never reaches `failJob`, so without
-    // this the sweep would hand it back every half hour for as long as the table exists.
+    // this the sweep would hand it back every lease period for as long as the table exists.
     const { db, recorded } = fakeDb([], {
       running: [
         { id: 'poison', lockedAt: stale, attempts: 4, maxAttempts: 5 },
@@ -406,7 +438,8 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 1, retired: 1 });
+    expect(result.requeued).toBe(1);
+    expect(result.retired).toBe(1);
     expect(recorded.reaped[0]).toEqual({ id: 'poison', attempts: 5, status: JobStatus.dead });
   });
 
@@ -421,7 +454,7 @@ describe('reclaimExpiredJobs', () => {
     // These rows carried a null `lastError` for three days and nothing on them said what
     // happened; the lease itself has already spaced the retry, so `runAfter` stays put.
     expect(recorded.reapValues).toContainEqual(
-      expect.stringContaining('lease expired after 30 min'),
+      expect.stringContaining('lease expired after 12 min'),
     );
     expect(recorded.reapValues).toContainEqual(new Date(now.getTime() - LEASE_TIMEOUT_MS));
     expect(sql).toContain('"lastError"');
@@ -507,8 +540,11 @@ describe('which process ran a job', () => {
     await reclaimExpiredJobs(db, new Date(LEASE_TIMEOUT_MS * 2));
 
     const sweep = recorded.rawSql.find((sql) => sql.includes('RETURNING status'))!;
-    expect(sweep).not.toContain('"lockedBy"');
-    expect(sweep).not.toContain('"lockedAt"    = NULL');
+    // Scoped to the assignments: the sweep *reads* `lockedBy` back to say who died, and must
+    // not write over either column — they are the only record of which process held the lease.
+    const assignments = sweep.slice(sweep.indexOf('SET'), sweep.indexOf('WHERE'));
+    expect(assignments).not.toContain('"lockedBy"');
+    expect(assignments).not.toContain('"lockedAt"');
     // What releases it instead — the sweep writes `queued` or `dead` over `running`.
     expect(sweep).toContain("status = 'running'");
   });

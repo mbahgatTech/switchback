@@ -3,8 +3,6 @@
  * message carries only a `dedupeKey`, so a message and a row can never disagree.
  */
 
-export type IngestQueueDriver = 'postgres' | 'servicebus';
-
 export const DEFAULT_INGEST_QUEUE = 'ingest-jobs';
 
 /**
@@ -33,15 +31,6 @@ const TOKEN_SKEW_MS = 120_000;
  */
 const MAX_BATCH = 100;
 
-/**
- * Which queue drives ingest, from `INGEST_QUEUE_DRIVER`. Anything but `servicebus` — unset,
- * blank, a typo — is the Postgres drain that has always shipped, so a broken value degrades to
- * the working path. `apps/web/src/env.ts` rejects the typo at startup rather than leaving it here.
- */
-export function ingestQueueDriver(source: NodeJS.ProcessEnv = process.env): IngestQueueDriver {
-  return source.INGEST_QUEUE_DRIVER?.trim() === 'servicebus' ? 'servicebus' : 'postgres';
-}
-
 interface SendTarget {
   /** `<namespace>.servicebus.windows.net`, the REST host — not the `sb://` endpoint. */
   host: string;
@@ -67,13 +56,26 @@ export interface PublishResult {
 }
 
 /**
+ * The literal an operator greps for when a wake-up did not reach the broker.
+ *
+ * Enqueue has one path now, so a publish that fails is the only moment at which a tile somebody
+ * is looking at depends on the pump's two-minute tick rather than on a doorbell. Nothing else
+ * says so: `publishIngestSignals` cannot throw without emptying the map on a broker incident, and
+ * a returned count reaches only a caller that is already inside `waitUntil`.
+ */
+export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
+
+/**
  * Publish one signal per key, best effort.
  *
  * **It never throws and never rejects.** The row is written by `queueTiles` before anything
  * calls this, so a broker outage — or a token exchange the identity provider refuses — costs
  * the wake-up and nothing else: the work is still queued, still deduped, still priority-ordered,
- * and the worker's own pump re-derives it from `ingest_jobs` within two minutes. Failing the
- * request instead would let a Service Bus incident empty the map.
+ * and `runPump` re-derives it from `ingest_jobs` on its next two-minute tick. Failing the request
+ * instead would let a Service Bus incident empty the map.
+ *
+ * That recovery is why a lost signal is latency rather than loss, and `PUBLISH_FAILED_MARKER` is
+ * what keeps it from being silent: `ingest_jobs` is the queue of record and this is a doorbell.
  */
 export async function publishIngestSignals(
   dedupeKeys: readonly string[],
@@ -83,7 +85,7 @@ export async function publishIngestSignals(
 
   const target = sendTarget(options.env ?? process.env);
   if (!target) {
-    console.error('[ingest] INGEST_QUEUE_DRIVER=servicebus with no usable publisher identity');
+    console.error(`${PUBLISH_FAILED_MARKER} no usable publisher identity for this deployment`);
     return { published: 0, failed: dedupeKeys.length };
   }
 
@@ -136,11 +138,14 @@ async function sendBatch(
      * mint an identical token, so it is kept and the operator gets the status code.
      */
     console.error(
-      `[ingest] service bus refused ${dedupeKeys.length} signal(s): ${response.status}`,
+      `${PUBLISH_FAILED_MARKER} service bus refused ${dedupeKeys.length} signal(s): ${response.status}`,
     );
     return false;
   } catch (error) {
-    console.error(`[ingest] service bus unreachable for ${dedupeKeys.length} signal(s)`, error);
+    console.error(
+      `${PUBLISH_FAILED_MARKER} service bus unreachable for ${dedupeKeys.length} signal(s)`,
+      error,
+    );
     return false;
   }
 }
@@ -173,7 +178,7 @@ export function resetPublisherToken(): void {
 async function accessToken(target: SendTarget, oidcToken?: string | null): Promise<string | null> {
   const assertion = oidcToken?.trim();
   if (!assertion) {
-    console.error('[ingest] no Vercel OIDC token on this request — nothing to exchange');
+    console.error(`${PUBLISH_FAILED_MARKER} no Vercel OIDC token on this request to exchange`);
     return null;
   }
 
@@ -204,13 +209,15 @@ async function accessToken(target: SendTarget, oidcToken?: string | null): Promi
       // The body carries an `error_description` naming the mismatched claim, and also echoes
       // the assertion's trace ids. Only the status is logged: the rest is a bearer token's
       // error envelope and this runs where anyone with log access can read it.
-      console.error(`[ingest] entra refused the OIDC assertion: ${response.status}`);
+      console.error(
+        `${PUBLISH_FAILED_MARKER} entra refused the OIDC assertion: ${response.status}`,
+      );
       return null;
     }
 
     const payload = (await response.json()) as { access_token?: string; expires_in?: number };
     if (!payload.access_token) {
-      console.error('[ingest] entra returned no access_token');
+      console.error(`${PUBLISH_FAILED_MARKER} entra returned no access_token`);
       return null;
     }
 
@@ -221,7 +228,10 @@ async function accessToken(target: SendTarget, oidcToken?: string | null): Promi
     };
     return cached.value;
   } catch (error) {
-    console.error('[ingest] could not reach entra to exchange the OIDC token', error);
+    console.error(
+      `${PUBLISH_FAILED_MARKER} could not reach entra to exchange the OIDC token`,
+      error,
+    );
     return null;
   }
 }
