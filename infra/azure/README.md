@@ -7,17 +7,10 @@ runs on Vercel, photographs live in Cloudflare R2, CI runs on GitHub Actions.
 **Production has served from Azure since 2026-07-30, about 20:09 UTC.** It is the only copy of
 this data.
 
-```mermaid
-flowchart LR
-  V["Vercel<br/>switchback-three.vercel.app"]
-  CI["GitHub Actions<br/>ci.yml migrate job"]
-  A["Azure Postgres 17 + PostGIS — live<br/>psql-switchback-prod-37ywppu5p7fri<br/>rg-switchback-prod-northcentralus"]
-  P["Point-in-time restore<br/>14 days, locally redundant<br/>restores into a new server"]
+![Switchback production estate: deployment boundaries, the credentials that cross them, and the absent network boundary](../../docs/diagrams/estate.svg)
 
-  V -->|"sbapp, password, DML only"| A
-  CI -->|"id-switchback-postgres-ci, Entra token, DDL"| A
-  A -.->|"the only recovery"| P
-```
+Recovery is point-in-time restore into a **new** server, 14 days, locally redundant. There is no
+second copy and no geo-redundant backup; see [Backups](#backups).
 
 ---
 
@@ -34,7 +27,7 @@ flowchart LR
   now a stored production administrator credential with no consumer. It still sets the blast radius
   while it exists: anyone with write access to this repository can add a workflow step that prints
   it, so compromise of repository write access is compromise of the database administrator. Delete
-  it and `DATABASE_URL` at step 7 of the cutover, not before — until then they are the way back if
+  it and `DATABASE_URL` at step 6 of the cutover, not before — until then they are the way back if
   the token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
   given the same value. A copy in the owner's
   password manager was claimed here previously; nobody observed it being made, so it is not counted.
@@ -135,14 +128,14 @@ There is one, and it is not portable.
 
 ### Azure point-in-time restore — the only recovery
 
-Free, automatic, and the fastest way back from a bad `db push`. Measured 2026-08-05:
+Free, automatic, and the fastest way back from a bad `db push`. Re-read 2026-08-08:
 
-| Fact                   | Value                                                               |
-| ---------------------- | ------------------------------------------------------------------- |
-| Retention configured   | 14 days, locally redundant, `geoRedundantBackup: Disabled`          |
-| Earliest restore point | `2026-07-30T16:32:40Z` — the server's own creation                  |
-| Full backups taken     | Daily, one per day since creation, plus continuous transaction logs |
-| Server state           | `Ready`, `replicationRole: Primary` — eligible                      |
+| Fact                   | Value                                                                      |
+| ---------------------- | -------------------------------------------------------------------------- |
+| Retention configured   | 14 days, locally redundant, `geoRedundantBackup: Disabled`                 |
+| Earliest restore point | `2026-07-30T16:32:40Z` — the server's own creation                         |
+| Full backups taken     | Daily, plus continuous transaction logs — Azure's schedule, not a readback |
+| Server state           | `Ready`, `replicationRole: Primary` — eligible                             |
 
 ```bash
 az postgres flexible-server show \
@@ -188,15 +181,41 @@ ground, not a home.
 
 ## What it provisions
 
-| File                | What it is                                                                                      |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| `main.bicep`        | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname.  |
-| `postgres.bicep`    | The server: compute, storage, backups, firewall, server parameters, the database.               |
-| `monitoring.bicep`  | Log Analytics workspace, the alert action group, and the workload budget.                       |
-| `lock.bicep`        | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.     |
-| `main.bicepparam`   | Every non-secret parameter. Committed. The password is **not** here and never may be.           |
-| `ingest.bicep`      | The ingest queue and its worker. Resource-group scoped, deployed **separately**. See below.     |
-| `ingest.bicepparam` | Its non-secret parameters. The connection string is read from the environment, not stored here. |
+| File                     | What it is                                                                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.bicep`             | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname.                                                                                        |
+| `postgres.bicep`         | The server: compute, storage, backups, firewall, server parameters, the database.                                                                                                     |
+| `monitoring.bicep`       | Log Analytics workspace, the alert action group, and the workload budget.                                                                                                             |
+| `lock.bicep`             | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.                                                                                           |
+| `ci-identity.bicep`      | `id-switchback-postgres-ci` and its federated credential. Zero Azure RBAC, by design.                                                                                                 |
+| `runtime-identity.bicep` | `id-switchback-vercel-publisher` and one federated credential per Vercel environment. Declared a second time in `ingest.bicep` — see below.                                           |
+| `infra-identity.bicep`   | `id-switchback-infra-deploy`. **Declared, not deployed** — see below.                                                                                                                 |
+| `main.bicepparam`        | Every non-secret parameter. Committed. The password is **not** here and never may be.                                                                                                 |
+| `ingest.bicep`           | The ingest queue, its worker, `id-switchback-worker-deploy`, and a second declaration of `id-switchback-vercel-publisher`. Resource-group scoped, deployed **separately**. See below. |
+| `ingest.bicepparam`      | Its non-secret parameters. The connection string is read from the environment, not stored here. **Compiled by no workflow** — see `docs/architecture.md`.                             |
+
+Three user-assigned identities exist in the resource group — `id-switchback-postgres-ci`,
+`id-switchback-vercel-publisher` and `id-switchback-worker-deploy`.
+`id-switchback-infra-deploy` is **not** among them: `main.bicep` declares it, no deployment
+carrying that module has run, and `grantInfraIdentityContributor` is `false` regardless, so
+`infrastructure.yml` compiles templates rather than deploying them. Read it back:
+
+```bash
+az identity list -g rg-switchback-prod-northcentralus --query '[].name' -o json
+```
+
+**Two templates declare `id-switchback-vercel-publisher`, and a reader converging templates
+against the estate should expect that.** `runtime-identity.bicep:57-88`, reached through
+`main.bicep`, and `ingest.bicep:365-427` — `publisher`, with `publisherProduction` and
+`publisherPreview` — declare the same identity name and the same pair of federated credentials in
+the same resource group, which is one live resource with two sources. Whichever template deployed
+last owns its `tags`; the live `component` is `ingest-worker`, so `ingest.bicep` is the one that
+wrote it. `id-switchback-worker-deploy` is declared in `ingest.bicep` alone.
+
+```bash
+az identity show -g rg-switchback-prod-northcentralus -n id-switchback-vercel-publisher \
+  --query tags -o json
+```
 
 | Resource          | Value                                                           |
 | ----------------- | --------------------------------------------------------------- |
@@ -274,18 +293,18 @@ machine with no PostgreSQL client installed.
   federated credential on `id-switchback-postgres-ci` trusts
   `repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/master` and nothing else, so a
   dispatch from any other branch fails at `azure/login` with `AADSTS700213` quoting a subject that
-  appears in no template — which reads as a broken identity rather than a wrong branch. The token
-  path itself has been run: run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3
-  and reported `is_admin|true`, `server_version|17.10` and the full role and row-count census.
-  **That run used a branch credential that has since been deleted, and the `github-master`
-  credential this instruction depends on has never been exercised** — every successful `inspect`
-  ran on `feat/credential-free-postgres` or a worktree branch, and the one dispatch attempted from
-  a feature branch after those credentials were removed failed with `AADSTS700213`. What is proven
-  is that the identity can reach the database and is an administrator; what is unproven is the
-  `master` ref exchange. `postgres-entra.yml` is added to `master` by this change, so the first
-  dispatch from `master` is also the first test of it. Do that while passwords still work — step 6
-  of the cutover requires it — rather than discovering it when there is no password to fall back
-  on.
+  appears in no template — which reads as a broken identity rather than a wrong branch. This exact
+  path has been run from `master`: run 31254093655 dispatched `inspect` from `master` at `1a477da`
+  on 2026-08-08, connected as `id-switchback-postgres-ci` over TLSv1.3, and reported
+  `is_admin|true`, `server_version|17.10` and the full role and row-count census.
+  `id-switchback-postgres-ci` carries exactly one federated credential — `github-master` — so that
+  run is proof of the ref exchange this instruction depends on, and `postgres-entra.yml` has been
+  on `master` since `b0b6406`, an ancestor of `origin/master`. The branch constraint is restated
+  because it has bitten: run 31063906113 succeeded from `feat/credential-free-postgres` against a
+  branch credential that has since been deleted, and run 31088984935, dispatched from a feature
+  branch after that deletion, failed at `azure/login` with `AADSTS700213`. Step 5 of the cutover
+  asks for both administrator doors to be re-proven in the same hour regardless — a door that
+  opened on 2026-08-08 is not a door proven on the day the password stops working.
 
 Do not use `connections_failed` to decide whether the server saw an attempt. It is not zero on this
 server and never has been: measured over 2026-08-05T12:00Z–2026-08-06T12:00Z it records 35 failures
@@ -307,27 +326,31 @@ door the moment `passwordAuthEnabled` is flipped to false.
 | `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
 
 **Both application roles exist and neither is in use.** Every consumer still authenticates by
-password as `sbapp`; `DATABASE_AUTH` is set nowhere. The role names above are what the live catalog
-holds, read on 2026-08-06.
+password as `sbapp`; `DATABASE_AUTH` is set nowhere. Read from the live catalogue on 2026-08-08,
+`pg_roles` holds `sbadmin`, `sbapp`, `sbapp_vercel`, `sbapp_func`, `id-switchback-postgres-ci` and
+the owner's UPN; `sbapp_vercel` and `sbapp_func` carry no password at all and are members of
+`sbapp`. There is no `sbapp_runtime` and none is planned.
 
-`id-switchback-vercel-publisher` is the shared runtime identity: Vercel production, Vercel preview
-and — once `infra/azure/ingest.bicep` moves the worker onto it — the ingest worker are all intended
-to authenticate as this one principal. The resource name is narrower than the role it will hold
-because ARM cannot rename a user-assigned identity; the `component: runtime-identity` tag is where
-a portal reader is told what it actually is.
+`id-switchback-vercel-publisher` is the shared runtime identity: Vercel production and Vercel
+preview both federate to it, and Postgres cannot tell the two environments apart because the FIC
+subject does not survive the token exchange. Two consumers, both Vercel — the resource name is
+accurate, and so is the Postgres role it holds, `sbapp_vercel`.
 
-The consolidation renames `sbapp_vercel` to `sbapp_runtime` and then drops `sbapp_func`, in that
-order and not together. The rename is the `provision` action of the `Postgres identity` workflow;
-it must run from `master`, because the CI identity's federated credential trusts no other ref. The
-drop is the separate `retire` action, and it refuses to run unless the dispatch asserts every
-consumer has been moved — the database cannot establish that for itself, and a sample of
-`pg_stat_activity` cannot stand in for it, because the worker scales to zero between invocations
-and shows no backend for most of any minute however healthy it is.
+The identity is declared in two templates, `runtime-identity.bicep` and `ingest.bicep`, with
+different tags, and the last deploy wins: the live `component` tag is `ingest-worker`. A portal tag
+is therefore not evidence of what this identity is for; the templates are.
 
-The application role holds its privileges by membership in `sbapp` rather than by a copied list of
-grants, so it cannot drift from it — including for a table `prisma db push` creates tomorrow, which
+**The ingest worker is not moving onto it.** Its Service Bus trigger receives as whatever principal
+the site runs under, so a worker on the shared identity would need Data Receiver on `ingest-jobs`
+put back on the identity every Vercel preview carries — the grant revoked on 2026-08-08. Two
+principals with two Postgres roles is the deployed arrangement and the intended one, which is why
+`provision` converges both roles rather than folding one into the other.
+
+Each role holds its privileges by membership in `sbapp` rather than by a copied list of grants, so
+neither can drift from it — including for a table `prisma db push` creates tomorrow, which
 `sbapp`'s default privileges already cover. `infra/postgres-identity/` holds the SQL, and the
-`provision` action of the `Postgres identity` workflow applies and re-verifies it.
+`provision` action of the `Postgres identity` workflow applies and re-verifies it. That action must
+run from `master`, because the CI identity's federated credential trusts no other ref.
 
 ARM cannot create these: they are SQL objects behind `pgaadauth_create_principal_with_oid`, which
 runs in the database as an Entra administrator. A `Microsoft.Resources/deploymentScripts` resource
@@ -381,9 +404,8 @@ and holds a live window nobody should move, so it keeps `2026-07-01` while the r
 keeps `2026-08-01`. Hence `budgetStartDate` and `workloadBudgetStartDate`, two different immutable
 facts.
 
-Neither needs the admin password. `main.bicepparam` falls back to empty and `postgres.bicep` omits
-`administratorLoginPassword` entirely when it is, so a redeploy converging a budget leaves the live
-credential untouched; see [Redeploying](#redeploying).
+Neither needs the admin password — see [Redeploying](#redeploying) for why an unset
+`PGADMIN_PASSWORD` leaves the live credential alone.
 
 `main.bicep`'s header lists the rest of the `what-if` change list: provider-assigned residue that
 never converges, and the one entry that is a real to-do. Read it before concluding the template has
@@ -443,24 +465,48 @@ So the perimeter is a credential, and these are the compensating controls:
 The residual risk is therefore _leakage_ rather than brute force, which makes the credential
 inventory the thing to keep honest:
 
-| Store             | Value                                 | Notes                                                   |
-| ----------------- | ------------------------------------- | ------------------------------------------------------- |
-| GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                        |
-| GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin`        |
-| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`           |
-| Vercel Preview    | neither                               | see [Preview has no database](#preview-has-no-database) |
+| Store             | Value                 | Read by                       | Notes                                                                                                  |
+| ----------------- | --------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------ |
+| GitHub secret     | `DATABASE_URL`        | **nothing**                   | `sbadmin`. Deletable at step 6 of the cutover, not before                                              |
+| GitHub secret     | `DIRECT_DATABASE_URL` | **nothing**                   | `sbadmin`, and the recorded copy of the admin password. Deletable at step 6 of the cutover, not before |
+| GitHub secret     | `VERCEL_DEPLOY_HOOK`  | `ci.yml`'s `deploy` job       | A URL that triggers a production build. No database reach                                              |
+| Vercel Production | `DATABASE_URL`        | the web app, on every request | `sbapp` — the web app never carries `sbadmin`                                                          |
+| Vercel Production | `DIRECT_DATABASE_URL` | **nothing**                   | `sbapp`. Prisma opens `directUrl` for `db push`, which is CI                                           |
+| Vercel Preview    | neither               | —                             | see [Preview has no database](#preview-has-no-database)                                                |
 
-That table is the whole inventory, and the three `AZURE_*` GitHub secrets are gone. Verify rather
-than trust this paragraph:
+**Neither database secret has a consumer.** `ci.yml`'s `migrate` job declares `id-token: write`,
+trades the runner's OIDC assertion for an Azure token against `id-switchback-postgres-ci`, and uses
+that token as the database password in all three of its Postgres steps — `assert-pg-admin.ts`,
+`npm run db:push` and `converge-runtime-grants.ts`. The schema push therefore authenticates as
+`id-switchback-postgres-ci`, **not** as `sbadmin`, which is why `ALTER DEFAULT PRIVILEGES … FOR ROLE
+sbadmin` never applied to the tables it created; `ci.yml`'s comment above the grant-convergence step
+records what that cost. Both are stored administrator credentials with nothing reading them, kept
+only as the way back if the token path fails.
+
+**Vercel's copy of `DIRECT_DATABASE_URL` has no consumer either, for a different reason.**
+`schema.prisma` binds it to `directUrl`, which Prisma opens only for `migrate` and `db push` — both
+of which run in CI, never on Vercel. `packages/db/src/client.ts` builds every runtime connection
+from `DATABASE_URL` alone, and `vercel-build` runs `prisma generate` before `next build`, which
+completes with neither variable set. The one remaining mention, in `apps/web/src/env.ts`, is the
+guard that refuses a non-Production environment naming the production host: a validation, not a
+connection. Step 3 of the cutover therefore converts one Vercel Production variable, not two.
+
+Those three are every GitHub secret the repository holds — the `AZURE_*` ones are gone. Verify
+rather than trust this paragraph:
 
 ```bash
-gh secret list --repo mbahgatTech/switchback
-npx vercel env ls
+gh secret list --repo mbahgatTech/switchback                    # three names, timestamps, no values
+npx vercel env ls                                               # per-environment presence
+git grep -nE 'secrets\.(DIRECT_)?DATABASE_URL' -- '.github/'    # empty: no workflow reads either
+git grep -n DIRECT_DATABASE_URL -- apps/ packages/              # schema, env guard, tests. No client
 ```
 
-GitHub's values cannot be read back, so the `Notes` column is design intent plus what each consumer
-demonstrably requires, not a readback. If you need to know what a secret contains, the only honest
-answer is to set it again from a source you trust.
+`Read by` is measured, and those two greps are the measurement: the first returns nothing, exit 1.
+`Value` is not measured — GitHub's API returns names and timestamps, never values, so what each
+secret _holds_ is design intent rather than a readback. A workflow can still print a secret, which
+is the blast radius named in [Read this first](#read-this-first) and the reason
+`DIRECT_DATABASE_URL` counts as a recorded copy of the admin password. Short of writing that
+workflow, setting a secret again from a source you trust is the honest way to know what it holds.
 
 ### Preview has no database
 
@@ -610,8 +656,9 @@ az deployment sub create \
   --parameters infra/azure/main.bicepparam
 ```
 
-**Put that password in a password manager now, before going any further.** This is the only moment
-it is readable — see [Redeploying](#redeploying) for what depends on it.
+**Record that password now, before going any further**, in the places [Read this
+first](#read-this-first) inventories. This is the only moment it is readable — see
+[Redeploying](#redeploying) for what depends on it.
 
 Read the outputs — hostname, ports, and the two connection-string templates, none of which contains
 the password:
@@ -620,8 +667,8 @@ the password:
 az deployment sub show --name switchback-db --query properties.outputs -o json
 ```
 
-Then shred the scratch files. This is **not** an archival step; the password manager above is the
-only copy that survives:
+Then shred the scratch files. This is **not** an archival step; the copies recorded above are the
+only ones that survive:
 
 ```bash
 rm -f "$TMP/pgpw"
@@ -684,10 +731,12 @@ to `password`, so a deploy that does not set it behaves exactly as before.
 | `entra-vercel` | Vercel                  | the per-request OIDC token, exchanged for an access token  |
 
 Under either Entra value `DATABASE_URL` must carry **no password** and the username becomes the
-Entra-mapped role — `sbapp_runtime` for both Vercel and the worker:
+Entra-mapped role for that consumer's own principal — `sbapp_vercel` on Vercel, `sbapp_func` on the
+Function App:
 
 ```
-postgresql://sbapp_runtime@<host>:5432/switchback?sslmode=verify-full
+postgresql://sbapp_vercel@<host>:5432/switchback?sslmode=verify-full
+postgresql://sbapp_func@<host>:5432/switchback?sslmode=verify-full
 ```
 
 A URL that still has a password in it is rejected at construction rather than quietly preferred, so
@@ -700,9 +749,10 @@ effect, because the adapter bypasses the connection string. Both pool sizes are 
 `packages/db/src/client.ts` instead.
 
 `DATABASE_URL` and `DIRECT_DATABASE_URL` are identical on this tier, and that is correct rather
-than redundant — `schema.prisma` requires `directUrl` to exist, and keeping the split means the
-eventual General Purpose escalation is a pure environment-variable change with no code diff. On
-General Purpose, `DATABASE_URL` moves to `:6432` and gains `&pgbouncer=true`.
+than redundant — `schema.prisma` declares `directUrl` against it for the `db push` CI runs, and
+keeping the split means the eventual General Purpose escalation is a pure environment-variable
+change with no code diff. On General Purpose, `DATABASE_URL` moves to `:6432` and gains
+`&pgbouncer=true`.
 
 Do **not** add `connection_limit` to either URL. `backgroundUrl()` in `packages/db/src/client.ts`
 only injects `connection_limit=10` when the URL does not already carry one, so setting a smaller
@@ -723,9 +773,13 @@ live credential untouched. Export `PGADMIN_PASSWORD` only when creating the serv
 to rotate, and when you rotate, every connection string carrying the old value stops working —
 including the ones Vercel is serving the site with.
 
-If you do intend to keep a value, a password-manager entry is the only place it can live. Not the
-`$TMP` file, which the deploy procedure shreds; not a GitHub Actions secret, which cannot be read
-back; not Vercel, which is deliberately never given the admin credential.
+If you do intend to keep a value, put it where [Read this first](#read-this-first) already counts it:
+`~/.switchback/pg-sbadmin-password`, owner-readable only, and the `DIRECT_DATABASE_URL` repository
+secret. Not the `$TMP` file, which the deploy procedure shreds; not Vercel, which is deliberately
+never given the admin credential. The repository secret is readable only by a workflow that prints
+it — the API returns names and timestamps, never values — which is both why it counts as a copy and
+why it sets the blast radius. A value kept anywhere else is outside that inventory, and the inventory
+goes stale without saying so.
 
 Deleting a Flexible Server deletes all of its backups, irrecoverably, which is what the resource
 group's `CanNotDelete` lock exists to prevent.
@@ -747,9 +801,8 @@ unset PGADMIN_PASSWORD            # this deployment has no reason to write the c
 # …then deploy exactly as under "Deploy"
 ```
 
-Placing the lock needs no admin password. With `PGADMIN_PASSWORD` unset, `main.bicepparam` falls
-back to empty and `postgres.bicep` omits `administratorLoginPassword` entirely, so the live
-credential is untouched. Export it here only if you also mean to rotate — and rotating breaks every
+Placing the lock needs no admin password; the `unset` above is what keeps it that way. Export it
+here only if you also mean to rotate — and rotating breaks every
 connection string carrying the old value, including the ones Vercel is serving the site with.
 
 If the lock has to be replaced by hand instead — by an Owner who is not running the deployment —
@@ -837,11 +890,16 @@ consumer at a time and defaults to `password`, so a consumer that misbehaves is 
 one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
 side and stays `true` until every consumer has been proved on a token.
 
-1. Move the Function App's database auth onto Entra — in `infra/azure/ingest.bicep`, `databaseAuth`
-   to `entra` and a password-free `databaseUrl` naming `sbapp_func`. No identity change is
-   involved: `sbapp_func` is already mapped to the Function App's system-assigned principal
-   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, so the token path is
-   privileged the moment the flag flips.
+1. Prepare the Function App's move onto Entra. `infra/azure/ingest.bicepparam` assigns no
+   `databaseAuth`, so the template default `password` is what deploys; add `param databaseAuth =
+'entra'` to it, and export `INGEST_DATABASE_URL` naming `sbapp_func` with no password in it.
+   `entraPoolConfig` refuses a URL that still carries one, so a half-done flip fails at connect
+   rather than quietly preferring the password. Nothing has to be provisioned first: `sbapp_func`
+   is already mapped to the Function App's system-assigned principal
+   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, and the server
+   already has `activeDirectoryAuth: Enabled`. **The deployment writes two application settings on
+   the Function App and touches no `Microsoft.DBforPostgreSQL` resource** — `ingest.bicep` declares
+   none — so it costs an app restart, not a server one. Step 4 deploys it and proves it.
 
    **Do not move the Function App onto the shared identity to achieve this.** The shared identity's
    Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
@@ -851,34 +909,59 @@ side and stays `true` until every consumer has been proved on a token.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
-   renames `sbapp_vercel` to `sbapp_runtime` and then asserts the Entra mapping followed the rename.
-   If the assertion fails, the inverse rename is the rollback and nothing has been dropped.
-3. Set `DATABASE_AUTH=entra-vercel` on Vercel preview, then production, with password-free URLs
-   naming `sbapp_runtime`. Prove a signed-in read and a write — `session.findUnique` is the canary.
-4. Set `DATABASE_AUTH=entra` on the Function App and prove a tile ingests end to end.
-5. Drop the Function App's system-assigned identity, delete the two role assignments it leaves
-   behind — removing a `roleAssignment` from Bicep is not a revocation — and run `Postgres identity`
-   → `retire` with `consumers_moved=MOVED`. The retire action asks for that assertion because the
-   database cannot check it: the worker scales to zero between invocations, so `pg_stat_activity`
-   shows no backend under its role whether or not it has been moved.
-6. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
+   applies `roles.sql` against `postgres` and `grants.sql` against `switchback`, then asserts the
+   result: each role mapped to the object id the run was given, no grant held directly rather than
+   inherited, no membership beyond `sbapp`, and `CREATE TABLE` refused when it `SET ROLE`s into each.
+   Against the deployed estate every write in it is idempotent — both roles exist, both memberships
+   already hold — so what the run is worth is the assertions. It is not the read-only door, though:
+   that is `inspect`, which asserts nothing. And it repairs nothing. Creation is guarded on the
+   role's _name_, so an identity recreated since leaves a role mapped to an object id that no longer
+   exists, and the job raises rather than remapping it.
+3. Convert Vercel **Production**, and only Production: set `DATABASE_AUTH=entra-vercel` and rewrite
+   `DATABASE_URL` to the password-free form naming `sbapp_vercel`. `AZURE_TENANT_ID` and
+   `AZURE_CLIENT_ID` are already set there, which is the whole of what `entra-vercel` needs beyond
+   the URL. Redeploy, then prove a signed-in read and a write — `session.findUnique` is the canary.
+   The way back is deleting `DATABASE_AUTH`, restoring the password-carrying `DATABASE_URL`, and
+   redeploying: absent resolves to `password`, but neither variable reaches the running deployment
+   until a new build.
+
+   **Preview is out of scope and cannot be brought into it as the estate stands**, so there is no
+   rehearsal environment for this step. Preview holds no `DATABASE_URL` — `npx vercel env ls` lists
+   that variable and `DIRECT_DATABASE_URL` under Production alone — so there is no connection there
+   to move; and `apps/web/src/env.ts` refuses any `VERCEL_ENV` other than `production` whose
+   `DATABASE_URL` or `DIRECT_DATABASE_URL` names `psql-switchback-prod-37ywppu5p7fri`, so it cannot
+   be handed the production URL to rehearse against, password-free or not. What replaces the
+   rehearsal is the size of the rollback: two variables and a redeploy, with the server still
+   accepting passwords until step 6. Preview becomes a rehearsal again on the day it has a database
+   of its own — see [Preview has no database](#preview-has-no-database).
+
+4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Use the
+   export set in [Deploying it](#deploying-it) rather than a shorter one: every variable there has
+   no fallback, so a missing one fails the build instead of writing a wrong value. Confirm the
+   settings landed with `az functionapp config appsettings list -o json`, and re-run
+   `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces the collection
+   whole and erases `WEBSITE_RUN_FROM_PACKAGE`.
+5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
-7. Only now set `passwordAuthEnabled = false` and deploy.
+6. Only now set `passwordAuthEnabled = false` and deploy.
 
-Two things to settle before step 7. The `migrate` job in `ci.yml` mints its own token and no longer
-reads `secrets.DIRECT_DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/`
-while passwords still work, so a failure is a red run rather than an outage. And `.env` on the
-owner's machine points at production — point it at the local Docker Postgres first, or every db
-script, `npm run dev` and the e2e suite stop working at step 7 with a connection error and no
-explanation.
+One thing to settle before step 6, and one already settled. The `migrate` job in `ci.yml` mints its
+own token and reads neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`, and both
+halves of it have run on `master` over that token. The unconditional half — `azure/login` and grant
+convergence — ran in run 31246622902. The half gated on `packages/db/prisma/` changing ran in run
+31183187247, which carried `244edf6` and its change to `spatial.sql`: `assert-pg-admin.ts`,
+`npm run db:generate` and `npm run db:push` each reported `success` against production, and those
+same three steps report `skipped` in 31246622902, which is what tells the two halves apart. No
+no-op schema commit is outstanding. What does still need settling is `.env` on the owner's machine,
+which points at production — point it at the local Docker Postgres first, or every db script,
+`npm run dev` and the e2e suite stop working at step 6 with a connection error and no explanation.
 
-After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
-server refuses password authentication outright. From step 7 onward the template needs no password
-at all: `administratorLoginPassword` defaults to empty and is omitted from the payload, so the
-accidental-rotation hazard is gone rather than dormant.
+After step 6 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
+server refuses password authentication outright, and from step 6 onward the template needs no
+password at all — so the accidental-rotation hazard is gone rather than dormant.
 
-**Rolling step 7 back — set `passwordAuthEnabled = true` and export the password with it.**
+**Rolling step 6 back — set `passwordAuthEnabled = true` and export the password with it.**
 
 ```bash
 # The recorded value. Without it the deploy omits the property and writes no password.
@@ -925,10 +1008,12 @@ continuously, replacing a once-daily Vercel cron that claimed four tiles a run a
 **It is a separate template, at resource-group scope, and that is the point.** It never declares the
 server, its database, its firewall rules or its parameters. `administratorLoginPassword` is
 `@secure()` with no default and ARM cannot read the current value back, so any deployment that
-includes `postgres.bicep` writes whatever it is handed — and the live password is unconfirmed (see
-[Read this first](#read-this-first)). Shipping a queue must not be the same operation as rotating the
-production password. `main.bicep` is not modified by this work and is not redeployed by it. There is
-no lock resource here either: the group's existing `CanNotDelete` does not block creates.
+includes `postgres.bicep` writes whatever it is handed. The live value is recorded — see [Read this
+first](#read-this-first) — but ARM cannot consult that record, so handing the wrong value to a
+template that declares the server rotates the production credential. Shipping a queue must not be the
+same operation as rotating the production password. `main.bicep` is not modified by this work and is
+not redeployed by it. There is no lock resource here either: the group's existing `CanNotDelete` does
+not block creates.
 
 | Resource        | Value                                                                                  |
 | --------------- | -------------------------------------------------------------------------------------- |
@@ -944,6 +1029,16 @@ no lock resource here either: the group's existing `CanNotDelete` does not block
 | Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
 | Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
 | Cost            | ~$10/month Standard namespace; Consumption and the storage account are inside the free |
+
+The storage row is checkable in two commands, and the pair is what proves key auth is refused
+rather than merely unconfigured:
+
+```bash
+az storage blob list --account-name stsbingest37ywppu5p7fri --container-name function-releases \
+  --auth-mode key -o json     # ERROR: Key based authentication is not permitted on this storage account.  (exit 1)
+az storage blob list --account-name stsbingest37ywppu5p7fri --container-name function-releases \
+  --auth-mode login -o json   # the package blob                                                            (exit 0)
+```
 
 ### The Overpass clamp — the thing to check in review
 
@@ -1005,6 +1100,7 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
+export INGEST_TRAIL_IDENTITY=claim                   # the live value — no default, state it
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1014,14 +1110,31 @@ az deployment group create \
 unset INGEST_DATABASE_URL
 ```
 
-Both exported strings are load-bearing and both have bitten. `INGEST_OVERPASS_USER_AGENT` must carry
-an `http(s)://` contact URL that reaches _this_ project — `assertUsableUserAgent` in
-`packages/ingest/src/overpass.ts` throws inside the handler on a placeholder or on a host it knows is
-not ours, so the worker dead-letters every tile after five deliveries with a message that names the
-database rather than the user agent. `switchback.app` is on that rejected list by name: it reads like
-ours, is registered to somebody else, and was what the Function App actually sent on every Overpass
-request until 2026-08-03. Only the shape can be checked in code — that a URL reaches you is the one
-thing the operator has to get right.
+Those four exports are the whole set with no fallback, and a missing one fails the build with
+`BCP427` naming the variable — before ARM is called. `ingest.bicepparam` reads three more from the
+environment — `INGEST_SUBDIVIDE_MAX_ZOOM`, `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` — and each of
+those falls back to what the app already holds (`9`, and absent for the other two), so leaving them
+unexported deploys the deployed value.
+
+`INGEST_TRAIL_IDENTITY` is in the block, and has no fallback, because for it that was not true: the
+app reads `claim` and an application-settings write replaces the collection whole, so any default
+would revert a live control. Confirm the value landed rather than assuming it — `identity.ts` reads
+an absent variable and `osm-id` identically, so a reverted app looks unchanged:
+
+```bash
+az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv   # expect claim
+```
+
+`INGEST_OVERPASS_USER_AGENT` is the one an operator has to get right rather than copy, and it has
+bitten. It must carry an `http(s)://` contact URL that reaches _this_ project —
+`assertUsableUserAgent` in `packages/ingest/src/overpass.ts` throws inside the handler on a
+placeholder or on a host it knows is not ours, so the worker dead-letters every tile after five
+deliveries with a message that names the database rather than the user agent. `switchback.app` is on
+that rejected list by name: it reads like ours, is registered to somebody else, and was what the
+Function App actually sent on every Overpass request until 2026-08-03. Only the shape can be checked
+in code — that a URL reaches you is the one thing the operator has to get right.
 `INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
 with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
 Postgres/Service Bus fan-out that an operator had just rolled back.
@@ -1110,14 +1223,12 @@ asks the host itself and is the answer to trust. So is the queue depth: `az serv
 `what-if` is safe and is the check worth running before any deploy — nothing under
 `Microsoft.DBforPostgreSQL` may appear as a create or a modify.
 
-**Role assignments are in the template now.** They used to be conditional on
-`DEPLOY_ROLE_ASSIGNMENTS`, with an `az role assignment create` in this file for an Owner to run,
-because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`. The
-deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
-Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
-group, on 2026-08-03 (assignment `8baf9393-029a-4226-a882-992a8146d775`). The parameter, the flag and
-the runbook step are all gone: the four queue role assignments are ordinary resources in
-`ingest.bicep` and nothing grants access by hand.
+**Role assignments are ordinary resources in the templates, and nothing grants access by hand.**
+`Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`, so the deploying
+service principal (`cf940ed6-…`, display name `plant`) holds **Role Based Access Control
+Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) at this resource group, unconditioned —
+assignment `8baf9393-029a-4226-a882-992a8146d775`, created 2026-08-03. That is a standing ability to
+grant any role here to any principal, and it is the price of keeping grants in Bicep.
 
 **Deleting a `roleAssignment` from Bicep is not a revocation.** Resource-group deployments are
 Incremental — ARM never removes a resource merely because the template stopped declaring it, and
@@ -1158,8 +1269,11 @@ az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microso
   --query "value[?contains(properties.scope,'queues/ingest-jobs')].{assignment:name, principal:properties.principalId, role:properties.roleDefinitionId}" -o tsv
 ```
 
-`atScope()` also returns what the subscription and the resource group grant — ten rows against this
-estate — so the filter on `properties.scope` is what narrows it to the queue's own. Three rows:
+`atScope()` means _at this scope and above_, not _at this scope_: it returns the queue's own
+assignments plus everything inherited, which against this estate is nine rows — three on the queue,
+one from the resource group, five from the subscription — so the filter on `properties.scope` is
+what narrows it to the queue's own. Dropping `atScope()` returns the same nine here, because a queue
+has no child scope for the unfiltered form to add. Three rows:
 Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and Data
 Sender alone for the publisher `c9bfba39-…`. Two things must **not** appear:
 `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner), and any Data Receiver held by `c9bfba39-…` —
@@ -1171,16 +1285,40 @@ mean a template or a hand edit put drain capability back on Vercel's identity.
 Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
 template, and a reader would otherwise conclude the template is the whole story.
 
-1. **CI's deployment identity.** Entra app registrations and federated credentials on an _app_ are
-   Microsoft Graph objects, not ARM, and Bicep cannot declare them. One time, as an Owner:
-   `az ad app create` / `az ad sp create`, an `az ad app federated-credential create` scoped to
-   `repo:mbahgatTech/switchback:ref:refs/heads/master`, `Contributor` **and** `Role Based Access
-Control Administrator` on this resource group, then `gh secret set AZURE_CLIENT_ID` /
-   `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`. No long-lived secret is stored.
+1. **The standing deploying principal, and its two grants.** An Entra app registration and the
+   credentials on it are Microsoft Graph objects, not ARM, and Bicep cannot declare them. `plant`
+   (`3ac53469-d72f-4813-b5e8-4bbf937cc76d`, object id `cf940ed6-…`) was created by hand as an
+   Owner. It authenticates with a **client secret** valid to 2027-03-01 and carries no federated
+   credential at all, so no GitHub workflow can assume it. Its grants are wider than this resource
+   group:
 
-   The Vercel publisher deliberately does **not** work this way. A federated credential on a
-   _user-assigned managed identity_ is an ARM resource, so it is in `ingest.bicep` with everything
-   else — see `publisherProduction` and `publisherPreview` there.
+   | Role                                    | Scope                               | Assignment               |
+   | --------------------------------------- | ----------------------------------- | ------------------------ |
+   | Contributor                             | the **subscription** `5cb9e7c3-…`   | `c2098a98-…`, 2026-03-01 |
+   | Role Based Access Control Administrator | `rg-switchback-prod-northcentralus` | `8baf9393-…`, 2026-08-03 |
+
+   ```bash
+   az role assignment list --assignee 3ac53469-d72f-4813-b5e8-4bbf937cc76d --all \
+     --query '[].{role:roleDefinitionName,scope:scope,name:name}' -o json
+   az ad app federated-credential list --id 3ac53469-d72f-4813-b5e8-4bbf937cc76d -o json   # []
+   ```
+
+   **CI is not this principal, and no `AZURE_*` secret exists.** Every `azure/login` in a workflow
+   presents a _user-assigned managed identity_, whose federated credentials are ARM resources and
+   so live in the templates rather than in a bootstrap command:
+
+   | Consumer                                                             | Client id from                                               | Identity                                   |
+   | -------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------ |
+   | `postgres-entra.yml`, `ci.yml`'s `migrate`, `token-expiry-probe.yml` | a literal in each workflow, `81c76484-…`                     | `id-switchback-postgres-ci`                |
+   | `ci.yml`'s worker deploy                                             | `vars.AZURE_WORKER_DEPLOY_CLIENT_ID`                         | `id-switchback-worker-deploy`              |
+   | `infrastructure.yml`                                                 | `vars.AZURE_INFRA_CLIENT_ID` — set nowhere, so the job skips | `id-switchback-infra-deploy`, not deployed |
+
+   That is every `azure/login` in the tree: `grep -rn "client-id:" .github/workflows/` returns six
+   occurrences across those four workflows.
+
+   The two that are not literals are repository **variables** — set with `gh variable set`, and
+   readable by anyone — not secrets. `gh secret list` holds `DATABASE_URL`, `DIRECT_DATABASE_URL`
+   and `VERCEL_DEPLOY_HOOK` and nothing else.
 
 2. **Managed identity to Postgres is available and not yet switched on.** The worker connects with a
    password in `DATABASE_URL`, but nothing is missing to stop that. Measured on the server:

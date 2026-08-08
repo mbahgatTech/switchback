@@ -348,10 +348,9 @@ flipping this is the only step between a compile-only pipeline and a deploying o
 param grantInfraIdentityContributor bool = false
 
 @description('''
-Name of the user-assigned managed identity the runtime clients are being consolidated onto —
-Vercel production, Vercel preview and the ingest worker. Declared, not yet in force; see
-runtime-identity.bicep for what is live today, why one identity serves all three, and what
-that costs.
+Name of the user-assigned managed identity both Vercel environments federate to. Declared, not
+yet in force: Vercel still authenticates to Postgres by password. See runtime-identity.bicep for
+what is live today and what one identity across two environments costs.
 ''')
 param runtimeIdentityName string = 'id-switchback-vercel-publisher'
 
@@ -853,17 +852,22 @@ output applicationDatabaseUrlTemplate string = postgres.outputs.applicationDatab
 output logAnalyticsWorkspaceId string = monitoring.outputs.workspaceId
 
 @description('''
-Resource id of the shared runtime identity. The parameter ingest.bicep takes so the worker runs
-as the same principal Vercel does.
+Resource id of `id-switchback-vercel-publisher`, the identity the two Vercel environments federate
+to. Nothing takes it as a parameter — ingest.bicep declares the same identity itself rather than
+receiving a reference — and the ingest worker does not run as it: the worker is the Function App's
+own system-assigned principal, `3db30cfd-…`.
 ''')
 output runtimeIdentityResourceId string = runtimeIdentity.outputs.resourceId
 
-@description('Client id of the shared runtime identity — `AZURE_CLIENT_ID` on every runtime consumer.')
+@description('''
+Client id of the shared runtime identity — `AZURE_CLIENT_ID` on the Vercel project. The Function
+App sets no `AZURE_CLIENT_ID` and must not be given one; it authenticates as itself.
+''')
 output runtimeIdentityClientId string = runtimeIdentity.outputs.clientId
 
 @description('''
-Object id of the shared runtime identity. What `sbapp_runtime` is mapped to, and the argument
-`postgres-entra.yml` asserts the live role against.
+Object id of the shared runtime identity. What the `sbapp_vercel` database role is mapped to, and
+the argument `postgres-entra.yml` asserts that role against.
 ''')
 output runtimeIdentityPrincipalId string = runtimeIdentity.outputs.principalId
 

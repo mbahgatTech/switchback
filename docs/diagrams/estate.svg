@@ -1,0 +1,268 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800"
+     role="img" aria-labelledby="t d" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="t">Switchback production estate: deployment boundaries, the credentials that cross them, and the absent network boundary</title>
+  <desc id="d">Readers and the owner reach a Next.js application on Vercel and an Azure resource group
+    holding Postgres, Service Bus, a Functions worker, storage and Log Analytics. Every Azure data
+    service sits on the public internet: there is no virtual network, publicNetworkAccess is Enabled,
+    and one firewall rule spans all of IPv4 because Vercel serverless has no static egress address.
+    Identity and the credential are the only boundaries that exist.</desc>
+
+  <defs>
+    <style>
+      .zone   { fill: #f8fafc; stroke-width: 1.5; }
+      .zlabel { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+      .zsub   { font-size: 10.5px; fill: #64748b; }
+      .node   { fill: #ffffff; stroke: #334155; stroke-width: 1.25; }
+      .nlabel { font-size: 12px; font-weight: 600; fill: #0f172a; }
+      .nsub   { font-size: 10px; fill: #64748b; }
+      .edge   { fill: none; stroke: #475569; stroke-width: 1.4; marker-end: url(#a-grey); }
+      .e-id   { fill: none; stroke: #0078d4; stroke-width: 1.5; marker-end: url(#a-blue); }
+      .e-pw   { fill: none; stroke: #b45309; stroke-width: 1.5; stroke-dasharray: 5 3; marker-end: url(#a-amber); }
+      .elab   { font-size: 9.5px; fill: #334155; }
+      .elab-id{ font-size: 9.5px; fill: #0369a1; }
+      .elab-pw{ font-size: 9.5px; fill: #b45309; }
+      .warn   { fill: #b91c1c; font-size: 12px; font-weight: 700; }
+      .warnsub{ fill: #7f1d1d; font-size: 10px; }
+      .ico    { fill: none; stroke: #0f172a; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      .ico-f  { fill: #0f172a; stroke: none; }
+    </style>
+
+    <marker id="a-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker>
+    <marker id="a-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0078d4"/></marker>
+    <marker id="a-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b45309"/></marker>
+
+    <!-- Actors are human figures, services are service marks. -->
+    <symbol id="i-person" viewBox="0 0 24 24">
+      <circle cx="12" cy="6.5" r="3.6" class="ico"/>
+      <path d="M4.5 21c0-4.2 3.4-7 7.5-7s7.5 2.8 7.5 7" class="ico"/></symbol>
+    <symbol id="i-browser" viewBox="0 0 24 24">
+      <rect x="2.5" y="4" width="19" height="16" rx="2" class="ico"/>
+      <path d="M2.5 9h19" class="ico"/><circle cx="6" cy="6.5" r=".9" class="ico-f"/></symbol>
+    <symbol id="i-phone" viewBox="0 0 24 24">
+      <rect x="6.5" y="2.5" width="11" height="19" rx="2.5" class="ico"/>
+      <path d="M10.5 18.5h3" class="ico"/></symbol>
+    <symbol id="i-lambda" viewBox="0 0 24 24">
+      <rect x="2.5" y="5" width="19" height="14" rx="2" class="ico"/>
+      <path d="M7 15l4-6 2 3 1.5-2 2.5 5" class="ico"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5" class="ico"/><path d="M12 7v5.5l3.5 2" class="ico"/></symbol>
+    <symbol id="i-db" viewBox="0 0 24 24">
+      <ellipse cx="12" cy="5.8" rx="7.5" ry="3.1" class="ico"/>
+      <path d="M4.5 5.8v12.4c0 1.7 3.4 3.1 7.5 3.1s7.5-1.4 7.5-3.1V5.8" class="ico"/>
+      <path d="M4.5 12c0 1.7 3.4 3.1 7.5 3.1s7.5-1.4 7.5-3.1" class="ico"/></symbol>
+    <symbol id="i-queue" viewBox="0 0 24 24">
+      <rect x="2.5" y="7" width="5.5" height="10" rx="1.2" class="ico"/>
+      <rect x="9.2" y="7" width="5.5" height="10" rx="1.2" class="ico"/>
+      <rect x="15.9" y="7" width="5.5" height="10" rx="1.2" class="ico"/></symbol>
+    <symbol id="i-func" viewBox="0 0 24 24">
+      <path d="M13.5 2.5L4.5 13.5h6l-1 8 9-11h-6z" class="ico"/></symbol>
+    <symbol id="i-blob" viewBox="0 0 24 24">
+      <rect x="2.5" y="6" width="19" height="12" rx="2" class="ico"/>
+      <path d="M2.5 10.5h19M2.5 14.5h19" class="ico"/></symbol>
+    <symbol id="i-logs" viewBox="0 0 24 24">
+      <rect x="4" y="3" width="16" height="18" rx="2" class="ico"/>
+      <path d="M8 8h8M8 12h8M8 16h5" class="ico"/></symbol>
+    <symbol id="i-cloud" viewBox="0 0 24 24">
+      <path d="M7 18h10.2a4 4 0 0 0 .4-8A6 6 0 0 0 6.3 11 3.6 3.6 0 0 0 7 18z" class="ico"/></symbol>
+    <symbol id="i-badge" viewBox="0 0 24 24">
+      <path d="M12 2.5l8 3v6c0 5-3.4 8.9-8 10-4.6-1.1-8-5-8-10v-6z" class="ico"/>
+      <path d="M8.5 12l2.5 2.5 4.5-5" class="ico"/></symbol>
+    <symbol id="i-gh" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9" class="ico"/><circle cx="12" cy="9.5" r="2.2" class="ico"/>
+      <path d="M8 16.5c0-1.8 1.8-2.8 4-2.8s4 1 4 2.8" class="ico"/></symbol>
+  </defs>
+
+  <rect width="1200" height="800" fill="#ffffff"/>
+  <text x="24" y="32" font-size="19" font-weight="700" fill="#0f172a">Switchback production — deployment boundaries and the credentials that cross them</text>
+  <text x="24" y="52" font-size="11.5" fill="#64748b">The deployed estate, measured 2026-08-08. Blue = Entra token. Dashed amber = password. Grey = unauthenticated public call.</text>
+
+  <!-- ============================== CLIENT ============================== -->
+  <rect class="zone" x="24" y="78" width="204" height="212" rx="10" stroke="#64748b" stroke-dasharray="6 4"/>
+  <text class="zlabel" x="40" y="100" fill="#334155">CLIENT</text>
+  <text class="zsub" x="40" y="114">the reader's own device</text>
+
+  <use href="#i-person" x="42" y="126" width="28" height="28"/>
+  <text class="nlabel" x="78" y="140">Reader</text>
+  <text class="nsub" x="78" y="153">anonymous, or signed in</text>
+
+  <rect class="node" x="42" y="168" width="80" height="46" rx="6"/>
+  <use href="#i-browser" x="52" y="178" width="18" height="18"/>
+  <text class="nlabel" x="52" y="208">Browser</text>
+
+  <rect class="node" x="130" y="168" width="80" height="46" rx="6"/>
+  <use href="#i-phone" x="140" y="178" width="18" height="18"/>
+  <text class="nlabel" x="140" y="208">iOS app</text>
+
+  <use href="#i-person" x="42" y="234" width="26" height="26"/>
+  <text class="nlabel" x="76" y="246">Owner</text>
+  <text class="nsub" x="76" y="259">Azure Owner</text>
+  <text class="nsub" x="76" y="271">Entra administrator</text>
+
+  <!-- ============================== VERCEL ============================== -->
+  <rect class="zone" x="280" y="78" width="220" height="330" rx="10" stroke="#0f172a"/>
+  <text class="zlabel" x="296" y="100" fill="#0f172a">VERCEL</text>
+  <text class="zsub" x="296" y="114">serverless on AWS iad1 — no static egress IP</text>
+
+  <rect class="node" x="296" y="126" width="188" height="72" rx="6"/>
+  <use href="#i-lambda" x="306" y="136" width="18" height="18"/>
+  <text class="nlabel" x="330" y="149">Production</text>
+  <text class="nsub" x="306" y="168">Next.js + tRPC · inline and cron drainers</text>
+  <text class="nsub" x="306" y="181">INGEST_TRAIL_IDENTITY = claim</text>
+  <text class="nsub" x="306" y="192">carries id-switchback-vercel-publisher</text>
+
+  <rect class="node" x="296" y="210" width="188" height="44" rx="6"/>
+  <use href="#i-clock" x="306" y="220" width="18" height="18"/>
+  <text class="nlabel" x="330" y="229">Cron drainer</text>
+  <text class="nsub" x="306" y="246">/api/cron/drain · CRON_SECRET</text>
+
+  <rect class="node" x="296" y="266" width="188" height="60" rx="6" stroke="#94a3b8" stroke-dasharray="5 3"/>
+  <use href="#i-lambda" x="306" y="276" width="18" height="18"/>
+  <text class="nlabel" x="330" y="285" fill="#475569">Preview</text>
+  <text class="nsub" x="306" y="302">no DATABASE_URL, no CRON_SECRET</text>
+  <text class="nsub" x="306" y="315">reaches no database — env.ts refuses the host</text>
+
+  <text class="zsub" x="296" y="348">Both environments federate to one Entra identity,</text>
+  <text class="zsub" x="296" y="362">so Azure sees a single caller and cannot tell them</text>
+  <text class="zsub" x="296" y="376">apart. Preview also sits behind Vercel Authentication.</text>
+  <text class="zsub" x="296" y="396">INGEST_TRAIL_IDENTITY is absent on Preview.</text>
+
+  <!-- ============================== THIRD PARTY ============================== -->
+  <rect class="zone" x="24" y="444" width="476" height="112" rx="10" stroke="#94a3b8" stroke-dasharray="6 4"/>
+  <text class="zlabel" x="40" y="466" fill="#475569">THIRD PARTY — public internet, no credential presented</text>
+
+  <rect class="node" x="40" y="478" width="140" height="62" rx="6"/>
+  <use href="#i-cloud" x="50" y="486" width="18" height="18"/>
+  <text class="nlabel" x="50" y="518">Overpass API</text>
+  <text class="nsub" x="50" y="532">OSM trail geometry</text>
+
+  <rect class="node" x="192" y="478" width="140" height="62" rx="6"/>
+  <use href="#i-cloud" x="202" y="486" width="18" height="18"/>
+  <text class="nlabel" x="202" y="518">AWS Terrain Tiles</text>
+  <text class="nsub" x="202" y="532">terrarium DEM PNGs</text>
+
+  <rect class="node" x="344" y="478" width="140" height="62" rx="6"/>
+  <use href="#i-cloud" x="354" y="486" width="18" height="18"/>
+  <text class="nlabel" x="354" y="518">Cloudflare R2</text>
+  <text class="nsub" x="354" y="532">photos, basemap · access key</text>
+
+  <!-- ============================== AZURE ============================== -->
+  <rect class="zone" x="600" y="78" width="576" height="478" rx="10" stroke="#0078d4" fill="#f4f9fd"/>
+  <text class="zlabel" x="618" y="100" fill="#0b5fa5">AZURE — rg-switchback-prod-northcentralus</text>
+  <text class="zsub" x="618" y="114">subscription 5cb9e7c3-… · CanNotDelete lock switchback-prod-no-delete</text>
+
+  <!-- The honest part. Drawing a tidy perimeter here would be the lie. -->
+  <rect x="616" y="122" width="544" height="50" rx="6" fill="#fef2f2" stroke="#b91c1c" stroke-width="1.5" stroke-dasharray="7 4"/>
+  <text class="warn" x="630" y="141">NO VIRTUAL NETWORK — every service below is on the public internet</text>
+  <text class="warnsub" x="630" y="156">publicNetworkAccess Enabled · one firewall rule 0.0.0.0–255.255.255.255, because Vercel serverless has no static egress.</text>
+  <text class="warnsub" x="630" y="167">Identity and the credential are the only boundaries there are.</text>
+
+  <rect class="node" x="616" y="200" width="256" height="80" rx="6"/>
+  <use href="#i-db" x="626" y="209" width="20" height="20"/>
+  <text class="nlabel" x="652" y="223">Postgres 17 + PostGIS</text>
+  <text class="nsub" x="626" y="242">psql-switchback-prod-37ywppu5p7fri · B2s Burstable</text>
+  <text class="nsub" x="626" y="256">passwordAuth Enabled · activeDirectoryAuth Enabled</text>
+  <text class="nsub" x="626" y="270">sbadmin · sbapp · sbapp_vercel · sbapp_func</text>
+
+  <rect class="node" x="904" y="200" width="256" height="80" rx="6"/>
+  <use href="#i-queue" x="914" y="209" width="20" height="20"/>
+  <text class="nlabel" x="940" y="223">Service Bus — ingest-jobs</text>
+  <text class="nsub" x="914" y="242">sb-switchback-prod-37ywppu5p7fri</text>
+  <text class="nsub" x="914" y="256">worker: Data Sender + Data Receiver</text>
+  <text class="nsub" x="914" y="270">publisher: Data Sender alone — Receiver revoked</text>
+
+  <rect class="node" x="616" y="300" width="256" height="80" rx="6"/>
+  <use href="#i-func" x="626" y="309" width="20" height="20"/>
+  <text class="nlabel" x="652" y="323">Functions worker — Y1 Linux</text>
+  <text class="nsub" x="626" y="342">func-switchback-ingest-37ywppu5p7fri</text>
+  <text class="nsub" x="626" y="356">system-assigned 3db30cfd-… · identity = claim</text>
+  <text class="nsub" x="626" y="370">queue driver postgres — idle, draining nothing</text>
+
+  <rect class="node" x="904" y="300" width="256" height="80" rx="6"/>
+  <use href="#i-blob" x="914" y="309" width="20" height="20"/>
+  <text class="nlabel" x="940" y="323">Storage — stsbingest37ywppu5p7fri</text>
+  <text class="nsub" x="914" y="342">allowSharedKeyAccess false — keys authorise nothing</text>
+  <text class="nsub" x="914" y="356">host state and function-releases by managed identity</text>
+  <text class="nsub" x="914" y="370">WEBSITE_RUN_FROM_PACKAGE is a bare blob URL</text>
+
+  <rect class="node" x="616" y="400" width="256" height="60" rx="6"/>
+  <use href="#i-logs" x="626" y="409" width="20" height="20"/>
+  <text class="nlabel" x="652" y="423">Log Analytics + App Insights</text>
+  <text class="nsub" x="626" y="441">workspace c188de03 — query it, not App Insights</text>
+  <text class="nsub" x="626" y="453">6 alert rules: 2 Postgres · 1 queue · 3 ingest</text>
+
+  <rect class="node" x="904" y="400" width="256" height="60" rx="6"/>
+  <use href="#i-badge" x="914" y="409" width="20" height="20"/>
+  <text class="nlabel" x="940" y="423">User-assigned identities</text>
+  <text class="nsub" x="914" y="441">id-switchback-vercel-publisher · -postgres-ci</text>
+  <text class="nsub" x="914" y="453">id-switchback-worker-deploy</text>
+
+  <text class="zsub" x="616" y="484">DATABASE_AUTH is unset on every consumer, so each database edge here is a password. sbapp_func and</text>
+  <text class="zsub" x="616" y="498">sbapp_vercel are already Entra-mapped and privileged; the flip is a parameter, not a provisioning step.</text>
+  <text class="zsub" x="616" y="518">TLS is mandatory and verified — sslmode=verify-full plus sslaccept=strict, because the two readers</text>
+  <text class="zsub" x="616" y="532">honour different keys. The 13-character hostname suffix is what keeps dictionary scanners off it.</text>
+  <text class="zsub" x="616" y="546">The subscription spending limit deallocates this whole group, which is why the tier is Burstable.</text>
+
+  <!-- ============================== CI ============================== -->
+  <rect class="zone" x="24" y="588" width="1152" height="86" rx="10" stroke="#334155" stroke-dasharray="6 4"/>
+  <text class="zlabel" x="40" y="610" fill="#334155">GITHUB ACTIONS — public repository, world-readable logs and artifacts</text>
+
+  <rect class="node" x="40" y="620" width="252" height="42" rx="6"/>
+  <use href="#i-gh" x="50" y="628" width="18" height="18"/>
+  <text class="nlabel" x="74" y="636">ci.yml — gates, migrate, deploy</text>
+  <text class="nsub" x="50" y="654">federated to id-switchback-postgres-ci · master only</text>
+
+  <rect class="node" x="308" y="620" width="252" height="42" rx="6"/>
+  <use href="#i-gh" x="318" y="628" width="18" height="18"/>
+  <text class="nlabel" x="342" y="636">deploy-worker.sh</text>
+  <text class="nsub" x="318" y="654">id-switchback-worker-deploy → function-releases</text>
+
+  <text class="zsub" x="600" y="628">infrastructure.yml only compiles templates — its deploy job is gated on a variable that is unset.</text>
+  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which must be followed by</text>
+  <text class="zsub" x="600" y="656">deploy-worker.sh — an ARM settings write erases WEBSITE_RUN_FROM_PACKAGE and leaves it codeless.</text>
+
+  <!-- ============================== EDGES ============================== -->
+  <path class="edge" d="M228 192 H 274"/>
+  <text class="elab" x="234" y="185">HTTPS</text>
+
+  <path class="edge" d="M228 258 C 256 258, 254 424, 292 424 H 540 C 578 424, 580 496, 596 500"/>
+  <text class="elab" x="330" y="418">ARM control plane + Entra administrator</text>
+
+  <path class="e-pw" d="M500 200 C 546 204, 560 232, 610 240"/>
+  <text class="elab-pw" x="504" y="194">sbapp password</text>
+
+  <path class="e-id" d="M500 150 C 552 150, 562 188, 604 188 H 1032 V 194"/>
+  <text class="elab-id" x="688" y="183">Data Sender — publish only, never receive</text>
+
+  <path class="edge" d="M330 408 V 440"/>
+
+  <path class="e-pw" d="M700 300 V 286"/>
+  <text class="elab-pw" x="708" y="296">sbapp password</text>
+
+  <path class="e-id" d="M872 332 H 898"/>
+  <path class="e-id" d="M872 352 C 884 352, 888 346, 898 342"/>
+  <path class="edge" d="M700 380 V 394"/>
+
+  <path class="e-id" d="M160 588 V 566 H 700 V 562"/>
+  <text class="elab-id" x="430" y="562">Entra token · prisma db push, grant convergence</text>
+
+  <path class="e-id" d="M434 588 V 578 H 1032 V 562"/>
+  <text class="elab-id" x="800" y="574">package upload, blob data role</text>
+
+  <!-- ============================== LEGEND ============================== -->
+  <rect x="24" y="698" width="1152" height="58" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text class="zlabel" x="40" y="720" fill="#334155">LEGEND</text>
+  <line x1="118" y1="716" x2="160" y2="716" class="e-id"/>
+  <text class="elab" x="168" y="720">Entra token — no shared secret at rest</text>
+  <line x1="400" y1="716" x2="442" y2="716" class="e-pw"/>
+  <text class="elab" x="450" y="720">Password in an environment variable</text>
+  <line x1="690" y1="716" x2="732" y2="716" class="edge"/>
+  <text class="elab" x="740" y="720">Unauthenticated public call</text>
+  <rect x="950" y="709" width="26" height="13" rx="3" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="5 3"/>
+  <text class="elab" x="984" y="720">Deployed but inert</text>
+  <text class="zsub" x="40" y="742">Every value is the deployed one. An edge that does not exist is not drawn, and the network boundary that does not exist is named rather than implied.</text>
+
+  <text x="24" y="782" font-size="10.5" fill="#94a3b8">docs/diagrams/estate.svg — hand-authored SVG. Mermaid architecture-beta was measured and rejected: iconify names render as "?" on GitHub. See docs/diagrams/README.md.</text>
+</svg>

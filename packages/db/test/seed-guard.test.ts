@@ -12,7 +12,7 @@ describe('looksLikeHostedDatabase', () => {
     ).toBe(true);
     expect(
       looksLikeHostedDatabase(
-        'postgresql://sbapp_runtime@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com/switchback',
+        'postgresql://sbapp_vercel@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com/switchback',
       ),
     ).toBe(true);
   });

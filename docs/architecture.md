@@ -685,8 +685,9 @@ per-tile cost — a region lookup and a tile-wide waypoint query that a smaller 
 cheaper — so deeper than z11 the overhead, not the work, is what fills the invocation.
 
 **It ships off, and turning it on takes two settings, not one.** `ingest.bicepparam` resolves
-`ingestSubdivideMaxZoom` to `9` — subdivision disabled — and `ingestTrailIdentity` to `osm-id`,
-unless the deploying shell exports otherwise. The two are coupled in code as well as in the
+`ingestSubdivideMaxZoom` to `9` — subdivision disabled — unless the deploying shell exports
+otherwise, and takes `ingestTrailIdentity` from the environment with no fallback at all, so a deploy
+either states the identity mode or fails. The two are coupled in code as well as in the
 template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTITY` is not `claim`,
 whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
 `min(wayId)` cannot be reached by setting one variable.
@@ -1229,16 +1230,17 @@ wait out the lease (30 minutes at most) and run it again.
 ### `INGEST_TRAIL_IDENTITY` → `osm-id`
 
 ```bash
-# 1. Vercel, both environments.
-vercel env rm INGEST_TRAIL_IDENTITY production --yes
-vercel env rm INGEST_TRAIL_IDENTITY preview --yes
+# 1. Vercel. Production carries the variable; Preview does not, and `env rm` on an absent name
+#    exits non-zero — check before removing rather than removing blind.
+vercel env ls production | grep INGEST_TRAIL_IDENTITY && \
+  vercel env rm INGEST_TRAIL_IDENTITY production --yes
 
 # 2. Promote a deployment built without it, or merges continue on the running one.
 vercel redeploy switchback-three.vercel.app --target production
 
 # 3. The Function App. `ingest.bicep` declares this setting explicitly, so set it rather than
-#    delete it — a deleted setting is re-asserted as `osm-id` by the next template deploy, and the
-#    two states would otherwise read as drift.
+#    delete it — a deleted setting is written back by the next template deploy from whatever the
+#    deploying shell exports, and the two states would otherwise read as drift.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_TRAIL_IDENTITY=osm-id -o none
 
@@ -1358,17 +1360,31 @@ snapshot-differencing invents traffic on ground nobody has hiked.
 
 ## Authentication
 
-Seven trust relationships. Four are identity-based and carry no secret at all; three still pass a
-stored password, and moving those is the work in progress. This section is the single picture,
-because until it existed the story lived in a Bicep comment, a workflow, a Vercel setting and two
-people's memory.
+Twelve trust relationships are drawn below. Seven present an Entra token and hold no stored secret;
+two more are Entra-mapped and privileged but carry nothing yet; two pass the stored `sbapp`
+password, and moving those is the work in progress; the last is a reader's session cookie. This
+section is the single picture — the story otherwise lives in a Bicep comment, a workflow and a
+Vercel setting.
+
+### Where it all runs
+
+![Switchback production estate: deployment boundaries, the credentials that cross them, and the absent network boundary](diagrams/estate.svg)
+
+The boundary to notice is the one that is not there. Nothing in Azure sits on a virtual network:
+`publicNetworkAccess` is Enabled and the Postgres firewall is a single rule spanning all of IPv4,
+because Vercel serverless has no static egress address to allow-list. Identity and the credential
+are the whole perimeter. `docs/diagrams/README.md` covers why that diagram is a committed SVG rather
+than Mermaid.
 
 ### Who trusts whom
 
-Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
-Dashed edges are not. Two of the three carry the stored `sbapp` password; the third is a move not
-yet made and carries no credential at all. `sbadmin`, which holds full DDL, is not drawn: it
-reaches this server by password too, but the secret holding that password has no consumer left.
+Solid edges are identity-based — the caller proves who it is and Entra issues a short-lived token —
+with one exception drawn solid because it is not a stored secret either: the reader's session cookie
+into Vercel. Two of the identity edges carry nothing yet: `sbapp_vercel` and `sbapp_func` are mapped
+and already hold `sbapp`'s grants by membership, and each label names the setting it waits on. The
+two dashed edges are the stored `sbapp` password, which is what both applications connect with
+today. `sbadmin`, which holds full DDL, is not drawn: it reaches this server by password too, but
+the secret holding that password has no consumer left.
 
 ```mermaid
 graph LR
@@ -1394,7 +1410,7 @@ graph LR
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
-  RUNTIME -->|sbapp_vercel<br/>mapped, unused, renamed on cutover| PG
+  RUNTIME -->|sbapp_vercel<br/>mapped, unused, awaiting DATABASE_AUTH=entra-vercel| PG
   FUNC -->|sbapp_func<br/>mapped, ready, awaiting databaseAuth=entra| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
@@ -1403,17 +1419,23 @@ graph LR
   READER -->|session cookie| VERCEL
 ```
 
-**One identity for every runtime client.** `id-switchback-vercel-publisher` is what Vercel
-production, Vercel preview and the ingest worker are all intended to authenticate as — one
-principal, one Postgres role, one grant set. Its two federated credentials distinguish the Vercel
-environments to Entra and to nothing else: the access token carries the identity's object id, so
-Postgres, Azure RBAC and every policy downstream see one caller. **That is the objection to this
-design, and it is now sharper than when it was written.** Preview holds no connection string, so a
-preview deployment cannot reach production Postgres today; consolidating onto this identity would
-give it back, by being a preview deployment rather than by holding a secret. The consolidation also
-removes the ability to revoke one consumer without the others. The two roles it replaces hold
-identical privileges, so nothing that was ever differentiated is lost in _privilege_; what is lost
-there is attribution, and `application_name` is what restores it. Attribution, not a boundary: any
+**One identity across the two Vercel environments, and four principals in the database.**
+`id-switchback-vercel-publisher` is what Vercel production and Vercel preview both federate to —
+one principal, one Postgres role (`sbapp_vercel`), one grant set across the two of them. The ingest
+worker is not one of these clients: it authenticates as the Function App's own system-assigned
+identity `3db30cfd-…`, whose role is `sbapp_func`, and the bullets below say why folding it in is
+refused. `pgaadauth_list_principals` returns four Entra principals — the owner, the CI identity
+`id-switchback-postgres-ci`, `sbapp_vercel` and `sbapp_func` — alongside the password roles
+`sbadmin` and `sbapp`.
+
+The two federated credentials distinguish the Vercel environments to Entra and to nothing else: the
+access token carries the identity's object id, so Postgres, Azure RBAC and every policy downstream
+see one caller. **That is the objection to this design, and it is now sharper than when it was
+written.** Preview holds no connection string, so a preview deployment cannot reach production
+Postgres today; moving Vercel onto this identity gives it back, by being a preview deployment
+rather than by holding a secret, and it removes the ability to revoke one environment without the
+other. What is lost is attribution rather than privilege — the two environments hold identical
+grants either way — and `application_name` is what restores it. Attribution, not a boundary: any
 client can set it to anything.
 
 **What does change is how the credential is obtained, and that is the part worth deciding on.**
@@ -1442,16 +1464,17 @@ Postgres role, `pg_hba` entry or RLS predicate can tell the two Vercel environme
 the FIC subject does not survive the token exchange — only the identity's object id does. Entra's
 sign-in logs can, which makes it forensics, not enforcement.
 
-**The consolidation is declared, not yet performed, and the diagram says so.** What is deployed is
-the identity and its two federated credentials. What is not:
+**The move onto this identity is declared, not yet performed, and the diagram says so.** What is
+deployed is the identity and its two federated credentials. What is not:
 
-- `sbapp_runtime` does not exist. Read from the live catalog on 2026-08-06 as the owner's Entra
-  administrator, `pg_roles` holds `sbapp`, `sbapp_func`, `sbapp_vercel` and `sbadmin`, and
+- `sbapp_runtime` does not exist, and is no longer planned. Read from the live catalogue on
+  2026-08-08 as the owner's Entra administrator, `pg_roles` holds `sbadmin`, `sbapp`,
+  `sbapp_vercel`, `sbapp_func`, `id-switchback-postgres-ci` and the owner's UPN, and
   `pgaadauth_list_principals` maps `sbapp_vercel` to `c9bfba39-…` and `sbapp_func` to
-  `3db30cfd-…` — the two-role topology this change replaces. `infra/postgres-identity/roles.sql`
-  carries the `ALTER ROLE sbapp_vercel RENAME TO sbapp_runtime` that creates it, and that has run
-  nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
-  provisioning workflow cannot execute from a branch.
+  `3db30cfd-…`. That two-role topology is the deployed one and the intended one: folding the two
+  into one presupposes the worker moving onto the shared identity, which is the change the next
+  bullet rules out. `infra/postgres-identity/roles.sql` converges and asserts both roles rather
+  than renaming either.
 - The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
   Service Bus grants under it. It also already has a working Entra path to Postgres: `sbapp_func` is
   mapped to that principal and is a member of `sbapp`, so removing the worker's password does not
@@ -1470,8 +1493,8 @@ the identity and its two federated credentials. What is not:
   group, not the assignment, which reads like the wrong error until you know that.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
-because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
-mapping against the live catalog after the rename rather than assuming the rename carried it.
+because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts each role
+against the object id its run was given, so that mismatch surfaces in the workflow instead.
 
 Two things the diagram is meant to make obvious. The deploying service principal holds Contributor
 at subscription scope and Role Based Access Control Administrator on the production resource group,
@@ -1647,8 +1670,8 @@ header into a module-level holder closes even that, at the cost of holding a bea
 memory.
 
 The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
-same one already trusted for Service Bus, and the one the `sbapp_vercel` database role carries
-until the rename in _What is left_ makes it `sbapp_runtime`.
+same one already trusted for Service Bus, and the one the `sbapp_vercel` database role is mapped
+to.
 
 Whether retiring connections is a correctness requirement or only hygiene turns on one question
 nobody should answer from memory: **is the token checked only at connect, or is a live session
@@ -1742,29 +1765,47 @@ but **no consumer has `DATABASE_AUTH` set**, so the path is password-authenticat
 no Entra-authenticated Prisma query has ever run against production. Four things come off in this
 order, each proved with passwords still enabled:
 
-1. **The database role.** `sbapp_runtime` does not exist yet; `infra/postgres-identity/roles.sql`
-   renames `sbapp_vercel` into it and then asserts the Entra security label survived the rename.
-   That assertion is the gate, because the label follows the role's oid and a rename not carrying
-   it would leave a role mapped to nothing — recoverable by the inverse rename, since nothing is
-   dropped. It cannot run from a branch: the CI identity's federated credential trusts
-   `refs/heads/master` alone, so this executes on merge.
-2. **The Function App.** `DATABASE_AUTH=entra`, `AZURE_CLIENT_ID` for the shared identity, and a
-   `DATABASE_URL` with the password removed. Its app setting still carries `sbapp`. Its identity
-   block lives in `infra/azure/ingest.bicep`, which also declares the queue and its four role
-   assignments, so the move and the Service Bus grant that follows it are one change to that file.
-   The shared identity already holds a Receiver assignment of its own on `ingest-jobs` — the
-   over-grant described above, which `ingest.bicep` adopts until the lock is lifted and it can be
-   revoked.
+1. **The database roles.** Both already exist and are Entra-mapped —
+   `infra/postgres-identity/roles.sql` converges `sbapp_vercel` against the shared identity's
+   object id and `sbapp_func` against the worker's, then asserts each mapping rather than assuming
+   it, because a security label follows the role's oid and an identity recreated since would leave
+   a role matching nothing. That failure otherwise surfaces at first use, which is a web request.
+   The `provision` action cannot run from a branch: the CI identity's federated credential trusts
+   `refs/heads/master` alone, so it executes on merge. Against the deployed estate it creates
+   nothing and only asserts.
+2. **The Function App.** `param databaseAuth = 'entra'` added to `ingest.bicepparam`, which assigns
+   it nowhere today, and `INGEST_DATABASE_URL` exported naming `sbapp_func` with no password in it —
+   `entraPoolConfig` refuses a URL that still carries one, so the half-done version fails at connect
+   rather than quietly preferring the password. Nothing needs creating first: `sbapp_func` is
+   Entra-mapped to this app's own **system-assigned** principal
+   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same table
+   grants the password role has, and the server already has `activeDirectoryAuth: Enabled`. The
+   deployment writes two application settings on the Function App; `ingest.bicep` declares no
+   `Microsoft.DBforPostgreSQL` resource, so the server is not in the change set.
+
+   **Do not move this app onto the shared identity to get there.** The trigger binding sets no
+   `__clientId`, so the host receives Service Bus messages as whatever principal the site runs
+   under; an app running as `id-switchback-vercel-publisher` would need Data Receiver on
+   `ingest-jobs` put back on it — the grant that was revoked precisely because that identity rides
+   on every Vercel preview. `ingest.bicep` declares the queue and its three role assignments. Two
+   principals with two Postgres roles is the cheaper arrangement and it is what is deployed.
+
 3. **Vercel.** `DATABASE_AUTH=entra-vercel`, plus `AZURE_TENANT_ID` and the client id of
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.
 4. **CI.** `ci.yml`'s `migrate` job composes a connection string from a freshly minted token for
-   `id-switchback-postgres-ci` rather than reading a stored password. That path has never
-   executed — it fires only when `packages/db/prisma/` changes — so it is written but unproven,
-   and proving it means a no-op schema commit while passwords still work. One thing will bite
-   when it is tried: `prisma db push` then runs as a role that is not `sbadmin`, so new tables
-   would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would not apply.
-   `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and is untested.
+   `id-switchback-postgres-ci` rather than reading a stored password, and **that path runs on every
+   push to `master`**: `azure/login` and the grant-convergence step are unconditional, and run
+   31246622902 reached production as `id-switchback-postgres-ci` and reported
+   `switchback-runtime-grants tables=26 ungranted=0`. The half gated on `packages/db/prisma/`
+   changing — `assert-pg-admin.ts`, `npm run db:generate` and `npm run db:push` — has run too: run
+   31183187247 carried `244edf6` and its change to `spatial.sql`, and all three reported `success`
+   against production, where the same steps report `skipped` in 31246622902.
+   The hazard in that half already materialised once: `db push` runs as a role that is not
+   `sbadmin`, so `trail_ways` and `trail_slug_aliases` were created owned by
+   `id-switchback-postgres-ci` and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` did not reach them. The
+   repair that shipped is `scripts/converge-runtime-grants.ts`, which re-grants unconditionally
+   after every push rather than relying on default privileges registered under one creating role.
 
 `passwordAuth` is a parameter — `passwordAuthEnabled` in `main.bicep`, defaulting true — so the
 flip is a reviewable deployment of its own rather than an edit to a template. It is gated on all
@@ -1797,26 +1838,31 @@ only `disable`/`prefer`/`require` for that key. In `password` mode Prisma still 
 the default — so until a consumer moves its TLS is unverified. Measured against Prisma 6.19.3 and
 node-postgres 8.22.0; the full matrix is at the foot of `infra/azure/postgres.bicep`.
 
-**Two data conditions are open, both measured against production on 2026-08-07.**
+**Claim identity is writing, and one data condition is open. Measured against production
+2026-08-08.**
 
-`trail_ways` and `trail_slug_aliases` exist and are empty — `information_schema.tables` returns both,
-with 2 and 3 columns respectively, and `count(*)` is 0 on each. CI run `31183187247` at `244edf6`
-records `Prove the token connects` and `Reconcile the production schema` both succeeding, so the
-schema is current. `pg_stat_user_tables` puts `n_tup_ins` at 0 for both.
+`trail_ways` holds the claims; `trail_slug_aliases` is empty because no merge has retired a slug yet.
+`sbapp` holds all four table privileges on both.
 
-**They are empty because the runtime role cannot write them, not because the flag is off**, and the
-two readings are not interchangeable. `ALTER DEFAULT PRIVILEGES` is registered per creating role and
-the only registration in this database is `FOR ROLE sbadmin`; the migrate job pushes as
-`id-switchback-postgres-ci`, so these two — the first tables to arrive by that route — are owned by
-it and inherit nothing. Measured 2026-08-08: `has_table_privilege('sbapp', 'trail_ways', …)` is
-`false` for SELECT, INSERT, UPDATE and DELETE alike, against `true` on all 24 `sbadmin`-owned tables.
-`INGEST_TRAIL_IDENTITY=claim` is therefore unreachable in production: `resolveTrail` reads
-`TrailWay` before it does anything else, so the read raises
-`42501 permission denied for table trail_ways` and unwinds the whole per-trail commit. Turning the
-flag on over tile `030230221` assembled 42 trails and committed none of them; turning it back off and
-re-running the same tile committed all 42. `scripts/converge-runtime-grants.ts`, run by the migrate
-job after every push, registers the missing default privileges and grants over the tables already on
-the ground, and fails the job if any application table is still short.
+```sql
+select relname, n_live_tup, n_tup_ins from pg_stat_user_tables
+ where relname in ('trail_ways', 'trail_slug_aliases');
+-- trail_ways          25238  26592     n_tup_ins exceeds the row count where a re-ingest re-claimed
+-- trail_slug_aliases      0      0
+
+select p, has_table_privilege('sbapp', 'trail_ways', p)
+  from unnest(array['SELECT','INSERT','UPDATE','DELETE']) p;   -- t  t  t  t
+```
+
+**Those grants had to be placed explicitly, and the reason still binds for the next table.**
+`ALTER DEFAULT PRIVILEGES` is registered per creating role, and the only registration in this
+database is `FOR ROLE sbadmin`. The migrate job pushes as `id-switchback-postgres-ci`, so a table
+arriving by that route is owned by it — `pg_tables` puts these two under that owner against 24 under
+`sbadmin` — and inherits no grant at all. A table in that state is not merely unwritten: `resolveTrail`
+reads `TrailWay` before it does anything else, so `42501 permission denied for table trail_ways`
+unwinds the whole per-trail commit and the tile records as covered with nothing in it.
+`scripts/converge-runtime-grants.ts` runs after every push, registers the missing default privileges,
+grants over the tables already on the ground, and fails the job if any application table is short.
 
 **102 groups — 204 trail rows — share byte-identical geometry**, by `md5(st_asbinary(geom))`, and 85
 of those pairs are a relation against a way. Kibbie Lake Trail is one: way `162652736` and relation
@@ -1825,23 +1871,46 @@ serving 200. The stored `lengthM` disagrees across that pair — 13,473 on the r
 way — so the two pages a reader can open today differ by 409 m on a geometry that is the same bytes,
 and the eventual backfill cannot take the stored column as its tiebreak. This is
 exactly the duplication claim identity exists to prevent, and it predates that work — the rows were
-written under `(osmType, osmId)` upserts, which cannot see that two ids describe one trail. Turning
-`INGEST_TRAIL_IDENTITY` to `claim` stops new pairs; it does not merge the existing ones, which needs
-a backfill that picks a winner per hash, moves user content onto it and retires the loser's slug
-through `trail_slug_aliases`. Both tables are in place, so what blocks the backfill is that nobody
-has written it.
+written under `(osmType, osmId)` upserts, which cannot see that two ids describe one trail. With
+`INGEST_TRAIL_IDENTITY` on `claim` no new pairs form; the existing ones are untouched, and merging
+them needs a backfill that picks a winner per hash, moves user content onto it and retires the
+loser's slug through `trail_slug_aliases`. Both tables are writable, so what blocks the backfill is
+that nobody has written it.
 
-`INGEST_TRAIL_IDENTITY` reads `osm-id` on the Function App and is absent on both Vercel
-environments, which resolve to the same thing. `infra/azure/ingest.bicep` declares it, so a
-template deploy writes the explicit value rather than leaving the setting to be inferred from its
-absence — the difference matters only to a reader, since `packages/ingest/src/identity.ts` returns
-`osm-id` for anything that is not exactly `claim`.
+`INGEST_TRAIL_IDENTITY` reads `claim` on the Function App and in Vercel **Production**, and is
+**absent in Vercel Preview** — `identity.ts` resolves anything that is not exactly `claim`, absence
+included, to `osm-id`. Preview carries no `DATABASE_URL`, so nothing there ingests and the asymmetry
+changes no behaviour; it starts to matter the day Preview is given a database of its own.
 
-**No workflow deploys `infra/azure/ingest.bicep`.** `infrastructure.yml` builds every template and
-deploys only `main.bicep` and `runtime-identity.bicep`, so a change to the ingest template reaches
-Azure on a human-run `az deployment group create` — and that deployment must be followed by
-`.github/scripts/deploy-worker.sh`, because an ARM application-settings write erases
-`WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the next package push.
+| Surface      | Read it back with                                                                                                             |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Function App | `az functionapp config appsettings list -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri -o json` |
+| Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone (see the runbook note on `--no-sensitive`)          |
+
+**A deploy of `ingest.bicep` from a shell that has not exported the flag fails the build.**
+`ingest.bicepparam` resolves `ingestTrailIdentity` through
+`readEnvironmentVariable('INGEST_TRAIL_IDENTITY')` with no fallback, so `BCP427` stops the
+deployment before ARM is called. A fallback would be the whole hazard: the app reads `claim`, an
+application-settings write replaces the collection whole, and `identity.ts` treats an absent
+variable and `osm-id` identically — so a reverted app looks unchanged. The ceiling above keeps its
+fallback because there the safe direction and the deployed value are the same one.
+
+**No workflow deploys `infra/azure/ingest.bicep`.** No workflow deploys any template:
+`infrastructure.yml` compiles the eight `infra/azure/*.bicep` templates and then builds
+`main.bicepparam`, and the only job that carries a `what-if` or an apply is
+gated on `vars.AZURE_INFRA_CLIENT_ID != ''`, which is unset — `gh variable list` returns
+`AZURE_SUBSCRIPTION_ID` and `AZURE_WORKER_DEPLOY_CLIENT_ID` and nothing else, so that job is skipped
+on every run. `.github/scripts/infra-deploy.sh` would take only `runtime-identity` and `main` in any
+case. So a change to the ingest template reaches Azure on a human-run `az deployment group create` —
+and that deployment must be followed by `.github/scripts/deploy-worker.sh`, because an ARM
+application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the
+next package push.
+
+**`ingest.bicepparam` is compiled by nothing, so a break in it surfaces at the deploy.** It resolves
+`INGEST_QUEUE_DRIVER`, `INGEST_OVERPASS_USER_AGENT`, `INGEST_TRAIL_IDENTITY` and
+`INGEST_DATABASE_URL` through `readEnvironmentVariable` with no default, and that call runs at build
+time, so `az bicep build-params` on it fails `BCP427` four times on a runner holding none of them —
+and one of the four is a database URL, which is why it is not simply added to the compile loop.
 
 ## Design decisions, recorded once
 

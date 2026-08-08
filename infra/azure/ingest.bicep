@@ -5,7 +5,9 @@
 // group `main.bicep` already created and never declares the Postgres server, its database, its
 // firewall rules or its parameters. `administratorLoginPassword` is `@secure()` with no default
 // and ARM cannot read the current value back, so any deployment that includes `postgres.bicep`
-// writes whatever it is handed — and the live password is not recorded anywhere readable. Adding
+// writes whatever it is handed. The live value is recorded outside the repository — see
+// infra/azure/README.md, "Read this first" — but ARM cannot consult that record, so handing the
+// wrong value to a template that declares the server rotates the production credential. Adding
 // these resources to `main.bicep` would have made shipping a queue and rotating the production
 // database password the same operation. This file cannot do that: `main.bicep` is not touched and
 // is never redeployed by this work.
@@ -992,11 +994,12 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
           // this on `claim` is the combination that fragments trails across the new seam.
           //
-          // Deployed and readable: `az functionapp config appsettings list` returns 28 settings on
-          // the live app and this one reads `osm-id`, matching `ingest.bicepparam`. Reading it back
-          // is the check an operator should use, because `identity.ts` treats an absent variable
-          // and `osm-id` identically — so an app whose settings collection was replaced without
-          // this entry looks safe and is, but says nothing about which template last converged it.
+          // Live value is `claim`, and `ingest.bicepparam` reads INGEST_TRAIL_IDENTITY with no
+          // fallback, so a deploy from a shell that has not exported it fails the build rather than
+          // writing `osm-id` over a control that is on. Read it back after every deployment with
+          // `az functionapp config appsettings list`: `identity.ts` treats an absent variable and
+          // `osm-id` identically, so an app whose settings collection was replaced without this
+          // entry looks unchanged and is not.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
