@@ -342,9 +342,16 @@ describe('the drain-failure alert, from the template', () => {
       resolve(__dirname, '../../../infra/azure/ingest.bicepparam'),
       'utf8',
     );
+    /*
+     * No fallback, unlike the ceiling above, and the asymmetry is the point. The live app reads
+     * `claim`; an application-settings write replaces the collection whole; so a fallback of
+     * `osm-id` would revert a deployed control on any deploy that forgot the export, silently and
+     * with nothing in the output naming the flag. Unset must fail the build instead.
+     */
     expect(params).toContain(
-      "param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')",
+      "param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY')",
     );
+    expect(params).not.toMatch(/readEnvironmentVariable\('INGEST_TRAIL_IDENTITY',/);
 
     // Deployed as committed, the ceiling is inert whatever it says.
     expect(

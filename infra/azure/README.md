@@ -909,9 +909,14 @@ side and stays `true` until every consumer has been proved on a token.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
-   converges `sbapp_vercel` and `sbapp_func` and then asserts each is mapped to the object id it
-   was given, which is the check that catches an identity recreated since. It creates nothing that
-   already exists, so a run against the deployed estate is an assertion rather than a change.
+   applies `roles.sql` against `postgres` and `grants.sql` against `switchback`, then asserts the
+   result: each role mapped to the object id the run was given, no grant held directly rather than
+   inherited, no membership beyond `sbapp`, and `CREATE TABLE` refused when it `SET ROLE`s into each.
+   Against the deployed estate every write in it is idempotent — both roles exist, both memberships
+   already hold — so what the run is worth is the assertions. It is not the read-only door, though:
+   that is `inspect`, which asserts nothing. And it repairs nothing. Creation is guarded on the
+   role's _name_, so an identity recreated since leaves a role mapped to an object id that no longer
+   exists, and the job raises rather than remapping it.
 3. Convert Vercel **Production**, and only Production: set `DATABASE_AUTH=entra-vercel` and rewrite
    `DATABASE_URL` to the password-free form naming `sbapp_vercel`. `AZURE_TENANT_ID` and
    `AZURE_CLIENT_ID` are already set there, which is the whole of what `entra-vercel` needs beyond
@@ -930,8 +935,10 @@ side and stays `true` until every consumer has been proved on a token.
    accepting passwords until step 6. Preview becomes a rehearsal again on the day it has a database
    of its own — see [Preview has no database](#preview-has-no-database).
 
-4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Confirm
-   the settings landed with `az functionapp config appsettings list -o json`, and re-run
+4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Use the
+   export set in [Deploying it](#deploying-it) rather than a shorter one: every variable there has
+   no fallback, so a missing one fails the build instead of writing a wrong value. Confirm the
+   settings landed with `az functionapp config appsettings list -o json`, and re-run
    `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces the collection
    whole and erases `WEBSITE_RUN_FROM_PACKAGE`.
 5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
@@ -1093,6 +1100,7 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
+export INGEST_TRAIL_IDENTITY=claim                   # the live value — no default, state it
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1102,14 +1110,31 @@ az deployment group create \
 unset INGEST_DATABASE_URL
 ```
 
-Both exported strings are load-bearing and both have bitten. `INGEST_OVERPASS_USER_AGENT` must carry
-an `http(s)://` contact URL that reaches _this_ project — `assertUsableUserAgent` in
-`packages/ingest/src/overpass.ts` throws inside the handler on a placeholder or on a host it knows is
-not ours, so the worker dead-letters every tile after five deliveries with a message that names the
-database rather than the user agent. `switchback.app` is on that rejected list by name: it reads like
-ours, is registered to somebody else, and was what the Function App actually sent on every Overpass
-request until 2026-08-03. Only the shape can be checked in code — that a URL reaches you is the one
-thing the operator has to get right.
+Those four exports are the whole set with no fallback, and a missing one fails the build with
+`BCP427` naming the variable — before ARM is called. `ingest.bicepparam` reads three more from the
+environment — `INGEST_SUBDIVIDE_MAX_ZOOM`, `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` — and each of
+those falls back to what the app already holds (`9`, and absent for the other two), so leaving them
+unexported deploys the deployed value.
+
+`INGEST_TRAIL_IDENTITY` is in the block, and has no fallback, because for it that was not true: the
+app reads `claim` and an application-settings write replaces the collection whole, so any default
+would revert a live control. Confirm the value landed rather than assuming it — `identity.ts` reads
+an absent variable and `osm-id` identically, so a reverted app looks unchanged:
+
+```bash
+az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv   # expect claim
+```
+
+`INGEST_OVERPASS_USER_AGENT` is the one an operator has to get right rather than copy, and it has
+bitten. It must carry an `http(s)://` contact URL that reaches _this_ project —
+`assertUsableUserAgent` in `packages/ingest/src/overpass.ts` throws inside the handler on a
+placeholder or on a host it knows is not ours, so the worker dead-letters every tile after five
+deliveries with a message that names the database rather than the user agent. `switchback.app` is on
+that rejected list by name: it reads like ours, is registered to somebody else, and was what the
+Function App actually sent on every Overpass request until 2026-08-03. Only the shape can be checked
+in code — that a URL reaches you is the one thing the operator has to get right.
 `INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
 with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
 Postgres/Service Bus fan-out that an operator had just rolled back.
@@ -1244,8 +1269,11 @@ az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microso
   --query "value[?contains(properties.scope,'queues/ingest-jobs')].{assignment:name, principal:properties.principalId, role:properties.roleDefinitionId}" -o tsv
 ```
 
-`atScope()` also returns what the subscription and the resource group grant — ten rows against this
-estate — so the filter on `properties.scope` is what narrows it to the queue's own. Three rows:
+`atScope()` means _at this scope and above_, not _at this scope_: it returns the queue's own
+assignments plus everything inherited, which against this estate is nine rows — three on the queue,
+one from the resource group, five from the subscription — so the filter on `properties.scope` is
+what narrows it to the queue's own. Dropping `atScope()` returns the same nine here, because a queue
+has no child scope for the unfiltered form to add. Three rows:
 Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and Data
 Sender alone for the publisher `c9bfba39-…`. Two things must **not** appear:
 `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner), and any Data Receiver held by `c9bfba39-…` —
