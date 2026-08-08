@@ -27,7 +27,7 @@ second copy and no geo-redundant backup; see [Backups](#backups).
   now a stored production administrator credential with no consumer. It still sets the blast radius
   while it exists: anyone with write access to this repository can add a workflow step that prints
   it, so compromise of repository write access is compromise of the database administrator. Delete
-  it and `DATABASE_URL` at step 7 of the cutover, not before — until then they are the way back if
+  it and `DATABASE_URL` at step 6 of the cutover, not before — until then they are the way back if
   the token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
   given the same value. A copy in the owner's
   password manager was claimed here previously; nobody observed it being made, so it is not counted.
@@ -300,27 +300,28 @@ door the moment `passwordAuthEnabled` is flipped to false.
 | `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
 
 **Both application roles exist and neither is in use.** Every consumer still authenticates by
-password as `sbapp`; `DATABASE_AUTH` is set nowhere. The role names above are what the live catalog
-holds, read on 2026-08-06.
+password as `sbapp`; `DATABASE_AUTH` is set nowhere. Read from the live catalogue on 2026-08-08,
+`pg_roles` holds `sbadmin`, `sbapp`, `sbapp_vercel`, `sbapp_func`, `id-switchback-postgres-ci` and
+the owner's UPN; `sbapp_vercel` and `sbapp_func` carry no password at all and are members of
+`sbapp`. There is no `sbapp_runtime` and none is planned.
 
-`id-switchback-vercel-publisher` is the shared runtime identity: Vercel production, Vercel preview
-and — once `infra/azure/ingest.bicep` moves the worker onto it — the ingest worker are all intended
-to authenticate as this one principal. The resource name is narrower than the role it will hold
+`id-switchback-vercel-publisher` is the shared runtime identity: Vercel production and Vercel
+preview both federate to it, and Postgres cannot tell the two environments apart because the FIC
+subject does not survive the token exchange. The resource name is narrower than the role it holds
 because ARM cannot rename a user-assigned identity; the `component: runtime-identity` tag is where
 a portal reader is told what it actually is.
 
-The consolidation renames `sbapp_vercel` to `sbapp_runtime` and then drops `sbapp_func`, in that
-order and not together. The rename is the `provision` action of the `Postgres identity` workflow;
-it must run from `master`, because the CI identity's federated credential trusts no other ref. The
-drop is the separate `retire` action, and it refuses to run unless the dispatch asserts every
-consumer has been moved — the database cannot establish that for itself, and a sample of
-`pg_stat_activity` cannot stand in for it, because the worker scales to zero between invocations
-and shows no backend for most of any minute however healthy it is.
+**The ingest worker is not moving onto it.** Its Service Bus trigger receives as whatever principal
+the site runs under, so a worker on the shared identity would need Data Receiver on `ingest-jobs`
+put back on the identity every Vercel preview carries — the grant revoked on 2026-08-08. Two
+principals with two Postgres roles is the deployed arrangement and the intended one, which is why
+`provision` converges both roles rather than folding one into the other.
 
-The application role holds its privileges by membership in `sbapp` rather than by a copied list of
-grants, so it cannot drift from it — including for a table `prisma db push` creates tomorrow, which
+Each role holds its privileges by membership in `sbapp` rather than by a copied list of grants, so
+neither can drift from it — including for a table `prisma db push` creates tomorrow, which
 `sbapp`'s default privileges already cover. `infra/postgres-identity/` holds the SQL, and the
-`provision` action of the `Postgres identity` workflow applies and re-verifies it.
+`provision` action of the `Postgres identity` workflow applies and re-verifies it. That action must
+run from `master`, because the CI identity's federated credential trusts no other ref.
 
 ARM cannot create these: they are SQL objects behind `pgaadauth_create_principal_with_oid`, which
 runs in the database as an Entra administrator. A `Microsoft.Resources/deploymentScripts` resource
@@ -676,10 +677,12 @@ to `password`, so a deploy that does not set it behaves exactly as before.
 | `entra-vercel` | Vercel                  | the per-request OIDC token, exchanged for an access token  |
 
 Under either Entra value `DATABASE_URL` must carry **no password** and the username becomes the
-Entra-mapped role — `sbapp_runtime` for both Vercel and the worker:
+Entra-mapped role for that consumer's own principal — `sbapp_vercel` on Vercel, `sbapp_func` on the
+Function App:
 
 ```
-postgresql://sbapp_runtime@<host>:5432/switchback?sslmode=verify-full
+postgresql://sbapp_vercel@<host>:5432/switchback?sslmode=verify-full
+postgresql://sbapp_func@<host>:5432/switchback?sslmode=verify-full
 ```
 
 A URL that still has a password in it is rejected at construction rather than quietly preferred, so
@@ -842,33 +845,29 @@ side and stays `true` until every consumer has been proved on a token.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
-   renames `sbapp_vercel` to `sbapp_runtime` and then asserts the Entra mapping followed the rename.
-   If the assertion fails, the inverse rename is the rollback and nothing has been dropped.
+   converges `sbapp_vercel` and `sbapp_func` and then asserts each is mapped to the object id it
+   was given, which is the check that catches an identity recreated since. It creates nothing that
+   already exists, so a run against the deployed estate is an assertion rather than a change.
 3. Set `DATABASE_AUTH=entra-vercel` on Vercel preview, then production, with password-free URLs
-   naming `sbapp_runtime`. Prove a signed-in read and a write — `session.findUnique` is the canary.
+   naming `sbapp_vercel`. Prove a signed-in read and a write — `session.findUnique` is the canary.
 4. Set `DATABASE_AUTH=entra` on the Function App and prove a tile ingests end to end.
-5. Drop the Function App's system-assigned identity, delete the two role assignments it leaves
-   behind — removing a `roleAssignment` from Bicep is not a revocation — and run `Postgres identity`
-   → `retire` with `consumers_moved=MOVED`. The retire action asks for that assertion because the
-   database cannot check it: the worker scales to zero between invocations, so `pg_stat_activity`
-   shows no backend under its role whether or not it has been moved.
-6. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
+5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
-7. Only now set `passwordAuthEnabled = false` and deploy.
+6. Only now set `passwordAuthEnabled = false` and deploy.
 
-Two things to settle before step 7. The `migrate` job in `ci.yml` mints its own token and no longer
+Two things to settle before step 6. The `migrate` job in `ci.yml` mints its own token and no longer
 reads `secrets.DIRECT_DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/`
 while passwords still work, so a failure is a red run rather than an outage. And `.env` on the
 owner's machine points at production — point it at the local Docker Postgres first, or every db
-script, `npm run dev` and the e2e suite stop working at step 7 with a connection error and no
+script, `npm run dev` and the e2e suite stop working at step 6 with a connection error and no
 explanation.
 
-After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
-server refuses password authentication outright, and from step 7 onward the template needs no
+After step 6 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
+server refuses password authentication outright, and from step 6 onward the template needs no
 password at all — so the accidental-rotation hazard is gone rather than dormant.
 
-**Rolling step 7 back — set `passwordAuthEnabled = true` and export the password with it.**
+**Rolling step 6 back — set `passwordAuthEnabled = true` and export the password with it.**
 
 ```bash
 # The recorded value. Without it the deploy omits the property and writes no password.

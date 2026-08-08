@@ -348,10 +348,9 @@ flipping this is the only step between a compile-only pipeline and a deploying o
 param grantInfraIdentityContributor bool = false
 
 @description('''
-Name of the user-assigned managed identity the runtime clients are being consolidated onto —
-Vercel production, Vercel preview and the ingest worker. Declared, not yet in force; see
-runtime-identity.bicep for what is live today, why one identity serves all three, and what
-that costs.
+Name of the user-assigned managed identity both Vercel environments federate to. Declared, not
+yet in force: Vercel still authenticates to Postgres by password. See runtime-identity.bicep for
+what is live today and what one identity across two environments costs.
 ''')
 param runtimeIdentityName string = 'id-switchback-vercel-publisher'
 
@@ -862,8 +861,8 @@ output runtimeIdentityResourceId string = runtimeIdentity.outputs.resourceId
 output runtimeIdentityClientId string = runtimeIdentity.outputs.clientId
 
 @description('''
-Object id of the shared runtime identity. What `sbapp_runtime` is mapped to, and the argument
-`postgres-entra.yml` asserts the live role against.
+Object id of the shared runtime identity. What the `sbapp_vercel` database role is mapped to, and
+the argument `postgres-entra.yml` asserts that role against.
 ''')
 output runtimeIdentityPrincipalId string = runtimeIdentity.outputs.principalId
 

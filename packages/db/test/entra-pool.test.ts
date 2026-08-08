@@ -6,7 +6,7 @@ import { CONNECTION_LIFETIME_S, CONNECT_BUDGET_MS, createTokenProvider } from '.
 import type { AccessToken } from '../src/entra-token';
 
 const URL_WITHOUT_PASSWORD =
-  'postgresql://sbapp_runtime@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full';
+  'postgresql://sbapp_vercel@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full';
 
 const sizing = { max: 7, connectionTimeoutMillis: 30_000 };
 const password = () => Promise.resolve('a-token');
@@ -27,7 +27,7 @@ describe('entraPoolConfig', () => {
   it('splits the URL into discrete fields rather than passing it through', () => {
     const config = entraPoolConfig(URL_WITHOUT_PASSWORD, { ...sizing, password });
     expect(config.connectionString).toBeUndefined();
-    expect(config.user).toBe('sbapp_runtime');
+    expect(config.user).toBe('sbapp_vercel');
     expect(config.database).toBe('switchback');
     expect(config.port).toBe(5432);
     expect(config.host).toBe('psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com');
