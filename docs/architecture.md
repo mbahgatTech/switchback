@@ -1892,11 +1892,15 @@ replaces the collection whole. The fallback is deliberately the safe direction f
 with identity now live, safe and current have diverged, and the export is a step in the deployment,
 not an optional one.
 
-**No workflow deploys `infra/azure/ingest.bicep`.** `infrastructure.yml` builds every template and
-deploys only `main.bicep` and `runtime-identity.bicep`, so a change to the ingest template reaches
-Azure on a human-run `az deployment group create` — and that deployment must be followed by
-`.github/scripts/deploy-worker.sh`, because an ARM application-settings write erases
-`WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the next package push.
+**No workflow deploys `infra/azure/ingest.bicep`.** No workflow deploys any template:
+`infrastructure.yml` compiles all of them, and the only job that carries a `what-if` or an apply is
+gated on `vars.AZURE_INFRA_CLIENT_ID != ''`, which is unset — `gh variable list` returns
+`AZURE_SUBSCRIPTION_ID` and `AZURE_WORKER_DEPLOY_CLIENT_ID` and nothing else, so that job is skipped
+on every run. `.github/scripts/infra-deploy.sh` would take only `runtime-identity` and `main` in any
+case. So a change to the ingest template reaches Azure on a human-run `az deployment group create` —
+and that deployment must be followed by `.github/scripts/deploy-worker.sh`, because an ARM
+application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the
+next package push.
 
 ## Design decisions, recorded once
 

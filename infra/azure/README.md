@@ -128,14 +128,14 @@ There is one, and it is not portable.
 
 ### Azure point-in-time restore — the only recovery
 
-Free, automatic, and the fastest way back from a bad `db push`. Measured 2026-08-05:
+Free, automatic, and the fastest way back from a bad `db push`. Re-read 2026-08-08:
 
-| Fact                   | Value                                                               |
-| ---------------------- | ------------------------------------------------------------------- |
-| Retention configured   | 14 days, locally redundant, `geoRedundantBackup: Disabled`          |
-| Earliest restore point | `2026-07-30T16:32:40Z` — the server's own creation                  |
-| Full backups taken     | Daily, one per day since creation, plus continuous transaction logs |
-| Server state           | `Ready`, `replicationRole: Primary` — eligible                      |
+| Fact                   | Value                                                                      |
+| ---------------------- | -------------------------------------------------------------------------- |
+| Retention configured   | 14 days, locally redundant, `geoRedundantBackup: Disabled`                 |
+| Earliest restore point | `2026-07-30T16:32:40Z` — the server's own creation                         |
+| Full backups taken     | Daily, plus continuous transaction logs — Azure's schedule, not a readback |
+| Server state           | `Ready`, `replicationRole: Primary` — eligible                             |
 
 ```bash
 az postgres flexible-server show \
@@ -452,13 +452,14 @@ So the perimeter is a credential, and these are the compensating controls:
 The residual risk is therefore _leakage_ rather than brute force, which makes the credential
 inventory the thing to keep honest:
 
-| Store             | Value                                 | Read by                       | Notes                                                     |
-| ----------------- | ------------------------------------- | ----------------------------- | --------------------------------------------------------- |
-| GitHub secret     | `DATABASE_URL`                        | **nothing**                   | `sbadmin`. Deletable at step 6 of the cutover, not before |
-| GitHub secret     | `DIRECT_DATABASE_URL`                 | **nothing**                   | `sbadmin`, and the recorded copy of the admin password    |
-| GitHub secret     | `VERCEL_DEPLOY_HOOK`                  | `ci.yml`'s `deploy` job       | A URL that triggers a production build. No database reach |
-| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | the web app, on every request | `sbapp` — the web app never carries `sbadmin`             |
-| Vercel Preview    | neither                               | —                             | see [Preview has no database](#preview-has-no-database)   |
+| Store             | Value                 | Read by                       | Notes                                                        |
+| ----------------- | --------------------- | ----------------------------- | ------------------------------------------------------------ |
+| GitHub secret     | `DATABASE_URL`        | **nothing**                   | `sbadmin`. Deletable at step 6 of the cutover, not before    |
+| GitHub secret     | `DIRECT_DATABASE_URL` | **nothing**                   | `sbadmin`, and the recorded copy of the admin password       |
+| GitHub secret     | `VERCEL_DEPLOY_HOOK`  | `ci.yml`'s `deploy` job       | A URL that triggers a production build. No database reach    |
+| Vercel Production | `DATABASE_URL`        | the web app, on every request | `sbapp` — the web app never carries `sbadmin`                |
+| Vercel Production | `DIRECT_DATABASE_URL` | **nothing**                   | `sbapp`. Prisma opens `directUrl` for `db push`, which is CI |
+| Vercel Preview    | neither               | —                             | see [Preview has no database](#preview-has-no-database)      |
 
 **Neither database secret has a consumer.** `ci.yml`'s `migrate` job declares `id-token: write`,
 trades the runner's OIDC assertion for an Azure token against `id-switchback-postgres-ci`, and uses
@@ -469,6 +470,14 @@ sbadmin` never applied to the tables it created; `ci.yml`'s comment above the gr
 records what that cost. Both are stored administrator credentials with nothing reading them, kept
 only as the way back if the token path fails.
 
+**Vercel's copy of `DIRECT_DATABASE_URL` has no consumer either, for a different reason.**
+`schema.prisma` binds it to `directUrl`, which Prisma opens only for `migrate` and `db push` — both
+of which run in CI, never on Vercel. `packages/db/src/client.ts` builds every runtime connection
+from `DATABASE_URL` alone, and `vercel-build` runs `prisma generate` before `next build`, which
+completes with neither variable set. The one remaining mention, in `apps/web/src/env.ts`, is the
+guard that refuses a non-Production environment naming the production host: a validation, not a
+connection. Step 3 of the cutover therefore converts one Vercel variable, not two.
+
 Those three are every GitHub secret the repository holds — the `AZURE_*` ones are gone. Verify
 rather than trust this paragraph:
 
@@ -476,14 +485,15 @@ rather than trust this paragraph:
 gh secret list --repo mbahgatTech/switchback                    # three names, timestamps, no values
 npx vercel env ls                                               # per-environment presence
 git grep -nE 'secrets\.(DIRECT_)?DATABASE_URL' -- '.github/'    # empty: no workflow reads either
+git grep -n DIRECT_DATABASE_URL -- apps/ packages/              # schema, env guard, tests. No client
 ```
 
-`Read by` is measured — that `git grep` returns nothing and exits 1. `Value` is not: GitHub's API
-returns names and timestamps, never values, so what each secret _holds_ is design intent rather than
-a readback. A workflow can still print a secret, which is the blast radius named in
-[Read this first](#read-this-first) and the reason `DIRECT_DATABASE_URL` counts as a recorded copy of
-the admin password. Short of writing that workflow, setting a secret again from a source you trust is
-the honest way to know what it holds.
+`Read by` is measured, and those two greps are the measurement: the first returns nothing, exit 1.
+`Value` is not measured — GitHub's API returns names and timestamps, never values, so what each
+secret _holds_ is design intent rather than a readback. A workflow can still print a secret, which
+is the blast radius named in [Read this first](#read-this-first) and the reason
+`DIRECT_DATABASE_URL` counts as a recorded copy of the admin password. Short of writing that
+workflow, setting a secret again from a source you trust is the honest way to know what it holds.
 
 ### Preview has no database
 
@@ -726,9 +736,10 @@ effect, because the adapter bypasses the connection string. Both pool sizes are 
 `packages/db/src/client.ts` instead.
 
 `DATABASE_URL` and `DIRECT_DATABASE_URL` are identical on this tier, and that is correct rather
-than redundant — `schema.prisma` requires `directUrl` to exist, and keeping the split means the
-eventual General Purpose escalation is a pure environment-variable change with no code diff. On
-General Purpose, `DATABASE_URL` moves to `:6432` and gains `&pgbouncer=true`.
+than redundant — `schema.prisma` declares `directUrl` against it for the `db push` CI runs, and
+keeping the split means the eventual General Purpose escalation is a pure environment-variable
+change with no code diff. On General Purpose, `DATABASE_URL` moves to `:6432` and gains
+`&pgbouncer=true`.
 
 Do **not** add `connection_limit` to either URL. `backgroundUrl()` in `packages/db/src/client.ts`
 only injects `connection_limit=10` when the URL does not already carry one, so setting a smaller

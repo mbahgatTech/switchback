@@ -219,9 +219,9 @@
   <text class="nlabel" x="342" y="636">deploy-worker.sh</text>
   <text class="nsub" x="318" y="654">id-switchback-worker-deploy → function-releases</text>
 
-  <text class="zsub" x="600" y="628">infrastructure.yml deploys main.bicep and runtime-identity.bicep only. ingest.bicep reaches Azure</text>
-  <text class="zsub" x="600" y="642">by a human-run az deployment group create, which must be followed by deploy-worker.sh — an ARM</text>
-  <text class="zsub" x="600" y="656">application-settings write erases WEBSITE_RUN_FROM_PACKAGE and leaves the app codeless.</text>
+  <text class="zsub" x="600" y="628">infrastructure.yml only compiles templates — its deploy job is gated on a variable that is unset.</text>
+  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which must be followed by</text>
+  <text class="zsub" x="600" y="656">deploy-worker.sh — an ARM settings write erases WEBSITE_RUN_FROM_PACKAGE and leaves it codeless.</text>
 
   <!-- ============================== EDGES ============================== -->
   <path class="edge" d="M228 192 H 274"/>
