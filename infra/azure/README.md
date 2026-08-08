@@ -29,8 +29,8 @@ second copy and no geo-redundant backup; see [Backups](#backups).
   it, so compromise of repository write access is compromise of the database administrator. Delete
   it and `DATABASE_URL` at step 6 of the cutover, not before — until then they are the way back if
   the token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
-  given the same value. A copy in the owner's
-  password manager was claimed here previously; nobody observed it being made, so it is not counted.
+  given the same value. **No copy in a password manager is counted**, because none has been
+  observed being made.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
   Microsoft Entra administrator; see [Connecting by hand, with no
   password](#connecting-by-hand-with-no-password). That is what stops "the password is not recorded
@@ -325,11 +325,12 @@ door the moment `passwordAuthEnabled` is flipped to false.
 | `id-switchback-vercel-publisher` | `sbapp_vercel`              | exactly what `sbapp` may do      |
 | `func-switchback-ingest-…` MSI   | `sbapp_func`                | exactly what `sbapp` may do      |
 
-**Both application roles exist and neither is in use.** Every consumer still authenticates by
-password as `sbapp`; `DATABASE_AUTH` is set nowhere. Read from the live catalogue on 2026-08-08,
-`pg_roles` holds `sbadmin`, `sbapp`, `sbapp_vercel`, `sbapp_func`, `id-switchback-postgres-ci` and
-the owner's UPN; `sbapp_vercel` and `sbapp_func` carry no password at all and are members of
-`sbapp`. There is no `sbapp_runtime` and none is planned.
+**One of the two application roles is in use.** The Function App authenticates as `sbapp_func` with
+an Entra token — `DATABASE_AUTH=entra`, set there and nowhere else since 2026-08-08T17:27:04Z.
+Vercel and every other consumer still authenticates by password as `sbapp`. Read from the live
+catalogue on 2026-08-08, `pg_roles` holds `sbadmin`, `sbapp`, `sbapp_vercel`, `sbapp_func`,
+`id-switchback-postgres-ci` and the owner's UPN; `sbapp_vercel` and `sbapp_func` carry no password
+at all and are members of `sbapp`. There is no `sbapp_runtime` and none is planned.
 
 `id-switchback-vercel-publisher` is the shared runtime identity: Vercel production and Vercel
 preview both federate to it, and Postgres cannot tell the two environments apart because the FIC
@@ -511,9 +512,16 @@ workflow, setting a secret again from a source you trust is the honest way to kn
 ### Preview has no database
 
 Vercel Preview holds no `DATABASE_URL`, no `DIRECT_DATABASE_URL` and no `CRON_SECRET`. A preview
-deployment therefore fails its startup environment check naming `DATABASE_URL`, and that is the
-intended outcome: a preview build has no database of its own, and the only one it could have reached
-was production.
+deployment builds and serves; the pages that need no data render, and the first Prisma query fails.
+That is the intended outcome: a preview has no database of its own, and the only one it could have
+reached was production.
+
+**The build must not require the credential.** `next build` evaluates `apps/web/src/env.ts` while
+collecting page data, so a required `DATABASE_URL` failed every preview build with
+`Invalid environment: DATABASE_URL: Required` and put a red check on every pull request, about
+nothing in the pull request. A permanently red check is how a repository learns to ignore a failing
+gate. `DATABASE_URL` is therefore optional in exactly one place — `VERCEL_ENV=preview` — and
+required on a laptop, in CI and in Production, where the fix is the missing variable.
 
 It held all three until 2026-08-08. The Postgres firewall is a single rule spanning
 `0.0.0.0`–`255.255.255.255`, so reachability was never the boundary — holding the connection string
@@ -526,10 +534,16 @@ The env vars are the containment; the durable control is in code. `apps/web/src/
 start when `VERCEL_ENV` is set to anything but `production` and `DATABASE_URL` or
 `DIRECT_DATABASE_URL` names `psql-switchback-prod-37ywppu5p7fri`, so re-adding the variable fails
 loudly rather than silently reopening the hole. `apps/web/test/env-preview-database.test.ts` holds
-that rule.
+that rule and the optionality above.
 
-Giving Preview a database of its own is the way to make previews useful again: point it at a
-non-production server and the rule above passes.
+**A Preview server of its own was priced and not bought.** The cheapest credible one is Burstable
+`B1MS` with 32 GB of Premium SSD: $0.017/vCore-hour and $0.115/GB-month from the retail API for
+`northcentralus`, so $12.41 + $3.68 = **$16.09 a month**. Cost is not what decides it — the
+subscription's `switchback-monthly-credit` budget reads $14.99 of $150 for August — utility is.
+`npm run db:seed` only queues ingest tiles; filling them means Overpass traffic from a second
+drainer, which is the writer [C1](#preview-has-no-database) exists to remove. A Preview server would
+therefore be an empty database behind a preview that renders an empty map. Buy one when Preview has
+a seeding path that is not a second drainer.
 
 **No geo-redundant backup, no high availability, no warm standby.** All three are off.
 
@@ -890,18 +904,20 @@ consumer at a time and defaults to `password`, so a consumer that misbehaves is 
 one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
 side and stays `true` until every consumer has been proved on a token.
 
-1. Prepare the Function App's move onto Entra. `infra/azure/ingest.bicepparam` assigns no
-   `databaseAuth`, so the template default `password` is what deploys; add `param databaseAuth =
-'entra'` to it, and export `INGEST_DATABASE_URL` naming `sbapp_func` with no password in it.
-   `entraPoolConfig` refuses a URL that still carries one, so a half-done flip fails at connect
-   rather than quietly preferring the password. Nothing has to be provisioned first: `sbapp_func`
-   is already mapped to the Function App's system-assigned principal
-   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, and the server
-   already has `activeDirectoryAuth: Enabled`. **The deployment writes two application settings on
-   the Function App and touches no `Microsoft.DBforPostgreSQL` resource** — `ingest.bicep` declares
-   none — so it costs an app restart, not a server one. Step 4 deploys it and proves it.
+1. **Done: the Function App is on Entra.** `databaseAuth='entra'` and an `INGEST_DATABASE_URL`
+   naming `sbapp_func` with no password in it, deployed 2026-08-08T17:27:04Z. `entraPoolConfig`
+   refuses a URL that still carries a password, so a half-done flip fails at connect rather than
+   quietly preferring it. The deployment wrote two application settings on the Function App and
+   touched no `Microsoft.DBforPostgreSQL` resource — `ingest.bicep` declares none — so it cost an
+   app restart, not a server one. The proof is the `ingestPump` heartbeat, whose gauges come out of
+   `ingest_jobs`: `dead=1 staleLeases=1` at 17:45:12Z and `staleLeases=0` at 17:46:00Z.
 
-   **Do not move the Function App onto the shared identity to achieve this.** The shared identity's
+   Reverting is `databaseAuth='password'` with a `databaseUrl` carrying `sbapp`'s password,
+   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
+   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it, leaving the app codeless
+   until the package is pushed again.
+
+   **Do not move the Function App onto the shared identity.** The shared identity's
    Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
    every Vercel deployment, previews included; a worker running as that identity would need the
    grant back, and `ingest.bicep` no longer declares it. Two principals with two Postgres roles is
@@ -1320,16 +1336,16 @@ template, and a reader would otherwise conclude the template is the whole story.
    readable by anyone — not secrets. `gh secret list` holds `DATABASE_URL`, `DIRECT_DATABASE_URL`
    and `VERCEL_DEPLOY_HOOK` and nothing else.
 
-2. **Managed identity to Postgres is available and not yet switched on.** The worker connects with a
-   password in `DATABASE_URL`, but nothing is missing to stop that. Measured on the server:
-   `activeDirectoryAuth: Enabled`, `passwordAuth: Enabled`, `tenantId: f0f92920-…`. Measured in the
-   catalog: role `sbapp_func` exists, carries no password, is Entra-mapped to the worker's principal
-   `3db30cfd-…`, and is a member of `sbapp`, so it already has the table grants.
+2. **Managed identity to Postgres carries the worker.** `DATABASE_AUTH=entra` is set on
+   `func-switchback-ingest-37ywppu5p7fri` and `DATABASE_URL` there names `sbapp_func` with no
+   password. Measured on the server: `activeDirectoryAuth: Enabled`, `passwordAuth: Enabled`,
+   `tenantId: f0f92920-…`. Measured in the catalog: role `sbapp_func` exists, carries no password,
+   is Entra-mapped to the worker's principal `3db30cfd-…`, and is a member of `sbapp`, so it has
+   the table grants by inheritance.
 
-   What remains is one parameter and one URL — `databaseAuth: 'entra'` in `ingest.bicepparam` and a
-   `databaseUrl` naming `sbapp_func` with no password. Both writes are to the Function App, not to
-   the server resource, so the password-rotation hazard at the top of this section is not in the
-   path.
+   Vercel is what remains — `DATABASE_AUTH=entra-vercel` and a `databaseUrl` naming `sbapp_vercel`.
+   Both writes are to Vercel, not to the server resource, so the password-rotation hazard at the
+   top of this section is not in that path either.
 
 ### Vercel's three variables
 

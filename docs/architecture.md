@@ -539,8 +539,7 @@ alertable and the reason is worth stating: a retry that eventually succeeds writ
 What an alert can watch is the subset that outlives the retry budget and fails a job, which
 `queueHealth`'s `rateLimited` counts from `lastError`. Etiquette is a correctness requirement here —
 the failure mode is an IP block that takes the product down — so the line exists even where no rule
-can read it, because previously this file contained no `console` call at all and a mirror
-rate-limiting this client left no trace anywhere.
+can read it, because without it a mirror rate-limiting this client leaves no trace anywhere.
 
 Retrieving them, which no rule can do for you:
 
@@ -675,7 +674,7 @@ the row already says. Edge-triggering is load-bearing rather than tidy: a blocke
 so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
 pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
 would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
-genuine failure signal — which trains an operator to ignore the signal round 5 was convened to create.
+genuine failure signal — which trains an operator to ignore the signal the rule exists to carry.
 `promoteFrom` nulls `lastError` when the roll-up lands, so the edge re-arms itself.
 
 **The floor is a parameter and it fails honestly at the bottom.** `INGEST_SUBDIVIDE_MAX_ZOOM` is the
@@ -872,7 +871,7 @@ switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unat
 
 All four are the commit-loop shape: the tile query returned, the deadline refused the rest,
 `refused > 0` selected the split, and each invocation returned normally between 540,244 ms and
-542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought.
+542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms.
 Two thousand unattempted trails is the size of the problem stated plainly: these boxes are an order
 of magnitude past what one invocation can commit. Overpass was healthy throughout: no 429, no
 `Retry-After`, no breaker trip in `traces` between 23:00Z and 00:45Z, and `ingest-jobs` held 0
@@ -887,11 +886,11 @@ proven as far as the split and no further: no `done` at z10, no roll-up, and no 
 `trails.browse` calls ready because it subdivided.** The deepest zoom reached is z10, as rows, not as
 work.
 
-**Earlier rounds' account of this is now settled, and both halves of it were wrong.** Round 1 said
-`splitTile` was never reached; a reviewer said subdivision had fired twice on 2026-08-05. Neither was
-supported then and neither is now: the 2026-08-05 over-deadline invocations logged `done` with no
-token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
-path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
+**Traces before 2026-08-06 say nothing either way about splitting.** `PipelineDeps.logger` was set
+on no deployed path until the worker wired it, so an invocation that ran past its deadline logged
+`done` and could not have emitted `switchback-ingest-tile-split` whatever it did. Absence of the
+token in that window is a property of the logging, not of the pipeline. The first observed split in
+this system is 2026-08-06T00:00:25Z.
 
 **The seam baseline, measured against the tiles that actually split.** Re-taken 2026-08-07. It is
 still a true "before": no tile below z9 exists, no trail is owned by a quadkey longer than nine
@@ -934,11 +933,23 @@ such flag. That is survivable for a bounded experiment and wrong as a resting st
 Merging removes all four, which is the argument for merging before the next run rather than a reason
 the run cannot happen.
 
-**Live production state, 2026-08-06.** `INGEST_QUEUE_DRIVER` is back to `postgres` and
-`INGEST_SUBDIVIDE_MAX_ZOOM` back to `9` on the worker: the worker drops every signal it receives,
-Vercel owns the drain, and no further tile can split. Six z9 tiles had split — `031313112`,
-`120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four z10 child
-rows and twenty-four queued `ingest_tile` jobs.
+**Subdivision is on.** `INGEST_SUBDIVIDE_MAX_ZOOM` is `11` on the worker and absent on Vercel, which
+resolves to `9` there — the safe direction, and the one that matters, because Vercel does not drain
+while `INGEST_QUEUE_DRIVER` is `servicebus`. `INGEST_TRAIL_IDENTITY` is `claim` on both, without
+which `subdivideMaxZoom` clamps the ceiling to `INGEST_ZOOM` however it is set.
+
+The first split under this configuration is `120221313` at 2026-08-08T17:55:05Z: 4,069 Overpass
+elements assembled into 1,397 trails, the deadline refused the rest, and the tile became `pending`
+with `lastError = 'split into 4 tiles at z10'` and four child rows `1202213130`–`1202213133`.
+
+Rolling back is `INGEST_SUBDIVIDE_MAX_ZOOM=9` on the worker. That stops new splits and undoes
+nothing: a tile already split has four children and `processTile` routes it to the roll-up with no
+flag to read. `npm run ingest:unsplit -- <quadkey>` is the undo, and it restores the pre-split state
+including its failure.
+
+**The state left by the pre-merge run, 2026-08-06, is retired.** Six z9 tiles had split —
+`031313112`, `120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four
+z10 child rows and twenty-four queued `ingest_tile` jobs.
 
 **Those children are retired, not finished, and the reason is the arithmetic above.** None had ever
 run: every row was `pending` with `fetchedAt` NULL, `attempts` 0 and `trailCount` 0, and no trail in
@@ -1170,27 +1181,23 @@ write leaves nothing draining while `vercel env ls` reports success.
 
 ### `INGEST_SUBDIVIDE_MAX_ZOOM` → `9`
 
+Only the Function App carries this variable; Vercel has never held it, and an absent value already
+resolves to `9`. Vercel is also not the drainer while `INGEST_QUEUE_DRIVER` is `servicebus`, so this
+rollback is one write.
+
 ```bash
-# 1. Vercel, both environments — this is the side that drains, so this is the side that splits.
-vercel env rm INGEST_SUBDIVIDE_MAX_ZOOM production --yes
-vercel env rm INGEST_SUBDIVIDE_MAX_ZOOM preview --yes
-
-# 2. Promote a deployment built without it. Vercel binds environment variables at build time, so
-#    until this lands the running deployment still splits under the old ceiling. Takes minutes.
-vercel redeploy switchback-three.vercel.app --target production
-
-# 3. The Function App, which honours it whenever INGEST_QUEUE_DRIVER is servicebus.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_SUBDIVIDE_MAX_ZOOM=9 -o none
 
-# 4. Verify all three. The first two are separate questions and the second is the load-bearing one:
-#    `env ls` reads the project's variable set, which step 1 already emptied, so it reports success
-#    whether or not any deployment carrying the change exists.
-vercel env ls production | grep INGEST_SUBDIVIDE_MAX_ZOOM   # expect no output
-vercel ls --environment production                          # newest row's Age younger than step 1
+# Read it back. An app-settings write recycles a Consumption host on its own schedule, so budget a
+# tick or two before the running process honours it.
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
   --query "[?name=='INGEST_SUBDIVIDE_MAX_ZOOM'].value | [0]" -o tsv                # expect 9
+
+# If INGEST_QUEUE_DRIVER is ever put back to postgres, Vercel becomes the drainer and needs the
+# same ceiling. It is absent there, which is already 9 — confirm rather than assume.
+vercel env ls production | grep INGEST_SUBDIVIDE_MAX_ZOOM   # expect no output
 ```
 
 Removing the Vercel variable rather than setting it to `9` is deliberate: an absent value resolves to
@@ -1409,9 +1416,8 @@ graph LR
   RUNTIME -->|Data Sender only<br/>Receiver revoked 2026-08-08| SB
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
-  FUNC -.->|sbapp password| PG
   RUNTIME -->|sbapp_vercel<br/>mapped, unused, awaiting DATABASE_AUTH=entra-vercel| PG
-  FUNC -->|sbapp_func<br/>mapped, ready, awaiting databaseAuth=entra| PG
+  FUNC -->|sbapp_func<br/>DATABASE_AUTH=entra, in use| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
@@ -1657,17 +1663,16 @@ arrives as the `x-vercel-oidc-token` header of the request in scope. No custom a
 the deployed federated credentials trust Vercel's default,
 `https://vercel.com/mbahgattechs-projects`.
 
-**UNVERIFIED: none of this has run against the production database.** The code compiles, the pool
-it constructs is asserted, and the driver behaviour underneath it is measured — but no consumer has
-`DATABASE_AUTH` set anywhere, so no Entra-authenticated Prisma query has ever been executed. The
-Vercel path in particular has never run in a Vercel runtime, and its named residual risk is
-unchanged: a connection opened from the cron drain or from `waitUntil` work that outlives the
-response has no request in scope, so `getVercelOidcToken()` has no header to read and that
-connection fails. A warm cache needs no assertion at all — the provider renews on the issuer's
-`refresh_in`, roughly half-life, so a busy instance asks perhaps twice an hour — and the exposure
-is a deployment whose _only_ traffic across a renewal is background work. Capturing each request's
-header into a module-level holder closes even that, at the cost of holding a bearer token in
-memory.
+**The worker runs on Entra; Vercel and its `entra-vercel` path do not.** `DATABASE_AUTH=entra` is
+set on `func-switchback-ingest-37ywppu5p7fri` and nowhere else, so every Entra-authenticated Prisma
+query executed against production so far is the worker's. The Vercel path has never run in a Vercel
+runtime, and its named residual risk is unchanged: a connection opened from the cron drain or from
+`waitUntil` work that outlives the response has no request in scope, so `getVercelOidcToken()` has
+no header to read and that connection fails. A warm cache needs no assertion at all — the provider
+renews on the issuer's `refresh_in`, roughly half-life, so a busy instance asks perhaps twice an
+hour — and the exposure is a deployment whose _only_ traffic across a renewal is background work.
+Capturing each request's header into a module-level holder closes even that, at the cost of holding
+a bearer token in memory.
 
 The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
 same one already trusted for Service Bus, and the one the `sbapp_vercel` database role is mapped
@@ -1760,10 +1765,10 @@ somebody else's account.
 
 ### What is left
 
-The refresh mechanism is proven at the pinned versions and both Prisma clients can be built on it,
-but **no consumer has `DATABASE_AUTH` set**, so the path is password-authenticated end to end and
-no Entra-authenticated Prisma query has ever run against production. Four things come off in this
-order, each proved with passwords still enabled:
+The refresh mechanism is proven at the pinned versions, both Prisma clients can be built on it, and
+**the Function App runs on it**: `DATABASE_AUTH=entra` has been set there since
+2026-08-08T17:27:04Z. Every other consumer is still password-authenticated. Three things remain,
+each provable with passwords still enabled:
 
 1. **The database roles.** Both already exist and are Entra-mapped —
    `infra/postgres-identity/roles.sql` converges `sbapp_vercel` against the shared identity's
@@ -1773,17 +1778,25 @@ order, each proved with passwords still enabled:
    The `provision` action cannot run from a branch: the CI identity's federated credential trusts
    `refs/heads/master` alone, so it executes on merge. Against the deployed estate it creates
    nothing and only asserts.
-2. **The Function App.** `param databaseAuth = 'entra'` added to `ingest.bicepparam`, which assigns
-   it nowhere today, and `INGEST_DATABASE_URL` exported naming `sbapp_func` with no password in it —
-   `entraPoolConfig` refuses a URL that still carries one, so the half-done version fails at connect
-   rather than quietly preferring the password. Nothing needs creating first: `sbapp_func` is
-   Entra-mapped to this app's own **system-assigned** principal
+2. **The Function App — done.** `databaseAuth='entra'` deploys `DATABASE_AUTH=entra` and an
+   `INGEST_DATABASE_URL` naming `sbapp_func` with no password in it; `entraPoolConfig` refuses a URL
+   that still carries one, so a half-done version fails at connect rather than quietly preferring
+   the password. `sbapp_func` is Entra-mapped to this app's own **system-assigned** principal
    `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same table
    grants the password role has, and the server already has `activeDirectoryAuth: Enabled`. The
    deployment writes two application settings on the Function App; `ingest.bicep` declares no
-   `Microsoft.DBforPostgreSQL` resource, so the server is not in the change set.
+   `Microsoft.DBforPostgreSQL` resource, so the server was not in the change set.
 
-   **Do not move this app onto the shared identity to get there.** The trigger binding sets no
+   The proof is the two-minute `ingestPump` heartbeat, whose gauges are read out of `ingest_jobs`:
+   `switchback-ingest-queue-health build=7d59395… dead=1 staleLeases=1 …` at 17:45:12Z and the same
+   line with `staleLeases=0` at 17:46:00Z. A changing gauge cannot come from anywhere but a query.
+
+   **Rolling back is `databaseAuth='password'` and a `databaseUrl` carrying `sbapp`'s password**,
+   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
+   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it. `passwordAuth` on the server
+   is `Enabled`, so that way back is open.
+
+   **Do not move this app onto the shared identity.** The trigger binding sets no
    `__clientId`, so the host receives Service Bus messages as whatever principal the site runs
    under; an app running as `id-switchback-vercel-publisher` would need Data Receiver on
    `ingest-jobs` put back on it — the grant that was revoked precisely because that identity rides

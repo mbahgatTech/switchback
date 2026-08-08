@@ -115,7 +115,9 @@ jobs:
 
       # A different principal from `id-switchback-postgres-ci`, which holds no Azure RBAC at all
       # by design so that a leak of it cannot touch the resource group. This one needs Contributor
-      # on the resource group, and on the subscription for `main.bicep`, which declares the group.
+      # on the subscription, not on the resource group: `main.bicep` declares the group itself, and
+      # `infraContributor` carries no `scope`, so the grant lands at the template's `targetScope`
+      # and reaches every resource in the subscription rather than only this group's.
       - uses: azure/login@v2
         with:
           client-id: ${{ vars.AZURE_INFRA_CLIENT_ID }}

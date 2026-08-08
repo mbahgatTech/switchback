@@ -18,9 +18,13 @@ const BASE: NodeJS.ProcessEnv = {
   AUTH_SECRET: 'a'.repeat(32),
 };
 
-async function load(overrides: Record<string, string>) {
+async function load(overrides: Record<string, string | undefined>) {
   vi.resetModules();
-  process.env = { ...BASE, ...overrides };
+  const merged: NodeJS.ProcessEnv = { ...BASE, ...overrides };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete merged[key];
+  }
+  process.env = merged;
   return (await import('../src/env')) as { env: Record<string, unknown> };
 }
 
@@ -59,5 +63,29 @@ describe('production database access by Vercel environment', () => {
   it('is inert where VERCEL_ENV is absent', async () => {
     const { env } = await load({ DATABASE_URL: PRODUCTION_URL });
     expect(env.VERCEL_ENV).toBeUndefined();
+  });
+});
+
+/**
+ * Preview holds no database, so requiring one at parse time made `next build` fail while
+ * collecting page data — a red check on every pull request, about nothing in the pull request.
+ */
+describe('an absent DATABASE_URL', () => {
+  it('lets a Preview build', async () => {
+    const { env } = await load({ VERCEL_ENV: 'preview', DATABASE_URL: undefined });
+    expect(env.DATABASE_URL).toBeUndefined();
+    expect(env.VERCEL_ENV).toBe('preview');
+  });
+
+  it('still fails Production', async () => {
+    await expect(load({ VERCEL_ENV: 'production', DATABASE_URL: undefined })).rejects.toThrow(
+      /DATABASE_URL: DATABASE_URL is required/u,
+    );
+  });
+
+  it('still fails off Vercel, where the fix is the missing variable', async () => {
+    await expect(load({ DATABASE_URL: undefined })).rejects.toThrow(
+      /DATABASE_URL: DATABASE_URL is required/u,
+    );
   });
 });

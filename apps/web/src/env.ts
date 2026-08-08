@@ -39,7 +39,11 @@ const base = z.object({
    */
   VERCEL_ENV: z.enum(['production', 'preview', 'development']).optional(),
 
-  DATABASE_URL: z.string().url(),
+  /**
+   * Optional in the schema so a Vercel Preview can build; the rule below still requires it
+   * everywhere else. Preview has no database of its own and must not hold Production's.
+   */
+  DATABASE_URL: z.string().url().optional(),
   /** Optional because only the Prisma CLI reads it (`directUrl`) — but migrations need it set. */
   DIRECT_DATABASE_URL: z.string().url().optional(),
 
@@ -156,6 +160,28 @@ const schema = base.superRefine((env, ctx) => {
         });
       }
     }
+  }
+
+  /*
+   * A Vercel Preview has no database, and that must not stop it building.
+   *
+   * Preview holds no `DATABASE_URL` because it may not hold Production's (below) and there is no
+   * second server. `next build` evaluates this module while collecting page data, so a required
+   * `DATABASE_URL` turned every Preview build into `Invalid environment: DATABASE_URL: Required`
+   * and every pull request into a red check that said nothing about the change under review — the
+   * condition that teaches a reader to ignore a failing gate. A preview therefore builds and
+   * degrades: `PrismaClient` constructs without the variable and fails at the first query, so the
+   * pages that need no data render and the ones that do return an error.
+   *
+   * Required everywhere else, including a laptop and CI, where the fix is the missing variable.
+   */
+  if (!env.DATABASE_URL && env.VERCEL_ENV !== 'preview') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['DATABASE_URL'],
+      message:
+        'DATABASE_URL is required. Only a Vercel Preview deployment, which has no database, may omit it.',
+    });
   }
 
   /*

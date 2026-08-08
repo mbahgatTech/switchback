@@ -44,17 +44,17 @@ Postgres connection string for the worker, written to the Function App's applica
 worker that cannot reach the database. Read from the environment in `ingest.bicepparam`, the same
 shape `PGADMIN_PASSWORD` uses — see that file's header.
 
-This is the application login, not the administrator, and it is the same string Vercel already
-holds. Entra authentication is already on at the server — this template does not own that flag,
-`main.bicep` does — so a managed-identity path to Postgres exists and is one parameter away: see
-`databaseAuth` below, which requires this value to name `sbapp_func` and carry no password.
+This is the application login, not the administrator. Under the deployed `databaseAuth='entra'` it
+names `sbapp_func` and carries **no password**, so it is not a credential at all — `entraPoolConfig`
+refuses a URL that still holds one. Under `databaseAuth='password'` it is the same secret string
+Vercel holds, which is why the parameter is `@secure()` either way.
 ''')
 @secure()
 param databaseUrl string
 
 @description('''
-How the worker authenticates to Postgres. `password` is the deployed default and reads
-`databaseUrl` as-is. `entra` emits `DATABASE_AUTH=entra`, which makes `packages/db/src/client.ts`
+How the worker authenticates to Postgres. `password` reads `databaseUrl` as-is. `entra` — the
+deployed value — emits `DATABASE_AUTH=entra`, which makes `packages/db/src/client.ts`
 take a token from `DefaultAzureCredential` — the Function App's system-assigned identity — instead
 of the password in the URL.
 
@@ -71,9 +71,10 @@ table grants the password role has. The server already has `activeDirectoryAuth:
 the change set, so neither the server restart that enabling Entra authentication costs nor any
 handling of the administrator password is in this path.
 
-Left at `password` because the token path has never served a production query, and this is the
-control that makes proving it a deployment rather than an edit. Rolling back is the same one-word
-change in the other direction.
+**The deployed value is `entra`**, set 2026-08-08T17:27:04Z. `password` remains the parameter
+default so that deploying this template from a shell that has not decided cannot silently move a
+consumer; a rollback is the same one-word change in the other direction, and `passwordAuth` on the
+server is still `Enabled`, so that door is open.
 ''')
 @allowed(['password', 'entra'])
 param databaseAuth string = 'password'
@@ -804,10 +805,10 @@ identity. Moving this app onto the shared identity would therefore need that gra
 identity every Vercel preview carries — which is the grant revoked on 2026-08-08. Two principals is
 the cheaper arrangement.
 
-Postgres is reachable by identity too, and has been since Entra auth was enabled on the server:
-role `sbapp_func` is mapped to `3db30cfd-…` and inherits `sbapp`'s table grants. The worker
-nonetheless connects by password, because `databaseAuth` is `password` — see that parameter for the
-one-word flip and what it requires of `databaseUrl`.
+Postgres is reachable by identity, and that is how the worker reaches it: role `sbapp_func` is
+mapped to `3db30cfd-…`, inherits `sbapp`'s table grants, and `databaseAuth` is `entra`, so
+`DATABASE_URL` here carries no password. See that parameter for what the flip requires and how to
+put it back.
 
 ---
 
