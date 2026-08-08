@@ -981,21 +981,23 @@ argument for keeping the cron's `reclaimExpiredJobs` call on the `servicebus` br
 skipping the cron entirely.
 
 **Least privilege on the queue.** Three role assignments, all queue-scoped, all in the template: the
-worker holds Data Sender and Data Receiver, the publisher holds Data Sender alone. Data Owner was the
-earlier choice because reading the queue depth looked like an administration operation — it is, for
-`ServiceBusAdministrationClient`, but both data roles already carry the control-plane `queues/read`
-action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth through ARM
-and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite or delete
-the queue it drains.
+worker holds Data Sender and Data Receiver, and the publisher holds Data Sender alone. Data Owner
+was the earlier choice because reading the queue depth looked like an administration operation — it
+is, for `ServiceBusAdministrationClient`, but both data roles already carry the control-plane
+`queues/read` action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth
+through ARM and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite
+or delete the queue it drains.
 
-The publisher gets Sender and nothing else because `id-switchback-vercel-publisher` is the shared
-runtime identity every Vercel deployment carries, previews included: anything granted to it is
-reachable from an unreviewed branch build, over the same REST surface
-`packages/ingest/src/publish.ts` uses to send. It briefly held Data Receiver as well — assignment
-`0090d328-0cee-592f-8359-e4cc64940694`, which was standing authority to drain the production ingest
-queue from any preview. That assignment was deleted with the resource-group lock lifted, and the
-declaration is gone from `ingest.bicep`: what is not declared is not granted, and a deployment that
-declared it would put it back.
+The publisher's asymmetry — Sender but not Receiver — is deliberate, and it is the answer to who can
+drain the production ingest queue. `id-switchback-vercel-publisher` is the shared runtime identity
+that every Vercel deployment carries, previews included, so a Receiver grant on it would reach all
+of them over the same REST surface `packages/ingest/src/publish.ts` already uses to send. Assignment
+`0090d328-0cee-592f-8359-e4cc64940694` was exactly that grant and was **revoked on 2026-08-08**,
+with the resource-group lock lifted; the queue now carries three assignments. The declaration
+mattered as much as the assignment: incremental ARM does not delete what a template stops declaring,
+but it does re-create what a template still names, so `ingest.bicep` had to stop declaring it too.
+The worker is unaffected: its trigger binding sets no `__clientId`, so the host receives as the
+Function App's own system-assigned principal.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection
@@ -1388,13 +1390,12 @@ graph LR
   end
 
   VERCEL -->|FIC, both environments| RUNTIME
-  FUNC -.->|not yet: needs AZURE_CLIENT_ID| RUNTIME
-  RUNTIME -->|Data Sender| SB
+  RUNTIME -->|Data Sender only<br/>Receiver revoked 2026-08-08| SB
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
   RUNTIME -->|sbapp_vercel<br/>mapped, unused, renamed on cutover| PG
-  FUNC -->|sbapp_func<br/>mapped, unused| PG
+  FUNC -->|sbapp_func<br/>mapped, ready, awaiting databaseAuth=entra| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
@@ -1452,15 +1453,21 @@ the identity and its two federated credentials. What is not:
   nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
   provisioning workflow cannot execute from a branch.
 - The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
-  Service Bus grants under it. Moving it onto the shared identity is a change to
-  `infra/azure/ingest.bicep`, which declares that identity, the queue and every assignment on it.
-- The shared identity holds Data Sender on `ingest-jobs` (`f1b97f59-263a-5e18-a1c0-40ce18436d52`)
-  and nothing else. It also held Data Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) — standing
-  authority to drain the production ingest queue from any Vercel deployment, previews included. That
-  assignment was deleted, and `ingest.bicep` no longer declares it. The declaration mattered as much
-  as the assignment: incremental ARM does not delete what a template stops declaring, but it does
-  re-create what a template still names, so a template that kept adopting it would have restored the
-  grant on the next deploy.
+  Service Bus grants under it. It also already has a working Entra path to Postgres: `sbapp_func` is
+  mapped to that principal and is a member of `sbapp`, so removing the worker's password does not
+  require moving it onto the shared identity.
+- The shared identity's Data Receiver on `ingest-jobs` was **revoked on 2026-08-08** — assignment
+  `0090d328-0cee-592f-8359-e4cc64940694`, deleted after lifting `switchback-prod-no-delete` and
+  restoring it. It was standing authority to drain the production ingest queue on an identity every
+  Vercel deployment carries, previews included. `ingest.bicep` no longer declares it, so no deploy
+  recreates it; the identity keeps Data Sender (`f1b97f59-263a-5e18-a1c0-40ce18436d52`), which is
+  what Vercel actually needs. Dropping the declaration mattered as much as deleting the assignment:
+  incremental ARM does not delete what a template stops declaring, but it does re-create what a
+  template still names.
+
+  Worth keeping: a `CanNotDelete` lock on a resource group refuses `DELETE` on **extension**
+  resources inside it, role assignments included. The refusal is `ScopeLocked` and it names the
+  group, not the assignment, which reads like the wrong error until you know that.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
 because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the

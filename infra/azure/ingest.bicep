@@ -43,12 +43,38 @@ worker that cannot reach the database. Read from the environment in `ingest.bice
 shape `PGADMIN_PASSWORD` uses — see that file's header.
 
 This is the application login, not the administrator, and it is the same string Vercel already
-holds. **This template does not enable Entra authentication on the server**, so there is no managed
-identity path to Postgres here; see the note beside the Function App's identity for what turning
-that on would cost.
+holds. Entra authentication is already on at the server — this template does not own that flag,
+`main.bicep` does — so a managed-identity path to Postgres exists and is one parameter away: see
+`databaseAuth` below, which requires this value to name `sbapp_func` and carry no password.
 ''')
 @secure()
 param databaseUrl string
+
+@description('''
+How the worker authenticates to Postgres. `password` is the deployed default and reads
+`databaseUrl` as-is. `entra` emits `DATABASE_AUTH=entra`, which makes `packages/db/src/client.ts`
+take a token from `DefaultAzureCredential` — the Function App's system-assigned identity — instead
+of the password in the URL.
+
+**Flipping this requires a `databaseUrl` with no password in it**, naming `sbapp_func`.
+`entraPoolConfig` in `packages/db/src/entra-pool.ts` refuses a URL that still carries one, so the
+mismatch fails at connect rather than silently preferring the password.
+
+The role is already provisioned: `sbapp_func` is Entra-mapped to this app's system-assigned
+principal `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same
+table grants the password role has. The server already has `activeDirectoryAuth: Enabled`.
+
+**The flip therefore writes two application settings on this Function App and nothing else.**
+`DATABASE_AUTH` appears and `DATABASE_URL` changes; no `Microsoft.DBforPostgreSQL` resource is in
+the change set, so neither the server restart that enabling Entra authentication costs nor any
+handling of the administrator password is in this path.
+
+Left at `password` because the token path has never served a production query, and this is the
+control that makes proving it a deployment rather than an edit. Rolling back is the same one-word
+change in the other direction.
+''')
+@allowed(['password', 'entra'])
+param databaseAuth string = 'password'
 
 @description('''
 Value of `OVERPASS_USER_AGENT`. Required, not defaulted, because `OverpassClient` throws on a blank
@@ -666,6 +692,14 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 var optionalWorkerSettings = concat(
+  databaseAuth == 'password'
+    ? []
+    : [
+        {
+          name: 'DATABASE_AUTH'
+          value: databaseAuth
+        }
+      ],
   empty(terrainTileUrl)
     ? []
     : [
@@ -761,12 +795,17 @@ that make it fit; the arithmetic is beside them.
 ---
 
 **Managed identity, and where it stops.** The Service Bus connection is identity-based — a fully
-qualified namespace, no key, backed by the role assignment below. Postgres is not: the server has
-`activeDirectoryAuth: Disabled` and `tenantId: null`, and enabling Entra authentication is a write to
-the server resource, which is the password-rotation hazard this template exists to avoid. Doing it
-later deliberately means: set `authConfig.activeDirectoryAuth: Enabled` and `tenantId` on the server,
-create an Entra administrator, run `pgaadauth_create_principal` for this app's principal id, and swap
-the driver to token auth. Until then the worker connects the way the web app already does.
+qualified namespace, no key, backed by the role assignment below. The binding carries no
+`__clientId`, so the host authenticates the trigger as this app's **system-assigned** principal,
+which is why the queue's Receiver grant is held by `3db30cfd-…` and not by the shared runtime
+identity. Moving this app onto the shared identity would therefore need that grant put back on an
+identity every Vercel preview carries — which is the grant revoked on 2026-08-08. Two principals is
+the cheaper arrangement.
+
+Postgres is reachable by identity too, and has been since Entra auth was enabled on the server:
+role `sbapp_func` is mapped to `3db30cfd-…` and inherits `sbapp`'s table grants. The worker
+nonetheless connects by password, because `databaseAuth` is `password` — see that parameter for the
+one-word flip and what it requires of `databaseUrl`.
 
 ---
 
@@ -1005,6 +1044,11 @@ that was buying and why it is not needed. The publisher gets Sender and nothing 
 `id-switchback-vercel-publisher` is the shared runtime identity every Vercel deployment carries,
 previews included, so anything granted to it is reachable from an unreviewed branch build over the
 same REST surface `packages/ingest/src/publish.ts` uses to send.
+
+Assignment `0090d328-0cee-592f-8359-e4cc64940694` was the publisher's Receiver and was revoked on
+2026-08-08. The worker never depended on it: its Service Bus binding carries no `__clientId`, so the
+host authenticates the trigger with the Function App's system-assigned principal, whose own Receiver
+grant is `workerReceiver` below.
 
 Two more, on the storage account and its `function-releases` container, are declared beside the
 storage resources above because that is where their argument lives.

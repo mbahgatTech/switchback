@@ -170,9 +170,17 @@ Receiver** on the queue — not Data Owner. Reading the depth is why Data Owner 
 `queues/read` action, so `src/service-bus.ts` asks ARM for `countDetails` instead. At queue scope
 Data Owner would also have allowed rewriting or deleting the queue.
 
-Identity does **not** carry Postgres: the server has `activeDirectoryAuth: Disabled`, and enabling
-it is a write to the server resource, which rotates the admin password. `infra/azure/README.md`
-records what doing that deliberately would take.
+Identity reaches Postgres too, and the door is already open. The server has `activeDirectoryAuth:
+Enabled`, and role `sbapp_func` is Entra-mapped to this app's own system-assigned principal
+`3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the table grants
+the password role holds. The worker connects by password only because `DATABASE_AUTH` is unset.
+
+Flipping it is **two application settings on this Function App and no write to the server**:
+`databaseAuth: 'entra'` in `ingest.bicepparam`, which emits `DATABASE_AUTH=entra`, and a
+`databaseUrl` naming `sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that
+still carries one, so a half-done flip fails at connect rather than quietly preferring the
+password. Nothing is provisioned and no `Microsoft.DBforPostgreSQL` resource is touched, so the
+server restart that enabling Entra authentication once required is not in this path.
 
 ## Building
 

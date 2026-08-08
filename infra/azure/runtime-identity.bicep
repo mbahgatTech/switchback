@@ -12,12 +12,13 @@
 // the database principal for the web application as well, and two templates declaring one resource
 // is how drift starts. ingest.bicep takes `resourceId` below as a parameter.
 //
-// **The identity, and nothing the identity is granted.** Its Service Bus role assignments belong
-// to ingest.bicep, which owns the namespace and the queue they are scoped to; declaring them here
-// too would recreate that drift one layer down, two templates computing one `guid()` against one
-// queue. What this principal holds live is Data Sender on `ingest-jobs` and nothing else: Data
-// Receiver was deleted, because this identity rides on every Vercel deployment and Receive is
-// standing authority to drain the production queue from an unreviewed preview.
+// **The identity, and nothing the identity is granted.** Its Service Bus role assignment belongs
+// to ingest.bicep, which owns the namespace and the queue it is scoped to; declaring it here too
+// would recreate that drift one layer down, two templates computing one `guid()` against one
+// queue. The grant this principal holds live is **Data Sender on `ingest-jobs`, and only that**.
+// Data Receiver was revoked on 2026-08-08 — it was drain capability for every Vercel deployment,
+// previews included, and the worker never needed it, because the worker receives as the Function
+// App's own system-assigned principal.
 //
 // The identity is not an administrator of anything. Its intended database privilege is
 // `sbapp_runtime` — a role that does not exist until the `provision` action renames `sbapp_vercel`
