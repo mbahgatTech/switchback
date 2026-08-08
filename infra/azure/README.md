@@ -293,18 +293,18 @@ machine with no PostgreSQL client installed.
   federated credential on `id-switchback-postgres-ci` trusts
   `repo:mbahgatTech@81331884/switchback@1316632119:ref:refs/heads/master` and nothing else, so a
   dispatch from any other branch fails at `azure/login` with `AADSTS700213` quoting a subject that
-  appears in no template — which reads as a broken identity rather than a wrong branch. The token
-  path itself has been run: run 31063906113 connected as `id-switchback-postgres-ci` over TLSv1.3
-  and reported `is_admin|true`, `server_version|17.10` and the full role and row-count census.
-  **That run used a branch credential that has since been deleted, and the `github-master`
-  credential this instruction depends on has never been exercised** — every successful `inspect`
-  ran on `feat/credential-free-postgres` or a worktree branch, and the one dispatch attempted from
-  a feature branch after those credentials were removed failed with `AADSTS700213`. What is proven
-  is that the identity can reach the database and is an administrator; what is unproven is the
-  `master` ref exchange. `postgres-entra.yml` is added to `master` by this change, so the first
-  dispatch from `master` is also the first test of it. Do that while passwords still work — step 6
-  of the cutover requires it — rather than discovering it when there is no password to fall back
-  on.
+  appears in no template — which reads as a broken identity rather than a wrong branch. This exact
+  path has been run from `master`: run 31254093655 dispatched `inspect` from `master` at `1a477da`
+  on 2026-08-08, connected as `id-switchback-postgres-ci` over TLSv1.3, and reported
+  `is_admin|true`, `server_version|17.10` and the full role and row-count census.
+  `id-switchback-postgres-ci` carries exactly one federated credential — `github-master` — so that
+  run is proof of the ref exchange this instruction depends on, and `postgres-entra.yml` has been
+  on `master` since `b0b6406`, an ancestor of `origin/master`. The branch constraint is restated
+  because it has bitten: run 31063906113 succeeded from `feat/credential-free-postgres` against a
+  branch credential that has since been deleted, and run 31088984935, dispatched from a feature
+  branch after that deletion, failed at `azure/login` with `AADSTS700213`. Step 5 of the cutover
+  asks for both administrator doors to be re-proven in the same hour regardless — a door that
+  opened on 2026-08-08 is not a door proven on the day the password stops working.
 
 Do not use `connections_failed` to decide whether the server saw an attempt. It is not zero on this
 server and never has been: measured over 2026-08-05T12:00Z–2026-08-06T12:00Z it records 35 failures
@@ -916,8 +916,9 @@ side and stays `true` until every consumer has been proved on a token.
    `DATABASE_URL` to the password-free form naming `sbapp_vercel`. `AZURE_TENANT_ID` and
    `AZURE_CLIENT_ID` are already set there, which is the whole of what `entra-vercel` needs beyond
    the URL. Redeploy, then prove a signed-in read and a write — `session.findUnique` is the canary.
-   The way back is deleting `DATABASE_AUTH` and restoring the password-carrying `DATABASE_URL`:
-   absent resolves to `password`.
+   The way back is deleting `DATABASE_AUTH`, restoring the password-carrying `DATABASE_URL`, and
+   redeploying: absent resolves to `password`, but neither variable reaches the running deployment
+   until a new build.
 
    **Preview is out of scope and cannot be brought into it as the estate stands**, so there is no
    rehearsal environment for this step. Preview holds no `DATABASE_URL` — `npx vercel env ls` lists
@@ -1276,11 +1277,14 @@ template, and a reader would otherwise conclude the template is the whole story.
    presents a _user-assigned managed identity_, whose federated credentials are ARM resources and
    so live in the templates rather than in a bootstrap command:
 
-   | Consumer                                   | Client id from                                               | Identity                                   |
-   | ------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------ |
-   | `postgres-entra.yml`, `ci.yml`'s `migrate` | a literal in each workflow, `81c76484-…`                     | `id-switchback-postgres-ci`                |
-   | `ci.yml`'s worker deploy                   | `vars.AZURE_WORKER_DEPLOY_CLIENT_ID`                         | `id-switchback-worker-deploy`              |
-   | `infrastructure.yml`                       | `vars.AZURE_INFRA_CLIENT_ID` — set nowhere, so the job skips | `id-switchback-infra-deploy`, not deployed |
+   | Consumer                                                             | Client id from                                               | Identity                                   |
+   | -------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------ |
+   | `postgres-entra.yml`, `ci.yml`'s `migrate`, `token-expiry-probe.yml` | a literal in each workflow, `81c76484-…`                     | `id-switchback-postgres-ci`                |
+   | `ci.yml`'s worker deploy                                             | `vars.AZURE_WORKER_DEPLOY_CLIENT_ID`                         | `id-switchback-worker-deploy`              |
+   | `infrastructure.yml`                                                 | `vars.AZURE_INFRA_CLIENT_ID` — set nowhere, so the job skips | `id-switchback-infra-deploy`, not deployed |
+
+   That is every `azure/login` in the tree: `grep -rn "client-id:" .github/workflows/` returns six
+   occurrences across those four workflows.
 
    The two that are not literals are repository **variables** — set with `gh variable set`, and
    readable by anyone — not secrets. `gh secret list` holds `DATABASE_URL`, `DIRECT_DATABASE_URL`
