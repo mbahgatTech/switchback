@@ -1893,7 +1893,8 @@ with identity now live, safe and current have diverged, and the export is a step
 not an optional one.
 
 **No workflow deploys `infra/azure/ingest.bicep`.** No workflow deploys any template:
-`infrastructure.yml` compiles all of them, and the only job that carries a `what-if` or an apply is
+`infrastructure.yml` compiles the eight `infra/azure/*.bicep` templates and then builds
+`main.bicepparam`, and the only job that carries a `what-if` or an apply is
 gated on `vars.AZURE_INFRA_CLIENT_ID != ''`, which is unset — `gh variable list` returns
 `AZURE_SUBSCRIPTION_ID` and `AZURE_WORKER_DEPLOY_CLIENT_ID` and nothing else, so that job is skipped
 on every run. `.github/scripts/infra-deploy.sh` would take only `runtime-identity` and `main` in any
@@ -1901,6 +1902,12 @@ case. So a change to the ingest template reaches Azure on a human-run `az deploy
 and that deployment must be followed by `.github/scripts/deploy-worker.sh`, because an ARM
 application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the
 next package push.
+
+**`ingest.bicepparam` is compiled by nothing, so a break in it surfaces at the deploy.** It resolves
+`INGEST_QUEUE_DRIVER`, `INGEST_OVERPASS_USER_AGENT` and `INGEST_DATABASE_URL` through
+`readEnvironmentVariable` with no default, and that call runs at build time, so
+`az bicep build-params` on it fails `BCP427` three times on a runner holding none of them — and one
+of the three is a database URL, which is why it is not simply added to the compile loop.
 
 ## Design decisions, recorded once
 
