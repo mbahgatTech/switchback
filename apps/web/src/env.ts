@@ -14,8 +14,30 @@ const bool = z
   .default('false')
   .transform((v) => v === 'true');
 
+/**
+ * The one production database server. Named here so the rule below can refuse it by identity
+ * rather than by convention; the same host appears in `.github/workflows/ci.yml`.
+ */
+const PRODUCTION_DATABASE_HOST = 'psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com';
+
+/** The host of a connection string, or nothing when it will not parse. */
+function databaseHost(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
 const base = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+
+  /**
+   * Which Vercel environment this process is. Set by the platform, absent everywhere else —
+   * so the production-database rule below is inert in CI, on a laptop and in the Azure worker.
+   */
+  VERCEL_ENV: z.enum(['production', 'preview', 'development']).optional(),
 
   DATABASE_URL: z.string().url(),
   /** Optional because only the Prisma CLI reads it (`directUrl`) — but migrations need it set. */
@@ -131,6 +153,29 @@ const schema = base.superRefine((env, ctx) => {
           code: z.ZodIssueCode.custom,
           path: [key],
           message: `${key} is required in production — otherwise nobody can sign in.`,
+        });
+      }
+    }
+  }
+
+  /*
+   * A Vercel environment that is not Production must not point at the production database.
+   *
+   * The Postgres firewall is a single rule spanning 0.0.0.0–255.255.255.255, so reachability is
+   * not the control; holding the connection string is. A Preview deployment runs unreviewed
+   * branch code, and `drainIfOwned` drains `ingest_jobs` on any `trails.browse` request, so a
+   * Preview holding this string is a second writer into the production corpus — and its
+   * `INGEST_TRAIL_IDENTITY` is a separate variable that can disagree with Production's, which
+   * makes the writes fragmenting rather than merely surplus. Refusing at startup is what stops
+   * the variable being re-added later without anyone noticing.
+   */
+  for (const key of ['DATABASE_URL', 'DIRECT_DATABASE_URL'] as const) {
+    if (env.VERCEL_ENV && env.VERCEL_ENV !== 'production') {
+      if (databaseHost(env[key]) === PRODUCTION_DATABASE_HOST) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `${key} names the production database ${PRODUCTION_DATABASE_HOST} in the ${env.VERCEL_ENV} environment. Only Production may hold it.`,
         });
       }
     }
