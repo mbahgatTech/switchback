@@ -14,9 +14,10 @@
 //   unset PGADMIN_PASSWORD
 //
 // A `$( )` substitution never reaches the process table, and what lands in shell history is
-// the variable name rather than its value. **Put the password in a password manager before
-// deleting the file** — it cannot be read back out of ARM, out of a GitHub secret, or out of
-// Vercel, and a redeploy has to pass the same value. See README.md, "Deploying".
+// the variable name rather than its value. **Record the password before deleting the file** —
+// ARM cannot read it back and a redeploy has to pass the same value. README.md's "Read this
+// first" inventories where the live one is kept; a copy outside that inventory goes stale
+// without saying so. See README.md, "Deploying".
 //
 // A `.bicepparam` may be combined with further `--parameters name=value` overrides, and
 // `.github/scripts/infra-deploy.sh` relies on it — it passes this file and `deployDatabase=false`
