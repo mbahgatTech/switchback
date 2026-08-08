@@ -1230,18 +1230,24 @@ moment the tile stops being retried is an alert nobody reads.
 
 **The fourth arm is the one that sees a killed handler.** A handler the host kills at
 `functionTimeout` writes no request row at all — the process stops between two awaits — so the
-first arm is structurally incapable of firing on it. Measured on 2026-08-08: `Functions.ingestDrain`
-logged 42 `Executing` against 37 `Executed`, and five invocations of 504,637 ms to 548,954 ms every
-one of which recorded `Success=True`. No arm of this rule matched any of it.
+first arm is structurally incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC:
+`Functions.ingestDrain` logged 42 `Executing` against 37 `Executed`, and five invocations of
+504,637 ms to 548,954 ms every one of which recorded `Success=True`.
 
-The signal it watches is written by the reaper rather than by the redelivery, because the reaper is
-the only participant that observes the death. `reclaimExpiredJobs` runs ahead of the claim in both
-`drainJobs` and `drainSlotGate`, so by the time a redelivered message is classified the row has
-already been returned to `queued` and that delivery has nothing left to report — which is the
-repair working, not a gap. The reclaim emits `switchback-ingest-lease-expired`, and it demonstrably
-fires on the real event: inside the 2026-08-08 window the pump logged four reclaims, at 17:04:00,
-17:45:12, 17:58:22 and 18:16:20 UTC. Each was a lease whose holder had died, and each carried no
-token any rule could match.
+The three deployed arms are **not** silent over that window — run verbatim they return five
+matches: one `ingest-job-failed` for `ingest_tile:120222201` at 16:56:39, and four
+`switchback-ingest-tile-split` at 17:55:05, 18:04:14, 18:13:20 and 18:22:30. Every one of those is
+a different fault. None is the killed handler, and the `Executing`-minus-`Executed` gap of five is
+invisible to all three.
+
+The signal the fourth arm watches is written by the reaper rather than by the redelivery, because
+the reaper is the only participant that observes the death. `reclaimExpiredJobs` runs ahead of the
+claim in both `drainJobs` and `drainSlotGate`, so by the time a redelivered message is classified
+the row has already been returned to `queued` and that delivery has nothing left to report — which
+is the repair working, not a gap. The reclaim emits `switchback-ingest-lease-expired`, and it fires
+on the real event: inside the same window the pump logged three non-zero reclaims, at 17:45:12,
+17:58:22 and 18:16:20 UTC, plus a retirement at 17:04:00. Each was a lease whose holder had died,
+and none carried a token any rule could match.
 
 **The fifth arm is narrower than it looks, deliberately.** `switchback-ingest-signal-stranded`
 covers the one state no reclaim can free — a `running` row whose `lockedAt` is NULL, which
