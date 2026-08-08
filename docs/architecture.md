@@ -201,12 +201,17 @@ git-branch argument: without it the CLI answers `git_branch_required` and sugges
 just ran, in a loop. Passing the value on stdin instead of `--value` sets it to the empty string
 silently.
 
-**Both** Vercel environments, in step 1. The flag is per environment and Preview's `DATABASE_URL`
-resolves to `psql-switchback-prod-37ywppu5p7fri` — the production server — so a Preview left on
-`postgres` (or, as it was until this branch, left unset, which resolves to `postgres`) is a second
-drainer against the same `ingest_jobs` with its own `OverpassClient` on every warm preview lambda.
-`vercel env ls preview` is the check; the absence of the variable is the failure mode, and it does
-not look like one.
+**Both** Vercel environments, in step 1 — for `INGEST_QUEUE_DRIVER`, which Preview still carries.
+The flag is per environment, and a Preview left on `postgres` (or, as it was until this branch, left
+unset, which resolves to `postgres`) would be a second drainer against the same `ingest_jobs` with
+its own `OverpassClient` on every warm preview lambda. `vercel env ls preview` is the check; the
+absence of the variable is the failure mode, and it does not look like one.
+
+Preview can no longer reach the production database at all: `DATABASE_URL`, `DIRECT_DATABASE_URL`
+and `CRON_SECRET` were removed from that environment, and `apps/web/src/env.ts` refuses to start a
+non-Production Vercel environment whose connection string names `psql-switchback-prod-37ywppu5p7fri`.
+So a Preview on the wrong driver value cannot drain; it fails its environment check first. Set the
+flag on both anyway — the day Preview gets a database of its own, the mismatch comes back.
 
 Between 1 and 3 **nothing drains at all**, and it is worth being exact about that because the
 reassuring version is wrong: the tiles do not wait for a pump tick, because the pump is the worker's
@@ -829,9 +834,10 @@ writes `trail_ways` or `trail_slug_aliases` and never reads `trail_ways`, so the
 depends on neither table's contents. It does read `trail_slug_aliases` — `uniqueSlug` and
 `trails.bySlug` both consult it in every mode, which is what keeps a retired URL answering after the
 flag goes off — but both tolerate `P2021` and treat a missing table as no aliases, so a runtime that
-reaches a database where the DDL has not been applied still ingests and still serves. That matters
-because Vercel Preview builds run branch code against the production database automatically, and
-`ci.yml`'s `migrate` job only runs on a push to `master`.
+reaches a database where the DDL has not been applied still ingests and still serves. That mattered
+while Vercel Preview builds ran branch code against the production database; Preview no longer holds
+a connection string, and `ci.yml`'s `migrate` job still only runs on a push to `master`, so the
+tolerance is what covers the window between a merge and that job.
 Setting the flag to `claim` needs no backfill: claims fill in as tiles re-ingest on the 30-day TTL,
 and until a trail's ways are claimed it resolves exactly as it does today. Setting it back to
 `osm-id` returns behaviour to the `(osmType, osmId)` upsert with `trail_ways` sitting unread.
@@ -974,22 +980,22 @@ and the tile waits for `reclaimExpiredJobs`. That is a slower path than #172 pro
 argument for keeping the cron's `reclaimExpiredJobs` call on the `servicebus` branch rather than
 skipping the cron entirely.
 
-**Least privilege on the queue.** Four role assignments, all queue-scoped, all in the template: the
-worker holds Data Sender and Data Receiver, and so does the publisher. Data Owner was the earlier
-choice because reading the queue depth looked like an administration operation — it is, for
+**Least privilege on the queue.** Three role assignments, all queue-scoped, all in the template: the
+worker holds Data Sender and Data Receiver, the publisher holds Data Sender alone. Data Owner was the
+earlier choice because reading the queue depth looked like an administration operation — it is, for
 `ServiceBusAdministrationClient`, but both data roles already carry the control-plane `queues/read`
 action and ARM exposes `countDetails.activeMessageCount`, so the pump reads the depth through ARM
 and the role is unnecessary. At queue scope Data Owner would have let the worker rewrite or delete
 the queue it drains.
 
-The publisher's Data Receiver is the exception to that heading, and it is the answer to who can
-drain the production ingest queue. `id-switchback-vercel-publisher` is the shared runtime identity
-that every Vercel deployment carries, previews included, so the grant reaches all of them — over the
-same REST surface `packages/ingest/src/publish.ts` already uses to send. It is declared by its
-literal assignment id, `0090d328-0cee-592f-8359-e4cc64940694`, because it predates the template and
-is adopted rather than created. Revoking it returns `ScopeLocked` naming `switchback-prod-no-delete`,
-the resource group's `CanNotDelete` lock, so revocation needs the lock lifted first — an Owner
-action, tracked separately.
+The publisher gets Sender and nothing else because `id-switchback-vercel-publisher` is the shared
+runtime identity every Vercel deployment carries, previews included: anything granted to it is
+reachable from an unreviewed branch build, over the same REST surface
+`packages/ingest/src/publish.ts` uses to send. It briefly held Data Receiver as well — assignment
+`0090d328-0cee-592f-8359-e4cc64940694`, which was standing authority to drain the production ingest
+queue from any preview. That assignment was deleted with the resource-group lock lifted, and the
+declaration is gone from `ingest.bicep`: what is not declared is not granted, and a deployment that
+declared it would put it back.
 
 **Progress is polled, not streamed.** The client re-asks `browse` every 2.5 s while tiles are
 outstanding. An SSE stream was the plan; with a twelve-tile cap it would cost a long-lived connection
@@ -1029,6 +1035,22 @@ script writes a bare `https://…/function-releases/<commit>-<utc>.zip` and the 
 its own system-assigned identity, which `ingest.bicep` grants Storage Blob Data Reader on that
 container. This is the mechanism Microsoft documents for external package URLs and recommends over a
 SAS, and it is what lets the deploy log name the package it just shipped.
+
+**Nothing in the storage account is a credential either.** `allowSharedKeyAccess` is `false`, so the
+two account keys authorise no data-plane request whatever their value — `az storage blob list
+--auth-mode key` answers `Key based authentication is not permitted on this storage account`. The
+host reads its own leases, keys and diagnostics through `AzureWebJobsStorage__blobServiceUri`,
+`__queueServiceUri`, `__tableServiceUri` and `__credential=managedidentity`, backed by Storage Blob
+Data Owner and Storage Table Data Contributor at account scope. Owner reaches `function-releases`
+as well as the host's own containers, which means the worker's identity can rewrite the package it
+runs from; that is not a new way in, because the token is only obtainable from inside the app, and
+the alternative it replaces was an account key sitting in an application setting. Separating host
+storage from the release container into two accounts is what would remove the residue.
+
+The Azure Files content share went with the key: Azure Files has no identity-based connection, so
+`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` is a key by construction. Linux Consumption does not need
+it — the content root is the package URL. Windows Consumption and Elastic Premium do, and could not
+make this trade.
 
 **The script does not trust its own exit codes.** An exit code says a blob was uploaded, which is a
 statement about the deploy and not about the host — and a package setting that still names last
@@ -1367,7 +1389,7 @@ graph LR
 
   VERCEL -->|FIC, both environments| RUNTIME
   FUNC -.->|not yet: needs AZURE_CLIENT_ID| RUNTIME
-  RUNTIME -->|Data Sender, Data Receiver<br/>Receiver is the over-grant| SB
+  RUNTIME -->|Data Sender| SB
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
@@ -1384,19 +1406,22 @@ graph LR
 production, Vercel preview and the ingest worker are all intended to authenticate as — one
 principal, one Postgres role, one grant set. Its two federated credentials distinguish the Vercel
 environments to Entra and to nothing else: the access token carries the identity's object id, so
-Postgres, Azure RBAC and every policy downstream see one caller. Preview writing production is
-carried forward rather than created by this — preview already holds `DATABASE_URL` pointing at the
-production server — but the consolidation does remove the ability to revoke one consumer without
-the others. The two roles it replaces hold identical privileges, so nothing that was ever
-differentiated is lost in _privilege_; what is lost there is attribution, and `application_name` is
-what restores it. Attribution, not a boundary: any client can set it to anything.
+Postgres, Azure RBAC and every policy downstream see one caller. **That is the objection to this
+design, and it is now sharper than when it was written.** Preview holds no connection string, so a
+preview deployment cannot reach production Postgres today; consolidating onto this identity would
+give it back, by being a preview deployment rather than by holding a secret. The consolidation also
+removes the ability to revoke one consumer without the others. The two roles it replaces hold
+identical privileges, so nothing that was ever differentiated is lost in _privilege_; what is lost
+there is attribution, and `application_name` is what restores it. Attribution, not a boundary: any
+client can set it to anything.
 
 **What does change is how the credential is obtained, and that is the part worth deciding on.**
-Today a preview deployment reaches production Postgres by holding a secret — `DATABASE_URL`
-carrying `sbapp`'s password, scoped by Vercel to the Preview environment. After the cutover it
-reaches production by being a preview deployment: the OIDC assertion is injected by the platform as
-the `x-vercel-oidc-token` request header, not as an environment variable, so it is not subject to
-Vercel's env-var scoping, and the other three inputs — client id `cd074036-4c63-4d1e-8ebb-72f448bb95a2`,
+A preview deployment used to reach production Postgres by holding a secret — `DATABASE_URL`
+carrying `sbapp`'s password, scoped by Vercel to the Preview environment. That variable is gone.
+After the cutover it would reach production by being a preview deployment: the OIDC assertion is
+injected by the platform as the `x-vercel-oidc-token` request header, not as an environment
+variable, so it is **not** subject to Vercel's env-var scoping, and the other three inputs — client
+id `cd074036-4c63-4d1e-8ebb-72f448bb95a2`,
 the tenant id and the server hostname — are public identifiers that appear in this repository. The
 failure scenario therefore changes shape rather than size: an actor who gets attacker-controlled
 code into any preview deployment no longer needs to extract a scoped secret to read and write
@@ -1429,21 +1454,13 @@ the identity and its two federated credentials. What is not:
 - The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
   Service Bus grants under it. Moving it onto the shared identity is a change to
   `infra/azure/ingest.bicep`, which declares that identity, the queue and every assignment on it.
-- The shared identity's Data Receiver on `ingest-jobs` is not revoked. `ingest.bicep` declares all
-  four queue assignments, and of them the shared identity holds **both** Data Sender
-  (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and Data Receiver
-  (`0090d328-0cee-592f-8359-e4cc64940694`). Receiver is the half that matters: it is standing
-  authority to drain the production ingest queue, on an identity every Vercel deployment carries,
-  previews included.
-
-  It was deployed before the grant moved out of this template, and incremental ARM does not delete
-  what a template stops declaring, so removing it from Bicep would not revoke it. Revoking it was
-  attempted and refused: the delete returns `ScopeLocked` naming `switchback-prod-no-delete`, the
-  resource group's `CanNotDelete` lock, and lifting that is an Owner action. `ingest.bicep` adopts
-  it in the meantime, declared by its literal assignment id rather than by the `guid()` expression
-  its three siblings use — a role assignment's resource name is its GUID, so the literal is the
-  only form that provably converges on the assignment already in the estate, where a `guid()`
-  resolving to anything else would attempt a second grant of the same role to the same principal.
+- The shared identity holds Data Sender on `ingest-jobs` (`f1b97f59-263a-5e18-a1c0-40ce18436d52`)
+  and nothing else. It also held Data Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) — standing
+  authority to drain the production ingest queue from any Vercel deployment, previews included. That
+  assignment was deleted, and `ingest.bicep` no longer declares it. The declaration mattered as much
+  as the assignment: incremental ARM does not delete what a template stops declaring, but it does
+  re-create what a template still names, so a template that kept adopting it would have restored the
+  grant on the next deploy.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
 because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the

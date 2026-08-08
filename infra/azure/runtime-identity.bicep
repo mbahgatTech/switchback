@@ -15,10 +15,9 @@
 // **The identity, and nothing the identity is granted.** Its Service Bus role assignments belong
 // to ingest.bicep, which owns the namespace and the queue they are scoped to; declaring them here
 // too would recreate that drift one layer down, two templates computing one `guid()` against one
-// queue. The consequence to know is that ingest.bicep is not on this branch, so the two grants
-// this principal already holds live — Data Sender and Data Receiver on `ingest-jobs` — are
-// declared by no template here. Removing a grant from a template is not a revocation either way;
-// see the disclosure in docs/architecture.md.
+// queue. What this principal holds live is Data Sender on `ingest-jobs` and nothing else: Data
+// Receiver was deleted, because this identity rides on every Vercel deployment and Receive is
+// standing authority to drain the production queue from an unreviewed preview.
 //
 // The identity is not an administrator of anything. Its intended database privilege is
 // `sbapp_runtime` — a role that does not exist until the `provision` action renames `sbapp_vercel`

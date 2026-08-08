@@ -187,6 +187,23 @@ var monitoringReaderRoleId = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
 var storageBlobDataReaderRoleId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 
+// Host storage, at **account** scope, because the Functions host creates its own containers —
+// `azure-webjobs-hosts` for leases and `azure-webjobs-secrets` for function keys — and a grant
+// cannot name a container that does not exist yet. Owner rather than Contributor is Microsoft's
+// documented minimum for `AzureWebJobsStorage`: the host sets blob ACLs when it takes a singleton
+// lease. Table Data Contributor is the second half of that minimum, for the diagnostic events the
+// host writes when it cannot start.
+//
+// **This subsumes the container-scoped Reader below, and the trade is deliberate.** Blob Data
+// Owner over the account includes write on `function-releases`, so the worker's identity can
+// overwrite the package it runs from. That is not a new way in: the token is only obtainable from
+// inside the app, so reaching it already requires execution there. What it replaces is an account
+// key in an application setting, which anyone who could read settings or a log could use from
+// anywhere. Separating host storage from the release container into two accounts is what would
+// remove the residue; it is not needed to close the key.
+var storageBlobDataOwnerRoleId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+var storageTableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+
 @description('''
 The `sub` prefix GitHub actually stamps on this repository's OIDC tokens.
 
@@ -231,11 +248,13 @@ user-assigned one below — and with local auth off no SAS key would work even i
 it back on is a one-line revert, and the flag rollback does not need it: `INGEST_QUEUE_DRIVER=postgres`
 bypasses the broker entirely.
 
-It is not a claim about this file. Two long-lived credentials are deployed from it and a maintainer
-needs to know they are there to rotate: the storage account key, minted into `AzureWebJobsStorage` and
-`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` below; and `DATABASE_URL`, passed in as a secure parameter
-and held as an application setting. `WEBSITE_RUN_FROM_PACKAGE` used to be a third — a ten-year blob
-SAS — and is now a bare URL the host reads with its own identity. What has no key is the queue.
+It is not a claim about this file, but this file is now close to it. **One** long-lived credential
+is deployed from here and a maintainer needs to know it is there to rotate: `DATABASE_URL`, passed
+in as a secure parameter and held as an application setting. The storage account key used to be a
+second — minted into `AzureWebJobsStorage` and `WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` — and is
+now neither read nor accepted: `allowSharedKeyAccess` is false and the host authenticates as itself.
+`WEBSITE_RUN_FROM_PACKAGE` was a third, a ten-year blob SAS, and is now a bare URL the host reads
+with the same identity.
 ''')
 resource namespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: namespaceName
@@ -474,10 +493,16 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
 @description('''
 The storage account the Functions host requires for leases, keys and the deployment package.
 
-Shared-key access stays on because the Consumption host reads `AzureWebJobsStorage` as a connection
-string; identity-based host storage is a Flex/Premium/Dedicated feature. That key never leaves ARM —
-it is composed into an application setting below and is not an output. The *Service Bus* connection,
-which is the one that matters for least privilege, is identity-based and keyless.
+**No key leaves this template, because none is minted.** `allowSharedKeyAccess: false` turns the
+two account keys off at the account: they still exist and `listKeys` still returns them, and
+neither one authorises a single data-plane request. The host reads blobs, queues and tables with
+its own system-assigned identity through the `AzureWebJobsStorage__*` settings below, and
+`.github/scripts/deploy-worker.sh` uploads the package with `--auth-mode login`.
+
+The Azure Files content share is gone with it. Azure Files has no identity-based connection, so
+`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` is a key by construction; Linux Consumption does not
+need it, because the app runs from the external package URL that `WEBSITE_RUN_FROM_PACKAGE` names.
+Windows Consumption and Elastic Premium do need it and could not make this trade.
 
 `Standard_LRS` because nothing durable lives here: lose the account and the fix is a redeploy plus a
 zip push.
@@ -494,8 +519,8 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     allowBlobPublicAccess: false
-    allowSharedKeyAccess: true
-    defaultToOAuthAuthentication: false
+    allowSharedKeyAccess: false
+    defaultToOAuthAuthentication: true
     accessTier: 'Hot'
   }
 }
@@ -541,10 +566,10 @@ resource functionAppPackageRead 'Microsoft.Authorization/roleAssignments@2022-04
   }
 }
 
-// The third grant `.github/scripts/deploy-worker.sh` needs, and the reason it can stop reading
-// `AzureWebJobsStorage`: uploading the package over Entra rather than over the account key that
-// setting carries. Contributor because the script writes; scoped to this container, so it reaches
-// neither the host keys nor the lease blobs beside it.
+// The third grant `.github/scripts/deploy-worker.sh` needs: uploading the package over Entra, with
+// `--auth-mode login`, which is the only mode the account accepts. Contributor because the script
+// writes; scoped to this container, so it reaches neither the host keys nor the lease blobs beside
+// it — which is a narrower reach than the host's own account-scoped grant below.
 resource workerDeployerPackageWrite 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: releases
   name: guid(releases.id, workerDeployer.id, storageBlobDataContributorRoleId)
@@ -554,6 +579,42 @@ resource workerDeployerPackageWrite 'Microsoft.Authorization/roleAssignments@202
       storageBlobDataContributorRoleId
     )
     principalId: workerDeployer.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+@description('''
+What replaces the account key: the host reading its own storage as itself.
+
+Account scope, not container scope, because the containers the host uses — `azure-webjobs-hosts`,
+`azure-webjobs-secrets` — are created by the host at start-up and a role assignment cannot name a
+resource that does not exist. See the note beside the two role ids for why Owner is the minimum
+and what the account-wide reach costs.
+''')
+resource functionAppHostStorageBlobs 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: storage
+  name: guid(storage.id, functionApp.id, storageBlobDataOwnerRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataOwnerRoleId
+    )
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Diagnostic events. The host writes them to Table storage precisely when it cannot start, so
+// without this the one signal that would explain a dead app is the one it cannot record.
+resource functionAppHostStorageTables 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: storage
+  name: guid(storage.id, functionApp.id, storageTableDataContributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageTableDataContributorRoleId
+    )
+    principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -603,8 +664,6 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
     publicNetworkAccessForQuery: 'Enabled'
   }
 }
-
-var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
 
 var optionalWorkerSettings = concat(
   empty(terrainTileUrl)
@@ -745,23 +804,34 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       use32BitWorkerProcess: false
       appSettings: concat(
         [
+          // Host storage as the app's own identity. The double underscore is read at runtime as a
+          // colon, so these four are properties of one `AzureWebJobsStorage` object rather than
+          // four settings; a plain `AzureWebJobsStorage` value alongside them would win, which is
+          // why it is absent rather than emptied. All three service URIs are named because the
+          // host resolves blob, queue and table independently and falls back to a connection
+          // string for any it cannot build.
           {
-            name: 'AzureWebJobsStorage'
-            value: storageConnectionString
-          }
-          // Consumption provisions the app onto an Azure Files share, and these two settings are
-          // what name it. Without them the host has no content root: the package blob downloads
-          // fine and `wwwroot` is still empty, so every start logs "0 functions found (Custom)"
-          // and the app idles at zero. Neither `what-if` nor a Bicep lint can see that — it only
-          // shows once something has to run.
-          {
-            name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
-            value: storageConnectionString
+            name: 'AzureWebJobsStorage__blobServiceUri'
+            value: storage.properties.primaryEndpoints.blob
           }
           {
-            name: 'WEBSITE_CONTENTSHARE'
-            value: toLower(functionAppName)
+            name: 'AzureWebJobsStorage__queueServiceUri'
+            value: storage.properties.primaryEndpoints.queue
           }
+          {
+            name: 'AzureWebJobsStorage__tableServiceUri'
+            value: storage.properties.primaryEndpoints.table
+          }
+          // System-assigned: no `clientId`, which is what selects a user-assigned identity.
+          {
+            name: 'AzureWebJobsStorage__credential'
+            value: 'managedidentity'
+          }
+          // `WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` and `WEBSITE_CONTENTSHARE` are deliberately
+          // absent. They name an Azure Files share, Azure Files authenticates only with the
+          // account key, and Linux Consumption does not use the share at all — the content root
+          // is the package `WEBSITE_RUN_FROM_PACKAGE` names. Adding them back re-introduces the
+          // key this template exists to have removed.
           {
             name: 'FUNCTIONS_EXTENSION_VERSION'
             value: '~4'
@@ -923,31 +993,21 @@ Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, scoped 
 group, on 2026-08-03. So the parameter, the fallback and the `az role assignment create` in
 README.md are all gone: the template is the only thing that grants anything.
 
-Four assignments, all **scoped to the queue** rather than the namespace, so nothing here has
+Three assignments here, all **scoped to the queue** rather than the namespace, so nothing has
 standing on an entity created later:
 
   worker    Data Sender    the pump publishes a wake-up signal per runnable row
   worker    Data Receiver  the trigger receives, completes, and dead-letters
   publisher Data Sender    Vercel publishes
-  publisher Data Receiver  the worker's grant, on the identity it is being moved onto
 
 The worker's pair replaces a single Data Owner; see the note beside the role ids above for what
-that was buying and why it is not needed.
+that was buying and why it is not needed. The publisher gets Sender and nothing else:
+`id-switchback-vercel-publisher` is the shared runtime identity every Vercel deployment carries,
+previews included, so anything granted to it is reachable from an unreviewed branch build over the
+same REST surface `packages/ingest/src/publish.ts` uses to send.
 
-`publisherReceiver` is declared because it already exists — assignment
-`0090d328-0cee-592f-8359-e4cc64940694`, deployed before the grant moved out of this template.
-Incremental ARM does not delete what a template stops declaring, so leaving it undeclared does not
-revoke it; it only means no deploy converges it and no reader finds it in the template. Deleting it
-instead was attempted and refused with `ScopeLocked` naming `switchback-prod-no-delete`, the
-resource group's `CanNotDelete` lock, so revocation needs the lock lifted first — an Owner action,
-tracked separately.
-
-`id-switchback-vercel-publisher` is the shared runtime identity: Vercel carries it on every
-deployment, previews included. Receive on `ingest-jobs` is therefore reachable from a preview build
-today, over the same REST surface `packages/ingest/src/publish.ts` already uses to send. That is a
-consequence of one identity serving both runtimes rather than of this template, and it is the reason
-the grant is worth revoking rather than keeping — but the template must describe the estate that
-exists.
+Two more, on the storage account and its `function-releases` container, are declared beside the
+storage resources above because that is where their argument lives.
 ''')
 resource workerSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: queue
@@ -989,24 +1049,12 @@ resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 }
 
 /*
- * Named by its literal assignment id rather than `guid(...)` like its three siblings, because this
- * one is not being created — it is being adopted. A role assignment's resource name *is* its GUID,
- * so this is the only form that provably converges on the assignment already in the estate; a
- * `guid()` expression that resolved to anything else would try to grant the same principal the same
- * role at the same scope a second time.
+ * `0090d328-0cee-592f-8359-e4cc64940694` — the publisher identity's Data Receiver on this queue —
+ * used to be declared here, on the argument that a template must describe the estate that exists.
+ * It no longer exists: the resource-group lock was lifted and the assignment deleted. Declaring it
+ * now would re-create it on the next deployment, handing Receive on `ingest-jobs` back to the one
+ * identity every Vercel deployment carries, previews included. What is not declared is not granted.
  */
-resource publisherReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: queue
-  name: '0090d328-0cee-592f-8359-e4cc64940694'
-  properties: {
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      serviceBusDataReceiverRoleId
-    )
-    principalId: publisher.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
 
 @description('''
 **The identity that publishes the worker bundle, and the reason there is one at all.**

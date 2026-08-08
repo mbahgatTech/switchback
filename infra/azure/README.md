@@ -443,12 +443,12 @@ So the perimeter is a credential, and these are the compensating controls:
 The residual risk is therefore _leakage_ rather than brute force, which makes the credential
 inventory the thing to keep honest:
 
-| Store             | Value                                 | Notes                                            |
-| ----------------- | ------------------------------------- | ------------------------------------------------ |
-| GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                 |
-| GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin` |
-| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`    |
-| Vercel Preview    | `DATABASE_URL`, `DIRECT_DATABASE_URL` | own entries, separate from Production            |
+| Store             | Value                                 | Notes                                                   |
+| ----------------- | ------------------------------------- | ------------------------------------------------------- |
+| GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                        |
+| GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin`        |
+| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`           |
+| Vercel Preview    | neither                               | see [Preview has no database](#preview-has-no-database) |
 
 That table is the whole inventory, and the three `AZURE_*` GitHub secrets are gone. Verify rather
 than trust this paragraph:
@@ -461,6 +461,29 @@ npx vercel env ls
 GitHub's values cannot be read back, so the `Notes` column is design intent plus what each consumer
 demonstrably requires, not a readback. If you need to know what a secret contains, the only honest
 answer is to set it again from a source you trust.
+
+### Preview has no database
+
+Vercel Preview holds no `DATABASE_URL`, no `DIRECT_DATABASE_URL` and no `CRON_SECRET`. A preview
+deployment therefore fails its startup environment check naming `DATABASE_URL`, and that is the
+intended outcome: a preview build has no database of its own, and the only one it could have reached
+was production.
+
+It held all three until 2026-08-08. The Postgres firewall is a single rule spanning
+`0.0.0.0`–`255.255.255.255`, so reachability was never the boundary — holding the connection string
+was. Preview runs unreviewed branch code, `drainIfOwned` drains `ingest_jobs` on any `trails.browse`
+request, and `INGEST_TRAIL_IDENTITY` is a per-environment variable that Preview did not carry while
+Production ran `claim`, so those writes resolved trail identity in the opposite mode and could insert
+duplicates into the production corpus.
+
+The env vars are the containment; the durable control is in code. `apps/web/src/env.ts` refuses to
+start when `VERCEL_ENV` is set to anything but `production` and `DATABASE_URL` or
+`DIRECT_DATABASE_URL` names `psql-switchback-prod-37ywppu5p7fri`, so re-adding the variable fails
+loudly rather than silently reopening the hole. `apps/web/test/env-preview-database.test.ts` holds
+that rule.
+
+Giving Preview a database of its own is the way to make previews useful again: point it at a
+non-production server and the rule above passes.
 
 **No geo-redundant backup, no high availability, no warm standby.** All three are off.
 
@@ -816,26 +839,19 @@ side and stays `true` until every consumer has been proved on a token.
 
 1. Deploy the shared identity, and — in `infra/azure/ingest.bicep` — move the Function App onto it:
    `identity.type` to `SystemAssigned,UserAssigned`, `AZURE_CLIENT_ID` and
-   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and the Service
+   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and a Service
    Bus **Data Receiver** grant declared by `ingest.bicep`, because `ingest.bicep` owns the queue.
 
-   That grant is not a new capability, and the ordering below depends on knowing so. Read live with
-   `az role assignment list --all`, the shared identity **already holds** Data Receiver on
-   `ingest-jobs` — assignment `0090d328-0cee-592f-8359-e4cc64940694`, alongside Data Sender
-   `f1b97f59-263a-5e18-a1c0-40ce18436d52`. It was deployed before the grant moved out of this
-   template, and incremental ARM does not delete what a template stops declaring, so its absence
-   from the Bicep here is not a revocation. Revoking it was attempted and refused: the delete
-   returns `ScopeLocked` naming `switchback-prod-no-delete`, the resource group's `CanNotDelete`
-   lock, and lifting that is an Owner action.
+   That grant is a new capability and the ordering below depends on knowing so. The shared identity
+   holds Data Sender on `ingest-jobs` (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and nothing else. It
+   held Data Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) until that assignment was deleted
+   with the resource-group lock lifted; `ingest.bicep` no longer declares it, which is what stops a
+   deployment putting it back.
 
-   The grant is inert while no Service Bus receive code exists in this repository, and it becomes
-   real capability — for every Vercel deployment, preview included, because the shared identity is
-   also Vercel's — the moment the worker's code merges. Revocation being locked, `ingest.bicep`
-   adopts it instead: resource `publisherReceiver`, named by the literal assignment id rather than
-   `guid(...)`, so the template converges on this assignment rather than proposing a second grant of
-   the same role to the same principal at the same scope. Adoption records the grant; it does not
-   reduce it. Revoking still requires lifting `switchback-prod-no-delete` first, and that stays open
-   as an Owner action.
+   Granting Receive to this identity gives it to **every Vercel deployment, previews included**,
+   because the shared identity is also Vercel's. That is the reason it was revoked, and moving the
+   Function App onto the shared identity re-creates the same exposure by a different route. Weigh
+   that before step 1: the worker's own system-assigned identity has no such reach.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
@@ -926,6 +942,8 @@ no lock resource here either: the group's existing `CanNotDelete` does not block
 | Publisher creds | Vercel OIDC token exchanged for an Entra token — **no key anywhere**                   |
 | Worker          | `func-switchback-ingest-37ywppu5p7fri`, Linux Consumption (Y1), Node 22                |
 | Worker creds    | System-assigned identity, **Data Sender + Data Receiver scoped to the queue**          |
+| Storage         | `stsbingest37ywppu5p7fri`, `allowSharedKeyAccess: false` — the keys authorise nothing  |
+| Host storage    | `AzureWebJobsStorage__*` over the worker's identity; no Azure Files content share      |
 | Plan            | `plan-switchback-ingest`, Y1 Dynamic, `functionAppScaleLimit: 1`                       |
 | Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
 | Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
@@ -968,13 +986,12 @@ Three call sites in a Vercel process can reach Overpass — `/api/cron/drain`, `
 `routes.kickNetwork` — and all three branch on the flag.
 
 **That is per Vercel environment, not per deployment, and the difference is the whole number.** The
-flag is an environment variable and Production and Preview hold it independently, while both resolve
-`DATABASE_URL` to `psql-switchback-prod-37ywppu5p7fri` — the production server. So an environment on
+flag is an environment variable and Production and Preview hold it independently. An environment on
 `postgres`, or with the variable simply absent (`ingestQueueDriver()` reads anything unrecognised as
-`postgres`), is a second drainer against the same `ingest_jobs`, with its own `OverpassClient` at 2
-on every warm lambda. At 2026-08-03T23:26Z Production read `postgres` and Preview had no
-`INGEST_QUEUE_DRIVER` at all, so the flag-on ceiling then was 2 + 2N, not 2. Check it, do not assume
-it:
+`postgres`), drains `ingest_jobs` with its own `OverpassClient` at 2 on every warm lambda. Only
+Production can do that now — Preview holds no `DATABASE_URL` and fails its startup environment
+check — but the flag is still per environment, so give Preview a database and the second drainer
+returns. Check it, do not assume it:
 
 ```bash
 vercel env ls production | grep INGEST_QUEUE_DRIVER
@@ -1137,7 +1154,7 @@ byte-identical; `az rest --method GET .../locks` is how to check. Read `lock.jso
 template rather than typing it, which is what went wrong the first time.
 
 **A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
-gets exactly the four assignments the template declares. This step existed only to converge the
+gets exactly the three assignments the template declares. This step existed only to converge the
 environment that had already run the older template. To check any environment:
 
 ```bash
@@ -1146,12 +1163,12 @@ az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microso
 ```
 
 `atScope()` also returns what the subscription and the resource group grant — ten rows against this
-estate — so the filter on `properties.scope` is what narrows it to the queue's own. Four rows:
-Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and the
-same pair for the publisher `c9bfba39-…`. `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner) must
-not be among them. The publisher's Receiver, assignment `0090d328-0cee-592f-8359-e4cc64940694`, is
-the over-grant `ingest.bicep` adopts by literal id, and the resource group's delete lock is what
-prevents revoking it.
+estate — so the filter on `properties.scope` is what narrows it to the queue's own. Three rows:
+Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and Data
+Sender alone for the publisher `c9bfba39-…`. `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner)
+must not be among them, and neither must `0090d328-0cee-592f-8359-e4cc64940694` — the publisher's
+Receiver, deleted because it was standing authority to drain the production queue from any preview
+deployment.
 
 ### The two things Bicep cannot express
 
