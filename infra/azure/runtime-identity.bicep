@@ -11,9 +11,12 @@
 // trigger receives as whatever principal the site runs under, so an app running as this identity
 // would need Data Receiver on `ingest-jobs` put back on an identity every Vercel preview carries.
 //
-// Declared here rather than in ingest.bicep because it is the web application's database
-// principal, not the worker's, and ingest.bicep needs only its resource id — two templates
-// declaring one resource is how drift starts. ingest.bicep takes `resourceId` below as a parameter.
+// Declared here because it is the web application's database principal, not the worker's.
+// **ingest.bicep declares the same identity, and the same two federated credentials, itself** — it
+// takes no resource id from this template. Two templates own one resource and the last deploy
+// wins, and that drift is live: the identity's `component` tag reads `ingest-worker`,
+// ingest.bicep's default, not the value set below. Converging the two declarations is an
+// infrastructure change, not a documentation one.
 //
 // **The identity, and nothing the identity is granted.** Its Service Bus role assignment belongs
 // to ingest.bicep, which owns the namespace and the queue it is scoped to; declaring it here too
@@ -32,9 +35,7 @@ param location string
 
 @description('''
 Name of the shared identity. `id-switchback-vercel-publisher` is the deployed name and changing
-it creates a second identity rather than renaming this one — ARM cannot rename a UAMI. The name
-reads narrower than the role it is being given; the Postgres role and this file carry the accurate
-name instead.
+it creates a second identity rather than renaming this one — ARM cannot rename a UAMI.
 ''')
 param identityName string
 
@@ -46,10 +47,11 @@ param vercelProjectName string
 
 param tags object
 
-// ARM cannot rename a user-assigned identity, so the resource name still says `vercel-publisher`
-// while the identity is being made to serve three consumers. The tag is where a portal reader is
-// told otherwise, and it is one of the two places the narrow name is corrected — the other is the
-// Postgres role.
+// Two consumers, both Vercel: production and preview. `vercel-publisher` is an accurate name for
+// what this identity is, and `sbapp_vercel` for the role it holds — neither needs correcting by a
+// tag. **This value does not reach the deployed resource.** ingest.bicep declares the same identity
+// with its own `tags`, and the live `component` is `ingest-worker`; trust the templates over the
+// portal tag until the two declarations are converged.
 var identityTags = union(tags, { component: 'runtime-identity' })
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {

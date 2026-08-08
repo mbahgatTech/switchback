@@ -852,12 +852,17 @@ output applicationDatabaseUrlTemplate string = postgres.outputs.applicationDatab
 output logAnalyticsWorkspaceId string = monitoring.outputs.workspaceId
 
 @description('''
-Resource id of the shared runtime identity. The parameter ingest.bicep takes so the worker runs
-as the same principal Vercel does.
+Resource id of `id-switchback-vercel-publisher`, the identity the two Vercel environments federate
+to. Nothing takes it as a parameter — ingest.bicep declares the same identity itself rather than
+receiving a reference — and the ingest worker does not run as it: the worker is the Function App's
+own system-assigned principal, `3db30cfd-…`.
 ''')
 output runtimeIdentityResourceId string = runtimeIdentity.outputs.resourceId
 
-@description('Client id of the shared runtime identity — `AZURE_CLIENT_ID` on every runtime consumer.')
+@description('''
+Client id of the shared runtime identity — `AZURE_CLIENT_ID` on the Vercel project. The Function
+App sets no `AZURE_CLIENT_ID` and must not be given one; it authenticates as itself.
+''')
 output runtimeIdentityClientId string = runtimeIdentity.outputs.clientId
 
 @description('''

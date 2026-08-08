@@ -307,9 +307,12 @@ the owner's UPN; `sbapp_vercel` and `sbapp_func` carry no password at all and ar
 
 `id-switchback-vercel-publisher` is the shared runtime identity: Vercel production and Vercel
 preview both federate to it, and Postgres cannot tell the two environments apart because the FIC
-subject does not survive the token exchange. The resource name is narrower than the role it holds
-because ARM cannot rename a user-assigned identity; the `component: runtime-identity` tag is where
-a portal reader is told what it actually is.
+subject does not survive the token exchange. Two consumers, both Vercel — the resource name is
+accurate, and so is the Postgres role it holds, `sbapp_vercel`.
+
+The identity is declared in two templates, `runtime-identity.bicep` and `ingest.bicep`, with
+different tags, and the last deploy wins: the live `component` tag is `ingest-worker`. A portal tag
+is therefore not evidence of what this identity is for; the templates are.
 
 **The ingest worker is not moving onto it.** Its Service Bus trigger receives as whatever principal
 the site runs under, so a worker on the shared identity would need Data Receiver on `ingest-jobs`

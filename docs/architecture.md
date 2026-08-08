@@ -1377,12 +1377,13 @@ than Mermaid.
 
 ### Who trusts whom
 
-Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
-Two of them carry nothing yet — `sbapp_vercel` and `sbapp_func` are mapped and already hold
-`sbapp`'s grants by membership, and each label names the setting it waits on. The two dashed edges
-are the stored `sbapp` password, which is what both applications connect with today. `sbadmin`,
-which holds full DDL, is not drawn: it reaches this server by password too, but the secret holding
-that password has no consumer left.
+Solid edges are identity-based — the caller proves who it is and Entra issues a short-lived token —
+with one exception drawn solid because it is not a stored secret either: the reader's session cookie
+into Vercel. Two of the identity edges carry nothing yet: `sbapp_vercel` and `sbapp_func` are mapped
+and already hold `sbapp`'s grants by membership, and each label names the setting it waits on. The
+two dashed edges are the stored `sbapp` password, which is what both applications connect with
+today. `sbadmin`, which holds full DDL, is not drawn: it reaches this server by password too, but
+the secret holding that password has no consumer left.
 
 ```mermaid
 graph LR
