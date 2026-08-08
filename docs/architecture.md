@@ -933,11 +933,23 @@ such flag. That is survivable for a bounded experiment and wrong as a resting st
 Merging removes all four, which is the argument for merging before the next run rather than a reason
 the run cannot happen.
 
-**Live production state, 2026-08-06.** `INGEST_QUEUE_DRIVER` is back to `postgres` and
-`INGEST_SUBDIVIDE_MAX_ZOOM` back to `9` on the worker: the worker drops every signal it receives,
-Vercel owns the drain, and no further tile can split. Six z9 tiles had split — `031313112`,
-`120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four z10 child
-rows and twenty-four queued `ingest_tile` jobs.
+**Subdivision is on.** `INGEST_SUBDIVIDE_MAX_ZOOM` is `11` on the worker and absent on Vercel, which
+resolves to `9` there — the safe direction, and the one that matters, because Vercel does not drain
+while `INGEST_QUEUE_DRIVER` is `servicebus`. `INGEST_TRAIL_IDENTITY` is `claim` on both, without
+which `subdivideMaxZoom` clamps the ceiling to `INGEST_ZOOM` however it is set.
+
+The first split under this configuration is `120221313` at 2026-08-08T17:55:05Z: 4,069 Overpass
+elements assembled into 1,397 trails, the deadline refused the rest, and the tile became `pending`
+with `lastError = 'split into 4 tiles at z10'` and four child rows `1202213130`–`1202213133`.
+
+Rolling back is `INGEST_SUBDIVIDE_MAX_ZOOM=9` on the worker. That stops new splits and undoes
+nothing: a tile already split has four children and `processTile` routes it to the roll-up with no
+flag to read. `npm run ingest:unsplit -- <quadkey>` is the undo, and it restores the pre-split state
+including its failure.
+
+**The state left by the pre-merge run, 2026-08-06, is retired.** Six z9 tiles had split —
+`031313112`, `120221231`, `120230202`, `120230203`, `120230212` and `120230220` — leaving twenty-four
+z10 child rows and twenty-four queued `ingest_tile` jobs.
 
 **Those children are retired, not finished, and the reason is the arithmetic above.** None had ever
 run: every row was `pending` with `fetchedAt` NULL, `attempts` 0 and `trailCount` 0, and no trail in
@@ -1169,27 +1181,23 @@ write leaves nothing draining while `vercel env ls` reports success.
 
 ### `INGEST_SUBDIVIDE_MAX_ZOOM` → `9`
 
+Only the Function App carries this variable; Vercel has never held it, and an absent value already
+resolves to `9`. Vercel is also not the drainer while `INGEST_QUEUE_DRIVER` is `servicebus`, so this
+rollback is one write.
+
 ```bash
-# 1. Vercel, both environments — this is the side that drains, so this is the side that splits.
-vercel env rm INGEST_SUBDIVIDE_MAX_ZOOM production --yes
-vercel env rm INGEST_SUBDIVIDE_MAX_ZOOM preview --yes
-
-# 2. Promote a deployment built without it. Vercel binds environment variables at build time, so
-#    until this lands the running deployment still splits under the old ceiling. Takes minutes.
-vercel redeploy switchback-three.vercel.app --target production
-
-# 3. The Function App, which honours it whenever INGEST_QUEUE_DRIVER is servicebus.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_SUBDIVIDE_MAX_ZOOM=9 -o none
 
-# 4. Verify all three. The first two are separate questions and the second is the load-bearing one:
-#    `env ls` reads the project's variable set, which step 1 already emptied, so it reports success
-#    whether or not any deployment carrying the change exists.
-vercel env ls production | grep INGEST_SUBDIVIDE_MAX_ZOOM   # expect no output
-vercel ls --environment production                          # newest row's Age younger than step 1
+# Read it back. An app-settings write recycles a Consumption host on its own schedule, so budget a
+# tick or two before the running process honours it.
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
   --query "[?name=='INGEST_SUBDIVIDE_MAX_ZOOM'].value | [0]" -o tsv                # expect 9
+
+# If INGEST_QUEUE_DRIVER is ever put back to postgres, Vercel becomes the drainer and needs the
+# same ceiling. It is absent there, which is already 9 — confirm rather than assume.
+vercel env ls production | grep INGEST_SUBDIVIDE_MAX_ZOOM   # expect no output
 ```
 
 Removing the Vercel variable rather than setting it to `9` is deliberate: an absent value resolves to
