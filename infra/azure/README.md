@@ -181,15 +181,28 @@ ground, not a home.
 
 ## What it provisions
 
-| File                | What it is                                                                                      |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| `main.bicep`        | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname.  |
-| `postgres.bicep`    | The server: compute, storage, backups, firewall, server parameters, the database.               |
-| `monitoring.bicep`  | Log Analytics workspace, the alert action group, and the workload budget.                       |
-| `lock.bicep`        | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.     |
-| `main.bicepparam`   | Every non-secret parameter. Committed. The password is **not** here and never may be.           |
-| `ingest.bicep`      | The ingest queue and its worker. Resource-group scoped, deployed **separately**. See below.     |
-| `ingest.bicepparam` | Its non-secret parameters. The connection string is read from the environment, not stored here. |
+| File                     | What it is                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------- |
+| `main.bicep`             | Subscription-scoped. Creates the resource group, then calls the modules. Outputs the hostname.  |
+| `postgres.bicep`         | The server: compute, storage, backups, firewall, server parameters, the database.               |
+| `monitoring.bicep`       | Log Analytics workspace, the alert action group, and the workload budget.                       |
+| `lock.bicep`             | The resource group's `CanNotDelete` lock. A module because locks are resource-group scoped.     |
+| `ci-identity.bicep`      | `id-switchback-postgres-ci` and its federated credential. Zero Azure RBAC, by design.           |
+| `runtime-identity.bicep` | `id-switchback-vercel-publisher` and one federated credential per Vercel environment.           |
+| `infra-identity.bicep`   | `id-switchback-infra-deploy`. **Declared, not deployed** — see below.                           |
+| `main.bicepparam`        | Every non-secret parameter. Committed. The password is **not** here and never may be.           |
+| `ingest.bicep`           | The ingest queue and its worker. Resource-group scoped, deployed **separately**. See below.     |
+| `ingest.bicepparam`      | Its non-secret parameters. The connection string is read from the environment, not stored here. |
+
+Three user-assigned identities exist in the resource group — `id-switchback-postgres-ci`,
+`id-switchback-vercel-publisher` and `id-switchback-worker-deploy`, the last declared in
+`ingest.bicep`. `id-switchback-infra-deploy` is **not** among them: `main.bicep` declares it, no
+deployment carrying that module has run, and `grantInfraIdentityContributor` is `false` regardless,
+so `infrastructure.yml` compiles templates rather than deploying them. Read it back:
+
+```bash
+az identity list -g rg-switchback-prod-northcentralus --query '[].name' -o json
+```
 
 | Resource          | Value                                                           |
 | ----------------- | --------------------------------------------------------------- |
@@ -439,26 +452,38 @@ So the perimeter is a credential, and these are the compensating controls:
 The residual risk is therefore _leakage_ rather than brute force, which makes the credential
 inventory the thing to keep honest:
 
-| Store             | Value                                 | Notes                                                   |
-| ----------------- | ------------------------------------- | ------------------------------------------------------- |
-| GitHub secret     | `DATABASE_URL`                        | read by `ci.yml`'s `migrate` job                        |
-| GitHub secret     | `DIRECT_DATABASE_URL`                 | `prisma db push` runs through this, so `sbadmin`        |
-| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | `sbapp` — the web app never carries `sbadmin`           |
-| Vercel Preview    | neither                               | see [Preview has no database](#preview-has-no-database) |
+| Store             | Value                                 | Read by                       | Notes                                                     |
+| ----------------- | ------------------------------------- | ----------------------------- | --------------------------------------------------------- |
+| GitHub secret     | `DATABASE_URL`                        | **nothing**                   | `sbadmin`. Deletable at step 6 of the cutover, not before |
+| GitHub secret     | `DIRECT_DATABASE_URL`                 | **nothing**                   | `sbadmin`, and the recorded copy of the admin password    |
+| GitHub secret     | `VERCEL_DEPLOY_HOOK`                  | `ci.yml`'s `deploy` job       | A URL that triggers a production build. No database reach |
+| Vercel Production | `DATABASE_URL`, `DIRECT_DATABASE_URL` | the web app, on every request | `sbapp` — the web app never carries `sbadmin`             |
+| Vercel Preview    | neither                               | —                             | see [Preview has no database](#preview-has-no-database)   |
 
-That table is the whole inventory, and the three `AZURE_*` GitHub secrets are gone. Verify rather
-than trust this paragraph:
+**Neither database secret has a consumer.** `ci.yml`'s `migrate` job declares `id-token: write`,
+trades the runner's OIDC assertion for an Azure token against `id-switchback-postgres-ci`, and uses
+that token as the database password in all three of its Postgres steps — `assert-pg-admin.ts`,
+`npm run db:push` and `converge-runtime-grants.ts`. The schema push therefore authenticates as
+`id-switchback-postgres-ci`, **not** as `sbadmin`, which is why `ALTER DEFAULT PRIVILEGES … FOR ROLE
+sbadmin` never applied to the tables it created; `ci.yml`'s comment above the grant-convergence step
+records what that cost. Both are stored administrator credentials with nothing reading them, kept
+only as the way back if the token path fails.
+
+Those three are every GitHub secret the repository holds — the `AZURE_*` ones are gone. Verify
+rather than trust this paragraph:
 
 ```bash
-gh secret list --repo mbahgatTech/switchback
-npx vercel env ls
+gh secret list --repo mbahgatTech/switchback                    # three names, timestamps, no values
+npx vercel env ls                                               # per-environment presence
+git grep -nE 'secrets\.(DIRECT_)?DATABASE_URL' -- '.github/'    # empty: no workflow reads either
 ```
 
-GitHub's API returns names and timestamps, never values, so the `Notes` column is design intent plus
-what each consumer demonstrably requires, not a readback. A workflow can still print a secret, which
-is the blast radius named in [Read this first](#read-this-first) and the reason
-`DIRECT_DATABASE_URL` counts as a recorded copy of the admin password. Short of writing that
-workflow, setting a secret again from a source you trust is the honest way to know what it holds.
+`Read by` is measured — that `git grep` returns nothing and exits 1. `Value` is not: GitHub's API
+returns names and timestamps, never values, so what each secret _holds_ is design intent rather than
+a readback. A workflow can still print a secret, which is the blast radius named in
+[Read this first](#read-this-first) and the reason `DIRECT_DATABASE_URL` counts as a recorded copy of
+the admin password. Short of writing that workflow, setting a secret again from a source you trust is
+the honest way to know what it holds.
 
 ### Preview has no database
 
@@ -874,12 +899,14 @@ side and stays `true` until every consumer has been proved on a token.
    worked last week".
 6. Only now set `passwordAuthEnabled = false` and deploy.
 
-Two things to settle before step 6. The `migrate` job in `ci.yml` mints its own token and no longer
-reads `secrets.DIRECT_DATABASE_URL`; prove it by pushing a no-op change under `packages/db/prisma/`
-while passwords still work, so a failure is a red run rather than an outage. And `.env` on the
-owner's machine points at production — point it at the local Docker Postgres first, or every db
-script, `npm run dev` and the e2e suite stop working at step 6 with a connection error and no
-explanation.
+Two things to settle before step 6. The `migrate` job in `ci.yml` mints its own token and reads
+neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`. Half of that is already proven —
+`azure/login` and the grant-convergence step are unconditional, and run 31246622902 reached
+production over the token. The half gated on `packages/db/prisma/` changing is not, so push a no-op
+change under that path while passwords still work, and a failure is a red run rather than an outage.
+And `.env` on the owner's machine points at production — point it at the local Docker Postgres
+first, or every db script, `npm run dev` and the e2e suite stop working at step 6 with a connection
+error and no explanation.
 
 After step 6 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
 server refuses password authentication outright, and from step 6 onward the template needs no

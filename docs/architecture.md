@@ -1793,12 +1793,17 @@ order, each proved with passwords still enabled:
    `id-switchback-vercel-publisher`. The code exists and has never run in a Vercel runtime; the
    cold-cache-outside-a-request risk above is real and unmitigated.
 4. **CI.** `ci.yml`'s `migrate` job composes a connection string from a freshly minted token for
-   `id-switchback-postgres-ci` rather than reading a stored password. That path has never
-   executed — it fires only when `packages/db/prisma/` changes — so it is written but unproven,
-   and proving it means a no-op schema commit while passwords still work. One thing will bite
-   when it is tried: `prisma db push` then runs as a role that is not `sbadmin`, so new tables
-   would be owned by it and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` would not apply.
-   `ALTER ROLE "id-switchback-postgres-ci" SET role = 'sbadmin'` is the cheap fix, and is untested.
+   `id-switchback-postgres-ci` rather than reading a stored password, and **that path runs on every
+   push to `master`**: `azure/login` and the grant-convergence step are unconditional, and run
+   31246622902 reached production as `id-switchback-postgres-ci` and reported
+   `switchback-runtime-grants tables=26 ungranted=0`. What has not been exercised recently is the
+   half gated on `packages/db/prisma/` changing — `assert-pg-admin.ts`, `npm run db:generate` and
+   `npm run db:push` — so a no-op schema commit while passwords still work is what proves the push.
+   The hazard in that half already materialised once: `db push` runs as a role that is not
+   `sbadmin`, so `trail_ways` and `trail_slug_aliases` were created owned by
+   `id-switchback-postgres-ci` and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` did not reach them. The
+   repair that shipped is `scripts/converge-runtime-grants.ts`, which re-grants unconditionally
+   after every push rather than relying on default privileges registered under one creating role.
 
 `passwordAuth` is a parameter — `passwordAuthEnabled` in `main.bicep`, defaulting true — so the
 flip is a reviewable deployment of its own rather than an edit to a template. It is gated on all
