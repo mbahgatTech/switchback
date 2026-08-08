@@ -14,9 +14,10 @@
 //   unset PGADMIN_PASSWORD
 //
 // A `$( )` substitution never reaches the process table, and what lands in shell history is
-// the variable name rather than its value. **Put the password in a password manager before
-// deleting the file** — it cannot be read back out of ARM, out of a GitHub secret, or out of
-// Vercel, and a redeploy has to pass the same value. See README.md, "Deploying".
+// the variable name rather than its value. **Record the password before deleting the file** —
+// ARM cannot read it back and a redeploy has to pass the same value. README.md's "Read this
+// first" inventories where the live one is kept; a copy outside that inventory goes stale
+// without saying so. See README.md, "Deploying".
 //
 // A `.bicepparam` may be combined with further `--parameters name=value` overrides, and
 // `.github/scripts/infra-deploy.sh` relies on it — it passes this file and `deployDatabase=false`
@@ -93,7 +94,7 @@ param serverNamePrefix = 'psql-switchback-prod'
 // `Microsoft.Support/*`, with empty `notActions` — and **no condition**, on the role definition
 // (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) or on the assignment
 // (`8baf9393-029a-4226-a882-992a8146d775`). It exists because a Contributor cannot write the role
-// assignments the templates declare; `infraContributor` in main.bicep is one, and the four queue
+// assignments the templates declare; `infraContributor` in main.bicep is one, and the three queue
 // grants in `infra/azure/ingest.bicep` are more. It was created by the owner's own object id,
 // `8c682736-…`, the same one declared as the Entra administrator below.
 //
@@ -248,10 +249,11 @@ param entraAuthEnabled = true
 // here while this migration was proved from one; it is not any more.
 param ciIdentityBranches = ['master']
 
-// One identity for every runtime client — Vercel production, Vercel preview and the ingest
-// worker. The name is the deployed one and is now narrower than the role: ARM cannot rename a
-// user-assigned identity, so renaming it here would create a second one and leave the first
-// holding every live grant. runtime-identity.bicep carries the accurate description.
+// The identity Vercel production and Vercel preview both federate to, and only those two. The
+// ingest worker is a separate principal — the Function App's own system-assigned identity, whose
+// Postgres role is `sbapp_func` — and stays one; runtime-identity.bicep says why. The name is the
+// deployed one: ARM cannot rename a user-assigned identity, so renaming it here would create a
+// second one and leave the first holding every live grant.
 param runtimeIdentityName = 'id-switchback-vercel-publisher'
 
 // Both halves of every federated-credential subject. Entra matches the subject as an exact

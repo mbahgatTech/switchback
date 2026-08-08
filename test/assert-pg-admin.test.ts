@@ -13,9 +13,7 @@ describe('the administrator verdict', () => {
   });
 
   it('refuses a driver that returns the flag as text', () => {
-    expect(readAdminVerdict([{ current_user: 'sbapp_runtime', is_admin: 't' }]).isAdmin).toBe(
-      false,
-    );
+    expect(readAdminVerdict([{ current_user: 'sbapp_vercel', is_admin: 't' }]).isAdmin).toBe(false);
   });
 
   it('throws when the probe returned nothing to judge', () => {
