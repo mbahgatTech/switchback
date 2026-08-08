@@ -1015,7 +1015,7 @@ Postgres/Service Bus fan-out that an operator had just rolled back.
 
 **The template deploy and the package push always run together, template first — and the push is a
 script, not a command.** Linux Consumption runs the code from a package URL that
-`az functionapp deployment source config-zip` writes into the same application-settings collection an
+`.github/scripts/deploy-worker.sh` writes into the same application-settings collection an
 ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
 — and a Bicep deployment on its own leaves the app codeless until the next push. For the same reason,
 a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
@@ -1025,13 +1025,51 @@ the template.
 bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip "$(git rev-parse HEAD)"
 ```
 
-That script is the whole sequence — push, trigger sync, and a wait for the running host to emit
+That script is the whole sequence — upload the bundle to the `function-releases` container, point
+`WEBSITE_RUN_FROM_PACKAGE` at it, sync the trigger cache, and wait for the running host to emit
 `switchback-ingest-queue-health build=<commit>`, a line only the package built from that commit can
-produce. It fails if the package blob did not change or if that heartbeat does not arrive, so a
-stale deploy cannot report success. `ci.yml`'s `deploy ingest worker` job will invoke the same file
-on every push to master; running it by hand and letting CI run it are the same code path, which is
-the point. That job has not executed yet — it is gated on master and nothing has merged since it was
-written.
+produce. It fails if the uploaded blob is short, if the settings write did not land, or if that
+heartbeat does not arrive, so a stale deploy cannot report success. `ci.yml`'s `deploy ingest worker`
+job invokes the same file on every push to master; running it by hand and letting CI run it are the
+same code path, which is the point.
+
+**Never `az functionapp deployment source config-zip` on this app.** The CLI decides between the
+blob path and a Kudu `/api/zipdeploy` by reading the plan to see whether it is Consumption, inside a
+bare `except:`. `id-switchback-worker-deploy` is Website Contributor on the _site_, which does not
+carry read on the plan resource, so the lookup fails, is swallowed, and the app is treated as
+non-Consumption — and the Kudu fallback is refused with **409**, because a site whose
+`WEBSITE_RUN_FROM_PACKAGE` names an external URL cannot also be extracted into. The same command
+succeeds for an operator who can read the plan, which is what made this look like a working deploy
+path for as long as only a workstation ran it.
+
+**The package URL carries no SAS.** `config-zip` mints one with a 520-week expiry. The Function App's
+system-assigned identity holds Storage Blob Data Reader on `function-releases` instead — the
+mechanism Microsoft documents for external package URLs and recommends over a SAS — so the setting is
+an ordinary blob URL that can be read out, logged and pasted without redaction.
+
+**Subscription Owner is not enough to run the script by hand.** The upload is `--auth-mode login`,
+and blob data access is a data-plane role that Owner does not imply: without one the script stops on
+`You do not have the required permissions needed to perform this operation`, before it has touched
+the app. CI is covered by the grant `ingest.bicep` gives `id-switchback-worker-deploy`; a person
+needs their own, which is not in the template because a template is the wrong place to enumerate
+humans. `az role assignment create` rejects a container scope here with `MissingSubscription`, so
+place it through ARM:
+
+```bash
+OBJECT_ID="$(az ad signed-in-user show --query id -o tsv)"
+SCOPE=/subscriptions/5cb9e7c3-0e31-4388-94e9-b36eab4bf977/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Storage/storageAccounts/stsbingest37ywppu5p7fri/blobServices/default/containers/function-releases
+cat >/tmp/grant.json <<JSON
+{"properties":{
+  "roleDefinitionId":"/subscriptions/5cb9e7c3-0e31-4388-94e9-b36eab4bf977/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+  "principalId":"$OBJECT_ID","principalType":"User"}}
+JSON
+az rest --method PUT --body @/tmp/grant.json \
+  --url "https://management.azure.com$SCOPE/providers/Microsoft.Authorization/roleAssignments/$(uuidgen)?api-version=2022-04-01"
+```
+
+`ba92f5b4-2d11-453d-a403-e96b0029c9fe` is Storage Blob Data Contributor. The scope is the one
+container: it reaches neither `azure-webjobs-secrets`, where the host keys live, nor the lease blobs
+beside it.
 
 The trigger sync inside it is not optional and cost half an hour to find. After an ARM deployment has
 removed `WEBSITE_RUN_FROM_PACKAGE` and the push has put it back, the host comes up reporting

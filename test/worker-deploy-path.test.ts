@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
@@ -125,5 +127,151 @@ describe('the heartbeat the deploy waits for', () => {
     expect(install).toBeDefined();
     // And the script refuses rather than waiting out its deadline on a runner without it.
     expect(deployScript).toContain("'az monitor app-insights' is unavailable");
+  });
+});
+
+/**
+ * How the package reaches the app, exercised rather than read.
+ *
+ * `az functionapp deployment source config-zip` picks between uploading a blob and a Kudu
+ * `/api/zipdeploy` by reading the plan to see whether it is Consumption, inside a bare `except:`.
+ * The deploy identity is Website Contributor on the *site* and cannot read the plan, so the lookup
+ * is swallowed, the Kudu fallback is taken, and the platform refuses it with 409 — a site running
+ * from an external package URL cannot also be extracted into. It succeeds for an operator who can
+ * read the plan, so the failure is invisible everywhere except a push to master.
+ *
+ * These run the real script against a stub `az` that records its argv, which is the only way to
+ * assert on a path whose live form is one production Function App.
+ */
+describe('the mechanism the deploy uses', () => {
+  const STORAGE = 'stfake';
+  const state = () => mkdtempSync(path.join(tmpdir(), 'deploy-worker-'));
+
+  /** A stub `az` that records every invocation and answers the six queries the script makes. */
+  function stubAz(
+    dir: string,
+    { heartbeats = '1', uploadedBytes = '', settingsWritesLand = true },
+  ) {
+    writeFileSync(
+      path.join(dir, 'az'),
+      `#!/usr/bin/env bash
+echo "$@" >>"${dir.replace(/\\/g, '/')}/argv"
+args="$*"
+case "$args" in
+  *"account show"*) echo 00000000-0000-0000-0000-000000000000 ;;
+  *"appsettings list"*) cat "${dir.replace(/\\/g, '/')}/setting" 2>/dev/null ;;
+  *"appsettings set"*)
+    ${settingsWritesLand ? '' : 'exit 0 # the write silently does not land\n    '}for a in "$@"; do
+      case "$a" in WEBSITE_RUN_FROM_PACKAGE=*) echo "\${a#WEBSITE_RUN_FROM_PACKAGE=}" >"${dir.replace(/\\/g, '/')}/setting" ;; esac
+    done ;;
+  *"blob show"*) echo "${uploadedBytes}" ;;
+  *"app-insights query"*) echo "${heartbeats}" ;;
+esac
+exit 0
+`,
+      'utf8',
+    );
+    chmodSync(path.join(dir, 'az'), 0o755);
+  }
+
+  function deploy(overrides: Parameters<typeof stubAz>[1] & { bundle?: string } = {}) {
+    const dir = state();
+    const bundle = path.join(dir, 'ingest-worker.zip');
+    writeFileSync(bundle, overrides.bundle ?? 'x'.repeat(64));
+    const size = String((overrides.bundle ?? 'x'.repeat(64)).length);
+    stubAz(dir, { uploadedBytes: size, ...overrides });
+    writeFileSync(
+      path.join(dir, 'setting'),
+      'https://old.blob.core.windows.net/c/old.zip?sig=REDACTED\n',
+    );
+    const result = spawnSync('bash', ['.github/scripts/deploy-worker.sh', bundle, 'c0ffee'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+        STORAGE_ACCOUNT: STORAGE,
+        HEARTBEAT_TIMEOUT_S: '0',
+      },
+    });
+    return {
+      ...result,
+      argv: readFileSync(path.join(dir, 'argv'), 'utf8'),
+      setting: readFileSync(path.join(dir, 'setting'), 'utf8').trim(),
+    };
+  }
+
+  it('uploads the bundle to function-releases rather than calling config-zip', () => {
+    const { status, argv, stdout, stderr } = deploy({});
+    expect(stdout + stderr).not.toContain('command not found');
+    expect(argv).toContain('storage blob upload');
+    expect(argv).toContain('--container-name function-releases');
+    expect(argv).not.toContain('deployment source config-zip');
+    expect(status).toBe(0);
+  });
+
+  it('points the app at a bare blob URL, with no SAS to expire or redact', () => {
+    const { setting } = deploy({});
+    expect(setting).toMatch(
+      new RegExp(
+        `^https://${STORAGE}\\.blob\\.core\\.windows\\.net/function-releases/c0ffee-\\d{8}T\\d{6}Z\\.zip$`,
+      ),
+    );
+    expect(setting).not.toContain('?');
+  });
+
+  it('syncs the trigger cache, without which a Consumption app never wakes', () => {
+    expect(deploy({}).argv).toContain('syncfunctiontriggers');
+  });
+
+  it('fails on a short upload rather than waiting out the heartbeat deadline', () => {
+    const { status, stdout, stderr, argv } = deploy({ uploadedBytes: '11' });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('The upload was truncated');
+    expect(argv).not.toContain('appsettings set');
+  });
+
+  it('fails when the settings write does not land', () => {
+    const { status, stdout, stderr } = deploy({ settingsWritesLand: false });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('The settings write did not land');
+  });
+
+  it('fails when no heartbeat naming the commit arrives', () => {
+    const { status, stdout, stderr } = deploy({ heartbeats: '0' });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('no heartbeat naming c0ffee');
+  });
+});
+
+/**
+ * The two grants that make the mechanism above possible, and the container they are scoped to.
+ * Without the first the host cannot fetch its own package without a SAS; without the second the
+ * deploy identity cannot upload one at all.
+ */
+describe('the package container and its grants', () => {
+  it('is declared, so the grants have a scope narrower than the storage account', () => {
+    expect(bicep).toContain(
+      "resource releases 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01'",
+    );
+    expect(bicep).toContain("name: '${storage.name}/default/function-releases'");
+  });
+
+  it("lets the host read its own package with the app's identity instead of a SAS", () => {
+    expect(bicep).toContain(
+      "var storageBlobDataReaderRoleId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'",
+    );
+    expect(bicep).toMatch(
+      /resource functionAppPackageRead[\s\S]*?scope: releases[\s\S]*?storageBlobDataReaderRoleId[\s\S]*?principalId: functionApp\.identity\.principalId/,
+    );
+  });
+
+  it('lets the deploy identity upload one over Entra rather than the account key', () => {
+    expect(bicep).toContain(
+      "var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'",
+    );
+    expect(bicep).toMatch(
+      /resource workerDeployerPackageWrite[\s\S]*?scope: releases[\s\S]*?storageBlobDataContributorRoleId[\s\S]*?principalId: workerDeployer\.properties\.principalId/,
+    );
   });
 });

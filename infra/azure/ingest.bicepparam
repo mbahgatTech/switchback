@@ -16,8 +16,8 @@
 //   unset INGEST_DATABASE_URL
 //
 // **A template deployment alone leaves the app codeless.** Linux Consumption runs from a package URL
-// that `az functionapp deployment source config-zip` writes into the same application-settings
-// collection an ARM deployment replaces wholesale, so the deploy above and the zip push always run
+// that `.github/scripts/deploy-worker.sh` writes into the same application-settings collection an
+// ARM deployment replaces wholesale, so the deploy above and the package push always run
 // together, template first. The symptom in between is `0 functions found` and `No job functions
 // found` in `traces`, with `az functionapp function list` returning nothing — read that as "the
 // package setting was replaced", not as a broken bundle. See the note beside the Function App in

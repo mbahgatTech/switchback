@@ -4,17 +4,32 @@
 #
 # This is the only thing that writes `WEBSITE_RUN_FROM_PACKAGE`. `infra/azure/ingest.bicep`
 # deliberately does not declare that setting — an ARM application-settings write replaces the
-# collection whole and would fight the zip push — so a template deploy leaves the app codeless
+# collection whole and would fight the package push — so a template deploy leaves the app codeless
 # until this script runs. Template first, then this. Both CI and a human invoke this same file so
 # the sequence cannot exist in two versions.
 #
-# **The verification is the point.** An exit code from `config-zip` says a blob was uploaded and a
-# setting was written; it says nothing about what the host is executing, which is exactly the gap
-# that left a five-week-old build in production under a green pipeline. So this asserts two
-# independent things, and fails if either is missing:
+# **Upload the blob, then name it — never `az functionapp deployment source config-zip`.** Linux
+# Consumption runs from an external package URL and has no `scm` site to extract into, so the CLI
+# has to pick the blob path over the Kudu one. It picks by reading the *plan* to see whether it is
+# Consumption, inside a bare `except:` — and the deploy identity is Website Contributor on the site
+# only, which does not carry read on the plan resource. The lookup fails, is swallowed, the app is
+# treated as non-Consumption, and the fallback is a Kudu `/api/zipdeploy` that the platform refuses
+# with **409** precisely because `WEBSITE_RUN_FROM_PACKAGE` names an external URL. Same command,
+# same app: it works for an operator who can read the plan and fails in CI. Doing the two steps
+# here removes the guess.
 #
-#   1. the package setting names a different blob than it did before this run — the deploy was not
-#      a silent no-op;
+# **The URL carries no SAS.** `config-zip` mints one with a 520-week expiry — a ten-year bearer
+# credential for the package, in an application setting, in a public repository. `ingest.bicep`
+# grants the Function App's system-assigned identity Storage Blob Data Reader on the container
+# instead, which is the mechanism Microsoft documents for external package URLs and recommends over
+# a SAS. So the setting is an ordinary URL: nothing to redact, rotate, or outlive its usefulness.
+#
+# **The verification is the point.** An exit code says a blob was uploaded and a setting was
+# written; it says nothing about what the host is executing, which is exactly the gap that left a
+# five-week-old build in production under a green pipeline. So this asserts two independent things,
+# and fails if either is missing:
+#
+#   1. the live setting names the blob this run uploaded — the ARM write landed, on this app;
 #   2. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
 #      timestamp after the deploy began. The marker is emitted by the first statement of the
 #      `ingestPump` handler, on a two-minute timer, ahead of the `INGEST_QUEUE_DRIVER` guard; the
@@ -24,7 +39,7 @@
 #      would pass on the previous build's heartbeat.
 #
 # Usage: deploy-worker.sh <zip-path> <commit>
-# Environment: RESOURCE_GROUP, FUNCTION_APP, APP_INSIGHTS.
+# Environment: RESOURCE_GROUP, FUNCTION_APP, APP_INSIGHTS, STORAGE_ACCOUNT.
 
 set -euo pipefail
 
@@ -33,6 +48,8 @@ COMMIT="${2:?usage: deploy-worker.sh <zip-path> <commit>}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-switchback-prod-northcentralus}"
 FUNCTION_APP="${FUNCTION_APP:-func-switchback-ingest-37ywppu5p7fri}"
 APP_INSIGHTS="${APP_INSIGHTS:-appi-switchback-ingest}"
+STORAGE_ACCOUNT="${STORAGE_ACCOUNT:-stsbingest37ywppu5p7fri}"
+CONTAINER=function-releases
 
 # How long to wait for a heartbeat. The pump fires every two minutes and Application Insights
 # ingests within about two more, against a cold start that can take one — so twelve minutes is
@@ -51,21 +68,41 @@ az monitor app-insights component show --app "$APP_INSIGHTS" -g "$RESOURCE_GROUP
   exit 1
 }
 
-# Identifies the blob without exposing the SAS query string the setting also carries. Never echo
-# the setting itself: this repository is public and that value is a bearer credential for the
-# package.
+# Reduces the setting to a blob name. Used for reporting only, and it strips the query string
+# because the value this script writes is not the only value that can be there: anything written by
+# `az functionapp deployment source config-zip` carries a SAS, and this repository is public.
 package_blob() {
   az functionapp config appsettings list -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
     --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv 2>/dev/null |
     sed -e 's/?.*$//' -e 's#^.*/##'
 }
 
-before="$(package_blob)"
-started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "deploying $(basename "$ZIP") at ${COMMIT} to $FUNCTION_APP; package before this run: ${before:-<unset>}"
+# A fresh name every run. The platform requires a restart when a package changes *behind* an
+# unchanged URL, and never needs one when the URL itself moves — so uniqueness is what makes the
+# trigger sync below sufficient.
+BLOB="${COMMIT}-$(date -u +%Y%m%dT%H%M%SZ).zip"
+PACKAGE_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}/${BLOB}"
 
-az functionapp deployment source config-zip \
-  -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" --src "$ZIP" -o none
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "deploying $(basename "$ZIP") at ${COMMIT} to $FUNCTION_APP; package before this run: $(package_blob)"
+
+az storage blob upload --auth-mode login --overwrite false -o none \
+  --account-name "$STORAGE_ACCOUNT" --container-name "$CONTAINER" --name "$BLOB" --file "$ZIP"
+
+# Bytes on the wire, not the exit code of the command that sent them. A short blob mounts as a
+# corrupt zip and the host reports `0 functions found`, which reads identically to a package that
+# never arrived — twelve minutes later, when the heartbeat has not come.
+uploaded="$(az storage blob show --auth-mode login --account-name "$STORAGE_ACCOUNT" \
+  --container-name "$CONTAINER" --name "$BLOB" --query properties.contentLength -o tsv)"
+local_size="$(wc -c <"$ZIP" | tr -d '[:space:]')"
+if [ "$uploaded" != "$local_size" ]; then
+  echo "::error::${BLOB} is ${uploaded} bytes and the bundle is ${local_size}. The upload was truncated."
+  exit 1
+fi
+echo "uploaded ${BLOB} (${uploaded} bytes)"
+
+az functionapp config appsettings set -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none \
+  --settings "WEBSITE_RUN_FROM_PACKAGE=${PACKAGE_URL}"
 
 # Not optional. After the package changes, a Consumption app whose scale controller still holds the
 # old trigger set comes back reporting `0 functions loaded`, `az functionapp function list` returns
@@ -74,16 +111,13 @@ az functionapp deployment source config-zip \
 az rest --method POST -o none --url \
   "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}/syncfunctiontriggers?api-version=2023-12-01"
 
-after="$(package_blob)"
-echo "package after this run: ${after:-<unset>}"
-if [ -z "$after" ]; then
-  echo "::error::WEBSITE_RUN_FROM_PACKAGE is unset after the push — the app has no code to run."
+after="$(az functionapp config appsettings list -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
+  --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)"
+if [ "$after" != "$PACKAGE_URL" ]; then
+  echo "::error::WEBSITE_RUN_FROM_PACKAGE names $(package_blob), not ${BLOB}. The settings write did not land."
   exit 1
 fi
-if [ "$after" = "$before" ]; then
-  echo "::error::the package blob did not change. The push was a no-op and the app is still on ${before}."
-  exit 1
-fi
+echo "package after this run: ${PACKAGE_URL}"
 
 echo "waiting up to ${HEARTBEAT_TIMEOUT_S}s for '${HEARTBEAT}' emitted after ${started_at}"
 deadline=$(( $(date +%s) + HEARTBEAT_TIMEOUT_S ))

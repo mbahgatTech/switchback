@@ -988,16 +988,31 @@ Both facts are load-bearing:
 | Step | Command                                                                 | Why the order                                                                                                            |
 | ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, and in doing so removes `WEBSITE_RUN_FROM_PACKAGE`. The app is codeless from here until step 2. |
-| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Pushes the package, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.                                |
+| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.     |
 
 Step 2 alone is the routine case; step 1 is only needed when the template changes.
 
-**The script does not trust its own exit codes.** A `config-zip` that returns 0 says a blob was
-uploaded, which is a statement about the deploy and not about the host — and a package setting that
-still names last month's blob passes every check built from exit codes alone. So it asserts two
-independent things and fails on either: the package blob differs from the one the app was running
-before, and `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
-timestamp after the push began. The second is behaviour, not a version string: that line is emitted
+**Step 2 uploads the blob itself rather than calling `az functionapp deployment source config-zip`.**
+That command chooses between the blob path and a Kudu `/api/zipdeploy` by reading the plan to see
+whether it is Consumption, inside a bare `except:`. The deploy identity is Website Contributor on the
+_site_, which does not carry read on the plan resource, so the lookup fails, is swallowed, and the
+app is treated as non-Consumption — and the Kudu fallback is refused with **409**, because a site
+already running from an external package URL cannot also be extracted into. The command succeeds for
+an operator who can read the plan and fails for CI, which is how a deploy path that only a
+workstation had ever exercised came to look sound.
+
+**Nothing in the setting is a credential.** `config-zip` writes a SAS with a 520-week expiry; the
+script writes a bare `https://…/function-releases/<commit>-<utc>.zip` and the host authenticates with
+its own system-assigned identity, which `ingest.bicep` grants Storage Blob Data Reader on that
+container. This is the mechanism Microsoft documents for external package URLs and recommends over a
+SAS, and it is what lets the deploy log name the package it just shipped.
+
+**The script does not trust its own exit codes.** An exit code says a blob was uploaded, which is a
+statement about the deploy and not about the host — and a package setting that still names last
+month's blob passes every check built from exit codes alone. So it asserts three independent things
+and fails on any: the uploaded blob is the same length as the bundle on disk, the live setting names
+that blob, and `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
+timestamp after the push began. The last is behaviour, not a version string: that line is emitted
 by the first statement of the `ingestPump` handler, on a two-minute timer, ahead of the
 `INGEST_QUEUE_DRIVER` guard, and the commit in it is substituted into the bundle by
 `apps/ingest-worker/scripts/bundle.ts`, so it travels inside the zip. A bare marker would have been
