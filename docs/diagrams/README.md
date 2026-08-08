@@ -61,3 +61,36 @@ For Mermaid blocks, `mmdc` renders one at a time and exits non-zero on a parse e
 ```bash
 npx --yes @mermaid-js/mermaid-cli@11 -i diagram.mmd -o /tmp/out.svg
 ```
+
+## A local Mermaid render is not evidence that GitHub renders
+
+`mmdc` and GitHub are different renderers on different builds behind different configuration, so a
+green `mmdc` run says a block parses somewhere and nothing about the only place readers see it.
+What GitHub does with three constructs, measured by loading a pushed commit and reading
+`svg#diagram` inside the iframe:
+
+| In the block                            | `aria-roledescription` | What a reader gets                                                             |
+| --------------------------------------- | ---------------------- | ------------------------------------------------------------------------------ |
+| `&lt;` in a label                       | `stateDiagram`         | The diagram, label reading `z < 11` — the markdown pipeline decodes the entity |
+| `stateDiagramm-v2`                      | `error`                | "Syntax error in text", and the raw source                                     |
+| `architecture-beta` with `logos:` names | `architecture`         | The diagram, every icon a `?` — a fenced block cannot call `registerIconPacks` |
+
+Only the middle row is a rendering failure. An entity is a legibility problem in the source and
+nothing more; icon names cost the diagram its icons but not its render, which is why no check that
+counts `<svg>` can see them.
+
+So, two checks answering different questions:
+
+```bash
+npm test -- test/mermaid-blocks.test.ts     # static: directive GitHub parses, no icon pack
+npx tsx scripts/check-mermaid-github.ts     # real: loads the pushed ref on github.com
+```
+
+The first runs in the gates on every push. It reads the directive each block opens with and rejects
+one Mermaid does not know, which is what a typo looks like from outside the renderer; it proves
+nothing about rendering. The second drives a browser against
+`https://github.com/<owner>/<repo>/blob/<ref>/<path>` and counts, per file, how many blocks became a
+non-error `svg#diagram` inside the `viewscreen.githubusercontent.com` iframe GitHub mounts them in.
+It runs in CI as `mermaid renders on github`, and needs the commit pushed, because it reads the site.
+
+Changing a Mermaid block means running the second one and quoting its output. Nothing else counts.

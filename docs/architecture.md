@@ -581,7 +581,7 @@ whole of the maths.
 stateDiagram-v2
   [*] --> running: claimed
   running --> ready: committed inside 540 s
-  running --> pending: out of clock, z &lt; 11
+  running --> pending: out of clock, z < 11
   running --> failed: out of clock at z11, or Overpass unavailable
   pending --> pending: children outstanding
   pending --> ready: all four children ready
