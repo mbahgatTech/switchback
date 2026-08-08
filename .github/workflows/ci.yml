@@ -181,6 +181,43 @@ jobs:
       - run: npm run lint
       - run: npm test
 
+  # The gates above assert what a Mermaid block *says*; this asserts what a reader *gets*. GitHub
+  # renders each block with its own Mermaid build inside a sandboxed iframe, and answers a parse
+  # failure by printing the source — visible to anyone reading the file, invisible to every check
+  # that does not load the page. A misspelt directive is the construct measured to do it.
+  mermaid:
+    name: mermaid renders on github
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # The script reads github.com, so it needs a commit that is already there under this
+    # repository's URL. `github.sha` on a pull request is the ephemeral merge commit, which has no
+    # blob page; the head commit does. A pull request from a fork has neither, so it is skipped
+    # rather than failed — nothing at this URL could render it, and a red check about the URL
+    # rather than the change is the habit this job exists to prevent.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # The full Chromium build rather than the headless shell: the render happens in a
+      # cross-origin iframe, and the shell does not mount one.
+      - run: npx playwright install --with-deps chromium
+
+      - name: Every block became a diagram, on the site
+        env:
+          REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npx tsx scripts/check-mermaid-github.ts "$REF"
+
   worker:
     name: ingest worker bundle
     runs-on: ubuntu-latest
