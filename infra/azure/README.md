@@ -1074,12 +1074,11 @@ that directly. Every link in the chain that stops it is readable from configurat
 multiplies that by the instance's core count. The load-bearing property is that Consumption runs one
 host instance for the whole app, so every invocation shares one Node process and one client.
 
-**This table bounds the Function App, which drains nothing today.** `INGEST_QUEUE_DRIVER` is
-`postgres`, so Vercel owns the drain and every row above except the last is a property of the wrong
-process — a lambda is a process, and Vercel starts as many as the traffic wants. What bounds the
-fleet is `INGEST_MAX_DRAINERS = 1`, enforced across processes by an advisory lock in
-`packages/ingest/src/drain-slot.ts`; `docs/architecture.md` states the resulting bound in full and
-is the one place that does.
+**This table bounds the Function App, which is now the only thing that drains.** The Vercel path is
+deleted, so every row above describes the process that actually makes Overpass requests rather than
+one side of a fan-out. The last row is what holds the bound across host instances:
+`INGEST_MAX_DRAINERS = 1`, enforced by an advisory lock in `packages/ingest/src/drain-slot.ts`.
+`docs/architecture.md` states the resulting bound in full and is the one place that does.
 
 **`functionAppScaleLimit` caps scale-out, not instance count.** Consumption still replaces instances,
 and for a few seconds around a replacement two hosts of this app run at once with a client each — the
@@ -1088,25 +1087,20 @@ starting 13 s later and taking sequence 2, with no evidence the first had stoppe
 sustained, up to 4 across a recycle. Fair use is about sustained load, so that is the honest number to
 quote rather than an unqualified deployment-wide 2.
 
-Vercel makes **zero** Overpass requests in an environment where `INGEST_QUEUE_DRIVER=servicebus`.
-Three call sites in a Vercel process can reach Overpass — `/api/cron/drain`, `trails.kickIngest` and
-`routes.kickNetwork` — and all three branch on the flag.
+Vercel makes **zero** Overpass requests, and that is now a property of the deployment rather than of
+an environment variable. The three call sites that could reach Overpass from a Vercel process —
+`/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — are deleted rather than gated. A
+Vercel process enqueues a row and publishes a Service Bus message; it holds no `OverpassClient` and
+has no drain to run.
 
-**That is per Vercel environment, not per deployment, and the difference is the whole number.** The
-flag is an environment variable and Production and Preview hold it independently. An environment on
-`postgres`, or with the variable simply absent (`ingestQueueDriver()` reads anything unrecognised as
-`postgres`), drains `ingest_jobs` with its own `OverpassClient` at 2 on every warm lambda. Only
-Production can do that now — Preview holds no `DATABASE_URL` and fails its startup environment
-check — but the flag is still per environment, so give Preview a database and the second drainer
-returns. Check it, do not assume it:
+That is what makes the number checkable. While the path existed behind a flag, the bound was a
+property of _a Vercel environment_: Production and Preview held the flag independently, an
+environment with it absent read as `postgres` and drained inline at 2 per warm lambda, and giving
+Preview a database was enough to bring a second drainer back. None of those states is reachable now
+— the code that would drain is not in the bundle.
 
-```bash
-vercel env ls production | grep INGEST_QUEUE_DRIVER
-vercel env ls preview    | grep INGEST_QUEUE_DRIVER   # absent is the failure mode, and looks like nothing
-```
-
-With both environments on `servicebus` the deployment-wide figure is the Azure one: 2 sustained, up
-to 4 across a recycle. Raising any row in the table above is not a throughput knob.
+The deployment-wide figure is therefore the Azure one: 2 sustained, up to 4 across a recycle.
+Raising any row in the table above is not a throughput knob.
 
 ### Deploying it
 
@@ -1115,7 +1109,6 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
-export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
 export INGEST_TRAIL_IDENTITY=claim                   # the live value — no default, state it
 
 az deployment group create \
@@ -1151,9 +1144,9 @@ deliveries with a message that names the database rather than the user agent. `s
 that rejected list by name: it reads like ours, is registered to somebody else, and was what the
 Function App actually sent on every Overpass request until 2026-08-03. Only the shape can be checked
 in code — that a URL reaches you is the one thing the operator has to get right.
-`INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
-with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
-Postgres/Service Bus fan-out that an operator had just rolled back.
+`INGEST_TRAIL_IDENTITY` has no default on purpose: the deployment overwrites the Function App's
+setting with whatever the parameter resolves to, and a default would let a routine deploy silently
+change how trails are identified across a tile seam.
 
 **The template deploy and the package push always run together, template first — and the push is a
 script, not a command.** Linux Consumption runs the code from a package URL that
@@ -1358,10 +1351,10 @@ az deployment group show -g rg-switchback-prod-northcentralus -n switchback-inge
 client:publisherClientId.value,tenant:publisherTenantId.value}" -o json
 ```
 
-→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` on the Vercel project, plus
-`INGEST_QUEUE_DRIVER=servicebus`. The exchange fails silently at Entra if the Vercel **team or
-project is renamed** — the `sub` claim follows the new name and the federated credential does not.
-Fixing that is a one-parameter redeploy of this template.
+→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` on the Vercel project. The
+exchange fails silently at Entra if the Vercel **team or project is renamed** — the `sub` claim
+follows the new name and the federated credential does not. Fixing that is a one-parameter redeploy
+of this template.
 
 ---
 

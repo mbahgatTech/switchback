@@ -366,11 +366,24 @@ describe('the queue health report', () => {
       expect(health.stalledDrain).toBe(1);
     });
 
-    // 27.90 h was the widest gap between terminal transitions over the 14 days to 2026-08-07,
-    // across 341 of them. A threshold under that pages somebody for ordinary quiet.
-    it('tolerates the widest gap production has actually shown', async () => {
-      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(27.9)), NOW);
+    /*
+     * The threshold is six hours, and it is bounded by the drain schedule rather than by a
+     * historical gap. `ingestPump` ticks every two minutes and the queue trigger drains
+     * continuously, so six hours is roughly forty tiles at the 9-minute handler bound — a drain
+     * that is merely slow clears it, one that has stopped does not.
+     *
+     * The 27.90 h maximum gap measured to 2026-08-08 belongs to the previous regime, where a
+     * once-a-day cron did the draining and the rest was request-driven. It is not a baseline for
+     * this one, and tolerating it now would mean a stopped drain going unnamed for a day.
+     */
+    it('tolerates quiet inside the threshold', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(5.9)), NOW);
       expect(health.stalledDrain).toBe(0);
+    });
+
+    it('fires on quiet past it, which continuous draining should never produce', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(6.1)), NOW);
+      expect(health.stalledDrain).toBe(1);
     });
 
     it('stays quiet when nothing is due, however long the drain has been idle', async () => {

@@ -8,8 +8,11 @@ import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import {
+  LEASE_EXPIRED_MARKER,
+  LEASE_TIMEOUT_MS,
   OVERPASS_MAX_CONCURRENT,
   OVERPASS_MAX_TOTAL_MS,
+  OVERPASS_STRAIN_MARKER,
   OverpassDeadlineError,
   SUBTREE_STUCK_MARKER,
   TILE_SPLIT_MARKER,
@@ -22,6 +25,7 @@ import {
   COMMIT_RESERVE_MS,
   HANDLER_DEADLINE_MS,
   JOB_FAILED_MARKER,
+  SIGNAL_STRANDED_MARKER,
   overpassDeadlineMs,
   runIngestSignal,
 } from '../src/drain';
@@ -307,6 +311,21 @@ describe('the drain-failure alert, from the template', () => {
     expect(query).toContain(SUBTREE_STUCK_MARKER);
   });
 
+  it('fires on a handler the host killed, which writes no request row at all', () => {
+    /*
+     * The arm that closes B4. A killed handler is discovered by `reclaimExpiredJobs`, not by the
+     * redelivery — the reclaim runs ahead of the claim, so by the time a redelivered message is
+     * classified the row is already back to `queued`. Watching the redelivery would be watching a
+     * signal the fix itself stopped emitting.
+     */
+    expect(query).toContain(LEASE_EXPIRED_MARKER);
+  });
+
+  it('keeps a separate arm for the strand no reclaim can free', () => {
+    // `lockedAt < cutoff` never matches NULL, so a `running` row with no `lockedAt` is permanent.
+    expect(query).toContain(SIGNAL_STRANDED_MARKER);
+  });
+
   it('exempts traces from sampling, since both trace arms are what it reads', () => {
     const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
       logging: { applicationInsights: { samplingSettings: { excludedTypes?: string } } };
@@ -375,5 +394,78 @@ describe('the drain-failure alert, from the template', () => {
     expect(
       subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11', INGEST_TRAIL_IDENTITY: 'osm-id' }),
     ).toBe(9);
+  });
+});
+
+/**
+ * The three numbers that decide whether a killed handler's work is re-run or silently dropped.
+ * They live in three separate files, so nothing but this test stops one of them moving alone.
+ */
+describe('the lease, the lock and the host clock', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
+    functionTimeout: string;
+    extensions: { serviceBus: { maxAutoLockRenewalDuration: string } };
+  };
+
+  function clockToMs(value: string): number {
+    const [hours = 0, minutes = 0, seconds = 0] = value.split(':').map(Number);
+    return (hours * 3600 + minutes * 60 + seconds) * 1000;
+  }
+
+  /** `PT5M`, `PT30S`, `PT1M30S` — the ISO-8601 durations ARM accepts for a queue lock. */
+  function durationToMs(value: string): number {
+    const found = /^PT(?:(\d+)M)?(?:(\d+)S)?$/.exec(value);
+    if (!found) throw new Error(`lockDuration ${value} is not a duration this test understands`);
+    return (Number(found[1] ?? 0) * 60 + Number(found[2] ?? 0)) * 1000;
+  }
+
+  const lock = /lockDuration: '([^']+)'/.exec(bicep)?.[1];
+  if (!lock) throw new Error('lockDuration is not set in infra/azure/ingest.bicep');
+
+  const functionTimeoutMs = clockToMs(host.functionTimeout);
+  const lockDurationMs = durationToMs(lock);
+
+  it('keeps a live handler from losing its lease while it is still working', () => {
+    /*
+     * The lower bound. If the lease could expire under a running handler, another process would
+     * reclaim the row and claim the tile, and both would commit the same trails.
+     */
+    expect(functionTimeoutMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('guarantees a redelivered message can find the lease expired, so the work is re-run', () => {
+    /*
+     * The upper bound, and the one that repairs the silent drop. Auto-renewal stops when the host
+     * kills the process, so the message returns at most `lockDuration` after the kill. If the
+     * lease outlived that window every redelivery would land on a live lease, claim nothing and
+     * complete. Lowering `lockDuration` to PT1M is the plausible tuning that reinstates the
+     * failure, and this is what refuses it.
+     */
+    expect(LEASE_TIMEOUT_MS).toBeLessThanOrEqual(functionTimeoutMs + lockDurationMs);
+  });
+
+  it('renews a running handler lock well past the moment the host would kill it', () => {
+    const renewalMs = clockToMs(host.extensions.serviceBus.maxAutoLockRenewalDuration);
+    expect(renewalMs).toBeGreaterThan(functionTimeoutMs);
+  });
+});
+
+/**
+ * The rule that watches Overpass rate limiting — the failure mode that gets the egress IP blocked
+ * and takes ingestion down for the whole product.
+ */
+describe('the Overpass rate-limit alert, from the template', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+
+  it('reads the request path, which is where a 429 arrives', () => {
+    /*
+     * `queueHealth.rateLimited` counts `lastError` containing '429', so it sees only a rate limit
+     * that outlived the retry budget and failed a job. Failover absorbs most of them first.
+     */
+    const rule = bicep.slice(bicep.indexOf("name: 'switchback-ingest-overpass-limited'"));
+    const query = /query: '([^']+)'/.exec(rule)?.[1] ?? '';
+    expect(query).toContain(OVERPASS_STRAIN_MARKER);
+    expect(query).toContain('status=429');
   });
 });

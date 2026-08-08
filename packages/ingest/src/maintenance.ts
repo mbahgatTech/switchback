@@ -140,13 +140,18 @@ export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
  * forever: the pinned gauge `DISTRESS_WINDOW_MS` exists to prevent, rebuilt.
  *
  * What separates a stopped drain from a slow one is throughput, so this measures the gap since
- * the last terminal transition. Over the 14 days to 2026-08-07 there were 341 of them, p95 gap
- * 0.70 h and maximum 27.90 h. Thirty-six hours clears that maximum and clears a whole missed
- * `/api/cron/drain` period — it fires once a day at 04:17 and the rest is request-driven — so a
- * quiet weekend does not page anybody, while a drain that has genuinely stopped is named within
- * a day and a half instead of never.
+ * the last terminal transition. Six hours is roughly forty tiles at the 9-minute handler bound,
+ * so a drain that is merely slow clears it comfortably while one that has stopped is named the
+ * same working day.
+ *
+ * **The old thirty-six hours was sized for a schedule that no longer exists.** It cleared a
+ * missed `/api/cron/drain` period — a once-a-day cron, with the rest request-driven — and the
+ * 27.90 h maximum gap measured over the fortnight to 2026-08-08 is an artefact of that regime,
+ * not a baseline for this one. `ingestPump` now runs every two minutes and the queue trigger
+ * drains continuously, so a day and a half of silence is not a quiet weekend any more. This
+ * number is due a re-measurement once the continuous regime has a fortnight of history.
  */
-export const DRAIN_SILENCE_MS = 36 * 60 * 60 * 1000;
+export const DRAIN_SILENCE_MS = 6 * 60 * 60 * 1000;
 
 /** Whether anything in this reading is worth waking somebody for. */
 export function isDistressed(health: QueueHealth): boolean {

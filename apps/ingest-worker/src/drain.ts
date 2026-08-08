@@ -33,9 +33,8 @@ export const HANDLER_DEADLINE_MS = 540_000;
  * Overpass had its own start-by deadline of 300 s and `OVERPASS_MAX_TOTAL_MS` of 240 s, which sum
  * to the entire 540 s handler budget: a tile whose two queries were slow reached `commitTrail`
  * with nothing left, every trail threw `IngestDeadlineError`, and the tile subdivided into four
- * children that each repeated the exercise. Measured 2026-08-07 with the flag on: invocations of
- * 542,898 ms and 548,899 ms, ten tiles ready and then 51 minutes with no completion at all while
- * the queue grew by 108 in eleven.
+ * children that each repeated the exercise. Measured 2026-08-08: five invocations of 504,637 ms
+ * to 548,954 ms against a 540,000 ms bound, every one of them reporting success.
  *
  * Reserving the tail closes that: the last moment a query may start is
  * `HANDLER_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS`, so whatever Overpass
@@ -99,10 +98,18 @@ export interface JobLease {
  * - **rescheduled** — `queued`, or `running` under a lease that has not expired. Something will
  *   pick it up: `runPump` republishes a due row every two minutes, and a live lease belongs to an
  *   invocation that is going to write an outcome.
- * - **stranded** — `running` under an expired lease this invocation could not claim. Nothing in
- *   this process is going to do the work and the pump cannot see a `running` row, so completing
- *   the message here is the silent drop measured on 2026-08-07: 26 `Executing` against 21
- *   `Executed`, four redeliveries at `DeliveryCount=2` each finishing in 11–38 ms.
+ * - **stranded** — `running` with no reclaimable lease. Nothing in this process is going to do the
+ *   work and the pump cannot see a `running` row, so completing the message here would drop it.
+ *
+ * **A handler killed mid-tile does not reach `stranded`, by design.** `reclaimExpiredJobs` runs
+ * ahead of the claim in both `drainJobs` and `drainSlotGate`, so a redelivery that arrives after
+ * the lease expired finds the row already returned to `queued`, claims it, and re-runs the work —
+ * which is the repair, not a gap. That death is reported by the reaper under
+ * `LEASE_EXPIRED_MARKER`, the only participant that observes it.
+ *
+ * What is left here is the state no reclaim can reach: `running` with `lockedAt` NULL, which
+ * `lockedAt < cutoff` never matches however long it sits. It is rare and it is permanent, so the
+ * message must not be completed on it.
  */
 export function classifyDisposition(
   job: JobLease | null,
@@ -127,9 +134,9 @@ export class StrandedSignalError extends Error {
 /**
  * The literal `switchback-ingest-signal-stranded` greps for.
  *
- * A silent mid-flight death writes no request row at all, so a rule reading `requests | success ==
- * false` is structurally incapable of firing on it. This line is written on the delivery that
- * *discovers* the strand, which is a trace and therefore visible to a rule.
+ * Written on the delivery that finds a `running` row no reclaim can free — `lockedAt` NULL. It is
+ * not the killed-handler signal; `LEASE_EXPIRED_MARKER` in `packages/ingest/src/jobs.ts` is, and
+ * the two are separate arms of `switchback-ingest-drain-failed` because they are separate faults.
  */
 export const SIGNAL_STRANDED_MARKER = 'switchback-ingest-signal-stranded';
 
@@ -144,11 +151,11 @@ export const SIGNAL_STRANDED_MARKER = 'switchback-ingest-signal-stranded';
  * disabled on the argument that `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1`
  * make this process the whole fleet, so the one `OverpassClient` singleton's
  * `OVERPASS_MAX_CONCURRENT: 2` was already the ceiling. The argument holds only while exactly one
- * host is running: across a recycle two overlap, each with its own singleton, and on 2026-08-07
- * Overpass answered 23× 504 and 4× 429 across all three mirrors beginning 79 seconds after the
- * first drain. Several invocations each honouring "two concurrent" locally is not two concurrent.
- * The gate is a `pg_advisory_xact_lock` in the database every claim passes through, so the bound
- * holds across processes however many the platform starts.
+ * host is running: across a recycle two overlap, each with its own singleton, and on 2026-08-08
+ * Overpass answered 25× 504 and 5× 429 across all three mirrors between 16:33 and 18:25 UTC.
+ * Several invocations each honouring "two concurrent" locally is not two concurrent. The gate is
+ * a `pg_advisory_xact_lock` in the database every claim passes through, so the bound holds across
+ * processes however many the platform starts.
  *
  * A refused claim is not a failure — it is this invocation declining to be the second drainer —
  * and the disposition below is what keeps that from costing the message.

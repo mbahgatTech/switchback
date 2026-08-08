@@ -73,13 +73,9 @@ sequenceDiagram
   B->>DB: trails whose bbox overlaps the viewport
   B-->>C: partial results now + the pending quadkeys
 
-  alt INGEST_QUEUE_DRIVER is servicebus
-    B->>SB: waitUntil publish, one dedupeKey per queued tile
-    W->>SB: queue trigger, one message at a time
-    W->>P: drainIngest limit 1, scoped to that dedupeKey
-  else postgres, the default
-    B->>P: waitUntil drainIngest, the same handler the cron runs
-  end
+  B->>SB: waitUntil publish, one dedupeKey per queued tile
+  W->>SB: queue trigger, one message at a time
+  W->>P: drainIngest limit 1, scoped to that dedupeKey
 
   P->>O: one tile query, plus one tile-wide waypoint query
   O-->>P: ways and relations
@@ -105,38 +101,30 @@ reaches `ready` only when Overpass answered — a failed tile keeps its reason, 
 re-queues instead of serving an empty map as though the ground held no trails.
 
 **Durability.** `waitUntil` buys latency and nothing else; a deploy or timeout mid-flight loses the
-work. So every kick also writes an `IngestJob` row that a Vercel Cron drains, and both paths run the
-same idempotent handler. Claims are a visibility timeout, never a transaction held open for minutes,
-which would exhaust a serverless pool. Admission control (`ingest/backpressure.ts`) is asked inside
+work. So every kick also writes an `IngestJob` row, and the message published alongside it only
+names that row. Claims are a visibility timeout, never a transaction held open for minutes, which
+would exhaust a serverless pool. Admission control (`ingest/backpressure.ts`) is asked inside
 `queueTiles` — the choke point every writing path crosses — rather than at the one button that has a
 person behind it.
 
-**One inline drain per instance, and a kick is carried rather than dropped.** The Overpass client
-caps itself at two concurrent requests, so a second drain running alongside the first would only
-pile claimed work behind it and sink the tile someone is waiting on. `api/inline-drain.ts`
-serialises them and carries the tile keys of anything asked for meanwhile into a single follow-up
-pass, because a drain is scoped to its caller's keys: dropped, the next reader's tile waits on a
-poll or on the cron. Two edges of that: keys past `MAX_PENDING_KEYS` are left to the cron, and the
-follow-up claims only its four oldest jobs, so a late key is asked for in the next pass and served
-within a few. The cost is that every poll landing mid-drain now holds its invocation open until the
-follow-up ends — 25 held invocations against 1 across a 60 s pass at the 2.5 s poll below — which is
-what buys the follow-up enough `after()` budget to finish.
+**Service Bus is the only way a tile is ingested.** A request publishes one `{dedupeKey}` message
+per queued tile and makes no Overpass call at all; the Azure Functions worker drains one job per
+message. There is no second driver and no flag selecting between them — the Vercel-side drainers
+(`/api/cron/drain`, `kickIngest`'s inline pass and `kickNetwork`'s) are deleted, not disabled.
 
-**Which queue drives it is `INGEST_QUEUE_DRIVER`**, read in `apps/web/src/env.ts` and branched on in
-`kickIngest`, `kickNetwork` and the drain cron — **and, on the Azure side, by the worker's own timer
-pump and queue trigger.** That last part is what makes the flag a rollback rather than a fan-out:
-set it to `postgres` on both sides and Vercel drains `ingest_jobs` again while the pump stops
-publishing and the trigger drops whatever is still in flight. Setting one side only leaves two
-drainers on the same table, which is worse than either alone.
+`ingest_jobs` stays the queue of record: a message names work, it never carries it, so a lost
+message costs a wait rather than a tile. A timer pump in the worker re-derives the runnable head of
+`ingest_jobs` every two minutes and tops the queue back up, which is what keeps `priority DESC`
+meaningful behind a FIFO broker — and what recovers any tile whose message was lost, dropped or
+never published.
 
-Unset or `postgres` is the original path, unchanged. On `servicebus` the request publishes one
-`{dedupeKey}` message per queued tile and makes no Overpass call at all, and an Azure Functions
-worker drains one job per message. `ingest_jobs` stays the queue of record either way — a message
-names work, it never carries it, so a lost message costs a wait rather than a tile. A timer pump in
-the worker re-derives the runnable head of `ingest_jobs` every two minutes and tops the queue back
-up to eight, which is what keeps `priority DESC` meaningful behind a FIFO broker. The cron runs on
-either driver and drains on neither by accident: it sweeps first and drains only when this side owns
-the queue.
+**What happens if Service Bus is unreachable.** With no fallback path the failure has to be explicit
+rather than silent, so `publishIngestSignals` does not swallow it: the row is already committed to
+`ingest_jobs` before any publish is attempted, the publish failure is logged under
+`PUBLISH_FAILED_MARKER`, and the tile is picked up by the pump's next two-minute tick. A broker
+outage therefore costs latency — up to two minutes — and never a tile. The marker is written by a
+Vercel process, which has no Application Insights, so it is visible in Vercel's logs only; the
+durability of the tile does not depend on anyone reading it.
 
 **Lease recovery does not depend on a drain happening.** It used to: `reclaimExpiredJobs` ran only
 inside `drainJobs`, and a drain is a side effect of traffic on cold ground plus a cron that Hobby
@@ -172,134 +160,50 @@ on 2026-08-07, `ingest_tile:120221231` re-enters at 4 of 5 and has one attempt l
 consequence is that the densest of the six can reach `dead`, which `queueHealth` counts and the
 distress rule reports.
 
-**Turning it on. The order is the mirror of the rollback below, and it matters for the same
-reason.** Vercel first, worker last:
+**Stopping it.** There is no driver flag and no second path, so "roll back the cutover" is not a
+thing that can be done — there is nowhere to roll back _to_. What exists instead is three brakes,
+and the right one depends on what has gone wrong. None needs a deploy.
 
 ```bash
-# 1. Both environments, plus the three identifiers beside them.
-vercel env add INGEST_QUEUE_DRIVER production --value servicebus --no-sensitive --yes
-vercel env add INGEST_QUEUE_DRIVER preview "" --value servicebus --no-sensitive --yes
+RG=rg-switchback-prod-northcentralus
+APP=func-switchback-ingest-37ywppu5p7fri
 
-# 2. Promote a deployment built with it, then confirm that deployment is the one serving. Minutes.
-vercel redeploy switchback-three.vercel.app --target production
-curl -s https://switchback-three.vercel.app/api/version
+# The queue is filling faster than it drains, or a bad tile is being retried.
+# Stops new work reaching the queue. In-flight messages finish; each is idempotent.
+az functionapp config appsettings set -g "$RG" -n "$APP" --settings INGEST_PUMP_ENABLED=false -o none
 
-# 3. The worker starts draining. Seconds.
-az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
-  -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_QUEUE_DRIVER=servicebus -o none
+# Overpass is rate-limiting, or the drain itself is the fault.
+# Stops the drain and leaves the pump's health reporting running, so the queue still has a gauge.
+az functionapp config appsettings set -g "$RG" -n "$APP" \
+  --settings AzureWebJobs.ingestDrain.Disabled=true -o none
+
+# Everything is wrong. Nothing drains and nothing is observed.
+az functionapp stop -g "$RG" -n "$APP"
 ```
 
-**Two things about those two commands, both learned the hard way.** `--no-sensitive` is not
-cosmetic: `vercel env add` marks Production and Preview values sensitive by default, and a sensitive
-variable reads back from `vercel env pull` as `INGEST_QUEUE_DRIVER=""` — indistinguishable from
-unset, and the exact failure this runbook exists to make visible. It does **not** change what
-`vercel env ls` prints. On CLI 54.1.0 a `--no-sensitive` variable still lists as `Encrypted`,
-measured on 2026-08-08 against `INGEST_TRAIL_IDENTITY` written with the flag and read back by
-`env pull` as the literal `claim`, so `env pull` is the only check that distinguishes the two and
-`env ls` answers presence alone. And the empty `""` positional in the Preview line is the
-git-branch argument: without it the CLI answers `git_branch_required` and suggests the command you
-just ran, in a loop. Passing the value on stdin instead of `--value` sets it to the empty string
-silently.
-
-**Both** Vercel environments, in step 1 — for `INGEST_QUEUE_DRIVER`, which Preview still carries.
-The flag is per environment, and a Preview left on `postgres` (or, as it was until this branch, left
-unset, which resolves to `postgres`) would be a second drainer against the same `ingest_jobs` with
-its own `OverpassClient` on every warm preview lambda. `vercel env ls preview` is the check; the
-absence of the variable is the failure mode, and it does not look like one.
-
-Preview can no longer reach the production database at all: `DATABASE_URL`, `DIRECT_DATABASE_URL`
-and `CRON_SECRET` were removed from that environment, and `apps/web/src/env.ts` refuses to start a
-non-Production Vercel environment whose connection string names `psql-switchback-prod-37ywppu5p7fri`.
-So a Preview on the wrong driver value cannot drain; it fails its environment check first. Set the
-flag on both anyway — the day Preview gets a database of its own, the mismatch comes back.
-
-Between 1 and 3 **nothing drains at all**, and it is worth being exact about that because the
-reassuring version is wrong: the tiles do not wait for a pump tick, because the pump is the worker's
-and returns early — `INGEST_QUEUE_DRIVER is not servicebus` — for as long as step 3 is outstanding.
-Vercel has stopped draining and the worker has not started, so `ingest_jobs` accumulates and the
-first thing to touch it is step 3. Rows are safe; the wait is however long step 3 takes. Doing 3
-first is the state this design exists to prevent — Vercel still draining `ingest_jobs` inline while
-the worker drains the same table — and it is worth naming that it happened here: the flag was set on
-the Function App while production Vercel still served a commit whose `kickIngest` drained
-unconditionally, and the first end-to-end run was collected in that state.
-
-**At 3am.** The worker stands down first and Vercel picks the drain back up last, and **the order is
-not arbitrary**:
+Verify by reading the setting back, not by assuming the write took:
 
 ```bash
-# 1. Stop new work reaching the queue. Instant, and it does not touch either drain.
-az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
-  -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_PUMP_ENABLED=false -o none
-
-# 2. The worker stands down. Seconds — an app-settings write restarts the host.
-az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
-  -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_QUEUE_DRIVER=postgres -o none
-
-# 3. Vercel, both environments. `--no-sensitive` is what makes step 5 able to read the value
-#    back with `env pull`; the `""` on the preview line is the git-branch positional. Both are
-#    explained above.
-vercel env rm INGEST_QUEUE_DRIVER production --yes
-vercel env rm INGEST_QUEUE_DRIVER preview --yes
-vercel env add INGEST_QUEUE_DRIVER production --value postgres --no-sensitive --yes
-vercel env add INGEST_QUEUE_DRIVER preview "" --value postgres --no-sensitive --yes
-
-# 4. Promote a deployment built with it. Vercel binds environment variables at build time, so
-#    until this lands the running deployment still publishes and does not drain. Minutes.
-#    Preview deployments are per-branch and carry the old value until each is rebuilt; redeploy
-#    any that are still serving, by URL from the second command.
-vercel redeploy switchback-three.vercel.app --target production
-vercel ls --environment preview
-
-# 5. Verify all three. The deployment check is the load-bearing one: the variable set is what
-#    step 3 already wrote, so it reports success whether or not any deployment carrying the
-#    change exists.
-#
-#    `env pull` rather than `env ls`: `ls` prints `Encrypted` for a `--no-sensitive` value too,
-#    so it answers presence and never which driver. The file it writes holds every production
-#    secret — put it outside this repository, which is public, and delete it.
-vercel env pull /tmp/switchback.env --environment production --yes
-grep '^INGEST_QUEUE_DRIVER=' /tmp/switchback.env && rm -f /tmp/switchback.env   # expect postgres
-vercel ls --environment production                    # newest row's Age must be younger than step 3
-az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
-  -n func-switchback-ingest-37ywppu5p7fri \
-  --query "[?name=='INGEST_QUEUE_DRIVER'].value | [0]" -o tsv              # expect postgres
+az functionapp config appsettings list -g "$RG" -n "$APP" \
+  --query "[?name=='INGEST_PUMP_ENABLED'].value | [0]" -o tsv
 ```
 
-**The rollback is also what makes the Vercel side readable.** Step 3 replaces a sensitive value with
-a `--no-sensitive` one, which is why `env rm` precedes `env add` rather than the value being edited
-in place, and why step 5's `env pull` can expect the literal `postgres` rather than `""`.
+**A stop longer than an hour loses wake-up signals, not work.** Queue TTL is `PT1H`. The
+`ingest_jobs` rows outlive any message, and the pump republishes the runnable head every two minutes
+once it is back, so the cost of a long stop is the latency of one pump tick.
 
-Step 1 is instant and reversible and stops the queue filling — but it stops _new_ publishes, not the
-up-to-eight messages already on the queue, which the trigger keeps working. So the worker has to be
-the side that stands down first. Its setting is an app-settings write that restarts the host in
-seconds; Vercel's needs a redeploy of the project, minutes. Doing Vercel first means the interval
-between the two has Vercel draining `ingest_jobs` inline while the worker is still on `servicebus`
-and still finishing in-flight messages — the two-drainer state this flag exists to prevent, entered
-by following the runbook. Doing the worker first means the interval has neither side draining, which
-costs a wait and nothing else.
+**Rolling the code back is a separate lever.** `WEBSITE_RUN_FROM_PACKAGE` names the zip the host
+runs; `.github/scripts/deploy-worker.sh` is the only thing that writes it, and the release container
+keeps prior builds under their commit SHA. Pointing it at the previous SHA and restarting is how a
+bad build is undone — application-settings writes replace the collection wholesale, so read, modify
+and write the full set.
 
-**"Seconds" means the queue trigger, not the timer.** An app-settings write restarts the host, but a
-timer tick already scheduled on the outgoing process can still run once holding the old value.
-Observed standing the worker down at 21:21:56Z on 2026-08-03: the 21:24:00 pump published seven more
-signals while the restarted trigger, in the same second, logged
-`INGEST_QUEUE_DRIVER is not servicebus — dropping the signal` for each. Harmless — a published
-signal makes no Overpass request and the rows stay `queued` for Postgres — but it is why step 1
-exists and why "the worker stands down in seconds" is a statement about the drain, not the pump.
-
-Between steps 2 and 4 nothing drains either, for the mirror-image reason: the trigger drops the
-message it receives and the Vercel cron does not drain until step 4's redeploy carries the new value
-into `drainOrReclaim`. A message that arrives is discarded and its `ingest_jobs` row waits for step 4. Nothing is lost either way, because a message names work and never carries it. **Stopping after
-step 3 is the one way to get this wrong**: the variable is written, `env ls` reports it, and no
-deployment carries it — so neither process drains and the check says the rollback succeeded. That is
-what step 4 is for and why step 5 reads the deployment rather than the variable.
-
-**Do not re-flip to `servicebus` within ten minutes of rolling back.** The queue carries
+**Do not restart within ten minutes of stopping.** The queue carries
 `duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
-`messageId`. Every signal dropped during the rollback was published under a `messageId` the broker
-still remembers, so a re-flip inside that window has those republished signals silently discarded —
-the rows are safe and the two-minute pump picks them up on the next tick, but the first tick after
-the re-flip does nothing and looks like a broken worker. Wait out the window, or expect one dead
-tick.
+`messageId`. Signals published before the stop are still remembered by the broker, so a restart
+inside that window has the republished ones silently discarded — the rows are safe and the next
+tick picks them up, but the first tick does nothing and looks like a broken worker. Wait the window
+out, or expect one dead tick.
 
 **The publisher holds no credential.** Vercel signs a short-lived OIDC token per deployment and puts
 it on every function request as `x-vercel-oidc-token`; `publishIngestSignals` posts that to Entra as
@@ -342,11 +246,10 @@ one egress IP — so a per-process singleton bounded a fraction of the drainer a
 fleet. `packages/ingest/src/config.ts` had said as much since it was written: _two clients at
 `maxConcurrent: 2` are one client at 4_.
 
-**Vercel is the drainer that runs.** `INGEST_QUEUE_DRIVER` is `postgres` in production, the Function
-App's own log says `INGEST_QUEUE_DRIVER is not servicebus → Postgres owns the drain`, and
-`ingestDrain`'s most recent invocation is 2026-08-06T00:44:04Z, the tail of the last flag-on proof.
-The Azure clamp above therefore
-bounds a process that performs no Overpass work. The first factor is what bounds the one that does.
+**The Function App is the drainer that runs, and the only one.** The Vercel drain paths are deleted,
+so the Azure clamp above bounds the process that actually performs Overpass work. The first factor
+is what holds that bound across host instances, because the clamp alone does not: around a
+Consumption instance replacement two hosts are briefly alive at once, each with its own client.
 
 The first factor is enforced where it has to be — across processes, in the database.
 `drainSlotGate` takes `pg_advisory_xact_lock`, reclaims expired leases, counts
@@ -410,17 +313,17 @@ Consumption instance replacement two host instances of the worker are briefly al
 worker's own contribution can reach 4 for the seconds of a recycle — measured, and recorded under
 the clamp section of `infra/azure/ingest.bicep`.
 
-**"Vercel fetches nothing" was only ever a statement about `INGEST_QUEUE_DRIVER=servicebus`, and it
-is per Vercel environment rather than per deployment.** Production and Preview hold the flag
-independently and both point at the production database, so an environment left on `postgres` is a
-second drainer against the same `ingest_jobs`. Measured at 2026-08-03T23:26Z, Production read
-`postgres` and Preview had no `INGEST_QUEUE_DRIVER` at all (17 variables, and it was not among
-them), which `ingestQueueDriver()` resolves to `postgres`. Both are now set explicitly, and
-`vercel env ls <environment>` is how you check rather than assume. Under the drain slot a second
-environment no longer multiplies the bound — it contends for the same slot against the same
-database — but it does halve the drain rate, so it is still worth knowing. The residue is branches
-cut before the flag existed: their code has no `ingestQueueDriver` call to make, and none has a
-`drainSlotGate` either, so their previews drain inline and unbounded until they rebase onto master.
+**"Vercel fetches nothing" is now a property of the deployment.** It used to be a statement about a
+per-environment driver flag: Production and Preview held it independently, both pointed
+at the production database, and an environment left on `postgres` — or with the variable simply
+absent, which resolved to `postgres` — was a second drainer against the same `ingest_jobs` with its
+own `OverpassClient` on every warm lambda. Measured at 2026-08-03T23:26Z, Production read `postgres`
+and Preview carried no such variable at all.
+
+None of that is reachable now. The three call sites that could reach Overpass from a Vercel process
+are gone from the bundle, so there is no value of any environment variable that turns one back on.
+The residue is branches cut before the deletion: their code still contains the inline drainers, so a
+preview built from one drains unbounded until it rebases onto master.
 
 **The client's retry budget has to fit inside `functionTimeout` — and fitting it is not enough.**
 Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
@@ -469,21 +372,27 @@ deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code and the
 agree on it. Severity 2, onto the same action group, `autoMitigate: false` — the condition is "this
 happened", not "this is happening".
 
-**Every arm of that rule reads telemetry the Function App emits, and the Function App is not the
-drainer.** `INGEST_QUEUE_DRIVER` is `postgres`, its own log says `INGEST_QUEUE_DRIVER is not
-servicebus — Postgres owns the drain`, and `ingestDrain`'s most recent invocation is
-2026-08-06T00:44:04Z — the tail of the last flag-on experiment, and nothing since. The drain runs on
-Vercel, which has no Application Insights, so a split marker, a stuck-subtree marker and a 429 from
-a mirror all reach a console with no rule able to query it. "No 429s observed" was a statement about
-what could be seen.
+**Every arm of that rule reads telemetry the Function App emits, and the Function App is now the
+drainer.** That was not always true: while the drain ran on Vercel, which has no Application
+Insights, a split marker, a stuck-subtree marker and a 429 from a mirror all reached a console no
+rule could query, and "no 429s observed" was a statement about what could be seen rather than about
+what happened. With the Vercel path deleted, every signal the drain produces is emitted by a process
+inside this Application Insights resource.
 
-What closes that is `switchback-ingest-queue-distress`. Five of those conditions are a row —
+Two of those signals needed arms of their own. A handler the host kills at `functionTimeout` writes
+no request row, so `switchback-ingest-lease-expired` — logged by `reclaimExpiredJobs`, the process
+that actually discovers the dead lease — is what the rule matches on instead. And a 429 that
+failover absorbs never reaches a job row, so `switchback-ingest-overpass-limited` reads the request
+path directly rather than relying on the `rateLimited` gauge below.
+
+What covers the rest is `switchback-ingest-queue-distress`. Five of those conditions are a row —
 a job buried inside the last hour, a lease past `LEASE_TIMEOUT_MS`, a `lastError` naming a 429, a
 tile carrying a split marker with no children, a subtree marked stuck — and `ingestPump` runs inside
 the alert's own subscription every two minutes and already reads that database.
 `apps/ingest-worker/src/health.ts`
-counts them and logs the token when any is non-zero, ahead of the pump's `INGEST_QUEUE_DRIVER`
-guard, because `postgres` is exactly the setting under which it matters.
+counts them and logs the token when any is non-zero, ahead of the pump's `INGEST_PUMP_ENABLED`
+brake, because a queue somebody has deliberately stopped feeding is exactly when its depth still
+needs watching.
 `apps/ingest-worker/test/health.test.ts` asserts the token, the query and that ordering. Severity 3
 and `autoMitigate: true`, unlike the rule above: this is a gauge re-read every two minutes, so a
 queue that has been repaired should clear it rather than leave a resolved condition open.
@@ -531,15 +440,19 @@ firing condition is a log line and a host that is down or serving an old bundle 
 the resting state and zero is alertable. That rule is the only one in this file whose firing
 condition a stale build cannot suppress.
 
-**Overpass strain reaches whichever platform log the drainer writes to, and no further.**
+**Overpass strain reaches Application Insights, and an alert reads the part that matters.**
 `packages/ingest/src/overpass.ts` emits `switchback-ingest-overpass-strain` on a retried 429, a
-transport failure, a mirror failover and every breaker transition. Those events are not all
-alertable and the reason is worth stating: a retry that eventually succeeds writes nothing to
-`ingest_jobs`, so the only channel is the console — Vercel's, under `INGEST_QUEUE_DRIVER=postgres`.
-What an alert can watch is the subset that outlives the retry budget and fails a job, which
-`queueHealth`'s `rateLimited` counts from `lastError`. Etiquette is a correctness requirement here —
-the failure mode is an IP block that takes the product down — so the line exists even where no rule
-can read it, because without it a mirror rate-limiting this client leaves no trace anywhere.
+transport failure, a mirror failover and every breaker transition. The drain runs in the Function
+App, so those lines land as `traces` — which is what makes
+`switchback-ingest-overpass-limited` possible: it matches `status=429` on that token directly.
+
+That rule exists because the older gauge is narrower than its name suggests. `queueHealth`'s
+`rateLimited` counts `ingest_jobs.lastError` containing '429', so it only sees a rate limit that
+outlived the retry budget and failed a job; failover absorbs most of them first, and an absorbed
+429 touches no job row. Measured on 2026-08-08, the distress line reported `rateLimited=0` on every
+tick while five real 429s landed between 16:37:28 and 18:24:51 UTC. Etiquette is a correctness
+requirement here — the failure mode is an IP block that takes the product down — so the signal is
+read where it actually arrives rather than where it happens to be convenient.
 
 Retrieving them, which no rule can do for you:
 
@@ -691,9 +604,7 @@ template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTI
 whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
 `min(wayId)` cannot be reached by setting one variable.
 
-**Both settings have to be set on the process that is actually draining.** In the resting
-configuration `INGEST_QUEUE_DRIVER` is `postgres`, the Function App drops every signal it receives,
-and Vercel owns the drain — so setting either variable on the Function App alone changes nothing.
+**Both settings have to be set on the process that is actually draining, which is the Function App.**
 Both are declared in `apps/web/src/env.ts` as well as in `ingest.bicep`, each defaulting to off, so a
 value set on one side and not the other is a difference an operator can see rather than a flag that
 appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
@@ -727,10 +638,8 @@ hard etiquette bound — 4× and 16× over to relieve DEM and database time, whi
 full procedure, with what each control's rollback actually costs, is in _Rolling a control back_
 below. The asymmetry worth stating here: an absent or unusable value resolves to `INGEST_ZOOM`, not
 to the ceiling, and the committed parameter is `9`, so a forgotten `export` and a routine template
-deploy both land on off. `ingestQueueDriver` has no default at all for the same reason and the
-opposite polarity — both of its values are dangerous if guessed, whereas the only dangerous direction
-here is _on_. Turning subdivision on for an experiment is therefore a hand-set app setting that the
-next deploy revokes, which is the correct asymmetry.
+deploy both land on off. Turning subdivision on for an experiment is therefore a hand-set app
+setting that the next deploy revokes, which is the correct asymmetry.
 
 **A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
 its deadline threw, `drainJobs` recorded a failure, and the drain-failure alert armed. Now it
@@ -738,15 +647,12 @@ returns normally and `report()` logs `done`, so an operator would read 8/8 tiles
 two of them ingested nothing. `switchback-ingest-drain-failed` therefore has a third arm matching
 `switchback-ingest-tile-split` and `switchback-ingest-subtree-stuck`.
 
-That alert is scoped to `appi-switchback-ingest`, which is the Function App drainer. In the resting
-configuration `INGEST_QUEUE_DRIVER` is `postgres`, so Vercel drains, and Vercel has no Application
-Insights — `packages/api/src/routers/trails.ts` and `apps/web/app/api/cron/drain/route.ts` both send
-the markers to `console` because there is nowhere else for them to go. Both subdivision flags are
-declared in `apps/web/src/env.ts`, so subdivision _can_ be turned on for that drainer, and on that
-drainer nothing is watching — including `switchback-ingest-subtree-stuck`, which is the
-edge-triggered "five failures, a human is needed" signal. Enabling subdivision therefore means
-either moving the drain to the worker first, or accepting that the split and stuck markers land only
-in the Vercel log stream. There is no Vercel log drain in the estate or in any template.
+That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so both
+markers land where the rule can read them — including `switchback-ingest-subtree-stuck`, the
+edge-triggered "five failures, a human is needed" signal. That was not true while the drain ran on
+Vercel: the markers went to `console` because there was nowhere else for them to go, and there is no
+Vercel log drain in the estate or in any template. Deleting the Vercel drain is what closed that
+gap, rather than any change to the rule.
 
 **The split gate is unattempted work, not the clock.** `forEachConcurrent` visits every assembled
 trail, so a tile is only short when the deadline _refused_ one — `processTile` counts
@@ -915,28 +821,26 @@ token. The earlier finding that only HTTPS egress was permitted described the sa
 the server.
 
 **How this was run before the branch was merged, and what it cost.** The worker is deployed from a
-zip, so it can carry this branch's `processTile` while Vercel still serves `master`. Setting
-`INGEST_QUEUE_DRIVER=servicebus` on the worker alone therefore gets subdivision into production
-without a merge — but it leaves two drainers on one `ingest_jobs` table, because `master` has no
-such flag. That is survivable for a bounded experiment and wrong as a resting state:
+zip, so it could carry a branch's `processTile` while Vercel still served `master`. Pointing the
+worker at the broker while `master` still drained inline got subdivision into production without a
+merge — but it left two drainers on one `ingest_jobs` table. That was survivable for a bounded
+experiment and wrong as a resting state:
 
 - `claimJobs` uses `FOR UPDATE SKIP LOCKED`, so the two never work the same row.
-- `master`'s inline drain is scoped to `coverage.queued`, which is `coverBBox(bbox, INGEST_ZOOM)` —
-  z9 keys only. It structurally cannot claim a z10 child, which is what makes the arrangement safe
-  enough to try. `master`'s daily `/api/cron/drain` at 04:17 UTC is not scoped and can.
-- The Overpass ceiling during the window is 2 per drainer, not 2 overall.
-- Reviving one of the six failed tiles needs `ensureCoverage`, which only `trails.browse` reaches —
-  and the same request kicks `master`'s inline drain, which claims the tile for the full 30-minute
-  `LEASE_TIMEOUT_MS` and dies at Vercel's function limit with nothing written. The tile is then
-  invisible until `reclaimExpiredJobs`. Budget half an hour for that before the worker sees it.
+- `master`'s inline drain was scoped to `coverage.queued`, which is `coverBBox(bbox, INGEST_ZOOM)` —
+  z9 keys only. It structurally could not claim a z10 child, which is what made the arrangement safe
+  enough to try. `master`'s daily `/api/cron/drain` at 04:17 UTC was not scoped and could.
+- The Overpass ceiling during the window was 2 per drainer, not 2 overall.
+- Reviving one of the six failed tiles needed `ensureCoverage`, which only `trails.browse` reaches —
+  and the same request kicked `master`'s inline drain, which claimed the tile for the full
+  `LEASE_TIMEOUT_MS` and died at Vercel's function limit with nothing written.
 
-Merging removes all four, which is the argument for merging before the next run rather than a reason
-the run cannot happen.
+Deleting the Vercel path removes all four. It is the reason none of this is a live concern rather
+than a caveat to be remembered.
 
-**Subdivision is on.** `INGEST_SUBDIVIDE_MAX_ZOOM` is `11` on the worker and absent on Vercel, which
-resolves to `9` there — the safe direction, and the one that matters, because Vercel does not drain
-while `INGEST_QUEUE_DRIVER` is `servicebus`. `INGEST_TRAIL_IDENTITY` is `claim` on both, without
-which `subdivideMaxZoom` clamps the ceiling to `INGEST_ZOOM` however it is set.
+**Subdivision is on.** `INGEST_SUBDIVIDE_MAX_ZOOM` is `11` on the worker, which is the only process
+that drains. `INGEST_TRAIL_IDENTITY` is `claim`, without which `subdivideMaxZoom` clamps the ceiling
+to `INGEST_ZOOM` however it is set.
 
 The first split under this configuration is `120221313` at 2026-08-08T17:55:05Z: 4,069 Overpass
 elements assembled into 1,397 trails, the deadline refused the rest, and the tile became `pending`
@@ -1073,7 +977,7 @@ and fails on any: the uploaded blob is the same length as the bundle on disk, th
 that blob, and `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
 timestamp after the push began. The last is behaviour, not a version string: that line is emitted
 by the first statement of the `ingestPump` handler, on a two-minute timer, ahead of the
-`INGEST_QUEUE_DRIVER` guard, and the commit in it is substituted into the bundle by
+`INGEST_PUMP_ENABLED` brake, and the commit in it is substituted into the bundle by
 `apps/ingest-worker/scripts/bundle.ts`, so it travels inside the zip. A bare marker would have been
 weaker than it looks: from the second deploy onward any build already carrying the current
 `health.ts` satisfies one, so a package that failed to mount would pass on the previous build's
@@ -1108,17 +1012,16 @@ left to scale on.
 
 ## Rolling a control back
 
-Three environment variables change what ingest does. **All three are read by two processes** — the
-Vercel deployment and the Function App — because `@switchback/ingest` reads `process.env` and both
-runtimes load it. Setting one on the Function App alone changes nothing while `INGEST_QUEUE_DRIVER`
-is `postgres`, because then Vercel owns the drain. Every rollback below therefore names both sides.
+Two environment variables change what ingest does. **Both are read by two processes** — the Vercel
+deployment and the Function App — because `@switchback/ingest` reads `process.env` and both runtimes
+load it. Only the Function App drains, so only its value changes behaviour; the Vercel side is set
+to match so that the two do not disagree in a way nobody can see.
 
-Two of the three are **not fully reversible**, and the table says which part is not. Reversing the
-setting is never the same as reversing what happened while it was on.
+Both are **not fully reversible**, and the table says which part is not. Reversing the setting is
+never the same as reversing what happened while it was on.
 
 | Control                     | Setting rolls back         | What does not roll back                                                                                                                         | Reversal for that                                                                                                                          |
 | --------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `INGEST_QUEUE_DRIVER`       | fully                      | nothing                                                                                                                                         | —                                                                                                                                          |
 | `INGEST_SUBDIVIDE_MAX_ZOOM` | new splits only            | a tile already split never fetches again — `processTile` routes any tile with four children to the roll-up with no flag to read                 | `npm run ingest:unsplit -- <quadkey>`, which restores the pre-split state including its failure — read the outcome below before running it |
 | `INGEST_TRAIL_IDENTITY`     | new claims and merges only | a merge is permanent: the losing trail's row is gone and its reviews, activities, lifeline sessions and photographs are repointed at the winner | none — the retired slug keeps answering through `trail_slug_aliases`, which `trails.bySlug` and `uniqueSlug` both read in every mode       |
 
@@ -1171,19 +1074,10 @@ Postgres session down, which reads as a rejected credential. That and the rest o
 diagnosis — in `PG*` form, for `psql` and `pg_dump` — are in
 [infra/azure/README.md](../infra/azure/README.md#connecting-by-hand-with-no-password).
 
-### `INGEST_QUEUE_DRIVER` → `postgres`
-
-Worker first, Vercel second. Reversing that order has both sides draining `ingest_jobs` at once. The
-five steps and the reasoning are in the **At 3am** block under _Which queue drives it_ above, and the
-check that matters is the same one the other two controls use: `vercel ls --environment production`,
-because writing the variable is not the same as running a deployment built from it. Stopping at the
-write leaves nothing draining while `vercel env ls` reports success.
-
 ### `INGEST_SUBDIVIDE_MAX_ZOOM` → `9`
 
-Only the Function App carries this variable; Vercel has never held it, and an absent value already
-resolves to `9`. Vercel is also not the drainer while `INGEST_QUEUE_DRIVER` is `servicebus`, so this
-rollback is one write.
+Only the Function App carries this variable, and only the Function App drains, so this rollback is
+one write.
 
 ```bash
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
@@ -1194,10 +1088,6 @@ az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
   --query "[?name=='INGEST_SUBDIVIDE_MAX_ZOOM'].value | [0]" -o tsv                # expect 9
-
-# If INGEST_QUEUE_DRIVER is ever put back to postgres, Vercel becomes the drainer and needs the
-# same ceiling. It is absent there, which is already 9 — confirm rather than assume.
-vercel env ls production | grep INGEST_SUBDIVIDE_MAX_ZOOM   # expect no output
 ```
 
 Removing the Vercel variable rather than setting it to `9` is deliberate: an absent value resolves to
@@ -1920,10 +1810,10 @@ application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app 
 next package push.
 
 **`ingest.bicepparam` is compiled by nothing, so a break in it surfaces at the deploy.** It resolves
-`INGEST_QUEUE_DRIVER`, `INGEST_OVERPASS_USER_AGENT`, `INGEST_TRAIL_IDENTITY` and
+`INGEST_OVERPASS_USER_AGENT`, `INGEST_TRAIL_IDENTITY` and
 `INGEST_DATABASE_URL` through `readEnvironmentVariable` with no default, and that call runs at build
-time, so `az bicep build-params` on it fails `BCP427` four times on a runner holding none of them —
-and one of the four is a database URL, which is why it is not simply added to the compile loop.
+time, so `az bicep build-params` on it fails `BCP427` three times on a runner holding none of them —
+and one of the three is a database URL, which is why it is not simply added to the compile loop.
 
 ## Design decisions, recorded once
 
