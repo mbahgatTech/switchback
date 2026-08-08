@@ -182,6 +182,11 @@ var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
 var websiteContributorRoleId = 'de139f84-1756-47ae-9be6-808fbbe84772'
 var monitoringReaderRoleId = '43d0d8ad-25c7-4714-9337-8ba259a9fe05'
 
+// The package container, from both ends: the host fetches its own code with the first, CI uploads
+// it with the second. Both are scoped to `function-releases` alone — see the assignments.
+var storageBlobDataReaderRoleId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+
 @description('''
 The `sub` prefix GitHub actually stamps on this repository's OIDC tokens.
 
@@ -226,11 +231,11 @@ user-assigned one below — and with local auth off no SAS key would work even i
 it back on is a one-line revert, and the flag rollback does not need it: `INGEST_QUEUE_DRIVER=postgres`
 bypasses the broker entirely.
 
-It is not a claim about this file. Three long-lived credentials are deployed from it and a maintainer
+It is not a claim about this file. Two long-lived credentials are deployed from it and a maintainer
 needs to know they are there to rotate: the storage account key, minted into `AzureWebJobsStorage` and
-`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` below; `DATABASE_URL`, passed in as a secure parameter and
-held as an application setting; and the ten-year blob SAS the zip push writes into
-`WEBSITE_RUN_FROM_PACKAGE`. What has no key is the queue.
+`WEBSITE_CONTENTAZUREFILECONNECTIONSTRING` below; and `DATABASE_URL`, passed in as a secure parameter
+and held as an application setting. `WEBSITE_RUN_FROM_PACKAGE` used to be a third — a ten-year blob
+SAS — and is now a bare URL the host reads with its own identity. What has no key is the queue.
 ''')
 resource namespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
   name: namespaceName
@@ -496,6 +501,64 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 }
 
 @description('''
+The container `WEBSITE_RUN_FROM_PACKAGE` points at, and the scope of the two grants below.
+
+Declared here rather than left to the deploy tool, because it is what the two role assignments are
+scoped to: a container ARM does not know about cannot be named as a scope, and granting at the
+account instead would hand the same principals `azure-webjobs-secrets`, where the host keys live.
+`publicAccess` is unset — identity-based fetch requires the blob to be private.
+''')
+resource releases 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  name: '${storage.name}/default/function-releases'
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+@description('''
+**How the host reads its own code, and why no SAS appears anywhere.**
+
+Linux Consumption runs from an external package URL — it is the only deployment technology the plan
+supports — and that URL can be authorised two ways. A SAS is the default because
+`az functionapp deployment source config-zip` mints one, with a **520-week** expiry: a ten-year
+bearer credential for the package, living in an application setting, in a repository that is public.
+This grant is the alternative Microsoft documents and recommends: the host presents its own
+system-assigned identity, `WEBSITE_RUN_FROM_PACKAGE` carries a bare `https://…/function-releases/
+<commit>-<utc>.zip`, and there is nothing in the setting to leak, rotate or outlive its usefulness.
+
+Reader, not Contributor: the host only ever fetches.
+''')
+resource functionAppPackageRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: releases
+  name: guid(releases.id, functionApp.id, storageBlobDataReaderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataReaderRoleId
+    )
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// The third grant `.github/scripts/deploy-worker.sh` needs, and the reason it can stop reading
+// `AzureWebJobsStorage`: uploading the package over Entra rather than over the account key that
+// setting carries. Contributor because the script writes; scoped to this container, so it reaches
+// neither the host keys nor the lease blobs beside it.
+resource workerDeployerPackageWrite 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: releases
+  name: guid(releases.id, workerDeployer.id, storageBlobDataContributorRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      storageBlobDataContributorRoleId
+    )
+    principalId: workerDeployer.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+@description('''
 Consumption (Y1 Dynamic), Linux. Two alternatives were live and both lost on something other than
 price:
 
@@ -649,10 +712,10 @@ the driver to token auth. Until then the worker connects the way the web app alr
 ---
 
 **`WEBSITE_RUN_FROM_PACKAGE` is deliberately absent, and that makes deploy ordering a hard rule.**
-Linux Consumption runs the code from a package URL that `az functionapp deployment source config-zip`
-writes into this same collection — and an ARM application-settings write replaces the collection
-whole. Declaring it here would fight the zip deploy; omitting it means a Bicep deployment on its own
-leaves the app codeless until the next zip. So the template deploy and the zip push always run
+Linux Consumption runs the code from a package URL that `.github/scripts/deploy-worker.sh` writes
+into this same collection — and an ARM application-settings write replaces the collection whole.
+Declaring it here would fight that script; omitting it means a Bicep deployment on its own
+leaves the app codeless until the next push. So the template deploy and the package push always run
 together, template first, **and a `syncfunctiontriggers` POST after** — otherwise the host comes back
 with `0 functions loaded`, `az functionapp function list` returns nothing, and a Consumption app with
 no registered triggers has nothing to scale on, so it never runs again and a restart does not fix it.

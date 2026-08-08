@@ -326,9 +326,11 @@ jobs:
 
       # A distinct identity from the two this repository already federates. `id-switchback-postgres-ci`
       # holds no Azure RBAC by design and could not deploy anything; the infrastructure identity is
-      # Contributor on the whole resource group. This one is Website Contributor on the one site
-      # and Monitoring Reader on the one Application Insights component — enough to push a package
-      # and to read back whether the host is running it, and nothing else.
+      # Contributor on the whole resource group. This one holds three narrow grants — Website
+      # Contributor on the one site, Monitoring Reader on the one Application Insights component,
+      # and Storage Blob Data Contributor on the one `function-releases` container — enough to
+      # upload a package, point the app at it and read back whether the host is running it, and
+      # nothing else.
       #
       # Declared in `infra/azure/ingest.bicep` as `workerDeployer`, whose `workerDeployerClientId`
       # output is what belongs in this variable.
