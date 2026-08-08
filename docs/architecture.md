@@ -685,8 +685,9 @@ per-tile cost — a region lookup and a tile-wide waypoint query that a smaller 
 cheaper — so deeper than z11 the overhead, not the work, is what fills the invocation.
 
 **It ships off, and turning it on takes two settings, not one.** `ingest.bicepparam` resolves
-`ingestSubdivideMaxZoom` to `9` — subdivision disabled — and `ingestTrailIdentity` to `osm-id`,
-unless the deploying shell exports otherwise. The two are coupled in code as well as in the
+`ingestSubdivideMaxZoom` to `9` — subdivision disabled — unless the deploying shell exports
+otherwise, and takes `ingestTrailIdentity` from the environment with no fallback at all, so a deploy
+either states the identity mode or fails. The two are coupled in code as well as in the
 template: `subdivideMaxZoom` returns `INGEST_ZOOM` whenever `INGEST_TRAIL_IDENTITY` is not `claim`,
 whatever the ceiling says, so the combination that cuts fresh seam while trail identity is still
 `min(wayId)` cannot be reached by setting one variable.
@@ -1238,8 +1239,8 @@ vercel env ls production | grep INGEST_TRAIL_IDENTITY && \
 vercel redeploy switchback-three.vercel.app --target production
 
 # 3. The Function App. `ingest.bicep` declares this setting explicitly, so set it rather than
-#    delete it — a deleted setting is re-asserted as `osm-id` by the next template deploy, and the
-#    two states would otherwise read as drift.
+#    delete it — a deleted setting is written back by the next template deploy from whatever the
+#    deploying shell exports, and the two states would otherwise read as drift.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_TRAIL_IDENTITY=osm-id -o none
 
@@ -1886,12 +1887,13 @@ changes no behaviour; it starts to matter the day Preview is given a database of
 | Function App | `az functionapp config appsettings list -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri -o json` |
 | Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone (see the runbook note on `--no-sensitive`)          |
 
-**A deploy of `ingest.bicep` from a shell that has not exported the flag turns it off.**
+**A deploy of `ingest.bicep` from a shell that has not exported the flag fails the build.**
 `ingest.bicepparam` resolves `ingestTrailIdentity` through
-`readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')`, and an ARM application-settings write
-replaces the collection whole. The fallback is deliberately the safe direction for subdivision — but
-with identity now live, safe and current have diverged, and the export is a step in the deployment,
-not an optional one.
+`readEnvironmentVariable('INGEST_TRAIL_IDENTITY')` with no fallback, so `BCP427` stops the
+deployment before ARM is called. A fallback would be the whole hazard: the app reads `claim`, an
+application-settings write replaces the collection whole, and `identity.ts` treats an absent
+variable and `osm-id` identically — so a reverted app looks unchanged. The ceiling above keeps its
+fallback because there the safe direction and the deployed value are the same one.
 
 **No workflow deploys `infra/azure/ingest.bicep`.** No workflow deploys any template:
 `infrastructure.yml` compiles the eight `infra/azure/*.bicep` templates and then builds
@@ -1905,10 +1907,10 @@ application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app 
 next package push.
 
 **`ingest.bicepparam` is compiled by nothing, so a break in it surfaces at the deploy.** It resolves
-`INGEST_QUEUE_DRIVER`, `INGEST_OVERPASS_USER_AGENT` and `INGEST_DATABASE_URL` through
-`readEnvironmentVariable` with no default, and that call runs at build time, so
-`az bicep build-params` on it fails `BCP427` three times on a runner holding none of them — and one
-of the three is a database URL, which is why it is not simply added to the compile loop.
+`INGEST_QUEUE_DRIVER`, `INGEST_OVERPASS_USER_AGENT`, `INGEST_TRAIL_IDENTITY` and
+`INGEST_DATABASE_URL` through `readEnvironmentVariable` with no default, and that call runs at build
+time, so `az bicep build-params` on it fails `BCP427` four times on a runner holding none of them —
+and one of the four is a database URL, which is why it is not simply added to the compile loop.
 
 ## Design decisions, recorded once
 

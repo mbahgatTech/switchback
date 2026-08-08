@@ -9,6 +9,7 @@
 //   export INGEST_DATABASE_URL="$(...)"          # the application login, same string Vercel holds
 //   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 //   export INGEST_QUEUE_DRIVER=postgres          # or servicebus; there is no default, state it
+//   export INGEST_TRAIL_IDENTITY=claim           # the live value; there is no default, state it
 //   az deployment group create \
 //     --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
 //     --template-file infra/azure/ingest.bicep \
@@ -50,10 +51,13 @@ param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 // is inert on its own: `subdivideMaxZoom` reads it as 9 unless identity is `claim`.
 param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')
 
-// The live Function App reads `claim`. This fallback does not, so exporting INGEST_TRAIL_IDENTITY
-// is part of deploying rather than an option: an application-settings write replaces the collection
-// whole, and an unexported variable takes identity off the worker without touching Vercel.
-param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')
+// The live Function App reads `claim`, and an application-settings write replaces the collection
+// whole. A fallback here would therefore take identity off the worker on any deploy from a shell
+// that forgot to export it — silently, with nothing in the output naming the flag, and without
+// touching Vercel. So there is none: an unset variable fails the build with `BCP427` before
+// anything reaches Azure. The polarity is the opposite of the ceiling above, whose fallback is
+// both the safe direction and the deployed value.
+param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY')
 
 // The two halves of the Vercel OIDC subject the publisher credential trusts. Renaming either on
 // Vercel breaks the token exchange silently — the claim follows the new name and the credential
