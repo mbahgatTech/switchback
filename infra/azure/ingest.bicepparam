@@ -8,7 +8,6 @@
 //
 //   export INGEST_DATABASE_URL="$(...)"          # the application login, same string Vercel holds
 //   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
-//   export INGEST_QUEUE_DRIVER=postgres          # or servicebus; there is no default, state it
 //   export INGEST_TRAIL_IDENTITY=claim           # the live value; there is no default, state it
 //   az deployment group create \
 //     --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -34,14 +33,6 @@ param functionAppPrefix = 'func-switchback-ingest'
 // Created by monitoring.bicep. Referenced `existing`, never redeployed from here.
 param logAnalyticsWorkspaceName = 'log-switchback-prod'
 param alertActionGroupName = 'ag-switchback-prod'
-
-// Which queue drives ingest, on this side. Vercel's own INGEST_QUEUE_DRIVER must agree: set only
-// one and the Postgres drain and the worker both claim from `ingest_jobs` at once.
-//
-// No fallback default. A deployment overwrites the Function App's INGEST_QUEUE_DRIVER with
-// whatever this resolves to, so a default would let a routine deploy re-arm the fan-out an
-// operator had just rolled back. Stating it is one word; guessing it wrong is an outage.
-param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 
 // How deep subdivision may go. `9` is off, and off is what an unset variable resolves to: unlike
 // the driver above, only one direction of this flag is dangerous. A split cuts fresh interior

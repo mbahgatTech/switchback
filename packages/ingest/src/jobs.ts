@@ -7,16 +7,20 @@ import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 
 /**
- * How long a claim holds a job before `reclaimExpiredJobs` may take it back. Sized above the
- * slowest honest run, because reclaiming live work runs it twice: `processTile` may spend the
- * query's own `[timeout:180]` plus 90 s on features and 60 s on the region before it commits
- * anything, and its commit loop measured 88 s over a 144-trail tile with each trail's
- * transaction allowed 30 s. `processRoute` is worse — a continental relation is refetched as
- * thousands of ways, 250 to a request, through a client capped at two concurrent. Ten minutes
- * sat inside that envelope. Thirty is outside it and still bounds a dead worker to half an
- * hour, against the seventy-five hours one managed in production.
+ * How long a claim holds a job before `reclaimExpiredJobs` may take it back.
+ *
+ * **It is bounded by the host, not by the work.** One process claims: the Function App's
+ * `ingestDrain`, whose `host.json` sets `functionTimeout` to ten minutes and whose handler stops
+ * beginning phases at `INGEST_DEADLINE_MS`. So no live lease can be older than ten minutes, and a
+ * lease that is has provably lost its holder — the host killed the process.
+ *
+ * Two minutes of margin above that covers clock skew between the app and Postgres and the
+ * bookkeeping after the last phase. Thirty minutes was sized for a Vercel drainer that could hold
+ * a lease across a whole `processRoute`; with that path removed, thirty minutes is twenty of
+ * pure delay before a killed invocation's tile can be picked up again — which is most of what
+ * "the work was dropped on the floor" measured as.
  */
-export const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
+export const LEASE_TIMEOUT_MS = 12 * 60 * 1000;
 
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];

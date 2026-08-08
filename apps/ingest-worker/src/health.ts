@@ -1,14 +1,10 @@
 /**
  * Republishes the ingest queue's state into Application Insights, on every reading.
  *
- * The drainer that actually runs is on Vercel, which has no Application Insights, so
- * `switchback-ingest-tile-split`, `switchback-ingest-subtree-stuck` and a mirror's 429 reach a
- * console nobody is watching and no alert can query. Every one of those conditions leaves a row
- * in `ingest_jobs` or `ingest_tiles`, and this process — the only one inside the subscription
- * that owns `appi-switchback-ingest` — can read them.
- *
- * It runs regardless of `INGEST_QUEUE_DRIVER`, which is the point: `postgres` is exactly the
- * setting under which the drainer is invisible.
+ * `switchback-ingest-tile-split`, `switchback-ingest-subtree-stuck` and a wedged tile are all
+ * *rows*, not events, so none of them appears in the telemetry of the invocation that caused it —
+ * a handler the host killed writes nothing at all. This process reads those tables from inside the
+ * subscription that owns `appi-switchback-ingest`, which is what puts them where a rule can query.
  */
 
 import {

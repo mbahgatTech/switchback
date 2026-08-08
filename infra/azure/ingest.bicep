@@ -94,28 +94,6 @@ param terrainTileUrl string = ''
 param mapillaryToken string = ''
 
 @description('''
-Whether ingest runs through this queue. Written to the Function App as `INGEST_QUEUE_DRIVER` and
-read by both functions here, exactly as Vercel reads it.
-
-That is what makes the flag a rollback: set both sides to `postgres` and the Vercel cron drains
-`ingest_jobs` again while the pump stops publishing and the trigger drops what is left. Set only
-one and the two drain the same table at once, which is worse than either alone. At 3am the faster
-brake is `az functionapp config appsettings set` on this one setting, which restarts the app and
-takes effect in seconds.
-
-**No default, on purpose.** A template deployment overwrites this setting with whatever the
-parameter says, so a default would let a routine deploy silently undo an operator's rollback —
-and the unsafe direction (`servicebus`) is exactly the one a forgotten `export` would have
-restored. Every deployment must state the driver; `ingest.bicepparam` reads it from
-`INGEST_QUEUE_DRIVER` in the deploying shell and the build fails if it is unset.
-''')
-@allowed([
-  'postgres'
-  'servicebus'
-])
-param ingestQueueDriver string
-
-@description('''
 How deep a tile that outruns `INGEST_DEADLINE_MS` may be subdivided. `9` is off: no tile splits,
 a dense one fails exactly as it did before, and children already created still finish and still
 roll up. `11` allows two levels — six Alps tiles hit the 540 s wall on 2026-08-04, and `120221203`
@@ -924,14 +902,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'SERVICE_BUS_QUEUE_RESOURCE_ID'
             value: queue.id
           }
-          // The same flag Vercel reads, so a rollback stops both drainers rather than one.
-          {
-            name: 'INGEST_QUEUE_DRIVER'
-            value: ingestQueueDriver
-          }
           // The instant brake. Setting this to false stops the pump publishing in seconds with no
-          // deploy anywhere, which is a faster stop than the Vercel-side INGEST_QUEUE_DRIVER flag
-          // (that one needs a redeploy to take effect).
+          // deploy anywhere. It does not stop the drain — in-flight messages finish and the
+          // maintenance sweep keeps running, which is what makes it safe to leave on.
           {
             name: 'INGEST_PUMP_ENABLED'
             value: 'true'
@@ -965,9 +938,22 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // 540 s worst case, inside the 600 s Consumption fixes `functionTimeout` at. Before
           // these, one query's own budget was six attempts of 190 s plus backoff — about 24
           // minutes — and `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
+          //
+          // 300 s is a ceiling now, not the operative number: `overpassDeadlineMs` derives the
+          // start-by moment as INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS
+          // and takes whichever is lower. The three below have to add up, so the derivation owns
+          // the arithmetic and this setting can only tighten it.
           {
             name: 'INGEST_OVERPASS_DEADLINE_MS'
             value: '300000'
+          }
+          // Wall clock held back for the commit loop. Without it the two Overpass queries could
+          // consume the whole handler budget, every trail threw `IngestDeadlineError`, and the
+          // tile subdivided into four children that repeated the exercise — measured 2026-08-07 as
+          // invocations of 542,898 ms and 548,899 ms with 51 minutes and no completions.
+          {
+            name: 'INGEST_COMMIT_RESERVE_MS'
+            value: '150000'
           }
           {
             name: 'OVERPASS_MAX_TOTAL_MS'
@@ -1225,6 +1211,13 @@ telemetry could take the one line these arms match with it. `excludedTypes` ther
 `Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough. `autoMitigate` is off
 — the condition is "this happened", not "this is happening", and an alert that resolves itself the
 moment the tile stops being retried is an alert nobody reads.
+
+**The fourth arm is the one that closes the failure this rule could not see.** A handler the host
+kills at `functionTimeout` writes no request row at all — the process is gone — so the first arm is
+structurally incapable of firing on it, which is exactly what happened on 2026-08-07: 26
+`Executing` against 21 `Executed`, four messages redelivered at `DeliveryCount=2`, and no alert.
+`switchback-ingest-signal-stranded` is written by the *next* delivery, which is a process that is
+alive and can therefore emit a trace, when it finds the job still held by a lease that has expired.
 ''')
 resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-failed'
@@ -1243,7 +1236,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0

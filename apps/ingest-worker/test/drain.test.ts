@@ -17,10 +17,12 @@ import {
   withDeadline,
 } from '@switchback/ingest';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
+import type { PrismaClient } from '@switchback/db';
 import {
+  COMMIT_RESERVE_MS,
   HANDLER_DEADLINE_MS,
   JOB_FAILED_MARKER,
-  OVERPASS_DEADLINE_MS,
+  overpassDeadlineMs,
   runIngestSignal,
 } from '../src/drain';
 import type { Drain } from '../src/drain';
@@ -54,6 +56,14 @@ function fakeLog(): WorkerLog & { lines: Array<[string, string]> } {
   return { lines, info: at('info'), warn: at('warn'), error: at('error') };
 }
 
+/**
+ * A job row that reads as finished, so `assertSettleable` completes the message. Cases that mean
+ * to exercise the stranded path live in `settlement.test.ts` and supply their own.
+ */
+const settledDb = {
+  ingestJob: { findUnique: async () => ({ status: 'done', lockedAt: null, lockedBy: null }) },
+} as unknown as PrismaClient;
+
 function drainReturning(result: DrainResult): Drain {
   return vi.fn(async () => result);
 }
@@ -63,16 +73,18 @@ describe('runIngestSignal', () => {
     const drain = drainReturning(outcome({ claimed: 1, succeeded: 1 }));
     const before = Date.now();
 
-    await runIngestSignal({ dedupeKey: KEY }, fakeLog(), { workerId: 'sb-1', drain, overpass });
+    await runIngestSignal({ dedupeKey: KEY }, fakeLog(), {
+      workerId: 'sb-1',
+      drain,
+      overpass,
+      db: settledDb,
+    });
 
     expect(drain).toHaveBeenCalledWith({
       limit: 1,
       derivedLimit: 0,
       dedupeKeys: [KEY],
       workerId: 'sb-1',
-      // Asserted, not incidental: this host is the whole fleet by Azure configuration, and it is
-      // the only caller entitled to skip `drainSlotGate`. Every Vercel path takes the default.
-      gate: null,
       deps: {
         overpass,
         deadlineAt: expect.any(Number) as number,
@@ -110,13 +122,13 @@ describe('runIngestSignal', () => {
     let clock = 0;
     const view = withDeadline(
       { query: async () => ({ elements: [] }) },
-      OVERPASS_DEADLINE_MS,
+      overpassDeadlineMs({}),
       () => clock,
     );
 
     await expect(view.query('[out:json];')).resolves.toBeDefined();
 
-    clock = OVERPASS_DEADLINE_MS;
+    clock = overpassDeadlineMs({});
     await expect(view.query('[out:json];')).rejects.toBeInstanceOf(OverpassDeadlineError);
   });
 
@@ -129,6 +141,7 @@ describe('runIngestSignal', () => {
       overpass,
       workerId: 'sb-1',
       drain: drainReturning(outcome()),
+      db: settledDb,
     });
 
     expect(log.lines).toEqual([['info', expect.stringContaining('nothing claimable') as string]]);
@@ -161,6 +174,7 @@ describe('runIngestSignal', () => {
       overpass,
       workerId: 'sb-1',
       drain: drainReturning(result),
+      db: settledDb,
     });
 
     expect(log.lines.map(([, line]) => line).join('\n')).toContain(expected);
@@ -207,14 +221,18 @@ describe('the invocation budget the host enforces', () => {
   it('deploys the two budgets the code falls back to', () => {
     // Drift on either side is the failure. A template that stops setting them lands on these
     // defaults; a template that sets something else is no longer the thing reasoned about.
-    expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBe(OVERPASS_DEADLINE_MS);
     expect(appSetting('OVERPASS_MAX_TOTAL_MS')).toBe(OVERPASS_MAX_TOTAL_MS);
     expect(appSetting('INGEST_DEADLINE_MS')).toBe(HANDLER_DEADLINE_MS);
+    expect(appSetting('INGEST_COMMIT_RESERVE_MS')).toBe(COMMIT_RESERVE_MS);
+    // The template may tighten the Overpass start-by moment; it may not loosen it.
+    expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBeGreaterThanOrEqual(
+      overpassDeadlineMs({}),
+    );
   });
 
   it('leaves the handler time to write the tile after Overpass is done', () => {
     expect(functionTimeoutMs).toBe(600_000);
-    expect(OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
+    expect(overpassDeadlineMs({}) + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
   });
 
   it('stops every phase, not only Overpass, before the host stops the process', () => {
@@ -222,7 +240,7 @@ describe('the invocation budget the host enforces', () => {
     // own deadline and finish outside the handler's — and it has to leave the host room for
     // whichever phase was mid-flight when it struck.
     expect(HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(
-      OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS,
+      overpassDeadlineMs({}) + OVERPASS_MAX_TOTAL_MS,
     );
     expect(functionTimeoutMs - HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(60_000);
   });

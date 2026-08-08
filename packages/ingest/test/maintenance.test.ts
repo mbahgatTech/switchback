@@ -3,7 +3,13 @@ import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
 import { LEASE_TIMEOUT_MS } from '../src/jobs';
-import { createThrottledSweep, isDistressed, queueHealth, sweepQueue } from '../src/maintenance';
+import {
+  countWedgedTiles,
+  createThrottledSweep,
+  isDistressed,
+  queueHealth,
+  sweepQueue,
+} from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
 
 /** A tile row as the sweep reads it. */
@@ -236,7 +242,11 @@ describe('the queue health report', () => {
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
       ingestTile: { count: async () => reading.stuckSubtrees },
-      $queryRaw: async () => [{ count: reading.orphanedSplits }],
+      // Two correlated counts share this seam; the child-set subquery names the split one.
+      $queryRaw: async (strings: TemplateStringsArray) =>
+        strings.join('').includes('ingest_tiles child')
+          ? [{ count: reading.orphanedSplits }]
+          : [{ count: reading.wedgedTiles }],
     } as unknown as PrismaClient;
   }
 
@@ -259,10 +269,11 @@ describe('the queue health report', () => {
     rateLimited: 3,
     orphanedSplits: 6,
     stuckSubtrees: 1,
+    wedgedTiles: 4,
     stalledDrain: 1,
   };
 
-  it('reads the six conditions the drainer leaves behind', async () => {
+  it('reads every condition the drainer leaves behind', async () => {
     expect(await queueHealth(countingDb(reading), NOW)).toEqual(reading);
   });
 
@@ -329,6 +340,7 @@ describe('the queue health report', () => {
       rateLimited: 0,
       orphanedSplits: 0,
       stuckSubtrees: 0,
+      wedgedTiles: 0,
       stalledDrain: 0,
     };
     expect(isDistressed(clean)).toBe(false);
@@ -372,5 +384,43 @@ describe('the queue health report', () => {
       expect((await queueHealth(drainDb(hoursAgo(1), null), NOW)).stalledDrain).toBe(0);
       expect((await queueHealth(drainDb(hoursAgo(40), null), NOW)).stalledDrain).toBe(1);
     });
+  });
+});
+
+/**
+ * The gauge for the state a killed handler leaves behind: a tile stuck at `running` because its
+ * invocation never came back. Nineteen sat in production on 2026-08-07 with nothing counting them
+ * — `staleLeases` reads `ingest_jobs`, and the job under a wedged tile is often not stale at all.
+ */
+describe('countWedgedTiles', () => {
+  function capturing(): { db: PrismaClient; sql: () => string } {
+    let captured = '';
+    const db = {
+      $queryRaw: async (strings: TemplateStringsArray) => {
+        captured = String(strings);
+        return [{ count: 3 }];
+      },
+    } as unknown as PrismaClient;
+    return { db, sql: () => captured };
+  }
+
+  it('counts tiles mid-fetch with nothing left to finish them', async () => {
+    const { db, sql } = capturing();
+    expect(await countWedgedTiles(db)).toBe(3);
+    expect(sql()).toContain("tile.status = 'running'");
+    expect(sql()).toContain('"fetchedAt" IS NULL');
+  });
+
+  it('exempts a tile whose job is still queued or running', async () => {
+    // Without this the gauge pins: every tile passes through `running` on the way to `ready`.
+    const { db, sql } = capturing();
+    await countWedgedTiles(db);
+    expect(sql()).toContain('NOT EXISTS');
+    expect(sql()).toContain("job.status IN ('queued', 'running')");
+  });
+
+  it('reads zero rather than undefined on an empty result', async () => {
+    const empty = { $queryRaw: async () => [] } as unknown as PrismaClient;
+    expect(await countWedgedTiles(empty)).toBe(0);
   });
 });

@@ -421,7 +421,7 @@ describe('reclaimExpiredJobs', () => {
     // These rows carried a null `lastError` for three days and nothing on them said what
     // happened; the lease itself has already spaced the retry, so `runAfter` stays put.
     expect(recorded.reapValues).toContainEqual(
-      expect.stringContaining('lease expired after 30 min'),
+      expect.stringContaining('lease expired after 12 min'),
     );
     expect(recorded.reapValues).toContainEqual(new Date(now.getTime() - LEASE_TIMEOUT_MS));
     expect(sql).toContain('"lastError"');
