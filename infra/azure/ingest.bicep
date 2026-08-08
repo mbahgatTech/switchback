@@ -43,9 +43,9 @@ worker that cannot reach the database. Read from the environment in `ingest.bice
 shape `PGADMIN_PASSWORD` uses — see that file's header.
 
 This is the application login, not the administrator, and it is the same string Vercel already
-holds. **This template does not enable Entra authentication on the server**, so there is no managed
-identity path to Postgres here; see the note beside the Function App's identity for what turning
-that on would cost.
+holds. Entra authentication is already on at the server — this template does not own that flag,
+`main.bicep` does — so a managed-identity path to Postgres exists and is one parameter away: see
+`databaseAuth` below, which requires this value to name `sbapp_func` and carry no password.
 ''')
 @secure()
 param databaseUrl string
@@ -62,8 +62,12 @@ mismatch fails at connect rather than silently preferring the password.
 
 The role is already provisioned: `sbapp_func` is Entra-mapped to this app's system-assigned
 principal `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same
-table grants the password role has. Nothing needs creating before the flip; it is one parameter and
-a URL.
+table grants the password role has. The server already has `activeDirectoryAuth: Enabled`.
+
+**The flip therefore writes two application settings on this Function App and nothing else.**
+`DATABASE_AUTH` appears and `DATABASE_URL` changes; no `Microsoft.DBforPostgreSQL` resource is in
+the change set, so neither the server restart that enabling Entra authentication costs nor any
+handling of the administrator password is in this path.
 
 Left at `password` because the token path has never served a production query, and this is the
 control that makes proving it a deployment rather than an edit. Rolling back is the same one-word
