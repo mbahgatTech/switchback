@@ -831,11 +831,16 @@ consumer at a time and defaults to `password`, so a consumer that misbehaves is 
 one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
 side and stays `true` until every consumer has been proved on a token.
 
-1. Move the Function App's database auth onto Entra — in `infra/azure/ingest.bicep`, `databaseAuth`
-   to `entra` and a password-free `databaseUrl` naming `sbapp_func`. No identity change is
-   involved: `sbapp_func` is already mapped to the Function App's system-assigned principal
-   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, so the token path is
-   privileged the moment the flag flips.
+1. Prepare the Function App's move onto Entra. `infra/azure/ingest.bicepparam` assigns no
+   `databaseAuth`, so the template default `password` is what deploys; add `param databaseAuth =
+'entra'` to it, and export `INGEST_DATABASE_URL` naming `sbapp_func` with no password in it.
+   `entraPoolConfig` refuses a URL that still carries one, so a half-done flip fails at connect
+   rather than quietly preferring the password. Nothing has to be provisioned first: `sbapp_func`
+   is already mapped to the Function App's system-assigned principal
+   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, and the server
+   already has `activeDirectoryAuth: Enabled`. **The deployment writes two application settings on
+   the Function App and touches no `Microsoft.DBforPostgreSQL` resource** — `ingest.bicep` declares
+   none — so it costs an app restart, not a server one. Step 4 deploys it and proves it.
 
    **Do not move the Function App onto the shared identity to achieve this.** The shared identity's
    Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
@@ -850,7 +855,10 @@ side and stays `true` until every consumer has been proved on a token.
    already exists, so a run against the deployed estate is an assertion rather than a change.
 3. Set `DATABASE_AUTH=entra-vercel` on Vercel preview, then production, with password-free URLs
    naming `sbapp_vercel`. Prove a signed-in read and a write — `session.findUnique` is the canary.
-4. Set `DATABASE_AUTH=entra` on the Function App and prove a tile ingests end to end.
+4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Confirm
+   the settings landed with `az functionapp config appsettings list -o json`, and re-run
+   `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces the collection
+   whole and erases `WEBSITE_RUN_FROM_PACKAGE`.
 5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
