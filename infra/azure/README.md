@@ -7,17 +7,10 @@ runs on Vercel, photographs live in Cloudflare R2, CI runs on GitHub Actions.
 **Production has served from Azure since 2026-07-30, about 20:09 UTC.** It is the only copy of
 this data.
 
-```mermaid
-flowchart LR
-  V["Vercel<br/>switchback-three.vercel.app"]
-  CI["GitHub Actions<br/>ci.yml migrate job"]
-  A["Azure Postgres 17 + PostGIS — live<br/>psql-switchback-prod-37ywppu5p7fri<br/>rg-switchback-prod-northcentralus"]
-  P["Point-in-time restore<br/>14 days, locally redundant<br/>restores into a new server"]
+![Switchback production estate: deployment boundaries, the credentials that cross them, and the absent network boundary](../../docs/diagrams/estate.svg)
 
-  V -->|"sbapp, password, DML only"| A
-  CI -->|"id-switchback-postgres-ci, Entra token, DDL"| A
-  A -.->|"the only recovery"| P
-```
+Recovery is point-in-time restore into a **new** server, 14 days, locally redundant. There is no
+second copy and no geo-redundant backup; see [Backups](#backups).
 
 ---
 
@@ -381,9 +374,8 @@ and holds a live window nobody should move, so it keeps `2026-07-01` while the r
 keeps `2026-08-01`. Hence `budgetStartDate` and `workloadBudgetStartDate`, two different immutable
 facts.
 
-Neither needs the admin password. `main.bicepparam` falls back to empty and `postgres.bicep` omits
-`administratorLoginPassword` entirely when it is, so a redeploy converging a budget leaves the live
-credential untouched; see [Redeploying](#redeploying).
+Neither needs the admin password — see [Redeploying](#redeploying) for why an unset
+`PGADMIN_PASSWORD` leaves the live credential alone.
 
 `main.bicep`'s header lists the rest of the `what-if` change list: provider-assigned residue that
 never converges, and the one entry that is a real to-do. Read it before concluding the template has
@@ -747,9 +739,8 @@ unset PGADMIN_PASSWORD            # this deployment has no reason to write the c
 # …then deploy exactly as under "Deploy"
 ```
 
-Placing the lock needs no admin password. With `PGADMIN_PASSWORD` unset, `main.bicepparam` falls
-back to empty and `postgres.bicep` omits `administratorLoginPassword` entirely, so the live
-credential is untouched. Export it here only if you also mean to rotate — and rotating breaks every
+Placing the lock needs no admin password; the `unset` above is what keeps it that way. Export it
+here only if you also mean to rotate — and rotating breaks every
 connection string carrying the old value, including the ones Vercel is serving the site with.
 
 If the lock has to be replaced by hand instead — by an Owner who is not running the deployment —
@@ -874,9 +865,8 @@ script, `npm run dev` and the e2e suite stop working at step 7 with a connection
 explanation.
 
 After step 7 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
-server refuses password authentication outright. From step 7 onward the template needs no password
-at all: `administratorLoginPassword` defaults to empty and is omitted from the payload, so the
-accidental-rotation hazard is gone rather than dormant.
+server refuses password authentication outright, and from step 7 onward the template needs no
+password at all — so the accidental-rotation hazard is gone rather than dormant.
 
 **Rolling step 7 back — set `passwordAuthEnabled = true` and export the password with it.**
 
@@ -944,6 +934,16 @@ no lock resource here either: the group's existing `CanNotDelete` does not block
 | Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
 | Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
 | Cost            | ~$10/month Standard namespace; Consumption and the storage account are inside the free |
+
+The storage row is checkable in two commands, and the pair is what proves key auth is refused
+rather than merely unconfigured:
+
+```bash
+az storage blob list --account-name stsbingest37ywppu5p7fri --container-name function-releases \
+  --auth-mode key -o json     # ERROR: Key based authentication is not permitted on this storage account.  (exit 1)
+az storage blob list --account-name stsbingest37ywppu5p7fri --container-name function-releases \
+  --auth-mode login -o json   # the package blob                                                            (exit 0)
+```
 
 ### The Overpass clamp — the thing to check in review
 
@@ -1110,14 +1110,12 @@ asks the host itself and is the answer to trust. So is the queue depth: `az serv
 `what-if` is safe and is the check worth running before any deploy — nothing under
 `Microsoft.DBforPostgreSQL` may appear as a create or a modify.
 
-**Role assignments are in the template now.** They used to be conditional on
-`DEPLOY_ROLE_ASSIGNMENTS`, with an `az role assignment create` in this file for an Owner to run,
-because `Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`. The
-deploying service principal (`cf940ed6-…`, display name `plant`) was granted **Role Based Access
-Control Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`), unconditioned, at this resource
-group, on 2026-08-03 (assignment `8baf9393-029a-4226-a882-992a8146d775`). The parameter, the flag and
-the runbook step are all gone: the four queue role assignments are ordinary resources in
-`ingest.bicep` and nothing grants access by hand.
+**Role assignments are ordinary resources in the templates, and nothing grants access by hand.**
+`Microsoft.Authorization/roleAssignments/write` is in Contributor's `notActions`, so the deploying
+service principal (`cf940ed6-…`, display name `plant`) holds **Role Based Access Control
+Administrator** (`f58310d9-a9f6-439a-9e8d-f62e7b41a168`) at this resource group, unconditioned —
+assignment `8baf9393-029a-4226-a882-992a8146d775`, created 2026-08-03. That is a standing ability to
+grant any role here to any principal, and it is the price of keeping grants in Bicep.
 
 **Deleting a `roleAssignment` from Bicep is not a revocation.** Resource-group deployments are
 Incremental — ARM never removes a resource merely because the template stopped declaring it, and
