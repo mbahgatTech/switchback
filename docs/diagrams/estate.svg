@@ -190,8 +190,8 @@
   <rect class="node" x="616" y="400" width="256" height="60" rx="6"/>
   <use href="#i-logs" x="626" y="409" width="20" height="20"/>
   <text class="nlabel" x="652" y="423">Log Analytics + App Insights</text>
-  <text class="nsub" x="626" y="441">workspace c188de03 · four alert rules</text>
-  <text class="nsub" x="626" y="453">query the workspace, not the App Insights proxy</text>
+  <text class="nsub" x="626" y="441">workspace c188de03 — query it, not App Insights</text>
+  <text class="nsub" x="626" y="453">6 alert rules: 2 Postgres · 1 queue · 3 ingest</text>
 
   <rect class="node" x="904" y="400" width="256" height="60" rx="6"/>
   <use href="#i-badge" x="914" y="409" width="20" height="20"/>
