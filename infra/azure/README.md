@@ -837,21 +837,17 @@ consumer at a time and defaults to `password`, so a consumer that misbehaves is 
 one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
 side and stays `true` until every consumer has been proved on a token.
 
-1. Deploy the shared identity, and — in `infra/azure/ingest.bicep` — move the Function App onto it:
-   `identity.type` to `SystemAssigned,UserAssigned`, `AZURE_CLIENT_ID` and
-   `ServiceBusConnection__clientId` set to `cd074036-4c63-4d1e-8ebb-72f448bb95a2`, and a Service
-   Bus **Data Receiver** grant declared by `ingest.bicep`, because `ingest.bicep` owns the queue.
+1. Move the Function App's database auth onto Entra — in `infra/azure/ingest.bicep`, `databaseAuth`
+   to `entra` and a password-free `databaseUrl` naming `sbapp_func`. No identity change is
+   involved: `sbapp_func` is already mapped to the Function App's system-assigned principal
+   `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is already a member of `sbapp`, so the token path is
+   privileged the moment the flag flips.
 
-   That grant is a new capability and the ordering below depends on knowing so. The shared identity
-   holds Data Sender on `ingest-jobs` (`f1b97f59-263a-5e18-a1c0-40ce18436d52`) and nothing else. It
-   held Data Receiver (`0090d328-0cee-592f-8359-e4cc64940694`) until that assignment was deleted
-   with the resource-group lock lifted; `ingest.bicep` no longer declares it, which is what stops a
-   deployment putting it back.
-
-   Granting Receive to this identity gives it to **every Vercel deployment, previews included**,
-   because the shared identity is also Vercel's. That is the reason it was revoked, and moving the
-   Function App onto the shared identity re-creates the same exposure by a different route. Weigh
-   that before step 1: the worker's own system-assigned identity has no such reach.
+   **Do not move the Function App onto the shared identity to achieve this.** The shared identity's
+   Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
+   every Vercel deployment, previews included; a worker running as that identity would need the
+   grant back, and `ingest.bicep` no longer declares it. Two principals with two Postgres roles is
+   the cheaper arrangement, and it is what is deployed.
 
 2. Run `Postgres identity` → `provision`, **from `master`** — the CI identity's federated credential
    trusts no other ref, and a dispatch from a branch fails at `azure/login` with `AADSTS700213`. It
@@ -1165,10 +1161,10 @@ az rest --method GET --url "https://management.azure.com$QUEUE/providers/Microso
 `atScope()` also returns what the subscription and the resource group grant — ten rows against this
 estate — so the filter on `properties.scope` is what narrows it to the queue's own. Three rows:
 Data Sender (`69a216fc-…`) and Data Receiver (`4f6d3b9b-…`) for the worker `3db30cfd-…`, and Data
-Sender alone for the publisher `c9bfba39-…`. `090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner)
-must not be among them, and neither must `0090d328-0cee-592f-8359-e4cc64940694` — the publisher's
-Receiver, deleted because it was standing authority to drain the production queue from any preview
-deployment.
+Sender alone for the publisher `c9bfba39-…`. Two things must **not** appear:
+`090c5cfd-751d-490a-894a-3ce6f1109419` (Data Owner), and any Data Receiver held by `c9bfba39-…` —
+that was assignment `0090d328-0cee-592f-8359-e4cc64940694`, revoked 2026-08-08, and its return would
+mean a template or a hand edit put drain capability back on Vercel's identity.
 
 ### The two things Bicep cannot express
 
@@ -1186,14 +1182,16 @@ Control Administrator` on this resource group, then `gh secret set AZURE_CLIENT_
    _user-assigned managed identity_ is an ARM resource, so it is in `ingest.bicep` with everything
    else — see `publisherProduction` and `publisherPreview` there.
 
-2. **Managed identity to Postgres is not done, deliberately.** The worker connects with
-   `DATABASE_URL` the way the web app already does. Measured on the server: `activeDirectoryAuth:
-Disabled`, `passwordAuth: Enabled`, `tenantId: null`. Turning it on means setting
-   `authConfig.activeDirectoryAuth` and `tenantId`, creating an Entra administrator, running
-   `pgaadauth_create_principal` for the worker's principal, and swapping the driver to token auth —
-   and the first two are writes to the server resource, which is the password hazard at the top of
-   this section. Service Bus needs no server change, so both Service Bus connections are keyless
-   today and the database connection is not.
+2. **Managed identity to Postgres is available and not yet switched on.** The worker connects with a
+   password in `DATABASE_URL`, but nothing is missing to stop that. Measured on the server:
+   `activeDirectoryAuth: Enabled`, `passwordAuth: Enabled`, `tenantId: f0f92920-…`. Measured in the
+   catalog: role `sbapp_func` exists, carries no password, is Entra-mapped to the worker's principal
+   `3db30cfd-…`, and is a member of `sbapp`, so it already has the table grants.
+
+   What remains is one parameter and one URL — `databaseAuth: 'entra'` in `ingest.bicepparam` and a
+   `databaseUrl` naming `sbapp_func` with no password. Both writes are to the Function App, not to
+   the server resource, so the password-rotation hazard at the top of this section is not in the
+   path.
 
 ### Vercel's three variables
 
