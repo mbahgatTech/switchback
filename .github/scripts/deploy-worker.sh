@@ -40,6 +40,12 @@
 #
 # Usage: deploy-worker.sh <zip-path> <commit>
 # Environment: RESOURCE_GROUP, FUNCTION_APP, APP_INSIGHTS, STORAGE_ACCOUNT.
+#
+# **Build the zip with something that writes POSIX separators.** CI uses `zip -qr`; on Windows
+# PowerShell's `Compress-Archive` writes `\` in archive names, so `node_modules/@azure/functions`
+# arrives as one flat entry and the host reports `0 functions found` with
+# `Cannot find module '@azure/functions'` — a package that uploads, sets and then does nothing.
+# The heartbeat check below is what catches it.
 
 set -euo pipefail
 

@@ -325,8 +325,10 @@ jobs:
           path: ${{ runner.temp }}
 
       # A distinct identity from the two this repository already federates. `id-switchback-postgres-ci`
-      # holds no Azure RBAC by design and could not deploy anything; the infrastructure identity is
-      # Contributor on the whole resource group. This one holds three narrow grants — Website
+      # holds no Azure RBAC by design and could not deploy anything; the infrastructure identity,
+      # once `grantInfraIdentityContributor` is on, is Contributor on the whole subscription —
+      # `infraContributor` in main.bicep declares no `scope`, so it takes that template's
+      # `targetScope`, and a resource group is not a boundary on it. This one holds three narrow grants — Website
       # Contributor on the one site, Monitoring Reader on the one Application Insights component,
       # and Storage Blob Data Contributor on the one `function-releases` container — enough to
       # upload a package, point the app at it and read back whether the host is running it, and

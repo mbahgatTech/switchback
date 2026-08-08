@@ -539,8 +539,7 @@ alertable and the reason is worth stating: a retry that eventually succeeds writ
 What an alert can watch is the subset that outlives the retry budget and fails a job, which
 `queueHealth`'s `rateLimited` counts from `lastError`. Etiquette is a correctness requirement here —
 the failure mode is an IP block that takes the product down — so the line exists even where no rule
-can read it, because previously this file contained no `console` call at all and a mirror
-rate-limiting this client left no trace anywhere.
+can read it, because without it a mirror rate-limiting this client leaves no trace anywhere.
 
 Retrieving them, which no rule can do for you:
 
@@ -675,7 +674,7 @@ the row already says. Edge-triggering is load-bearing rather than tidy: a blocke
 so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
 pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
 would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
-genuine failure signal — which trains an operator to ignore the signal round 5 was convened to create.
+genuine failure signal — which trains an operator to ignore the signal the rule exists to carry.
 `promoteFrom` nulls `lastError` when the roll-up lands, so the edge re-arms itself.
 
 **The floor is a parameter and it fails honestly at the bottom.** `INGEST_SUBDIVIDE_MAX_ZOOM` is the
@@ -872,7 +871,7 @@ switchback-ingest-tile-split 120230202: ran out of clock with 2032 trail(s) unat
 
 All four are the commit-loop shape: the tile query returned, the deadline refused the rest,
 `refused > 0` selected the split, and each invocation returned normally between 540,244 ms and
-542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms, which is what round 5 bought.
+542,349 ms against a 540,000 ms budget — inside the host's 600,000 ms.
 Two thousand unattempted trails is the size of the problem stated plainly: these boxes are an order
 of magnitude past what one invocation can commit. Overpass was healthy throughout: no 429, no
 `Retry-After`, no breaker trip in `traces` between 23:00Z and 00:45Z, and `ingest-jobs` held 0
@@ -887,11 +886,11 @@ proven as far as the split and no further: no `done` at z10, no roll-up, and no 
 `trails.browse` calls ready because it subdivided.** The deepest zoom reached is z10, as rows, not as
 work.
 
-**Earlier rounds' account of this is now settled, and both halves of it were wrong.** Round 1 said
-`splitTile` was never reached; a reviewer said subdivision had fired twice on 2026-08-05. Neither was
-supported then and neither is now: the 2026-08-05 over-deadline invocations logged `done` with no
-token, and the token could not have been emitted because `PipelineDeps.logger` was set on no deployed
-path. What is known is what is above — the first observed split in this system is 2026-08-06T00:00:25Z.
+**Traces before 2026-08-06 say nothing either way about splitting.** `PipelineDeps.logger` was set
+on no deployed path until the worker wired it, so an invocation that ran past its deadline logged
+`done` and could not have emitted `switchback-ingest-tile-split` whatever it did. Absence of the
+token in that window is a property of the logging, not of the pipeline. The first observed split in
+this system is 2026-08-06T00:00:25Z.
 
 **The seam baseline, measured against the tiles that actually split.** Re-taken 2026-08-07. It is
 still a true "before": no tile below z9 exists, no trail is owned by a quadkey longer than nine
@@ -1409,9 +1408,8 @@ graph LR
   RUNTIME -->|Data Sender only<br/>Receiver revoked 2026-08-08| SB
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
-  FUNC -.->|sbapp password| PG
   RUNTIME -->|sbapp_vercel<br/>mapped, unused, awaiting DATABASE_AUTH=entra-vercel| PG
-  FUNC -->|sbapp_func<br/>mapped, ready, awaiting databaseAuth=entra| PG
+  FUNC -->|sbapp_func<br/>DATABASE_AUTH=entra, in use| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
   OWNER -->|Owner| RG
@@ -1657,17 +1655,16 @@ arrives as the `x-vercel-oidc-token` header of the request in scope. No custom a
 the deployed federated credentials trust Vercel's default,
 `https://vercel.com/mbahgattechs-projects`.
 
-**UNVERIFIED: none of this has run against the production database.** The code compiles, the pool
-it constructs is asserted, and the driver behaviour underneath it is measured — but no consumer has
-`DATABASE_AUTH` set anywhere, so no Entra-authenticated Prisma query has ever been executed. The
-Vercel path in particular has never run in a Vercel runtime, and its named residual risk is
-unchanged: a connection opened from the cron drain or from `waitUntil` work that outlives the
-response has no request in scope, so `getVercelOidcToken()` has no header to read and that
-connection fails. A warm cache needs no assertion at all — the provider renews on the issuer's
-`refresh_in`, roughly half-life, so a busy instance asks perhaps twice an hour — and the exposure
-is a deployment whose _only_ traffic across a renewal is background work. Capturing each request's
-header into a module-level holder closes even that, at the cost of holding a bearer token in
-memory.
+**The worker runs on Entra; Vercel and its `entra-vercel` path do not.** `DATABASE_AUTH=entra` is
+set on `func-switchback-ingest-37ywppu5p7fri` and nowhere else, so every Entra-authenticated Prisma
+query executed against production so far is the worker's. The Vercel path has never run in a Vercel
+runtime, and its named residual risk is unchanged: a connection opened from the cron drain or from
+`waitUntil` work that outlives the response has no request in scope, so `getVercelOidcToken()` has
+no header to read and that connection fails. A warm cache needs no assertion at all — the provider
+renews on the issuer's `refresh_in`, roughly half-life, so a busy instance asks perhaps twice an
+hour — and the exposure is a deployment whose _only_ traffic across a renewal is background work.
+Capturing each request's header into a module-level holder closes even that, at the cost of holding
+a bearer token in memory.
 
 The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
 same one already trusted for Service Bus, and the one the `sbapp_vercel` database role is mapped
@@ -1760,10 +1757,10 @@ somebody else's account.
 
 ### What is left
 
-The refresh mechanism is proven at the pinned versions and both Prisma clients can be built on it,
-but **no consumer has `DATABASE_AUTH` set**, so the path is password-authenticated end to end and
-no Entra-authenticated Prisma query has ever run against production. Four things come off in this
-order, each proved with passwords still enabled:
+The refresh mechanism is proven at the pinned versions, both Prisma clients can be built on it, and
+**the Function App runs on it**: `DATABASE_AUTH=entra` has been set there since
+2026-08-08T17:27:04Z. Every other consumer is still password-authenticated. Three things remain,
+each provable with passwords still enabled:
 
 1. **The database roles.** Both already exist and are Entra-mapped —
    `infra/postgres-identity/roles.sql` converges `sbapp_vercel` against the shared identity's
@@ -1773,17 +1770,25 @@ order, each proved with passwords still enabled:
    The `provision` action cannot run from a branch: the CI identity's federated credential trusts
    `refs/heads/master` alone, so it executes on merge. Against the deployed estate it creates
    nothing and only asserts.
-2. **The Function App.** `param databaseAuth = 'entra'` added to `ingest.bicepparam`, which assigns
-   it nowhere today, and `INGEST_DATABASE_URL` exported naming `sbapp_func` with no password in it —
-   `entraPoolConfig` refuses a URL that still carries one, so the half-done version fails at connect
-   rather than quietly preferring the password. Nothing needs creating first: `sbapp_func` is
-   Entra-mapped to this app's own **system-assigned** principal
+2. **The Function App — done.** `databaseAuth='entra'` deploys `DATABASE_AUTH=entra` and an
+   `INGEST_DATABASE_URL` naming `sbapp_func` with no password in it; `entraPoolConfig` refuses a URL
+   that still carries one, so a half-done version fails at connect rather than quietly preferring
+   the password. `sbapp_func` is Entra-mapped to this app's own **system-assigned** principal
    `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same table
    grants the password role has, and the server already has `activeDirectoryAuth: Enabled`. The
    deployment writes two application settings on the Function App; `ingest.bicep` declares no
-   `Microsoft.DBforPostgreSQL` resource, so the server is not in the change set.
+   `Microsoft.DBforPostgreSQL` resource, so the server was not in the change set.
 
-   **Do not move this app onto the shared identity to get there.** The trigger binding sets no
+   The proof is the two-minute `ingestPump` heartbeat, whose gauges are read out of `ingest_jobs`:
+   `switchback-ingest-queue-health build=7d59395… dead=1 staleLeases=1 …` at 17:45:12Z and the same
+   line with `staleLeases=0` at 17:46:00Z. A changing gauge cannot come from anywhere but a query.
+
+   **Rolling back is `databaseAuth='password'` and a `databaseUrl` carrying `sbapp`'s password**,
+   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
+   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it. `passwordAuth` on the server
+   is `Enabled`, so that way back is open.
+
+   **Do not move this app onto the shared identity.** The trigger binding sets no
    `__clientId`, so the host receives Service Bus messages as whatever principal the site runs
    under; an app running as `id-switchback-vercel-publisher` would need Data Receiver on
    `ingest-jobs` put back on it — the grant that was revoked precisely because that identity rides

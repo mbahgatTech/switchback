@@ -199,8 +199,8 @@
   <text class="nsub" x="914" y="441">id-switchback-vercel-publisher · -postgres-ci</text>
   <text class="nsub" x="914" y="453">id-switchback-worker-deploy</text>
 
-  <text class="zsub" x="616" y="484">DATABASE_AUTH is unset on every consumer, so each database edge here is a password. sbapp_func and</text>
-  <text class="zsub" x="616" y="498">sbapp_vercel are already Entra-mapped and privileged; the flip is a parameter, not a provisioning step.</text>
+  <text class="zsub" x="616" y="484">The Function App connects as sbapp_func with an Entra token (DATABASE_AUTH=entra). Every other database</text>
+  <text class="zsub" x="616" y="498">edge here is still a password; sbapp_vercel is mapped and privileged and awaits DATABASE_AUTH=entra-vercel.</text>
   <text class="zsub" x="616" y="518">TLS is mandatory and verified — sslmode=verify-full plus sslaccept=strict, because the two readers</text>
   <text class="zsub" x="616" y="532">honour different keys. The 13-character hostname suffix is what keeps dictionary scanners off it.</text>
   <text class="zsub" x="616" y="546">The subscription spending limit deallocates this whole group, which is why the tier is Burstable.</text>
