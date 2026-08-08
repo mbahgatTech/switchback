@@ -49,6 +49,10 @@ param ingestQueueDriver = readEnvironmentVariable('INGEST_QUEUE_DRIVER')
 // setting stops new splits and does not undo that, so both of these default off and the ceiling
 // is inert on its own: `subdivideMaxZoom` reads it as 9 unless identity is `claim`.
 param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')
+
+// The live Function App reads `claim`. This fallback does not, so exporting INGEST_TRAIL_IDENTITY
+// is part of deploying rather than an option: an application-settings write replaces the collection
+// whole, and an unexported variable takes identity off the worker without touching Vercel.
 param ingestTrailIdentity = readEnvironmentVariable('INGEST_TRAIL_IDENTITY', 'osm-id')
 
 // The two halves of the Vercel OIDC subject the publisher credential trusts. Renaming either on

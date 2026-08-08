@@ -992,11 +992,11 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Paired with the ceiling above, and for the same reason: a ceiling above 9 without
           // this on `claim` is the combination that fragments trails across the new seam.
           //
-          // Deployed and readable: `az functionapp config appsettings list` returns 28 settings on
-          // the live app and this one reads `osm-id`, matching `ingest.bicepparam`. Reading it back
-          // is the check an operator should use, because `identity.ts` treats an absent variable
-          // and `osm-id` identically — so an app whose settings collection was replaced without
-          // this entry looks safe and is, but says nothing about which template last converged it.
+          // Live value is `claim`, and `ingest.bicepparam` falls back to `osm-id`, so a deploy from
+          // a shell that has not exported INGEST_TRAIL_IDENTITY turns identity off on this app.
+          // Read it back after every deployment with `az functionapp config appsettings list`:
+          // `identity.ts` treats an absent variable and `osm-id` identically, so an app whose
+          // settings collection was replaced without this entry looks unchanged and is not.
           {
             name: 'INGEST_TRAIL_IDENTITY'
             value: ingestTrailIdentity
