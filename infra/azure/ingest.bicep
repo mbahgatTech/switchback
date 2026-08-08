@@ -786,8 +786,8 @@ conditional.
 `OverpassClient`'s own worst case on the defaults is `maxAttempts` 6 x `requestTimeoutMs` 190 s plus
 backoff — roughly 24 minutes for *one* query, and `processTile` issues several. Left alone the host
 wins that race: it kills the process mid-tile, which strands the `ingest_jobs` lease and redelivers
-the message. `INGEST_OVERPASS_DEADLINE_MS` and `OVERPASS_MAX_TOTAL_MS` below are the two numbers
-that make it fit; the arithmetic is beside them.
+the message. `OVERPASS_MAX_TOTAL_MS` below, and the start-by moment `overpassDeadlineMs` derives
+from it, are the two numbers that make it fit; the arithmetic is beside them.
 
 ---
 
@@ -949,20 +949,17 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'OVERPASS_MAX_CONCURRENT'
             value: '2'
           }
-          // The two halves of the Overpass budget. 300 s is the last moment the worker will
-          // *start* a query; 240 s is the most that one query may then spend across every retry.
-          // 540 s worst case, inside the 600 s Consumption fixes `functionTimeout` at. Before
-          // these, one query's own budget was six attempts of 190 s plus backoff — about 24
+          // The Overpass budget's two halves are `OVERPASS_MAX_TOTAL_MS` — the most one query may
+          // spend across every retry — and the start-by moment, which is *derived* rather than set.
+          // `overpassDeadlineMs` computes INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS -
+          // INGEST_COMMIT_RESERVE_MS, so the three numbers below cannot fail to add up. Before any
+          // of this, one query's own budget was six attempts of 190 s plus backoff — about 24
           // minutes — and `ingest_tile:120221221` duly ran 600008 ms and was killed mid-tile.
           //
-          // 300 s is a ceiling now, not the operative number: `overpassDeadlineMs` derives the
-          // start-by moment as INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS
-          // and takes whichever is lower. The three below have to add up, so the derivation owns
-          // the arithmetic and this setting can only tighten it.
-          {
-            name: 'INGEST_OVERPASS_DEADLINE_MS'
-            value: '300000'
-          }
+          // `INGEST_OVERPASS_DEADLINE_MS` is deliberately absent. The code still reads it and takes
+          // whichever is lower, so an operator can tighten the clamp in an incident; a template
+          // value could only ever be inert or a loosening, and `test/drain.test.ts` fails if one
+          // reappears here.
           // Wall clock held back for the commit loop. Without it the two Overpass queries could
           // consume the whole handler budget, every trail threw `IngestDeadlineError`, and the
           // tile subdivided into four children that repeated the exercise — measured 2026-08-08 as
@@ -1228,11 +1225,16 @@ telemetry could take the one line these arms match with it. `excludedTypes` ther
 — the condition is "this happened", not "this is happening", and an alert that resolves itself the
 moment the tile stops being retried is an alert nobody reads.
 
-**The fourth arm is the one that sees a killed handler.** A handler the host kills at
-`functionTimeout` writes no request row at all — the process stops between two awaits — so the
-first arm is structurally incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC:
-`Functions.ingestDrain` logged 42 `Executing` against 37 `Executed`, and five invocations of
-504,637 ms to 548,954 ms every one of which recorded `Success=True`.
+**The fourth arm is the one that sees a killed handler.** A handler the host kills writes no
+request row at all — the process stops between two awaits — so the first arm is structurally
+incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC: `Functions.ingestDrain` logged
+42 `Executing` against 37 `Executed`, and the five invocations that logged a start and no end
+(16:32:42, 17:06:37, 17:28:19, 17:45:12 and 18:24:00 UTC) have no `AppRequests` row under their
+invocation ids — the query returns zero.
+
+A slow handler that *does* return is a separate fault the first arm also misses, for the opposite
+reason: five other invocations ran 504,637 ms to 548,954 ms against the 540,000 ms bound and every
+one recorded `Success=True`. Overrunning is not failing, as far as the host is concerned.
 
 The three deployed arms are **not** silent over that window — run verbatim they return five
 matches: one `ingest-job-failed` for `ingest_tile:120222201` at 16:56:39, and four
@@ -1253,6 +1255,12 @@ and none carried a token any rule could match.
 covers the one state no reclaim can free — a `running` row whose `lockedAt` is NULL, which
 `lockedAt < cutoff` never matches however long it sits. That is a different fault from a killed
 handler and it needs its own arm; it is not a second chance at the same one.
+**The sixth arm covers the pump, which is now the only route from `ingest_jobs` to a drainer.**
+`runPump` reads the queue depth through ARM and publishes; if either throws, `ingestPump` rejects.
+`reportQueueHealth` has already run by then, so `switchback-ingest-worker-silent` stays quiet on its
+heartbeat and the estate looks alive while nothing reaches the queue. Unlike the drain, a rejected
+timer invocation does write a request row — the process is not killed — so `success == false` is the
+right predicate here even though it is the wrong one two arms up.
 ''')
 resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-failed'
@@ -1260,7 +1268,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   tags: tags
   properties: {
     displayName: 'switchback-ingest-drain-failed'
-    description: 'An ingest job failed, was killed by the host, or deferred its tile to four children. None of the three dead-letters, so this rule is the only signal.'
+    description: 'An ingest job failed, was killed by the host, deferred its tile to four children, or the pump could not publish. None of these dead-letters, so this rule is the only signal.'
     severity: 2
     enabled: true
     scopes: [
@@ -1271,7 +1279,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0

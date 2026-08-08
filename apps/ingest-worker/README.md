@@ -188,7 +188,7 @@ empty tick.
 | `INGEST_PUMP_ENABLED`                           | `true`        | the pump                                       |
 | `DATABASE_URL`                                  | —             | `backgroundPrisma`, as the web app connects    |
 | `INGEST_DEADLINE_MS`                            | `540000`      | `runIngestSignal`, and every phase under it    |
-| `INGEST_OVERPASS_DEADLINE_MS`                   | `300000`      | `runIngestSignal`, for the Overpass view only  |
+| `INGEST_COMMIT_RESERVE_MS`                      | `150000`      | `overpassDeadlineMs`, held back for the commit |
 | `OVERPASS_MAX_TOTAL_MS`                         | `240000`      | `getOverpass`, per query                       |
 | `OVERPASS_MAX_CONCURRENT`                       | `2`           | `getOverpass`, per client                      |
 | `INGEST_MAX_DRAINERS`                           | `1`           | `drainSlotGate`, per fleet                     |
@@ -200,17 +200,20 @@ Receiver** on the queue — not Data Owner. Reading the depth is why Data Owner 
 `queues/read` action, so `src/service-bus.ts` asks ARM for `countDetails` instead. At queue scope
 Data Owner would also have allowed rewriting or deleting the queue.
 
-Identity reaches Postgres too, and the door is already open. The server has `activeDirectoryAuth:
+Identity reaches Postgres too, and it is what the worker uses. The server has `activeDirectoryAuth:
 Enabled`, and role `sbapp_func` is Entra-mapped to this app's own system-assigned principal
 `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the table grants
-the password role holds. The worker connects by password only because `DATABASE_AUTH` is unset.
+the password role holds. `DATABASE_AUTH=entra` is set on the Function App, and `databaseUrl` names
+`sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that still carries one, so a
+half-done flip fails at connect rather than quietly preferring the password.
 
-Flipping it is **two application settings on this Function App and no write to the server**:
-`databaseAuth: 'entra'` in `ingest.bicepparam`, which emits `DATABASE_AUTH=entra`, and a
-`databaseUrl` naming `sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that
-still carries one, so a half-done flip fails at connect rather than quietly preferring the
-password. Nothing is provisioned and no `Microsoft.DBforPostgreSQL` resource is touched, so the
-server restart that enabling Entra authentication once required is not in this path.
+Both halves are declared: `databaseAuth = 'entra'` in `ingest.bicepparam` is what emits the setting.
+It is a literal there rather than an environment read because an application-settings write replaces
+the collection whole, so a deployment that let it fall back to the template's `password` default
+would delete `DATABASE_AUTH` from the live app and leave the worker holding a passwordless URL it
+could not authenticate with. Nothing is provisioned and no `Microsoft.DBforPostgreSQL` resource is
+touched by that setting, so the server restart that enabling Entra authentication once required is
+not in this path.
 
 ## Building
 

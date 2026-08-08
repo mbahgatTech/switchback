@@ -47,9 +47,11 @@ function drainReturning(result: DrainResult): Drain {
 }
 /**
  * The invariant the broker and the queue have to agree on: a message is completed only when its
- * work is done or something else is going to do it. Measured 2026-08-07, before this existed: 26
- * `Executing` against 21 `Executed`, four redeliveries at `DeliveryCount=2` each finishing in
- * 11-38 ms because the tile row was still `running` under the dead invocation's lease.
+ * work is done or something else is going to do it. Measured 2026-08-08, before this existed: 42
+ * `Executing` against 37 `Executed` on `Functions.ingestDrain`. The five invocations that logged a
+ * start and no end — 16:32:42, 17:06:37, 17:28:19, 17:45:12 and 18:24:00 UTC — are handlers the
+ * host killed mid-tile, each leaving its `ingest_jobs` lease held by a process that no longer
+ * exists.
  */
 describe('what a delivery may tell the broker', () => {
   const held = (ageMs: number) => ({

@@ -13,7 +13,7 @@ import { env } from '@/env';
  * collection moved to the Function App's `ingestPump`, which runs every two minutes beside the
  * only process that drains — `apps/web/vercel.json` asks for once a day, because Hobby fails the
  * deployment for any expression that would run more often, and a daily tick was never a schedule
- * for a thirty-minute lease.
+ * for a twelve-minute lease.
  */
 export const runtime = 'nodejs';
 

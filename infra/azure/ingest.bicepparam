@@ -69,3 +69,11 @@ param overpassUserAgent = readEnvironmentVariable('INGEST_OVERPASS_USER_AGENT')
 // the build loudly rather than deploy a worker that cannot reach the database.
 param databaseUrl = readEnvironmentVariable('INGEST_DATABASE_URL')
 param mapillaryToken = readEnvironmentVariable('MAPILLARY_TOKEN', '')
+
+// A literal, not an environment read, because this is the one parameter whose omission is silent
+// and fatal. `optionalWorkerSettings` emits `DATABASE_AUTH` only when this is not `password`, and
+// an application-settings write replaces the collection whole — so a deployment that left this at
+// the template's `password` default would delete `DATABASE_AUTH=entra` from the live app. The
+// deployed `DATABASE_URL` is passwordless (`entraPoolConfig` refuses one that is not), so the
+// worker would then fall back to password auth with no password and stop reaching Postgres.
+param databaseAuth = 'entra'

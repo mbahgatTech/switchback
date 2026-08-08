@@ -228,10 +228,15 @@ describe('the invocation budget the host enforces', () => {
     expect(appSetting('OVERPASS_MAX_TOTAL_MS')).toBe(OVERPASS_MAX_TOTAL_MS);
     expect(appSetting('INGEST_DEADLINE_MS')).toBe(HANDLER_DEADLINE_MS);
     expect(appSetting('INGEST_COMMIT_RESERVE_MS')).toBe(COMMIT_RESERVE_MS);
-    // The template may tighten the Overpass start-by moment; it may not loosen it.
-    expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBeGreaterThanOrEqual(
-      overpassDeadlineMs({}),
-    );
+  });
+
+  it('leaves the Overpass start-by moment to the derivation, not the template', () => {
+    // `overpassDeadlineMs` takes min(configured, derived), so a template value can only be inert
+    // or — if the three budgets above ever move — a loosening of the one bound whose failure mode
+    // is an Overpass IP block. The derivation already guarantees the three add up, so the setting
+    // has no safe value to hold. It stays absent, and an operator tightening the clamp during an
+    // incident still works because the code reads the variable.
+    expect(bicep).not.toMatch(/name: 'INGEST_OVERPASS_DEADLINE_MS'/);
   });
 
   it('leaves the handler time to write the tile after Overpass is done', () => {

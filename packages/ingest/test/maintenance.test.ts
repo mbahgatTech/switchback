@@ -3,13 +3,7 @@ import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
 import { LEASE_TIMEOUT_MS } from '../src/jobs';
-import {
-  countWedgedTiles,
-  createThrottledSweep,
-  isDistressed,
-  queueHealth,
-  sweepQueue,
-} from '../src/maintenance';
+import { countWedgedTiles, isDistressed, queueHealth, sweepQueue } from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
 
 /** A tile row as the sweep reads it. */
@@ -194,37 +188,6 @@ describe('the sweep both live entry points call', () => {
     expect(result).toMatchObject({ requeued: 0, retired: 0 });
     expect(result.unsplit).toHaveLength(1);
     expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:031313112`]);
-  });
-});
-
-describe('the throttled sweep', () => {
-  const at = (iso: string) => new Date(iso);
-  const noop = () => vi.fn(async () => ({ requeued: 0, retired: 0, unsplit: [] }));
-
-  it('runs the first time it is asked', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    expect(sweep(at('2026-08-07T10:00:00Z'))).not.toBeNull();
-    expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it('declines inside the window, so a busy process does not sweep on every request', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    void sweep(at('2026-08-07T10:00:00Z'));
-    expect(sweep(at('2026-08-07T10:14:59Z'))).toBeNull();
-    expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it('runs again once the window has passed', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    void sweep(at('2026-08-07T10:00:00Z'));
-    void sweep(at('2026-08-07T10:15:00Z'));
-    expect(run).toHaveBeenCalledTimes(2);
   });
 });
 

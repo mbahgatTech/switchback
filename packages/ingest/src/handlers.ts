@@ -1,7 +1,6 @@
 /**
- * The job-kind to handler map. Every caller of the queue uses this — the cron route, the tRPC
- * router's `waitUntil` kick, the CLI — so the immediate path is provably an optimisation over
- * the durable one rather than a divergent implementation of it.
+ * The job-kind to handler map. Both callers of the queue use this — the Function App's queue
+ * trigger and the CLI — so the two cannot drift into divergent implementations of the pipeline.
  */
 
 import { JobKind } from '@switchback/db';
@@ -53,27 +52,25 @@ export function ingestHandlers(deps?: Partial<PipelineDeps>): Partial<Record<Job
 }
 
 /**
- * How many derived jobs a drain claims on top of its batch. Sized against the two callers
- * rather than the backlog: a cron tick's 60 s budget and a `waitUntil` kick hanging off a map
- * request both have slack for two `enrichTrailPhotos` calls, which are a lookup and an image
- * fetch. It is a rate, not a target — two per drain times every viewport that finds new ground
- * is what makes the backlog fall with the traffic it rises with.
+ * How many derived jobs a drain claims on top of its batch. Sized against the handler that runs
+ * them: one invocation's budget has slack for two `enrichTrailPhotos` calls, which are a lookup
+ * and an image fetch. It is a rate, not a target — two per drain times every viewport that finds
+ * new ground is what makes the backlog fall with the traffic it rises with.
  */
 export const DEFAULT_DERIVED_SHARE = 2;
 
 /**
- * Drain a batch of ingest work. This is the cron route's entire body.
+ * Drain a batch of ingest work.
  *
- * `limit` is small on purpose: a Vercel cron invocation has a wall-clock budget and a tile can
- * take a minute, so claiming twenty would mean nineteen locks expiring unhelpfully.
- * `derivedLimit` defaults to a share rather than zero because derived work sits below every
- * requestable kind and a batch that reserves no room for it never runs any. See `drainJobs`.
+ * `limit` is small on purpose: an invocation has a wall-clock budget and a tile can take minutes,
+ * so claiming twenty would mean nineteen leases expiring unhelpfully. `derivedLimit` defaults to a
+ * share rather than zero because derived work sits below every requestable kind and a batch that
+ * reserves no room for it never runs any. See `drainJobs`.
  *
- * **The Overpass bound is the default, not the call site's to remember.** Every handler below can
- * reach `OverpassClient`, `OVERPASS_MAX_CONCURRENT` bounds one process, and Vercel starts as many
- * processes as the traffic asks for — so an omitted `gate` used to mean "unbounded against one
- * egress IP", and one of the three drain call sites omitted it. Opting out is now an argument a
- * reader can see and a reviewer can question.
+ * **The Overpass bound is the default, not the call site's to remember.** Every handler above can
+ * reach `OverpassClient` and `OVERPASS_MAX_CONCURRENT` bounds only one process, so an omitted
+ * `gate` would mean "unbounded against one egress IP" the moment two processes overlap. Opting out
+ * is an argument a reader can see and a reviewer can question.
  */
 export async function drainIngest(
   options: {

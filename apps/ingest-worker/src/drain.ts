@@ -6,7 +6,13 @@
 import { JobStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { backgroundPrisma } from '@switchback/db';
-import { LEASE_TIMEOUT_MS, drainIngest, getOverpass, withDeadline } from '@switchback/ingest';
+import {
+  LEASE_TIMEOUT_MS,
+  OVERPASS_MAX_TOTAL_MS,
+  drainIngest,
+  getOverpass,
+  withDeadline,
+} from '@switchback/ingest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 import type { IngestSignal } from './message';
@@ -43,9 +49,6 @@ export const HANDLER_DEADLINE_MS = 540_000;
  * subdivision is the answer to.
  */
 export const COMMIT_RESERVE_MS = 150_000;
-
-/** `OVERPASS_MAX_TOTAL_MS` as the deployed template sets it, when the environment is silent. */
-export const OVERPASS_MAX_TOTAL_MS = 240_000;
 
 function positive(value: unknown, fallback: number): number {
   const parsed = Number(value);

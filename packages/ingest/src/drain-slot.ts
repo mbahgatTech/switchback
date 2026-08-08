@@ -3,12 +3,12 @@
  * across processes, in the database.
  *
  * `OVERPASS_MAX_CONCURRENT` bounds one `OverpassClient`, and `config.ts` makes that a per-process
- * singleton. On the Function App that is the whole fleet, because `functionAppScaleLimit=1` and
- * `FUNCTIONS_WORKER_PROCESS_COUNT=1` mean there is one process. On Vercel it is one *lambda*: the
- * platform starts as many as the traffic asks for, each with its own singleton, so the setting
- * bounded a fraction of the drainer and nothing bounded the drainer. Overpass allots slots per
- * client IP and every Vercel instance shares one egress IP, so the fleet was one client with no
- * ceiling — the failure mode being an IP block, which takes the product down.
+ * singleton, so a platform argument about process count is the only thing that could turn it into
+ * a fleet bound. `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1` come close, but
+ * they hold only while exactly one host is running: across a recycle two overlap, each with its
+ * own singleton, and several processes each honouring "two concurrent" locally is not two
+ * concurrent. Overpass allots slots per client IP and the whole estate shares one egress IP, so
+ * the failure mode is an IP block, which takes the product down.
  */
 
 import { prisma } from '@switchback/db';
@@ -54,15 +54,15 @@ export function maxDrainers(source: NodeJS.ProcessEnv = process.env): number {
  * so it sees the rows the previous holder committed.
  *
  * Expired leases are reclaimed inside the lock, before the count. A drainer that died still holds
- * `running` rows and would otherwise hold the slot shut until something else swept — which, on
- * Vercel's 60 s wall clock, is most drains. That makes the worst-case block `LEASE_TIMEOUT_MS`
- * rather than a day, and it is the reason `sweepQueue` exists as well.
+ * `running` rows and would otherwise hold the slot shut until something else swept, so this makes
+ * the worst-case block `LEASE_TIMEOUT_MS` rather than indefinite. `sweepQueue` on the pump's
+ * two-minute tick is the other half of that, and it runs whether or not anything drains.
  *
  * Drainers are counted by `count(distinct "lockedBy")`, so **every caller must pass a `workerId`
- * unique to its process.** A fleet sharing the string `inline` counts as one drainer however many
- * lambdas are running, which is the bug this replaces wearing a lock. The three application
- * entry points — `trails.ts`, `routes.ts` and the cron route — derive theirs from `randomUUID`;
- * `drainJobs` falls back to a timestamp, which is unique enough for the same reason.
+ * unique to its process.** A fleet sharing one string counts as one drainer however many processes
+ * are running, which is the bug this replaces wearing a lock. `runIngestSignal` derives its from
+ * the host's `invocationId`; `drainJobs` falls back to a timestamp, which is unique enough for the
+ * same reason.
  */
 export function drainSlotGate(db: PrismaClient = prisma, limit = maxDrainers()): ClaimGate {
   return (claim) =>

@@ -127,14 +127,14 @@ Vercel process, which has no Application Insights, so it is visible in Vercel's 
 durability of the tile does not depend on anyone reading it.
 
 **Lease recovery does not depend on a drain happening.** It used to: `reclaimExpiredJobs` ran only
-inside `drainJobs`, and a drain is a side effect of traffic on cold ground plus a cron that Hobby
+inside `drainJobs`, and a drain was a side effect of traffic on cold ground plus a cron that Hobby
 allows to fire once a day. So a cron tick that claimed ten jobs at 04:51 UTC on 2026-08-07, then
-died on Vercel's 60 s wall clock still holding them, left ten leases 5.9 h old against a 30-minute
-lease — four of them at their last attempt, so the next reclaim would have buried them.
-`sweepQueue` in `packages/ingest/src/maintenance.ts` is that reclaim plus the split-marker repair
-below, run from three places that do not require a drain: the cron route unconditionally,
-`trails.kickIngest` off any request traffic at most once per fifteen minutes per process, and
-`drainSlotGate` inside the transaction that admits a drainer.
+died on Vercel's 60 s wall clock still holding them, left ten leases 5.9 h old against the
+thirty-minute lease of that regime — four of them at their last attempt, so the next reclaim would
+have buried them. Recovery now runs from two places that do not require a drain: `ingestPump`'s
+two-minute `maintain()` calls `sweepQueue` in `packages/ingest/src/maintenance.ts`, which is that
+reclaim plus the split-marker repair below, and `drainSlotGate` calls `reclaimExpiredJobs` inside
+the transaction that admits a drainer, so a dead drainer cannot hold the slot shut.
 
 **A parent can claim a subdivision that has nothing behind it.** `splitTile` upserts four child
 rows, enqueues four jobs and only then marks the parent, so the marker is the _last_ write and a
@@ -329,13 +329,14 @@ preview built from one drains unbounded until it rebases onto master.
 Consumption ends an invocation at ten minutes and will not raise it; `OverpassClient`'s own worst
 case on the defaults is six attempts of 190 s plus backoff — about 24 minutes for one query, and
 `processTile` makes several. That is not theoretical: `ingest_tile:120221221` ran 600008 ms on
-2026-08-03 and the host killed the worker mid-tile. Two numbers bound the Overpass part of it, both
-set in `ingest.bicep`: `INGEST_OVERPASS_DEADLINE_MS` (300 s) is the last moment the worker will
-_start_ a query, and `OVERPASS_MAX_TOTAL_MS` (240 s) is the most one query may then spend across
-every retry — 540 s worst case inside 600 s. Past the deadline the Overpass view throws, `drainJobs`
+2026-08-03 and the host killed the worker mid-tile. Two numbers bound the Overpass part of it.
+`OVERPASS_MAX_TOTAL_MS` (240 s), set in `ingest.bicep`, is the most one query may spend across every
+retry; the last moment the worker will _start_ a query is derived rather than set, as
+`INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS` — 150 s — so the budgets
+cannot fail to add up. Past that moment the Overpass view throws, `drainJobs`
 catches it per job, writes `lastError` and releases the lease, which is a far cheaper failure than
 the host killing the process. And the pump calls `reclaimExpiredJobs` on its two-minute tick, so a
-lease that _is_ stranded comes back in minutes rather than waiting for the daily cron.
+lease that _is_ stranded comes back in minutes.
 
 **540 s bounds Overpass. `INGEST_DEADLINE_MS` bounds the invocation, and it had to.** Overpass was
 never the handler's only wall clock. `TerrainSource` fetched a terrarium tile per DEM sample with a
@@ -416,10 +417,13 @@ than every parent carrying a marker — a legitimate subdivision holds its marke
 four children take, and counting those would report dozens of wedged tiles on a healthy system.
 `stalledDrain` is the third, and the trap there is subtler: the obvious implementation counts due
 work, and `ingest_jobs` holds 44,884 `queued` rows overdue since 2026-07-30, which is a light left
-on rather than a gauge. Silence is the signal instead. Over the 14 days to 2026-08-07 there were 341
-terminal transitions, p95 gap 0.70 h and widest 27.90 h; `DRAIN_SILENCE_MS` is 36 h, which clears
-that maximum and a whole missed daily cron, so a quiet weekend is not a page and a real stoppage is
-named within a day and a half.
+on rather than a gauge. Silence is the signal instead. `DRAIN_SILENCE_MS` is 6 h — roughly forty
+tiles at the nine-minute handler bound, so a drain that is merely slow clears it while one that has
+stopped is named the same working day. The 27.90 h widest gap measured over the fortnight to
+2026-08-08 belongs to the old regime, where the only scheduled drain was a once-a-day cron; that
+cron is gone, `ingestPump` runs every two minutes and the queue trigger drains continuously, so a
+day and a half of silence is no longer a quiet weekend. The number is due a re-measurement once the
+continuous regime has a fortnight of history.
 
 Measured read-only against production on 2026-08-07 17:50 UTC, every field reads zero:
 `dead` 0 windowed against 25 unwindowed, `staleLeases` 0, `rateLimited` 0, and no `ingest_tiles` row
@@ -1118,11 +1122,11 @@ what step 2 above is for, and why step 4 checks the deployment rather than the v
 
 Doing that by hand is what wedges a tile: a parent whose `lastError` still starts `split into ` with
 no children on the ground is a row claiming a subdivision that is not there, and only
-`reconcileOrphanedSplits` — which runs off request traffic and the daily cron — repairs it, on its
-own schedule rather than yours. `unsplitTile` does both halves in one transaction, and it takes the
-same advisory lock the drain holds, so a descendant job cannot start between the check and the
-delete and write its tile row back afterwards. It refuses outright while one is already `running`;
-wait out the lease (30 minutes at most) and run it again.
+`reconcileOrphanedSplits` — which runs inside `sweepQueue` on `ingestPump`'s two-minute tick —
+repairs it, on its own schedule rather than yours. `unsplitTile` does both halves in one
+transaction, and it takes the same advisory lock the drain holds, so a descendant job cannot start
+between the check and the delete and write its tile row back afterwards. It refuses outright while
+one is already `running`; wait out the lease (12 minutes at most) and run it again.
 
 ### `INGEST_TRAIL_IDENTITY` → `osm-id`
 

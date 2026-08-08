@@ -9,13 +9,6 @@ import { LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
 
-/**
- * How often one process will run the sweep off the back of a request. Half a lease, so an expired
- * one is never more than `LEASE_TIMEOUT_MS * 1.5` old while anything at all is being served, and
- * two indexed statements per fifteen minutes per process is a cost that does not show up.
- */
-export const SWEEP_INTERVAL_MS = LEASE_TIMEOUT_MS / 2;
-
 export interface SweepResult {
   /** Expired leases returned to the queue. */
   requeued: number;
@@ -52,28 +45,6 @@ export async function sweepQueue(
   }
 
   return { requeued, retired, unsplit };
-}
-
-/**
- * A sweep hung off request traffic, at most once per `SWEEP_INTERVAL_MS` per process.
- *
- * Module state rather than a database column: the throttle exists to keep one process from
- * writing the same two statements on every request, and a second instance sweeping in the same
- * window is harmless — both statements are conditional updates over rows the other has already
- * left alone.
- */
-export function createThrottledSweep(
-  run: (now: Date) => Promise<SweepResult> = (now) => sweepQueue(prisma, now),
-  intervalMs = SWEEP_INTERVAL_MS,
-): (now?: Date) => Promise<SweepResult> | null {
-  let sweptAt: number | null = null;
-
-  return (now = new Date()) => {
-    if (sweptAt !== null && now.getTime() - sweptAt < intervalMs) return null;
-    // Stamped before the await, so a slow sweep does not admit a second one behind it.
-    sweptAt = now.getTime();
-    return run(now);
-  };
 }
 
 /**

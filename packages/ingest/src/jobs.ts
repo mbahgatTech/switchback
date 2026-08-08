@@ -1,6 +1,6 @@
 /**
- * The durable half of the ingest queue: every `waitUntil` kick also writes a row here and a
- * cron drains it, both through the same idempotent handler. See `docs/architecture.md`.
+ * The durable record of the ingest queue: every enqueue writes a row here, and the Function App
+ * drains it through the idempotent handlers. See `docs/architecture.md`.
  */
 
 import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
@@ -115,9 +115,9 @@ export interface ClaimedJob {
  * reached the top four in seventy-five hours. `reclaimExpiredJobs` owns that transition now,
  * under no limit and no ordering, and it is the only way out of `running`.
  *
- * `dedupeKeys` narrows the claim to specific work: a request drain wants the tiles under the
- * map in front of somebody, and the global answer is usually not that, since every pending
- * tile shares one viewport priority and ordering falls through to the oldest `runAfter`.
+ * `dedupeKeys` narrows the claim to specific work: a message names one tile, and the global
+ * answer is usually not that, since every pending tile shares one viewport priority and ordering
+ * falls through to the oldest `runAfter`.
  *
  * `kinds` narrows it the other way, because `ORDER BY priority DESC` is a starvation order:
  * derived work sits at `-10` and is never claimed while any request job is runnable. See
@@ -405,8 +405,8 @@ const DERIVED_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as const;
  * drains is `commitGate` in `pipeline.ts`, over the `backgroundPrisma` pool.
  *
  * **`derivedLimit` is a fairness reservation, and without it derived work never runs.** A
- * plain claim orders by `priority DESC` and derived jobs sit at `-10`, while both inline kicks
- * scope their claim to the tile keys they just queued and so cannot reach one at all. The
+ * plain claim orders by `priority DESC` and derived jobs sit at `-10`, while a message-scoped
+ * drain narrows its claim to the one tile the message named and so cannot reach one at all. The
  * second, kind-scoped claim costs one more indexed statement and makes the backlog fall at the
  * rate of the traffic that creates it.
  */
@@ -438,9 +438,9 @@ export async function drainJobs(
    * Before claiming, not after: a lease that expired a moment ago should be claimable in this
    * same tick rather than the next one.
    *
-   * No longer the *only* sweep, and that is the point: `sweepQueue` runs it on paths that drain
-   * nothing, because a drain is a side effect of traffic plus a once-a-day cron, and leases were
-   * sitting six hours past a thirty-minute lease waiting for one.
+   * No longer the *only* sweep, and that is the point: `sweepQueue` runs it from `ingestPump`'s
+   * two-minute tick, which drains nothing, so a lease left by a killed handler is reclaimed on a
+   * schedule of its own rather than waiting for the next drainer to arrive.
    *
    * Its own try/catch for the same reason the derived claim below has one: bookkeeping must not
    * be able to stop the drain.

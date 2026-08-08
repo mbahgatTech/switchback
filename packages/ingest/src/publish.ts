@@ -61,7 +61,8 @@ export interface PublishResult {
  * Enqueue has one path now, so a publish that fails is the only moment at which a tile somebody
  * is looking at depends on the pump's two-minute tick rather than on a doorbell. Nothing else
  * says so: `publishIngestSignals` cannot throw without emptying the map on a broker incident, and
- * a returned count reaches only a caller that is already inside `waitUntil`.
+ * a returned count reaches only a caller that is already inside `waitUntil`. Greppable in Vercel's
+ * runtime logs; there is no Azure-side emitter and no alert.
  */
 export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
 
@@ -74,8 +75,11 @@ export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
  * and `runPump` re-derives it from `ingest_jobs` on its next two-minute tick. Failing the request
  * instead would let a Service Bus incident empty the map.
  *
- * That recovery is why a lost signal is latency rather than loss, and `PUBLISH_FAILED_MARKER` is
- * what keeps it from being silent: `ingest_jobs` is the queue of record and this is a doorbell.
+ * That recovery is why a lost signal is latency rather than loss. `PUBLISH_FAILED_MARKER` makes the
+ * failure greppable in Vercel's runtime logs, which is where it lands and the only place it lands:
+ * Vercel writes to no Application Insights, so no rule in `infra/azure/ingest.bicep` can read it and
+ * none tries. Durability does not depend on anyone seeing it — `ingest_jobs` is the queue of record
+ * and this is a doorbell.
  */
 export async function publishIngestSignals(
   dedupeKeys: readonly string[],
