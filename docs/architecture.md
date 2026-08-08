@@ -1796,9 +1796,10 @@ order, each proved with passwords still enabled:
    `id-switchback-postgres-ci` rather than reading a stored password, and **that path runs on every
    push to `master`**: `azure/login` and the grant-convergence step are unconditional, and run
    31246622902 reached production as `id-switchback-postgres-ci` and reported
-   `switchback-runtime-grants tables=26 ungranted=0`. What has not been exercised recently is the
-   half gated on `packages/db/prisma/` changing — `assert-pg-admin.ts`, `npm run db:generate` and
-   `npm run db:push` — so a no-op schema commit while passwords still work is what proves the push.
+   `switchback-runtime-grants tables=26 ungranted=0`. The half gated on `packages/db/prisma/`
+   changing — `assert-pg-admin.ts`, `npm run db:generate` and `npm run db:push` — has run too: run
+   31183187247 carried `244edf6` and its change to `spatial.sql`, and all three reported `success`
+   against production, where the same steps report `skipped` in 31246622902.
    The hazard in that half already materialised once: `db push` runs as a role that is not
    `sbadmin`, so `trail_ways` and `trail_slug_aliases` were created owned by
    `id-switchback-postgres-ci` and `sbadmin`'s `ALTER DEFAULT PRIVILEGES` did not reach them. The

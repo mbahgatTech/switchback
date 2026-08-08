@@ -939,14 +939,16 @@ side and stays `true` until every consumer has been proved on a token.
    worked last week".
 6. Only now set `passwordAuthEnabled = false` and deploy.
 
-Two things to settle before step 6. The `migrate` job in `ci.yml` mints its own token and reads
-neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`. Half of that is already proven —
-`azure/login` and the grant-convergence step are unconditional, and run 31246622902 reached
-production over the token. The half gated on `packages/db/prisma/` changing is not, so push a no-op
-change under that path while passwords still work, and a failure is a red run rather than an outage.
-And `.env` on the owner's machine points at production — point it at the local Docker Postgres
-first, or every db script, `npm run dev` and the e2e suite stop working at step 6 with a connection
-error and no explanation.
+One thing to settle before step 6, and one already settled. The `migrate` job in `ci.yml` mints its
+own token and reads neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`, and both
+halves of it have run on `master` over that token. The unconditional half — `azure/login` and grant
+convergence — ran in run 31246622902. The half gated on `packages/db/prisma/` changing ran in run
+31183187247, which carried `244edf6` and its change to `spatial.sql`: `assert-pg-admin.ts`,
+`npm run db:generate` and `npm run db:push` each reported `success` against production, and those
+same three steps report `skipped` in 31246622902, which is what tells the two halves apart. No
+no-op schema commit is outstanding. What does still need settling is `.env` on the owner's machine,
+which points at production — point it at the local Docker Postgres first, or every db script,
+`npm run dev` and the e2e suite stop working at step 6 with a connection error and no explanation.
 
 After step 6 the recorded `sbadmin` password stops being break-glass. It is not a door any more; the
 server refuses password authentication outright, and from step 6 onward the template needs no
