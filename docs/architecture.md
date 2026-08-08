@@ -1405,7 +1405,7 @@ graph LR
   FUNC -->|Data Sender, Data Receiver| SB
   VERCEL -.->|sbapp password| PG
   FUNC -.->|sbapp password| PG
-  RUNTIME -->|sbapp_vercel<br/>mapped, unused, renamed on cutover| PG
+  RUNTIME -->|sbapp_vercel<br/>mapped, unused, awaiting DATABASE_AUTH=entra-vercel| PG
   FUNC -->|sbapp_func<br/>mapped, ready, awaiting databaseAuth=entra| PG
   CI -->|Entra administrator<br/>ci.yml migrate, postgres-entra.yml| PG
   OWNER -->|Entra administrator| PG
@@ -1453,16 +1453,17 @@ Postgres role, `pg_hba` entry or RLS predicate can tell the two Vercel environme
 the FIC subject does not survive the token exchange — only the identity's object id does. Entra's
 sign-in logs can, which makes it forensics, not enforcement.
 
-**The consolidation is declared, not yet performed, and the diagram says so.** What is deployed is
-the identity and its two federated credentials. What is not:
+**The move onto this identity is declared, not yet performed, and the diagram says so.** What is
+deployed is the identity and its two federated credentials. What is not:
 
-- `sbapp_runtime` does not exist. Read from the live catalog on 2026-08-06 as the owner's Entra
-  administrator, `pg_roles` holds `sbapp`, `sbapp_func`, `sbapp_vercel` and `sbadmin`, and
+- `sbapp_runtime` does not exist, and is no longer planned. Read from the live catalogue on
+  2026-08-08 as the owner's Entra administrator, `pg_roles` holds `sbadmin`, `sbapp`,
+  `sbapp_vercel`, `sbapp_func`, `id-switchback-postgres-ci` and the owner's UPN, and
   `pgaadauth_list_principals` maps `sbapp_vercel` to `c9bfba39-…` and `sbapp_func` to
-  `3db30cfd-…` — the two-role topology this change replaces. `infra/postgres-identity/roles.sql`
-  carries the `ALTER ROLE sbapp_vercel RENAME TO sbapp_runtime` that creates it, and that has run
-  nowhere: the CI identity's federated credential trusts `refs/heads/master` alone, so the
-  provisioning workflow cannot execute from a branch.
+  `3db30cfd-…`. That two-role topology is the deployed one and the intended one: folding the two
+  into one presupposes the worker moving onto the shared identity, which is the change the next
+  bullet rules out. `infra/postgres-identity/roles.sql` converges and asserts both roles rather
+  than renaming either.
 - The ingest worker still runs on its own system-assigned identity, `3db30cfd-…`, and holds both
   Service Bus grants under it. It also already has a working Entra path to Postgres: `sbapp_func` is
   mapped to that principal and is a member of `sbapp`, so removing the worker's password does not
@@ -1481,8 +1482,8 @@ the identity and its two federated credentials. What is not:
   group, not the assignment, which reads like the wrong error until you know that.
 
 The solid Postgres edges are drawn from the object ids on both ends rather than from the names,
-because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts the
-mapping against the live catalog after the rename rather than assuming the rename carried it.
+because a role mapped to the wrong principal fails only at first use. `roles.sql` asserts each role
+against the object id its run was given, so that mismatch surfaces in the workflow instead.
 
 Two things the diagram is meant to make obvious. The deploying service principal holds Contributor
 at subscription scope and Role Based Access Control Administrator on the production resource group,
@@ -1658,8 +1659,8 @@ header into a module-level holder closes even that, at the cost of holding a bea
 memory.
 
 The identity Vercel presents is `id-switchback-vercel-publisher`, principal id `c9bfba39-…` — the
-same one already trusted for Service Bus, and the one the `sbapp_vercel` database role carries
-until the rename in _What is left_ makes it `sbapp_runtime`.
+same one already trusted for Service Bus, and the one the `sbapp_vercel` database role is mapped
+to.
 
 Whether retiring connections is a correctness requirement or only hygiene turns on one question
 nobody should answer from memory: **is the token checked only at connect, or is a live session
@@ -1753,12 +1754,14 @@ but **no consumer has `DATABASE_AUTH` set**, so the path is password-authenticat
 no Entra-authenticated Prisma query has ever run against production. Four things come off in this
 order, each proved with passwords still enabled:
 
-1. **The database role.** `sbapp_runtime` does not exist yet; `infra/postgres-identity/roles.sql`
-   renames `sbapp_vercel` into it and then asserts the Entra security label survived the rename.
-   That assertion is the gate, because the label follows the role's oid and a rename not carrying
-   it would leave a role mapped to nothing — recoverable by the inverse rename, since nothing is
-   dropped. It cannot run from a branch: the CI identity's federated credential trusts
-   `refs/heads/master` alone, so this executes on merge.
+1. **The database roles.** Both already exist and are Entra-mapped —
+   `infra/postgres-identity/roles.sql` converges `sbapp_vercel` against the shared identity's
+   object id and `sbapp_func` against the worker's, then asserts each mapping rather than assuming
+   it, because a security label follows the role's oid and an identity recreated since would leave
+   a role matching nothing. That failure otherwise surfaces at first use, which is a web request.
+   The `provision` action cannot run from a branch: the CI identity's federated credential trusts
+   `refs/heads/master` alone, so it executes on merge. Against the deployed estate it creates
+   nothing and only asserts.
 2. **The Function App.** `databaseAuth: 'entra'` in `ingest.bicepparam`, and a `databaseUrl` naming
    `sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that still carries one, so
    the half-done version fails at connect rather than quietly preferring the password. Nothing needs

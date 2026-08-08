@@ -1,6 +1,6 @@
--- What the Entra-mapped role may do, against the `switchback` database.
+-- What the Entra-mapped roles may do, against the `switchback` database.
 --
--- **The specification is `sbapp` itself, by membership rather than by copy.** Every grant the
+-- **The specification is `sbapp` itself, by membership rather than by copy.** Every grant an
 -- application role holds — CONNECT, USAGE on public, and INSERT/SELECT/UPDATE/DELETE on the
 -- tables, including whatever `ALTER DEFAULT PRIVILEGES` hands the next table `prisma db push`
 -- creates — is inherited. A second list of GRANTs would be a second thing to keep in step, and
@@ -13,10 +13,11 @@
 
 \set ON_ERROR_STOP on
 
-GRANT sbapp TO sbapp_runtime;
+GRANT sbapp TO sbapp_vercel;
+GRANT sbapp TO sbapp_func;
 
--- It may do nothing else. `pgaadauth_create_principal_with_oid(..., isAdmin => false)` already
--- creates the role without CREATEDB or CREATEROLE and outside `azure_pg_admin`; this states it as
+-- They may do nothing else. `pgaadauth_create_principal_with_oid(..., isAdmin => false)` already
+-- creates a role without CREATEDB or CREATEROLE and outside `azure_pg_admin`; this states it as
 -- an assertion so a role that acquired one later fails this file rather than passing silently.
 DO $$
 DECLARE
@@ -24,20 +25,20 @@ DECLARE
 BEGIN
   SELECT string_agg(rolname, ', ') INTO offender
     FROM pg_roles
-   WHERE rolname = 'sbapp_runtime'
+   WHERE rolname IN ('sbapp_vercel', 'sbapp_func')
      AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolbypassrls OR rolreplication);
   IF offender IS NOT NULL THEN
-    RAISE EXCEPTION 'the runtime role carries attributes it should not: %', offender;
+    RAISE EXCEPTION 'an application role carries attributes it should not: %', offender;
   END IF;
 
-  SELECT string_agg(g.rolname, ', ') INTO offender
+  SELECT string_agg(r.rolname || ' -> ' || g.rolname, ', ') INTO offender
     FROM pg_auth_members m
     JOIN pg_roles r ON r.oid = m.member
     JOIN pg_roles g ON g.oid = m.roleid
-   WHERE r.rolname = 'sbapp_runtime'
+   WHERE r.rolname IN ('sbapp_vercel', 'sbapp_func')
      AND g.rolname <> 'sbapp';
   IF offender IS NOT NULL THEN
-    RAISE EXCEPTION 'the runtime role is a member of something other than sbapp: %', offender;
+    RAISE EXCEPTION 'an application role is a member of something other than sbapp: %', offender;
   END IF;
 END
 $$;

@@ -1,12 +1,15 @@
-// The identity the runtime clients are being consolidated onto — Vercel production, Vercel preview
-// and the ingest worker — so that one principal, one Postgres role and one grant set are what
-// there is to audit.
+// The identity Vercel production and Vercel preview both federate to, so that one principal, one
+// Postgres role and one grant set are what there is to audit across the two of them.
 //
-// **Declared, not yet in force.** Today Vercel authenticates by password (`DATABASE_AUTH` is set
-// by no consumer) and the ingest worker runs as its own system-assigned principal,
-// `3db30cfd-ea61-47ce-9b03-8b34ebc420b0`. The cutover that makes this identity the one they use is
-// sequenced in infra/azure/README.md and is gated on each consumer being proved on a token while
-// passwords still work. Nothing here performs it.
+// **Declared, not yet in force.** Vercel authenticates by password today — `DATABASE_AUTH` is set
+// by no consumer — and its Entra-mapped role `sbapp_vercel` waits unused. The cutover is sequenced
+// in infra/azure/README.md and is gated on each consumer being proved on a token while passwords
+// still work. Nothing here performs it.
+//
+// **The ingest worker is not one of these clients.** It runs as its own system-assigned principal
+// `3db30cfd-ea61-47ce-9b03-8b34ebc420b0`, whose Postgres role is `sbapp_func`. Its Service Bus
+// trigger receives as whatever principal the site runs under, so an app running as this identity
+// would need Data Receiver on `ingest-jobs` put back on an identity every Vercel preview carries.
 //
 // Declared here rather than in ingest.bicep because it is not only the worker's identity: it is
 // the database principal for the web application as well, and two templates declaring one resource
@@ -20,10 +23,9 @@
 // previews included, and the worker never needed it, because the worker receives as the Function
 // App's own system-assigned principal.
 //
-// The identity is not an administrator of anything. Its intended database privilege is
-// `sbapp_runtime` — a role that does not exist until the `provision` action renames `sbapp_vercel`
-// — and see infra/postgres-identity/ for the privilege set, which is a SQL object no template can
-// declare.
+// The identity is not an administrator of anything. Its database privilege is `sbapp_vercel`,
+// which holds exactly what `sbapp` holds, by membership. See infra/postgres-identity/ for the
+// privilege set — a SQL object no template can declare.
 
 @description('Azure region. Inherited from main.bicep.')
 param location string
