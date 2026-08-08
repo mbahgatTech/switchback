@@ -5,7 +5,9 @@
 // group `main.bicep` already created and never declares the Postgres server, its database, its
 // firewall rules or its parameters. `administratorLoginPassword` is `@secure()` with no default
 // and ARM cannot read the current value back, so any deployment that includes `postgres.bicep`
-// writes whatever it is handed — and the live password is not recorded anywhere readable. Adding
+// writes whatever it is handed. The live value is recorded outside the repository — see
+// infra/azure/README.md, "Read this first" — but ARM cannot consult that record, so handing the
+// wrong value to a template that declares the server rotates the production credential. Adding
 // these resources to `main.bicep` would have made shipping a queue and rotating the production
 // database password the same operation. This file cannot do that: `main.bicep` is not touched and
 // is never redeployed by this work.

@@ -454,9 +454,11 @@ gh secret list --repo mbahgatTech/switchback
 npx vercel env ls
 ```
 
-GitHub's values cannot be read back, so the `Notes` column is design intent plus what each consumer
-demonstrably requires, not a readback. If you need to know what a secret contains, the only honest
-answer is to set it again from a source you trust.
+GitHub's API returns names and timestamps, never values, so the `Notes` column is design intent plus
+what each consumer demonstrably requires, not a readback. A workflow can still print a secret, which
+is the blast radius named in [Read this first](#read-this-first) and the reason
+`DIRECT_DATABASE_URL` counts as a recorded copy of the admin password. Short of writing that
+workflow, setting a secret again from a source you trust is the honest way to know what it holds.
 
 ### Preview has no database
 
@@ -606,8 +608,9 @@ az deployment sub create \
   --parameters infra/azure/main.bicepparam
 ```
 
-**Put that password in a password manager now, before going any further.** This is the only moment
-it is readable — see [Redeploying](#redeploying) for what depends on it.
+**Record that password now, before going any further**, in the places [Read this
+first](#read-this-first) inventories. This is the only moment it is readable — see
+[Redeploying](#redeploying) for what depends on it.
 
 Read the outputs — hostname, ports, and the two connection-string templates, none of which contains
 the password:
@@ -616,8 +619,8 @@ the password:
 az deployment sub show --name switchback-db --query properties.outputs -o json
 ```
 
-Then shred the scratch files. This is **not** an archival step; the password manager above is the
-only copy that survives:
+Then shred the scratch files. This is **not** an archival step; the copies recorded above are the
+only ones that survive:
 
 ```bash
 rm -f "$TMP/pgpw"
@@ -721,9 +724,13 @@ live credential untouched. Export `PGADMIN_PASSWORD` only when creating the serv
 to rotate, and when you rotate, every connection string carrying the old value stops working —
 including the ones Vercel is serving the site with.
 
-If you do intend to keep a value, a password-manager entry is the only place it can live. Not the
-`$TMP` file, which the deploy procedure shreds; not a GitHub Actions secret, which cannot be read
-back; not Vercel, which is deliberately never given the admin credential.
+If you do intend to keep a value, put it where [Read this first](#read-this-first) already counts it:
+`~/.switchback/pg-sbadmin-password`, owner-readable only, and the `DIRECT_DATABASE_URL` repository
+secret. Not the `$TMP` file, which the deploy procedure shreds; not Vercel, which is deliberately
+never given the admin credential. The repository secret is readable only by a workflow that prints
+it — the API returns names and timestamps, never values — which is both why it counts as a copy and
+why it sets the blast radius. A value kept anywhere else is outside that inventory, and the inventory
+goes stale without saying so.
 
 Deleting a Flexible Server deletes all of its backups, irrecoverably, which is what the resource
 group's `CanNotDelete` lock exists to prevent.
@@ -925,10 +932,12 @@ continuously, replacing a once-daily Vercel cron that claimed four tiles a run a
 **It is a separate template, at resource-group scope, and that is the point.** It never declares the
 server, its database, its firewall rules or its parameters. `administratorLoginPassword` is
 `@secure()` with no default and ARM cannot read the current value back, so any deployment that
-includes `postgres.bicep` writes whatever it is handed — and the live password is unconfirmed (see
-[Read this first](#read-this-first)). Shipping a queue must not be the same operation as rotating the
-production password. `main.bicep` is not modified by this work and is not redeployed by it. There is
-no lock resource here either: the group's existing `CanNotDelete` does not block creates.
+includes `postgres.bicep` writes whatever it is handed. The live value is recorded — see [Read this
+first](#read-this-first) — but ARM cannot consult that record, so handing the wrong value to a
+template that declares the server rotates the production credential. Shipping a queue must not be the
+same operation as rotating the production password. `main.bicep` is not modified by this work and is
+not redeployed by it. There is no lock resource here either: the group's existing `CanNotDelete` does
+not block creates.
 
 | Resource        | Value                                                                                  |
 | --------------- | -------------------------------------------------------------------------------------- |
