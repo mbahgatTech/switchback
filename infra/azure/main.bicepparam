@@ -248,10 +248,11 @@ param entraAuthEnabled = true
 // here while this migration was proved from one; it is not any more.
 param ciIdentityBranches = ['master']
 
-// One identity for every runtime client — Vercel production, Vercel preview and the ingest
-// worker. The name is the deployed one and is now narrower than the role: ARM cannot rename a
-// user-assigned identity, so renaming it here would create a second one and leave the first
-// holding every live grant. runtime-identity.bicep carries the accurate description.
+// The identity Vercel production and Vercel preview both federate to, and only those two. The
+// ingest worker is a separate principal — the Function App's own system-assigned identity, whose
+// Postgres role is `sbapp_func` — and stays one; runtime-identity.bicep says why. The name is the
+// deployed one: ARM cannot rename a user-assigned identity, so renaming it here would create a
+// second one and leave the first holding every live grant.
 param runtimeIdentityName = 'id-switchback-vercel-publisher'
 
 // Both halves of every federated-credential subject. Entra matches the subject as an exact

@@ -11,9 +11,9 @@
 // trigger receives as whatever principal the site runs under, so an app running as this identity
 // would need Data Receiver on `ingest-jobs` put back on an identity every Vercel preview carries.
 //
-// Declared here rather than in ingest.bicep because it is not only the worker's identity: it is
-// the database principal for the web application as well, and two templates declaring one resource
-// is how drift starts. ingest.bicep takes `resourceId` below as a parameter.
+// Declared here rather than in ingest.bicep because it is the web application's database
+// principal, not the worker's, and ingest.bicep needs only its resource id — two templates
+// declaring one resource is how drift starts. ingest.bicep takes `resourceId` below as a parameter.
 //
 // **The identity, and nothing the identity is granted.** Its Service Bus role assignment belongs
 // to ingest.bicep, which owns the namespace and the queue it is scoped to; declaring it here too

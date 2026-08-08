@@ -1359,10 +1359,11 @@ snapshot-differencing invents traffic on ground nobody has hiked.
 
 ## Authentication
 
-Seven trust relationships. Four are identity-based and carry no secret at all; three still pass a
-stored password, and moving those is the work in progress. This section is the single picture,
-because until it existed the story lived in a Bicep comment, a workflow, a Vercel setting and two
-people's memory.
+Twelve trust relationships are drawn below. Seven present an Entra token and hold no stored secret;
+two more are Entra-mapped and privileged but carry nothing yet; two pass the stored `sbapp`
+password, and moving those is the work in progress; the last is a reader's session cookie. This
+section is the single picture — the story otherwise lives in a Bicep comment, a workflow and a
+Vercel setting.
 
 ### Where it all runs
 
@@ -1377,9 +1378,11 @@ than Mermaid.
 ### Who trusts whom
 
 Solid edges are identity-based: the caller proves who it is and Entra issues a short-lived token.
-Dashed edges are not. Two of the three carry the stored `sbapp` password; the third is a move not
-yet made and carries no credential at all. `sbadmin`, which holds full DDL, is not drawn: it
-reaches this server by password too, but the secret holding that password has no consumer left.
+Two of them carry nothing yet — `sbapp_vercel` and `sbapp_func` are mapped and already hold
+`sbapp`'s grants by membership, and each label names the setting it waits on. The two dashed edges
+are the stored `sbapp` password, which is what both applications connect with today. `sbadmin`,
+which holds full DDL, is not drawn: it reaches this server by password too, but the secret holding
+that password has no consumer left.
 
 ```mermaid
 graph LR
@@ -1414,17 +1417,23 @@ graph LR
   READER -->|session cookie| VERCEL
 ```
 
-**One identity for every runtime client.** `id-switchback-vercel-publisher` is what Vercel
-production, Vercel preview and the ingest worker are all intended to authenticate as — one
-principal, one Postgres role, one grant set. Its two federated credentials distinguish the Vercel
-environments to Entra and to nothing else: the access token carries the identity's object id, so
-Postgres, Azure RBAC and every policy downstream see one caller. **That is the objection to this
-design, and it is now sharper than when it was written.** Preview holds no connection string, so a
-preview deployment cannot reach production Postgres today; consolidating onto this identity would
-give it back, by being a preview deployment rather than by holding a secret. The consolidation also
-removes the ability to revoke one consumer without the others. The two roles it replaces hold
-identical privileges, so nothing that was ever differentiated is lost in _privilege_; what is lost
-there is attribution, and `application_name` is what restores it. Attribution, not a boundary: any
+**One identity across the two Vercel environments, and four principals in the database.**
+`id-switchback-vercel-publisher` is what Vercel production and Vercel preview both federate to —
+one principal, one Postgres role (`sbapp_vercel`), one grant set across the two of them. The ingest
+worker is not one of these clients: it authenticates as the Function App's own system-assigned
+identity `3db30cfd-…`, whose role is `sbapp_func`, and the bullets below say why folding it in is
+refused. `pgaadauth_list_principals` returns four Entra principals — the owner, the CI identity
+`id-switchback-postgres-ci`, `sbapp_vercel` and `sbapp_func` — alongside the password roles
+`sbadmin` and `sbapp`.
+
+The two federated credentials distinguish the Vercel environments to Entra and to nothing else: the
+access token carries the identity's object id, so Postgres, Azure RBAC and every policy downstream
+see one caller. **That is the objection to this design, and it is now sharper than when it was
+written.** Preview holds no connection string, so a preview deployment cannot reach production
+Postgres today; moving Vercel onto this identity gives it back, by being a preview deployment
+rather than by holding a secret, and it removes the ability to revoke one environment without the
+other. What is lost is attribution rather than privilege — the two environments hold identical
+grants either way — and `application_name` is what restores it. Attribution, not a boundary: any
 client can set it to anything.
 
 **What does change is how the credential is obtained, and that is the part worth deciding on.**
@@ -1762,12 +1771,15 @@ order, each proved with passwords still enabled:
    The `provision` action cannot run from a branch: the CI identity's federated credential trusts
    `refs/heads/master` alone, so it executes on merge. Against the deployed estate it creates
    nothing and only asserts.
-2. **The Function App.** `databaseAuth: 'entra'` in `ingest.bicepparam`, and a `databaseUrl` naming
-   `sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that still carries one, so
-   the half-done version fails at connect rather than quietly preferring the password. Nothing needs
-   creating first: `sbapp_func` is Entra-mapped to this app's own **system-assigned** principal
+2. **The Function App.** `param databaseAuth = 'entra'` added to `ingest.bicepparam`, which assigns
+   it nowhere today, and `INGEST_DATABASE_URL` exported naming `sbapp_func` with no password in it —
+   `entraPoolConfig` refuses a URL that still carries one, so the half-done version fails at connect
+   rather than quietly preferring the password. Nothing needs creating first: `sbapp_func` is
+   Entra-mapped to this app's own **system-assigned** principal
    `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the same table
-   grants the password role has.
+   grants the password role has, and the server already has `activeDirectoryAuth: Enabled`. The
+   deployment writes two application settings on the Function App; `ingest.bicep` declares no
+   `Microsoft.DBforPostgreSQL` resource, so the server is not in the change set.
 
    **Do not move this app onto the shared identity to get there.** The trigger binding sets no
    `__clientId`, so the host receives Service Bus messages as whatever principal the site runs
