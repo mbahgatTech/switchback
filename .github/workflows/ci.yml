@@ -470,8 +470,10 @@ jobs:
         id: schema
         run: npx tsx scripts/schema-changed.ts "${{ github.event.before }}" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
 
-      - if: steps.schema.outputs.changed == 'true'
-        uses: azure/login@v2
+      # Unconditional, unlike the push below: the grant convergence at the end of this job has to
+      # run whether or not this commit touched the schema, because the database it repairs drifted
+      # under an earlier one.
+      - uses: azure/login@v2
         # The same identity and the same federated credential `postgres-entra.yml` uses, and
         # for the same reason: it holds no Azure RBAC at all, so `allow-no-subscriptions` is
         # the least privilege working rather than a broken credential.
@@ -527,6 +529,24 @@ jobs:
           set -euo pipefail
           . ./.github/scripts/pg-token-url.sh
           npm run db:push
+
+      # After the push, so the tables it created exist to be granted on, and unconditional, so a
+      # database that is already short converges rather than waiting for the next new table.
+      #
+      # `ALTER DEFAULT PRIVILEGES` is registered per creating role. This job pushes as
+      # `id-switchback-postgres-ci` and the only registration in the database was
+      # `FOR ROLE sbadmin`, so `trail_ways` and `trail_slug_aliases` reached production with no
+      # privilege for `sbapp` at all — which is what made `INGEST_TRAIL_IDENTITY=claim`
+      # unreachable there. The script explains the mechanism and asserts the outcome.
+      - name: Converge the runtime role's grants
+        env:
+          PGHOST: psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com
+          PGUSER: id-switchback-postgres-ci
+          PGDATABASE: switchback
+        run: |
+          set -euo pipefail
+          . ./.github/scripts/pg-token-url.sh
+          ./node_modules/.bin/tsx scripts/converge-runtime-grants.ts
 
   deploy:
     name: deploy production

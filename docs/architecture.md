@@ -190,14 +190,16 @@ az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
 ```
 
 **Two things about those two commands, both learned the hard way.** `--no-sensitive` is not
-cosmetic: `vercel env add` marks Production and Preview values sensitive by default, a sensitive
-variable reads back from `vercel env pull` as `INGEST_QUEUE_DRIVER=""` and prints as `Encrypted`
-under `vercel env ls` — the first indistinguishable from unset, the second unable to tell one driver
-from the other, and both the exact failure this runbook exists to make visible. Today's variable is
-sensitive in both environments, so whichever direction is taken next is also the one that makes it
-readable. And the empty `""` positional in the Preview line is the git-branch argument: without it
-the CLI answers `git_branch_required` and suggests the command you just ran, in a loop. Passing the
-value on stdin instead of `--value` sets it to the empty string silently.
+cosmetic: `vercel env add` marks Production and Preview values sensitive by default, and a sensitive
+variable reads back from `vercel env pull` as `INGEST_QUEUE_DRIVER=""` — indistinguishable from
+unset, and the exact failure this runbook exists to make visible. It does **not** change what
+`vercel env ls` prints. On CLI 54.1.0 a `--no-sensitive` variable still lists as `Encrypted`,
+measured on 2026-08-08 against `INGEST_TRAIL_IDENTITY` written with the flag and read back by
+`env pull` as the literal `claim`, so `env pull` is the only check that distinguishes the two and
+`env ls` answers presence alone. And the empty `""` positional in the Preview line is the
+git-branch argument: without it the CLI answers `git_branch_required` and suggests the command you
+just ran, in a loop. Passing the value on stdin instead of `--value` sets it to the empty string
+silently.
 
 **Both** Vercel environments, in step 1. The flag is per environment and Preview's `DATABASE_URL`
 resolves to `psql-switchback-prod-37ywppu5p7fri` — the production server — so a Preview left on
@@ -229,7 +231,8 @@ az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_QUEUE_DRIVER=postgres -o none
 
 # 3. Vercel, both environments. `--no-sensitive` is what makes step 5 able to read the value
-#    back; the `""` on the preview line is the git-branch positional. Both are explained above.
+#    back with `env pull`; the `""` on the preview line is the git-branch positional. Both are
+#    explained above.
 vercel env rm INGEST_QUEUE_DRIVER production --yes
 vercel env rm INGEST_QUEUE_DRIVER preview --yes
 vercel env add INGEST_QUEUE_DRIVER production --value postgres --no-sensitive --yes
@@ -242,10 +245,15 @@ vercel env add INGEST_QUEUE_DRIVER preview "" --value postgres --no-sensitive --
 vercel redeploy switchback-three.vercel.app --target production
 vercel ls --environment preview
 
-# 5. Verify all three. The deployment check is the load-bearing one: `env ls` reads the project's
-#    variable set, which step 3 already wrote, so it reports success whether or not any
-#    deployment carrying the change exists.
-vercel env ls production | grep INGEST_QUEUE_DRIVER   # expect the literal postgres, not Encrypted
+# 5. Verify all three. The deployment check is the load-bearing one: the variable set is what
+#    step 3 already wrote, so it reports success whether or not any deployment carrying the
+#    change exists.
+#
+#    `env pull` rather than `env ls`: `ls` prints `Encrypted` for a `--no-sensitive` value too,
+#    so it answers presence and never which driver. The file it writes holds every production
+#    secret — put it outside this repository, which is public, and delete it.
+vercel env pull /tmp/switchback.env --environment production --yes
+grep '^INGEST_QUEUE_DRIVER=' /tmp/switchback.env && rm -f /tmp/switchback.env   # expect postgres
 vercel ls --environment production                    # newest row's Age must be younger than step 3
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
@@ -254,7 +262,7 @@ az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
 
 **The rollback is also what makes the Vercel side readable.** Step 3 replaces a sensitive value with
 a `--no-sensitive` one, which is why `env rm` precedes `env add` rather than the value being edited
-in place, and why step 5's `env ls` can expect the literal `postgres` rather than `Encrypted`.
+in place, and why step 5's `env pull` can expect the literal `postgres` rather than `""`.
 
 Step 1 is instant and reversible and stops the queue filling — but it stops _new_ publishes, not the
 up-to-eight messages already on the queue, which the trigger keeps working. So the worker has to be
@@ -686,6 +694,21 @@ value set on one side and not the other is a difference an operator can see rath
 appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
 of a silent fallback, which is why they exist at all: `@switchback/ingest` reads both from
 `process.env` itself.
+
+**And `claim` needs a database privilege the flag cannot grant.** `resolveTrail` reads `TrailWay`
+before it decides anything, so a runtime role without SELECT on `trail_ways` fails every trail in
+every tile with `42501` rather than falling back. Check it before flipping, not after:
+
+```bash
+# Expect four `t`. Anything else and the flag will empty the tiles it touches.
+psql -Atc "select has_table_privilege('sbapp','trail_ways','SELECT'),
+                  has_table_privilege('sbapp','trail_ways','INSERT'),
+                  has_table_privilege('sbapp','trail_slug_aliases','SELECT'),
+                  has_table_privilege('sbapp','trail_slug_aliases','INSERT')"
+```
+
+`scripts/converge-runtime-grants.ts` is what keeps that true — the migrate job runs it after every
+push and fails on any application table the runtime role cannot use.
 
 **The ceiling stays at 9 even though the seam is fixed, and the reason is arithmetic rather than
 correctness.** Every split observed in production ran out of clock in the _commit_ phase, never the
@@ -1755,8 +1778,21 @@ node-postgres 8.22.0; the full matrix is at the foot of `infra/azure/postgres.bi
 `trail_ways` and `trail_slug_aliases` exist and are empty — `information_schema.tables` returns both,
 with 2 and 3 columns respectively, and `count(*)` is 0 on each. CI run `31183187247` at `244edf6`
 records `Prove the token connects` and `Reconcile the production schema` both succeeding, so the
-schema is current. `pg_stat_user_tables` puts `n_tup_ins` at 0 for both: the claim mechanism has
-never written a row, which is what `INGEST_TRAIL_IDENTITY` being `osm-id` means.
+schema is current. `pg_stat_user_tables` puts `n_tup_ins` at 0 for both.
+
+**They are empty because the runtime role cannot write them, not because the flag is off**, and the
+two readings are not interchangeable. `ALTER DEFAULT PRIVILEGES` is registered per creating role and
+the only registration in this database is `FOR ROLE sbadmin`; the migrate job pushes as
+`id-switchback-postgres-ci`, so these two — the first tables to arrive by that route — are owned by
+it and inherit nothing. Measured 2026-08-08: `has_table_privilege('sbapp', 'trail_ways', …)` is
+`false` for SELECT, INSERT, UPDATE and DELETE alike, against `true` on all 24 `sbadmin`-owned tables.
+`INGEST_TRAIL_IDENTITY=claim` is therefore unreachable in production: `resolveTrail` reads
+`TrailWay` before it does anything else, so the read raises
+`42501 permission denied for table trail_ways` and unwinds the whole per-trail commit. Turning the
+flag on over tile `030230221` assembled 42 trails and committed none of them; turning it back off and
+re-running the same tile committed all 42. `scripts/converge-runtime-grants.ts`, run by the migrate
+job after every push, registers the missing default privileges and grants over the tables already on
+the ground, and fails the job if any application table is still short.
 
 **102 groups — 204 trail rows — share byte-identical geometry**, by `md5(st_asbinary(geom))`, and 85
 of those pairs are a relation against a way. Kibbie Lake Trail is one: way `162652736` and relation
