@@ -5,8 +5,9 @@
 
 /** Thrown by any phase that would run past the invocation's deadline. */
 export class IngestDeadlineError extends Error {
-  constructor(phase: string, overrunMs: number) {
-    super(`ingest deadline for this invocation passed ${Math.round(overrunMs / 1000)}s ago`);
+  /** `note` carries anything else that went wrong in the same phase, so one message holds both. */
+  constructor(phase: string, overrunMs: number, note = '') {
+    super(`ingest deadline for this invocation passed ${Math.round(overrunMs / 1000)}s ago${note}`);
     this.name = 'IngestDeadlineError';
     this.phase = phase;
   }

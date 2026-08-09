@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { JobKind, TileStatus } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   AREA_PRIORITY,
@@ -24,6 +24,8 @@ interface TileRow {
   quadkey: string;
   status: TileStatus;
   fetchedAt: Date | null;
+  /** Trails the tile has committed. Absent means none, as a fresh row would report. */
+  trailCount?: number;
 }
 
 interface Recorded {
@@ -34,6 +36,8 @@ interface Recorded {
 interface FakeOptions {
   /** Dedupe keys the fake should report as queued or running. */
   inFlight?: string[];
+  /** Dedupe keys whose retry ladder ran out — `dead`, in the job table's words. */
+  dead?: string[];
   /** What the admission guard's grouped count answers — the queue-depth guard's input. */
   queueDepth?: number;
 }
@@ -52,10 +56,15 @@ function fakeDb(
 ): { db: PrismaClient; recorded: Recorded } {
   const recorded: Recorded = { tileUpserts: [], jobUpserts: [] };
   const inFlight = options.inFlight ?? [];
+  const dead = options.dead ?? [];
   const db = {
     ingestTile: {
       findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
-        Promise.resolve(existing.filter((tile) => where.quadkey.in.includes(tile.quadkey))),
+        Promise.resolve(
+          existing
+            .filter((tile) => where.quadkey.in.includes(tile.quadkey))
+            .map((tile) => ({ trailCount: 0, ...tile })),
+        ),
       upsert: (args: { where: { quadkey: string }; create: Record<string, unknown> }) => {
         recorded.tileUpserts.push(args);
         return Promise.resolve(args.create);
@@ -63,11 +72,14 @@ function fakeDb(
     },
     ingestJob: {
       findMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) =>
-        Promise.resolve(
-          inFlight
+        Promise.resolve([
+          ...inFlight
             .filter((key) => where.dedupeKey.in.includes(key))
-            .map((dedupeKey) => ({ dedupeKey })),
-        ),
+            .map((dedupeKey) => ({ dedupeKey, status: JobStatus.queued })),
+          ...dead
+            .filter((key) => where.dedupeKey.in.includes(key))
+            .map((dedupeKey) => ({ dedupeKey, status: JobStatus.dead })),
+        ]),
       groupBy: () =>
         Promise.resolve([{ kind: JobKind.ingest_tile, _count: { _all: options.queueDepth ?? 0 } }]),
       updateMany: () => Promise.resolve({ count: 0 }),
@@ -139,6 +151,62 @@ describe('ensureCoverage partitioning', () => {
     expect(result.ready).toEqual([]);
     expect(result.pending).toEqual([quadkey]);
     expect(result.queued).toEqual([quadkey]);
+  });
+
+  it('serves a failed tile that holds trails instead of calling it still loading', async () => {
+    /*
+     * The tile a lost trail produces: 899 of 900 committed, `failed` because of the last one.
+     * `pending` is the set `explore.tsx` refetches on every 2.5 s, so classifying this as
+     * pending both hides trails that are in the table and starts a poll for them.
+     */
+    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const { db } = fakeDb([
+      { quadkey, status: TileStatus.failed, fetchedAt: null, trailCount: 899 },
+    ]);
+
+    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+
+    expect(result.ready).toEqual([quadkey]);
+    expect(result.refreshing).toEqual([quadkey]);
+    expect(result.pending).toEqual([]);
+    // Still queued: it is short a trail and a retry is owed.
+    expect(result.queued).toEqual([quadkey]);
+  });
+
+  it('stops polling and stops queueing once the tile job is out of attempts', async () => {
+    /*
+     * `enqueue` revives `dead` with `attempts` reset to zero, so a poll that re-queues a buried
+     * job restarts the ladder every 2.5 s and the tile re-runs for as long as the map is open.
+     * Neither half may happen: no `pending` entry to poll on, no job upsert to revive it.
+     */
+    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const { db, recorded } = fakeDb([{ quadkey, status: TileStatus.failed, fetchedAt: null }], {
+      dead: [`ingest_tile:${quadkey}`],
+    });
+
+    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+
+    expect(result.pending).toEqual([]);
+    expect(result.queued).toEqual([]);
+    expect(recorded.jobUpserts).toHaveLength(0);
+  });
+
+  it('still draws what a buried tile committed before it gave up', async () => {
+    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const { db } = fakeDb(
+      [{ quadkey, status: TileStatus.failed, fetchedAt: null, trailCount: 899 }],
+      {
+        dead: [`ingest_tile:${quadkey}`],
+      },
+    );
+
+    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+
+    expect(result.ready).toEqual([quadkey]);
+    expect(result.pending).toEqual([]);
+    // Not `refreshing`: nothing is running behind it, and saying so would be a lie.
+    expect(result.refreshing).toEqual([]);
+    expect(result.queued).toEqual([]);
   });
 
   it('counts an empty tile as covered — "no trails here" is an answer', async () => {
@@ -269,10 +337,23 @@ describe('surveyArea', () => {
     expect(area.fresh).toContain(a);
     expect(area.outstanding).toContain(b);
     expect(area.outstanding).toContain(c);
-    // A stale-but-ready tile still has trails behind it; a failed one has none.
+    // A stale-but-ready tile still has trails behind it; this failed one committed nothing.
     expect(area.missing).not.toContain(b);
     expect(area.missing).toContain(c);
     expect(area.fresh.length + area.outstanding.length).toBe(area.quadkeys.length);
+  });
+
+  it('does not call a failed tile missing when it committed most of its trails', async () => {
+    const { db: probe } = fakeDb();
+    const key = (await surveyArea(HUGE, { db: probe, now: NOW })).quadkeys[0]!;
+
+    const { db } = fakeDb([
+      { quadkey: key, status: TileStatus.failed, fetchedAt: null, trailCount: 899 },
+    ]);
+    const area = await surveyArea(HUGE, { db, now: NOW });
+
+    expect(area.outstanding).toContain(key);
+    expect(area.missing).not.toContain(key);
   });
 
   /*

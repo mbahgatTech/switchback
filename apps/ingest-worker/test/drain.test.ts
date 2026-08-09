@@ -167,7 +167,9 @@ describe('runIngestSignal', () => {
       }),
     ).resolves.toBeDefined();
 
-    expect(log.lines).toContainEqual(['error', expect.stringContaining('handler failed')]);
+    // The token, not the prose: `switchback-ingest-drain-failed` reads this arm, and a tile that
+    // could not commit a trail rethrows into exactly this counter.
+    expect(log.lines).toContainEqual(['error', expect.stringContaining(JOB_FAILED_MARKER)]);
   });
 
   it.each([

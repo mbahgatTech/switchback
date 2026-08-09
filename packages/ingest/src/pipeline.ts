@@ -68,6 +68,7 @@ import {
 import type { ClaimPolicy, TrailIdentityMode } from './identity';
 import {
   CHILDREN_PER_TILE,
+  SPLIT_CHILD_ATTEMPT_CAP,
   SUBTREE_STUCK_MARKER,
   TILE_SPLIT_MARKER,
   canSubdivide,
@@ -148,6 +149,30 @@ export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
  * countable, and it is why `lookupRegion` logs at all.
  */
 export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
+
+/**
+ * The literal an operator greps for when a tile could not commit a trail it had fetched.
+ *
+ * It carries no alert rule of its own. The tile fails and rethrows, so `drainJobs` writes the
+ * message to the job row and the worker logs `ingest-job-failed`, which
+ * `switchback-ingest-drain-failed` already reads; a second arm on the same event would page
+ * twice. What this token adds is the *cause* and the OSM ids, on the tile row, the job row and
+ * the log line, so one search answers which trails a tile is missing.
+ */
+export const TRAIL_LOST_MARKER = 'switchback-ingest-trail-lost';
+
+/** How many OSM ids the message names before it stops; the count beside them is always exact. */
+const NAMED_TRAIL_LIMIT = 10;
+
+/**
+ * The sentence naming the trails a tile assembled and could not commit. A function because a
+ * tile can run out of clock *and* lose a trail, and both exits have to carry the ids.
+ */
+function describeLost(quadkey: string, lost: readonly string[], assembled: number): string {
+  const named = lost.slice(0, NAMED_TRAIL_LIMIT).join(', ');
+  const rest = lost.length > NAMED_TRAIL_LIMIT ? `, +${lost.length - NAMED_TRAIL_LIMIT} more` : '';
+  return `${TRAIL_LOST_MARKER} ${quadkey}: ${lost.length} of ${assembled} trail(s) did not commit: ${named}${rest}`;
+}
 
 export interface PipelineDeps {
   db?: PrismaClient;
@@ -235,7 +260,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   const previous = await db.ingestTile.findUnique({
     where: { quadkey },
-    select: { status: true, fetchedAt: true, lastError: true },
+    select: { status: true, fetchedAt: true, lastError: true, trailCount: true },
   });
 
   const children = await childTiles(db, quadkey);
@@ -358,6 +383,8 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   let failed = 0;
   /** Trails the deadline refused outright. The only count that justifies a split. */
   let refused = 0;
+  /** OSM ids of trails that threw on their own account, so the failure can name them. */
+  const lost: string[] = [];
   /*
    * Retiring a trail row is the one thing this pipeline does that no setting reverses, and a
    * refused union is the one thing that leaves a seam fragmented. Both are counted per tile so an
@@ -386,6 +413,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       else skipped += 1;
     } catch (error) {
       if (error instanceof IngestDeadlineError) refused += 1;
+      else lost.push(`${trail.osmType}/${trail.osmId}`);
       failed += 1;
       log('trail failed', {
         quadkey,
@@ -417,11 +445,30 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   if (refused > 0) {
     const fetchMs = Date.now() - startedAt;
+    /*
+     * The clock decides this tile's fate — it is what says the box is too big — but a tile can
+     * run out of clock *and* lose a trail on its own account, and the ids have to survive that.
+     * Without this the one tile that hit both failures is the only one whose missing ground is
+     * invisible, because the branch below never runs for it.
+     */
+    const alsoLost = lost.length > 0 ? ` — ${describeLost(quadkey, lost, assembled.length)}` : '';
 
     if (canSubdivide(tile.z, maxZoom)) {
-      const split = await splitTile(db, quadkey, { previous, fetchMs });
+      /*
+       * `splitTile`'s write is the last one this path makes to the parent, and it returns rather
+       * than throwing — so `failJob` never runs and an id that reaches only the log line reaches
+       * no row an operator can query. `trailCount` goes with it because a split parent that
+       * committed nothing reads as holding nothing, which puts it in `ensureCoverage`'s pending
+       * set and makes the client poll it every 2.5 s until the last child lands.
+       */
+      const split = await splitTile(db, quadkey, {
+        previous,
+        fetchMs,
+        lostNote: alsoLost,
+        trailCount: Math.max(committed, previous?.trailCount ?? 0),
+      });
       log(
-        `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted`,
+        `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted${alsoLost}`,
         {
           quadkey,
           phase: 'commit',
@@ -429,6 +476,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           skipped,
           failed,
           refused,
+          lost,
           children: split,
           fetchMs,
         },
@@ -444,22 +492,72 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       };
     }
 
-    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt!);
+    const error = new IngestDeadlineError('tile', Date.now() - deps.deadlineAt!, alsoLost);
     await db.ingestTile.update({
       where: { quadkey },
-      data: { status: TileStatus.failed, lastError: error.message.slice(0, 1000) },
+      data: {
+        status: TileStatus.failed,
+        trailCount: Math.max(committed, previous?.trailCount ?? 0),
+        lastError: error.message.slice(0, 1000),
+      },
     });
+    log(error.message, { quadkey, committed, skipped, failed, refused, lost, fetchMs });
     throw error;
   }
 
   const fetchMs = Date.now() - startedAt;
+
+  /*
+   * A trail that threw is ground this tile was responsible for and does not have, so the tile
+   * does not get to say `ready`. That status plus `fetchedAt` is what `isTileFresh` sells to
+   * `ensureCoverage`, and writing it here bought `TILE_TTL_MS` of silence over a hole: tile
+   * 1202212023 reached `ready` with `trailCount=900` and `lastError="6 trail(s) failed to
+   * commit"`, and four of the six had no row in `trails` at all. Nothing read that `lastError` —
+   * the heartbeat's gauges match `'429'` and `SUBTREE_STUCK_MARKER`, neither of which it is.
+   *
+   * **Rethrowing is the requeue, and the ladder is the bound.** `failJob` puts the row back with
+   * a backoff of 30 s, 2 m, 10 m, 30 m and buries it `dead` on the fifth failure, roughly 43
+   * minutes in. `queueHealth` counts it there and `ensureCoverage` stops queueing and stops
+   * reporting it pending, so a tile that fails every time costs five runs and then nothing.
+   *
+   * **Priced on the unit that re-runs, which is a whole ~900-trail tile.** Over the trailing
+   * seven days to 2026-08-09T10:47Z production logged 30 non-deadline `trail failed` lines, but
+   * one invocation logs one line per trail: they collapse to **10 tile-invocations over 10
+   * distinct tiles**, against 14,040 deadline refusals. Ten failing tiles a week at five runs
+   * each is the ceiling. That is a cost this pays for the first time — the `ready` write it
+   * replaces suppressed every re-run for `TILE_TTL_MS`, so the measured 10 is a count of *first*
+   * failures and prices the old behaviour, not this one. A per-trail job was the alternative and
+   * is the same work with a new `JobKind`: the geometry is not on the row, so the job would
+   * re-run the tile query to get it back.
+   *
+   * `refused` is zero here — the branch above owns the mixed tile. `skipped` is deliberate — no
+   * terrain under the line, a relation another tile owns — and leaves the tile's ground covered.
+   */
+  if (failed > 0) {
+    const message = describeLost(quadkey, lost, assembled.length);
+    const error = new Error(message);
+    await db.ingestTile.update({
+      where: { quadkey },
+      data: {
+        status: TileStatus.failed,
+        // Commits are upserts and this path deletes nothing, so the row must not claim fewer
+        // trails than the tile already had drawn. `ensureCoverage` reads this to tell a tile
+        // holding most of its ground from one holding none.
+        trailCount: Math.max(committed, previous?.trailCount ?? 0),
+        lastError: message.slice(0, 1000),
+      },
+    });
+    log(error.message, { quadkey, committed, skipped, failed, fetchMs });
+    throw error;
+  }
+
   await db.ingestTile.update({
     where: { quadkey },
     data: {
       status: TileStatus.ready,
       fetchedAt: now(),
       trailCount: committed,
-      lastError: failed > 0 ? `${failed} trail(s) failed to commit` : null,
+      lastError: null,
       fetchMs,
     },
   });
@@ -476,6 +574,34 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     fetchMs,
     children: [],
   };
+}
+
+/**
+ * The parent's account of a subtree that is not moving, or null while every child still is.
+ *
+ * The marker leads the text because `queueHealth`'s `stuckSubtrees` gauge counts
+ * `ingest_tiles.lastError` containing it, and a message carrying the marker only in the log left
+ * that gauge reading zero over a wedged subtree.
+ */
+function describeStalledSubtree(
+  quadkey: string,
+  exhausted: readonly string[],
+  abandoned: readonly string[],
+): string | null {
+  const clauses: string[] = [];
+  // Named apart because they are different instructions: an exhausted child is back on the queue,
+  // an abandoned one is past the cap and no automatic path will touch it again.
+  if (abandoned.length > 0) {
+    clauses.push(`abandoned after ${SPLIT_CHILD_ATTEMPT_CAP} runs: ${abandoned.join(', ')}`);
+  }
+  if (exhausted.length > 0) {
+    clauses.push(`requeued after five failures: ${exhausted.join(', ')}`);
+  }
+  if (clauses.length === 0) return null;
+  return `${SUBTREE_STUCK_MARKER} ${quadkey}: blocked by descendant(s) — ${clauses.join('; ')}`.slice(
+    0,
+    1000,
+  );
 }
 
 /**
@@ -496,13 +622,22 @@ async function rollUpSplitTile(
     lastError: string | null;
   },
 ): Promise<ProcessTileResult> {
-  const { queued, waiting, exhausted } = await queueStaleChildren(db, children, context.now);
+  const { queued, waiting, exhausted, abandoned } = await queueStaleChildren(
+    db,
+    children,
+    context.now,
+  );
   const promoted = await promoteFrom(db, quadkey);
   const settled = promoted.includes(quadkey);
 
   /*
-   * A descendant out of retries is the one state nothing else reports: `ingest-job-failed` names
-   * the leaf, and the z9 a reader is actually polling stays `pending` with nothing said about it.
+   * A descendant that is not moving is the one state nothing else reports: `ingest-job-failed`
+   * names the leaf, and the z9 a reader is actually polling stays `pending` with nothing said
+   * about it.
+   *
+   * A parent with an abandoned child is **held, not promoted and not failed**: `rollUp` needs all
+   * four children settled, so it will not report an area complete with a quarter of it missing,
+   * and the trails the parent did commit stay on the row. `unsplitTile` is the way back.
    *
    * Written once per transition, not once per drain. A blocked parent is `pending`, so
    * `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
@@ -511,11 +646,12 @@ async function rollUpSplitTile(
    * the edge, and it survives a restart where a module-level flag would not. Clearing it is
    * `promoteFrom`'s job, which nulls it the moment the roll-up lands.
    */
-  const stalled = `blocked by exhausted descendant(s): ${exhausted.join(', ')}`.slice(0, 1000);
-  if (exhausted.length > 0 && !settled && stalled !== context.lastError) {
-    context.log(`${SUBTREE_STUCK_MARKER} ${quadkey}: ${stalled} — requeued after five failures`, {
+  const stalled = describeStalledSubtree(quadkey, exhausted, abandoned);
+  if (stalled !== null && !settled && stalled !== context.lastError) {
+    context.log(stalled, {
       quadkey,
       exhausted,
+      abandoned,
       // Whether anything else is still moving is the difference between "wait" and "intervene".
       queued,
       waiting,
@@ -1214,6 +1350,19 @@ async function attemptCommit(
  * How long one trail's transaction may take, and how long it may wait for a connection.
  * Prisma's 5 s / 2 s defaults are sized for a web request; a trail's transaction is dozens of
  * round-trips, and under load the default aborts healthy commits and blames the trail.
+ *
+ * **Thirty seconds is not always enough, and raising it is not obviously the fix.** Of the 30
+ * non-deadline trail failures production logged in the trailing seven days to 2026-08-09T10:47Z,
+ * 29 were this transaction expiring — 26 naming an elapsed figure, spread 31.5 s / 39.2 s median
+ * / 80.5 s, and
+ * three reaching a closed transaction from a later statement. No value short of a multiple covers
+ * that tail, and a multiple holds one of `BACKGROUND_POOL_SIZE` connections for over a minute
+ * while `COMMIT_CONCURRENCY` commits run, buying one trail's success with other trails' failures.
+ * The thirtieth failure is the reason to suspect contention rather than slow work: a Postgres
+ * `40P01` deadlock between two committers on `trail_ways`. Whether the body is slow because of
+ * database work or because six concurrent commits starve the event loop between its awaits is
+ * **UNVERIFIED** — 418 `[HostMonitor] Host CPU threshold exceeded (100 >= 80)` lines over the same
+ * window are consistent with starvation but do not establish it. Measure that before moving this.
  */
 const TRAIL_TX_TIMEOUT_MS = 30_000;
 

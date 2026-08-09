@@ -17,7 +17,7 @@ import type { BBox } from '@switchback/core';
 import { admitIngest } from './backpressure';
 import type { IngestRefusal } from './backpressure';
 import { enqueue, tileJobKey } from './jobs';
-import { isTileFresh } from './freshness';
+import { isTileFresh, isTileSettled } from './freshness';
 
 /** Priority for a tile someone is looking at, above the 0 a scheduled refresh enqueues with. */
 export const VIEWPORT_PRIORITY = 5;
@@ -90,25 +90,31 @@ export async function ensureCoverage(
 
   /*
    * The job table is read to tell a tile nobody has asked for apart from one somebody is
-   * already waiting on. `IngestTile.status` cannot answer that — a row sits at `pending`
-   * whether its job is running or died five attempts ago — so trusting it would make a dead
-   * tile permanently "in flight" and permanently unqueueable.
+   * already waiting on, and both apart from one the retry ladder has given up on.
+   * `IngestTile.status` cannot answer either — a row sits at `pending` whether its job is
+   * running or died five attempts ago — so trusting it would make a dead tile permanently
+   * "in flight" and permanently unqueueable.
    */
   const [existing, jobs] = await Promise.all([
     db.ingestTile.findMany({
       where: { quadkey: { in: cover.quadkeys } },
-      select: { quadkey: true, status: true, fetchedAt: true },
+      select: { quadkey: true, status: true, fetchedAt: true, trailCount: true },
     }),
     db.ingestJob.findMany({
       where: {
         dedupeKey: { in: cover.quadkeys.map(tileJobKey) },
-        status: { in: [JobStatus.queued, JobStatus.running] },
+        status: { in: [JobStatus.queued, JobStatus.running, JobStatus.dead] },
       },
-      select: { dedupeKey: true },
+      select: { dedupeKey: true, status: true },
     }),
   ]);
   const byKey = new Map(existing.map((tile) => [tile.quadkey, tile]));
-  const inFlight = new Set(jobs.map((job) => job.dedupeKey));
+  const inFlight = new Set(
+    jobs.filter((job) => job.status !== JobStatus.dead).map((job) => job.dedupeKey),
+  );
+  const givenUp = new Set(
+    jobs.filter((job) => job.status === JobStatus.dead).map((job) => job.dedupeKey),
+  );
 
   const ready: string[] = [];
   const pending: string[] = [];
@@ -121,10 +127,25 @@ export async function ensureCoverage(
       ready.push(quadkey);
       continue;
     }
+
+    // Whether there is anything to draw, which the status word alone does not say: a `failed`
+    // tile that committed 899 of its 900 trails holds them, and a `ready` tile past the TTL
+    // holds the ones it fetched last month.
+    const holdsTrails = tile !== null && (isTileSettled(tile.status) || tile.trailCount > 0);
+
+    /*
+     * A job the ladder buried after five attempts is not coming back on a poll, and re-queueing
+     * it would be worse than useless: `enqueue` revives `dead` with `attempts` reset to zero, so
+     * a tile that fails every time would re-run for as long as one map stayed open, never
+     * reaching `dead` again. `fetchArea` is the way back and a person pressing it is the bound.
+     */
+    if (givenUp.has(tileJobKey(quadkey))) {
+      if (holdsTrails) ready.push(quadkey);
+      continue;
+    }
+
     needsWork.push(quadkey);
-    // `ready`/`empty` past the TTL still has trails in the table; a `running` tile that a
-    // previous request queued has none yet, and neither does a `failed` one.
-    if (tile?.status === TileStatus.ready || tile?.status === TileStatus.empty) {
+    if (holdsTrails) {
       ready.push(quadkey);
       refreshing.push(quadkey);
     } else {
@@ -295,7 +316,7 @@ export async function surveyArea(bbox: BBox, options: AreaOptions = {}): Promise
   const [tiles, jobs] = await Promise.all([
     db.ingestTile.findMany({
       where: { quadkey: { in: cover.quadkeys } },
-      select: { quadkey: true, status: true, fetchedAt: true },
+      select: { quadkey: true, status: true, fetchedAt: true, trailCount: true },
     }),
     db.ingestJob.findMany({
       where: {
@@ -321,8 +342,9 @@ export async function surveyArea(bbox: BBox, options: AreaOptions = {}): Promise
       continue;
     }
     outstanding.push(quadkey);
-    // `ready`/`empty` past the TTL still has trails behind it; anything else has nothing.
-    if (tile?.status !== TileStatus.ready && tile?.status !== TileStatus.empty) {
+    // Whether the tile has anything drawn, not what its status word is: a `failed` tile that
+    // committed all but one of its trails is not missing.
+    if (!isTileSettled(tile?.status ?? TileStatus.pending) && (tile?.trailCount ?? 0) === 0) {
       missing.push(quadkey);
     }
     if (inFlight.has(tileJobKey(quadkey))) working.push(quadkey);
