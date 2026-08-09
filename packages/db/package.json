@@ -5,8 +5,11 @@
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
+  "//exports": "app-insights and token-alarm are reachable on their own because both have to be usable by a process that has no database — scripts/alarm-channel-probe.ts proves the channel, and /api/version reports which channel is live. Importing the package root would construct a PrismaClient to do either.",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./app-insights": "./src/app-insights.ts",
+    "./token-alarm": "./src/token-alarm.ts"
   },
   "scripts": {
     "generate": "dotenv -e ../../.env -- prisma generate",

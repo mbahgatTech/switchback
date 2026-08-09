@@ -8,6 +8,13 @@ export { createEntraTokenSource, databaseAuthMode, POSTGRES_SCOPE } from './entr
 export type { DatabaseAuthMode } from './entra-source';
 export { CONNECTION_LIFETIME_S, RENEW_MARGIN_MS, createTokenProvider } from './entra-token';
 export type { AccessToken, TokenProviderOptions, TokenSource } from './entra-token';
+export {
+  ALARM_MIN_INTERVAL_MS,
+  NEARLY_EXPIRED_MARKER,
+  RENEWAL_FAILED_MARKER,
+  alarmSink,
+} from './token-alarm';
+export type { AlarmSink } from './token-alarm';
 export * from './spatial';
 
 // Re-exported so consumers get the generated enums and row types without adding a direct
