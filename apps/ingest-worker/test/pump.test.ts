@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
-import { VIEWPORT_PRIORITY } from '@switchback/ingest';
+import { RECLAIM_PRIORITY, VIEWPORT_PRIORITY } from '@switchback/ingest';
 import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from '../src/log';
 import {
@@ -101,18 +101,30 @@ function compare(orderBy: OrderBy, left: JobRow, right: JobRow): number {
  * A `findMany` that applies the `orderBy` it is given before taking, so a row's position in the
  * backlog decides whether the pump reaches it. `fakeDb` slices from the head of an array and
  * cannot see ordering at all, which is why it can hold no opinion on reachability.
+ *
+ * `reclaims` names the row the sweep frees. `$queryRaw` here *is* `reclaimExpiredJobs`, so it
+ * applies that statement's effect — raising the row to `RECLAIM_PRIORITY` — to the same rows the
+ * selects read. Sharing the row set is what puts the sweep's position inside `runPump` under test:
+ * move it after the selects and the elevation lands too late to be published.
  */
-function backlogged(rows: readonly JobRow[]): Db {
+function backlogged(rows: readonly JobRow[], reclaims?: string): Db {
+  let current = [...rows];
   return {
     ingestJob: {
       findMany: async (args: FindManyArgs) =>
-        (args.where.kind.in ? [] : rows.filter((row) => row.runAfter <= args.where.runAfter.lte))
+        (args.where.kind.in ? [] : current.filter((row) => row.runAfter <= args.where.runAfter.lte))
           .slice()
           .sort((a, b) => compare(args.orderBy, a, b))
           .slice(0, args.take)
           .map(({ dedupeKey }) => ({ dedupeKey })),
     },
-    $queryRaw: async () => [],
+    $queryRaw: async () => {
+      if (reclaims === undefined) return [];
+      current = current.map((row) =>
+        row.dedupeKey === reclaims ? { ...row, priority: RECLAIM_PRIORITY } : row,
+      );
+      return [{ status: JobStatus.queued }];
+    },
   } as unknown as Db;
 }
 
@@ -280,5 +292,34 @@ describe('a wake-up that never reached the broker', () => {
     await runPump(backlogged(rows), queue, silent, QUEUED_AT);
 
     expect(queue.published[0]).toBe(LOST_DOORBELL);
+  });
+});
+
+/**
+ * The bound `classifyDisposition` completes a Service Bus message on. Completing is irreversible,
+ * so a killed handler's tile has to be reachable from the row alone — and reachable in a tick,
+ * not when a five-figure backlog drains.
+ */
+describe('a lease the reaper took back', () => {
+  it('is published on the tick that reclaimed it, from behind a full backlog', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(backlogged(withBacklog(40), LOST_DOORBELL), queue, silent, QUEUED_AT);
+
+    // The same fixture the case above proves unreachable, differing only in that the sweep ran.
+    // `runPump` sweeps before it selects, so the elevated row is at the head of this tick's order.
+    expect(queue.published[0]).toBe(LOST_DOORBELL);
+  });
+
+  it('does not outrank a backlog that shares its own elevated priority', async () => {
+    const rows = withBacklog(40).map((row) => ({ ...row, priority: RECLAIM_PRIORITY }));
+    const queue = fakeQueue(0);
+
+    // The elevation is a band, not a queue jump: reclaimed rows sort among themselves by
+    // `runAfter`, oldest first, rather than each new one climbing above the last.
+    await runPump(backlogged(rows, LOST_DOORBELL), queue, silent, QUEUED_AT);
+
+    expect(queue.published).not.toContain(LOST_DOORBELL);
+    expect(queue.published[0]).toBe('ingest_tile:backlog-0');
   });
 });

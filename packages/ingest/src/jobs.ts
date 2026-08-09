@@ -36,12 +36,13 @@ export const LEASE_MARGIN_MS = 2 * 60 * 1000;
  * five of the six arrived while the lease was still live, and the two at the floor came back at
  * exactly `lockDuration`.
  *
- * So the redelivery is not the repair. `ingestPump` is: it reclaims on a two-minute tick and
- * republishes the row, whatever any delivery decided. `apps/ingest-worker/test/drain.test.ts`
- * asserts the whole chain, including the one relation that makes the republish durable — the
- * broker's duplicate detection window has to be *shorter* than this, or the pump's republish is
- * discarded as a duplicate of the message that was already completed and the work is lost with
- * nothing logged.
+ * So the redelivery is not the repair. The reaper is: `reclaimExpiredJobs` returns the row to
+ * `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `runPump` sweeps before
+ * it selects — so the tick that takes a lease back is the tick that republishes the row.
+ * `apps/ingest-worker/test/drain.test.ts` asserts the template relation that makes the republish
+ * durable: the broker's duplicate detection window has to be *shorter* than this, or the republish
+ * is discarded as a duplicate of the message a delivery already completed and the work is lost
+ * with nothing logged.
  */
 export const LEASE_TIMEOUT_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS;
 
@@ -327,6 +328,32 @@ export const LEASE_EXPIRED_MARKER = 'switchback-ingest-lease-expired';
 const MARKER_KEY_LIMIT = 10;
 
 /**
+ * Priority a requeued lease is raised to: above every band `enqueue` assigns, so the next pump
+ * tick publishes the row from the head of `priority DESC` rather than from wherever the backlog
+ * had put it.
+ *
+ * **Returning the row to `queued` is not on its own enough to get it re-run.** `runPump` publishes
+ * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` primary rows a tick from the head of
+ * `priority DESC, "runAfter" ASC`, and every viewport tile shares one priority — so a row put back
+ * at the priority it had sorts to the tail of its own band and is reached when the backlog ahead of
+ * it drains. Two things are built on the tighter bound and would be wrong without this:
+ * `classifyDisposition` completes a Service Bus message on the strength of the reclaim, which is
+ * irreversible, and `WEDGE_GRACE_MS` sizes the wedged-tile gauge at one lease plus one tick.
+ *
+ * Raised to a fixed value rather than incremented, so repeated reclaims are idempotent: reclaimed
+ * rows form one band ordered among themselves by `runAfter`, never a ladder that climbs away from
+ * the queue. Retired rows keep the priority they had — `enqueue` revives a `dead` row without
+ * lowering priority, and a row that is never going to run again must not carry the head of the
+ * queue into that revival.
+ *
+ * It cannot starve ordinary work: a row only arrives here by losing a lease, the host runs one
+ * handler at a time, and the attempt this sweep spends retires a reliably fatal job rather than
+ * parking it at the head. `packages/ingest/test/jobs.test.ts` asserts it outranks every band
+ * `enqueue` is given.
+ */
+export const RECLAIM_PRIORITY = 6;
+
+/**
  * Take back every job whose lease has expired: the reaper, and the only route out of `running`
  * for a worker that never came back. Unbounded and unordered on purpose — that is the whole
  * difference from the arm of `claimJobs` this replaces, which could only ever recover a job
@@ -360,6 +387,8 @@ export async function reclaimExpiredJobs(
       attempts      = attempts + 1,
       status        = CASE WHEN attempts + 1 >= "maxAttempts"
                            THEN 'dead'::"JobStatus" ELSE 'queued'::"JobStatus" END,
+      priority      = CASE WHEN attempts + 1 >= "maxAttempts"
+                           THEN priority ELSE GREATEST(priority, ${RECLAIM_PRIORITY}::int) END,
       "completedAt" = CASE WHEN attempts + 1 >= "maxAttempts"
                            THEN ${now} ELSE "completedAt" END,
       "lastError"   = ${reason}

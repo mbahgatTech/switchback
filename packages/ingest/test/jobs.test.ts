@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
+import { AREA_PRIORITY, VIEWPORT_PRIORITY } from '../src/coverage';
+import { NETWORK_PRIORITY } from '../src/network';
+import { SPLIT_PRIORITY } from '../src/subdivide';
 import {
   LEASE_EXPIRED_MARKER,
   LEASE_TIMEOUT_MS,
+  RECLAIM_PRIORITY,
   claimJobs,
   completeJob,
   deferJob,
@@ -368,6 +372,44 @@ describe('reclaimExpiredJobs', () => {
   const now = new Date('2026-01-01T12:00:00Z');
   const stale = new Date(now.getTime() - LEASE_TIMEOUT_MS - 60_000);
   const fresh = new Date(now.getTime() - 60_000);
+
+  /** The reap statement's SQL, with its indentation flattened so it can be matched literally. */
+  function reapSql(recorded: Recorded): string {
+    const found = recorded.rawSql.find((sql) => sql.includes('RETURNING status'));
+    if (!found) throw new Error('the lease sweep did not run');
+    return found.replace(/\s+/g, ' ');
+  }
+
+  it('outranks every band enqueue assigns, or the row it freed stays behind the backlog', () => {
+    /*
+     * `priority DESC` leads both `runPump`'s order and `claimJobs`, and returning a row to
+     * `queued` at the priority it had puts it at the tail of its own band. A band added above
+     * this constant would falsify the recovery bound `classifyDisposition` completes a Service
+     * Bus message on, and nothing else in the estate would notice.
+     */
+    for (const band of [VIEWPORT_PRIORITY, SPLIT_PRIORITY, NETWORK_PRIORITY, AREA_PRIORITY]) {
+      expect(RECLAIM_PRIORITY).toBeGreaterThan(band);
+    }
+  });
+
+  it('raises a requeued lease to the head of the queue, and never lowers a higher one', async () => {
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+
+    await reclaimExpiredJobs(db, now);
+
+    // Bound rather than inlined, so the statement carries the constant the pump's order is
+    // asserted against rather than a copy of its value. The elevation sits inside the retirement
+    // test, so a row out of attempts keeps the priority it had — it is not going back to a worker,
+    // and `enqueue` revives without lowering priority, so elevating it would hand a later revival
+    // the head of the queue on the strength of a run that never finished.
+    expect(recorded.reapValues).toContain(RECLAIM_PRIORITY);
+    expect(reapSql(recorded)).toContain(
+      'priority = CASE WHEN attempts + 1 >= "maxAttempts" ' +
+        'THEN priority ELSE GREATEST(priority, ?::int) END',
+    );
+  });
 
   it('takes back a job locked beyond the timeout and spends an attempt on it', async () => {
     const { db, recorded } = fakeDb([], {

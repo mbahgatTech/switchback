@@ -147,6 +147,17 @@ therefore reached when the backlog ahead of it drains, not on the next tick. Rai
 is the one lever that moves it to the head, because `priority DESC` leads both this order and
 `claimJobs`.
 
+**A reclaimed lease is the one exception, and the reaper pulls that lever for it.**
+`reclaimExpiredJobs` returns an expired lease to `queued` at `RECLAIM_PRIORITY`, above every band
+`enqueue` assigns, and `runPump` sweeps before it selects — so the tick that takes a lease back is
+the tick that republishes the row. Two things depend on that bound and would be wrong without it:
+`classifyDisposition` completes a Service Bus message on the strength of the reclaim, which the
+broker will never undo, and `WEDGE_GRACE_MS` sizes the wedged-tile gauge at one lease plus one tick.
+The elevation is a fixed value rather than an increment, so repeated reclaims form one band ordered
+by `runAfter` instead of a ladder, and a retired row keeps the priority it had so a later revival
+does not inherit the head of the queue. `apps/ingest-worker/test/pump.test.ts` runs `runPump` over an
+ordered backlog and asserts both halves: the elevated row is reached, an unelevated one is not.
+
 **What happens if Service Bus is unreachable.** With no fallback path the failure has to be explicit
 rather than silent, so `publishIngestSignals` does not swallow it: the row is already committed to
 `ingest_jobs` before any publish is attempted, and the publish failure is logged under

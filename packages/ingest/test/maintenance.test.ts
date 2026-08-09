@@ -184,8 +184,10 @@ describe('the sweep both live entry points call', () => {
 
     expect(result).toMatchObject({ requeued: 2, retired: 1 });
     // The cutoff the reclaim bound, not merely that something ran: `now` has to reach it, or a
-    // sweep would take back leases measured from some other moment.
-    const [, , cutoff] = recorded.rawBinds[0] ?? [];
+    // sweep would take back leases measured from some other moment. Picked out by type rather
+    // than by position — the statement binds two dates, `now` then `cutoff`, and anything else it
+    // binds would silently shift an index.
+    const [, cutoff] = (recorded.rawBinds[0] ?? []).filter((bind) => bind instanceof Date);
     expect(cutoff).toEqual(new Date(NOW.getTime() - LEASE_TIMEOUT_MS));
   });
 

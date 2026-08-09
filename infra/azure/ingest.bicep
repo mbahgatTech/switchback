@@ -331,16 +331,20 @@ lease the lease would have to be shorter than `lockDuration`; to be safe under a
 must be longer than `functionTimeout`. Since `PT5M` is the service maximum and `functionTimeout` is
 ten minutes, no value satisfies both.
 
-So the repair is `ingestPump`, not the broker. It reclaims expired leases and republishes the row
-on a two-minute tick off its own timer, whatever any delivery decided, which bounds recovery at
-`LEASE_TIMEOUT_MS` plus one tick. The relation that makes *that* durable is the dedupe window
-below: it has to be shorter than the lease, or the pump's republish is discarded as a duplicate of
-the message a redelivery already completed, and the tile is lost with nothing logged.
+So the repair is the reaper, not the broker. `reclaimExpiredJobs` returns an expired lease to
+`queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `ingestPump` sweeps before
+it selects — so the tick that takes a lease back is the tick that republishes the row, whatever any
+delivery decided, which bounds recovery at `LEASE_TIMEOUT_MS` plus one tick. Without that elevation
+the row would rejoin the tail of its own priority band and wait for the backlog ahead of it to
+drain. The relation that makes the republish durable is the dedupe window below: it has to be
+shorter than the lease, or the republish is discarded as a duplicate of the message a redelivery
+already completed, and the tile is lost with nothing logged.
 
 All of these numbers live in different files, so `apps/ingest-worker/test/drain.test.ts` reads
 `lockDuration`, `duplicateDetectionHistoryTimeWindow` and `defaultMessageTimeToLive` from this
-template, `functionTimeout` and `maxAutoLockRenewalDuration` from `host.json`, and the pump's
-schedule from its own source, and asserts the whole chain.
+template and `functionTimeout` and `maxAutoLockRenewalDuration` from `host.json`, and asserts the
+chain. That the elevated row is the one the pump reaches is asserted in
+`apps/ingest-worker/test/pump.test.ts`, which runs `runPump` against an ordered backlog.
 
 `maxAutoLockRenewalDuration` in `host.json` is `00:30:00`, well past `functionTimeout`, so a running
 handler never loses its lock to renewal expiry.

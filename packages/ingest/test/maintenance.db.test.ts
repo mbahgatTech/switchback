@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
-import { LEASE_TIMEOUT_MS, tileJobKey } from '../src/jobs';
+import { LEASE_TIMEOUT_MS, RECLAIM_PRIORITY, tileJobKey } from '../src/jobs';
+import { VIEWPORT_PRIORITY } from '../src/coverage';
 import { DISTRESS_WINDOW_MS, queueHealth, sweepQueue } from '../src/maintenance';
 
 /**
@@ -174,6 +175,52 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
     const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
     expect(job).toMatchObject({ status: JobStatus.queued, attempts: 2, lockedBy: 'cron' });
     expect(requeued).toBeGreaterThanOrEqual(1);
+  });
+
+  it('returns the lease above the band it was queued in, so the pump reaches it next tick', async () => {
+    // `GREATEST(priority, ...)` against a real column, which is the half a fake client cannot
+    // show. Queued at `VIEWPORT_PRIORITY`, the band a tile someone is waiting on carries.
+    await prisma.ingestJob.create({
+      data: {
+        kind: JobKind.ingest_tile,
+        dedupeKey: STALE_JOB,
+        payload: { quadkey: `${NS}999999` },
+        status: JobStatus.running,
+        attempts: 1,
+        priority: VIEWPORT_PRIORITY,
+        lockedBy: 'cron',
+        lockedAt: new Date(NOW.getTime() - LEASE_TIMEOUT_MS - 60_000),
+      },
+    });
+
+    await sweepQueue(prisma, NOW);
+
+    const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
+    expect(job.priority).toBe(RECLAIM_PRIORITY);
+  });
+
+  it('leaves a lease it retired at the priority it had', async () => {
+    // Out of attempts, so the sweep buries it. A `dead` row is never claimed again, and `enqueue`
+    // revives without lowering priority — elevating here would hand a later revival the head of
+    // the queue on the strength of a run that never finished.
+    await prisma.ingestJob.create({
+      data: {
+        kind: JobKind.ingest_tile,
+        dedupeKey: STALE_JOB,
+        payload: { quadkey: `${NS}999999` },
+        status: JobStatus.running,
+        attempts: 4,
+        maxAttempts: 5,
+        priority: VIEWPORT_PRIORITY,
+        lockedBy: 'cron',
+        lockedAt: new Date(NOW.getTime() - LEASE_TIMEOUT_MS - 60_000),
+      },
+    });
+
+    await sweepQueue(prisma, NOW);
+
+    const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
+    expect(job).toMatchObject({ status: JobStatus.dead, priority: VIEWPORT_PRIORITY });
   });
 });
 

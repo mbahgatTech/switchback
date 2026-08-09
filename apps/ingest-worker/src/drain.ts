@@ -111,13 +111,24 @@ export interface JobLease {
  * - **stranded** — `running` under a lease the reaper should already have taken back, or one it can
  *   never date. Nothing is going to do the work, so completing the message here would drop it.
  *
- * **What makes `rescheduled` true is `ingestPump`, not the lease.** A redelivery usually arrives
+ * **What makes `rescheduled` true is the reaper, not the lease.** A redelivery usually arrives
  * while the lease still looks live — the gap starts at `lockDuration`, below `functionTimeout`, and
  * five of 2026-08-08's six redeliveries came back inside it — so "a live lease belongs to an
  * invocation still working" is not something this can infer from the row. What it can rely on is
- * the pump: it reclaims expired leases and republishes the row on a two-minute tick, off its own
- * timer, whatever any delivery decided. So a dated lease is durably rescheduled even when its
- * holder is already dead, and the recovery is bounded by `LEASE_TIMEOUT_MS` plus one tick.
+ * `reclaimExpiredJobs`: off its own timer, whatever any delivery decided, it returns the row to
+ * `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `runPump` sweeps before
+ * it selects. So the tick that takes the lease back is the tick that republishes the row, and
+ * recovery is bounded by `LEASE_TIMEOUT_MS` plus one tick even when the holder is already dead.
+ * Without that elevation the row would rejoin the tail of its own priority band and be reached
+ * only when the backlog ahead of it drained — a bound no delivery could complete a message on.
+ *
+ * **Abandoning instead is rejected, and it is the alternative worth naming.** Completing is
+ * irreversible, so throwing looks like the conservative choice; it is not. The common reason a
+ * lease is live is that its holder is alive and working. Abandoning returns the message at once,
+ * the next delivery finds the same live lease and abandons again, and `maxDeliveryCount: 5`
+ * dead-letters it within seconds — while the holder goes on to finish the tile normally. It also
+ * costs `switchback-ingest-deadletter` its one meaning, *the worker could not reach Postgres five
+ * times*, and still leaves the row to the reaper. It buys nothing it does not first spend.
  *
  * That makes `stranded` the state where *the reaper itself* has not done its job: a lease past
  * `LEASE_TIMEOUT_MS` that is still `running` means the sweep in `drainJobs` and `drainSlotGate`

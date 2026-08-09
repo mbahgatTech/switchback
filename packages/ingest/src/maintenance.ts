@@ -209,8 +209,9 @@ export async function countWedgedTiles(
  * How long a tile may sit `running` with no job before it counts as wedged.
  *
  * One lease plus one pump tick plus slack: everything that legitimately rescues such a tile —
- * `reclaimExpiredJobs` returning the lease, then `runPump` republishing it — has completed inside
- * that. Below it the gauge would count tiles that are about to be repaired by the ordinary path.
+ * `reclaimExpiredJobs` returning the lease at `RECLAIM_PRIORITY`, then the same tick's `runPump`
+ * publishing it from the head of the queue — has completed inside that. Below it the gauge would
+ * count tiles that are about to be repaired by the ordinary path.
  */
 export const WEDGE_GRACE_MS = LEASE_TIMEOUT_MS + 5 * 60 * 1000;
 

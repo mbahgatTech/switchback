@@ -429,12 +429,12 @@ describe('the drain-failure alert, from the template', () => {
 
 /**
  * The numbers that decide whether a killed handler's work is re-run or silently dropped. They live
- * in four separate files — `host.json`, `ingest.bicep`, `jobs.ts`, `functions/pump.ts` — so nothing
- * but this test stops one of them moving alone.
+ * in three separate files — `host.json`, `ingest.bicep`, `jobs.ts` — so nothing but this test stops
+ * one of them moving alone. That the freed row is then *reached* is a property of `runPump`, and is
+ * asserted in `apps/ingest-worker/test/pump.test.ts`, which runs it.
  */
 describe('the lease, the lock and the host clock', () => {
   const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
-  const pump = readFileSync(resolve(__dirname, '../src/functions/pump.ts'), 'utf8');
   const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
     functionTimeout: string;
     extensions: { serviceBus: { maxAutoLockRenewalDuration: string } };
@@ -462,13 +462,6 @@ describe('the lease, the lock and the host clock', () => {
   const functionTimeoutMs = clockToMs(host.functionTimeout);
   const lockDurationMs = durationToMs(queueSetting('lockDuration'));
   const dedupeWindowMs = durationToMs(queueSetting('duplicateDetectionHistoryTimeWindow'));
-
-  /** The pump's own tick, which is what bounds recovery once the lease has expired. */
-  const pumpPeriodMs = (() => {
-    const schedule = /schedule: '0 \*\/(\d+) \* \* \* \*'/.exec(pump)?.[1];
-    if (!schedule) throw new Error('ingestPump schedule is not a whole number of minutes');
-    return Number(schedule) * 60_000;
-  })();
 
   it('mirrors the host timeout the lease is derived from', () => {
     // `LEASE_TIMEOUT_MS` is `HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS`, and the first of those is
@@ -513,31 +506,19 @@ describe('the lease, the lock and the host clock', () => {
     expect(lockDurationMs).toBeLessThan(LEASE_TIMEOUT_MS);
   });
 
-  it('leaves the pump able to republish before the broker would call it a duplicate', () => {
+  it('keeps the dedupe window shorter than the lease, so a republish is not read as a duplicate', () => {
     /*
-     * **The relation the durability of a dropped message actually rests on.** A redelivery that
-     * finds a live-looking lease completes the message, so the only thing left that will re-run the
-     * work is the pump: it reclaims at `LEASE_TIMEOUT_MS` and republishes the row on its next tick.
-     * The queue has duplicate detection on, keyed on `messageId = dedupeKey` and measured from the
-     * original enqueue — so if that window outlived the lease, the pump's republish would be
-     * discarded as a duplicate of the message that was already completed, and the tile would be
-     * lost with nothing logged anywhere.
+     * **The template relation the durability of a reclaimed row rests on.** A redelivery that finds
+     * a live-looking lease completes the message, so what re-runs the work is the reaper's
+     * republish. Duplicate detection is keyed on `messageId = dedupeKey` and measured from the
+     * original enqueue, and the reclaim cannot fire before `LEASE_TIMEOUT_MS` — so if that window
+     * outlived the lease, the republish would be discarded as a duplicate of the message that was
+     * already completed, and the tile would be lost with nothing logged anywhere.
      *
      * Raising `duplicateDetectionHistoryTimeWindow` to PT15M is the plausible tuning that would do
      * it, and this is what refuses it.
      */
     expect(dedupeWindowMs).toBeLessThan(LEASE_TIMEOUT_MS);
-  });
-
-  it('bounds how long a killed handler s work waits before it is republished', () => {
-    /*
-     * Worst case from the kill to a new message: the lease has to expire, then the pump has to
-     * tick. Both are bounded, which is what makes "durably re-scheduled" a fact about the estate
-     * rather than a hope about the broker. Kept under the message time-to-live so the republished
-     * signal is a fresh message rather than one the broker would drop on arrival.
-     */
-    const recoveryMs = LEASE_TIMEOUT_MS + pumpPeriodMs;
-    expect(recoveryMs).toBeLessThan(durationToMs(queueSetting('defaultMessageTimeToLive')));
   });
 
   it('expires stale signals rather than dead-lettering them, so the pump is not suppressed', () => {

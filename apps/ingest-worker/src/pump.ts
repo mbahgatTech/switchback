@@ -97,11 +97,10 @@ export async function runPump(
   bounds: PumpBounds = pumpBounds(),
 ): Promise<{ published: number }> {
   /*
-   * Before publishing, not after: a job whose worker the host killed mid-drain still holds its
-   * lease, and the pump would otherwise keep re-signalling a row no worker can claim. Recovery
-   * used to belong to the daily Vercel cron alone, which meant an invocation that outran
-   * `functionTimeout` stranded its tile for up to a day. Cheap — one UPDATE over an indexed
-   * predicate — and it runs on the same two-minute tick.
+   * Before the selects, not after, and the ordering is load-bearing: the sweep raises a reclaimed
+   * row to `RECLAIM_PRIORITY`, so the tick that takes a lease back is the tick that republishes
+   * the row rather than the one after it. It also stops the pump re-signalling a row whose killed
+   * holder still nominally owns the lease. Cheap — one UPDATE over an indexed predicate.
    */
   const reclaimed = await reclaimExpiredJobs(db, now);
   if (reclaimed.requeued > 0 || reclaimed.retired > 0) {
