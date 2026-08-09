@@ -30,7 +30,18 @@ second copy and no geo-redundant backup; see [Backups](#backups).
   it and `DATABASE_URL` at step 6 of the cutover, not before — until then they are the way back if
   the token path in `migrate` fails. It remains unreadable from ARM, so a redeploy still has to be
   given the same value. **No copy in a password manager is counted**, because none has been
-  observed being made.
+  observed being made. The recorded file authenticated as `sbadmin` on 2026-08-09, so it is a door
+  that has been opened rather than only written down.
+- **`sbapp`'s password cannot be read back from anywhere, and a replacement is recorded but not
+  installed.** `sbapp` serves all production web traffic and its password exists only inside the
+  Vercel Production `DATABASE_URL`; `vercel env pull` writes that variable out empty (measured
+  2026-08-09), and ARM never held it. A generated replacement is at
+  `~/.switchback/pg-sbapp-password`, owner-readable only. It is **not** the role's password yet:
+  installing it is one `ALTER ROLE sbapp PASSWORD` statement by an Entra administrator, and that
+  statement displaces the value Vercel is still authenticating with, so every new connection fails
+  until the same value reaches `DATABASE_URL` and `DIRECT_DATABASE_URL`. It belongs at the top of
+  cutover step 3, beside the Vercel rewrite, and nowhere earlier. The file
+  `pg-sbapp-scram-verifier`, in the same directory, undoes it.
 - **There is now a path into this database that needs no password at all.** The owner is a declared
   Microsoft Entra administrator; see [Connecting by hand, with no
   password](#connecting-by-hand-with-no-password). That is what stops "the password is not recorded
@@ -310,6 +321,30 @@ machine with no PostgreSQL client installed.
   asks for both administrator doors to be re-proven in the same hour regardless — a door that
   opened on 2026-08-08 is not a door proven on the day the password stops working.
 
+**A third door, for a subscription Owner who is not a Postgres administrator.** The two declared
+Entra administrators are the owner's UPN and `id-switchback-postgres-ci`; a colleague inheriting
+this estate is neither, and holds no password once step 6 lands. Subscription Owner is the way in.
+It carries `Microsoft.DBforPostgreSQL/flexibleServers/administrators/write`, so an Owner can add
+themselves and then take the recipe above. Two principals hold Owner on subscription
+`5cb9e7c3-0e31-4388-94e9-b36eab4bf977`, read on 2026-08-09:
+`mazenbahgat_outlook.com#EXT#@mazenbahgatoutlook.onmicrosoft.com` (`8c682736-…`), who is also a
+Postgres administrator, and `mazenbahgat_microsoft.com#EXT#@mazenbahgatoutlook.onmicrosoft.com`
+(`55d2021b-982f-4ae1-ae8e-469bab6c817f`), who is not.
+
+```bash
+az postgres flexible-server microsoft-entra-admin create \
+  -g rg-switchback-prod-northcentralus \
+  -s psql-switchback-prod-37ywppu5p7fri \
+  -i "$(az ad signed-in-user show --query id -o tsv)" \
+  -u "$(az ad signed-in-user show --query userPrincipalName -o tsv)" \
+  -t User -o json
+```
+
+The verb is `microsoft-entra-admin`, present in Azure CLI 2.83.0. Reaching for `ad-admin` finds
+nothing and sends the reader to ARM REST for a call the CLI already supports. This is an ARM write,
+so it needs the token service healthy: it is the door for a missing person, not for a directory
+outage.
+
 Do not use `connections_failed` to decide whether the server saw an attempt. It is not zero on this
 server and never has been: measured over 2026-08-05T12:00Z–2026-08-06T12:00Z it records 35 failures
 across six of twenty-four hourly buckets, from a periodic caller unrelated to whoever is debugging.
@@ -323,11 +358,16 @@ door the moment `passwordAuthEnabled` is flipped to false.
 **What flipping it costs, stated plainly.** Disabling password authentication leaves no non-Entra
 path to this database. Both remaining doors — the owner's UPN and `id-switchback-postgres-ci` —
 authenticate against the same directory, so a directory-wide Entra outage closes both at once and
-no stored credential reopens them. What survives such an outage is only the ARM control plane:
-`az postgres flexible-server update --password-auth Enabled` re-enables the password path without
-touching the admin credential, and the resource group's lock is `CanNotDelete`, which does not block
-an update. That is the recovery, and it is worth confirming the caller holds Contributor on the
-server before the flip rather than during an incident.
+no stored credential reopens them.
+
+**ARM is not a way around that.** Authorizing
+`az postgres flexible-server update --password-auth Enabled` needs a bearer token from the same
+security token service that issues the database tokens, so an outage broad enough to stop Postgres
+accepting tokens also stops `az login` and every silent refresh, and the recovery command cannot be
+authorized either. What the command does recover is the narrower failure where the token service is
+healthy and Postgres-side Entra validation is not: it re-enables the password path without touching
+the admin credential, and the resource group's `CanNotDelete` lock does not block an update. Confirm
+the caller holds Contributor on the server before the flip rather than during an incident.
 
 ### Machine identities
 
@@ -986,13 +1026,28 @@ neither can authenticate any way but by token, and `sbapp` is what Vercel presen
    that is `inspect`, which asserts nothing. And it repairs nothing. Creation is guarded on the
    role's _name_, so an identity recreated since leaves a role mapped to an object id that no longer
    exists, and the job raises rather than remapping it.
-3. Convert Vercel **Production**, and only Production: set `DATABASE_AUTH=entra-vercel` and rewrite
+3. Convert Vercel **Production**, and only Production. First give `sbapp` a password that is written
+   down, because the one it is authenticating with right now is readable from nowhere and this step
+   overwrites the only copy of it:
+
+   ```bash
+   # As an Entra administrator. The value is generated and recorded already; never echo it.
+   printf "ALTER ROLE sbapp PASSWORD '%s';\n" "$(cat ~/.switchback/pg-sbapp-password)" \
+     > "$TMPDIR/alter.sql" && bash scripts/pgenv.sh -X -f "$TMPDIR/alter.sql"; rm -f "$TMPDIR/alter.sql"
+   ```
+
+   That statement is what turns the rollback below from a sentence into a procedure, and it is also
+   an outage until the same value reaches Vercel — every `sbapp` connection made after it fails —
+   so it is run here and not a day earlier. `~/.switchback/pg-sbapp-scram-verifier` puts the old
+   credential back verbatim if the step is abandoned part way.
+
+   Then set `DATABASE_AUTH=entra-vercel` and rewrite
    `DATABASE_URL` to the password-free form naming `sbapp_vercel`. `AZURE_TENANT_ID` and
    `AZURE_CLIENT_ID` are already set there, which is the whole of what `entra-vercel` needs beyond
    the URL. Redeploy, then prove a signed-in read and a write — `session.findUnique` is the canary.
-   The way back is deleting `DATABASE_AUTH`, restoring the password-carrying `DATABASE_URL`, and
-   redeploying: absent resolves to `password`, but neither variable reaches the running deployment
-   until a new build.
+   The way back is deleting `DATABASE_AUTH`, restoring a `DATABASE_URL` carrying `sbapp` and the
+   recorded password, and redeploying: absent resolves to `password`, but neither variable reaches
+   the running deployment until a new build.
 
    **Preview is out of scope and cannot be brought into it as the estate stands**, so there is no
    rehearsal environment for this step. Preview holds no `DATABASE_URL` — `npx vercel env ls` lists
@@ -1033,7 +1088,13 @@ neither can authenticate any way but by token, and `sbapp` is what Vercel presen
    parameter defaults to `true`, so leaving it while the server is Disabled means the next
    `main.bicep` deploy silently switches password authentication back on. The declaration is what
    stops that; it is not itself the mechanism, and this change is not a reason to deploy the
-   template.
+   template. `.github/scripts/assert-password-auth-param.sh` compares the two and is run by
+   `infra-deploy.sh` before any `main` deployment, so a forgotten parameter fails the deploy rather
+   than reversing the cutover. Run it by hand after the flip to confirm the pair landed:
+
+   ```bash
+   bash .github/scripts/assert-password-auth-param.sh
+   ```
 
 One thing to settle before step 6, and one already settled. The `migrate` job in `ci.yml` mints its
 own token and reads neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`, and both
@@ -1050,8 +1111,10 @@ After step 6 the recorded `sbadmin` password stops being break-glass. It is not 
 server refuses password authentication outright, and from step 6 onward the template needs no
 password at all — so the accidental-rotation hazard is gone rather than dormant.
 
-**Rolling step 6 back.** The reversal is the same targeted call with the flag inverted, and it is
-the one that works during an Entra outage because it authenticates to ARM rather than to Postgres:
+**Rolling step 6 back.** The reversal is the same targeted call with the flag inverted. It reaches
+ARM rather than Postgres, which makes it the reversal for a broken database-side Entra path — not
+for a directory-wide outage, because ARM authorizes the same bearer token that the outage stops
+being issued:
 
 ```bash
 az postgres flexible-server update \
@@ -1077,11 +1140,21 @@ password authentication switched on over whatever verifier the server happens to
 recorded value makes the reversal write a credential known to work, which costs nothing if the old
 verifier survived and is the whole rollback if it did not.
 
-Whether the SCRAM verifier survives a Disable → Enable cycle is **UNVERIFIED**. Nothing in this
-repository establishes it either way, Microsoft's documentation does not say, and measuring it
-needs a throwaway Flexible Server the subscription cannot currently afford (~$57/month, and it is
-already over its credit with the spending limit on). Treat the recorded password as the thing that
-makes the reversal work rather than as a formality, and do not clear the hash on the way in — an
+Whether the SCRAM verifier survives disabling and re-enabling password authentication is
+**UNVERIFIED**. Microsoft's documentation does not say, and measuring it needs a throwaway Flexible
+Server the subscription cannot afford (about USD 57 a month, already over its credit with the
+spending limit on). It is no longer load-bearing, because a verifier that does not survive can be
+put back.
+An Entra administrator can read `pg_authid.rolpassword`, and PostgreSQL stores a string beginning
+`SCRAM-SHA-256$` verbatim when it is given to `ALTER ROLE` as a password instead of hashing it
+again, so the recorded verifier restores the exact credential the server held. Both are kept beside
+the passwords they belong to, as `pg-sbadmin-scram-verifier` and `pg-sbapp-scram-verifier` in the
+owner's `.switchback` directory, owner-readable only.
+
+That mechanism is measured rather than assumed. On 2026-08-09 a throwaway role was created with one
+password and altered to a second; the first was then refused, which is what stops the check being
+vacuous. Assigning the captured verifier as the password made the first password authenticate again,
+and `rolpassword` compared byte-identical to the capture. Do not clear the hash on the way in: an
 inert hash costs nothing while `passwordAuth` is Disabled and is the cheap half of the way back.
 
 **Never deploy this resource group in Complete mode.** Incremental deployments leave undeclared

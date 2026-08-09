@@ -265,6 +265,11 @@ param vercelProjectName = 'switchback'
 // having been proved on a token *and* both administrator doors re-proved in the same hour — see
 // infra/azure/README.md. It is a separate, reviewable deployment on purpose: the way back from a
 // wrong flip is an ARM write that itself needs Entra to be working.
+//
+// The value is compared against the server's live `authConfig.passwordAuth` before every `main`
+// deployment — `.github/scripts/assert-password-auth-param.sh`, called by `infra-deploy.sh`. The
+// flip itself is a targeted `az` call, so a parameter left at `true` after it is what would switch
+// password authentication back on, and that comparison is what refuses to.
 param passwordAuthEnabled = true
 
 // The owner is here as break-glass: a human who can reach the database with a token and no

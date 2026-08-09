@@ -28,6 +28,11 @@ case "$template" in
                    tags="$TAGS"
     ;;
   main)
+    # The parameter and the server must already agree. `passwordAuthEnabled` defaults to true, so a
+    # server flipped to Disabled by the targeted `az` call and a parameter left behind means this
+    # deployment switches password authentication back on and reports success for it.
+    bash .github/scripts/assert-password-auth-param.sh
+
     # No PGADMIN_PASSWORD is exported here on purpose. main.bicepparam falls back to empty and
     # postgres.bicep then omits the property, so this run cannot rotate the admin credential.
     # `deployDatabase=false` because charset and collation are fixed by CREATE DATABASE and the
