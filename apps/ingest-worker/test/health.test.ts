@@ -2,7 +2,12 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { QUEUE_DISTRESS_MARKER, QUEUE_HEALTH_MARKER } from '@switchback/ingest';
+import {
+  QUEUE_DISTRESS_MARKER,
+  QUEUE_HEALTH_MARKER,
+  TILE_SPLIT_MARKER,
+  TRAIL_LOST_MARKER,
+} from '@switchback/ingest';
 import type { QueueHealth } from '@switchback/ingest';
 import type { PrismaClient } from '@switchback/db';
 import { BUILD_COMMIT } from '../src/build';
@@ -144,6 +149,89 @@ describe('the alert that watches it', () => {
     expect(bicep).toContain(`traces | where message has "${QUEUE_HEALTH_MARKER}"`);
     expect(bicep).toContain(`name: 'switchback-ingest-worker-silent'`);
     expect(bicep).toMatch(/switchback-ingest-worker-silent'\n[\s\S]{0,900}?enabled: true/);
+  });
+});
+
+/**
+ * Each of these pins one half of "what makes it fire, and what makes it stop". They are asserted
+ * against the template text because nothing else can: the rule lives in Azure and the condition it
+ * watches lives in this repository, so a change to either side is silent to the other.
+ */
+describe('the rules that page a human', () => {
+  const bicep = readFileSync(resolve(here, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const drainQuery = bicep.split('\n').find((line) => line.includes('name == "ingestDrain"')) ?? '';
+
+  /*
+   * The split exit returns `pending` without throwing, so `failJob` never runs and no
+   * `ingest-job-failed` is written. Tile 023010230 took that exit on 2026-08-09 having lost 4 of
+   * 1519 trails, and this token was the only thing in the estate that marked it.
+   */
+  it('reads lost ground, which the split exit reports through no other token', () => {
+    expect(drainQuery).toContain(`message has "${TRAIL_LOST_MARKER}"`);
+  });
+
+  /* Subdivision is the designed answer to a dense tile. It outnumbered every real fault 9 to 7 in
+   * the 48 h to 2026-08-09T21:12Z, and a Sev2 on it is a Sev2 on healthy operation. */
+  it('does not page on subdivision', () => {
+    expect(drainQuery).not.toContain(TILE_SPLIT_MARKER);
+  });
+
+  /* 16 rate limits in 48 h, peaking at 4 in any rolling hour, is the ambient behaviour of a free
+   * public Overpass. The threshold has to sit above that and below one blocked tile's ~24. */
+  it('measures Overpass rate limiting as a rate, not a presence', () => {
+    const rule = bicep.slice(bicep.indexOf(`displayName: 'switchback-ingest-overpass-limited'`));
+    expect(rule).toMatch(/windowSize: 'PT1H'/);
+    expect(rule.slice(0, rule.indexOf('actions:'))).toMatch(/threshold: 8/);
+  });
+
+  /*
+   * Azure reduces the window's datapoints with the declared aggregation and compares the result to
+   * the threshold, so the aggregation decides what the rule can see. `DeadletteredMessages` is
+   * published densely — 2880 of 2880 fifteen-minute windows carried a value over the 30 d to
+   * 2026-08-09 — so the window really does hold a datapoint per minute, and reducing one here is
+   * the same arithmetic the rule performs.
+   */
+  const REDUCERS: Record<string, (window: readonly number[]) => number> = {
+    Maximum: (window) => Math.max(...window),
+    Minimum: (window) => Math.min(...window),
+    Average: (window) => window.reduce((sum, value) => sum + value, 0) / window.length,
+  };
+
+  const deadLetterRule = bicep.slice(bicep.indexOf(`name: 'switchback-ingest-deadletter'`));
+  const deadLetterCriteria = deadLetterRule.slice(0, deadLetterRule.indexOf('actions:'));
+  const declaredAggregation = /timeAggregation: '(\w+)'/.exec(deadLetterCriteria)?.[1] ?? '';
+  const declaredThreshold = Number(/threshold: (\d+)/.exec(deadLetterCriteria)?.[1]);
+
+  /** What Azure would read off this window, using the aggregation the template declares. */
+  function reduceWindow(window: readonly number[]): number {
+    const reduce = REDUCERS[declaredAggregation];
+    if (reduce === undefined) {
+      throw new Error(`Service Bus does not publish '${declaredAggregation}' for this metric`);
+    }
+    return reduce(window);
+  }
+
+  /* One message dead-lettered four minutes in and drained six minutes later. `Minimum` reads 0 over
+   * this and the operator is never told; the tile's ground stays missing with nothing pointing at
+   * it. This is the case the aggregation is chosen for. */
+  it('sees a message dead-lettered and drained inside one window', () => {
+    expect(reduceWindow([0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0])).toBeGreaterThan(
+      declaredThreshold,
+    );
+  });
+
+  /* Service Bus publishes this metric with `supportedAggregationTypes` of Average, Minimum and
+   * Maximum, confirmed against the live namespace. `Total` deploys and then never evaluates. */
+  it('reads an aggregation Service Bus publishes for this metric', () => {
+    expect(['Average', 'Minimum', 'Maximum']).toContain(declaredAggregation);
+  });
+
+  /* Clearing needs both halves: a reading that returns to zero on an empty queue, and the rule
+   * being willing to act on it. Nothing drains the dead-letter queue by itself, so a resolution can
+   * only follow an operator emptying it. */
+  it('resolves itself once the queue is empty', () => {
+    expect(reduceWindow(new Array<number>(15).fill(0))).not.toBeGreaterThan(declaredThreshold);
+    expect(deadLetterCriteria).toContain('autoMitigate: true');
   });
 });
 

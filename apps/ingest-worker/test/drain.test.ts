@@ -18,6 +18,7 @@ import {
   OverpassDeadlineError,
   SUBTREE_STUCK_MARKER,
   TILE_SPLIT_MARKER,
+  TRAIL_LOST_MARKER,
   subdivideMaxZoom,
   withDeadline,
 } from '@switchback/ingest';
@@ -302,7 +303,13 @@ describe('the Overpass concurrency clamp, from the template', () => {
  */
 describe('the drain-failure alert, from the template', () => {
   const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
-  const query = /query: '([^']+)'/.exec(bicep)?.[1] ?? '';
+  // Anchored on the rule's own first arm, not on the first `query:` in the file — the template
+  // holds six scheduled rules and a bare match binds to whichever happens to be declared first.
+  const query =
+    bicep
+      .split('\n')
+      .map((line) => /query: '([^']+)'/.exec(line)?.[1] ?? '')
+      .find((q) => q.includes('name == "ingestDrain"')) ?? '';
 
   it('greps traces for the token the worker logs, not for its prose', () => {
     // The coupling that keeps this honest: reword the sentence and the test still passes;
@@ -316,9 +323,16 @@ describe('the drain-failure alert, from the template', () => {
     expect(query).toContain('success == false');
   });
 
-  it('fires on a split, which returns normally and would otherwise log only "done"', () => {
-    expect(query).toContain(TILE_SPLIT_MARKER);
+  /*
+   * A split is the designed answer to a dense tile — 9 of them against 7 real faults in the 48 h to
+   * 2026-08-09T21:12Z — so it must not page. What must still page is a split that lost ground on
+   * the way: `splitTile` returns `pending` without throwing, `failJob` never runs, and
+   * `TRAIL_LOST_MARKER` inside the split line is the only token left marking it.
+   */
+  it('separates a subtree that is stuck from a tile that merely split', () => {
     expect(query).toContain(SUBTREE_STUCK_MARKER);
+    expect(query).toContain(TRAIL_LOST_MARKER);
+    expect(query).not.toContain(TILE_SPLIT_MARKER);
   });
 
   it('fires on a handler the host killed, which writes no request row at all', () => {

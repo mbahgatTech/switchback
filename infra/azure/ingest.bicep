@@ -520,18 +520,31 @@ Because of the queue policy above this fires for exactly one condition — a mes
 to process five times, which in this design means it could not reach Postgres. That is an operator
 signal, not noise, so the threshold is zero and the severity is 2.
 
-**`autoMitigate` is off, and that is forced by the metric.** `DeadletteredMessages` is the *depth*
-of the dead-letter queue, and nothing drains it: a dead-lettered message sits there until a person
-removes it. So the gauge never returns to zero on its own, and an auto-mitigating rule on it would
-stay fired until somebody acted anyway. Edge-triggered is the honest reading: the alert means "a
-message was dead-lettered", the operator drains the queue, and closing the alert is part of that
-work rather than something the platform guesses at.
+**`Maximum`, because the window has to see a dead letter that arrives inside it.**
+`DeadletteredMessages` is the *depth* of the dead-letter queue, and it is published densely: over the
+30 d to 2026-08-09 all 2880 fifteen-minute windows carried a value, every one of them 0. The
+aggregation is therefore taken over a full window of real datapoints, and `Maximum` breaches on the
+first one above zero. `Minimum` reads the floor instead, which requires the queue to be non-empty at
+*every* datapoint in the window: it delays detection by up to a full window, and never fires at all
+for a message dead-lettered and drained inside one.
 
-`Maximum` because it is the only aggregation that is both accepted and correct here. Service Bus
-publishes `DeadletteredMessages` with `supportedAggregationTypes` of Average, Minimum and Maximum —
-`Total` is not among them. It is also the wrong reading on a depth gauge: summing a window conflates
-depth with duration, so one message sitting for fifteen minutes and fifteen messages arriving in one
-read identically. `Maximum` moves 1 → 2 on the second dead letter, which is the thing to see.
+**It clears, and that is measured rather than assumed.** Azure aggregates over a rolling window, so
+once the queue is drained the window holds only zeros and `Maximum` reads 0. Measured against
+`ActiveMessages` — the sibling depth gauge on this namespace, same unit and same supported
+aggregations — across the drain beginning 2026-08-08T22:07Z: a rolling fifteen-minute `Maximum`
+breached at 22:14Z and fell back below threshold at 23:56Z, with nothing resetting it. A rolling
+`Minimum` over the same data did not breach until 22:45Z, 31 minutes after the depth first rose.
+`autoMitigate` is on because nothing drains the dead-letter queue by itself, so a resolution can only
+follow an operator emptying it.
+
+`Total` is not an option and the aggregation is not free to choose. Service Bus publishes
+`DeadletteredMessages` with `supportedAggregationTypes` of Average, Minimum and Maximum only,
+confirmed against the live namespace. It would also be the wrong reading on a depth gauge: summing
+a window conflates depth with duration, so one message sitting for fifteen minutes and fifteen
+messages arriving at once read identically.
+
+**Fires** when the dead-letter queue holds a message at any point in a fifteen-minute window.
+**Clears** when the queue has been emptied and the next window sees only zeros.
 
 Draining it is `infra/azure/README.md`, "A message dead-lettered".
 ''')
@@ -540,7 +553,7 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   location: 'global'
   tags: tags
   properties: {
-    description: 'A message on ingest-jobs was dead-lettered: the worker could not process it in ${queue.properties.maxDeliveryCount} deliveries. Nothing drains the dead-letter queue, so this stays open until an operator does.'
+    description: 'A message on ingest-jobs was dead-lettered and is still sitting there: the worker could not process it in ${queue.properties.maxDeliveryCount} deliveries. Nothing drains the dead-letter queue, so this stays open until an operator does — and clears once they have.'
     severity: 2
     enabled: true
     scopes: [
@@ -571,7 +584,7 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
         }
       ]
     }
-    autoMitigate: false
+    autoMitigate: true
     actions: [
       {
         actionGroupId: actionGroup.id
@@ -1287,15 +1300,25 @@ The second arm reads `traces` for the token `runIngestSignal` logs beside every 
 Matching a token rather than the sentence is deliberate: a reworded log line must not silently
 disarm the alert, and `apps/ingest-worker/test/drain.test.ts` asserts the two agree.
 
-The third arm is subdivision, which would otherwise have *disarmed* the second. Before it a tile
-that exhausted `deadlineAt` threw `IngestDeadlineError`, `drainJobs` recorded a failure and the
-token above was logged; now that tile splits, `processTile` returns normally and the invocation
-logs `done`. An operator would read 8/8 tiles succeeded while two of them ingested nothing and
-deferred to four children each. A split is a deferral, not a success, and the ground a reader is
-waiting for is still missing when one happens.
+**The third arm is ground a tile could not commit, and subdivision is why it needs its own token.**
+A tile that runs out of clock splits: `processTile` returns `TileStatus.pending`, `failJob` never
+runs, and no `ingest-job-failed` is written. When that tile also lost trails on its own account,
+`describeLost` puts `switchback-ingest-trail-lost` inside the split line, and that token is the only
+thing in the estate marking it. Tile `023010230` at 2026-08-09T20:53:32Z took exactly that path —
+4 of 1519 trails did not commit, and `AppTraces` holds no `ingest-job-failed` within ten minutes
+either side. On the other exit, where the tile fails and rethrows, the same token rides alongside
+`ingest-job-failed`; a union counts the window once, so the pair cannot page twice.
 
-**Both tokens in that arm are edge-triggered, and the rule depends on it.** A split is logged once,
-when it happens. `switchback-ingest-subtree-stuck` is written only when the parent's stored
+Subdivision itself is not on this rule. A split is the designed answer to a dense tile, not a
+fault: 9 splits in the 48 h to 2026-08-09T21:12Z, against 7 events across every other arm combined.
+What task #224 asked for — that a split must not read as a clean success — is carried by the status
+write rather than by a page. `splitTile` leaves the parent `pending`, so `ensureCoverage` still
+counts it outstanding and the client still polls it. A split that dies before writing its children
+is not silent either: `splitTile` upserts all four children ahead of the parent's marker, so a
+partial run throws, `failJob` records it, and the `ingest-job-failed` arm above catches it.
+
+**`switchback-ingest-subtree-stuck` is edge-triggered, and the rule depends on it.** It is written
+only when the parent's stored
 `lastError` does not already say so — without that it would be logged on every drain of a blocked
 parent, and a blocked parent is `pending`, so `ensureCoverage` re-queues it on every viewport poll
 and `explore.tsx` polls *because* it is pending. One stuck subtree would then page every fifteen
@@ -1307,9 +1330,14 @@ five items per second and adaptive sampling drops correlated *sets*, so a dense 
 telemetry could take the one line these arms match with it. `excludedTypes` there now holds
 `Trace`, which is what makes this rule's evidence non-droppable.
 
-`Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough. `autoMitigate` is off
-— the condition is "this happened", not "this is happening", and an alert that resolves itself the
-moment the tile stops being retried is an alert nobody reads.
+`Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough.
+
+**Fires** when any arm below records one event in a fifteen-minute window: a job buried, ground not
+committed, a subtree stuck, a lease expired with no outcome, a stranded signal, a double commit, a
+wedged tile, or a rejected `ingestDrain`/`ingestPump`. **Clears** only when an operator closes it —
+`autoMitigate` is off, because every one of those is "this happened" rather than "this is
+happening", and there is no later observation that would mean the lost ground came back. An alert
+that resolved itself the moment the tile stopped being retried would be an alert nobody reads.
 
 **The fourth arm is the one that sees a killed handler.** A handler the host kills writes no
 request row at all — the process stops between two awaits — so the first arm is structurally
@@ -1322,11 +1350,11 @@ A slow handler that *does* return is a separate fault the first arm also misses,
 reason: six other invocations ran 540,111 ms to 548,954 ms past the 540,000 ms bound and every
 one recorded `Success=True`. Overrunning is not failing, as far as the host is concerned.
 
-The three deployed arms are **not** silent over that window — run verbatim they return five
-matches: one `ingest-job-failed` for `ingest_tile:120222201` at 16:56:39, and four
-`switchback-ingest-tile-split` at 17:55:05, 18:04:14, 18:13:20 and 18:22:30. Every one of those is
-a different fault. None is the killed handler, and the `Executing`-minus-`Executed` gap of five is
-invisible to all three.
+The fault arms are **not** silent over that window — run verbatim they return one match, the
+`ingest-job-failed` for `ingest_tile:120222201` at 16:56:39. The four `switchback-ingest-tile-split`
+lines at 17:55:05, 18:04:14, 18:13:20 and 18:22:30 are subdivision, which no longer arms this rule.
+Neither set is the killed handler, and the `Executing`-minus-`Executed` gap of five is invisible to
+both.
 
 The signal the fourth arm watches is written by the reaper rather than by the redelivery, because
 the reaper is the only participant that observes the death. `reclaimExpiredJobs` runs ahead of the
@@ -1365,7 +1393,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   tags: tags
   properties: {
     displayName: 'switchback-ingest-drain-failed'
-    description: 'An ingest job failed, was killed by the host, deferred its tile to four children, or the pump could not publish. None of these dead-letters, so this rule is the only signal.'
+    description: 'An ingest job failed, was killed by the host, could not commit ground it had fetched, or the pump could not publish. None of these dead-letters, so this rule is the only signal. Subdivision is not on it: a split is the designed answer to a dense tile.'
     severity: 2
     enabled: true
     scopes: [
@@ -1376,7 +1404,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (traces | where message has "switchback-ingest-double-commit" | project timestamp), (traces | where message has "switchback-ingest-tile-wedged" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-trail-lost" | project timestamp), (traces | where message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (traces | where message has "switchback-ingest-double-commit" | project timestamp), (traces | where message has "switchback-ingest-tile-wedged" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -1410,8 +1438,26 @@ recorded five real 429s between 16:37:28 and 18:24:51 UTC, each followed by a fa
 This rule reads the request path directly, where the 429 actually arrives.
 `packages/ingest/src/overpass.ts` logs one line per non-OK response, and the `status=` in it is the
 code the mirror returned. Scoped to 429 rather than to strain generally: a 504 is a slow mirror and
-failover is the designed answer, but a 429 is the upstream telling us we are over our allowance,
-and the correct response is a person deciding whether to back off.
+failover is the designed answer, but a 429 is the upstream telling us we are over our allowance.
+
+**A single 429 is the ambient behaviour of a free public instance, so the threshold is a rate, not
+a presence.** Measured over the 48 h to 2026-08-09T21:12Z: 16 rate limits in total, and the busiest
+rolling window held 2 in fifteen minutes, 4 in an hour, 6 in six hours. That load is present with
+and without a worker draining, the client already retries and rotates across three endpoints, and
+none of the 16 cost a tile its ground.
+
+`GreaterThan 8` over an hour sits at twice the measured hourly peak and roughly 24x the hourly mean
+of 0.33, and it is still well inside what a real block produces. `maxAttempts` is
+`max(6, endpoints x 2)` = 6, and a tile spends up to four Overpass queries, so one tile against a
+blocked IP emits up to 24 refusals — the threshold is crossed inside a single tile, long before an
+hour of it. Exhaustion past that point is not this rule's job: when failover runs out the request
+throws, the tile fails, and `switchback-ingest-drain-failed` reads the `ingest-job-failed` it
+writes.
+
+**Fires** when Overpass returns more than 8 rate limits in any rolling hour. **Clears** by itself
+once the trailing hour falls back to 8 or fewer — `autoMitigate` is on, because unlike lost ground
+this is a condition that is either present or over, the client recovers without help, and an
+operator arriving at a resolved rate-limit alert has nothing left to do.
 ''')
 resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-overpass-limited'
@@ -1419,21 +1465,21 @@ resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
   tags: tags
   properties: {
     displayName: 'switchback-ingest-overpass-limited'
-    description: 'Overpass answered 429. Sustained rate limiting is answered with an IP block, which stops ingestion entirely.'
+    description: 'Overpass is rate limiting sustainedly: more than 8 refusals in an hour, against a measured ceiling of 4. Sustained rate limiting is answered with an IP block, which stops ingestion entirely.'
     severity: 2
     enabled: true
     scopes: [
       appInsights.id
     ]
     evaluationFrequency: 'PT15M'
-    windowSize: 'PT15M'
+    windowSize: 'PT1H'
     criteria: {
       allOf: [
         {
           query: 'traces | where message has "switchback-ingest-overpass-strain" and message has "status=429" | project timestamp'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
-          threshold: 0
+          threshold: 8
           failingPeriods: {
             numberOfEvaluationPeriods: 1
             minFailingPeriodsToAlert: 1
@@ -1441,7 +1487,7 @@ resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
         }
       ]
     }
-    autoMitigate: false
+    autoMitigate: true
     actions: {
       actionGroups: [
         actionGroup.id

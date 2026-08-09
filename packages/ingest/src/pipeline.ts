@@ -153,11 +153,10 @@ export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
 /**
  * The literal an operator greps for when a tile could not commit a trail it had fetched.
  *
- * It carries no alert rule of its own. The tile fails and rethrows, so `drainJobs` writes the
- * message to the job row and the worker logs `ingest-job-failed`, which
- * `switchback-ingest-drain-failed` already reads; a second arm on the same event would page
- * twice. What this token adds is the *cause* and the OSM ids, on the tile row, the job row and
- * the log line, so one search answers which trails a tile is missing.
+ * `switchback-ingest-drain-failed` reads it, and the split exit is why. On the failing exit the
+ * tile rethrows and the worker logs `ingest-job-failed` beside this token, so the union counts one
+ * window and the pair cannot page twice. On the split exit `splitTile` returns `pending` and
+ * `failJob` never runs, so this token is the only thing marking the ground that did not commit.
  */
 export const TRAIL_LOST_MARKER = 'switchback-ingest-trail-lost';
 
