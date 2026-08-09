@@ -275,8 +275,10 @@ Basic is a legitimate downgrade if the credit tightens — the only change is th
 an Entra identity — the worker with the Function App's system-assigned one, Vercel with the federated
 user-assigned one below — and with local auth off no SAS key would work even if one leaked. Turning
 it back on is a one-line revert. There is no longer a flag that bypasses the broker: Service Bus is
-the only route a tile takes, so the broker being reachable is a hard dependency rather than an
-optimisation, and `publishIngestSignals` fails loudly rather than falling back.
+the only route a tile takes. That makes the broker a hard dependency for *latency* but not for
+durability — `ensureCoverage` writes the `ingest_jobs` row before anything publishes, so
+`publishIngestSignals` logs a failed send and returns rather than throwing, and `ingestPump`
+re-derives the row on its next tick.
 
 It is not a claim about this file, but this file is now close to it. **One** long-lived credential
 is deployed from here and a maintainer needs to know it is there to rotate: `DATABASE_URL`, passed
@@ -348,13 +350,23 @@ catches per job and routes to `failJob`, and retry semantics for the work itself
 `maxAttempts` and the `dead` status in Postgres, none of which Service Bus can express. Dead-lettering
 expired messages would fill the DLQ with stale wake-up signals and hide the one thing it should mean.
 
-**`defaultMessageTimeToLive: PT1H` does expire messages, and that is survivable rather than
-prevented.** Measured over the 50 `ingestDrain` invocations of 2026-08-08: mean 126,245 ms, p90
+**`defaultMessageTimeToLive: PT1H` does expire messages, and both it and the dead-lettering flag
+are load-bearing at the values above — moving either in the direction that looks safer makes
+recovery worse.** Measured over the 50 `ingestDrain` invocations of 2026-08-08: mean 126,245 ms, p90
 540,111 ms, max 548,954 ms, 20 of 50 past 30 s. At `maxConcurrentCalls: 1` a queue eight deep is
 ~15 minutes of dwell at the mean and over an hour at p90, so both the 10-minute dedupe window and
 this TTL are exceeded in the tail. Neither loses work: the queue carries a wake-up signal and
 `ingest_jobs` carries the record, so an expired message leaves a `queued` row that the next pump
 tick republishes. `PUMP_LOW_WATER` is what stops the republishes stacking up behind a slow tile.
+
+Expiry is therefore the mechanism that *restores* the pump rather than a leak in it. `runPump`
+publishes nothing while `activeMessageCount` is at or above `PUMP_LOW_WATER`, and
+`apps/ingest-worker/src/service-bus.ts` reads that count from the queue's ARM `countDetails`, where
+an expired message no longer appears. A longer TTL would hold stale signals in the active count and
+suppress the one process that can re-derive the work; `deadLetteringOnMessageExpiration: true` would
+clear the active count but route every stale doorbell to the DLQ, whose alert exists to mean one
+thing. A worker stopped for maintenance loses wake-up signals and no work, which is the trade these
+two values are chosen for. `apps/ingest-worker/test/drain.test.ts` pins both against that argument.
 
 The dedupe window is 10 minutes for one reason only — it must be *shorter* than `LEASE_TIMEOUT_MS`
 (720 s), or the pump's republish of a reclaimed job is discarded as a duplicate of the message a
@@ -1167,11 +1179,12 @@ resource publisherSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 @description('''
 **The identity that publishes the worker bundle, and the reason there is one at all.**
 
-`ingest.bicep` cannot declare `WEBSITE_RUN_FROM_PACKAGE` — an ARM application-settings write
-replaces the collection whole and would erase whatever the last zip push put there — so the code
-the Function App runs arrives by a path outside this template. That path was a workstation, which
-is to say it was one person remembering. Master then moves and the site does not, with every CI
-gate green, because the gates describe a build and nothing was asserting anything about production.
+`WEBSITE_RUN_FROM_PACKAGE` is declared in this template, from `packageUrl` — but what it names is a
+per-commit blob, `function-releases/<commit>-<utc>.zip`, and uploading that blob is not something a
+template can do. So the setting is declared here and the *package* arrives from somewhere else. That
+somewhere was a workstation, which is to say it was one person remembering. Master then moves and
+the site does not, with every CI gate green, because the gates describe a build and nothing was
+asserting anything about production.
 
 This identity is what lets `.github/workflows/ci.yml` close that loop on every push to master. Its
 `workerDeployerClientId` output is the `AZURE_WORKER_DEPLOY_CLIENT_ID` repository variable; without
@@ -1482,17 +1495,18 @@ resource overpassSkippedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
 handler the host killed, a tile that deferred itself to four children. This rule watches what is
 *true*: conditions that persist, and that nothing would report until somebody went looking.
 
-Five of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
-`lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck.
-The sixth is the absence of rows changing — a drain that has stopped leaves no error behind, so
+Six of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
+`lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck,
+a tile left mid-fetch that no job can finish. The seventh is the absence of rows changing — a drain
+that has stopped leaves no error behind, so
 `stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`.
 `ingestPump` runs every two minutes and already reads that database, so
-`apps/ingest-worker/src/health.ts` reads the six counts and logs `switchback-ingest-queue-distress`
+`apps/ingest-worker/src/health.ts` reads the seven counts and logs `switchback-ingest-queue-distress`
 when any is non-zero. The report runs ahead of the `INGEST_PUMP_ENABLED` brake in
 `functions/pump.ts`: a queue somebody has deliberately stopped feeding is exactly when its depth
 still needs watching.
 
-**Each of the six can return to zero, which is what makes this a rule rather than a light left
+**Each of the seven can return to zero, which is what makes this a rule rather than a light left
 on.** Three of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
 `pruneFinishedJobs` keeps that row for thirty days, so an unwindowed count reads the same
 twenty-five for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
@@ -1559,7 +1573,7 @@ resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
 
 Every other rule in this file is armed by something the Function App emits, so all of them read a
 host that is down, wedged, or running a build that predates the code they watch as an estate with
-nothing wrong. That is not a hypothetical: `WEBSITE_RUN_FROM_PACKAGE` is set by
+nothing wrong. That is not a hypothetical: the zip `WEBSITE_RUN_FROM_PACKAGE` names is uploaded by
 `.github/scripts/deploy-worker.sh` and by nothing else, so any failure of that path leaves the app
 serving whatever zip it last received, indefinitely and silently.
 

@@ -913,9 +913,9 @@ side and stays `true` until every consumer has been proved on a token.
    `ingest_jobs`: `dead=1 staleLeases=1` at 17:45:12Z and `staleLeases=0` at 17:46:00Z.
 
    Reverting is `databaseAuth='password'` with a `databaseUrl` carrying `sbapp`'s password,
-   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
-   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it, leaving the app codeless
-   until the package is pushed again.
+   redeployed. That deployment rewrites the whole application-settings collection, so export the
+   live `INGEST_PACKAGE_URL` with it — the parameter has no fallback, so an unset one fails the
+   build rather than moving the app onto another package.
 
    **Do not move the Function App onto the shared identity.** The shared identity's
    Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
@@ -954,9 +954,9 @@ side and stays `true` until every consumer has been proved on a token.
 4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Use the
    export set in [Deploying it](#deploying-it) rather than a shorter one: every variable there has
    no fallback, so a missing one fails the build instead of writing a wrong value. Confirm the
-   settings landed with `az functionapp config appsettings list -o json`, and re-run
-   `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces the collection
-   whole and erases `WEBSITE_RUN_FROM_PACKAGE`.
+   settings landed with `az functionapp config appsettings list -o json` — an ARM
+   application-settings write replaces the collection whole, and that read is the only thing that
+   can confirm what it wrote.
 5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
@@ -1160,13 +1160,20 @@ in code — that a URL reaches you is the one thing the operator has to get righ
 setting with whatever the parameter resolves to, and a default would let a routine deploy silently
 change how trails are identified across a tile seam.
 
-**The template deploy and the package push always run together, template first — and the push is a
-script, not a command.** Linux Consumption runs the code from a package URL that
-`.github/scripts/deploy-worker.sh` writes into the same application-settings collection an
-ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
-— and a Bicep deployment on its own leaves the app codeless until the next push. For the same reason,
-a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
-the template.
+**The template declares the package URL; the package itself is pushed by a script.** Linux
+Consumption runs the code from `WEBSITE_RUN_FROM_PACKAGE`, which `ingest.bicep` declares from
+`packageUrl` — so a template-only deploy writes back the URL that is already live, provided
+`INGEST_PACKAGE_URL` names it. What no template can do is upload the per-commit zip, which is what
+the script below is for. For the same reason a setting added by hand in the portal is erased by the
+next deployment: worker environment belongs in the template.
+
+**`az deployment group what-if` cannot check any of this.** ARM redacts `siteConfig.appSettings` to
+`*******` in both the before and after payloads, because the collection can hold secrets — so no
+application setting appears in a what-if at any confidence level, and a plan that looks clean says
+nothing about `WEBSITE_RUN_FROM_PACKAGE`, `DATABASE_AUTH` or the two ingest flags. What-if is still
+worth running for the resource-level change list, and it is what proves no
+`Microsoft.DBforPostgreSQL` resource is in the change set. Settings are confirmed after the fact,
+with the `az functionapp config appsettings list` reads below.
 
 ```bash
 bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip "$(git rev-parse HEAD)"
@@ -1218,8 +1225,8 @@ az rest --method PUT --body @/tmp/grant.json \
 container: it reaches neither `azure-webjobs-secrets`, where the host keys live, nor the lease blobs
 beside it.
 
-The trigger sync inside it is not optional and cost half an hour to find. After an ARM deployment has
-removed `WEBSITE_RUN_FROM_PACKAGE` and the push has put it back, the host comes up reporting
+The trigger sync inside it is not optional and cost half an hour to find. When the package the app
+runs from changes, the host comes up reporting
 `0 functions loaded` / "No functions were found", `az functionapp function list` returns `[]`, and
 nothing ever wakes it — a Consumption app with no registered triggers has nothing to scale on, so it
 sits there indefinitely and a restart does not help. The call the script makes is:

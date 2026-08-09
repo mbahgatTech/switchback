@@ -425,9 +425,10 @@ that actually discovers the dead lease — is what the rule matches on instead. 
 failover absorbs never reaches a job row, so `switchback-ingest-overpass-limited` reads the request
 path directly rather than relying on the `rateLimited` gauge below.
 
-What covers the rest is `switchback-ingest-queue-distress`. Five of those conditions are a row —
+What covers the rest is `switchback-ingest-queue-distress`. Six of those conditions are a row —
 a job buried inside the last hour, a lease past `LEASE_TIMEOUT_MS`, a `lastError` naming a 429, a
-tile carrying a split marker with no children, a subtree marked stuck — and `ingestPump` runs inside
+tile carrying a split marker with no children, a subtree marked stuck, a tile left mid-fetch that no
+job can finish — and `ingestPump` runs inside
 the alert's own subscription every two minutes and already reads that database.
 `apps/ingest-worker/src/health.ts`
 counts them and logs the token when any is non-zero, ahead of the pump's `INGEST_PUMP_ENABLED`
@@ -969,18 +970,22 @@ hands the members to the same assembler.
 
 ## Deploying the ingest worker
 
-**The Function App's code arrives by a path outside `infra/azure/ingest.bicep`, and that is
-deliberate.** `WEBSITE_RUN_FROM_PACKAGE` is what Linux Consumption runs from, and an ARM
-application-settings write replaces the collection whole — so a template that declared it would
-fight the package push, and a template that does not declare it erases whatever the last push wrote.
-Both facts are load-bearing:
+**`infra/azure/ingest.bicep` declares `WEBSITE_RUN_FROM_PACKAGE`, and the zip it names arrives by a
+separate path.** That setting is what Linux Consumption runs from, and an ARM application-settings
+write replaces the collection whole — so a template that left it out unmounted the code on every
+deployment that ran without a package push. It is declared from the `packageUrl` parameter, which
+has no fallback: `INGEST_PACKAGE_URL` must be read off the live app first, and an unset variable
+fails the build with `BCP427` rather than pointing production at another build. What a template
+cannot do is upload `function-releases/<commit>-<utc>.zip`, so both steps still exist:
 
-| Step | Command                                                                 | Why the order                                                                                                            |
-| ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, and in doing so removes `WEBSITE_RUN_FROM_PACKAGE`. The app is codeless from here until step 2. |
-| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.     |
+| Step | Command                                                                 | Why the order                                                                                                                   |
+| ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, including the package URL it was handed. Harmless when that URL is the live one; wrong when it is not. |
+| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.            |
 
-Step 2 alone is the routine case; step 1 is only needed when the template changes.
+Step 2 alone is the routine case; step 1 is only needed when the template changes. Step 1 no longer
+leaves the app codeless, so the two are independent — but the trigger cache still has to be synced
+whenever the **package** changes, which is what step 2 does and step 1 never needs to.
 
 **Step 2 uploads the blob itself rather than calling `az functionapp deployment source config-zip`.**
 That command chooses between the blob path and a Kudu `/api/zipdeploy` by reading the plan to see
@@ -1725,9 +1730,9 @@ each provable with passwords still enabled:
    line with `staleLeases=0` at 17:46:00Z. A changing gauge cannot come from anywhere but a query.
 
    **Rolling back is `databaseAuth='password'` and a `databaseUrl` carrying `sbapp`'s password**,
-   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
-   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it. `passwordAuth` on the server
-   is `Enabled`, so that way back is open.
+   redeployed. `passwordAuth` on the server is `Enabled`, so that way back is open. The deployment
+   rewrites the whole application-settings collection, so `INGEST_PACKAGE_URL` has to name the live
+   package on the way through — it is a parameter with no fallback for exactly that reason.
 
    **Do not move this app onto the shared identity.** The trigger binding sets no
    `__clientId`, so the host receives Service Bus messages as whatever principal the site runs
@@ -1848,9 +1853,8 @@ gated on `vars.AZURE_INFRA_CLIENT_ID != ''`, which is unset — `gh variable lis
 `AZURE_SUBSCRIPTION_ID` and `AZURE_WORKER_DEPLOY_CLIENT_ID` and nothing else, so that job is skipped
 on every run. `.github/scripts/infra-deploy.sh` would take only `runtime-identity` and `main` in any
 case. So a change to the ingest template reaches Azure on a human-run `az deployment group create` —
-and that deployment must be followed by `.github/scripts/deploy-worker.sh`, because an ARM
-application-settings write erases `WEBSITE_RUN_FROM_PACKAGE` and leaves the app codeless until the
-next package push.
+and that deployment rewrites the whole application-settings collection, so it must be handed the
+live `INGEST_PACKAGE_URL`, or the app comes back running a different build.
 
 **`ingest.bicepparam` is compiled by nothing, so a break in it surfaces at the deploy.** It resolves
 `INGEST_OVERPASS_USER_AGENT`, `INGEST_TRAIL_IDENTITY` and

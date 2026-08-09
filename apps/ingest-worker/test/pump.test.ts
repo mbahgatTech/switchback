@@ -146,3 +146,41 @@ describe('runPump', () => {
     expect(queue.published).toEqual([]);
   });
 });
+
+/**
+ * Why a lost wake-up needs no alarm of its own. `publishIngestSignals` swallows a broker failure
+ * and logs `PUBLISH_FAILED_MARKER` on Vercel, where no Azure rule can read it; that is only
+ * defensible while the pump re-derives the work from `ingest_jobs` regardless.
+ */
+describe('recovery from a wake-up that never reached the broker', () => {
+  it('selects on the row alone, so a failed publish cannot make a job unreachable', async () => {
+    const { db, calls } = fakeDb({ primary: ['ingest_tile:never-signalled'] });
+    const queue = fakeQueue(0);
+
+    await runPump(db, queue, silent);
+
+    /*
+     * The predicate is `status` and `runAfter` and nothing else. A column recording whether a
+     * signal was ever sent — or a successful publish being what moves the row on — would make a
+     * dropped message permanent, which is the failure this queue has no second path to catch.
+     */
+    const primary = calls[0];
+    expect(Object.keys(primary?.where ?? {}).sort()).toEqual(['kind', 'runAfter', 'status']);
+    expect(primary?.where.status).toBe(JobStatus.queued);
+    expect(queue.published).toEqual(['ingest_tile:never-signalled']);
+  });
+
+  it('republishes the same key on the next tick, because publishing claims nothing', async () => {
+    const rows = { primary: ['ingest_tile:a'] };
+    const first = fakeQueue(0);
+    const second = fakeQueue(0);
+
+    // Two ticks against a row no worker has claimed: the pump must name it both times, or a
+    // message lost between them is lost for good.
+    await runPump(fakeDb(rows).db, first, silent);
+    await runPump(fakeDb(rows).db, second, silent);
+
+    expect(first.published).toEqual(['ingest_tile:a']);
+    expect(second.published).toEqual(['ingest_tile:a']);
+  });
+});

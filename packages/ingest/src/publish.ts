@@ -58,11 +58,22 @@ export interface PublishResult {
 /**
  * The literal an operator greps for when a wake-up did not reach the broker.
  *
- * Enqueue has one path now, so a publish that fails is the only moment at which a tile somebody
- * is looking at depends on the pump's two-minute tick rather than on a doorbell. Nothing else
- * says so: `publishIngestSignals` cannot throw without emptying the map on a broker incident, and
- * a returned count reaches only a caller that is already inside `waitUntil`. Greppable in Vercel's
- * runtime logs; there is no Azure-side emitter and no alert.
+ * **A diagnostic, not an alarm, and the distinction is the whole design.** Every caller writes its
+ * `ingest_jobs` rows before ringing this doorbell, so a failed publish costs the doorbell and not
+ * the tile: `runPump` re-derives the runnable head of `ingest_jobs` on a two-minute timer and
+ * publishes it again. Nothing needs to observe a lost signal for the work to happen.
+ *
+ * What that argument depends on is the pump, so the pump is what is watched — from Azure, where the
+ * telemetry actually is. `switchback-ingest-worker-silent` fires when no queue-health heartbeat
+ * arrives for 30 minutes, and `switchback-ingest-drain-failed` carries an arm for
+ * `ingestPump` invocations that end `success == false`, which is how a pump that starts and then
+ * fails to publish is caught. A drain that has stopped for any reason shows up in the
+ * `stalledDrain` gauge behind `switchback-ingest-queue-distress`.
+ *
+ * This marker lands in Vercel's runtime logs and only there — Vercel writes to no Application
+ * Insights, so no rule in `infra/azure/ingest.bicep` can read it and none tries. Its use is telling
+ * an operator *why* ingest latency rose to the pump's cadence, after one of the rules above has
+ * already said that something is wrong.
  */
 export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
 
@@ -74,12 +85,6 @@ export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
  * the wake-up and nothing else: the work is still queued, still deduped, still priority-ordered,
  * and `runPump` re-derives it from `ingest_jobs` on its next two-minute tick. Failing the request
  * instead would let a Service Bus incident empty the map.
- *
- * That recovery is why a lost signal is latency rather than loss. `PUBLISH_FAILED_MARKER` makes the
- * failure greppable in Vercel's runtime logs, which is where it lands and the only place it lands:
- * Vercel writes to no Application Insights, so no rule in `infra/azure/ingest.bicep` can read it and
- * none tries. Durability does not depend on anyone seeing it — `ingest_jobs` is the queue of record
- * and this is a doorbell.
  */
 export async function publishIngestSignals(
   dedupeKeys: readonly string[],

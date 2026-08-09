@@ -2,11 +2,11 @@
 #
 # Publish the ingest worker bundle to the Function App, and then prove the app is running it.
 #
-# This is the only thing that writes `WEBSITE_RUN_FROM_PACKAGE`. `infra/azure/ingest.bicep`
-# deliberately does not declare that setting — an ARM application-settings write replaces the
-# collection whole and would fight the package push — so a template deploy leaves the app codeless
-# until this script runs. Template first, then this. Both CI and a human invoke this same file so
-# the sequence cannot exist in two versions.
+# This is the only thing that uploads the bundle and points `WEBSITE_RUN_FROM_PACKAGE` at it.
+# `infra/azure/ingest.bicep` declares that setting from its `packageUrl` parameter, so a template
+# deploy writes back whatever `INGEST_PACKAGE_URL` names — it cannot upload a per-commit zip, which
+# is what this does. Both CI and a human invoke this same file so the sequence cannot exist in two
+# versions.
 #
 # **Upload the blob, then name it — never `az functionapp deployment source config-zip`.** Linux
 # Consumption runs from an external package URL and has no `scm` site to extract into, so the CLI

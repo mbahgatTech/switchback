@@ -539,6 +539,31 @@ describe('the lease, the lock and the host clock', () => {
     const recoveryMs = LEASE_TIMEOUT_MS + pumpPeriodMs;
     expect(recoveryMs).toBeLessThan(durationToMs(queueSetting('defaultMessageTimeToLive')));
   });
+
+  it('expires stale signals rather than dead-lettering them, so the pump is not suppressed', () => {
+    /*
+     * **Both halves of the expiry policy are chosen against the pump, and each looks safer moved
+     * the other way.** `runPump` publishes nothing while `activeMessageCount` is at or above
+     * `PUMP_LOW_WATER`, and `service-bus.ts` reads that count from the queue's ARM `countDetails`,
+     * where an expired message no longer appears. So a finite TTL is what returns the pump to
+     * work after a stoppage: raise it and stale doorbells hold the active count up, suppressing
+     * the one process that can re-derive the rows.
+     *
+     * Dead-lettering them instead would clear the active count and cost the dead-letter alert its
+     * meaning — `switchback-ingest-deadletter` exists to say the worker could not reach Postgres
+     * five times, and a DLQ full of stale wake-ups says nothing.
+     */
+    const ttlMs = durationToMs(queueSetting('defaultMessageTimeToLive'));
+    // Anchored to the property, not the prose above it, which names the rejected value too.
+    expect(bicep).toMatch(/^\s+deadLetteringOnMessageExpiration: false$/m);
+
+    // A republish after expiry has to be a fresh message, not one the dedupe window collapses.
+    expect(dedupeWindowMs).toBeLessThan(ttlMs);
+
+    // The count the pump reads must exclude expired messages, or the TTL buys nothing.
+    const serviceBus = readFileSync(resolve(__dirname, '../src/service-bus.ts'), 'utf8');
+    expect(serviceBus).toContain('countDetails?.activeMessageCount');
+  });
 });
 
 /**

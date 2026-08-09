@@ -217,8 +217,8 @@
   <text class="nsub" x="318" y="654">id-switchback-worker-deploy → function-releases</text>
 
   <text class="zsub" x="600" y="628">infrastructure.yml only compiles templates — its deploy job is gated on a variable that is unset.</text>
-  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which must be followed by</text>
-  <text class="zsub" x="600" y="656">deploy-worker.sh — an ARM settings write erases WEBSITE_RUN_FROM_PACKAGE and leaves it codeless.</text>
+  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which writes back the package</text>
+  <text class="zsub" x="600" y="656">URL it is handed; deploy-worker.sh is what uploads a new bundle and syncs the trigger cache.</text>
 
   <!-- ============================== EDGES ============================== -->
   <path class="edge" d="M228 192 H 274"/>
