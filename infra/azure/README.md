@@ -247,7 +247,11 @@ declared Microsoft Entra administrator of the server, so an `az login` is enough
 session down after the TCP connection is established, which reads as a hung or rejected connection
 and sends the reader hunting for a firewall or credential problem. With it disconnected this recipe
 works from the owner's machine — run end to end on 2026-08-06, returning `PostgreSQL 17.10` and the
-full role census.
+full role census, and again on 2026-08-09 through `scripts/pgenv.sh`, which wraps it.
+
+The client does not have to match the server. That 2026-08-09 run used psql 16.8 against the 17.10
+server and returned `current_user` and `version()` at exit 0, so a major-version gap in the local
+client is not a reason to go looking for another machine.
 
 ```bash
 az login
@@ -315,6 +319,15 @@ Password authentication is still enabled, so `sbadmin` remains available as the 
 Its password is not in ARM and not readable from Vercel, but it **is** in the `DIRECT_DATABASE_URL`
 repository secret and in a file on the owner's machine — see "Read this first". It stops being a
 door the moment `passwordAuthEnabled` is flipped to false.
+
+**What flipping it costs, stated plainly.** Disabling password authentication leaves no non-Entra
+path to this database. Both remaining doors — the owner's UPN and `id-switchback-postgres-ci` —
+authenticate against the same directory, so a directory-wide Entra outage closes both at once and
+no stored credential reopens them. What survives such an outage is only the ARM control plane:
+`az postgres flexible-server update --password-auth Enabled` re-enables the password path without
+touching the admin credential, and the resource group's lock is `CanNotDelete`, which does not block
+an update. That is the recovery, and it is worth confirming the caller holds Contributor on the
+server before the flip rather than during an incident.
 
 ### Machine identities
 
@@ -458,6 +471,20 @@ So the perimeter is a credential, and these are the compensating controls:
   failed logins.
 - `log_connections` / `log_disconnections` shipping to Log Analytics, so an unexpected login leaves
   a record.
+
+**The rule stays this wide after password authentication goes.** Narrowing it is tempting once the
+perimeter is a token rather than a password, but the reason for its width is unchanged: the two
+consumers that must reach 5432 — Vercel's functions and GitHub-hosted runners — still have no
+static egress, and the observed source addresses confirm it rather than contradicting it. A live
+sample on 2026-08-09 caught the web app arriving from `35.175.112.101` (Vercel, AWS us-east-1) and
+the worker from `23.96.252.11` (Azure). Only the second of those is predictable, and it is already
+the consumer that needs the allowance least. Any narrowing that covered Vercel would have to
+enumerate AWS us-east-1, which is neither smaller in practice nor stable.
+
+What does change is what the rule is worth to an attacker. Reaching the port with no valid Entra
+token gets nothing, so after the flip the width is a reachability fact rather than an exposure —
+which is the argument for doing the flip rather than for rewriting the rule.
+
 - The one that bounds the blast radius: **the credential Vercel carries is `sbapp`, not
   `sbadmin`**. It can read and write rows and is refused `CREATE TABLE` — see
   [The least-privilege application role](#the-least-privilege-application-role) for the check that
@@ -905,8 +932,33 @@ consumer at a time and defaults to `password`, so a consumer that misbehaves is 
 one environment variable and redeploying. `passwordAuthEnabled` in `main.bicepparam` is the server
 side and stays `true` until every consumer has been proved on a token.
 
+### Which consumers are proved, and which are not
+
+Every row measured 2026-08-09 against the live estate, not read off a template. The gate on step 6
+is that no row still says password.
+
+| Consumer                                       | Role                        | Auth     | How it was established                                                                                                                                         |
+| ---------------------------------------------- | --------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vercel web app, Production                     | `sbapp`                     | password | No `DATABASE_AUTH` in `vercel env pull`, so `databaseAuthMode()` is `password`; a live backend from `35.175.112.101` observed during a request to a trail page |
+| Ingest Function App                            | `sbapp_func`                | Entra    | `DATABASE_AUTH=entra` and a `DATABASE_URL` with no password, both read from `az functionapp config appsettings list`; live backends from `23.96.252.11`        |
+| CI `migrate` job (`ci.yml`)                    | `id-switchback-postgres-ci` | Entra    | `pg-token-url.sh` mints an `oss-rdbms` token; no workflow references `secrets.DATABASE_URL` or `secrets.DIRECT_DATABASE_URL`                                   |
+| `postgres-entra.yml`, `token-expiry-probe.yml` | `id-switchback-postgres-ci` | Entra    | `azure/login` OIDC exchange, token handed to libpq                                                                                                             |
+| Operator by hand                               | the owner's UPN             | Entra    | `scripts/pgenv.sh`, exercised 2026-08-09                                                                                                                       |
+| Playwright e2e suite                           | —                           | none     | No file under `e2e/` imports `@switchback/db` or builds a client; it drives HTTP only                                                                          |
+| iOS app                                        | —                           | none     | Reaches the database only through the web API                                                                                                                  |
+
+The two GitHub repository secrets named `DATABASE_URL` and `DIRECT_DATABASE_URL` still exist and are
+read by nothing. They matter here only because `DIRECT_DATABASE_URL` is a recorded copy of the
+`sbadmin` password — see the credential inventory.
+
+`pg_authid` is the check that settles it without reading any connection string: exactly two roles
+carry a stored password, `sbadmin` and `sbapp`. `sbapp_vercel` and `sbapp_func` carry none, so
+neither can authenticate any way but by token, and `sbapp` is what Vercel presents today.
+
 1. **Done: the Function App is on Entra.** `databaseAuth='entra'` and an `INGEST_DATABASE_URL`
-   naming `sbapp_func` with no password in it, deployed 2026-08-08T17:27:04Z. `entraPoolConfig`
+   parameter naming `sbapp_func` with no password in it — it lands on the app as `DATABASE_URL`,
+   which is the name to look for in `az functionapp config appsettings list` — deployed
+   2026-08-08T17:27:04Z. `entraPoolConfig`
    refuses a URL that still carries a password, so a half-done flip fails at connect rather than
    quietly preferring it. The deployment wrote two application settings on the Function App and
    touched no `Microsoft.DBforPostgreSQL` resource — `ingest.bicep` declares none — so it cost an
@@ -961,7 +1013,27 @@ side and stays `true` until every consumer has been proved on a token.
 5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
-6. Only now set `passwordAuthEnabled = false` and deploy.
+6. Only now take the password out, in two writes that must land together.
+
+   **Live, by a targeted call — not by deploying the template.** `passwordAuth` lives in
+   `postgres.bicep`, and deploying that module is what rotates the admin credential when ARM is
+   given a password it cannot read back. The standing rule on this repository is that a template
+   carrying `postgres.bicep` is only deployed when `what-if` reports `Microsoft.DBforPostgreSQL` as
+   `Ignore`, and flipping this flag makes it `Modify` by construction — so the rule and the deploy
+   cannot both be satisfied. Use the flag's own command instead, which touches one property:
+
+   ```bash
+   az postgres flexible-server update \
+     -g rg-switchback-prod-northcentralus \
+     -n psql-switchback-prod-37ywppu5p7fri \
+     --password-auth Disabled -o json
+   ```
+
+   **In Bicep, in the same change.** Set `passwordAuthEnabled = false` in `main.bicepparam`. The
+   parameter defaults to `true`, so leaving it while the server is Disabled means the next
+   `main.bicep` deploy silently switches password authentication back on. The declaration is what
+   stops that; it is not itself the mechanism, and this change is not a reason to deploy the
+   template.
 
 One thing to settle before step 6, and one already settled. The `migrate` job in `ci.yml` mints its
 own token and reads neither `secrets.DATABASE_URL` nor `secrets.DIRECT_DATABASE_URL`, and both
@@ -978,20 +1050,32 @@ After step 6 the recorded `sbadmin` password stops being break-glass. It is not 
 server refuses password authentication outright, and from step 6 onward the template needs no
 password at all — so the accidental-rotation hazard is gone rather than dormant.
 
-**Rolling step 6 back — set `passwordAuthEnabled = true` and export the password with it.**
+**Rolling step 6 back.** The reversal is the same targeted call with the flag inverted, and it is
+the one that works during an Entra outage because it authenticates to ARM rather than to Postgres:
+
+```bash
+az postgres flexible-server update \
+  -g rg-switchback-prod-northcentralus \
+  -n psql-switchback-prod-37ywppu5p7fri \
+  --password-auth Enabled -o json
+```
+
+Set `passwordAuthEnabled = true` in `main.bicepparam` alongside it, so the declaration and the
+server agree again.
+
+If the reversal is instead done by deploying the template, export the recorded password with it:
 
 ```bash
 # The recorded value. Without it the deploy omits the property and writes no password.
 export PGADMIN_PASSWORD="$(cat ~/.switchback/pg-sbadmin-password)"
 ```
 
-Then deploy with `passwordAuthEnabled = true`. The export is not optional politeness.
-`writeAdministratorPassword` in `postgres.bicep` is `passwordAuthEnabled && !empty(...)`, so a
-reversal run with no password exported omits `administratorLoginPassword` from the payload
-entirely and **still reports success** — leaving password authentication switched on over whatever
-verifier the server happens to hold. Exporting the recorded value makes the reversal write a
-credential known to work, which costs nothing if the old verifier survived and is the whole
-rollback if it did not.
+The export is not optional politeness. `writeAdministratorPassword` in `postgres.bicep` is
+`passwordAuthEnabled && !empty(...)`, so a reversal run with no password exported omits
+`administratorLoginPassword` from the payload entirely and **still reports success** — leaving
+password authentication switched on over whatever verifier the server happens to hold. Exporting the
+recorded value makes the reversal write a credential known to work, which costs nothing if the old
+verifier survived and is the whole rollback if it did not.
 
 Whether the SCRAM verifier survives a Disable → Enable cycle is **UNVERIFIED**. Nothing in this
 repository establishes it either way, Microsoft's documentation does not say, and measuring it

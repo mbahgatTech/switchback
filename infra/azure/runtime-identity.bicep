@@ -1,10 +1,12 @@
 // The identity Vercel production and Vercel preview both federate to, so that one principal, one
 // Postgres role and one grant set are what there is to audit across the two of them.
 //
-// **Declared, not yet in force.** Vercel authenticates by password today — `DATABASE_AUTH` is set
-// by no consumer — and its Entra-mapped role `sbapp_vercel` waits unused. The cutover is sequenced
-// in infra/azure/README.md and is gated on each consumer being proved on a token while passwords
-// still work. Nothing here performs it.
+// **Declared, not yet in force.** Vercel authenticates by password as `sbapp` — no Vercel
+// environment sets `DATABASE_AUTH`, so `databaseAuthMode()` resolves to `password` — and its
+// Entra-mapped role `sbapp_vercel` waits unused. The Function App does set it, to `entra`, and
+// carries its traffic as `sbapp_func`. The cutover is sequenced in infra/azure/README.md and is
+// gated on each consumer being proved on a token while passwords still work. Nothing here
+// performs it.
 //
 // **The ingest worker is not one of these clients.** It runs as its own system-assigned principal
 // `3db30cfd-ea61-47ce-9b03-8b34ebc420b0`, whose Postgres role is `sbapp_func`. Its Service Bus

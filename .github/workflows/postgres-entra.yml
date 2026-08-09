@@ -46,10 +46,12 @@ env:
   AZURE_TENANT_ID: f0f92920-ce90-42c9-b87f-3ea8644bccd8
   # Object ids of the two application principals `roles.sql` maps: `id-switchback-vercel-publisher`,
   # which both Vercel environments federate to, and the ingest Function App's own system-assigned
-  # identity. Both roles are mapped and privileged; neither carries traffic while `DATABASE_AUTH`
-  # is unset. Neither id is a secret — both are Bicep outputs and both are in the portal — and each
-  # is what its database role is matched against. The principals that reach this database without a
-  # password today are the owner and `id-switchback-postgres-ci`, both Entra administrators.
+  # identity. Both roles are mapped and privileged. `sbapp_func` carries the worker's traffic, which
+  # sets `DATABASE_AUTH=entra`; `sbapp_vercel` carries none, because no Vercel environment sets the
+  # variable and the web app therefore connects as `sbapp` over a password. Neither id is a secret —
+  # both are Bicep outputs and both are in the portal — and each is what its database role is
+  # matched against. The principals that reach this database without a password are the owner,
+  # `id-switchback-postgres-ci` — both Entra administrators — and the Function App.
   #
   # Literals rather than read from `az` at run time, deliberately: `id-switchback-postgres-ci`
   # holds **zero** Azure RBAC, which is the property that makes a leak of it unable to touch
