@@ -520,14 +520,22 @@ Because of the queue policy above this fires for exactly one condition — a mes
 to process five times, which in this design means it could not reach Postgres. That is an operator
 signal, not noise, so the threshold is zero and the severity is 2.
 
-**`Minimum`, because `Maximum` on this metric cannot clear.** `DeadletteredMessages` is the *depth*
-of the dead-letter queue, and nothing drains it: a dead-lettered message sits there until a person
-removes it. `Maximum` latches on the window peak, so once a single message dead-letters the rule
-reads breached on every subsequent evaluation whatever an operator does, and `autoMitigate` is inert
-against it — the alert is then a light left on, indistinguishable between "messages are
-dead-lettering now" and "one dead-lettered once, ever". `Minimum` reads the floor of the window
-instead: above zero it means the queue was non-empty for the whole fifteen minutes, and it returns
-to zero at the first evaluation after the queue is drained.
+**`Maximum`, because the window has to see a dead letter that arrives inside it.**
+`DeadletteredMessages` is the *depth* of the dead-letter queue, and it is published densely: over the
+30 d to 2026-08-09 all 2880 fifteen-minute windows carried a value, every one of them 0. The
+aggregation is therefore taken over a full window of real datapoints, and `Maximum` breaches on the
+first one above zero. `Minimum` reads the floor instead, which requires the queue to be non-empty at
+*every* datapoint in the window: it delays detection by up to a full window, and never fires at all
+for a message dead-lettered and drained inside one.
+
+**It clears, and that is measured rather than assumed.** Azure aggregates over a rolling window, so
+once the queue is drained the window holds only zeros and `Maximum` reads 0. Measured against
+`ActiveMessages` — the sibling depth gauge on this namespace, same unit and same supported
+aggregations — across the drain beginning 2026-08-08T22:07Z: a rolling fifteen-minute `Maximum`
+breached at 22:14Z and fell back below threshold at 23:56Z, with nothing resetting it. A rolling
+`Minimum` over the same data did not breach until 22:45Z, 31 minutes after the depth first rose.
+`autoMitigate` is on because nothing drains the dead-letter queue by itself, so a resolution can only
+follow an operator emptying it.
 
 `Total` is not an option and the aggregation is not free to choose. Service Bus publishes
 `DeadletteredMessages` with `supportedAggregationTypes` of Average, Minimum and Maximum only,
@@ -535,11 +543,8 @@ confirmed against the live namespace. It would also be the wrong reading on a de
 a window conflates depth with duration, so one message sitting for fifteen minutes and fifteen
 messages arriving at once read identically.
 
-**Fires** when the dead-letter queue has been non-empty for a full fifteen-minute window. **Clears**
-when the queue is emptied, which is the operator finishing the work — `autoMitigate` is on because
-under `Minimum` the resolution is a real observation rather than a guess. The one case this misses
-is a message dead-lettered and drained inside the same window, and that requires an operator who
-already knew.
+**Fires** when the dead-letter queue holds a message at any point in a fifteen-minute window.
+**Clears** when the queue has been emptied and the next window sees only zeros.
 
 Draining it is `infra/azure/README.md`, "A message dead-lettered".
 ''')
@@ -574,7 +579,7 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
           ]
           operator: 'GreaterThan'
           threshold: 0
-          timeAggregation: 'Minimum'
+          timeAggregation: 'Maximum'
           criterionType: 'StaticThresholdCriterion'
         }
       ]
@@ -1308,8 +1313,9 @@ Subdivision itself is not on this rule. A split is the designed answer to a dens
 fault: 9 splits in the 48 h to 2026-08-09T21:12Z, against 7 events across every other arm combined.
 What task #224 asked for — that a split must not read as a clean success — is carried by the status
 write rather than by a page. `splitTile` leaves the parent `pending`, so `ensureCoverage` still
-counts it outstanding and the client still polls it, and a split that fails to produce children is
-`orphanedSplits` on `switchback-ingest-queue-distress`, which is the gauge built for it.
+counts it outstanding and the client still polls it. A split that dies before writing its children
+is not silent either: `splitTile` upserts all four children ahead of the parent's marker, so a
+partial run throws, `failJob` records it, and the `ingest-job-failed` arm above catches it.
 
 **`switchback-ingest-subtree-stuck` is edge-triggered, and the rule depends on it.** It is written
 only when the parent's stored

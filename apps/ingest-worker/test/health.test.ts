@@ -184,11 +184,54 @@ describe('the rules that page a human', () => {
     expect(rule.slice(0, rule.indexOf('actions:'))).toMatch(/threshold: 8/);
   });
 
-  /* `Maximum` latches on the window peak, so a queue nobody has drained reads breached for ever and
-   * `autoMitigate` is inert. `Minimum` returns to zero at the first evaluation after a drain. */
-  it('lets the dead-letter alert clear when the queue is drained', () => {
-    const rule = bicep.slice(bicep.indexOf(`name: 'switchback-ingest-deadletter'`));
-    expect(rule.slice(0, rule.indexOf('actions:'))).toContain(`timeAggregation: 'Minimum'`);
+  /*
+   * Azure reduces the window's datapoints with the declared aggregation and compares the result to
+   * the threshold, so the aggregation decides what the rule can see. `DeadletteredMessages` is
+   * published densely — 2880 of 2880 fifteen-minute windows carried a value over the 30 d to
+   * 2026-08-09 — so the window really does hold a datapoint per minute, and reducing one here is
+   * the same arithmetic the rule performs.
+   */
+  const REDUCERS: Record<string, (window: readonly number[]) => number> = {
+    Maximum: (window) => Math.max(...window),
+    Minimum: (window) => Math.min(...window),
+    Average: (window) => window.reduce((sum, value) => sum + value, 0) / window.length,
+  };
+
+  const deadLetterRule = bicep.slice(bicep.indexOf(`name: 'switchback-ingest-deadletter'`));
+  const deadLetterCriteria = deadLetterRule.slice(0, deadLetterRule.indexOf('actions:'));
+  const declaredAggregation = /timeAggregation: '(\w+)'/.exec(deadLetterCriteria)?.[1] ?? '';
+  const declaredThreshold = Number(/threshold: (\d+)/.exec(deadLetterCriteria)?.[1]);
+
+  /** What Azure would read off this window, using the aggregation the template declares. */
+  function reduceWindow(window: readonly number[]): number {
+    const reduce = REDUCERS[declaredAggregation];
+    if (reduce === undefined) {
+      throw new Error(`Service Bus does not publish '${declaredAggregation}' for this metric`);
+    }
+    return reduce(window);
+  }
+
+  /* One message dead-lettered four minutes in and drained six minutes later. `Minimum` reads 0 over
+   * this and the operator is never told; the tile's ground stays missing with nothing pointing at
+   * it. This is the case the aggregation is chosen for. */
+  it('sees a message dead-lettered and drained inside one window', () => {
+    expect(reduceWindow([0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0])).toBeGreaterThan(
+      declaredThreshold,
+    );
+  });
+
+  /* Service Bus publishes this metric with `supportedAggregationTypes` of Average, Minimum and
+   * Maximum, confirmed against the live namespace. `Total` deploys and then never evaluates. */
+  it('reads an aggregation Service Bus publishes for this metric', () => {
+    expect(['Average', 'Minimum', 'Maximum']).toContain(declaredAggregation);
+  });
+
+  /* Clearing needs both halves: a reading that returns to zero on an empty queue, and the rule
+   * being willing to act on it. Nothing drains the dead-letter queue by itself, so a resolution can
+   * only follow an operator emptying it. */
+  it('resolves itself once the queue is empty', () => {
+    expect(reduceWindow(new Array<number>(15).fill(0))).not.toBeGreaterThan(declaredThreshold);
+    expect(deadLetterCriteria).toContain('autoMitigate: true');
   });
 });
 
