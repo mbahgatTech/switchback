@@ -196,10 +196,12 @@ inside `drainJobs`, and a drain was a side effect of traffic on cold ground plus
 allows to fire once a day. So a cron tick that claimed ten jobs at 04:51 UTC on 2026-08-07, then
 died on Vercel's 60 s wall clock still holding them, left ten leases 5.9 h old against the
 thirty-minute lease of that regime — four of them at their last attempt, so the next reclaim would
-have buried them. Recovery now runs from two places that do not require a drain: `ingestPump`'s
-two-minute `maintain()` calls `sweepQueue` in `packages/ingest/src/maintenance.ts`, which is that
-reclaim plus the split-marker repair below, and `drainSlotGate` calls `reclaimExpiredJobs` inside
-the transaction that admits a drainer, so a dead drainer cannot hold the slot shut.
+have buried them. Recovery now runs from three places that do not require a drain, two of them on
+the pump's two-minute tick: `maintain()` calls `sweepQueue` in `packages/ingest/src/maintenance.ts`,
+which is that reclaim plus the split-marker repair below; `runPump` reclaims again before it selects
+the head, so a tick publishes with the reclaim already applied rather than one tick behind it; and
+`drainSlotGate` calls `reclaimExpiredJobs` inside the transaction that admits a drainer, so a dead
+drainer cannot hold the slot shut.
 
 **A parent can claim a subdivision that has nothing behind it.** `splitTile` upserts four child
 rows, enqueues four jobs and only then marks the parent, so the marker is the _last_ write and a
@@ -384,19 +386,19 @@ select "lockedBy", count(*), min("lockedAt"), max("completedAt") from ingest_job
 45,225 rows, these are forensic queries rather than a hot path, and a second index would cost a
 write on every job outcome to save a sequential scan nobody runs in a request.
 
-**The gate is `drainIngest`'s default, not a call site's to remember.** Three entry points on
-Vercel reach the queue — `trails.ts` for viewport tiles, `routes.ts` for the route planner's
-network tiles, and the cron route — and `routes.ts` shipped without a gate for as long as passing
-one was a caller's decision, which left the `ingest_network` path (a real Overpass query, reachable
-from the public `routes.coverage` procedure) bounded by nothing. `drainIngest` now supplies
+**The gate is `drainIngest`'s default, not a call site's to remember.** Two entry points on Vercel
+reach the queue — `trails.ts:394` for viewport tiles and `routes.ts:119` for the route planner's
+network tiles — and both publish a signal rather than drain; the maintenance cron is not a third,
+because it touches the auth tables and R2 and never the ingest queue. `drainIngest` supplies
 `drainSlotGate` unless the caller passes `gate: null`, and `packages/ingest/test/drain-slot.test.ts`
 holds that: a caller that asks for no gate is still refused while another process holds the slot.
 
-One caller opts out, and only one: `apps/ingest-worker/src/drain.ts`, where the process is the whole
-fleet by Azure configuration and a cross-process lock would serialise invocations the platform has
-already made safe. `scripts/ingest.ts` does not opt out — an operator draining from a laptop against
-this database counts against the same slot, which is conservative rather than exact, since that run
-leaves from a different egress IP.
+No process opts out. `gate: null` appears at exactly one place in the tree — that test — and both
+production callers, `apps/ingest-worker/src/drain.ts:211` and `scripts/ingest.ts:56`, take the
+default. The worker used to opt out on the argument that `functionAppScaleLimit=1` made it the whole
+fleet; that argument holds only while exactly one host is running, and across a Consumption instance
+replacement two overlap. An operator draining from a laptop counts against the same slot, which is
+conservative rather than exact, since that run leaves from a different egress IP.
 
 The cost is honest and deliberate: a drainer that dies holding claims keeps the slot shut until its
 lease expires. That is why the gate sweeps inside its own transaction, and why `sweepQueue` runs off
@@ -443,6 +445,15 @@ both dense alpine tiles, killed at 612,947 ms and 615,938 ms. The same window ha
 `ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so a saturated single instance
 with the timer contending against the queue trigger is a second, independent term — and one
 `maxConcurrentCalls: 1` does not cover, because the pump is not a queue message.
+
+**The saturation is not confined to that window, and it tracks the commit rather than the fetch.**
+Over the 24 hours to 2026-08-09T09:08Z the host wrote `Host CPU threshold exceeded` in 130 distinct
+minutes; 47 of those also carried a `prisma.trail.upsert` trace and 12 carried an Overpass one,
+against 50 minutes carrying any Overpass trace at all. That is a coincidence count rather than a
+mechanism — traces are sampled, and those upsert lines are `slug` collisions rather than healthy
+writes, so both figures undercount — but what pins a Consumption instance is the tile committing its
+thousand-odd trails, not the query that fetched them. Read it as a capacity fact: more Overpass
+window buys nothing here, and relief is a plan tier or a smaller commit.
 
 So there is now one wall clock rather than one per subsystem: `INGEST_DEADLINE_MS` (540 s) is passed
 to every phase as `PipelineDeps.deadlineAt`. Past it terrain refuses to start a fetch, the commit
@@ -1884,12 +1895,16 @@ that nobody has written it.
 
 `INGEST_TRAIL_IDENTITY` reads `claim` on the Function App, which is the only surface where it does
 anything. Vercel **Production** still carries the name with an empty value; nothing there reads it.
-`pipelineDeps` in `packages/ingest/src/config.ts` is the only caller of `trailIdentityMode`,
-`ingestHandlers` is the only caller of `pipelineDeps`, and neither `apps/web` nor `packages/api`
-imports either — the routers take `ensureCoverage`, `publishIngestSignals`, `requestArea`,
-`surveyArea` and the geocoder, none of which resolve an identity mode. `apps/web/src/env.ts` does
-not declare it, and the empty Vercel entry is residue that can be deleted whenever somebody is in
-the project settings.
+`trailIdentityMode` resolves the flag at four call sites and `pipelineDeps` at three, all of them
+inside `packages/ingest`. What confines it to the worker is not their number but where they are:
+`git grep -n -E "trailIdentityMode|pipelineDeps" -- apps/web packages/api` returns nothing, against
+195 files under `apps/web` alone that the same traversal reads. The fifteen value symbols the
+routers do import — `ensureCoverage`, `publishIngestSignals`, `requestArea`, `surveyArea`,
+`tileJobKey`, `VERCEL_OIDC_HEADER`, `centroidOf`, `elevateLine`, `ensureNetworkCoverage`,
+`getTerrain`, `loadNetworkSegments`, `networkJobKey`, `getGeocoder`, `TerrainSource` and `fillGaps`
+— queue work and shape geometry; none resolves an identity mode. `apps/web/src/env.ts` does not
+declare it, and the empty Vercel entry is residue that can be deleted whenever somebody is in the
+project settings.
 
 | Surface      | Read it back with                                                                                                             |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |

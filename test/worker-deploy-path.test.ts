@@ -141,6 +141,7 @@ function stubAz(
     uploadedBytes = '',
     settingsWritesLand = true,
     startWorks = true,
+    startsAfterPolls = 0,
     stopsDuringWait = false,
     syncFails = false,
   },
@@ -156,9 +157,26 @@ case "$args" in
   ${/* What ARM answers when it proxies the call to a host that is not serving. */ ''}
   *syncfunctiontriggers*)
     ${syncFails ? `printf '%s\\n' 'ERROR: Bad Request({"Code":"Unauthorized","Message":"Encountered an error (Forbidden) from extensions API."})' >&2; exit 1` : ':'} ;;
-  *"functionapp show"*) cat "${at}/state" ;;
+  ${/* A host that reports Stopped for `startsAfterPolls` reads after the start, then Running. */ ''}
+  *"functionapp show"*)
+    if [ -f "${at}/pending" ]; then
+      remaining=$(( $(cat "${at}/pending") - 1 ))
+      if [ "$remaining" -le 0 ]; then
+        echo Running >"${at}/state"
+        rm -f "${at}/pending"
+      else
+        echo "$remaining" >"${at}/pending"
+      fi
+    fi
+    cat "${at}/state" ;;
   ${/* `:` is a start that reports success and leaves the host down. */ ''}
-  *"functionapp start"*) ${startWorks ? `echo Running >"${at}/state"` : ':'} ;;
+  *"functionapp start"*) ${
+    startWorks
+      ? startsAfterPolls > 0
+        ? `echo ${startsAfterPolls} >"${at}/pending"`
+        : `echo Running >"${at}/state"`
+      : ':'
+  } ;;
   *"appsettings list"*) cat "${at}/setting" 2>/dev/null ;;
   *"appsettings set"*)
     ${settingsWritesLand ? '' : 'exit 0 # the write silently does not land\n    '}for a in "$@"; do
@@ -177,7 +195,12 @@ exit 0
 }
 
 function deploy(
-  overrides: Parameters<typeof stubAz>[1] & { bundle?: string; appState?: string } = {},
+  overrides: Parameters<typeof stubAz>[1] & {
+    bundle?: string;
+    appState?: string;
+    /** `null` leaves it unset, which is the only way to exercise the script's own default. */
+    startTimeoutS?: string | null;
+  } = {},
 ) {
   const dir = scratch();
   const bundle = path.join(dir, 'ingest-worker.zip');
@@ -189,16 +212,18 @@ function deploy(
     path.join(dir, 'setting'),
     'https://old.blob.core.windows.net/c/old.zip?sig=REDACTED\n',
   );
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+    STORAGE_ACCOUNT: STORAGE,
+    HEARTBEAT_TIMEOUT_S: '0',
+    START_TIMEOUT_S: overrides.startTimeoutS ?? '0',
+  };
+  if (overrides.startTimeoutS === null) delete env.START_TIMEOUT_S;
   const result = spawnSync('bash', ['.github/scripts/deploy-worker.sh', bundle, 'c0ffee'], {
     cwd: repoRoot,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: `${dir}${path.delimiter}${process.env.PATH}`,
-      STORAGE_ACCOUNT: STORAGE,
-      HEARTBEAT_TIMEOUT_S: '0',
-      START_TIMEOUT_S: '0',
-    },
+    env,
   });
   return {
     ...result,
@@ -295,6 +320,40 @@ describe('a deploy that arrives while the host is stopped', () => {
   it('leaves a running host alone', () => {
     expect(deploy({}).argv).not.toContain('functionapp start');
   });
+
+  /*
+   * `az functionapp start` returns as soon as ARM accepts it, and the site reports `Running` some
+   * time later — which is the whole reason `ensure_running` polls rather than reading the state
+   * once. A host that is Running on the first read exercises none of that, so both assertions below
+   * use a stub that reports `Stopped` for two reads after the start and `Running` only after them.
+   *
+   * Replacing the poll loop with a single post-start read turns both of these red while every other
+   * case in this file stays green: those all pin `START_TIMEOUT_S=0`, where the loop makes exactly
+   * one pass and is indistinguishable from no loop at all.
+   */
+  it('waits for a host that reports Running only after the start returns', () => {
+    const { status, stdout, argv } = deploy({
+      appState: 'Stopped',
+      startsAfterPolls: 2,
+      startTimeoutS: '60',
+    });
+    expect(stdout).toContain('the host is Stopped; starting it');
+    expect(stdout).toContain('host state: Running');
+    expect(order(argv, 'functionapp start')).toBeLessThan(order(argv, 'appsettings set'));
+    expect(status).toBe(0);
+    // Two reads either side of one `sleep 5`, so this cannot finish inside the default timeout.
+  }, 30_000);
+
+  it('carries a budget for that lag with nothing set, rather than giving up on the first read', () => {
+    expect(deployScript).toContain('START_TIMEOUT_S="${START_TIMEOUT_S:-120}"');
+    const { status, stdout } = deploy({
+      appState: 'Stopped',
+      startsAfterPolls: 2,
+      startTimeoutS: null,
+    });
+    expect(stdout).toContain('host state: Running');
+    expect(status).toBe(0);
+  }, 30_000);
 
   it('leaves the app on its previous package when the host will not come up', () => {
     const { status, stdout, stderr, argv, setting } = deploy({
