@@ -96,9 +96,21 @@ flowchart LR
 
 Three properties make this safe to run unattended. Every trail is keyed by `(osmType, osmId)` and
 every write is an upsert, so an at-least-once queue is harmless. Each trail commits in its own
-transaction and its own `try`, so one broken geometry costs one row rather than forty. And a tile
-reaches `ready` only when Overpass answered — a failed tile keeps its reason, so the next request
-re-queues instead of serving an empty map as though the ground held no trails.
+transaction and its own `try`, so one broken geometry does not abort the other thirty-nine. And a
+tile reaches `ready` only when Overpass answered _and_ every trail it assembled either committed or
+was deliberately skipped — a tile that lost one keeps its reason and fails, so the job's retry
+ladder runs it again rather than selling `TILE_TTL_MS` of coverage it does not have.
+
+**A failing tile is bounded in both directions.** The re-run unit is a whole tile, so "retry it"
+needs a floor and a ceiling. `IngestJob` supplies both: five attempts on a 30 s / 2 m / 10 m / 30 m
+backoff, then `dead`. `ensureCoverage` reads that job status rather than the tile row, because
+`IngestTile.status` reads `failed` both for a tile thirty seconds from its next attempt and for one
+that has given up — and reviving a `dead` job resets `attempts` to zero, so a viewport poll that
+re-queued it would restart the ladder every 2.5 s and the tile would re-run for as long as one map
+stayed open. A buried tile is therefore neither queued nor reported `pending`; `fetchArea` is the
+way back, and a person pressing it is the bound. Separately, a `failed` tile that committed most of
+its trails is served from what it holds rather than reported as still loading — `trailCount`, not
+the status word, decides whether there is anything to draw.
 
 **Durability.** `waitUntil` buys latency and nothing else; a deploy or timeout mid-flight loses the
 work. So every kick also writes an `IngestJob` row, and the message published alongside it only
@@ -608,11 +620,16 @@ whole of the maths.
 ```mermaid
 stateDiagram-v2
   [*] --> running: claimed
-  running --> ready: committed inside 540 s
+  running --> ready: every trail committed or skipped, inside 540 s
   running --> pending: out of clock, z < 11
-  running --> failed: out of clock at z11, or Overpass unavailable
+  running --> failed: a trail did not commit, out of clock at z11, or Overpass unavailable
+  failed --> running: retried on the job's backoff ladder
   pending --> pending: children outstanding
   pending --> ready: all four children ready
+  note right of failed
+    five attempts, then the job is dead:
+    no further runs, and no longer polled for
+  end note
   note right of pending
     four child rows written at z+1,
     one ingest_tile job each

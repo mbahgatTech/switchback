@@ -3,6 +3,7 @@ import { JobStatus, Prisma, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   TILE_TTL_MS,
+  TRAIL_LOST_MARKER,
   chooseHero,
   fetchWayGeometries,
   isTileFresh,
@@ -12,8 +13,10 @@ import {
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
+import type { TerrainSource } from '../src/elevate';
 import { SUBTREE_STUCK_MARKER } from '../src/subdivide';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
+import type { TerrariumTile } from '@switchback/geo';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
 const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
@@ -137,98 +140,98 @@ describe('processTile', () => {
   });
 });
 
-describe('processTile, out of clock', () => {
-  const DENSE = '120221203';
+const DENSE = '120221203';
 
-  /** One named way, long enough to survive `MIN_TRAIL_LENGTH_M`. */
-  const oneTrail: OverpassElement[] = [
-    {
-      type: 'way',
-      id: 42,
-      tags: { highway: 'path', name: 'Chamonix Balcon' },
-      geometry: [
-        { lat: 46.1, lon: 6.5 },
-        { lat: 46.11, lon: 6.5 },
-      ],
+/** One named way, long enough to survive `MIN_TRAIL_LENGTH_M`. */
+const oneTrail: OverpassElement[] = [
+  {
+    type: 'way',
+    id: 42,
+    tags: { highway: 'path', name: 'Chamonix Balcon' },
+    geometry: [
+      { lat: 46.1, lon: 6.5 },
+      { lat: 46.11, lon: 6.5 },
+    ],
+  },
+];
+
+interface Recorded {
+  updates: Array<{ quadkey: string; data: Record<string, unknown> }>;
+  upserts: string[];
+  jobs: string[];
+}
+
+interface TileRow extends Record<string, unknown> {
+  quadkey: string;
+  status?: TileStatus;
+  fetchedAt?: Date | null;
+  lastError?: string | null;
+}
+
+/**
+ * A Prisma stand-in that *stores* the rows it is given rather than replaying a fixed answer.
+ * The difference is load-bearing: `processTile` writes `running` to the parent before it
+ * fetches, so a fake whose `findUnique` always returns null cannot tell a parent that was
+ * serving trails from one that never has, and the branch that preserves the first is exactly
+ * where a bug hid behind a green test.
+ */
+function fakeDb(
+  seed: TileRow[] = [],
+  jobs: Record<string, JobStatus> = {},
+): {
+  db: PrismaClient;
+  recorded: Recorded;
+} {
+  const recorded: Recorded = { updates: [], upserts: [], jobs: [] };
+  const tiles = new Map<string, TileRow>(seed.map((row) => [row.quadkey, { ...row }]));
+  const db = {
+    ingestTile: {
+      findUnique: ({ where }: { where: { quadkey: string } }) =>
+        Promise.resolve(tiles.get(where.quadkey) ?? null),
+      findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
+        Promise.resolve(
+          [...tiles.values()].filter((row) => where.quadkey.in.includes(row.quadkey)),
+        ),
+      upsert: (args: {
+        where: { quadkey: string };
+        create: Record<string, unknown>;
+        update: Record<string, unknown>;
+      }) => {
+        recorded.upserts.push(args.where.quadkey);
+        const existing = tiles.get(args.where.quadkey);
+        tiles.set(
+          args.where.quadkey,
+          existing
+            ? { ...existing, ...args.update, quadkey: args.where.quadkey }
+            : { ...args.create, quadkey: args.where.quadkey },
+        );
+        return Promise.resolve({});
+      },
+      update: (args: { where: { quadkey: string }; data: Record<string, unknown> }) => {
+        recorded.updates.push({ quadkey: args.where.quadkey, data: args.data });
+        const existing = tiles.get(args.where.quadkey);
+        if (existing) Object.assign(existing, args.data);
+        return Promise.resolve({});
+      },
     },
-  ];
-
-  interface Recorded {
-    updates: Array<{ quadkey: string; data: Record<string, unknown> }>;
-    upserts: string[];
-    jobs: string[];
-  }
-
-  interface TileRow extends Record<string, unknown> {
-    quadkey: string;
-    status?: TileStatus;
-    fetchedAt?: Date | null;
-    lastError?: string | null;
-  }
-
-  /**
-   * A Prisma stand-in that *stores* the rows it is given rather than replaying a fixed answer.
-   * The difference is load-bearing: `processTile` writes `running` to the parent before it
-   * fetches, so a fake whose `findUnique` always returns null cannot tell a parent that was
-   * serving trails from one that never has, and the branch that preserves the first is exactly
-   * where a bug hid behind a green test.
-   */
-  function fakeDb(
-    seed: TileRow[] = [],
-    jobs: Record<string, JobStatus> = {},
-  ): {
-    db: PrismaClient;
-    recorded: Recorded;
-  } {
-    const recorded: Recorded = { updates: [], upserts: [], jobs: [] };
-    const tiles = new Map<string, TileRow>(seed.map((row) => [row.quadkey, { ...row }]));
-    const db = {
-      ingestTile: {
-        findUnique: ({ where }: { where: { quadkey: string } }) =>
-          Promise.resolve(tiles.get(where.quadkey) ?? null),
-        findMany: ({ where }: { where: { quadkey: { in: string[] } } }) =>
-          Promise.resolve(
-            [...tiles.values()].filter((row) => where.quadkey.in.includes(row.quadkey)),
-          ),
-        upsert: (args: {
-          where: { quadkey: string };
-          create: Record<string, unknown>;
-          update: Record<string, unknown>;
-        }) => {
-          recorded.upserts.push(args.where.quadkey);
-          const existing = tiles.get(args.where.quadkey);
-          tiles.set(
-            args.where.quadkey,
-            existing
-              ? { ...existing, ...args.update, quadkey: args.where.quadkey }
-              : { ...args.create, quadkey: args.where.quadkey },
-          );
-          return Promise.resolve({});
-        },
-        update: (args: { where: { quadkey: string }; data: Record<string, unknown> }) => {
-          recorded.updates.push({ quadkey: args.where.quadkey, data: args.data });
-          const existing = tiles.get(args.where.quadkey);
-          if (existing) Object.assign(existing, args.data);
-          return Promise.resolve({});
-        },
+    ingestJob: {
+      findMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) =>
+        Promise.resolve(
+          where.dedupeKey.in
+            .filter((key) => jobs[key] !== undefined)
+            .map((key) => ({ dedupeKey: key, status: jobs[key]! })),
+        ),
+      updateMany: () => Promise.resolve({ count: 0 }),
+      upsert: (args: { where: { dedupeKey: string } }) => {
+        recorded.jobs.push(args.where.dedupeKey);
+        return Promise.resolve({});
       },
-      ingestJob: {
-        findMany: ({ where }: { where: { dedupeKey: { in: string[] } } }) =>
-          Promise.resolve(
-            where.dedupeKey.in
-              .filter((key) => jobs[key] !== undefined)
-              .map((key) => ({ dedupeKey: key, status: jobs[key]! })),
-          ),
-        updateMany: () => Promise.resolve({ count: 0 }),
-        upsert: (args: { where: { dedupeKey: string } }) => {
-          recorded.jobs.push(args.where.dedupeKey);
-          return Promise.resolve({});
-        },
-      },
-    } as unknown as PrismaClient;
-    return { db, recorded };
-  }
+    },
+  } as unknown as PrismaClient;
+  return { db, recorded };
+}
 
+describe('processTile, out of clock', () => {
   it('splits a tile that ran out of clock instead of failing it', async () => {
     // The measured failure: six Alps tiles exhausted the 540 s budget and were written
     // `failed`, retried whole, and failed again. A tile that cannot be finished at this zoom
@@ -262,22 +265,22 @@ describe('processTile, out of clock', () => {
      * there discards a finished tile to queue four children over work already in `trails`.
      *
      * The minimal fake below has no `trail` model, so `commitTrail` throws for a reason that is
-     * not the clock — one row's worth of damage, and no subdivision.
+     * not the clock — the tile fails and is retried whole, and no children are queued.
      */
     const { db, recorded } = fakeDb();
     const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
 
-    const result = await processTile(DENSE, {
-      db,
-      overpass,
-      enrichWaypoints: false,
-      deadlineAt: Date.now() + 600_000,
-    });
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(TRAIL_LOST_MARKER);
 
-    expect(result.failed).toBe(1);
-    expect(result.children).toEqual([]);
     expect(recorded.jobs).toEqual([]);
-    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.ready);
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.failed);
   });
 
   it('fails a tile at the floor, because there is nowhere left to split', async () => {
@@ -433,6 +436,249 @@ describe('processTile, out of clock', () => {
     await processTile(DENSE, deps);
 
     expect(lines.filter((line) => line.includes(SUBTREE_STUCK_MARKER))).toHaveLength(1);
+  });
+});
+
+describe('processTile, a trail that would not commit', () => {
+  /**
+   * A raster that answers every pixel with the same elevation, so a trail reaches the
+   * transaction rather than being skipped for an all-gap profile.
+   */
+  const FLAT_TERRAIN: TerrariumTile = (() => {
+    const encoded = 1_000 + 32_768;
+    const pixel = [Math.floor(encoded / 256), encoded % 256, 0];
+    return {
+      z: 13,
+      x: 0,
+      y: 0,
+      width: 2,
+      height: 2,
+      channels: 3,
+      data: Uint8Array.from([...pixel, ...pixel, ...pixel, ...pixel]),
+    };
+  })();
+
+  /** Terrain that covers everything, so the commit is the only thing that can go wrong. */
+  const flatTerrain = {
+    tilesFor: () =>
+      Promise.resolve({ get: () => FLAT_TERRAIN } as unknown as Map<string, TerrariumTile>),
+  } as unknown as TerrainSource;
+
+  /** Terrain that covers nothing: every sample is a gap, so the trail is skipped, not lost. */
+  const noTerrain = {
+    tilesFor: () => Promise.resolve(new Map<string, TerrariumTile>()),
+  } as unknown as TerrainSource;
+
+  /**
+   * The production failure, verbatim: 26 of the 30 non-deadline trail failures in the seven days
+   * to 2026-08-09 carried this message, over 31.5-80.5 s against `TRAIL_TX_TIMEOUT_MS`.
+   */
+  function timingOutTransaction(): PrismaClient {
+    const { db, recorded } = fakeDb();
+    (db as unknown as { $transaction: () => Promise<never> }).$transaction = () =>
+      Promise.reject(
+        new Error(
+          'Transaction API error: Transaction already closed: A commit cannot be executed on an ' +
+            'expired transaction. The timeout for this transaction was 30000 ms, however 39202 ms passed.',
+        ),
+      );
+    return Object.assign(db, { recorded });
+  }
+
+  /** Two named ways, so a fixture can commit one and lose the other. */
+  const twoTrails: OverpassElement[] = [
+    ...oneTrail,
+    {
+      type: 'way',
+      id: 43,
+      tags: { highway: 'path', name: 'Grand Balcon Nord' },
+      geometry: [
+        { lat: 46.2, lon: 6.6 },
+        { lat: 46.21, lon: 6.6 },
+      ],
+    },
+  ];
+
+  /**
+   * One trail commits, the next hits the expiry. The only shape that separates "this tile lost
+   * ground" from "this tile committed nothing": with a single-trail fixture `committed` is zero
+   * whenever `failed` is one, so a gate reading either count alone behaves identically.
+   */
+  function oneCommitOneExpiry(): PrismaClient {
+    const { db, recorded } = fakeDb();
+    let calls = 0;
+    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve('trail-1')
+        : Promise.reject(
+            new Error(
+              'Transaction API error: Transaction already closed: A commit cannot be executed on ' +
+                'an expired transaction. The timeout for this transaction was 30000 ms, however ' +
+                '39202 ms passed.',
+            ),
+          );
+    };
+    return Object.assign(db, { recorded });
+  }
+
+  it('fails a tile that committed most of its trails and lost one', async () => {
+    /*
+     * The half of the contract a single-trail fixture cannot reach. Tile 1202212023 committed
+     * 900 and lost six; a gate that fired only when *nothing* committed would write `ready`
+     * over that hole and — unlike the behaviour this replaces — without even a `lastError`.
+     */
+    const db = oneCommitOneExpiry();
+    const { recorded } = db as unknown as { recorded: Recorded };
+    const overpass = { query: async () => ({ elements: twoTrails }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(TRAIL_LOST_MARKER);
+
+    const last = recorded.updates.at(-1);
+    expect(last?.data.status).toBe(TileStatus.failed);
+    expect(last?.data.fetchedAt).toBeUndefined();
+    // One trail did commit: the fixture is mixed, not another all-fail case.
+    expect(last?.data.trailCount).toBe(1);
+    expect(String(last?.data.lastError)).toContain('1 of 2 trail(s) did not commit');
+    expect(String(last?.data.lastError)).toContain('way/43');
+    expect(String(last?.data.lastError)).not.toContain('way/42');
+  });
+
+  it('refuses to report ready with a trail it could not commit', async () => {
+    /*
+     * Tile 1202212023 in production: `status=ready, trailCount=900`, and four of the six trails
+     * its log named have no row in `trails` at all. `ready` plus `fetchedAt` is what
+     * `isTileFresh` sells to `ensureCoverage`, so that write bought `TILE_TTL_MS` of silence
+     * over ground with holes in it.
+     */
+    const db = timingOutTransaction();
+    const { recorded } = db as unknown as { recorded: Recorded };
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(/39202 ms passed|did not commit/);
+
+    const last = recorded.updates.at(-1);
+    expect(last?.data.status).toBe(TileStatus.failed);
+    expect(last?.data.fetchedAt).toBeUndefined();
+  });
+
+  it('names the tile and the trail on the row an operator reads', async () => {
+    // `failJob` copies the thrown message onto the job row, so one token has to reach the tile
+    // row, the job row and the log for the three to be correlatable.
+    const db = timingOutTransaction();
+    const { recorded } = db as unknown as { recorded: Recorded };
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+    const lines: string[] = [];
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        logger: (message: string) => lines.push(message),
+      }),
+    ).rejects.toThrow(TRAIL_LOST_MARKER);
+
+    const lastError = String(recorded.updates.at(-1)?.data.lastError);
+    expect(lastError).toContain(TRAIL_LOST_MARKER);
+    expect(lastError).toContain(DENSE);
+    expect(lastError).toContain('way/42');
+    expect(lines.some((line) => line.includes(TRAIL_LOST_MARKER))).toBe(true);
+  });
+
+  it('names the lost trail even when the clock is what failed the tile', async () => {
+    /*
+     * A tile can run out of clock *and* lose a trail. The clock decides its fate, so it exits
+     * through the deadline branch — and until that branch carried the ids, the one tile that
+     * hit both failures was the only one whose missing ground was never named anywhere.
+     *
+     * At the zoom floor, so there is nowhere to split and the tile fails rather than
+     * subdividing. More trails than `COMMIT_CONCURRENCY`, so the workers that pick up the tail
+     * do so after the deadline has passed: the first batch is lost or committed, the tail is
+     * refused.
+     */
+    const many: OverpassElement[] = Array.from({ length: 8 }, (_, index) => ({
+      type: 'way',
+      id: 100 + index,
+      tags: { highway: 'path', name: `Balcon ${String(index)}` },
+      geometry: [
+        { lat: 46.1 + index / 100, lon: 6.5 },
+        { lat: 46.11 + index / 100, lon: 6.5 },
+      ],
+    }));
+
+    const { db, recorded } = fakeDb();
+    let calls = 0;
+    // Every commit outlives the deadline, so the trails nobody got to are refused by the clock.
+    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
+      calls += 1;
+      const lost = calls === 1;
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          if (lost) reject(new Error('The timeout for this transaction was 30000 ms.'));
+          else resolve('trail');
+        }, 200);
+      });
+    };
+    const overpass = { query: async () => ({ elements: many }) } as unknown as OverpassClient;
+    const lines: string[] = [];
+
+    await expect(
+      processTile('12022120300', {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        subdivideMaxZoom: MAX_INGEST_ZOOM,
+        deadlineAt: Date.now() + 100,
+        logger: (message: string) => lines.push(message),
+      }),
+    ).rejects.toThrow(/deadline/);
+
+    const lastError = String(recorded.updates.at(-1)?.data.lastError);
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.failed);
+    // Both facts on the one row `failJob` copies to the job: the clock, and the trail.
+    expect(lastError).toContain('deadline');
+    expect(lastError).toContain(TRAIL_LOST_MARKER);
+    expect(lastError).toContain('way/100');
+    expect(lines.some((line) => line.includes(TRAIL_LOST_MARKER))).toBe(true);
+  });
+
+  it('still reports ready when the tile skipped a trail rather than losing it', async () => {
+    /*
+     * A skip is a decision — no terrain under the line, a resample too short to be a trail, a
+     * relation another tile owns — and the tile has covered its ground. Keying the refusal on
+     * "committed fewer than we assembled" would fail every tile over open water.
+     */
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: noTerrain,
+      enrichWaypoints: false,
+    });
+
+    expect(result).toMatchObject({ status: TileStatus.ready, skipped: 1, failed: 0 });
+    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.ready);
   });
 });
 
