@@ -1672,11 +1672,43 @@ while it is still valid and suppresses the next attempt for `RENEW_RETRY_BACKOFF
 fast-failing Entra does not turn into one token request per connection — including once the cached
 token is genuinely dead, which is the outage the backoff exists for. And a token served with less
 life left than a connection attempt may take says so through `onTokenNearlyExpired`, which logs at
-**error** level. That is a weaker control than it should be: only the Function App's logs reach an
-Azure alert rule, so on Vercel and in CI the log line is the whole signal. It is unreachable on
-either healthy path, which is what makes it worth reading — an earlier margin derived from
-connection lifetime instead fired it 28 times per 12 hours against a 60-minute token while handing
-out tokens with 9 minutes of life left.
+**error** level. It is unreachable on either healthy path, which is what makes it worth reading — an
+earlier margin derived from connection lifetime instead fired it 28 times per 12 hours against a
+60-minute token while handing out tokens with 9 minutes of life left.
+
+**Both callbacks reach an alert rule, and on Vercel that took a push.** `entra-client.ts` passes
+`createTokenAlarms()` from `packages/db/src/token-alarm.ts` to every token provider it builds. Each
+alarm logs, and also POSTs a trace to `appi-switchback-ingest` over the Application Insights
+ingestion API. Three things ruled out the alternatives:
+
+- **A counter behind an endpoint reads nothing.** Vercel runs many short-lived instances and scrapes
+  none of them, so a reader almost never reaches the instance that raised the alarm. That is the
+  same structural blindness as an Azure rule over logs Azure cannot see.
+- **An Azure rule over Vercel's logs cannot exist.** They reach no Azure resource, and no log drain
+  is configured. Only a push from the instance that has the fault crosses that boundary.
+- **The push must not depend on what is failing.** The ingestion API authenticates on the
+  instrumentation key in the envelope, not on Entra, so a renewal failure can still be reported.
+
+Measured on 2026-08-09: a trace posted from a workstation outside Azure returned
+`itemsReceived: 1, itemsAccepted: 1` and was queryable about three minutes later as
+`traces | where cloud_RoleName == "switchback-web"`. `switchback-db-token-alarm` in
+`infra/azure/ingest.bicep` reads exactly that. A 200 alone is not treated as delivery — the
+collector answers `itemsAccepted: 0` for a rejected envelope, and `createTraceSink` rejects on it.
+
+The alarm is awaited rather than dropped, because an invocation that has answered its request is
+frozen and an unawaited POST is one the platform may discard. It is bounded at `TRACE_TIMEOUT_MS`
+and rate-limited per marker at `ALARM_MIN_INTERVAL_MS`, since `onTokenNearlyExpired` fires per
+connection; what a window suppressed rides out on the next trace as `suppressedSincePrevious`. A
+collector that is down costs the connection that timeout and nothing else — never the connection
+itself.
+
+**What leaves this silent is one variable.** With `APPLICATIONINSIGHTS_CONNECTION_STRING` absent
+from Vercel Production there is no push and the console line is the whole signal, which on Vercel
+means a live `vercel logs --follow` and nothing durable. `/api/version` reports `alarms` as
+`application-insights` or `console` so the two can be told apart from outside. **Setting that
+variable is a precondition of `DATABASE_AUTH=entra-vercel`, not a follow-up to it** — cutting the
+site to token auth while the alarm is on `console` is what turns a transient refresh fault into an
+outage nobody sees starting.
 
 **What is wired, and what is switched on.** `packages/db/src/client.ts` builds both Prisma clients
 through `createClient`, which reads `DATABASE_AUTH`. It defaults to `password` and behaves exactly

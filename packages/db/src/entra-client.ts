@@ -4,6 +4,7 @@ import type { Pool } from 'pg';
 import { entraPoolConfig } from './entra-pool';
 import { createEntraTokenSource, type DatabaseAuthMode } from './entra-source';
 import { createTokenProvider } from './entra-token';
+import { createTokenAlarms } from './token-alarm';
 
 /** Assembles the pieces: one token cache, a `pg` pool per Prisma client, a driver adapter. */
 
@@ -23,7 +24,11 @@ function tokenProvider(mode: DatabaseAuthMode): () => Promise<string> {
   if (shared && shared.mode !== mode) {
     throw new Error(`Token cache already built for "${shared.mode}"; cannot also serve "${mode}".`);
   }
-  shared ??= { mode, provider: createTokenProvider(createEntraTokenSource(mode)) };
+  // The alarms are what make a failing renewal something other than a line in a log nobody keeps.
+  shared ??= {
+    mode,
+    provider: createTokenProvider(createEntraTokenSource(mode), createTokenAlarms()),
+  };
   return shared.provider;
 }
 

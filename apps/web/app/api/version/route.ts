@@ -6,6 +6,8 @@
  * the alias moved and the app serves requests, rather than a record somewhere reading READY.
  * `commit` is null without git metadata, which the pipeline treats as a failure, not a pass.
  */
+import { alarmSink } from '@switchback/db/token-alarm';
+
 export const runtime = 'nodejs';
 
 /**
@@ -27,6 +29,11 @@ export function GET(): Response {
       ref: read('VERCEL_GIT_COMMIT_REF'),
       // The pipeline asserts on this so a preview URL cannot stand in for the production alias.
       environment: read('VERCEL_ENV') ?? 'development',
+      // Which channel a token-refresh alarm would leave on. Configuration, not a counter: an
+      // instance's own tally would be invisible here anyway, since the reader almost never
+      // reaches the instance that raised one. `console` means the only durable signal is the
+      // site failing, which is what makes this checkable before anything is cut over to tokens.
+      alarms: alarmSink(),
     },
     { headers: { 'cache-control': 'no-store' } },
   );

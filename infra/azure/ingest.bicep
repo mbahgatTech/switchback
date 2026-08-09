@@ -1642,6 +1642,67 @@ resource workerSilentAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
   }
 }
 
+@description('''
+The web app's token-refresh alarm. It lives in this file because this is where
+`appi-switchback-ingest` is declared, and a scheduled query rule has to scope to the component it
+reads — nothing about the condition belongs to ingest.
+
+**What arms it.** `packages/db/src/token-alarm.ts` POSTs to the component's ingestion endpoint when
+`onRenewalFailure` or `onTokenNearlyExpired` fires. Vercel's own logs reach no Azure rule and its
+instances do not outlive the request, so a push is the only channel; the instrumentation key in the
+connection string is what authenticates it, which is why the report survives the Entra outage it is
+reporting. Measured on 2026-08-09: a trace posted from outside Azure was queryable as
+`traces | where cloud_RoleName == "switchback-web"` within about three minutes.
+
+**What leaves it silent.** `APPLICATIONINSIGHTS_CONNECTION_STRING` absent from Vercel Production.
+`databaseAuthMode()` then still reports `password` and no token is being refreshed at all, so
+silence is correct — but the two facts are independent, and only the first is visible here. Read
+`alarms` from `/api/version` to tell them apart; it reports `application-insights` or `console`.
+Setting that variable is a precondition of `DATABASE_AUTH=entra-vercel`, not a follow-up to it.
+
+Severity 1 rather than the 2 the ingest rules use: this is the credential the production site
+serves every request on, and the failure it names ends in an outage rather than a slow queue.
+''')
+resource tokenAlarmRule 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-db-token-alarm'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-db-token-alarm'
+    description: 'The web app is failing to renew its Entra access token for Postgres, or is serving one with less life left than a connection attempt needs. The cached token still works until it does not; this is the window before an outage, not the outage.'
+    severity: 1
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          // `summarize` with no `by` returns a single zero row when nothing matches, which is what
+          // keeps the comparison well defined rather than leaving an empty result to the platform.
+          query: 'traces | where cloud_RoleName == "switchback-web" | where message has "switchback-db-token-renewal-failed" or message has "switchback-db-token-nearly-expired" | summarize alarms = count()'
+          metricMeasureColumn: 'alarms'
+          timeAggregation: 'Total'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------------
 // Outputs. No keys and no connection strings, because there are none: the three values Vercel
 // needs are a hostname, a tenant id and a client id, and none of them authenticates anything on

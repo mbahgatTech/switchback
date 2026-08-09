@@ -50,14 +50,16 @@ export interface TokenProviderOptions {
   /** Injected so the renewal boundary can be tested without waiting an hour for it. */
   now?: () => number;
   /** Called when an acquisition fails while a usable token is still cached. */
-  onRenewalFailure?: (error: unknown) => void;
+  onRenewalFailure?: (error: unknown) => void | Promise<void>;
   /** Called when a token is served with too little life left to be sure a connect completes. */
-  onTokenNearlyExpired?: (lifetimeMs: number) => void;
+  onTokenNearlyExpired?: (lifetimeMs: number) => void | Promise<void>;
 }
 
 // Defaults rather than optional calls. Both conditions are silent degradation otherwise: the
 // app keeps serving while an Entra outage or a token-lifetime policy quietly removes the
-// guarantee, and nobody learns until it becomes an outage.
+// guarantee, and nobody learns until it becomes an outage. A console line is the floor, not the
+// plan — `token-alarm.ts` is what carries these somewhere a rule can read, and `entra-client.ts`
+// is what passes it.
 const warnRenewalFailure = (error: unknown): void =>
   console.warn('[entra-token] renewal failed; serving the cached token', error);
 
@@ -66,13 +68,26 @@ const warnRenewalFailure = (error: unknown): void =>
 // degrading. The margin already carries clock skew, so this measures the handshake alone.
 // Unreachable on either healthy path — `refresh_in` renews at half-life, and the margin
 // fallback renews five minutes out — which is what makes it a signal rather than noise.
-// Only the Function App's logs reach an Azure alert rule, so on Vercel this line is all there is.
 const warnTokenNearlyExpired = (lifetimeMs: number): void =>
   console.error(
     `[entra-token] serving a token with ${Math.round(lifetimeMs / 1000)}s left, under the ` +
       `${Math.round(CONNECT_BUDGET_MS / 1000)}s a connection attempt may take. Connections may ` +
       `be refused. Entra is unreachable, or is issuing tokens shorter than the renewal margin.`,
   );
+
+/**
+ * Runs an alarm to completion without letting it fail the connection that raised it.
+ *
+ * Awaited rather than dropped because the caller may be on Vercel, where an invocation that has
+ * answered its request is frozen — an unawaited report is one the platform is free to discard.
+ */
+async function raise(alarm: () => void | Promise<void>): Promise<void> {
+  try {
+    await alarm();
+  } catch {
+    // A report that cannot be delivered leaves nothing further to report it to.
+  }
+}
 
 /**
  * A function returning a currently-valid access token, for use as `pg`'s `password` option.
@@ -133,9 +148,9 @@ export function createTokenProvider(
     return inFlight;
   }
 
-  function serve(token: AccessToken): string {
+  async function serve(token: AccessToken): Promise<string> {
     const lifetimeMs = token.expiresOnTimestamp - now();
-    if (lifetimeMs < CONNECT_BUDGET_MS) onTokenNearlyExpired(lifetimeMs);
+    if (lifetimeMs < CONNECT_BUDGET_MS) await raise(() => onTokenNearlyExpired(lifetimeMs));
     return token.token;
   }
 
@@ -153,7 +168,7 @@ export function createTokenProvider(
     }
 
     try {
-      return serve(await acquire(current));
+      return await serve(await acquire(current));
     } catch (error) {
       retryNotBefore = now() + RENEW_RETRY_BACKOFF_MS;
       lastFailure = error instanceof Error ? error : new Error(String(error));
@@ -162,7 +177,7 @@ export function createTokenProvider(
       // acquisition is still failing once the old token has genuinely expired, which is the
       // point at which there is nothing honest left to return.
       if (isUsable(current)) {
-        onRenewalFailure(error);
+        await raise(() => onRenewalFailure(error));
         return serve(current);
       }
       throw lastFailure;
