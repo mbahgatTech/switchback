@@ -200,9 +200,8 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
   });
 
   it('leaves a lease it retired at the priority it had', async () => {
-    // Out of attempts, so the sweep buries it. A `dead` row is never claimed again, and `enqueue`
-    // revives without lowering priority — elevating here would hand a later revival the head of
-    // the queue on the strength of a run that never finished.
+    // Out of attempts, so the sweep buries it. A `dead` row is never claimed again, so the
+    // elevation would buy nothing; `enqueue` resets `priority` when it revives one.
     await prisma.ingestJob.create({
       data: {
         kind: JobKind.ingest_tile,

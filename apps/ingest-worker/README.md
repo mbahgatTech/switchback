@@ -148,9 +148,15 @@ az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_PUMP_ENABLED=false -o none
 ```
 
-Seconds, no deploy. New work stops reaching the queue. It does **not** stop the trigger draining
-what is already there — messages in flight finish, which is deliberate, because each is idempotent
-and dropping one mid-tile strands a lease for nothing.
+Seconds, no deploy. New work stops reaching the queue, with one exception: a lease the sweep has
+just reclaimed is still republished. `classifyDisposition` completes a Service Bus message on the
+strength of that republish and cannot take the completion back, so suppressing it would leave the
+row correct and unreachable until someone lifted the brake. The exception stays narrow because
+`enqueue` resets `priority` when it revives a finished row, so a tile that was once reclaimed and is
+requested again re-enters at its own band. Reverse the brake with `INGEST_PUMP_ENABLED=true`.
+
+It does **not** stop the trigger draining what is already there — messages in flight finish, which
+is deliberate, because each is idempotent and dropping one mid-tile strands a lease for nothing.
 
 **Overpass is rate-limiting, or the drain itself is the problem.** Disable the trigger and leave the
 pump's health reporting running, so the queue still has a gauge while the drain is stopped:
@@ -160,6 +166,8 @@ az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings AzureWebJobs.ingestDrain.Disabled=true -o none
 ```
 
+Reverse it with `AzureWebJobs.ingestDrain.Disabled=false`.
+
 **Everything is wrong and it needs to stop now.** Stop the app:
 
 ```bash
@@ -168,7 +176,17 @@ az functionapp stop -g rg-switchback-prod-northcentralus -n func-switchback-inge
 
 Nothing drains and nothing is observed. Messages stay on the queue — TTL is `PT1H`, so a stop
 longer than an hour loses the wake-up signals, though not the work: the rows are still in
-`ingest_jobs` and the pump republishes them when it comes back.
+`ingest_jobs` and the pump republishes them when it comes back. Reverse it with:
+
+```bash
+az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
+```
+
+**A merge to `master` reverses it too, and that is not optional.** `ci.yml` gates
+`deploy ingest worker` on a push to `refs/heads/master`, and `.github/scripts/deploy-worker.sh`
+starts a host it finds stopped, then fails the run if the host is not `Running` afterwards — a
+stopped host emits no heartbeat, so the deploy has no other way to tell a bad package from a
+deliberate stop. This brake holds ingestion off until the next merge, not across a release.
 
 **The new build is the problem.** Roll the code back by pointing `WEBSITE_RUN_FROM_PACKAGE` at the
 previous zip; `.github/scripts/deploy-worker.sh` is what writes it, and the blob container keeps

@@ -300,6 +300,34 @@ describe('enqueue', () => {
     // Kept: until this attempt writes its own outcome it is the row's only diagnostic.
     expect(revive?.data).not.toHaveProperty('lastError');
   });
+
+  it('returns a revived job to the band its request asks for', async () => {
+    /*
+     * The reaper raises an expired lease to `RECLAIM_PRIORITY`, and the retirement branch leaves
+     * that elevation on the buried row. Reviving without writing `priority` left it there for the
+     * row's whole remaining life: the raise below is guarded on `priority < incoming`, so a
+     * viewport enqueue at 5 is a no-op against 6, and nothing else in the estate lowers it. The
+     * row then outranked ordinary work until `FAILED_JOB_TTL_MS` collected it, thirty days on.
+     */
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+      priority: VIEWPORT_PRIORITY,
+    });
+
+    const revive = recorded.updateManys[0];
+    expect(revive?.data.priority).toBe(VIEWPORT_PRIORITY);
+    expect(VIEWPORT_PRIORITY).toBeLessThan(RECLAIM_PRIORITY);
+  });
+
+  it('defaults a revived job to the base band when the request names none', async () => {
+    const { db, recorded } = fakeDb();
+    await enqueue(db, { kind: JobKind.ingest_tile, dedupeKey: tileJobKey('0333'), payload: {} });
+
+    expect(recorded.updateManys[0]?.data.priority).toBe(0);
+  });
 });
 
 describe('claimJobs', () => {
@@ -423,9 +451,8 @@ describe('reclaimExpiredJobs', () => {
 
     // Bound rather than inlined, so the statement carries the constant the pump's order is
     // asserted against rather than a copy of its value. The elevation sits inside the retirement
-    // test, so a row out of attempts keeps the priority it had — it is not going back to a worker,
-    // and `enqueue` revives without lowering priority, so elevating it would hand a later revival
-    // the head of the queue on the strength of a run that never finished.
+    // test, so a row out of attempts keeps the priority it had — the band exists to reach a
+    // worker, and a buried row is not going to one.
     expect(recorded.reapValues).toContain(RECLAIM_PRIORITY);
     expect(reapSql(recorded)).toContain(
       'priority = CASE WHEN attempts + 1 >= "maxAttempts" ' +

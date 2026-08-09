@@ -74,12 +74,18 @@ export interface EnqueueInput {
  *   resets the backoff and a rate-limited tile becomes one we hammer once per render.
  * - **Finished** (`done`, `failed`, `dead`) — reset and run again. A `dedupeKey` lives
  *   forever, so without this each tile is ingestable exactly once in the database's lifetime
- *   and a tile whose attempts landed during an outage stays `dead`. `attempts` is cleared too:
- *   this is a new request, not a sixth try.
+ *   and a tile whose attempts landed during an outage stays `dead`. `attempts` and `priority`
+ *   are both reset: this is a new request, not a sixth try, so it starts at the band its caller
+ *   asks for. Leaving `priority` alone would let a row the reaper had raised to
+ *   `RECLAIM_PRIORITY` keep that elevation for the rest of its life, because the raise below
+ *   cannot lower it and nothing else writes the column.
  *
  * Three statements, each a single conditional `UPDATE` Postgres applies atomically. A
  * read-then-write would let two concurrent enqueues both revive and reset `attempts` twice, and
- * would let either of them write back a priority the other had already raised.
+ * would let either of them write back a priority the other had already raised. The reset above
+ * is the one write that lowers, and it is safe under concurrency because the revive clears the
+ * very status it selects on: one of two racing enqueues performs it, and every raise that
+ * follows — the loser's included — only climbs.
  */
 export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
   const priority = input.priority ?? 0;
@@ -93,6 +99,7 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
     data: {
       status: JobStatus.queued,
       attempts: 0,
+      priority,
       runAfter,
       lockedAt: null,
       lockedBy: null,
@@ -352,14 +359,14 @@ const MARKER_KEY_LIMIT = 10;
  * ordered among themselves by `runAfter`, never a ladder that climbs away from the queue. The band
  * is therefore subject to the same per-tick window as any other — one tick while it fits inside
  * that window, its own drain when it does not. `apps/ingest-worker/test/pump.test.ts` asserts each
- * half against an ordered backlog. Retired rows keep the priority they had, and `enqueue` raises
- * but never lowers, so a row that is never going to run again does not carry the head of the queue
- * into a later revival.
+ * half against an ordered backlog.
  *
- * It cannot starve ordinary work: a row only arrives here by losing a lease, the host runs one
- * handler at a time, and the attempt this sweep spends retires a reliably fatal job rather than
- * parking it at the head. `packages/ingest/test/jobs.test.ts` asserts it outranks every band
- * `enqueue` is given.
+ * It cannot starve ordinary work, and two things hold that. `reclaimExpiredJobs` is the only
+ * writer of this band and spends an attempt every time it writes, so `maxAttempts` retires a
+ * reliably fatal job rather than republishing it forever. Retirement leaves the elevation on the
+ * row, so `enqueue` resets `priority` when it revives a finished one — the elevation cannot
+ * outlive the lease that earned it, and a revived row competes at the band its request asks for.
+ * `packages/ingest/test/jobs.test.ts` asserts both halves.
  */
 export const RECLAIM_PRIORITY = 6;
 

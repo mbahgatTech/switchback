@@ -51,10 +51,12 @@ app.timer('ingestPump', {
  * broker until an operator lifted the brake, and how long that takes is not a bound.
  *
  * Reclaimed work is not new work, which is what the brake is for. The bleed is bounded twice over:
- * only a row that lost a lease reaches this band, and `reclaimExpiredJobs` spends an attempt each
- * time it does, so a tile that reliably kills its handler is retired rather than republished
- * forever. A brake that must stop the ingestion of a tile outright is
- * `AzureWebJobs.ingestDrain.Disabled`, and the one that must stop everything is stopping the host.
+ * `reclaimExpiredJobs` is the only writer of this band and spends an attempt every time it writes,
+ * so a tile that reliably kills its handler is retired rather than republished forever; and
+ * `enqueue` resets `priority` when it revives a finished row, so a request for a tile that was
+ * once reclaimed re-enters at its own band and the brake still holds it. A brake that must stop
+ * the ingestion of a tile outright is `AzureWebJobs.ingestDrain.Disabled`, and the one that must
+ * stop everything is stopping the host.
  */
 async function refill(log: InvocationContext, minPriority?: number): Promise<void> {
   await runPump(backgroundPrisma, serviceBusQueue(), log, new Date(), pumpBounds(), minPriority);

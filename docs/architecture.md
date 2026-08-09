@@ -134,9 +134,11 @@ The first brake narrows the pump to reclaimed leases rather than silencing it. `
 completes a Service Bus message on the strength of the reaper returning the row to `queued` at
 `RECLAIM_PRIORITY` and the pump republishing it, and a completion cannot be taken back — so
 suppressing the republish would leave the row correct and unreachable until someone lifted the
-brake. Reclaimed work is not new work; the band is bounded by rows that lost a lease, and each
-reclaim spends an attempt, so a tile that reliably kills its handler is retired rather than
-republished forever.
+brake. Reclaimed work is not new work, and two things bound the band. `reclaimExpiredJobs` is its
+only writer and spends an attempt every time it writes, so a tile that reliably kills its handler is
+retired rather than republished forever; and `enqueue` resets `priority` when it revives a finished
+row, so a request for a tile that was once reclaimed re-enters at its own band and the brake still
+holds it.
 
 None loses a tile. `ingest_jobs` is the record and the pump re-derives the runnable head every two
 minutes, so a brake costs the queue its throughput and not its contents — though work queued while
@@ -173,8 +175,10 @@ rows form one band ordered among themselves by `runAfter`, and that band is publ
 `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` rows a tick as any other. Recovery therefore costs one tick
 while the band fits inside a tick's window and the band's own drain when it does not — never the
 five-figure backlog, which is the bound the elevation exists to escape. A fixed value rather than
-an increment is also what keeps repeated reclaims idempotent instead of a ladder, and a retired row
-keeps the priority it had so a later revival does not inherit the head of the queue.
+an increment is also what keeps repeated reclaims idempotent instead of a ladder. A retired row
+keeps the priority it had, because the elevation exists to reach a worker and a buried row is not
+going to one; `enqueue` resets `priority` when it revives such a row, so the band cannot outlive
+the lease that earned it.
 `apps/ingest-worker/test/pump.test.ts` runs `runPump` over an ordered backlog and asserts all
 three: the elevated row is reached, an unelevated one is not, and an elevated row behind a backlog
 of its own band is not either.
@@ -213,8 +217,9 @@ under. The predicate is the marker the repair removes, so a second pass finds no
 order is also what makes the repair safe beside a live split: a split that has written the marker
 has already written its four children, so `childTiles` returns four and the parent is left alone.
 
-The six do not all get the same number of tries. `enqueue` resets `attempts` only for a job in
-`done`, `failed` or `dead`, so a parent whose job is already `queued` keeps its ladder — measured
+The six do not all get the same number of tries. `enqueue` resets `attempts` and `priority` only
+for a job in `done`, `failed` or `dead`, so a parent whose job is already `queued` keeps its ladder
+— measured
 on 2026-08-07, `ingest_tile:120221231` re-enters at 4 of 5 and has one attempt left, while
 `ingest_tile:120230212` was `done` and starts again at 0. Preserving the ladder is the intent; the
 consequence is that the densest of the six can reach `dead`, which `queueHealth` counts and the

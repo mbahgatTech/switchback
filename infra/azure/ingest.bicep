@@ -995,7 +995,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // message on the strength of that republish and cannot take the completion back, so a
           // brake that suppressed it would leave the row `queued` with nothing to carry it to the
           // broker until an operator lifted the brake. Nothing is lost either way; what the
-          // republish buys is a bound on when it comes back.
+          // republish buys is a bound on when it comes back. What keeps that exception narrow is
+          // `enqueue` resetting `priority` on a revived row: a reclaimed tile requested again
+          // re-enters at its own band, so the brake holds it like any other new work.
           {
             name: 'INGEST_PUMP_ENABLED'
             value: 'true'
