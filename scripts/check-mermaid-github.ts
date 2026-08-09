@@ -68,7 +68,17 @@ async function renderedBlocks(frames: Frame[]): Promise<number> {
       .map(async (frame) => {
         const diagram = frame.locator('svg#diagram');
         if ((await diagram.count().catch(() => 0)) === 0) return false;
-        return (await diagram.first().getAttribute('aria-roledescription')) !== 'error';
+        /*
+         * A rejection here means GitHub swapped this iframe between the count and the read, which
+         * it does while the page settles. That is "not rendered *yet*", not a failure: the next
+         * poll takes a fresh frame list. Letting it reject instead failed the whole run on a race
+         * the following half-second would have won.
+         */
+        const role = await diagram
+          .first()
+          .getAttribute('aria-roledescription')
+          .catch(() => 'error');
+        return role !== 'error';
       }),
   );
   return verdicts.filter(Boolean).length;
@@ -88,25 +98,33 @@ async function main(): Promise<void> {
   if (targets.length === 0) throw new Error('no markdown file carries a Mermaid block');
 
   const browser = await chromium.launch();
-  const page = await browser.newPage();
   const failures: string[] = [];
 
-  for (const { path, expected } of targets) {
-    const url = `https://github.com/${slug}/blob/${ref}/${path}`;
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+  /*
+   * `finally`, because a throw that leaves chromium connected leaves the event loop with a live
+   * handle and the process never exits — so the job sits until its 15-minute timeout and is
+   * *cancelled*, which reports no verdict at all rather than the failure it actually had.
+   */
+  try {
+    const page = await browser.newPage();
 
-    let rendered = 0;
-    for (let waited = 0; waited < SETTLE_MS && rendered < expected; waited += POLL_MS) {
-      await page.waitForTimeout(POLL_MS);
-      rendered = await renderedBlocks(page.frames());
+    for (const { path, expected } of targets) {
+      const url = `https://github.com/${slug}/blob/${ref}/${path}`;
+      await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+      let rendered = 0;
+      for (let waited = 0; waited < SETTLE_MS && rendered < expected; waited += POLL_MS) {
+        await page.waitForTimeout(POLL_MS);
+        rendered = await renderedBlocks(page.frames());
+      }
+
+      process.stdout.write(`${rendered}/${expected} rendered  ${url}\n`);
+      if (rendered < expected)
+        failures.push(`${path}: ${expected - rendered} of ${expected} did not render`);
     }
-
-    process.stdout.write(`${rendered}/${expected} rendered  ${url}\n`);
-    if (rendered < expected)
-      failures.push(`${path}: ${expected - rendered} of ${expected} did not render`);
+  } finally {
+    await browser.close();
   }
-
-  await browser.close();
 
   if (failures.length > 0) {
     process.stdout.write(`\n${failures.join('\n')}\n`);

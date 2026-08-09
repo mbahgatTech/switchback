@@ -209,8 +209,9 @@ jobs:
 
       - run: npm ci
 
-      # The full Chromium build rather than the headless shell: the render happens in a
-      # cross-origin iframe, and the shell does not mount one.
+      # `chromium` installs Chrome for Testing *and* the headless shell, and `chromium.launch()`
+      # takes the shell. The shell does mount the cross-origin iframe GitHub renders Mermaid in —
+      # run 31307574351 rendered all twelve blocks on it in 68 s.
       - run: npx playwright install --with-deps chromium
 
       - name: Every block became a diagram, on the site
