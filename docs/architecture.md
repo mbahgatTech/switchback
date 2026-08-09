@@ -761,6 +761,48 @@ trail, so a tile is only short when the deadline _refused_ one — `processTile`
 tile whose last commit lands a millisecond past the wall is finished; splitting it would throw away
 the `ready` write and queue four children over rows already in `trails`.
 
+**A tile that lost trails is not `ready`.** `ready` with a fresh `fetchedAt` is what tells freshness
+to skip the tile, the roll-up to promote its parent, and the person waiting on the viewport that the
+ground is covered. A trail that throws still costs only its own row, but the tile now records
+`switchback-ingest-trail-lost`, keeps the `fetchedAt` it had, and `processTile` throws so the job's
+own ladder runs the tile again — `enqueue` revives a `done`, `failed` or `dead` row, and the job
+asking for the re-run is its own `running` one, so an enqueue from inside it would be a priority
+raise and nothing else. The commits are idempotent upserts, so the second pass re-lands the same rows
+and only the missing ones are new work. Once, edge-triggered on the marker the first pass wrote — a
+trail that fails deterministically would otherwise burn the whole retry ladder — after which the tile
+settles as `ready` still carrying the marker, which is the `lostTrails` gauge in the queue-health
+heartbeat. Measured on tile `1202212023`: 906 trails assembled, 900 committed, `ready` with
+`attempts` at 1 and nothing that would ever run it again, and four of the six it dropped exist in no
+other tile.
+
+#### Slugs: the contested rungs are handed out before the batch commits
+
+A trail's URL comes from a three-rung ladder in `packages/ingest/src/slug.ts` — the bare name, then
+region-qualified, then `<name>--<osmType>-<osmId base36>`. The last is unique by construction:
+`slugify` collapses every run of non-alphanumerics into a single hyphen, so no name-derived slug
+contains `--`, and `(osmType, osmId)` names one OSM element.
+
+**Walking that ladder per trail is a check-then-insert, and a dense tile races it.** The read of
+`trails.slug` and the upsert that takes it are separated by the rest of a 30 s transaction, six
+trails commit at once, and a tile routinely carries a dozen under one name — twelve
+`Chemin d'Exploitation` inside one Ain tile, all committed inside 587 ms. Every one of them reads
+the bare slug as free; Postgres then serialises them at the unique index, so eleven block on the
+winner's uncommitted row, take a `P2002` when it lands, and replay their whole write set. Production
+logged 226 of those in the thirty minutes to 08:30 UTC on 2026-08-09.
+
+`planTileSlugs` ranks each same-named group by OSM identity — relations before ways, then ascending
+id — and gives the trail at rank _n_ the ladder from rung _n_ down, so no two trails in a tile ever
+ask for the same candidate and there is nothing left inside the tile to race over. It is also what
+makes a re-ingest converge: which trail held the bare slug used to be decided by whichever
+transaction the pool scheduled first, so rebuilding a wiped tile moved public URLs between OSM ways.
+The Ain group proves it — `chemin-d-exploitation` went to way 26667074 while the lower id 26667073
+took the region rung.
+
+What is left is two _tiles_ committing the same name at once, which the unique index still catches
+and `commitWithSlugRetry` still resolves — now only for the slug index, since a unique violation on
+any other column is one a re-run reaches again, and four transactions spent doing that end with the
+trail dropped anyway.
+
 **Children wait for the backlog, and that is the pump's shape rather than subdivision's.** They are
 enqueued at `SPLIT_PRIORITY` — level with a live viewport — but the pump only refills the broker
 when fewer than `INGEST_PUMP_LOW_WATER` (4) messages are in flight, and at equal priority
@@ -1868,7 +1910,7 @@ database is `FOR ROLE sbadmin`. The migrate job pushes as `id-switchback-postgre
 arriving by that route is owned by it — `pg_tables` puts these two under that owner against 24 under
 `sbadmin` — and inherits no grant at all. A table in that state is not merely unwritten: `resolveTrail`
 reads `TrailWay` before it does anything else, so `42501 permission denied for table trail_ways`
-unwinds the whole per-trail commit and the tile records as covered with nothing in it.
+unwinds the whole per-trail commit, and every trail in the tile fails the same way.
 `scripts/converge-runtime-grants.ts` runs after every push, registers the missing default privileges,
 grants over the tables already on the ground, and fails the job if any application table is short.
 

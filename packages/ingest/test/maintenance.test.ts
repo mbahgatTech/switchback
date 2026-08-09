@@ -16,6 +16,7 @@ import {
   sweepQueue,
 } from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
+import { TRAIL_LOSS_MARKER } from '../src/pipeline';
 
 /** A tile row as the sweep reads it. */
 interface TileRow {
@@ -217,7 +218,13 @@ describe('the queue health report', () => {
         findFirst: async () => (reading.stalledDrain ? { runAfter: new Date(0) } : null),
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
-      ingestTile: { count: async () => reading.stuckSubtrees },
+      // Both tile counts arrive here; the marker in the predicate is what tells them apart.
+      ingestTile: {
+        count: async ({ where }: { where: { lastError?: { contains?: string } } }) =>
+          where.lastError?.contains === TRAIL_LOSS_MARKER
+            ? reading.lostTrails
+            : reading.stuckSubtrees,
+      },
       // Two correlated counts share this seam; the child-set subquery names the split one.
       $queryRaw: async (strings: TemplateStringsArray) =>
         strings.join('').includes('ingest_tiles child')
@@ -246,6 +253,7 @@ describe('the queue health report', () => {
     orphanedSplits: 6,
     stuckSubtrees: 1,
     wedgedTiles: 4,
+    lostTrails: 2,
     stalledDrain: 1,
   };
 
@@ -327,6 +335,7 @@ describe('the queue health report', () => {
       orphanedSplits: 0,
       stuckSubtrees: 0,
       wedgedTiles: 0,
+      lostTrails: 0,
       stalledDrain: 0,
     };
     expect(isDistressed(clean)).toBe(false);

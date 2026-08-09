@@ -9,6 +9,7 @@ export * from './deadline';
 export * from './assemble';
 export * from './elevate';
 export * from './derive';
+export * from './slug';
 export * from './enrich';
 export * from './geocode';
 export * from './jobs';

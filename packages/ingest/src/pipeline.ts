@@ -16,8 +16,7 @@ import {
   writeTrailGeometry,
   writeWaypointPoints,
 } from '@switchback/db';
-import { Prisma } from '@switchback/db';
-import type { PrismaClient } from '@switchback/db';
+import type { Prisma, PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
   MAX_INGEST_ZOOM,
@@ -32,7 +31,9 @@ import {
 } from '@switchback/geo';
 import { assembleTrails } from './assemble';
 import type { AssembledTrail } from './assemble';
-import { deriveTrail, slugify } from './derive';
+import { deriveTrail } from './derive';
+import { planTileSlugs, uniqueSlug } from './slug';
+import type { SlugPlan } from './slug';
 import {
   attachWaypoints,
   featureSearchBBox,
@@ -149,6 +150,24 @@ export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
  */
 export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
 
+/**
+ * The literal `switchback-ingest-trail-lost` greps for, and what `queueHealth` counts.
+ *
+ * A trail that throws costs its own row and nothing else, by design — but the tile then wrote
+ * `ready` with a fresh `fetchedAt`, which tells freshness, the roll-up and the reader waiting on
+ * the viewport that this ground is covered when some of it is not. The marker is on the tile
+ * rather than only in a log line because a log line is not something a later pass can find.
+ */
+export const TRAIL_LOSS_MARKER = 'switchback-ingest-trail-lost';
+
+/** A tile that assembled trails it could not commit. Thrown so the job runs the tile again. */
+export class TrailsLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TrailsLostError';
+  }
+}
+
 export interface PipelineDeps {
   db?: PrismaClient;
   /** The shared client, or a `withDeadline` view of it — never a second client. */
@@ -204,7 +223,8 @@ export interface ProcessTileResult {
 /**
  * Fetch, assemble and commit every trail in one tile. Returns rather than throws for the
  * ordinary failure modes — the caller is a job handler that records the outcome either way —
- * but throws when Overpass is unavailable, so the queue backs off instead of burning attempts.
+ * but throws when Overpass is unavailable, so the queue backs off instead of burning attempts,
+ * and when trails were assembled and could not be committed, so the job runs the tile again.
  *
  * A tile that already has children is never fetched: subdivision has moved the work down a
  * level, so this becomes the roll-up — queue whatever child is stale, promote the parent once
@@ -365,6 +385,10 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   const identityOutcomes = new Map<IdentityOutcome, number>();
 
+  // Every trail's slug candidates, decided across the whole tile before any of them commit —
+  // see `planTileSlugs` for what the six concurrent committers below would otherwise race over.
+  const slugs = planTileSlugs(assembled, region.regionName);
+
   // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
   // throws must cost its tile one row, not the rest of the tile.
   await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
@@ -378,6 +402,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
           terrain,
           now: now(),
           identity,
+          slugs,
           deadlineAt: deps.deadlineAt,
           onIdentity: (kind) => identityOutcomes.set(kind, (identityOutcomes.get(kind) ?? 0) + 1),
         }),
@@ -453,13 +478,49 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   }
 
   const fetchMs = Date.now() - startedAt;
+
+  /*
+   * A tile that lost trails is not ready.
+   *
+   * `ready` with a fresh `fetchedAt` is the assertion every other reader depends on — freshness
+   * skips the tile, the roll-up promotes its parent, and the person waiting on the viewport is
+   * told the ground is covered. Tile 1202212023 asserted all three over 900 of the 906 trails it
+   * assembled, and four of the six it dropped exist nowhere in `trails`. So the tile stays out of
+   * `ready`, keeps whatever `fetchedAt` it had, and neither the parent roll-up nor the parent-route
+   * discovery below runs on a pass that did not finish.
+   *
+   * **Thrown rather than re-queued, because this runs inside the job's own lease.** `enqueue`
+   * revives a `done`, `failed` or `dead` row and this job is `running`, so an enqueue here is a
+   * priority raise and nothing else. Throwing hands the tile to `failJob`, which is the queue's
+   * existing "did not finish" path: one attempt spent, a backoff, and `dead` at five for the
+   * heartbeat to count. The commits are idempotent upserts, so the next pass re-lands the same
+   * rows and only the missing ones are new work.
+   *
+   * Once, and edge-triggered on the marker this pass wrote, because a trail that fails
+   * deterministically would otherwise burn the whole retry ladder. A second loss settles as
+   * `ready` carrying the marker, which is the `lostTrails` gauge an operator acts on.
+   */
+  const lostBefore = previous?.lastError?.includes(TRAIL_LOSS_MARKER) ?? false;
+  if (failed > 0 && !lostBefore) {
+    const message = `${TRAIL_LOSS_MARKER} ${quadkey}: ${failed} of ${assembled.length} trail(s) failed to commit`;
+    await db.ingestTile.update({
+      where: { quadkey },
+      data: { status: TileStatus.pending, trailCount: committed, lastError: message, fetchMs },
+    });
+    log(message, { quadkey, committed, skipped, failed, fetchMs });
+    throw new TrailsLostError(message);
+  }
+
   await db.ingestTile.update({
     where: { quadkey },
     data: {
       status: TileStatus.ready,
       fetchedAt: now(),
       trailCount: committed,
-      lastError: failed > 0 ? `${failed} trail(s) failed to commit` : null,
+      lastError:
+        failed > 0
+          ? `${TRAIL_LOSS_MARKER} ${quadkey}: ${failed} trail(s) failed to commit on a second pass`
+          : null,
       fetchMs,
     },
   });
@@ -832,6 +893,7 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
     terrain,
     now: now(),
     identity: deps.trailIdentity ?? trailIdentityMode(),
+    slugs: planTileSlugs([assembled], region.regionName),
     deadlineAt: deps.deadlineAt,
   });
 
@@ -853,6 +915,7 @@ interface CommitContext {
   terrain: TerrainSource;
   now: Date;
   identity: TrailIdentityMode;
+  slugs: SlugPlan;
   deadlineAt?: number;
   onIdentity?: (outcome: IdentityOutcome) => void;
 }
@@ -1080,7 +1143,7 @@ async function attemptCommit(
       await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
     }
 
-    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
+    const slug = await uniqueSlug(tx, ctx.slugs(trail), osmType, osmId);
 
     const row = {
       slug,
@@ -1221,18 +1284,34 @@ const TRAIL_TX_TIMEOUT_MS = 30_000;
 const UNIQUE_VIOLATION = 'P2002';
 
 /**
- * Attempts allowed per trail — must stay equal to the number of slugs `uniqueSlug` can offer,
- * since each losing attempt burns exactly one. Any lower and the last candidate is
- * unreachable, and the last candidate is the only one unique by construction.
+ * Attempts a trail gets at the slug ladder. Three rungs, and the last is unique by construction,
+ * so a losing attempt always has somewhere lower to go and the fourth is headroom.
  */
 const MAX_SLUG_ATTEMPTS = 4;
 
 /**
- * Run a trail's transaction, retrying when it loses a race for a slug. `uniqueSlug` reads and
- * the upsert writes; with six trails in flight and several called "Lake Trail" in one valley,
- * another worker takes the name in between. A retry is the whole fix because the read is
- * inside the transaction, and the last candidate is unique by construction, so this
- * terminates. Only unique violations are retried — everything else belongs to that trail.
+ * Whether a rejection is the slug's unique index — the one violation re-running the body can
+ * resolve, because `uniqueSlug` re-reads and steps down the ladder. A claim conflict on
+ * `trail_ways` arrives as `ClaimConflictError` and belongs to `commitTrail`'s own retry; anything
+ * else re-run is four transactions spent reaching the same failure.
+ *
+ * Prisma does not promise `meta.target` on every driver, and a slug conflict that reads as
+ * unknown must still be retried: an unhelpful retry costs one transaction, a refused one costs
+ * the trail.
+ */
+export function isSlugConflict(error: unknown): boolean {
+  const known = error as { code?: string; meta?: { target?: unknown } } | null;
+  if (known?.code !== UNIQUE_VIOLATION) return false;
+  const target = known.meta?.target;
+  if (typeof target === 'string') return target.includes('slug');
+  if (Array.isArray(target)) return target.some((field) => String(field).includes('slug'));
+  return true;
+}
+
+/**
+ * Run a trail's transaction, retrying when it loses a race for a slug. `planTileSlugs` settles
+ * every collision inside one tile, so what is left here is two tiles committing the same name at
+ * once — rare, and the ladder's last rung is unique by construction, so a retry terminates.
  */
 async function commitWithSlugRetry(
   db: PrismaClient,
@@ -1245,8 +1324,7 @@ async function commitWithSlugRetry(
         maxWait: TRAIL_TX_TIMEOUT_MS,
       });
     } catch (error) {
-      const code = (error as { code?: string } | null)?.code;
-      if (code !== UNIQUE_VIOLATION || attempt >= MAX_SLUG_ATTEMPTS) throw error;
+      if (!isSlugConflict(error) || attempt >= MAX_SLUG_ATTEMPTS) throw error;
     }
   }
 }
@@ -1263,59 +1341,6 @@ function elevationAt(
       best = point;
   }
   return Math.round(best.eleM);
-}
-
-/**
- * A slug that is unique and stays that way. The bare name first, because `/trails/ben-nevis`
- * is what somebody would guess; then region-qualified, which says which Eagle Peak Trail this
- * is; then the OSM id, unlovely but unique and stable.
- */
-export async function uniqueSlug(
-  tx: Prisma.TransactionClient,
-  name: string,
-  regionName: string | null,
-  osmType: OsmElementType,
-  osmId: bigint,
-): Promise<string> {
-  const candidates = [slugify(name)];
-  if (regionName) candidates.push(slugify(name, regionName));
-  candidates.push(`${slugify(name)}-${osmId.toString(36)}`);
-
-  for (const candidate of candidates) {
-    const existing = await tx.trail.findUnique({
-      where: { slug: candidate },
-      select: { osmType: true, osmId: true },
-    });
-    // Free, or already ours — a re-ingest of the same trail keeps its URL.
-    if (existing) {
-      if (existing.osmType !== osmType || existing.osmId !== osmId) continue;
-      return candidate;
-    }
-    // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
-    // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
-    // Read in every mode, not only `claim`: a merge made while the flag was on retires a slug
-    // permanently, and the rollback that turns the flag off is exactly when an unrelated trail
-    // would otherwise be free to take it.
-    //
-    // P2021 only, and it is what keeps `osm-id` free of any dependency on this table: a database
-    // the DDL has not reached has no aliases, so no candidate is retired and the bare name is
-    // free. Vercel Preview builds run branch code against whichever database they are pointed at
-    // while `ci.yml`'s `migrate` job runs on `master` alone, so that gap is reachable. Any other
-    // error is a real failure and has to keep failing the commit.
-    const alias = await tx.trailSlugAlias
-      .findUnique({
-        where: { slug: candidate },
-        select: { slug: true },
-      })
-      .catch((error: unknown) => {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2021') {
-          return null;
-        }
-        throw error;
-      });
-    if (!alias) return candidate;
-  }
-  return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
 }
 
 export interface RegionInfo {

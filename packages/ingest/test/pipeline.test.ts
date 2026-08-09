@@ -1,16 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { JobStatus, Prisma, TileStatus } from '@switchback/db';
+import { JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   TILE_TTL_MS,
+  TRAIL_LOSS_MARKER,
+  TrailsLostError,
   chooseHero,
   fetchWayGeometries,
+  isSlugConflict,
   isTileFresh,
   pickRegion,
   processTile,
-  uniqueSlug,
 } from '../src/pipeline';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
+import type { TerrainSource } from '../src/elevate';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
 import { SUBTREE_STUCK_MARKER } from '../src/subdivide';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
@@ -267,17 +270,92 @@ describe('processTile, out of clock', () => {
     const { db, recorded } = fakeDb();
     const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
 
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toBeInstanceOf(TrailsLostError);
+
+    // No children queued and no tile written `failed`: this is one lost row, not a tile too big.
+    expect(recorded.jobs).toEqual([]);
+    expect(recorded.updates.some((update) => update.data.status === TileStatus.failed)).toBe(false);
+  });
+
+  /** Terrain that refuses, so a trail fails for a named reason of its own and nothing is fetched. */
+  const brokenTerrain = {
+    tilesFor: () => Promise.reject(new Error('terrain unavailable')),
+  } as unknown as TerrainSource;
+
+  it('keeps a tile that lost trails out of ready, and hands it back to the queue', async () => {
+    // Tile 1202212023 assembled 906 trails, committed 900 and wrote `ready` with a fresh
+    // `fetchedAt` — four of the six it dropped exist in no other tile. `ready` is the assertion
+    // freshness, the roll-up and the reader all act on, so a tile short of trails must not make
+    // it. Thrown rather than re-queued: `enqueue` cannot revive this job's own `running` row.
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: brokenTerrain,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(TRAIL_LOSS_MARKER);
+
+    const written = recorded.updates.at(-1)!;
+    expect(written.quadkey).toBe(DENSE);
+    expect(written.data.status).toBe(TileStatus.pending);
+    expect(written.data.lastError).toContain(TRAIL_LOSS_MARKER);
+    // `fetchedAt` is what freshness reads. Bumping it would hide the gap for the whole TTL.
+    expect(written.data).not.toHaveProperty('fetchedAt');
+  });
+
+  it('settles a tile that lost trails twice as ready, carrying the marker', async () => {
+    // Bounded at one retry: a trail that fails deterministically would otherwise burn the job's
+    // whole ladder. The second pass records the loss where `queueHealth` counts it instead.
+    const { db, recorded } = fakeDb([
+      { quadkey: DENSE, status: TileStatus.pending, lastError: `${TRAIL_LOSS_MARKER} ${DENSE}: 1` },
+    ]);
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
     const result = await processTile(DENSE, {
       db,
       overpass,
+      terrain: brokenTerrain,
       enrichWaypoints: false,
       deadlineAt: Date.now() + 600_000,
     });
 
-    expect(result.failed).toBe(1);
-    expect(result.children).toEqual([]);
+    expect(result.status).toBe(TileStatus.ready);
+    const written = recorded.updates.at(-1)!;
+    expect(written.data.status).toBe(TileStatus.ready);
+    expect(written.data.lastError).toContain(TRAIL_LOSS_MARKER);
     expect(recorded.jobs).toEqual([]);
-    expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.ready);
+  });
+
+  it('writes a clean tile ready with no error at all', async () => {
+    // The marker must be edge-triggered on a real loss: a tile whose trails all landed has to
+    // clear `lastError`, or one bad pass pins `lostTrails` on for the life of the row.
+    const { db, recorded } = fakeDb();
+    const overpass = { query: async () => ({ elements: [] }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: brokenTerrain,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() + 600_000,
+    });
+
+    // No trails at all is `empty`, not `ready` — but the point stands: no marker, no re-queue.
+    expect(result.failed).toBe(0);
+    expect(recorded.updates.at(-1)?.data.lastError).toBeNull();
+    expect(recorded.jobs).toEqual([]);
   });
 
   it('fails a tile at the floor, because there is nowhere left to split', async () => {
@@ -615,65 +693,27 @@ describe('fetchWayGeometries', () => {
   });
 });
 
-describe('uniqueSlug', () => {
-  const OSM_ID = 162652736n;
+describe('isSlugConflict', () => {
+  const p2002 = (target?: unknown): unknown =>
+    Object.assign(new Error('Unique constraint failed'), { code: 'P2002', meta: { target } });
 
-  /** A transaction client that holds no trails, and answers the alias lookup however told to. */
-  function txWith(
-    retired: readonly string[],
-    aliasLookup?: () => Promise<{ slug: string } | null>,
-  ): Prisma.TransactionClient {
-    return {
-      trail: { findUnique: () => Promise.resolve(null) },
-      trailSlugAlias: {
-        findUnique:
-          aliasLookup ??
-          (({ where }: { where: { slug: string } }) =>
-            Promise.resolve(retired.includes(where.slug) ? { slug: where.slug } : null)),
-      },
-    } as unknown as Prisma.TransactionClient;
-  }
-
-  function rejectWith(code: string): () => Promise<never> {
-    return () =>
-      Promise.reject(
-        new Prisma.PrismaClientKnownRequestError(code, { code, clientVersion: 'test' }),
-      );
-  }
-
-  it('takes the bare name when no trail and no alias hold it', async () => {
-    const slug = await uniqueSlug(txWith([]), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID);
-    expect(slug).toBe('kibbie-lake-trail');
+  it('retries the slug index, which stepping down the ladder resolves', () => {
+    expect(isSlugConflict(p2002(['slug']))).toBe(true);
+    expect(isSlugConflict(p2002('Trail_slug_key'))).toBe(true);
   });
 
-  it('steps past a slug a merge retired, so a permanent link keeps its own trail', async () => {
-    const slug = await uniqueSlug(
-      txWith(['kibbie-lake-trail']),
-      'Kibbie Lake Trail',
-      'Tuolumne',
-      'way',
-      OSM_ID,
-    );
-    expect(slug).toBe('kibbie-lake-trail-tuolumne');
+  it('does not retry a unique violation a second attempt would hit again', () => {
+    // Four transactions spent reaching the same failure, and the trail dropped anyway.
+    expect(isSlugConflict(p2002(['primaryPhotoId']))).toBe(false);
+    expect(isSlugConflict(p2002(['wayId']))).toBe(false);
   });
 
-  // The property `osm-id` is documented to have: no dependency on `trail_slug_aliases` existing.
-  // A Preview build runs branch code against whichever database it is pointed at while `migrate`
-  // runs on `master` alone, so without this the whole commit fails there rather than ingesting.
-  it('ingests against a database that has no trail_slug_aliases at all', async () => {
-    const slug = await uniqueSlug(
-      txWith([], rejectWith('P2021')),
-      'Kibbie Lake Trail',
-      'Tuolumne',
-      'way',
-      OSM_ID,
-    );
-    expect(slug).toBe('kibbie-lake-trail');
+  it('retries when the driver names no target, because a refused retry costs the trail', () => {
+    expect(isSlugConflict(p2002())).toBe(true);
   });
 
-  it('still fails the commit on an error that is not a missing table', async () => {
-    await expect(
-      uniqueSlug(txWith([], rejectWith('P1010')), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID),
-    ).rejects.toMatchObject({ code: 'P1010' });
+  it('leaves everything that is not a unique violation to the caller', () => {
+    expect(isSlugConflict(new Error('Transaction already closed'))).toBe(false);
+    expect(isSlugConflict(null)).toBe(false);
   });
 });

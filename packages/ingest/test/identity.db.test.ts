@@ -424,8 +424,8 @@ describe.skipIf(!IS_LOCAL).sequential('what `osm-id` touches', () => {
     /*
      * Vercel Preview runs branch code against the production database and CI's migrate job never
      * runs on a pull request, so a claim written under `osm-id` would throw on a missing relation
-     * for every trail — and `processTile` counts those `failed`, then writes the tile `ready`
-     * with `fetchedAt`, which reads as covered for the whole TTL.
+     * for every trail — and `processTile` counts those `failed`, which now costs the tile a whole
+     * second pass and leaves `switchback-ingest-trail-lost` on it for an operator to read.
      */
     await processTile(WEST, deps([W1, W2], { trailIdentity: 'osm-id' }));
 

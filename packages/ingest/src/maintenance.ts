@@ -6,6 +6,7 @@
 import { JobStatus, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
+import { TRAIL_LOSS_MARKER } from './pipeline';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
 
@@ -98,6 +99,14 @@ export interface QueueHealth {
   stuckSubtrees: number;
   /** Tiles left mid-fetch with no job that will ever finish them — see `wedgedTiles`. */
   wedgedTiles: number;
+  /**
+   * Tiles a second pass still could not commit every trail of — see `TRAIL_LOSS_MARKER`.
+   *
+   * Un-windowed like `stuckSubtrees`, and for the same reason: this is a condition on the ground
+   * rather than an event, so it clears when the tile ingests cleanly and not on a timer. The first
+   * loss is not counted here — that tile is `pending` and its job is already retrying.
+   */
+  lostTrails: number;
   /** 1 when work is due and nothing has finished in `DRAIN_SILENCE_MS` — the drain has stopped. */
   stalledDrain: number;
 }
@@ -162,7 +171,8 @@ export function formatQueueHealth(health: QueueHealth): string {
   return (
     `dead=${health.dead} staleLeases=${health.staleLeases} rateLimited=${health.rateLimited} ` +
     `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees} ` +
-    `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain}`
+    `wedgedTiles=${health.wedgedTiles} lostTrails=${health.lostTrails} ` +
+    `stalledDrain=${health.stalledDrain}`
   );
 }
 
@@ -291,6 +301,7 @@ export async function queueHealth(
     orphanedSplits,
     stuckSubtrees,
     wedgedTiles,
+    lostTrails,
     oldestDue,
     lastFinished,
   ] = await Promise.all([
@@ -307,6 +318,9 @@ export async function queueHealth(
     countOrphanedSplits(db),
     db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
     countWedgedTiles(db, now),
+    db.ingestTile.count({
+      where: { status: TileStatus.ready, lastError: { contains: TRAIL_LOSS_MARKER } },
+    }),
     db.ingestJob.findFirst({
       where: { status: JobStatus.queued, runAfter: { lte: now } },
       orderBy: { runAfter: 'asc' },
@@ -325,6 +339,7 @@ export async function queueHealth(
     orphanedSplits,
     stuckSubtrees,
     wedgedTiles,
+    lostTrails,
     stalledDrain: stalledDrain(
       oldestDue?.runAfter ?? null,
       lastFinished._max.completedAt,

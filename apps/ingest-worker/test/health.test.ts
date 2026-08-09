@@ -34,6 +34,7 @@ const CLEAN: QueueHealth = {
   orphanedSplits: 0,
   stuckSubtrees: 0,
   wedgedTiles: 0,
+  lostTrails: 0,
   stalledDrain: 0,
 };
 
