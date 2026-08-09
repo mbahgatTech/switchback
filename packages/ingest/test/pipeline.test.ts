@@ -14,7 +14,7 @@ import {
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
 import type { TerrainSource } from '../src/elevate';
-import { SUBTREE_STUCK_MARKER } from '../src/subdivide';
+import { SPLIT_MARKER_PREFIX, SUBTREE_STUCK_MARKER, TILE_SPLIT_MARKER } from '../src/subdivide';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
 import type { TerrariumTile } from '@switchback/geo';
 
@@ -659,6 +659,64 @@ describe('processTile, a trail that would not commit', () => {
     expect(lastError).toContain(TRAIL_LOST_MARKER);
     expect(lastError).toContain('way/100');
     expect(lines.some((line) => line.includes(TRAIL_LOST_MARKER))).toBe(true);
+  });
+
+  it('carries the lost trail onto the parent row when the tile splits', async () => {
+    /*
+     * The shape production takes. Over the seven days to 2026-08-09 ten tile-invocations lost a
+     * trail for a reason that was not the clock; five of them also ran out of clock, and all five
+     * were z9 against a live ceiling of z11 — so every one took the split branch, not the floor
+     * branch. `splitTile` is the last write to the parent, so an id that reaches only the log
+     * line reaches nothing an operator queries.
+     */
+    const many: OverpassElement[] = Array.from({ length: 8 }, (_, index) => ({
+      type: 'way',
+      id: 100 + index,
+      tags: { highway: 'path', name: `Balcon ${String(index)}` },
+      geometry: [
+        { lat: 46.1 + index / 100, lon: 6.5 },
+        { lat: 46.11 + index / 100, lon: 6.5 },
+      ],
+    }));
+
+    const { db, recorded } = fakeDb();
+    let calls = 0;
+    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
+      calls += 1;
+      const lost = calls === 1;
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          if (lost) reject(new Error('The timeout for this transaction was 30000 ms.'));
+          else resolve('trail');
+        }, 200);
+      });
+    };
+    const overpass = { query: async () => ({ elements: many }) } as unknown as OverpassClient;
+    const lines: string[] = [];
+
+    // z9 against a z11 ceiling: `canSubdivide` is true, so this returns rather than throwing.
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: flatTerrain,
+      enrichWaypoints: false,
+      subdivideMaxZoom: MAX_INGEST_ZOOM,
+      deadlineAt: Date.now() + 100,
+      logger: (message: string) => lines.push(message),
+    });
+
+    expect(result.status).toBe(TileStatus.pending);
+    expect(result.children).toHaveLength(4);
+
+    const parent = recorded.updates.filter((update) => update.quadkey === DENSE).at(-1);
+    const lastError = String(parent?.data.lastError);
+    // The split marker stays the prefix `reconcileOrphanedSplits` sweeps on, and the ids ride
+    // behind it on the one row that survives the return.
+    expect(lastError).toContain(SPLIT_MARKER_PREFIX);
+    expect(lastError.startsWith(SPLIT_MARKER_PREFIX)).toBe(true);
+    expect(lastError).toContain(TRAIL_LOST_MARKER);
+    expect(lastError).toContain('way/100');
+    expect(lines.some((line) => line.includes(TILE_SPLIT_MARKER))).toBe(true);
   });
 
   it('still reports ready when the tile skipped a trail rather than losing it', async () => {

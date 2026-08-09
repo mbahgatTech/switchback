@@ -9,6 +9,8 @@ import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { INGEST_ZOOM, MAX_INGEST_ZOOM, childQuadkeys } from '@switchback/geo';
 import {
+  SPLIT_CHILD_ATTEMPT_CAP,
+  SPLIT_MARKER_PREFIX,
   SPLIT_PRIORITY,
   canSubdivide,
   promoteFrom,
@@ -32,6 +34,7 @@ function child(quadkey: string, overrides: Partial<ChildTile> = {}): ChildTile {
     fetchedAt: NOW,
     trailCount: 10,
     fetchMs: 1000,
+    attempts: 0,
     ...overrides,
   };
 }
@@ -245,6 +248,38 @@ describe('splitTile', () => {
 
     expect(recorded.tileUpdates[0]!.data.status).toBe(TileStatus.pending);
   });
+
+  it('carries a lost-trail note behind the marker, never in front of it', async () => {
+    // `reconcileOrphanedSplits` and `countOrphanedSplits` both match the marker as a prefix, so a
+    // note prepended here would hide the parent from its own repair sweep.
+    const { db, recorded } = fakeDb();
+
+    await splitTile(db, PARENT, { previous: null, lostNote: ' — way/100 did not commit' });
+
+    const lastError = String(recorded.tileUpdates[0]!.data.lastError);
+    expect(lastError.startsWith(SPLIT_MARKER_PREFIX)).toBe(true);
+    expect(lastError).toContain('way/100 did not commit');
+  });
+
+  it('records the trails the splitting run did commit', async () => {
+    // A split parent with `trailCount` 0 reads as holding nothing, which puts it in
+    // `ensureCoverage`'s pending set and makes the client poll it every 2.5 s.
+    const { db, recorded } = fakeDb();
+
+    await splitTile(db, PARENT, { previous: null, trailCount: 812 });
+
+    expect(recorded.tileUpdates[0]!.data.trailCount).toBe(812);
+  });
+
+  it('leaves trailCount alone when the caller does not know it', async () => {
+    // The Overpass-deadline split never reaches the commit loop, so it has no count to offer and
+    // must not overwrite one the row already holds with a zero.
+    const { db, recorded } = fakeDb();
+
+    await splitTile(db, PARENT, { previous: null });
+
+    expect(recorded.tileUpdates[0]!.data).not.toHaveProperty('trailCount');
+  });
 });
 
 describe('queueStaleChildren', () => {
@@ -280,7 +315,12 @@ describe('queueStaleChildren', () => {
 
     const outcome = await queueStaleChildren(db, rows, NOW);
 
-    expect(outcome).toEqual({ queued: [], waiting: [keys[3]], exhausted: [] });
+    expect(outcome).toEqual({
+      queued: [],
+      waiting: [keys[3]],
+      exhausted: [],
+      abandoned: [],
+    });
     expect(recorded.jobUpserts).toEqual([]);
   });
 
@@ -295,8 +335,75 @@ describe('queueStaleChildren', () => {
 
     const outcome = await queueStaleChildren(db, rows, NOW);
 
-    expect(outcome).toEqual({ queued: [keys[3]], waiting: [], exhausted: [keys[3]] });
+    expect(outcome).toEqual({
+      queued: [keys[3]],
+      waiting: [],
+      exhausted: [keys[3]],
+      abandoned: [],
+    });
     expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[3])]);
+  });
+
+  it('stops reviving a child that has used up its run cap', async () => {
+    /*
+     * The bound on the revival above. `enqueue` resets the *job*'s `attempts` on every revival, so
+     * a dead child restarts a fresh five-attempt ladder each time a viewport poll drains the
+     * parent — for as long as anyone leaves that map open. The tile's own `attempts` is the only
+     * counter that survives, and this is where it stops the loop.
+     */
+    const rows = siblings([
+      {},
+      {},
+      {},
+      { status: TileStatus.failed, fetchedAt: null, attempts: SPLIT_CHILD_ATTEMPT_CAP },
+    ]);
+    const { db, recorded } = fakeDb(rows, { [jobKey(keys[3])]: JobStatus.dead });
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome).toEqual({
+      queued: [],
+      waiting: [],
+      exhausted: [],
+      abandoned: [keys[3]],
+    });
+    // Nothing queued is the whole point: an abandoned child is off the ladder for good.
+    expect(recorded.jobUpserts).toEqual([]);
+  });
+
+  it('revives a child one run short of the cap', async () => {
+    // The boundary from the other side, so the comparison cannot be `>` or the cap a constant off.
+    const rows = siblings([
+      {},
+      {},
+      {},
+      { status: TileStatus.failed, fetchedAt: null, attempts: SPLIT_CHILD_ATTEMPT_CAP - 1 },
+    ]);
+    const { db, recorded } = fakeDb(rows, { [jobKey(keys[3])]: JobStatus.dead });
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.abandoned).toEqual([]);
+    expect(outcome.exhausted).toEqual([keys[3]]);
+    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[3])]);
+  });
+
+  it('leaves the cap to dead children, not to one still working through its ladder', async () => {
+    // `attempts` past the cap is not by itself a reason to stop: a child whose job is `queued` is
+    // coming back on its own schedule, and the cap governs revival, not the queue.
+    const rows = siblings([
+      {},
+      {},
+      {},
+      { status: TileStatus.failed, fetchedAt: null, attempts: SPLIT_CHILD_ATTEMPT_CAP + 5 },
+    ]);
+    const { db, recorded } = fakeDb(rows, { [jobKey(keys[3])]: JobStatus.queued });
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.waiting).toEqual([keys[3]]);
+    expect(outcome.abandoned).toEqual([]);
+    expect(recorded.jobUpserts).toEqual([]);
   });
 });
 

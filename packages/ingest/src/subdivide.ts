@@ -56,6 +56,16 @@ export const TILE_SPLIT_MARKER = 'switchback-ingest-tile-split';
 export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
 
 /**
+ * Runs of a single child tile after which `queueStaleChildren` stops reviving it.
+ *
+ * Two full retry ladders. `IngestTile.attempts` is the counter because it is the only durable
+ * one: `processTile` increments it on every run and nothing resets it, while `enqueue` clears the
+ * *job*'s `attempts` on each revival — which is precisely how a revived child restarts its
+ * five-attempt ladder from zero and why an uncapped revival never terminates.
+ */
+export const SPLIT_CHILD_ATTEMPT_CAP = 10;
+
+/**
  * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision, and
  * that is what an absent or unusable variable returns — it has to be switched on deliberately,
  * which is also what makes deleting the setting a rollback. `infra/azure/ingest.bicep` declares it
@@ -89,6 +99,8 @@ export interface ChildTile {
   fetchedAt: Date | null;
   trailCount: number;
   fetchMs: number | null;
+  /** Runs of this tile, ever. The revival cap counts in these — see `SPLIT_CHILD_ATTEMPT_CAP`. */
+  attempts: number;
 }
 
 /** What a parent row becomes once every child is in. */
@@ -135,6 +147,7 @@ const childSelect = {
   fetchedAt: true,
   trailCount: true,
   fetchMs: true,
+  attempts: true,
 } as const;
 
 /**
@@ -170,11 +183,23 @@ export type TileSnapshot = { status: TileStatus; fetchedAt: Date | null } | null
  * says what the tile was.** `processTile` writes `running` before it fetches, so a re-read here
  * sees `running` for every caller and the preservation above is dead code — which is exactly what
  * it was until this parameter existed. The caller holds the only honest answer.
+ *
+ * `lostNote` rides *behind* the split marker, never in front of it: `reconcileOrphanedSplits` and
+ * `countOrphanedSplits` both match the marker as a prefix, so anything prepended would hide the
+ * parent from its own repair sweep.
  */
 export async function splitTile(
   db: PrismaClient,
   quadkey: string,
-  options: { previous: TileSnapshot; fetchMs?: number; priority?: number },
+  options: {
+    previous: TileSnapshot;
+    fetchMs?: number;
+    priority?: number;
+    /** Trails this tile owed and does not have, appended to `lastError` after the marker. */
+    lostNote?: string;
+    /** Trails the splitting run did commit, so the parent is not read as holding nothing. */
+    trailCount?: number;
+  },
 ): Promise<string[]> {
   const children = childQuadkeys(quadkey);
   const priority = options.priority ?? SPLIT_PRIORITY;
@@ -198,13 +223,15 @@ export async function splitTile(
 
   const servesData =
     previous !== null && isTileSettled(previous.status) && previous.fetchedAt !== null;
+  const marker = `${SPLIT_MARKER_PREFIX}${children.length} tiles at z${quadkey.length + 1}`;
 
   await db.ingestTile.update({
     where: { quadkey },
     data: {
       status: servesData ? previous.status : TileStatus.pending,
-      lastError: `${SPLIT_MARKER_PREFIX}${children.length} tiles at z${quadkey.length + 1}`,
+      lastError: `${marker}${options.lostNote ?? ''}`.slice(0, 1000),
       ...(options.fetchMs === undefined ? {} : { fetchMs: options.fetchMs }),
+      ...(options.trailCount === undefined ? {} : { trailCount: options.trailCount }),
     },
   });
 
@@ -223,6 +250,12 @@ export interface ChildQueueOutcome {
    * ground, not about the schedule, and a sixth is unlikely to go differently.
    */
   exhausted: string[];
+  /**
+   * Children past `SPLIT_CHILD_ATTEMPT_CAP`, left off the queue. Disjoint from `queued`: this is
+   * the set no automatic path will run again, and the parent stays incomplete until an operator
+   * intervenes.
+   */
+  abandoned: string[];
 }
 
 /**
@@ -234,10 +267,17 @@ export interface ChildQueueOutcome {
  * coming back, on every viewport poll. `failJob` writes `queued` with a future `runAfter` while
  * attempts remain and `dead` only when they are gone, which is the distinction this reads.
  *
- * **A `dead` child is revived, deliberately.** It is the only path back: `splitTile` enqueues each
- * child exactly once, `ensureCoverage` covers z9 alone, and `reclaimExpiredJobs` does not touch a
- * dead row. Before subdivision a viewport poll revived a dead z9 the same way, so this restores
- * the recovery the split had removed rather than inventing one.
+ * **A `dead` child is revived, deliberately, but only up to `SPLIT_CHILD_ATTEMPT_CAP` runs.** The
+ * revival is the only path back: `splitTile` enqueues each child exactly once, `ensureCoverage`
+ * covers z9 alone, and `reclaimExpiredJobs` does not touch a dead row. The cap is what keeps that
+ * from running forever — a revived child starts a fresh five-attempt ladder, so without a counter
+ * the ladder restarts for as long as anyone leaves a map open over the parent. `attempts` on the
+ * *tile* survives the revival where the job's does not.
+ *
+ * Past the cap the parent is **held, not promoted**: `rollUp` needs all four children settled, so
+ * an abandoned child leaves the parent short rather than letting it report an area complete with a
+ * quarter of it missing. `rollUpSplitTile` names the abandoned children on the parent's row and in
+ * `SUBTREE_STUCK_MARKER`, and `unsplitTile` is the way back.
  */
 export async function queueStaleChildren(
   db: PrismaClient,
@@ -246,7 +286,7 @@ export async function queueStaleChildren(
   priority = SPLIT_PRIORITY,
 ): Promise<ChildQueueOutcome> {
   const outstanding = children.filter((child) => !isTileFresh(child, now));
-  if (outstanding.length === 0) return { queued: [], waiting: [], exhausted: [] };
+  if (outstanding.length === 0) return { queued: [], waiting: [], exhausted: [], abandoned: [] };
 
   const jobs = await db.ingestJob.findMany({
     where: { dedupeKey: { in: outstanding.map((child) => tileJobKey(child.quadkey)) } },
@@ -254,7 +294,7 @@ export async function queueStaleChildren(
   });
   const jobStatus = new Map(jobs.map((job) => [job.dedupeKey, job.status]));
 
-  const outcome: ChildQueueOutcome = { queued: [], waiting: [], exhausted: [] };
+  const outcome: ChildQueueOutcome = { queued: [], waiting: [], exhausted: [], abandoned: [] };
 
   for (const child of outstanding) {
     const status = jobStatus.get(tileJobKey(child.quadkey)) ?? null;
@@ -263,7 +303,14 @@ export async function queueStaleChildren(
       continue;
     }
 
-    if (status === JobStatus.dead) outcome.exhausted.push(child.quadkey);
+    if (status === JobStatus.dead) {
+      if (child.attempts >= SPLIT_CHILD_ATTEMPT_CAP) {
+        outcome.abandoned.push(child.quadkey);
+        continue;
+      }
+      outcome.exhausted.push(child.quadkey);
+    }
+
     await enqueue(db, {
       kind: JobKind.ingest_tile,
       dedupeKey: tileJobKey(child.quadkey),

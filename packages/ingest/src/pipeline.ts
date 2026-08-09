@@ -68,6 +68,7 @@ import {
 import type { ClaimPolicy, TrailIdentityMode } from './identity';
 import {
   CHILDREN_PER_TILE,
+  SPLIT_CHILD_ATTEMPT_CAP,
   SUBTREE_STUCK_MARKER,
   TILE_SPLIT_MARKER,
   canSubdivide,
@@ -453,7 +454,19 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     const alsoLost = lost.length > 0 ? ` — ${describeLost(quadkey, lost, assembled.length)}` : '';
 
     if (canSubdivide(tile.z, maxZoom)) {
-      const split = await splitTile(db, quadkey, { previous, fetchMs });
+      /*
+       * `splitTile`'s write is the last one this path makes to the parent, and it returns rather
+       * than throwing — so `failJob` never runs and an id that reaches only the log line reaches
+       * no row an operator can query. `trailCount` goes with it because a split parent that
+       * committed nothing reads as holding nothing, which puts it in `ensureCoverage`'s pending
+       * set and makes the client poll it every 2.5 s until the last child lands.
+       */
+      const split = await splitTile(db, quadkey, {
+        previous,
+        fetchMs,
+        lostNote: alsoLost,
+        trailCount: Math.max(committed, previous?.trailCount ?? 0),
+      });
       log(
         `${TILE_SPLIT_MARKER} ${quadkey}: ran out of clock with ${refused} trail(s) unattempted${alsoLost}`,
         {
@@ -564,6 +577,34 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
 }
 
 /**
+ * The parent's account of a subtree that is not moving, or null while every child still is.
+ *
+ * The marker leads the text because `queueHealth`'s `stuckSubtrees` gauge counts
+ * `ingest_tiles.lastError` containing it, and a message carrying the marker only in the log left
+ * that gauge reading zero over a wedged subtree.
+ */
+function describeStalledSubtree(
+  quadkey: string,
+  exhausted: readonly string[],
+  abandoned: readonly string[],
+): string | null {
+  const clauses: string[] = [];
+  // Named apart because they are different instructions: an exhausted child is back on the queue,
+  // an abandoned one is past the cap and no automatic path will touch it again.
+  if (abandoned.length > 0) {
+    clauses.push(`abandoned after ${SPLIT_CHILD_ATTEMPT_CAP} runs: ${abandoned.join(', ')}`);
+  }
+  if (exhausted.length > 0) {
+    clauses.push(`requeued after five failures: ${exhausted.join(', ')}`);
+  }
+  if (clauses.length === 0) return null;
+  return `${SUBTREE_STUCK_MARKER} ${quadkey}: blocked by descendant(s) — ${clauses.join('; ')}`.slice(
+    0,
+    1000,
+  );
+}
+
+/**
  * A tile that has been subdivided, revisited. It fetches nothing: the children own the ground
  * now, so all this does is put back whatever child has gone stale and promote the parent once
  * all four are in. Cheap by design — every viewport over a split tile lands here, because
@@ -581,13 +622,22 @@ async function rollUpSplitTile(
     lastError: string | null;
   },
 ): Promise<ProcessTileResult> {
-  const { queued, waiting, exhausted } = await queueStaleChildren(db, children, context.now);
+  const { queued, waiting, exhausted, abandoned } = await queueStaleChildren(
+    db,
+    children,
+    context.now,
+  );
   const promoted = await promoteFrom(db, quadkey);
   const settled = promoted.includes(quadkey);
 
   /*
-   * A descendant out of retries is the one state nothing else reports: `ingest-job-failed` names
-   * the leaf, and the z9 a reader is actually polling stays `pending` with nothing said about it.
+   * A descendant that is not moving is the one state nothing else reports: `ingest-job-failed`
+   * names the leaf, and the z9 a reader is actually polling stays `pending` with nothing said
+   * about it.
+   *
+   * A parent with an abandoned child is **held, not promoted and not failed**: `rollUp` needs all
+   * four children settled, so it will not report an area complete with a quarter of it missing,
+   * and the trails the parent did commit stay on the row. `unsplitTile` is the way back.
    *
    * Written once per transition, not once per drain. A blocked parent is `pending`, so
    * `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
@@ -596,11 +646,12 @@ async function rollUpSplitTile(
    * the edge, and it survives a restart where a module-level flag would not. Clearing it is
    * `promoteFrom`'s job, which nulls it the moment the roll-up lands.
    */
-  const stalled = `blocked by exhausted descendant(s): ${exhausted.join(', ')}`.slice(0, 1000);
-  if (exhausted.length > 0 && !settled && stalled !== context.lastError) {
-    context.log(`${SUBTREE_STUCK_MARKER} ${quadkey}: ${stalled} — requeued after five failures`, {
+  const stalled = describeStalledSubtree(quadkey, exhausted, abandoned);
+  if (stalled !== null && !settled && stalled !== context.lastError) {
+    context.log(stalled, {
       quadkey,
       exhausted,
+      abandoned,
       // Whether anything else is still moving is the difference between "wait" and "intervene".
       queued,
       waiting,
