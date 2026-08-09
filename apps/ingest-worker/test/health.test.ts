@@ -2,7 +2,12 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { QUEUE_DISTRESS_MARKER, QUEUE_HEALTH_MARKER } from '@switchback/ingest';
+import {
+  QUEUE_DISTRESS_MARKER,
+  QUEUE_HEALTH_MARKER,
+  TILE_SPLIT_MARKER,
+  TRAIL_LOST_MARKER,
+} from '@switchback/ingest';
 import type { QueueHealth } from '@switchback/ingest';
 import type { PrismaClient } from '@switchback/db';
 import { BUILD_COMMIT } from '../src/build';
@@ -144,6 +149,46 @@ describe('the alert that watches it', () => {
     expect(bicep).toContain(`traces | where message has "${QUEUE_HEALTH_MARKER}"`);
     expect(bicep).toContain(`name: 'switchback-ingest-worker-silent'`);
     expect(bicep).toMatch(/switchback-ingest-worker-silent'\n[\s\S]{0,900}?enabled: true/);
+  });
+});
+
+/**
+ * Each of these pins one half of "what makes it fire, and what makes it stop". They are asserted
+ * against the template text because nothing else can: the rule lives in Azure and the condition it
+ * watches lives in this repository, so a change to either side is silent to the other.
+ */
+describe('the rules that page a human', () => {
+  const bicep = readFileSync(resolve(here, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const drainQuery = bicep.split('\n').find((line) => line.includes('name == "ingestDrain"')) ?? '';
+
+  /*
+   * The split exit returns `pending` without throwing, so `failJob` never runs and no
+   * `ingest-job-failed` is written. Tile 023010230 took that exit on 2026-08-09 having lost 4 of
+   * 1519 trails, and this token was the only thing in the estate that marked it.
+   */
+  it('reads lost ground, which the split exit reports through no other token', () => {
+    expect(drainQuery).toContain(`message has "${TRAIL_LOST_MARKER}"`);
+  });
+
+  /* Subdivision is the designed answer to a dense tile. It outnumbered every real fault 9 to 7 in
+   * the 48 h to 2026-08-09T21:12Z, and a Sev2 on it is a Sev2 on healthy operation. */
+  it('does not page on subdivision', () => {
+    expect(drainQuery).not.toContain(TILE_SPLIT_MARKER);
+  });
+
+  /* 16 rate limits in 48 h, peaking at 4 in any rolling hour, is the ambient behaviour of a free
+   * public Overpass. The threshold has to sit above that and below one blocked tile's ~24. */
+  it('measures Overpass rate limiting as a rate, not a presence', () => {
+    const rule = bicep.slice(bicep.indexOf(`displayName: 'switchback-ingest-overpass-limited'`));
+    expect(rule).toMatch(/windowSize: 'PT1H'/);
+    expect(rule.slice(0, rule.indexOf('actions:'))).toMatch(/threshold: 8/);
+  });
+
+  /* `Maximum` latches on the window peak, so a queue nobody has drained reads breached for ever and
+   * `autoMitigate` is inert. `Minimum` returns to zero at the first evaluation after a drain. */
+  it('lets the dead-letter alert clear when the queue is drained', () => {
+    const rule = bicep.slice(bicep.indexOf(`name: 'switchback-ingest-deadletter'`));
+    expect(rule.slice(0, rule.indexOf('actions:'))).toContain(`timeAggregation: 'Minimum'`);
   });
 });
 

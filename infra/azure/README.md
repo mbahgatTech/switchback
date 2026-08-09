@@ -1032,20 +1032,20 @@ same operation as rotating the production password. `main.bicep` is not modified
 not redeployed by it. There is no lock resource here either: the group's existing `CanNotDelete` does
 not block creates.
 
-| Resource        | Value                                                                                  |
-| --------------- | -------------------------------------------------------------------------------------- |
-| Namespace       | `sb-switchback-prod-37ywppu5p7fri`, **Standard**, `disableLocalAuth: true` — no SAS    |
-| Queue           | `ingest-jobs`, `lockDuration PT5M`, `maxDeliveryCount 5`, TTL `PT1H`, no sessions      |
-| Publisher       | `id-switchback-vercel-publisher`, user-assigned, two Vercel federated credentials      |
-| Publisher creds | Vercel OIDC token exchanged for an Entra token — **no key anywhere**                   |
-| Worker          | `func-switchback-ingest-37ywppu5p7fri`, Linux Consumption (Y1), Node 22                |
-| Worker creds    | System-assigned identity, **Data Sender + Data Receiver scoped to the queue**          |
-| Storage         | `stsbingest37ywppu5p7fri`, `allowSharedKeyAccess: false` — the keys authorise nothing  |
-| Host storage    | `AzureWebJobsStorage__*` over the worker's identity; no Azure Files content share      |
-| Plan            | `plan-switchback-ingest`, Y1 Dynamic, `functionAppScaleLimit: 1`                       |
-| Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`      |
-| Alert           | `switchback-ingest-deadletter`, `DeadletteredMessages > 0` → `ag-switchback-prod`      |
-| Cost            | ~$10/month Standard namespace; Consumption and the storage account are inside the free |
+| Resource        | Value                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------- |
+| Namespace       | `sb-switchback-prod-37ywppu5p7fri`, **Standard**, `disableLocalAuth: true` — no SAS         |
+| Queue           | `ingest-jobs`, `lockDuration PT5M`, `maxDeliveryCount 5`, TTL `PT1H`, no sessions           |
+| Publisher       | `id-switchback-vercel-publisher`, user-assigned, two Vercel federated credentials           |
+| Publisher creds | Vercel OIDC token exchanged for an Entra token — **no key anywhere**                        |
+| Worker          | `func-switchback-ingest-37ywppu5p7fri`, Linux Consumption (Y1), Node 22                     |
+| Worker creds    | System-assigned identity, **Data Sender + Data Receiver scoped to the queue**               |
+| Storage         | `stsbingest37ywppu5p7fri`, `allowSharedKeyAccess: false` — the keys authorise nothing       |
+| Host storage    | `AzureWebJobsStorage__*` over the worker's identity; no Azure Files content share           |
+| Plan            | `plan-switchback-ingest`, Y1 Dynamic, `functionAppScaleLimit: 1`                            |
+| Telemetry       | `appi-switchback-ingest`, workspace-based onto the existing `log-switchback-prod`           |
+| Alert           | Seven rules onto `ag-switchback-prod` — see [What each alert means](#what-each-alert-means) |
+| Cost            | ~$10/month Standard namespace; Consumption and the storage account are inside the free      |
 
 The storage row is checkable in two commands, and the pair is what proves key auth is refused
 rather than merely unconfigured:
@@ -1056,6 +1056,86 @@ az storage blob list --account-name stsbingest37ywppu5p7fri --container-name fun
 az storage blob list --account-name stsbingest37ywppu5p7fri --container-name function-releases \
   --auth-mode login -o json   # the package blob                                                            (exit 0)
 ```
+
+### What each alert means
+
+Every rule here is meant to satisfy one test: it fires only when a human should do something, and it
+stops firing when they no longer should. Counts are breaching fifteen-minute evaluation windows over
+the 48 h to 2026-08-09T21:12Z, measured against `AppTraces`/`AppRequests` in
+`log-switchback-prod`.
+
+| Rule                                 | Sev | Fires when                                                                      | Clears when                           | 48 h |
+| ------------------------------------ | --- | ------------------------------------------------------------------------------- | ------------------------------------- | ---- |
+| `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                          | A heartbeat lands                     | 34   |
+| `switchback-db-token-alarm`          | 1   | A Vercel token renewal failed, or a token is nearly expired                     | The 15-min window comes back empty    | 1    |
+| `switchback-ingest-drain-failed`     | 2   | Any job buried, ground uncommitted, lease expired, subtree stuck, pump rejected | An operator closes it                 | 6    |
+| `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                     | The trailing hour drops to 8 or fewer | 0    |
+| `switchback-ingest-deadletter`       | 2   | Dead-letter queue non-empty for a full 15 min                                   | The queue is drained                  | 0    |
+| `switchback-ingest-queue-distress`   | 3   | Any distress gauge non-zero                                                     | Every gauge returns to zero           | 61   |
+| `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                      | The window falls back to 4 or fewer   | 0    |
+
+**The live estate is behind this template, and the table describes the template.** Read from Azure on
+2026-08-09 the resource group holds four scheduled query rules — `drain-failed`, `queue-distress`,
+`worker-silent`, `overpass-limited` — plus three metric alerts. `overpass-skipped` and
+`switchback-db-token-alarm` are declared here and have never been deployed, and the deployed
+`drain-failed` carries six arms against the nine the template now declares. Nothing in this section
+is live until `ingest.bicep` is deployed; check with
+`az monitor scheduled-query list -g rg-switchback-prod-northcentralus -o json` before trusting it.
+`switchback-db-token-alarm`'s single window is the deliberate probe
+`scripts/alarm-channel-probe.ts` emitted at 2026-08-09T20:56Z and 20:59Z, not a real renewal
+failure.
+
+**`switchback-postgres-connections` is Sev1 at a threshold nothing derived.** It fires on
+`active_connections > 300` averaged over 15 minutes. The server's `max_connections` is 429, so 300 is
+70% of the server ceiling — but the application's own bound is `BACKGROUND_POOL_SIZE = 10` per
+client, and the measured peak over the same 48 h was 24 against a mean of 16. A leak would have to
+reach twelve times normal before anything said so, and it is Sev1 when it finally does. Deriving that
+threshold from the pool count rather than the server ceiling is a change to `postgres.bicep`, which
+this work does not deploy — see [Read this first](#read-this-first) — so it is recorded here rather
+than half-changed into a template nobody can apply.
+
+**`worker-silent` is the one that matters most, and it is the one the others drown.** Every other
+rule is armed by something the worker emits, so a host that is down, wedged, or serving a build
+without `health.ts` reads as a healthy estate to all of them. It fired for a 524-minute heartbeat
+gap from 2026-08-08T23:04Z. Act on this before anything else in the table: check the Function App is
+Running and that the heartbeat's `build=` matches `origin/master`.
+
+**`drain-failed` does not fire on subdivision.** A split is the designed answer to a dense tile — 9
+in the measured window against 7 events across every real fault. It is visible without a page: the
+parent is left `pending` with its children recorded, so `ensureCoverage` still counts it
+outstanding, and a split that fails to produce children is `orphanedSplits` on `queue-distress`. What
+does page is `switchback-ingest-trail-lost`, which marks ground a tile fetched and could not commit —
+including on the split exit, where nothing throws and no `ingest-job-failed` is written.
+
+**`overpass-limited` measures a rate.** 16 rate limits in 48 h is the ambient behaviour of a free
+public instance, peaking at 4 in any rolling hour; the client retries and rotates three endpoints and
+none of the 16 cost a tile its ground. The threshold sits at 8/hour, above that ceiling and below the
+~24 refusals one tile produces against a blocked IP. When it fires, the question is whether to back
+off, not whether to restart anything.
+
+**`deadletter` reads `Minimum`, not `Maximum`.** The metric is queue depth and nothing drains it, so
+`Maximum` latches on the window peak and the rule can never clear whatever an operator does.
+`Minimum` above zero means the queue stayed non-empty for the whole window, and it returns to zero at
+the first evaluation after a drain. Draining is [A message dead-lettered](#a-message-dead-lettered).
+
+**`queue-distress` is the noisiest rule in the set and is worth a look.** Its 61 windows are almost
+entirely one gauge: `staleLeases` sat at 3 for the 8.5 h from 2026-08-08T07:42Z. It is Sev3 and it
+does auto-mitigate — it went quiet at 22:20Z — so it is not paging anyone at night, but a gauge that
+holds a constant for hours is reporting a condition nobody is clearing rather than an event.
+
+The rules query `traces` and `requests`, not `AppTraces`/`AppRequests`, and that is correct: they are
+scoped to the `appi-switchback-ingest` component, where the classic aliases are the only ones that
+resolve. Both directions are checkable —
+
+```bash
+az monitor app-insights query --app appi-switchback-ingest -g rg-switchback-prod-northcentralus \
+  --offset 48h --analytics-query "traces | summarize n=count()"      # 32007  (exit 0)
+az monitor log-analytics query -w c188de03-100d-4608-9502-65e12323d986 \
+  --analytics-query "AppTraces | where TimeGenerated>ago(48h) | summarize n=count()"   # 32007  (exit 0)
+```
+
+`AppTraces` against the component and `traces` against the workspace both fail with
+`BadArgumentError`, so neither alias is silently returning an empty set.
 
 ### The Overpass clamp — the thing to check in review
 
