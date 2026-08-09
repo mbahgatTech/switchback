@@ -7,20 +7,42 @@ import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 
 /**
+ * The host's kill deadline, mirrored from `apps/ingest-worker/host.json` `functionTimeout`.
+ * `apps/ingest-worker/test/broker-lease.test.ts` reads that file and fails if the two disagree.
+ */
+export const HOST_FUNCTION_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Margin above the host's kill deadline, covering clock skew between the app and Postgres and the
+ * bookkeeping after the last phase.
+ */
+export const LEASE_MARGIN_MS = 2 * 60 * 1000;
+
+/**
  * How long a claim holds a job before `reclaimExpiredJobs` may take it back.
  *
- * **It is bounded by the host, not by the work.** One process claims: the Function App's
- * `ingestDrain`, whose `host.json` sets `functionTimeout` to ten minutes and whose handler stops
- * beginning phases at `INGEST_DEADLINE_MS`. So no live lease can be older than ten minutes, and a
- * lease that is has provably lost its holder — the host killed the process.
+ * **Bounded by the host, not by the work, and not by the broker.** One process claims — the
+ * Function App's `ingestDrain` — so a lease older than `functionTimeout` has provably lost its
+ * holder. Deriving it from that constant is what stops the two drifting apart: raising
+ * `functionTimeout` without raising this would let a reclaim fire under a handler still working,
+ * and a second process would then commit the same trails alongside it.
  *
- * Two minutes of margin above that covers clock skew between the app and Postgres and the
- * bookkeeping after the last phase. Thirty minutes was sized for a Vercel drainer that could hold
- * a lease across a whole `processRoute`; with that path removed, thirty minutes is twenty of
- * pure delay before a killed invocation's tile can be picked up again — which is most of what
- * "the work was dropped on the floor" measured as.
+ * **A redelivery cannot be relied on to find this expired, and no value of it would change that.**
+ * The broker's redelivery gap starts at `lockDuration` — auto-renewal stops the instant the process
+ * dies, and an eviction can kill it before the first renewal — while this must exceed
+ * `functionTimeout` to be safe under a live handler. `lockDuration` (300 s) is below
+ * `functionTimeout` (600 s), so the two requirements have no common value. Measured over
+ * 2026-08-08's six redeliveries, the gaps were 299.9, 300.0, 455.0, 592.8, 708.1 and 1012.7 s:
+ * five of the six arrived while the lease was still live, and the two at the floor came back at
+ * exactly `lockDuration`.
+ *
+ * So the redelivery is not the repair. `ingestPump` is: it reclaims on a two-minute tick and
+ * republishes the row, whatever any delivery decided. `broker-lease.test.ts` asserts the whole
+ * chain, including the one relation that makes the republish durable — the broker's duplicate
+ * detection window has to be *shorter* than this, or the pump's republish is discarded as a
+ * duplicate of the message that was already completed and the work is lost with nothing logged.
  */
-export const LEASE_TIMEOUT_MS = 12 * 60 * 1000;
+export const LEASE_TIMEOUT_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS;
 
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -293,10 +315,10 @@ export interface ReclaimedLease {
  * of firing on it. What it does leave behind is a `running` row nothing will renew, and the
  * reaper below is the process that discovers it.
  *
- * The token belongs here rather than on the redelivery that finds the tile busy. By the time a
- * redelivered message is classified, this reclaim has already run ahead of the claim and returned
- * the row to `queued` — so the redelivery sees a healthy queue and has nothing to report. The
- * reaper is the only participant that observes the death itself.
+ * The token belongs here rather than on the redelivery that finds the tile busy. A redelivery
+ * mostly arrives while the lease is still live — measured 2026-08-08, five of six did — so it sees
+ * a `running` row it cannot distinguish from healthy work and has nothing to report. The reaper is
+ * the only participant that observes the death itself, whenever it happens to run.
  */
 export const LEASE_EXPIRED_MARKER = 'switchback-ingest-lease-expired';
 

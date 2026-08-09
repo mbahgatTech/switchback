@@ -288,27 +288,33 @@ The two settings that carry an argument:
 
 `lockDuration: PT5M` is the service maximum, and what matters about it is how it composes with the
 handler's clock and the database lease. `host.json` kills the handler at `functionTimeout`
-(`00:10:00`) and `LEASE_TIMEOUT_MS` (packages/ingest/src/jobs.ts) is twelve minutes, which puts
-both bounds the right way round:
-
-  functionTimeout (600 s) < LEASE_TIMEOUT_MS (720 s) <= functionTimeout + lockDuration (900 s)
+(`00:10:00`) and `LEASE_TIMEOUT_MS` (packages/ingest/src/jobs.ts) derives twelve minutes from it.
 
 The **lower** bound stops a live handler's lease expiring underneath it while it is still working —
-another process would claim the tile and the two would commit the same trails twice.
+another process would claim the tile and the two would commit the same trails twice:
 
-The **upper** bound is what repairs a killed handler. Auto-renewal stops the moment the process
-dies, so the message returns somewhere inside the five minutes after the kill; the lease expires at
-720 s, no later than the end of that window. A redelivery arriving after it finds an expired lease,
-`reclaimExpiredJobs` returns the row to `queued` ahead of the claim, and the work is re-run rather
-than short-circuited. A redelivery arriving *before* it still sees `running` and completes — that
-one is caught by `ingestPump`, whose two-minute reclaim frees the lease and republishes the row.
-Both paths re-run the work; neither drops it.
+  lockDuration (300 s) < functionTimeout (600 s) < LEASE_TIMEOUT_MS (720 s)
 
-All three numbers live in different files, and any one of them moving alone breaks the chain, so
-`apps/ingest-worker/test/drain.test.ts` reads `lockDuration` from this template and `functionTimeout`
-from `host.json` and asserts the inequality. Lowering `lockDuration` to `PT1M` is the plausible
-tuning that would break it, and it is the one that reinstates the measured failure: the message
-would come back at 660 s against a lease still live until 720 s, every time.
+**There is no upper bound that makes a redelivery the repair, and that is a property of the
+service, not a tuning mistake.** Auto-renewal stops the instant the process dies, and an eviction
+can kill it before the first renewal, so the redelivery gap starts at one whole `lockDuration` —
+not at `functionTimeout + lockDuration`. Measured over 2026-08-08's six redeliveries: 299.9, 300.0,
+455.0, 592.8, 708.1 and 1012.7 s. Five of the six arrived while the lease was still live, and the
+two at the floor came back at exactly `lockDuration`. For a redelivery to always find an expired
+lease the lease would have to be shorter than `lockDuration`; to be safe under a live handler it
+must be longer than `functionTimeout`. Since `PT5M` is the service maximum and `functionTimeout` is
+ten minutes, no value satisfies both.
+
+So the repair is `ingestPump`, not the broker. It reclaims expired leases and republishes the row
+on a two-minute tick off its own timer, whatever any delivery decided, which bounds recovery at
+`LEASE_TIMEOUT_MS` plus one tick. The relation that makes *that* durable is the dedupe window
+below: it has to be shorter than the lease, or the pump's republish is discarded as a duplicate of
+the message a redelivery already completed, and the tile is lost with nothing logged.
+
+All of these numbers live in different files, so `apps/ingest-worker/test/drain.test.ts` reads
+`lockDuration`, `duplicateDetectionHistoryTimeWindow` and `defaultMessageTimeToLive` from this
+template, `functionTimeout` and `maxAutoLockRenewalDuration` from `host.json`, and the pump's
+schedule from its own source, and asserts the whole chain.
 
 `maxAutoLockRenewalDuration` in `host.json` is `00:30:00`, well past `functionTimeout`, so a running
 handler never loses its lock to renewal expiry.
@@ -320,8 +326,9 @@ catches per job and routes to `failJob`, and retry semantics for the work itself
 expired messages would fill the DLQ with stale wake-up signals and hide the one thing it should mean.
 
 `defaultMessageTimeToLive: PT1H` against a 14-day default: a signal older than an hour is worthless
-because the pump re-derives the truth every two minutes. The dedupe window is 10 minutes, comfortably
-above the pump interval plus the worst-case dwell of a queue held at most eight deep.
+because the pump re-derives the truth every two minutes. The dedupe window is 10 minutes, above the
+pump interval plus the worst-case dwell of a queue held at most eight deep, and below the lease for
+the reason above.
 ''')
 resource queue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   parent: namespace
@@ -465,15 +472,27 @@ Because of the queue policy above this fires for exactly one condition — a mes
 to process five times, which in this design means it could not reach Postgres. That is an operator
 signal, not noise, so the threshold is zero and the severity is 2.
 
-`Maximum` rather than `Average`: `DeadletteredMessages` is a gauge of current DLQ depth, and averaging
-a gauge over fifteen minutes can hide a single message that arrived late in the window.
+**`autoMitigate` is off, and that is forced by the metric.** `DeadletteredMessages` is the *depth*
+of the dead-letter queue, and nothing drains it: a dead-lettered message sits there until a person
+removes it. So the gauge never returns to zero on its own, and an auto-mitigating rule on it would
+either stay fired forever or — worse, on `Maximum` over a rolling window — resolve and re-fire on
+every evaluation while the depth was unchanged. Edge-triggered is the honest reading: the alert
+means "a message was dead-lettered", the operator drains the queue, and closing the alert is part
+of that work rather than something the platform guesses at.
+
+`Total` rather than `Maximum` or `Average` for the same reason. On a gauge that only rises, all
+three fire on the first message; what distinguishes them is what happens afterwards, and summing
+the window keeps a second dead letter visible in the alert payload rather than hidden behind an
+unchanged maximum.
+
+Draining it is `infra/azure/README.md`, "A message dead-lettered".
 ''')
 resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: 'switchback-ingest-deadletter'
   location: 'global'
   tags: tags
   properties: {
-    description: 'A message on ingest-jobs was dead-lettered: the worker could not process it in ${queue.properties.maxDeliveryCount} deliveries.'
+    description: 'A message on ingest-jobs was dead-lettered: the worker could not process it in ${queue.properties.maxDeliveryCount} deliveries. Nothing drains the dead-letter queue, so this stays open until an operator does.'
     severity: 2
     enabled: true
     scopes: [
@@ -499,12 +518,12 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
           ]
           operator: 'GreaterThan'
           threshold: 0
-          timeAggregation: 'Maximum'
+          timeAggregation: 'Total'
           criterionType: 'StaticThresholdCriterion'
         }
       ]
     }
-    autoMitigate: true
+    autoMitigate: false
     actions: [
       {
         actionGroupId: actionGroup.id
@@ -963,7 +982,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Wall clock held back for the commit loop. Without it the two Overpass queries could
           // consume the whole handler budget, every trail threw `IngestDeadlineError`, and the
           // tile subdivided into four children that repeated the exercise — measured 2026-08-08 as
-          // five invocations of 504,637 ms to 548,954 ms against a 540,000 ms bound.
+          // six invocations running 540,111 ms to 548,954 ms past a 540,000 ms bound.
           {
             name: 'INGEST_COMMIT_RESERVE_MS'
             value: '150000'
@@ -1233,7 +1252,7 @@ incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC: `Functions.
 invocation ids — the query returns zero.
 
 A slow handler that *does* return is a separate fault the first arm also misses, for the opposite
-reason: five other invocations ran 504,637 ms to 548,954 ms against the 540,000 ms bound and every
+reason: six other invocations ran 540,111 ms to 548,954 ms past the 540,000 ms bound and every
 one recorded `Success=True`. Overrunning is not failing, as far as the host is concerned.
 
 The three deployed arms are **not** silent over that window — run verbatim they return five

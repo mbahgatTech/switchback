@@ -9,7 +9,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import {
   LEASE_EXPIRED_MARKER,
+  LEASE_MARGIN_MS,
   LEASE_TIMEOUT_MS,
+  HOST_FUNCTION_TIMEOUT_MS,
   OVERPASS_MAX_CONCURRENT,
   OVERPASS_MAX_TOTAL_MS,
   OVERPASS_STRAIN_MARKER,
@@ -403,11 +405,13 @@ describe('the drain-failure alert, from the template', () => {
 });
 
 /**
- * The three numbers that decide whether a killed handler's work is re-run or silently dropped.
- * They live in three separate files, so nothing but this test stops one of them moving alone.
+ * The numbers that decide whether a killed handler's work is re-run or silently dropped. They live
+ * in four separate files — `host.json`, `ingest.bicep`, `jobs.ts`, `functions/pump.ts` — so nothing
+ * but this test stops one of them moving alone.
  */
 describe('the lease, the lock and the host clock', () => {
   const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const pump = readFileSync(resolve(__dirname, '../src/functions/pump.ts'), 'utf8');
   const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
     functionTimeout: string;
     extensions: { serviceBus: { maxAutoLockRenewalDuration: string } };
@@ -418,41 +422,99 @@ describe('the lease, the lock and the host clock', () => {
     return (hours * 3600 + minutes * 60 + seconds) * 1000;
   }
 
-  /** `PT5M`, `PT30S`, `PT1M30S` — the ISO-8601 durations ARM accepts for a queue lock. */
+  /** `PT5M`, `PT30S`, `PT1H` — the ISO-8601 durations ARM accepts for a queue. */
   function durationToMs(value: string): number {
-    const found = /^PT(?:(\d+)M)?(?:(\d+)S)?$/.exec(value);
-    if (!found) throw new Error(`lockDuration ${value} is not a duration this test understands`);
-    return (Number(found[1] ?? 0) * 60 + Number(found[2] ?? 0)) * 1000;
+    const found = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(value);
+    if (!found) throw new Error(`${value} is not a duration this test understands`);
+    const [, hours, minutes, seconds] = found;
+    return (Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0)) * 1000;
   }
 
-  const lock = /lockDuration: '([^']+)'/.exec(bicep)?.[1];
-  if (!lock) throw new Error('lockDuration is not set in infra/azure/ingest.bicep');
+  function queueSetting(name: string): string {
+    const found = new RegExp(`${name}: '([^']+)'`).exec(bicep)?.[1];
+    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
+    return found;
+  }
 
   const functionTimeoutMs = clockToMs(host.functionTimeout);
-  const lockDurationMs = durationToMs(lock);
+  const lockDurationMs = durationToMs(queueSetting('lockDuration'));
+  const dedupeWindowMs = durationToMs(queueSetting('duplicateDetectionHistoryTimeWindow'));
+
+  /** The pump's own tick, which is what bounds recovery once the lease has expired. */
+  const pumpPeriodMs = (() => {
+    const schedule = /schedule: '0 \*\/(\d+) \* \* \* \*'/.exec(pump)?.[1];
+    if (!schedule) throw new Error('ingestPump schedule is not a whole number of minutes');
+    return Number(schedule) * 60_000;
+  })();
+
+  it('mirrors the host timeout the lease is derived from', () => {
+    // `LEASE_TIMEOUT_MS` is `HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS`, and the first of those is
+    // a copy of a value that lives in host.json. This is what stops the copy going stale.
+    expect(HOST_FUNCTION_TIMEOUT_MS).toBe(functionTimeoutMs);
+    expect(LEASE_TIMEOUT_MS).toBe(functionTimeoutMs + LEASE_MARGIN_MS);
+  });
+
+  it('stops the handler before the host kills it', () => {
+    // Past `HANDLER_DEADLINE_MS` no phase begins, which leaves the host's remaining budget for
+    // whichever phase was already running plus the bookkeeping that writes the outcome.
+    expect(HANDLER_DEADLINE_MS).toBeLessThan(functionTimeoutMs);
+  });
 
   it('keeps a live handler from losing its lease while it is still working', () => {
     /*
-     * The lower bound. If the lease could expire under a running handler, another process would
-     * reclaim the row and claim the tile, and both would commit the same trails.
+     * If the lease could expire under a running handler, another process would reclaim the row and
+     * claim the tile, and both would commit the same trails.
      */
     expect(functionTimeoutMs).toBeLessThan(LEASE_TIMEOUT_MS);
-  });
-
-  it('guarantees a redelivered message can find the lease expired, so the work is re-run', () => {
-    /*
-     * The upper bound, and the one that repairs the silent drop. Auto-renewal stops when the host
-     * kills the process, so the message returns at most `lockDuration` after the kill. If the
-     * lease outlived that window every redelivery would land on a live lease, claim nothing and
-     * complete. Lowering `lockDuration` to PT1M is the plausible tuning that reinstates the
-     * failure, and this is what refuses it.
-     */
-    expect(LEASE_TIMEOUT_MS).toBeLessThanOrEqual(functionTimeoutMs + lockDurationMs);
   });
 
   it('renews a running handler lock well past the moment the host would kill it', () => {
     const renewalMs = clockToMs(host.extensions.serviceBus.maxAutoLockRenewalDuration);
     expect(renewalMs).toBeGreaterThan(functionTimeoutMs);
+  });
+
+  it('records that a redelivery cannot be the repair, because no lease value would make it one', () => {
+    /*
+     * The redelivery gap starts at `lockDuration`: auto-renewal stops the instant the process dies,
+     * and an eviction can kill it before the first renewal, so the message can return one whole
+     * `lockDuration` after delivery and no later bound applies. Measured over 2026-08-08's six
+     * redeliveries the gaps were 299.9, 300.0, 455.0, 592.8, 708.1 and 1012.7 s — the two at the
+     * floor are exactly `lockDuration`, and five of the six landed while the lease was still live.
+     *
+     * For a redelivery to always find an expired lease the lease would have to be shorter than
+     * `lockDuration`; to be safe under a live handler it must be longer than `functionTimeout`.
+     * This asserts those two requirements really do conflict, so the fix is never to retune the
+     * lease — it is `ingestPump`, below.
+     */
+    expect(lockDurationMs).toBeLessThan(functionTimeoutMs);
+    expect(lockDurationMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('leaves the pump able to republish before the broker would call it a duplicate', () => {
+    /*
+     * **The relation the durability of a dropped message actually rests on.** A redelivery that
+     * finds a live-looking lease completes the message, so the only thing left that will re-run the
+     * work is the pump: it reclaims at `LEASE_TIMEOUT_MS` and republishes the row on its next tick.
+     * The queue has duplicate detection on, keyed on `messageId = dedupeKey` and measured from the
+     * original enqueue — so if that window outlived the lease, the pump's republish would be
+     * discarded as a duplicate of the message that was already completed, and the tile would be
+     * lost with nothing logged anywhere.
+     *
+     * Raising `duplicateDetectionHistoryTimeWindow` to PT15M is the plausible tuning that would do
+     * it, and this is what refuses it.
+     */
+    expect(dedupeWindowMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('bounds how long a killed handler s work waits before it is republished', () => {
+    /*
+     * Worst case from the kill to a new message: the lease has to expire, then the pump has to
+     * tick. Both are bounded, which is what makes "durably re-scheduled" a fact about the estate
+     * rather than a hope about the broker. Kept under the message time-to-live so the republished
+     * signal is a fresh message rather than one the broker would drop on arrival.
+     */
+    const recoveryMs = LEASE_TIMEOUT_MS + pumpPeriodMs;
+    expect(recoveryMs).toBeLessThan(durationToMs(queueSetting('defaultMessageTimeToLive')));
   });
 });
 

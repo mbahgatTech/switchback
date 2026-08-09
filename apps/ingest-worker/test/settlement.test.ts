@@ -72,17 +72,22 @@ describe('what a delivery may tell the broker', () => {
 
   it('completes when something else will pick the work up', () => {
     const now = Date.now();
-    // Queued is the pump's to republish; a live lease belongs to an invocation still working.
+    // Both are the pump's to republish: a `queued` row directly, and a dated lease once the reaper
+    // has taken it back. Neither depends on the lease's holder still being alive — measured
+    // 2026-08-08, five of six redeliveries arrived while a dead holder's lease still looked live.
     expect(classifyDisposition({ status: JobStatus.queued, lockedAt: null }, now)).toBe(
       'rescheduled',
     );
     expect(classifyDisposition(held(LEASE_TIMEOUT_MS - 1_000), now)).toBe('rescheduled');
   });
 
-  it('refuses to complete a job held by a lease that has expired', () => {
+  it('refuses to complete a job the reaper should already have freed', () => {
     const now = Date.now();
+    // A lease past its timeout that is still `running` means the sweep did not run or threw —
+    // `drainJobs` and `drainSlotGate` both catch and carry on — so the durable rescheduler is the
+    // thing that is broken, and this is the delivery that says so.
     expect(classifyDisposition(held(LEASE_TIMEOUT_MS + 1_000), now)).toBe('stranded');
-    // A `running` row with no `lockedAt` is a lease nothing can date, so nothing reclaims it.
+    // A `running` row with no `lockedAt` is a lease nothing can date, so no cutoff reclaims it.
     expect(classifyDisposition({ status: JobStatus.running, lockedAt: null }, now)).toBe(
       'stranded',
     );
@@ -144,9 +149,33 @@ describe('the commit reserve', () => {
   };
 
   it('leaves the commit loop its share whatever Overpass spends', () => {
-    expect(overpassDeadlineMs(budget)).toBe(150_000);
-    // Worst case: a query starts at the last legal moment and spends its whole budget.
-    expect(overpassDeadlineMs(budget) + 240_000 + 150_000).toBe(handlerDeadlineMs(budget));
+    /*
+     * Stated as the property rather than as the subtraction that produced it: a query starting at
+     * the last legal moment and spending its entire budget must still finish with at least the
+     * reserve left. Re-deriving `D - M - R + M + R = D` over the same literals would pass against
+     * any three numbers and prove nothing.
+     */
+    const startBy = overpassDeadlineMs(budget);
+    const worstCaseQueryEnd = startBy + Number(budget.OVERPASS_MAX_TOTAL_MS);
+    const leftForCommits = handlerDeadlineMs(budget) - worstCaseQueryEnd;
+
+    expect(leftForCommits).toBeGreaterThanOrEqual(Number(budget.INGEST_COMMIT_RESERVE_MS));
+    expect(startBy).toBeGreaterThan(0);
+  });
+
+  it('holds the reserve when the budgets move', () => {
+    // The same property against a different trio, so the assertion cannot be satisfied by the
+    // deployed literals alone.
+    const wider = {
+      INGEST_DEADLINE_MS: '600000',
+      OVERPASS_MAX_TOTAL_MS: '120000',
+      INGEST_COMMIT_RESERVE_MS: '90000',
+    };
+    const leftForCommits =
+      handlerDeadlineMs(wider) - (overpassDeadlineMs(wider) + Number(wider.OVERPASS_MAX_TOTAL_MS));
+
+    expect(overpassDeadlineMs(wider)).toBe(390_000);
+    expect(leftForCommits).toBeGreaterThanOrEqual(Number(wider.INGEST_COMMIT_RESERVE_MS));
   });
 
   it('lets an operator tighten the Overpass window but never widen it', () => {

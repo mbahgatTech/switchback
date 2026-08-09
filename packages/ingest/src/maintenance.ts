@@ -73,7 +73,7 @@ export const QUEUE_HEALTH_MARKER = 'switchback-ingest-queue-health';
 export interface QueueHealth {
   /** Jobs buried within `DISTRESS_WINDOW_MS`. Nothing retries these. */
   dead: number;
-  /** Leases past `LEASE_TIMEOUT_MS` that no sweep has taken back yet. */
+  /** Leases past `LEASE_TIMEOUT_MS` that survived a sweep — see `LEASE_SWEEP_GRACE_MS`. */
   staleLeases: number;
   /** Unfinished or freshly buried jobs whose last failure names a rate limit. */
   rateLimited: number;
@@ -99,6 +99,19 @@ export interface QueueHealth {
  * and short enough that a fixed queue reads clean by the next tick.
  */
 export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * How long past `LEASE_TIMEOUT_MS` a lease may sit before its survival is distress rather than
+ * ordinary timing.
+ *
+ * `reportQueueHealth` runs at the top of the `ingestPump` handler and the sweep runs just after it,
+ * so every reading catches the leases that tick is about to reclaim. Measured over the 24 h to
+ * 2026-08-08: `staleLeases` was non-zero in 376 of 685 readings, against 52 for `dead` and 3 for
+ * `wedgedTiles` — so this one field decided `isDistressed` more than half the time and the rule
+ * reading it was a light left on. A lease younger than one sweep interval has not yet had a sweep
+ * to survive; one older than that has, and something is wrong with the reaper.
+ */
+export const LEASE_SWEEP_GRACE_MS = 5 * 60 * 1000;
 
 /**
  * How long the drain may go without finishing anything, while work is due, before that is a
@@ -184,7 +197,7 @@ export async function queueHealth(
   now: Date = new Date(),
   leaseTimeoutMs = LEASE_TIMEOUT_MS,
 ): Promise<QueueHealth> {
-  const staleBefore = new Date(now.getTime() - leaseTimeoutMs);
+  const staleBefore = new Date(now.getTime() - leaseTimeoutMs - LEASE_SWEEP_GRACE_MS);
   const recent = new Date(now.getTime() - DISTRESS_WINDOW_MS);
   const silentBefore = new Date(now.getTime() - DRAIN_SILENCE_MS);
 

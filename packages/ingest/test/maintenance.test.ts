@@ -3,7 +3,13 @@ import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
 import { LEASE_TIMEOUT_MS } from '../src/jobs';
-import { countWedgedTiles, isDistressed, queueHealth, sweepQueue } from '../src/maintenance';
+import {
+  LEASE_SWEEP_GRACE_MS,
+  countWedgedTiles,
+  isDistressed,
+  queueHealth,
+  sweepQueue,
+} from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
 
 /** A tile row as the sweep reads it. */
@@ -240,7 +246,14 @@ describe('the queue health report', () => {
     expect(await queueHealth(countingDb(reading), NOW)).toEqual(reading);
   });
 
-  it('counts a lease as stale only once it is past the lease timeout', async () => {
+  /**
+   * The gauge has to survive a sweep before it means anything. `reportQueueHealth` runs at the top
+   * of the `ingestPump` handler and the sweep runs immediately after, so a reading taken without
+   * the grace catches the leases that same tick is about to reclaim — measured over the 24 h to
+   * 2026-08-08, `staleLeases` was non-zero in 376 of 685 readings and decided `isDistressed` more
+   * often than every other field combined.
+   */
+  it('counts a lease as stale only once it has outlived a sweep as well as the timeout', async () => {
     const now = new Date('2026-08-07T10:44:00Z');
     const seen: TileWhere[] = [];
     const db = {
@@ -258,8 +271,11 @@ describe('the queue health report', () => {
 
     await queueHealth(db, now, 30 * 60_000);
 
+    // 10:44 back thirty minutes of lease, then back the sweep grace on top.
     const stale = seen.find((where) => where.status === JobStatus.running);
-    expect(stale?.lockedAt?.lt).toEqual(new Date('2026-08-07T10:14:00Z'));
+    expect(stale?.lockedAt?.lt).toEqual(
+      new Date(now.getTime() - 30 * 60_000 - LEASE_SWEEP_GRACE_MS),
+    );
   });
 
   /**
