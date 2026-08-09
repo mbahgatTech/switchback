@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { JobStatus, Prisma, TileStatus } from '@switchback/db';
+import { JobStatus, OsmElementType, Prisma, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   TILE_TTL_MS,
@@ -9,8 +9,11 @@ import {
   isTileFresh,
   pickRegion,
   processTile,
-  uniqueSlug,
+  slugLadder,
 } from '../src/pipeline';
+import { assignSlugs, planCommitBatches } from '../src/commit-batch';
+import type { SlugWant } from '../src/commit-batch';
+import type { AssembledTrail } from '../src/assemble';
 import type { OverpassClient, OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
 import type { TerrainSource } from '../src/elevate';
@@ -469,21 +472,140 @@ describe('processTile, a trail that would not commit', () => {
     tilesFor: () => Promise.resolve(new Map<string, TerrariumTile>()),
   } as unknown as TerrainSource;
 
+  /** Covers everything, slowly, so a deadline can pass while trails are still being prepared. */
+  function slowTerrain(delayMs: number): TerrainSource {
+    return {
+      tilesFor: () =>
+        new Promise((resolve) => {
+          setTimeout(
+            () => resolve({ get: () => FLAT_TERRAIN } as unknown as Map<string, TerrariumTile>),
+            delayMs,
+          );
+        }),
+    } as unknown as TerrainSource;
+  }
+
   /**
    * The production failure, verbatim: 26 of the 30 non-deadline trail failures in the seven days
    * to 2026-08-09 carried this message, over 31.5-80.5 s against `TRAIL_TX_TIMEOUT_MS`.
    */
+  function expiredTransaction(): Error {
+    return new Error(
+      'Transaction API error: Transaction already closed: A commit cannot be executed on an ' +
+        'expired transaction. The timeout for this transaction was 30000 ms, however 39202 ms passed.',
+    );
+  }
+
   function timingOutTransaction(): PrismaClient {
     const { db, recorded } = fakeDb();
     (db as unknown as { $transaction: () => Promise<never> }).$transaction = () =>
-      Promise.reject(
-        new Error(
-          'Transaction API error: Transaction already closed: A commit cannot be executed on an ' +
-            'expired transaction. The timeout for this transaction was 30000 ms, however 39202 ms passed.',
-        ),
-      );
+      Promise.reject(expiredTransaction());
     return Object.assign(db, { recorded });
   }
+
+  /**
+   * A database that runs the batch transaction for real and refuses one named trail's row.
+   *
+   * The fixture the batch path needs: a stub that rejects `$transaction` outright cannot tell a
+   * batch that lost one member from a batch that lost all of them, and "the good rows still
+   * landed" is the whole claim the per-row fallback makes. `committed` collects the OSM ids that
+   * reached `trail.upsert` without throwing.
+   */
+  function poisonedDb(poison: readonly number[]): PrismaClient {
+    const { db, recorded } = fakeDb();
+    const refuse = new Set(poison.map((id) => BigInt(id)));
+    const committed: string[] = [];
+    let batches = 0;
+    // Rolled back on a throw, like the transaction it stands in for. Without this the rows
+    // written before the poison one would count twice and the assertion would pass either way.
+    let staged: string[] = [];
+
+    const tx = {
+      trail: {
+        findMany: () => Promise.resolve([]),
+        upsert: ({ where }: { where: { osmType_osmId: { osmId: bigint } } }) => {
+          const osmId = where.osmType_osmId.osmId;
+          if (refuse.has(osmId)) return Promise.reject(expiredTransaction());
+          staged.push(osmId.toString());
+          return Promise.resolve({ id: `trail-${osmId.toString()}` });
+        },
+        update: () => Promise.resolve({ id: 'trail-existing' }),
+      },
+      trailSlugAlias: { findMany: () => Promise.resolve([]) },
+      elevationProfile: {
+        deleteMany: () => Promise.resolve({ count: 0 }),
+        createMany: () => Promise.resolve({ count: 0 }),
+      },
+      waypoint: {
+        deleteMany: () => Promise.resolve({ count: 0 }),
+        createMany: () => Promise.resolve({ count: 0 }),
+      },
+      $executeRaw: () => Promise.resolve(0),
+    };
+
+    (
+      db as unknown as {
+        $transaction: (body: (tx: unknown) => Promise<string[]>) => Promise<string[]>;
+      }
+    ).$transaction = async (body) => {
+      batches += 1;
+      staged = [];
+      const ids = await body(tx);
+      committed.push(...staged);
+      return ids;
+    };
+
+    return Object.assign(db, {
+      recorded,
+      poisoned: { committed, batchCount: () => batches },
+    });
+  }
+
+  /**
+   * The claim the fallback makes, on its own, before any tile-level status is involved: a batch
+   * that hits a bad row still lands every good one, and the bad one is named.
+   */
+  it('lands the good rows and names the bad one when a batch hits a poison row', async () => {
+    const eight: OverpassElement[] = Array.from({ length: 8 }, (_, index) => ({
+      type: 'way',
+      id: 200 + index,
+      tags: { highway: 'path', name: `Balcon ${String(index)}` },
+      geometry: [
+        { lat: 46.1 + index / 100, lon: 6.5 },
+        { lat: 46.11 + index / 100, lon: 6.5 },
+      ],
+    }));
+
+    const db = poisonedDb([203]);
+    const { recorded, poisoned } = db as unknown as {
+      recorded: Recorded;
+      poisoned: { committed: string[]; batchCount: () => number };
+    };
+    const overpass = { query: async () => ({ elements: eight }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(TRAIL_LOST_MARKER);
+
+    // Seven landed and one is named — not "the batch failed".
+    expect(poisoned.committed.sort()).toEqual(
+      ['200', '201', '202', '204', '205', '206', '207'].sort(),
+    );
+    const lastError = String(recorded.updates.at(-1)?.data.lastError);
+    expect(lastError).toContain('1 of 8 trail(s) did not commit');
+    expect(lastError).toContain('way/203');
+    expect(lastError).not.toContain('way/204');
+    expect(recorded.updates.at(-1)?.data.trailCount).toBe(7);
+
+    // One batch attempt, then eight single-row writes. The compute never repeats.
+    expect(poisoned.batchCount()).toBe(9);
+  });
 
   /** Two named ways, so a fixture can commit one and lose the other. */
   const twoTrails: OverpassElement[] = [
@@ -505,21 +627,7 @@ describe('processTile, a trail that would not commit', () => {
    * whenever `failed` is one, so a gate reading either count alone behaves identically.
    */
   function oneCommitOneExpiry(): PrismaClient {
-    const { db, recorded } = fakeDb();
-    let calls = 0;
-    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
-      calls += 1;
-      return calls === 1
-        ? Promise.resolve('trail-1')
-        : Promise.reject(
-            new Error(
-              'Transaction API error: Transaction already closed: A commit cannot be executed on ' +
-                'an expired transaction. The timeout for this transaction was 30000 ms, however ' +
-                '39202 ms passed.',
-            ),
-          );
-    };
-    return Object.assign(db, { recorded });
+    return poisonedDb([43]);
   }
 
   it('fails a tile that committed most of its trails and lost one', async () => {
@@ -610,9 +718,9 @@ describe('processTile, a trail that would not commit', () => {
      * hit both failures was the only one whose missing ground was never named anywhere.
      *
      * At the zoom floor, so there is nowhere to split and the tile fails rather than
-     * subdividing. More trails than `COMMIT_CONCURRENCY`, so the workers that pick up the tail
-     * do so after the deadline has passed: the first batch is lost or committed, the tail is
-     * refused.
+     * subdividing. Preparation is slower than the deadline and there are more trails than
+     * `COMMIT_CONCURRENCY`, so the tail is refused by the clock while `way/100` is lost on its
+     * own account.
      */
     const many: OverpassElement[] = Array.from({ length: 8 }, (_, index) => ({
       type: 'way',
@@ -624,19 +732,8 @@ describe('processTile, a trail that would not commit', () => {
       ],
     }));
 
-    const { db, recorded } = fakeDb();
-    let calls = 0;
-    // Every commit outlives the deadline, so the trails nobody got to are refused by the clock.
-    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
-      calls += 1;
-      const lost = calls === 1;
-      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          if (lost) reject(new Error('The timeout for this transaction was 30000 ms.'));
-          else resolve('trail');
-        }, 200);
-      });
-    };
+    const db = poisonedDb([100]);
+    const { recorded } = db as unknown as { recorded: Recorded };
     const overpass = { query: async () => ({ elements: many }) } as unknown as OverpassClient;
     const lines: string[] = [];
 
@@ -644,7 +741,7 @@ describe('processTile, a trail that would not commit', () => {
       processTile('12022120300', {
         db,
         overpass,
-        terrain: flatTerrain,
+        terrain: slowTerrain(150),
         enrichWaypoints: false,
         subdivideMaxZoom: MAX_INGEST_ZOOM,
         deadlineAt: Date.now() + 100,
@@ -679,18 +776,8 @@ describe('processTile, a trail that would not commit', () => {
       ],
     }));
 
-    const { db, recorded } = fakeDb();
-    let calls = 0;
-    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
-      calls += 1;
-      const lost = calls === 1;
-      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          if (lost) reject(new Error('The timeout for this transaction was 30000 ms.'));
-          else resolve('trail');
-        }, 200);
-      });
-    };
+    const db = poisonedDb([100]);
+    const { recorded } = db as unknown as { recorded: Recorded };
     const overpass = { query: async () => ({ elements: many }) } as unknown as OverpassClient;
     const lines: string[] = [];
 
@@ -698,7 +785,7 @@ describe('processTile, a trail that would not commit', () => {
     const result = await processTile(DENSE, {
       db,
       overpass,
-      terrain: flatTerrain,
+      terrain: slowTerrain(150),
       enrichWaypoints: false,
       subdivideMaxZoom: MAX_INGEST_ZOOM,
       deadlineAt: Date.now() + 100,
@@ -919,21 +1006,31 @@ describe('fetchWayGeometries', () => {
   });
 });
 
-describe('uniqueSlug', () => {
+describe('assignSlugs', () => {
   const OSM_ID = 162652736n;
+  const LADDER = slugLadder('Kibbie Lake Trail', 'Tuolumne', OsmElementType.way, OSM_ID);
 
-  /** A transaction client that holds no trails, and answers the alias lookup however told to. */
+  function want(candidates: readonly string[] = LADDER, osmId = OSM_ID): SlugWant {
+    return { osmType: OsmElementType.way, osmId, candidates };
+  }
+
+  /** A transaction client holding the given trails, and answering the alias lookup as told. */
   function txWith(
     retired: readonly string[],
-    aliasLookup?: () => Promise<{ slug: string } | null>,
+    options: {
+      trails?: ReadonlyArray<{ slug: string; osmType: OsmElementType | null; osmId: bigint | null }>;
+      aliasLookup?: () => Promise<never>;
+    } = {},
   ): Prisma.TransactionClient {
     return {
-      trail: { findUnique: () => Promise.resolve(null) },
+      trail: { findMany: () => Promise.resolve(options.trails ?? []) },
       trailSlugAlias: {
-        findUnique:
-          aliasLookup ??
-          (({ where }: { where: { slug: string } }) =>
-            Promise.resolve(retired.includes(where.slug) ? { slug: where.slug } : null)),
+        findMany:
+          options.aliasLookup ??
+          (({ where }: { where: { slug: { in: string[] } } }) =>
+            Promise.resolve(
+              where.slug.in.filter((slug) => retired.includes(slug)).map((slug) => ({ slug })),
+            )),
       },
     } as unknown as Prisma.TransactionClient;
   }
@@ -946,38 +1043,113 @@ describe('uniqueSlug', () => {
   }
 
   it('takes the bare name when no trail and no alias hold it', async () => {
-    const slug = await uniqueSlug(txWith([]), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID);
-    expect(slug).toBe('kibbie-lake-trail');
+    expect(await assignSlugs(txWith([]), [want()])).toEqual(['kibbie-lake-trail']);
   });
 
   it('steps past a slug a merge retired, so a permanent link keeps its own trail', async () => {
-    const slug = await uniqueSlug(
-      txWith(['kibbie-lake-trail']),
-      'Kibbie Lake Trail',
-      'Tuolumne',
-      'way',
-      OSM_ID,
-    );
-    expect(slug).toBe('kibbie-lake-trail-tuolumne');
+    expect(await assignSlugs(txWith(['kibbie-lake-trail']), [want()])).toEqual([
+      'kibbie-lake-trail-tuolumne',
+    ]);
+  });
+
+  it('keeps a slug the same trail already holds, so a re-ingest keeps its URL', async () => {
+    const tx = txWith([], {
+      trails: [{ slug: 'kibbie-lake-trail', osmType: OsmElementType.way, osmId: OSM_ID }],
+    });
+    expect(await assignSlugs(tx, [want()])).toEqual(['kibbie-lake-trail']);
+  });
+
+  it('steps past a slug a different trail holds', async () => {
+    const tx = txWith([], {
+      trails: [{ slug: 'kibbie-lake-trail', osmType: OsmElementType.way, osmId: 99n }],
+    });
+    expect(await assignSlugs(tx, [want()])).toEqual(['kibbie-lake-trail-tuolumne']);
+  });
+
+  /*
+   * The reason this function exists rather than a ladder walk per trail. Both reads happen
+   * before either trail is written, so nothing in the database distinguishes them: without the
+   * in-batch reservation both take `kibbie-lake-trail` and the batch dies on the unique index.
+   */
+  it('does not hand one free name to two trails in the same batch', async () => {
+    const other = 900123n;
+    const slugs = await assignSlugs(txWith([]), [
+      want(),
+      want(slugLadder('Kibbie Lake Trail', 'Tuolumne', OsmElementType.way, other), other),
+    ]);
+    expect(slugs[0]).toBe('kibbie-lake-trail');
+    expect(slugs[1]).toBe('kibbie-lake-trail-tuolumne');
+    expect(new Set(slugs).size).toBe(slugs.length);
+  });
+
+  /*
+   * The last rung is the only one unique by construction, and the only one carrying `osmType`.
+   * A trail whose first three rungs all belong to somebody else has to reach it rather than
+   * take a name that is not its own.
+   */
+  it('falls to the rung carrying osmType when every earlier one is taken', async () => {
+    const tx = txWith([], {
+      trails: LADDER.slice(0, 3).map((slug) => ({
+        slug,
+        osmType: OsmElementType.way,
+        osmId: 99n,
+      })),
+    });
+    expect(await assignSlugs(tx, [want()])).toEqual([
+      `kibbie-lake-trail-way-${OSM_ID.toString(36)}`,
+    ]);
   });
 
   // The property `osm-id` is documented to have: no dependency on `trail_slug_aliases` existing.
   // A Preview build runs branch code against whichever database it is pointed at while `migrate`
   // runs on `master` alone, so without this the whole commit fails there rather than ingesting.
   it('ingests against a database that has no trail_slug_aliases at all', async () => {
-    const slug = await uniqueSlug(
-      txWith([], rejectWith('P2021')),
-      'Kibbie Lake Trail',
-      'Tuolumne',
-      'way',
-      OSM_ID,
-    );
-    expect(slug).toBe('kibbie-lake-trail');
+    const tx = txWith([], { aliasLookup: rejectWith('P2021') });
+    expect(await assignSlugs(tx, [want()])).toEqual(['kibbie-lake-trail']);
   });
 
   it('still fails the commit on an error that is not a missing table', async () => {
-    await expect(
-      uniqueSlug(txWith([], rejectWith('P1010')), 'Kibbie Lake Trail', 'Tuolumne', 'way', OSM_ID),
-    ).rejects.toMatchObject({ code: 'P1010' });
+    const tx = txWith([], { aliasLookup: rejectWith('P1010') });
+    await expect(assignSlugs(tx, [want()])).rejects.toMatchObject({ code: 'P1010' });
   });
 });
+
+describe('planCommitBatches', () => {
+  function trail(osmId: number, memberWayIds: number[]): AssembledTrail {
+    return {
+      osmType: 'way',
+      osmId,
+      name: `Trail ${osmId}`,
+      tags: {},
+      coords: [
+        [0, 0],
+        [1, 1],
+      ],
+      bbox: [0, 0, 1, 1],
+      lengthM: 100,
+      bridgedM: 0,
+      memberWayIds,
+    };
+  }
+
+  it('fills a batch to the cap and no further', () => {
+    const trails = Array.from({ length: 7 }, (_, i) => trail(i, [i]));
+    expect(planCommitBatches(trails, 3).map((batch) => batch.length)).toEqual([3, 3, 1]);
+  });
+
+  /*
+   * The invariant `writeCommitBatch`'s single claim read depends on. Two trails sharing a way
+   * have to see each other's insert to arbitrate, and one batch-wide read cannot show that.
+   * Tile 021231030 has three such ways among 144 trails, so this is reachable.
+   */
+  it('closes a batch rather than put two claimants of one way in it', () => {
+    const batches = planCommitBatches([trail(1, [10, 11]), trail(2, [11, 12]), trail(3, [13])], 25);
+    expect(batches.map((batch) => batch.map((entry) => entry.osmId))).toEqual([[1], [2, 3]]);
+  });
+
+  it('leaves a trail with no member ways free to share any batch', () => {
+    const batches = planCommitBatches([trail(1, []), trail(2, []), trail(3, [])], 25);
+    expect(batches).toHaveLength(1);
+  });
+});
+

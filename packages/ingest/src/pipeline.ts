@@ -13,8 +13,6 @@ import {
   TileStatus,
   backgroundPrisma,
   mergeTrailGeometry,
-  writeTrailGeometry,
-  writeWaypointPoints,
 } from '@switchback/db';
 import { Prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
@@ -60,12 +58,13 @@ import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
 import {
   ClaimConflictError,
   canMergeTrails,
-  claimWays,
   mergeTrails,
   resolveTrail as resolveClaims,
   trailIdentityMode,
 } from './identity';
 import type { ClaimPolicy, TrailIdentityMode } from './identity';
+import { COMMIT_BATCH_SIZE, planCommitBatches, writeCommitBatch } from './commit-batch';
+import type { PreparedTrail } from './commit-batch';
 import {
   CHILDREN_PER_TILE,
   SPLIT_CHILD_ATTEMPT_CAP,
@@ -392,36 +391,85 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   const identityOutcomes = new Map<IdentityOutcome, number>();
 
-  // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
-  // throws must cost its tile one row, not the rest of the tile.
-  await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
+  const commitCtx: CommitContext = {
+    quadkey,
+    features,
+    region,
+    terrain,
+    now: now(),
+    identity,
+    deadlineAt: deps.deadlineAt,
+    onIdentity: (kind) => identityOutcomes.set(kind, (identityOutcomes.get(kind) ?? 0) + 1),
+  };
+
+  /** A trail that threw must cost its tile one row, not the rest of the tile. */
+  const recordFailure = (trail: AssembledTrail, error: unknown): void => {
+    if (error instanceof IngestDeadlineError) refused += 1;
+    else lost.push(`${trail.osmType}/${trail.osmId}`);
+    failed += 1;
+    log('trail failed', {
+      quadkey,
+      osm: `${trail.osmType}/${trail.osmId}`,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  };
+
+  /*
+   * Compute the whole batch, then write it — the split is the point, not the batching alone.
+   * A trail's transaction used to be open while `COMMIT_CONCURRENCY` other trails ran their
+   * synchronous per-feature scans, and a synchronous scan stops the event loop from resolving
+   * anything: on tile 023010230 that expired transactions at 34,372 ms and 39,599 ms against a
+   * 30 s ceiling while the server itself sat at 9% CPU. Nothing computes inside the transaction
+   * below, so the connection is held for round trips only.
+   */
+  for (const batch of planCommitBatches(assembled)) {
+    const prepared: PreparedTrail[] = [];
+
+    await forEachConcurrent(batch, COMMIT_CONCURRENCY, async (trail) => {
+      try {
+        assertBefore(deps.deadlineAt, 'commit');
+        const ready = await commitGate.run(() => prepareCommit(db, trail, commitCtx));
+        if (ready) prepared.push(ready);
+        else skipped += 1;
+      } catch (error) {
+        recordFailure(trail, error);
+      }
+    });
+
+    if (prepared.length === 0) continue;
+
     try {
-      assertBefore(deps.deadlineAt, 'commit');
-      const outcome = await commitGate.run(() =>
-        commitTrail(db, trail, {
-          quadkey,
-          features,
-          region,
-          terrain,
-          now: now(),
-          identity,
-          deadlineAt: deps.deadlineAt,
-          onIdentity: (kind) => identityOutcomes.set(kind, (identityOutcomes.get(kind) ?? 0) + 1),
-        }),
-      );
-      if (outcome === 'committed') committed += 1;
-      else skipped += 1;
-    } catch (error) {
-      if (error instanceof IngestDeadlineError) refused += 1;
-      else lost.push(`${trail.osmType}/${trail.osmId}`);
-      failed += 1;
-      log('trail failed', {
-        quadkey,
-        osm: `${trail.osmType}/${trail.osmId}`,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      await writePrepared(db, prepared, commitCtx);
+      committed += prepared.length;
+    } catch {
+      /*
+       * The batch is the fast path and the per-trail write is the correctness floor. One bad
+       * row rolls its batch back, so every member is rewritten alone: the good ones land and
+       * the bad one throws on its own account, where `recordFailure` names it. Worst case for
+       * one poison row in a batch of N is the batch's round trips spent twice — no compute
+       * repeats, because `prepared` is reused.
+       */
+      for (const entry of prepared) {
+        try {
+          await writePrepared(db, [entry], commitCtx);
+          committed += 1;
+        } catch (error) {
+          // A lost race for a way invalidates the resolution the line was built from, so this
+          // one trail re-resolves and recomputes rather than retrying a stale write.
+          if (error instanceof ClaimConflictError) {
+            try {
+              if ((await commitTrail(db, entry.trail, commitCtx)) === 'committed') committed += 1;
+              else skipped += 1;
+            } catch (retryError) {
+              recordFailure(entry.trail, retryError);
+            }
+            continue;
+          }
+          recordFailure(entry.trail, error);
+        }
+      }
     }
-  });
+  }
 
   if (identityOutcomes.size > 0) {
     log('identity resolved', { quadkey, ...Object.fromEntries(identityOutcomes) });
@@ -1111,10 +1159,10 @@ async function resolveIdentity(
 const MAX_CLAIM_ATTEMPTS = 2;
 
 /**
- * One trail, committed or skipped. Retried when another committer claims a way underneath this
- * one — that conflict invalidates the resolution the line and every derived stat were built from,
- * so the whole commit is re-run rather than the transaction alone. A trail that loses twice
- * concedes: the ways belong to the winner, and this tile's copy of them is a fragment of it.
+ * One trail, committed or skipped, on its own. The fallback the batch path drops to, and the
+ * only caller that re-resolves: a lost race for a way invalidates the resolution the line and
+ * every derived stat were built from, so the whole commit is re-run rather than the transaction
+ * alone. A trail that loses twice concedes — the ways belong to the winner.
  */
 async function commitTrail(
   db: PrismaClient,
@@ -1123,7 +1171,10 @@ async function commitTrail(
 ): Promise<'committed' | 'skipped'> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await attemptCommit(db, trail, ctx);
+      const prepared = await prepareCommit(db, trail, ctx);
+      if (!prepared) return 'skipped';
+      await writePrepared(db, [prepared], ctx);
+      return 'committed';
     } catch (error) {
       if (!(error instanceof ClaimConflictError)) throw error;
       if (attempt >= MAX_CLAIM_ATTEMPTS) return 'skipped';
@@ -1132,21 +1183,21 @@ async function commitTrail(
 }
 
 /**
- * The transaction covers the trail row, its geometry, its profile and its waypoints: a trail row
- * whose `geom` write failed is invisible to every spatial query while still appearing in search,
- * and nothing about it looks broken.
+ * Settle a trail's identity and compute everything its rows will hold. No writes, so the caller
+ * decides when a transaction opens — which is the whole reason the commit phase is two phases.
+ * Null when this tile's copy of the trail adds nothing.
  */
-async function attemptCommit(
+async function prepareCommit(
   db: PrismaClient,
   trail: AssembledTrail,
   ctx: CommitContext,
-): Promise<'committed' | 'skipped'> {
+): Promise<PreparedTrail | null> {
   const resolved = await resolveIdentity(db, trail, ctx.identity, ctx.onIdentity ?? (() => {}));
-  if (!resolved) return 'skipped';
+  if (!resolved) return null;
 
   const spacingM = profileSpacingFor(resolved.lengthM);
   const resampled = resampleLine(resolved.coords, spacingM);
-  if (resampled.length < 2) return 'skipped';
+  if (resampled.length < 2) return null;
 
   /*
    * `alongLengthM` is not an optimisation. A capped profile resamples the PCT at 725 m, and
@@ -1162,7 +1213,7 @@ async function attemptCommit(
 
   // An all-gap profile means every terrain tile under this line failed or does not exist.
   // Storing it would publish a flat sea-level trail with zero gain, which reads as fact.
-  if (gapCount === points.length) return 'skipped';
+  if (gapCount === points.length) return null;
 
   const derived = deriveTrail({
     coords: resolved.coords,
@@ -1211,15 +1262,18 @@ async function attemptCommit(
   const osmType = trail.osmType === 'relation' ? OsmElementType.relation : OsmElementType.way;
   const osmId = BigInt(trail.osmId);
 
-  const trailId = await commitWithSlugRetry(db, async (tx) => {
-    if (resolved.trailId && resolved.retiredIds.length > 0) {
-      await mergeTrails(tx, resolved.trailId, resolved.retiredIds);
-    }
-
-    const slug = await uniqueSlug(tx, trail.name, ctx.region.regionName, osmType, osmId);
-
-    const row = {
-      slug,
+  return {
+    trail,
+    trailId: resolved.trailId,
+    retiredIds: resolved.retiredIds,
+    claim: resolved.claim,
+    conceded: resolved.conceded,
+    osmType,
+    osmId,
+    row: {
+      // `slug` is decided at write time, against one read for the whole batch — see
+      // `assignSlugs`. Everything else on the row is settled here.
+      slug: '',
       name: trail.name,
       displayName,
       description: derived.description,
@@ -1253,151 +1307,83 @@ async function attemptCommit(
       wheelchairAccessible: derived.wheelchairAccessible,
       feeRequired: derived.feeRequired,
       parkingCapacity: parkingCapacity(allWaypoints),
-    };
-
-    // `osmType`/`osmId` are never rewritten on an existing row. For a way-derived trail they are
-    // one member id out of many, and moving them would shift the unique key a concurrent tile is
-    // upserting against — `TrailWay` is the identity now, not `min(wayId)`.
-    //
-    // `quadkey` is held for the same reason: a trail spanning a seam is committed by both tiles,
-    // and rewriting it each time would make "trails owned by tile X" answer differently depending
-    // on which sibling drained last.
-    const saved = resolved.trailId
-      ? await tx.trail.update({
-          where: { id: resolved.trailId },
-          data: {
-            ...row,
-            slug: undefined,
-            osmType: undefined,
-            osmId: undefined,
-            quadkey: undefined,
-          },
-        })
-      : await tx.trail.upsert({
-          where: { osmType_osmId: { osmType, osmId } },
-          create: row,
-          // `slug` is omitted from the update on purpose: it is a public URL from the moment
-          // the trail is first indexed, and a rename in OSM must not 404 every link to it.
-          update: { ...row, slug: undefined },
-        });
-
-    // Gated with resolution, not written unconditionally: `osm-id` must stay a complete rollback,
-    // and a runtime that reaches a database without `trail_ways` must still ingest rather than
-    // fail every trail and record the tile covered.
-    if (ctx.identity === 'claim') {
-      await claimWays(tx, saved.id, trail.memberWayIds, resolved.claim, resolved.conceded);
-    }
-
-    await writeTrailGeometry(tx, {
-      trailId: saved.id,
-      geometry,
-      centroid: derived.centroid,
-    });
-
-    await tx.elevationProfile.upsert({
-      where: { trailId: saved.id },
-      create: {
-        trailId: saved.id,
-        points: profile,
-        spacingM,
-        highPointIndex: derived.highPointIndex,
-      },
-      update: {
-        points: profile,
-        spacingM,
-        highPointIndex: derived.highPointIndex,
-      },
-    });
-
+    },
+    geometry,
+    centroid: derived.centroid,
+    profile,
+    spacingM,
+    highPointIndex: derived.highPointIndex,
     // Waypoints are replaced wholesale rather than diffed: derived data with no user-owned
     // state, and OSM node ids are not stable enough across a retag for a diff to be better.
-    // Three statements for any number of waypoints — one `createMany`, then
-    // `writeWaypointPoints` derives every PostGIS point from the `lng`/`lat` just written.
-    await tx.waypoint.deleteMany({ where: { trailId: saved.id } });
-    if (placed.length > 0) {
-      await tx.waypoint.createMany({
-        data: placed.map((waypoint) => ({
-          trailId: saved.id,
-          kind: waypoint.kind,
-          name: waypoint.name,
-          lng: waypoint.lng,
-          lat: waypoint.lat,
-          eleM: waypoint.eleM,
-          osmEleM: waypoint.osmEleM,
-          distM: waypoint.distM,
-          osmType: waypoint.osmId ? (waypoint.osmType as OsmElementType) : null,
-          osmId: waypoint.osmId ? BigInt(waypoint.osmId) : null,
-        })),
-      });
-      await writeWaypointPoints(tx, saved.id);
-    }
-
-    return saved.id;
-  });
-
-  // Outside the transaction: a queue write failing must not roll back a good trail.
-  await enqueue(db, {
-    kind: JobKind.enrich_trail,
-    dedupeKey: trailEnrichJobKey(trailId),
-    payload: { trailId },
-    priority: -10,
-  });
-
-  return 'committed';
+    waypoints: placed.map((waypoint) => ({
+      kind: waypoint.kind,
+      name: waypoint.name,
+      lng: waypoint.lng,
+      lat: waypoint.lat,
+      eleM: waypoint.eleM,
+      osmEleM: waypoint.osmEleM,
+      distM: waypoint.distM,
+      osmType: waypoint.osmId ? (waypoint.osmType as OsmElementType) : null,
+      osmId: waypoint.osmId ? BigInt(waypoint.osmId) : null,
+      trailId: '',
+    })),
+  };
 }
 
 /**
- * How long one trail's transaction may take, and how long it may wait for a connection.
- * Prisma's 5 s / 2 s defaults are sized for a web request; a trail's transaction is dozens of
- * round-trips, and under load the default aborts healthy commits and blames the trail.
+ * Write prepared trails — one transaction, however many trails. Enrichment jobs go in
+ * afterwards: a queue write failing must not roll back good trails.
+ */
+async function writePrepared(
+  db: PrismaClient,
+  prepared: readonly PreparedTrail[],
+  ctx: CommitContext,
+): Promise<void> {
+  const trailIds = await db.$transaction(
+    (tx) =>
+      writeCommitBatch(tx, prepared, {
+        identity: ctx.identity,
+        slugCandidates: (entry) =>
+          slugLadder(entry.trail.name, ctx.region.regionName, entry.osmType, entry.osmId),
+        mergeTrails,
+      }),
+    { timeout: batchTimeoutMs(prepared.length), maxWait: TRAIL_TX_TIMEOUT_MS },
+  );
+
+  for (const trailId of trailIds) {
+    await enqueue(db, {
+      kind: JobKind.enrich_trail,
+      dedupeKey: trailEnrichJobKey(trailId),
+      payload: { trailId },
+      priority: -10,
+    });
+  }
+}
+
+/**
+ * How long a write transaction may take, and how long it may wait for a connection.
+ * Prisma's 5 s / 2 s defaults are sized for a web request; this is dozens of round trips.
  *
- * **Thirty seconds is not always enough, and raising it is not obviously the fix.** Of the 30
- * non-deadline trail failures production logged in the trailing seven days to 2026-08-09T10:47Z,
- * 29 were this transaction expiring — 26 naming an elapsed figure, spread 31.5 s / 39.2 s median
- * / 80.5 s, and
- * three reaching a closed transaction from a later statement. No value short of a multiple covers
- * that tail, and a multiple holds one of `BACKGROUND_POOL_SIZE` connections for over a minute
- * while `COMMIT_CONCURRENCY` commits run, buying one trail's success with other trails' failures.
- * The thirtieth failure is the reason to suspect contention rather than slow work: a Postgres
- * `40P01` deadlock between two committers on `trail_ways`. Whether the body is slow because of
- * database work or because six concurrent commits starve the event loop between its awaits is
- * **UNVERIFIED** — 418 `[HostMonitor] Host CPU threshold exceeded (100 >= 80)` lines over the same
- * window are consistent with starvation but do not establish it. Measure that before moving this.
+ * **The 30 s that stood here was expiring, and slow database work was never why.** Over the
+ * trailing seven days to 2026-08-09T10:47Z, 29 of production's 30 non-deadline trail failures
+ * were this transaction expiring, spread 31.5 s / 39.2 s median / 80.5 s. On tile 023010230 two
+ * expired at 34,372 ms and 39,599 ms while the server's own `cpu_percent` read 8.24–12.20 and it
+ * consumed zero burst credits: the wait was the event loop failing to schedule a continuation,
+ * because the transaction was open while other trails ran their synchronous per-feature scans.
+ * Nothing computes inside the transaction now, so a batch is bounded by round trips alone.
  */
 const TRAIL_TX_TIMEOUT_MS = 30_000;
 
-/** Prisma's code for a unique-constraint violation. */
-const UNIQUE_VIOLATION = 'P2002';
-
 /**
- * Attempts allowed per trail — must stay equal to the number of slugs `uniqueSlug` can offer,
- * since each losing attempt burns exactly one. Any lower and the last candidate is
- * unreachable, and the last candidate is the only one unique by construction.
+ * A batch's ceiling: the same 30 s of headroom, plus what its trails add. Measured against a
+ * local PostGIS on tile 023010230, a batch of 25 spends 400–700 ms inside the transaction — the
+ * per-trail allowance is two orders of magnitude above that, because the figure this has to
+ * survive is a stalled event loop, not a slow query.
  */
-const MAX_SLUG_ATTEMPTS = 4;
+const TRAIL_TX_PER_TRAIL_MS = 2_000;
 
-/**
- * Run a trail's transaction, retrying when it loses a race for a slug. `uniqueSlug` reads and
- * the upsert writes; with six trails in flight and several called "Lake Trail" in one valley,
- * another worker takes the name in between. A retry is the whole fix because the read is
- * inside the transaction, and the last candidate is unique by construction, so this
- * terminates. Only unique violations are retried — everything else belongs to that trail.
- */
-async function commitWithSlugRetry(
-  db: PrismaClient,
-  body: (tx: Prisma.TransactionClient) => Promise<string>,
-): Promise<string> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await db.$transaction(body, {
-        timeout: TRAIL_TX_TIMEOUT_MS,
-        maxWait: TRAIL_TX_TIMEOUT_MS,
-      });
-    } catch (error) {
-      const code = (error as { code?: string } | null)?.code;
-      if (code !== UNIQUE_VIOLATION || attempt >= MAX_SLUG_ATTEMPTS) throw error;
-    }
-  }
+function batchTimeoutMs(size: number): number {
+  return TRAIL_TX_TIMEOUT_MS + size * TRAIL_TX_PER_TRAIL_MS;
 }
 
 /** Elevation for a waypoint that sits on the line, from the profile we already built. */
@@ -1415,56 +1401,26 @@ function elevationAt(
 }
 
 /**
- * A slug that is unique and stays that way. The bare name first, because `/trails/ben-nevis`
- * is what somebody would guess; then region-qualified, which says which Eagle Peak Trail this
- * is; then the OSM id, unlovely but unique and stable.
+ * The slugs a trail will accept, best first. The bare name, because `/trails/ben-nevis` is what
+ * somebody would guess; then region-qualified, which says which Eagle Peak Trail this is; then
+ * the OSM id, unlovely but unique and stable. The last rung carries `osmType` too and so is
+ * unique by construction — which is what lets `assignSlugs` stop walking and terminate.
+ *
+ * The ladder degenerates outside Latin script: `slugify('北海道', 'Hokkaido')` collapses to
+ * `slugify('北海道')`, so the middle rung can repeat the first. Duplicates are harmless — a
+ * candidate already taken is skipped — but do not assume the rungs are distinct.
  */
-export async function uniqueSlug(
-  tx: Prisma.TransactionClient,
+export function slugLadder(
   name: string,
   regionName: string | null,
   osmType: OsmElementType,
   osmId: bigint,
-): Promise<string> {
+): string[] {
   const candidates = [slugify(name)];
   if (regionName) candidates.push(slugify(name, regionName));
   candidates.push(`${slugify(name)}-${osmId.toString(36)}`);
-
-  for (const candidate of candidates) {
-    const existing = await tx.trail.findUnique({
-      where: { slug: candidate },
-      select: { osmType: true, osmId: true },
-    });
-    // Free, or already ours — a re-ingest of the same trail keeps its URL.
-    if (existing) {
-      if (existing.osmType !== osmType || existing.osmId !== osmId) continue;
-      return candidate;
-    }
-    // A retired slug still answers on `/trails/<slug>`, so handing it to a different trail would
-    // point a permanent link at somebody else's trail — worse than the 404 the alias prevents.
-    // Read in every mode, not only `claim`: a merge made while the flag was on retires a slug
-    // permanently, and the rollback that turns the flag off is exactly when an unrelated trail
-    // would otherwise be free to take it.
-    //
-    // P2021 only, and it is what keeps `osm-id` free of any dependency on this table: a database
-    // the DDL has not reached has no aliases, so no candidate is retired and the bare name is
-    // free. Vercel Preview builds run branch code against whichever database they are pointed at
-    // while `ci.yml`'s `migrate` job runs on `master` alone, so that gap is reachable. Any other
-    // error is a real failure and has to keep failing the commit.
-    const alias = await tx.trailSlugAlias
-      .findUnique({
-        where: { slug: candidate },
-        select: { slug: true },
-      })
-      .catch((error: unknown) => {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2021') {
-          return null;
-        }
-        throw error;
-      });
-    if (!alias) return candidate;
-  }
-  return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
+  candidates.push(`${slugify(name)}-${osmType}-${osmId.toString(36)}`);
+  return candidates;
 }
 
 export interface RegionInfo {

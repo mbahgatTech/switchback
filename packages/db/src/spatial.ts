@@ -23,14 +23,7 @@ export interface TrailGeometryInput {
  * `trail.create()`. A row with geometry but no search vector maps but never appears in search.
  */
 export async function writeTrailGeometry(db: Db, input: TrailGeometryInput): Promise<void> {
-  const geojson = JSON.stringify(input.geometry);
-  await db.$executeRaw`
-    UPDATE trails SET
-      "geom"     = ST_SetSRID(ST_GeomFromGeoJSON(${geojson}), 4326),
-      "centroid" = ST_SetSRID(ST_MakePoint(${input.centroid[0]}, ${input.centroid[1]}), 4326)
-    WHERE id = ${input.trailId}
-  `;
-  await refreshTrailSearchVector(db, input.trailId);
+  await writeTrailGeometries(db, [input]);
 }
 
 /**
@@ -45,6 +38,18 @@ export async function writeTrailGeometry(db: Db, input: TrailGeometryInput): Pro
  * still reaches the trail whichever of the two is on it.
  */
 export async function refreshTrailSearchVector(db: Db, trailId: string): Promise<void> {
+  await refreshTrailSearchVectors(db, [trailId]);
+}
+
+/**
+ * The same projection over many rows in one statement. `writeTrailGeometries` is the only
+ * caller that needs it; `refreshTrailSearchVector` delegates so the expression exists once.
+ */
+export async function refreshTrailSearchVectors(
+  db: Db,
+  trailIds: readonly string[],
+): Promise<void> {
+  if (trailIds.length === 0) return;
   await db.$executeRaw`
     UPDATE trails SET
       "searchVector" =
@@ -52,8 +57,37 @@ export async function refreshTrailSearchVector(db: Db, trailId: string): Promise
        || setweight(to_tsvector('english', COALESCE("displayName", '')), 'A')
        || setweight(to_tsvector('english', COALESCE("regionName", '')), 'B')
        || setweight(to_tsvector('english', COALESCE("description", '')), 'C')
-    WHERE id = ${trailId}
+    WHERE id = ANY(${[...trailIds]}::text[])
   `;
+}
+
+/**
+ * Geometry, centroid and search vector for a whole batch of trails in two statements. The
+ * per-row `writeTrailGeometry` is `writeTrailGeometries` of one, so the SQL exists once.
+ */
+export async function writeTrailGeometries(
+  db: Db,
+  inputs: readonly TrailGeometryInput[],
+): Promise<void> {
+  if (inputs.length === 0) return;
+  const ids = inputs.map((input) => input.trailId);
+  const geojson = inputs.map((input) => JSON.stringify(input.geometry));
+  const lngs = inputs.map((input) => input.centroid[0]);
+  const lats = inputs.map((input) => input.centroid[1]);
+
+  await db.$executeRaw`
+    UPDATE trails AS t SET
+      "geom"     = ST_SetSRID(ST_GeomFromGeoJSON(v.geojson), 4326),
+      "centroid" = ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)
+      FROM (
+        SELECT unnest(${ids}::text[])     AS id,
+               unnest(${geojson}::text[]) AS geojson,
+               unnest(${lngs}::double precision[]) AS lng,
+               unnest(${lats}::double precision[]) AS lat
+      ) AS v
+     WHERE t.id = v.id
+  `;
+  await refreshTrailSearchVectors(db, ids);
 }
 
 /**
@@ -63,10 +97,19 @@ export async function refreshTrailSearchVector(db: Db, trailId: string): Promise
  * is what kept a forty-waypoint trail inside the transaction's 30 s ceiling.
  */
 export async function writeWaypointPoints(db: Db, trailId: string): Promise<void> {
+  await writeWaypointPointsFor(db, [trailId]);
+}
+
+/** The same projection for a batch of trails, still one statement. */
+export async function writeWaypointPointsFor(
+  db: Db,
+  trailIds: readonly string[],
+): Promise<void> {
+  if (trailIds.length === 0) return;
   await db.$executeRaw`
     UPDATE waypoints
        SET "point" = ST_SetSRID(ST_MakePoint("lng", "lat"), 4326)
-     WHERE "trailId" = ${trailId}
+     WHERE "trailId" = ANY(${[...trailIds]}::text[])
   `;
 }
 
