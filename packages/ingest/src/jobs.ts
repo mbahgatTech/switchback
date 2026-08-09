@@ -8,7 +8,7 @@ import type { PrismaClient } from '@switchback/db';
 
 /**
  * The host's kill deadline, mirrored from `apps/ingest-worker/host.json` `functionTimeout`.
- * `apps/ingest-worker/test/broker-lease.test.ts` reads that file and fails if the two disagree.
+ * `apps/ingest-worker/test/drain.test.ts` reads that file and fails if the two disagree.
  */
 export const HOST_FUNCTION_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -37,10 +37,11 @@ export const LEASE_MARGIN_MS = 2 * 60 * 1000;
  * exactly `lockDuration`.
  *
  * So the redelivery is not the repair. `ingestPump` is: it reclaims on a two-minute tick and
- * republishes the row, whatever any delivery decided. `broker-lease.test.ts` asserts the whole
- * chain, including the one relation that makes the republish durable — the broker's duplicate
- * detection window has to be *shorter* than this, or the pump's republish is discarded as a
- * duplicate of the message that was already completed and the work is lost with nothing logged.
+ * republishes the row, whatever any delivery decided. `apps/ingest-worker/test/drain.test.ts`
+ * asserts the whole chain, including the one relation that makes the republish durable — the
+ * broker's duplicate detection window has to be *shorter* than this, or the pump's republish is
+ * discarded as a duplicate of the message that was already completed and the work is lost with
+ * nothing logged.
  */
 export const LEASE_TIMEOUT_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS;
 

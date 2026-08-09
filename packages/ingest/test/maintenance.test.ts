@@ -1,13 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
 import { LEASE_TIMEOUT_MS } from '../src/jobs';
 import {
   LEASE_SWEEP_GRACE_MS,
+  TILE_WEDGED_MARKER,
+  WEDGE_GRACE_MS,
   countWedgedTiles,
   isDistressed,
   queueHealth,
+  repairWedgedTiles,
   sweepQueue,
 } from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
@@ -325,6 +330,14 @@ describe('the queue health report', () => {
     expect(isDistressed(clean)).toBe(false);
     expect(isDistressed({ ...clean, rateLimited: 1 })).toBe(true);
     expect(isDistressed({ ...clean, stalledDrain: 1 })).toBe(true);
+    // Every field is an OR term, so every field has to be able to raise it on its own — and a
+    // field that could never fall would pin the alert on forever. `repairWedgedTiles` is what makes
+    // this one fall.
+    expect(isDistressed({ ...clean, dead: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, staleLeases: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, orphanedSplits: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, stuckSubtrees: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, wedgedTiles: 1 })).toBe(true);
   });
 
   /**
@@ -381,8 +394,8 @@ describe('the queue health report', () => {
 
 /**
  * The gauge for the state a killed handler leaves behind: a tile stuck at `running` because its
- * invocation never came back. Nineteen sat in production on 2026-08-07 with nothing counting them
- * — `staleLeases` reads `ingest_jobs`, and the job under a wedged tile is often not stale at all.
+ * invocation never came back. `staleLeases` reads `ingest_jobs`, and the job under a wedged tile is
+ * often not stale at all — it was completed, or reclaimed and buried.
  */
 describe('countWedgedTiles', () => {
   function capturing(): { db: PrismaClient; sql: () => string } {
@@ -411,8 +424,86 @@ describe('countWedgedTiles', () => {
     expect(sql()).toContain("job.status IN ('queued', 'running')");
   });
 
+  it('waits out a lease and a pump tick before counting anything', async () => {
+    // The other half of not pinning: a tile is only wedged once everything that would ordinarily
+    // rescue it — the reclaim, then the republish — has had its chance.
+    const { db, sql } = capturing();
+    await countWedgedTiles(db);
+    expect(sql()).toContain('"updatedAt" <');
+    expect(WEDGE_GRACE_MS).toBeGreaterThan(LEASE_TIMEOUT_MS);
+  });
+
   it('reads zero rather than undefined on an empty result', async () => {
     const empty = { $queryRaw: async () => [] } as unknown as PrismaClient;
     expect(await countWedgedTiles(empty)).toBe(0);
+  });
+});
+
+/**
+ * The repair the gauge would otherwise have no route to. `runPump` publishes only `queued` jobs and
+ * `reclaimExpiredJobs` only moves `running` to `queued` or `dead`, so a tile whose job was buried on
+ * its last attempt has nothing that reaches it.
+ */
+describe('repairWedgedTiles', () => {
+  function capturing(rows: Array<{ quadkey: string }>): {
+    db: PrismaClient;
+    sql: () => string;
+    values: () => unknown[];
+  } {
+    let captured = '';
+    let bound: unknown[] = [];
+    const db = {
+      $queryRaw: async (strings: TemplateStringsArray, ...args: unknown[]) => {
+        captured = String(strings);
+        bound = args;
+        return rows;
+      },
+    } as unknown as PrismaClient;
+    return { db, sql: () => captured, values: () => bound };
+  }
+
+  it('takes a wedged tile out of running and says why', async () => {
+    const { db, sql, values } = capturing([{ quadkey: '120221203' }]);
+    expect(await repairWedgedTiles(db)).toEqual(['120221203']);
+    expect(sql()).toContain('UPDATE ingest_tiles');
+    expect(values()).toContain(TileStatus.failed);
+    expect(values()).toContain(
+      `${TILE_WEDGED_MARKER}: left running with no job that could finish it`,
+    );
+  });
+
+  it('matches exactly what the gauge counts, so the repair cannot miss a counted tile', async () => {
+    const counted = capturing([]);
+    await countWedgedTiles(counted.db);
+    const repaired = capturing([]);
+    await repairWedgedTiles(repaired.db);
+
+    for (const clause of [
+      "status = 'running'",
+      '"fetchedAt" IS NULL',
+      '"updatedAt" <',
+      "job.status IN ('queued', 'running')",
+    ]) {
+      expect(counted.sql()).toContain(clause);
+      expect(repaired.sql()).toContain(clause);
+    }
+  });
+
+  it('fails the tile rather than re-enqueueing it, so the repair cannot loop', async () => {
+    // A tile is only wedged after its job was buried out of attempts, which is precisely the input
+    // a re-enqueue would spin on. `failed` is re-fetchable by the ordinary freshness path.
+    const { db, sql, values } = capturing([]);
+    await repairWedgedTiles(db);
+    expect(values()).toContain(TileStatus.failed);
+    expect(sql()).not.toContain('ingest_jobs job\n               WHERE job."dedupeKey" = INSERT');
+    expect(sql()).not.toContain('INSERT INTO');
+  });
+
+  it('runs from the sweep, after the reclaim that would otherwise rescue the tile', async () => {
+    const source = readFileSync(resolve(__dirname, '../src/maintenance.ts'), 'utf8');
+    const reclaim = source.indexOf('reclaimExpiredJobs(db, now)');
+    const repair = source.indexOf('repairWedgedTiles(db, now)');
+    expect(reclaim).toBeGreaterThan(-1);
+    expect(repair).toBeGreaterThan(reclaim);
   });
 });

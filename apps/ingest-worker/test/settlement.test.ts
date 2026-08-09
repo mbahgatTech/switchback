@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { JobStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { LEASE_TIMEOUT_MS } from '@switchback/ingest';
+import { LEASE_TIMEOUT_MS, OVERPASS_MAX_TOTAL_MS, drainSlotGate } from '@switchback/ingest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import {
   classifyDisposition,
@@ -118,6 +120,53 @@ describe('what a delivery may tell the broker', () => {
     expect(log.lines).toContainEqual(['error', expect.stringContaining(SIGNAL_STRANDED_MARKER)]);
   });
 
+  it('strands rather than throwing when the gate sweep fails, so the arm is reachable', async () => {
+    /*
+     * The two halves of the reachability argument, composed. `drainSlotGate` sweeps before it opens
+     * the transaction, so a reclaim that throws leaves the gate admitting a claim rather than
+     * aborting the transaction with `25P02` and taking the next statement down with it — which is
+     * what previously made `runIngestSignal` rethrow before `assertSettleable` ever ran. With the
+     * gate surviving, a lease the sweep failed to take back is still `running` when the disposition
+     * is read, which is exactly the state `switchback-ingest-signal-stranded` exists to report.
+     */
+    const sql = (strings: TemplateStringsArray) => strings.join('?');
+    const raw = async (strings: TemplateStringsArray) => {
+      if (sql(strings).includes('UPDATE ingest_jobs')) throw new Error('reclaim failed');
+      return sql(strings).includes('count(distinct') ? [{ drainers: 0 }] : [];
+    };
+    const gateDb = {
+      $queryRaw: raw,
+      $transaction: async (run: (client: unknown) => Promise<unknown>) =>
+        run({ $executeRaw: async () => 1, $queryRaw: raw }),
+    } as unknown as PrismaClient;
+
+    const batch = await drainSlotGate(gateDb, 1)(async () => ({ primary: [], derived: [] }));
+    expect(batch).toEqual({ primary: [], derived: [] });
+
+    const log = fakeLog();
+    const strandedDb = {
+      ingestJob: {
+        findUnique: async () => ({
+          status: JobStatus.running,
+          lockedAt: new Date(Date.now() - LEASE_TIMEOUT_MS - 1_000),
+          lockedBy: 'sb-dead-invocation',
+        }),
+      },
+    } as unknown as PrismaClient;
+
+    await expect(
+      runIngestSignal({ dedupeKey: KEY }, log, {
+        workerId: 'sb-test',
+        deliveryCount: 2,
+        drain: drainReturning(outcome({ claimed: 0 })),
+        overpass,
+        db: strandedDb,
+      }),
+    ).rejects.toBeInstanceOf(StrandedSignalError);
+
+    expect(log.lines).toContainEqual(['error', expect.stringContaining(SIGNAL_STRANDED_MARKER)]);
+  });
+
   it('completes without reading the row when this invocation did the work', async () => {
     const log = fakeLog();
     const findUnique = vi.fn();
@@ -144,16 +193,61 @@ describe('what a delivery may tell the broker', () => {
 describe('the commit reserve', () => {
   const budget = {
     INGEST_DEADLINE_MS: '540000',
-    OVERPASS_MAX_TOTAL_MS: '240000',
+    OVERPASS_MAX_TOTAL_MS: '190000',
     INGEST_COMMIT_RESERVE_MS: '150000',
   };
+
+  /**
+   * Production, 2026-08-05 to 2026-08-08. `assembled` is logged the moment the tile query returns,
+   * so its offset from the invocation start is that query's own wall clock: 34 observations, median
+   * 8.3 s, p90 65 s, worst 168.4 s (quadkey 133002102). The region and feature queries follow it, so
+   * the worst observed start of a pre-commit query is that same 168.4 s.
+   */
+  const WORST_TILE_QUERY_MS = 168_400;
+
+  /**
+   * The same 34 invocations, of which 23 finished inside the handler budget: work after `assembled`
+   * ran 32.9 s to 381.2 s, median ~133 s. The reserve has to clear the median or the commit loop is
+   * being promised less than a typical tile needs.
+   */
+  const MEDIAN_COMMIT_WORK_MS = 133_000;
+
+  /** `OverpassClient`'s `requestTimeoutMs` default — one attempt's abort window. */
+  const REQUEST_TIMEOUT_MS = 190_000;
+
+  it('admits every pre-commit query production has been observed to make', () => {
+    // The binding number, not the subtraction that produced it. `D - M - R + M + R = D` holds for
+    // any three literals; this fails the moment the start-by drops below a query production makes.
+    expect(overpassDeadlineMs(budget)).toBeGreaterThanOrEqual(WORST_TILE_QUERY_MS);
+  });
+
+  it('reserves at least what the commit loop has been measured to need', () => {
+    expect(Number(budget.INGEST_COMMIT_RESERVE_MS)).toBeGreaterThanOrEqual(MEDIAN_COMMIT_WORK_MS);
+  });
+
+  it('spends no budget on a retry that could not finish', () => {
+    /*
+     * Above one attempt's abort window the extra can only fund a *second* attempt, which starts too
+     * late to complete a query whose server-side `[timeout:]` is up to 180 s — and every millisecond
+     * of it comes out of the start-by above. Below the worst observed tile query it would refuse
+     * work that succeeds today.
+     */
+    expect(OVERPASS_MAX_TOTAL_MS).toBeLessThanOrEqual(REQUEST_TIMEOUT_MS);
+    expect(OVERPASS_MAX_TOTAL_MS).toBeGreaterThanOrEqual(WORST_TILE_QUERY_MS);
+    expect(Number(budget.OVERPASS_MAX_TOTAL_MS)).toBe(OVERPASS_MAX_TOTAL_MS);
+
+    const client = readFileSync(
+      resolve(__dirname, '../../../packages/ingest/src/overpass.ts'),
+      'utf8',
+    );
+    expect(client).toContain(`options.requestTimeoutMs ?? 190_000`);
+  });
 
   it('leaves the commit loop its share whatever Overpass spends', () => {
     /*
      * Stated as the property rather than as the subtraction that produced it: a query starting at
      * the last legal moment and spending its entire budget must still finish with at least the
-     * reserve left. Re-deriving `D - M - R + M + R = D` over the same literals would pass against
-     * any three numbers and prove nothing.
+     * reserve left.
      */
     const startBy = overpassDeadlineMs(budget);
     const worstCaseQueryEnd = startBy + Number(budget.OVERPASS_MAX_TOTAL_MS);
@@ -180,7 +274,7 @@ describe('the commit reserve', () => {
 
   it('lets an operator tighten the Overpass window but never widen it', () => {
     expect(overpassDeadlineMs({ ...budget, INGEST_OVERPASS_DEADLINE_MS: '60000' })).toBe(60_000);
-    expect(overpassDeadlineMs({ ...budget, INGEST_OVERPASS_DEADLINE_MS: '300000' })).toBe(150_000);
+    expect(overpassDeadlineMs({ ...budget, INGEST_OVERPASS_DEADLINE_MS: '300000' })).toBe(200_000);
   });
 
   it('still allows the one query the invocation exists to make', () => {

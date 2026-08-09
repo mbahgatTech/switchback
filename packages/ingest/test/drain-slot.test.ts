@@ -21,19 +21,24 @@ process.env.OVERPASS_USER_AGENT ??= 'Switchback/test (+https://switchback-three.
 interface Recorded {
   raw: string[];
   claimed: boolean;
+  /** Makes `reclaimExpiredJobs` throw, which is the sweep failure the strand arm depends on. */
+  failReclaim: boolean;
 }
 
 /** The statement that takes work. Its presence is how these cases see a claim happen. */
 const CLAIM_SQL = 'FOR UPDATE SKIP LOCKED';
 
 function fakeDb(drainers: number): { db: PrismaClient; recorded: Recorded } {
-  const recorded: Recorded = { raw: [], claimed: false };
+  const recorded: Recorded = { raw: [], claimed: false, failReclaim: false };
 
   // Everything but the drainer count reads as an empty queue, which is what makes "did the claim
   // statement run at all" the observable these cases turn on.
   const answer = async (strings: TemplateStringsArray) => {
     const sql = strings.join('?');
     recorded.raw.push(sql);
+    if (recorded.failReclaim && sql.includes('UPDATE ingest_jobs')) {
+      throw new Error('reclaim failed');
+    }
     return sql.includes('count(distinct') ? [{ drainers }] : [];
   };
 
@@ -96,12 +101,36 @@ describe('the drain slot', () => {
     expect(recorded.claimed, 'claimed despite the slot being taken').toBe(false);
   });
 
-  it('takes the lock, sweeps and counts before it claims', async () => {
+  it('sweeps outside the transaction, then takes the lock and counts before it claims', async () => {
     const { db, recorded } = fakeDb(0);
     await drainSlotGate(db, 1)(async () => ({ primary: [], derived: [] }));
 
-    expect(recorded.raw[0]).toContain('pg_advisory_xact_lock');
+    // The reclaim commits first so the count below sees it; the lock opens the transaction.
+    expect(recorded.raw[0]).toContain('UPDATE ingest_jobs');
+    expect(recorded.raw[1]).toContain('pg_advisory_xact_lock');
     expect(recorded.raw.at(-1)).toContain('count(distinct "lockedBy")');
+  });
+
+  it('carries on when the sweep throws, because a statement that errors inside a transaction aborts it', async () => {
+    const { db, recorded } = fakeDb(0);
+    // A reclaim that fails inside `db.$transaction` leaves Postgres in `25P02`, so the count that
+    // follows throws uncaught and `runIngestSignal` never reaches `assertSettleable`. That is what
+    // made `SIGNAL_STRANDED_MARKER` unreachable: the strand it reports is precisely a lease no
+    // sweep took back.
+    recorded.failReclaim = true;
+    const claimed: string[] = [];
+
+    const batch = await drainSlotGate(
+      db,
+      1,
+    )(async () => {
+      claimed.push('claimed');
+      return { primary: [], derived: [] };
+    });
+
+    expect(claimed).toEqual(['claimed']);
+    expect(batch).toEqual({ primary: [], derived: [] });
+    expect(recorded.raw.some((sql) => sql.includes('pg_advisory_xact_lock'))).toBe(true);
   });
 
   it('reads its limit from the environment, and refuses to be talked out of one', () => {

@@ -1,7 +1,7 @@
 import { app } from '@azure/functions';
 import type { InvocationContext, Timer } from '@azure/functions';
 import { backgroundPrisma } from '@switchback/db';
-import { pruneFinishedJobs, sweepQueue } from '@switchback/ingest';
+import { TILE_WEDGED_MARKER, pruneFinishedJobs, sweepQueue } from '@switchback/ingest';
 import { reportQueueHealth } from '../health';
 import { runPump } from '../pump';
 import { serviceBusQueue } from '../service-bus';
@@ -57,6 +57,12 @@ async function maintain(log: InvocationContext): Promise<void> {
       log.warn(
         `ingest sweep: cleared ${sweep.unsplit.length} orphaned split marker(s): ` +
           sweep.unsplit.map((repair) => repair.quadkey).join(', '),
+      );
+    }
+    if (sweep.unwedged.length > 0) {
+      log.error(
+        `${TILE_WEDGED_MARKER}: ${sweep.unwedged.length} tile(s) left running with no job that ` +
+          `could finish them, now failed: ${sweep.unwedged.join(', ')}`,
       );
     }
     await pruneFinishedJobs(backgroundPrisma);

@@ -93,6 +93,7 @@ describe('runIngestSignal', () => {
       workerId: 'sb-1',
       deps: {
         overpass,
+        overpassAfterCommits: overpass,
         deadlineAt: expect.any(Number) as number,
         logger: expect.any(Function) as () => void,
       },
@@ -340,13 +341,14 @@ describe('the drain-failure alert, from the template', () => {
     expect(host.logging.applicationInsights.samplingSettings.excludedTypes).toContain('Trace');
   });
 
-  it('takes the subdivision ceiling from a parameter, so a deploy cannot re-enable it', () => {
+  it('takes the subdivision ceiling from a parameter with no default on either side', () => {
     /*
-     * The rollback the docs promise is `az functionapp config appsettings set
-     * INGEST_SUBDIVIDE_MAX_ZOOM=9`, and an ARM application-settings write replaces the collection
-     * whole — so a literal in the template would undo that operator's 3am decision on the next
-     * routine deploy. `ingest.bicepparam` resolves the parameter to `9` unless the deploying shell
-     * says otherwise, which puts the accident on the safe side.
+     * A literal in the template would undo an operator's `az functionapp config appsettings set
+     * INGEST_SUBDIVIDE_MAX_ZOOM=9` on the next routine deploy, because an application-settings
+     * write replaces the collection whole. A *fallback* in `ingest.bicepparam` is the same defect
+     * inverted: the live app holds `11`, so a deploy from a shell that forgot to export it would
+     * silently write `9` — and `9` is off, not safe. `canSubdivide(9, 9)` is false, so a dense z9
+     * tile is failed rather than split, which is the 540 s overrun this exists to bound.
      */
     const setting = /name: 'INGEST_SUBDIVIDE_MAX_ZOOM'\s*\r?\n\s*value: ([^\s]+)/.exec(bicep)?.[1];
     expect(setting).toBe('ingestSubdivideMaxZoom');
@@ -358,8 +360,29 @@ describe('the drain-failure alert, from the template', () => {
       'utf8',
     );
     expect(params).toContain(
-      "param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')",
+      "param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM')",
     );
+    expect(params).not.toContain("readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', ");
+  });
+
+  it('declares the package URL, so a template deploy does not leave the app codeless', () => {
+    /*
+     * An application-settings write replaces the collection whole, so omitting
+     * `WEBSITE_RUN_FROM_PACKAGE` meant any deployment that ran without a package push unmounted the
+     * code. No fallback for the same reason as the ceiling above: a default would point the app at
+     * some other build.
+     */
+    expect(bicep).toContain("name: 'WEBSITE_RUN_FROM_PACKAGE'");
+    expect(bicep).toContain('value: packageUrl');
+    expect(bicep).toContain('param packageUrl string');
+    expect(bicep).not.toContain('param packageUrl string =');
+
+    const params = readFileSync(
+      resolve(__dirname, '../../../infra/azure/ingest.bicepparam'),
+      'utf8',
+    );
+    expect(params).toContain("param packageUrl = readEnvironmentVariable('INGEST_PACKAGE_URL')");
+    expect(params).not.toContain("readEnvironmentVariable('INGEST_PACKAGE_URL', ");
   });
 
   it('reads a deployed ceiling of 11 as two levels of subdivision, and 9 as off', () => {

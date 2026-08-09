@@ -1110,6 +1110,10 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 export INGEST_TRAIL_IDENTITY=claim                   # the live value — no default, state it
+export INGEST_SUBDIVIDE_MAX_ZOOM=11                  # the live value — no default, state it
+export INGEST_PACKAGE_URL="$(az functionapp config appsettings list \
+  -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)"
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1119,21 +1123,29 @@ az deployment group create \
 unset INGEST_DATABASE_URL
 ```
 
-Those four exports are the whole set with no fallback, and a missing one fails the build with
-`BCP427` naming the variable — before ARM is called. `ingest.bicepparam` reads three more from the
-environment — `INGEST_SUBDIVIDE_MAX_ZOOM`, `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` — and each of
-those falls back to what the app already holds (`9`, and absent for the other two), so leaving them
-unexported deploys the deployed value.
+Those five exports are the whole set with no fallback, and a missing one fails the build with
+`BCP427` naming the variable — before ARM is called. Every one of them names a live control, and an
+application-settings write replaces the collection whole, so any default would revert one:
 
-`INGEST_TRAIL_IDENTITY` is in the block, and has no fallback, because for it that was not true: the
-app reads `claim` and an application-settings write replaces the collection whole, so any default
-would revert a live control. Confirm the value landed rather than assuming it — `identity.ts` reads
-an absent variable and `osm-id` identically, so a reverted app looks unchanged:
+| Export                       | Live value                              | What a default would do                                                                                                   |
+| ---------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `INGEST_DATABASE_URL`        | the `sbapp` connection string           | deploy a worker that cannot reach Postgres                                                                                |
+| `INGEST_OVERPASS_USER_AGENT` | a contact URL that reaches this project | run unattended under a placeholder, which is what mirrors block for                                                       |
+| `INGEST_TRAIL_IDENTITY`      | `claim`                                 | revert to `osm-id`, silently — `identity.ts` reads an absent variable and `osm-id` identically                            |
+| `INGEST_SUBDIVIDE_MAX_ZOOM`  | `11`                                    | write `9`, which turns subdivision **off**: `canSubdivide(9, 9)` is false, so a dense z9 tile is failed rather than split |
+| `INGEST_PACKAGE_URL`         | the zip the host currently runs         | point the app at another build, or leave it codeless                                                                      |
+
+`ingest.bicepparam` reads two more from the environment — `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` —
+and both fall back to absent, which is what the app already holds, so leaving them unexported
+deploys the deployed value.
+
+Confirm the two flags landed rather than assuming it:
 
 ```bash
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
-  --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv   # expect claim
+  --query "[?name=='INGEST_TRAIL_IDENTITY' || name=='INGEST_SUBDIVIDE_MAX_ZOOM'].[name,value]" -o tsv
+# expect: INGEST_TRAIL_IDENTITY claim / INGEST_SUBDIVIDE_MAX_ZOOM 11
 ```
 
 `INGEST_OVERPASS_USER_AGENT` is the one an operator has to get right rather than copy, and it has

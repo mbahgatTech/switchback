@@ -9,19 +9,21 @@
 //   export INGEST_DATABASE_URL="$(...)"          # the application login, same string Vercel holds
 //   export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
 //   export INGEST_TRAIL_IDENTITY=claim           # the live value; there is no default, state it
+//   export INGEST_SUBDIVIDE_MAX_ZOOM=11          # the live value; there is no default, state it
+//   export INGEST_PACKAGE_URL="$(az functionapp config appsettings list \
+//     -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
+//     --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)"
 //   az deployment group create \
 //     --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
 //     --template-file infra/azure/ingest.bicep \
 //     --parameters infra/azure/ingest.bicepparam
 //   unset INGEST_DATABASE_URL
 //
-// **A template deployment alone leaves the app codeless.** Linux Consumption runs from a package URL
-// that `.github/scripts/deploy-worker.sh` writes into the same application-settings collection an
-// ARM deployment replaces wholesale, so the deploy above and the package push always run
-// together, template first. The symptom in between is `0 functions found` and `No job functions
-// found` in `traces`, with `az functionapp function list` returning nothing — read that as "the
-// package setting was replaced", not as a broken bundle. See the note beside the Function App in
-// ingest.bicep.
+// Those five exports are the whole set with no fallback: `databaseUrl`, `overpassUserAgent`,
+// `ingestTrailIdentity`, `ingestSubdivideMaxZoom` and `packageUrl`. Every one of them names a live
+// control that a default would silently overwrite, so an unset variable fails the build with
+// `BCP427` rather than deploying a changed estate. `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` do have
+// fallbacks, and their fallbacks match what the app already holds.
 
 using './ingest.bicep'
 
@@ -34,13 +36,20 @@ param functionAppPrefix = 'func-switchback-ingest'
 param logAnalyticsWorkspaceName = 'log-switchback-prod'
 param alertActionGroupName = 'ag-switchback-prod'
 
-// How deep subdivision may go. `9` is off, and off is what an unset variable resolves to: unlike
-// the driver above, only one direction of this flag is dangerous. A split cuts fresh interior
-// seam through tiles that are currently whole, and a multi-way trail crossing one is written back
-// truncated plus a duplicate — permanently, because `commitTrail` only upserts. Deleting the
-// setting stops new splits and does not undo that, so both of these default off and the ceiling
-// is inert on its own: `subdivideMaxZoom` reads it as 9 unless identity is `claim`.
-param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')
+// How deep subdivision may go. The live app holds `11`, and an application-settings write replaces
+// the collection whole — so a fallback here would silently write `9` on any deploy from a shell that
+// forgot to export it, and `9` turns subdivision off: `canSubdivide(9, 9)` is false, so a dense z9
+// tile is failed rather than split. That is the 540 s overrun class subdivision exists to bound, so
+// there is no safe default in either direction. An unset variable fails the build with `BCP427`.
+// The pairing with `ingestTrailIdentity` is enforced in code as well: `subdivideMaxZoom` reads the
+// ceiling as `9` whatever is deployed unless identity is `claim`.
+param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM')
+
+// The package the Function App runs from. No fallback for the same reason as the two flags: an
+// application-settings write replaces the collection whole, so any value here that is not the live
+// one leaves the app running a different build — or, before this parameter existed, no build at all.
+// Read the live value first; the deploy block above shows the command.
+param packageUrl = readEnvironmentVariable('INGEST_PACKAGE_URL')
 
 // The live Function App reads `claim`, and an application-settings write replaces the collection
 // whole. A fallback here would therefore take identity off the worker on any deploy from a shell

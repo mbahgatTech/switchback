@@ -9,9 +9,18 @@ import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 
 /**
- * How many messages the pump will leave in flight. One worker takes them at ~10-30 s each, so
- * eight is under three minutes of work — long enough that the queue never runs dry between
- * ticks, short enough that a tile someone is looking at is not stuck behind a day of backlog.
+ * How many messages the pump will leave in flight.
+ *
+ * Not a work-time budget — that reading does not survive measurement. Over the 50 `ingestDrain`
+ * invocations of 2026-08-08 the distribution is bimodal: a median of 2.1 s for the ones that find
+ * nothing claimable, a mean of 126.2 s and a p90 of 540.1 s for the ones that drain a tile. At
+ * `maxConcurrentCalls: 1` a queue eight deep is therefore ~15 minutes of work at the mean and over
+ * an hour at p90, which is past `defaultMessageTimeToLive`.
+ *
+ * Eight is a *wake-up* depth, and it is safe at that dwell because the queue holds no state: a
+ * message that expires is deleted silently, its `ingest_jobs` row is still `queued`, and the next
+ * tick republishes it. What the depth actually buys is that the queue never runs dry between ticks;
+ * what `PUMP_LOW_WATER` buys is that a backlog of duplicates cannot build up behind a slow tile.
  */
 export const PUMP_QUEUE_DEPTH = 8;
 

@@ -3,7 +3,7 @@
  * runs it every two minutes, which is the estate's only maintenance schedule.
  */
 
-import { JobStatus, prisma } from '@switchback/db';
+import { JobStatus, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
@@ -16,14 +16,17 @@ export interface SweepResult {
   retired: number;
   /** Split markers cleared from parents that have no children — see `reconcileOrphanedSplits`. */
   unsplit: OrphanedSplitRepair[];
+  /** Tiles left `running` by a handler that never came back — see `repairWedgedTiles`. */
+  unwedged: string[];
 }
 
 /**
- * Take back expired leases and clear split markers left by a subdivision that produced nothing.
+ * Take back expired leases, clear split markers left by a subdivision that produced nothing, and
+ * correct tiles whose handler never came back.
  *
- * Each half is caught separately: these are bookkeeping, and neither is worth failing a request
- * or a cron tick for. What they return is counted by the caller, which is the only place the
- * result is worth a log line.
+ * Each part is caught separately: these are bookkeeping, and none is worth failing a request or a
+ * cron tick for. What they return is counted by the caller, which is the only place the result is
+ * worth a log line.
  */
 export async function sweepQueue(
   db: PrismaClient = prisma,
@@ -44,7 +47,19 @@ export async function sweepQueue(
     console.warn('[ingest] split reconciliation failed', error);
   }
 
-  return { requeued, retired, unsplit };
+  /*
+   * After the lease sweep, never before: a reclaim turns a job back to `queued`, which is exactly
+   * the condition that makes its tile not wedged. Running this first would fail tiles the sweep
+   * was about to rescue.
+   */
+  let unwedged: string[] = [];
+  try {
+    unwedged = await repairWedgedTiles(db, now);
+  } catch (error) {
+    console.warn('[ingest] wedged tile repair failed', error);
+  }
+
+  return { requeued, retired, unsplit, unwedged };
 }
 
 /**
@@ -155,27 +170,91 @@ export function formatQueueHealth(health: QueueHealth): string {
  * Tiles stuck mid-fetch: `running` with nothing fetched and no job that can finish them.
  *
  * `processTile` writes `running` before it queries and every exit rewrites the row, so a tile left
- * `running` is one whose invocation did not come back. Nineteen of them sat in production on
- * 2026-08-07 with nothing observing the number: `staleLeases` counts `ingest_jobs`, and the job
- * beneath a wedged tile is frequently *not* stale — it was completed, or reclaimed and buried —
- * which is exactly why the tile is the thing that has to be counted.
+ * `running` is one whose invocation did not come back. `staleLeases` does not see them: it counts
+ * `ingest_jobs`, and the job beneath a wedged tile is frequently *not* stale — it was completed, or
+ * reclaimed and buried — which is why the tile is the thing that has to be counted. Measured on
+ * 2026-08-08, the first day this gauge ran in production: six of 37 readings non-zero, peak six.
  *
- * The join is what keeps the gauge from pinning. A tile is only wedged if no job of its own is
- * `queued` or `running`; while one is, the tile is mid-flight and healthy, which is the state
- * every tile passes through on the way to `ready`.
+ * The join is what keeps the gauge from pinning on a tile that is merely mid-flight. A tile is only
+ * wedged if no job of its own is `queued` or `running`; while one is, the tile is on its way to
+ * `ready`, which is the state every tile passes through.
+ *
+ * `WEDGE_GRACE_MS` is what keeps it from pinning on a tile nothing will ever repair. `runPump`
+ * selects only `queued` jobs and `reclaimExpiredJobs` only moves `running` to `queued` or `dead`,
+ * so a tile whose job was buried on its last attempt has no route back and would otherwise be
+ * counted forever. `repairWedgedTiles` is the route back; this window is how long a tile waits for
+ * it before it is worth reporting.
  */
-export async function countWedgedTiles(db: PrismaClient): Promise<number> {
+export async function countWedgedTiles(
+  db: PrismaClient,
+  now: Date = new Date(),
+  graceMs: number = WEDGE_GRACE_MS,
+): Promise<number> {
+  const wedgedBefore = new Date(now.getTime() - graceMs);
   const [row] = await db.$queryRaw<Array<{ count: number }>>`
     SELECT count(*)::int AS count
       FROM ingest_tiles tile
      WHERE tile.status = 'running'
        AND tile."fetchedAt" IS NULL
+       AND tile."updatedAt" < ${wedgedBefore}
        AND NOT EXISTS (
              SELECT 1 FROM ingest_jobs job
               WHERE job."dedupeKey" = 'ingest_tile:' || tile.quadkey
                 AND job.status IN ('queued', 'running'))
   `;
   return row?.count ?? 0;
+}
+
+/**
+ * How long a tile may sit `running` with no job before it counts as wedged.
+ *
+ * One lease plus one pump tick plus slack: everything that legitimately rescues such a tile —
+ * `reclaimExpiredJobs` returning the lease, then `runPump` republishing it — has completed inside
+ * that. Below it the gauge would count tiles that are about to be repaired by the ordinary path.
+ */
+export const WEDGE_GRACE_MS = LEASE_TIMEOUT_MS + 5 * 60 * 1000;
+
+/**
+ * The literal `switchback-ingest-drain-failed` greps for, written into the tile's `lastError`.
+ *
+ * A wedged tile is repaired by correcting the row rather than by retrying it, so nothing else
+ * would record that it happened.
+ */
+export const TILE_WEDGED_MARKER = 'switchback-ingest-tile-wedged';
+
+/**
+ * Take tiles out of `running` when nothing is running them.
+ *
+ * `running` is a claim that a handler holds this tile. A tile whose handler the host killed on its
+ * last attempt has no such holder and no route back: `runPump` publishes only `queued` jobs and
+ * `reclaimExpiredJobs` only moves `running` to `queued` or `dead`, so neither reaches it. Left
+ * alone the row states something false forever and `wedgedTiles` never falls.
+ *
+ * `failed` is the repair rather than a re-enqueue: a tile that has exhausted its attempts is
+ * exactly what re-enqueueing loops on. `isTileFresh` treats `failed` as re-fetchable, so the next
+ * request for that area picks it up on the ordinary path, with the reason still on the row.
+ */
+export async function repairWedgedTiles(
+  db: PrismaClient = prisma,
+  now: Date = new Date(),
+  graceMs: number = WEDGE_GRACE_MS,
+): Promise<string[]> {
+  const wedgedBefore = new Date(now.getTime() - graceMs);
+  const repaired = await db.$queryRaw<Array<{ quadkey: string }>>`
+    UPDATE ingest_tiles tile
+       SET status = ${TileStatus.failed}::"TileStatus",
+           "lastError" = ${`${TILE_WEDGED_MARKER}: left running with no job that could finish it`},
+           "updatedAt" = ${now}
+     WHERE tile.status = 'running'
+       AND tile."fetchedAt" IS NULL
+       AND tile."updatedAt" < ${wedgedBefore}
+       AND NOT EXISTS (
+             SELECT 1 FROM ingest_jobs job
+              WHERE job."dedupeKey" = 'ingest_tile:' || tile.quadkey
+                AND job.status IN ('queued', 'running'))
+    RETURNING tile.quadkey
+  `;
+  return repaired.map((row) => row.quadkey);
 }
 
 /**
@@ -223,7 +302,7 @@ export async function queueHealth(
     }),
     countOrphanedSplits(db),
     db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
-    countWedgedTiles(db),
+    countWedgedTiles(db, now),
     db.ingestJob.findFirst({
       where: { status: JobStatus.queued, runAfter: { lte: now } },
       orderBy: { runAfter: 'asc' },

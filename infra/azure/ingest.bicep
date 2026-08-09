@@ -94,23 +94,46 @@ param terrainTileUrl string = ''
 param mapillaryToken string = ''
 
 @description('''
+The package the Function App runs from, written to `WEBSITE_RUN_FROM_PACKAGE`.
+
+**Declared here because an application-settings write replaces the collection whole.** Linux
+Consumption mounts its code from this URL and `.github/scripts/deploy-worker.sh` writes it into the
+same collection an ARM deployment replaces — so omitting it from the template left every deployment
+that ran on its own with a codeless app until the next package push. Declaring it makes a
+template-only deploy write back the URL that is already live.
+
+No default, for the reason `ingestTrailIdentity` has none: a fallback would silently point the app
+at some other build, while an unset variable fails the build with `BCP427` before anything reaches
+Azure. `infra/azure/README.md` documents reading the live value into `INGEST_PACKAGE_URL` first,
+which is one `az functionapp config appsettings list` away.
+
+`BUILD_COMMIT` is stamped into the bundle by `apps/ingest-worker/scripts/bundle.ts`, so the
+`switchback-ingest-queue-health build=<sha>` heartbeat — not this URL — is what proves which build
+is actually mounted.
+''')
+param packageUrl string
+
+@description('''
 How deep a tile that outruns `INGEST_DEADLINE_MS` may be subdivided. `9` is off: no tile splits,
 a dense one fails exactly as it did before, and children already created still finish and still
 roll up. `11` allows two levels — six Alps tiles hit the 540 s wall on 2026-08-04, and `120221203`
 measures 6,440 Overpass elements at z9 against 1,641 in its first z10 child, so one level is
-expected to be enough and the second is margin.
+expected to be enough and the second is margin. **The live app holds `11`.**
 
-**A parameter, not a literal, and `ingest.bicepparam` resolves it to `9` unless the deploying
-shell says otherwise.** An ARM application-settings write replaces the collection whole, so a
-value baked into the template would re-enable subdivision on the next routine deploy after an
-operator had turned it off at 3am. The polarity is the point: the unsafe direction here is only
-ever *on*, so a forgotten `export` must land on off.
+**A parameter with no default, on either side.** An ARM application-settings write replaces the
+collection whole, so a literal in the template would re-enable subdivision on the next routine
+deploy after an operator had turned it off. A *fallback* in `ingest.bicepparam` is the same defect
+pointing the other way: the live value is `11`, so a deploy from a shell that forgot to export it
+would silently write `9` and turn subdivision off. `9` is not the safe direction once the ceiling is
+live — `canSubdivide(9, 9)` is false, so a dense z9 tile is failed rather than split, which is the
+540 s overrun class subdivision exists to bound. An unset variable therefore fails the build with
+`BCP427` before anything reaches Azure, exactly as `INGEST_TRAIL_IDENTITY` does.
 
-Subdivision stays off in the committed parameters until `INGEST_TRAIL_IDENTITY` is `claim`. A new
-interior seam fragments a multi-way trail that crosses it — `assembleTrails` keys a way-trail by
-the lowest way id *it saw*, and `commitTrail` only ever upserts — so a split writes damage into
-`trails` that turning the flag back off does not undo. `subdivideMaxZoom` enforces the pairing in
-code as well: with identity on `osm-id` the ceiling reads as `9` whatever is deployed here.
+Subdivision stays paired with `INGEST_TRAIL_IDENTITY` being `claim`. A new interior seam fragments a
+multi-way trail that crosses it — `assembleTrails` keys a way-trail by the lowest way id *it saw*,
+and `commitTrail` only ever upserts — so a split writes damage into `trails` that turning the flag
+back off does not undo. `subdivideMaxZoom` enforces the pairing in code as well: with identity on
+`osm-id` the ceiling reads as `9` whatever is deployed here.
 ''')
 @allowed([
   '9'
@@ -325,10 +348,17 @@ catches per job and routes to `failJob`, and retry semantics for the work itself
 `maxAttempts` and the `dead` status in Postgres, none of which Service Bus can express. Dead-lettering
 expired messages would fill the DLQ with stale wake-up signals and hide the one thing it should mean.
 
-`defaultMessageTimeToLive: PT1H` against a 14-day default: a signal older than an hour is worthless
-because the pump re-derives the truth every two minutes. The dedupe window is 10 minutes, above the
-pump interval plus the worst-case dwell of a queue held at most eight deep, and below the lease for
-the reason above.
+**`defaultMessageTimeToLive: PT1H` does expire messages, and that is survivable rather than
+prevented.** Measured over the 50 `ingestDrain` invocations of 2026-08-08: mean 126,245 ms, p90
+540,111 ms, max 548,954 ms, 20 of 50 past 30 s. At `maxConcurrentCalls: 1` a queue eight deep is
+~15 minutes of dwell at the mean and over an hour at p90, so both the 10-minute dedupe window and
+this TTL are exceeded in the tail. Neither loses work: the queue carries a wake-up signal and
+`ingest_jobs` carries the record, so an expired message leaves a `queued` row that the next pump
+tick republishes. `PUMP_LOW_WATER` is what stops the republishes stacking up behind a slow tile.
+
+The dedupe window is 10 minutes for one reason only — it must be *shorter* than `LEASE_TIMEOUT_MS`
+(720 s), or the pump's republish of a reclaimed job is discarded as a duplicate of the message a
+redelivery already completed, and the tile is lost with nothing logged. 120 s of margin.
 ''')
 resource queue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   parent: namespace
@@ -475,15 +505,15 @@ signal, not noise, so the threshold is zero and the severity is 2.
 **`autoMitigate` is off, and that is forced by the metric.** `DeadletteredMessages` is the *depth*
 of the dead-letter queue, and nothing drains it: a dead-lettered message sits there until a person
 removes it. So the gauge never returns to zero on its own, and an auto-mitigating rule on it would
-either stay fired forever or — worse, on `Maximum` over a rolling window — resolve and re-fire on
-every evaluation while the depth was unchanged. Edge-triggered is the honest reading: the alert
-means "a message was dead-lettered", the operator drains the queue, and closing the alert is part
-of that work rather than something the platform guesses at.
+stay fired until somebody acted anyway. Edge-triggered is the honest reading: the alert means "a
+message was dead-lettered", the operator drains the queue, and closing the alert is part of that
+work rather than something the platform guesses at.
 
-`Total` rather than `Maximum` or `Average` for the same reason. On a gauge that only rises, all
-three fire on the first message; what distinguishes them is what happens afterwards, and summing
-the window keeps a second dead letter visible in the alert payload rather than hidden behind an
-unchanged maximum.
+`Maximum` because it is the only aggregation that is both accepted and correct here. Service Bus
+publishes `DeadletteredMessages` with `supportedAggregationTypes` of Average, Minimum and Maximum —
+`Total` is not among them. It is also the wrong reading on a depth gauge: summing a window conflates
+depth with duration, so one message sitting for fifteen minutes and fifteen messages arriving in one
+read identically. `Maximum` moves 1 → 2 on the second dead letter, which is the thing to see.
 
 Draining it is `infra/azure/README.md`, "A message dead-lettered".
 ''')
@@ -518,7 +548,7 @@ resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
           ]
           operator: 'GreaterThan'
           threshold: 0
-          timeAggregation: 'Total'
+          timeAggregation: 'Maximum'
           criterionType: 'StaticThresholdCriterion'
         }
       ]
@@ -825,17 +855,17 @@ put it back.
 
 ---
 
-**`WEBSITE_RUN_FROM_PACKAGE` is deliberately absent, and that makes deploy ordering a hard rule.**
-Linux Consumption runs the code from a package URL that `.github/scripts/deploy-worker.sh` writes
-into this same collection — and an ARM application-settings write replaces the collection whole.
-Declaring it here would fight that script; omitting it means a Bicep deployment on its own
-leaves the app codeless until the next push. So the template deploy and the package push always run
-together, template first, **and a `syncfunctiontriggers` POST after** — otherwise the host comes back
-with `0 functions loaded`, `az functionapp function list` returns nothing, and a Consumption app with
-no registered triggers has nothing to scale on, so it never runs again and a restart does not fix it.
-See infra/azure/README.md for the command. Anything the worker needs from the environment belongs in
-this list for the same reason: a setting added by hand in the portal is erased by the next
-deployment.
+**`WEBSITE_RUN_FROM_PACKAGE` is declared here, from the `packageUrl` parameter.** Linux Consumption
+runs the code from a package URL that `.github/scripts/deploy-worker.sh` writes into this same
+collection — and an ARM application-settings write replaces the collection whole. Leaving it out of
+the template therefore left the app codeless after any deployment that ran without a package push;
+declaring it means a template-only deploy writes back the URL that is already live, provided
+`INGEST_PACKAGE_URL` names it. A `syncfunctiontriggers` POST is still required whenever the package
+*changes* — otherwise the host comes back with `0 functions loaded`, `az functionapp function list`
+returns nothing, and a Consumption app with no registered triggers has nothing to scale on, so it
+never runs again and a restart does not fix it. See infra/azure/README.md for the command. Anything
+the worker needs from the environment belongs in this list for the same reason: a setting added by
+hand in the portal is erased by the next deployment.
 ''')
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: functionAppName
@@ -859,6 +889,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       use32BitWorkerProcess: false
       appSettings: concat(
         [
+          {
+            name: 'WEBSITE_RUN_FROM_PACKAGE'
+            value: packageUrl
+          }
           // Host storage as the app's own identity. The double underscore is read at runtime as a
           // colon, so these four are properties of one `AzureWebJobsStorage` object rather than
           // four settings; a plain `AzureWebJobsStorage` value alongside them would win, which is
@@ -982,14 +1016,22 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           // Wall clock held back for the commit loop. Without it the two Overpass queries could
           // consume the whole handler budget, every trail threw `IngestDeadlineError`, and the
           // tile subdivided into four children that repeated the exercise — measured 2026-08-08 as
-          // six invocations running 540,111 ms to 548,954 ms past a 540,000 ms bound.
+          // six invocations running 540,111 ms to 548,954 ms past a 540,000 ms bound. 150,000 is
+          // measured too: the work after `assembled` on the 23 invocations that finished inside the
+          // budget between 2026-08-05 and 2026-08-08 ran 32.9 s to 381.2 s, median ~133 s.
           {
             name: 'INGEST_COMMIT_RESERVE_MS'
             value: '150000'
           }
+          // 190,000 is `OverpassClient.requestTimeoutMs`: one full attempt. Budget above that can
+          // only fund a retry that starts too late to finish a query whose server-side `[timeout:]`
+          // is up to 180 s, and every millisecond of it comes out of the start-by. The 240,000 it
+          // replaces pushed the start-by to 150 s, which refused five of five parent-route lookups
+          // on 2026-08-08 between 22:34 and 22:48 UTC and would have refused the feature query on
+          // the tile that reached `assembled` at 168.4 s (quadkey 133002102, 17:02:11 UTC).
           {
             name: 'OVERPASS_MAX_TOTAL_MS'
-            value: '240000'
+            value: '190000'
           }
           // The outer wall clock, covering every phase rather than only Overpass — terrain and
           // the per-trail commits included, through `PipelineDeps.deadlineAt`. Past 540 s no
@@ -1274,12 +1316,23 @@ and none carried a token any rule could match.
 covers the one state no reclaim can free — a `running` row whose `lockedAt` is NULL, which
 `lockedAt < cutoff` never matches however long it sits. That is a different fault from a killed
 handler and it needs its own arm; it is not a second chance at the same one.
-**The sixth arm covers the pump, which is now the only route from `ingest_jobs` to a drainer.**
+
+**The sixth arm is the one condition `writeOutcome`'s lease fence exists to detect.**
+`switchback-ingest-double-commit` is written when a handler finished under a lease that had already
+been taken back, so the same trails were committed twice. The count lives only in `DrainResult.lost`
+and the row belongs to whoever reclaimed it, so without this line nothing anywhere records it.
+
+**The seventh arm is a repair, reported because nothing else would show it happened.**
+`switchback-ingest-tile-wedged` is written by `repairWedgedTiles` when it takes a tile out of
+`running` that no job could have finished. A tile reaches that state only by having its handler
+killed on its last attempt, so the repair firing means the killing is still happening.
+
+**The eighth arm covers the pump, which is now the only route from `ingest_jobs` to a drainer.**
 `runPump` reads the queue depth through ARM and publishes; if either throws, `ingestPump` rejects.
 `reportQueueHealth` has already run by then, so `switchback-ingest-worker-silent` stays quiet on its
 heartbeat and the estate looks alive while nothing reaches the queue. Unlike the drain, a rejected
 timer invocation does write a request row — the process is not killed — so `success == false` is the
-right predicate here even though it is the wrong one two arms up.
+right predicate here even though it is the wrong one four arms up.
 ''')
 resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-failed'
@@ -1298,7 +1351,7 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
+          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-tile-split" or message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (traces | where message has "switchback-ingest-double-commit" | project timestamp), (traces | where message has "switchback-ingest-tile-wedged" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -1364,6 +1417,56 @@ resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
       ]
     }
     autoMitigate: false
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
+@description('''
+**Three of a tile's four Overpass queries fail soft, so a budget that is too tight loses data
+silently.** Region, waypoints and parent-route discovery all catch and carry on: the tile still
+reaches `ready`, the request row still reads success, and no job row records anything. Measured on
+2026-08-08, five of five invocations that reached parent-route discovery between 22:34 and 22:48 UTC
+were refused by the start-by, and nothing in the estate said so.
+
+`packages/ingest/src/pipeline.ts` now prefixes all three with `switchback-ingest-overpass-skipped`,
+which is what makes them countable. The threshold is not zero: one skipped waypoint query is a slow
+mirror, and paging on it would be noise. Sustained skipping means the budget or the upstream has
+moved, which is a person's decision — hence severity 3 and `autoMitigate` on, since unlike a dead
+letter this genuinely recovers on its own.
+''')
+resource overpassSkippedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-overpass-skipped'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-overpass-skipped'
+    description: 'Tiles are completing without their region, waypoints or parent routes because Overpass queries are being refused or failing. The data loss is silent everywhere else.'
+    severity: 3
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'traces | where message has "switchback-ingest-overpass-skipped" | project timestamp'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 4
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
     actions: {
       actionGroups: [
         actionGroup.id

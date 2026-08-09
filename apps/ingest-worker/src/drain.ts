@@ -42,11 +42,16 @@ export const HANDLER_DEADLINE_MS = 540_000;
  * children that each repeated the exercise. Measured 2026-08-08: six invocations ran 540,111 ms to
  * 548,954 ms past a 540,000 ms bound, every one of them reporting success.
  *
- * Reserving the tail closes that: the last moment a query may start is
+ * Reserving the tail closes that: the last moment a pre-commit query may start is
  * `HANDLER_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS`, so whatever Overpass
  * does the commit loop still gets this long. A tile that then runs out of clock has run out of it
  * *committing trails*, which is what "too big for one invocation" actually looks like and what
  * subdivision is the answer to.
+ *
+ * **150 s is what the commit loop measurably needs.** Of the 23 invocations between 2026-08-05 and
+ * 2026-08-08 that logged `assembled` and finished inside the handler budget, the work after
+ * assembly took 32.9 s to 381.2 s, median ~133 s. The reserve clears the median; it is not a
+ * promise that every tile fits, which is subdivision's job and not a budget's.
  */
 export const COMMIT_RESERVE_MS = 150_000;
 
@@ -61,12 +66,16 @@ export function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): numb
 }
 
 /**
- * The last moment this invocation will *start* an Overpass query.
+ * The last moment this invocation will *start* an Overpass query that precedes the commit loop.
  *
  * Derived rather than configured, because the three numbers have to add up and a deployment that
  * sets them independently is one `az functionapp config appsettings set` away from the budget
  * arithmetic above being false again. `INGEST_OVERPASS_DEADLINE_MS` may still lower it — an
  * operator tightening the clamp is always safe — but never raise it past the reserve.
+ *
+ * Only the pre-commit queries. `discoverParentRoutes` runs after the tile is `ready` and after the
+ * commit loop has finished, so refusing it reserves nothing for anybody; it gets the handler
+ * deadline instead, through `PipelineDeps.overpassAfterCommits`.
  */
 export function overpassDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
   const reserve = positive(source.INGEST_COMMIT_RESERVE_MS, COMMIT_RESERVE_MS);
@@ -189,10 +198,12 @@ export async function runIngestSignal(
   const drain = options.drain ?? drainIngest;
   const db = options.db ?? backgroundPrisma;
   const startedAt = Date.now();
-  // A view of the shared client, not a second one: the queue and the breaker stay the
-  // singleton's, so the concurrency ceiling is unchanged.
+  const handlerDeadline = startedAt + handlerDeadlineMs();
+  // Views of the shared client, not second ones: the queue and the breaker stay the singleton's,
+  // so the concurrency ceiling is unchanged.
   const overpass =
     options.overpass ?? withDeadline(getOverpass(), startedAt + overpassDeadlineMs());
+  const overpassAfterCommits = options.overpass ?? withDeadline(getOverpass(), handlerDeadline);
 
   let result: DrainResult;
   try {
@@ -203,7 +214,8 @@ export async function runIngestSignal(
       workerId: options.workerId,
       deps: {
         overpass,
-        deadlineAt: startedAt + handlerDeadlineMs(),
+        overpassAfterCommits,
+        deadlineAt: handlerDeadline,
         logger: pipelineLogger(log),
       },
     });
@@ -273,6 +285,16 @@ async function assertSettleable(
 export const JOB_FAILED_MARKER = 'ingest-job-failed';
 
 /**
+ * The literal `switchback-ingest-drain-failed` greps for when a handler committed under a lease
+ * that had already been taken back — the work ran twice.
+ *
+ * This is the condition `writeOutcome`'s lease fence exists to detect, and the fence's own count
+ * (`DrainResult.lost`) is written nowhere but this line: the row belongs to whoever reclaimed it,
+ * so nothing on `ingest_jobs` records that a second process also finished it.
+ */
+export const DOUBLE_COMMIT_MARKER = 'switchback-ingest-double-commit';
+
+/**
  * Give the pipeline somewhere to log. Until this existed `PipelineDeps.logger` was set on no
  * deployed path — only `scripts/ingest.ts` — so every line subdivision emits went to
  * `deps.logger ?? (() => {})` and a split was indistinguishable from an ordinary `done`.
@@ -315,7 +337,9 @@ function report(signal: IngestSignal, result: DrainResult, log: WorkerLog): void
   }
 
   if (result.lost > 0) {
-    log.warn(`ingest ${key}: finished after its lease expired — the work ran twice`);
+    log.error(
+      `${DOUBLE_COMMIT_MARKER} ${key}: finished after its lease expired — the work ran twice`,
+    );
   }
 
   if (result.requeued > 0 || result.retired > 0) {

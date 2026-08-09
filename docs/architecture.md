@@ -112,6 +112,24 @@ per queued tile and makes no Overpass call at all; the Azure Functions worker dr
 message. There is no second driver and no flag selecting between them — the Vercel-side drainers
 (`/api/cron/drain`, `kickIngest`'s inline pass and `kickNetwork`'s) are deleted, not disabled.
 
+**So there is no rollback switch for ingestion, and that is the operational story.** Nothing can be
+flipped to make Vercel drain again; the code is not there to run. What an operator has instead is
+three brakes of increasing severity, all on the Function App, none of them a deploy — and the honest
+last one is _stop the Function App_:
+
+| Symptom                                                                    | Do this                                  | What it costs                                                                                       |
+| -------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| The queue is filling faster than it drains, or a bad tile is being retried | `INGEST_PUMP_ENABLED=false`              | new work stops reaching the queue; in-flight messages finish, each idempotent                       |
+| Overpass is rate-limiting, or the drain itself is the fault                | `AzureWebJobs.ingestDrain.Disabled=true` | nothing drains, but the pump keeps reporting queue health, so there is still a gauge                |
+| Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped |
+
+None loses a tile. `ingest_jobs` is the record and the pump re-derives the runnable head every two
+minutes, so every brake costs latency and nothing else. Reading trails, browsing and every other
+request path are untouched by all three — ingestion is the only thing that stops.
+
+The commands, and the read-back that proves each landed, are under _Rolling a control back_ below.
+A bad _build_ is a different lever from a bad _tile_: see the code rollback there.
+
 `ingest_jobs` stays the queue of record: a message names work, it never carries it, so a lost
 message costs a wait rather than a tile. A timer pump in the worker re-derives the runnable head of
 `ingest_jobs` every two minutes and tops the queue back up, which is what keeps `priority DESC`
@@ -192,11 +210,28 @@ az functionapp config appsettings list -g "$RG" -n "$APP" \
 `ingest_jobs` rows outlive any message, and the pump republishes the runnable head every two minutes
 once it is back, so the cost of a long stop is the latency of one pump tick.
 
-**Rolling the code back is a separate lever.** `WEBSITE_RUN_FROM_PACKAGE` names the zip the host
-runs; `.github/scripts/deploy-worker.sh` is the only thing that writes it, and the release container
-keeps prior builds under their commit SHA. Pointing it at the previous SHA and restarting is how a
-bad build is undone — application-settings writes replace the collection wholesale, so read, modify
-and write the full set.
+**Rolling the code back is a separate lever, and it is a script rather than a setting.**
+`WEBSITE_RUN_FROM_PACKAGE` names the zip the host runs, and the release container keeps prior builds
+under their commit SHA — but changing it by hand is not enough. After the package changes, the scale
+controller still holds the old trigger set: the host comes back reporting `0 functions loaded`, `az
+functionapp function list` returns nothing, and a restart does not clear it, because a Consumption
+app with no registered triggers has nothing to scale on. `.github/scripts/deploy-worker.sh` POSTs
+`syncfunctiontriggers` for exactly that reason, then re-reads the setting and waits for a
+`switchback-ingest-queue-health build=<sha>` heartbeat before reporting success.
+
+So: **re-run `deploy-worker.sh` against the previous SHA.** By hand it is the same two calls, in this
+order — `appsettings set` is read-modify-write on the one key, so it does not disturb the rest of the
+collection:
+
+```bash
+az functionapp config appsettings set -g "$RG" -n "$APP" -o none \
+  --settings "WEBSITE_RUN_FROM_PACKAGE=https://<storage>.blob.core.windows.net/function-releases/<sha>-<ts>.zip"
+az rest --method POST -o none --url \
+  "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RG}/providers/Microsoft.Web/sites/${APP}/syncfunctiontriggers?api-version=2023-12-01"
+```
+
+Confirm the build that came up rather than the URL that went in: `BUILD_COMMIT` is stamped into the
+bundle, so the heartbeat names the package that actually mounted.
 
 **Do not restart within ten minutes of stopping.** The queue carries
 `duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
@@ -358,10 +393,14 @@ because Node's `fetch` imposes none and a stalled socket is how you reach 615,93
 phase ever _starting_ late.
 
 **And it now alerts — on the job, which is where the failure actually lands.** A killed invocation
-does not dead-letter: the redelivery finds the row still under the killed invocation's lease, logs
-"nothing claimable" and _completes_ the message in ~165 ms, so `DeliveryCount` never reaches 2 and
+does not dead-letter: the redelivery finds the row still under the killed invocation's lease and
+`classifyDisposition` reads that as `rescheduled`, because the pump is what re-runs it, so the
+message is completed in ~165 ms, `DeliveryCount` never reaches 2, and
 `switchback-ingest-deadletter` — which fires on `DeadletteredMessages` — structurally cannot see it.
-`deadLetterMessageCount` was 0 for the whole run while this happened twice.
+`deadLetterMessageCount` was 0 for the whole run while this happened twice. The one delivery that
+does _not_ complete is the one whose row is past `LEASE_TIMEOUT_MS` or has no `lockedAt` at all:
+that means the reaper itself has stopped, so `assertSettleable` throws and
+`switchback-ingest-signal-stranded` says so.
 
 The first version of `switchback-ingest-drain-failed` read `requests | where success == false`, and
 that was blind to the failure mode it was written for. `drainJobs` catches every handler error,
@@ -1016,10 +1055,11 @@ left to scale on.
 
 ## Rolling a control back
 
-Two environment variables change what ingest does. **Both are read by two processes** — the Vercel
-deployment and the Function App — because `@switchback/ingest` reads `process.env` and both runtimes
-load it. Only the Function App drains, so only its value changes behaviour; the Vercel side is set
-to match so that the two do not disagree in a way nobody can see.
+Two environment variables change what ingest does, and **only the Function App's copies matter.** It
+is the only process that drains, so it is the only process whose value changes behaviour —
+`apps/web/src/env.ts` declares them on the Vercel side purely so a typo is a startup error rather
+than a silent misread, and nothing there reads them for behaviour. Every rollback below is therefore
+one write, against the Function App.
 
 Both are **not fully reversible**, and the table says which part is not. Reversing the setting is
 never the same as reversing what happened while it was on.
@@ -1080,8 +1120,7 @@ diagnosis — in `PG*` form, for `psql` and `pg_dump` — are in
 
 ### `INGEST_SUBDIVIDE_MAX_ZOOM` → `9`
 
-Only the Function App carries this variable, and only the Function App drains, so this rollback is
-one write.
+One write, against the Function App, for the reason at the top of this section.
 
 ```bash
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
@@ -1094,9 +1133,9 @@ az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   --query "[?name=='INGEST_SUBDIVIDE_MAX_ZOOM'].value | [0]" -o tsv                # expect 9
 ```
 
-Removing the Vercel variable rather than setting it to `9` is deliberate: an absent value resolves to
-`INGEST_ZOOM`, so the two spellings mean the same thing and the absent one cannot be misread as a
-ceiling somebody chose.
+The next template deployment will write `11` back unless the deploying shell exports `9` —
+`ingest.bicepparam` has no fallback for this parameter precisely so the value is always stated. An
+incident rollback that is meant to outlive the incident belongs in that export.
 
 **Tiles already split stay split.** To put one back, delete its subtree and clear its marker in the
 same operation:
