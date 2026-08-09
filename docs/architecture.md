@@ -674,6 +674,33 @@ kept apart deliberately: a breaker that is open, a mirror answering 504 and a ma
 mean come back later, and subdividing on those would quadruple the load on a service already
 refusing.
 
+### The commit phase computes, then writes
+
+A tile's trails are committed in batches of `COMMIT_BATCH_SIZE`, and the ordering inside a batch is
+the point rather than the batching alone: every trail's geometry, profile and waypoints are computed
+first, and only then does one transaction write the whole group.
+
+**What that fixes is a transaction expiring against an idle database.** Under one transaction per
+trail, a trail's transaction was open while the other five in flight ran their per-feature
+enrichment scans — and those scans are synchronous, so nothing else on the event loop can resolve
+while one runs. On quadkey `023010230` two transactions expired at 34,372 ms and 39,599 ms against a
+30 s ceiling while the server's own `cpu_percent` read 8.24–12.20 and it consumed zero burst
+credits. Over the trailing seven days to 2026-08-09, 29 of the 30 non-deadline trail failures were
+that expiry. Nothing computes inside the transaction now, so it is bounded by round trips alone.
+
+**The batch is the fast path; the per-trail write is the correctness floor.** A batch that throws
+is rolled back whole and every member is rewritten alone, so the good rows still land and the bad
+one throws on its own account — which is what keeps
+`switchback-ingest-trail-lost <quadkey>: N of M trail(s) did not commit: <osm ids>` naming the trail
+rather than the batch. The worst case for one poison row in a batch of N is that batch's round trips
+spent twice; no compute repeats, because the prepared trails are reused.
+
+**It buys the failure mode, not the wall clock.** Measured over the same 105 trails of `023010230`
+against a local PostGIS, batching took the commit phase from 2,735 statements and 3,053 ms inside
+transactions to 1,547 and 1,887 — and left wall clock at 34.8 s against 36.6 s. A dense tile is
+compute-bound, and `attachWaypoints` is where that compute is; see `COMMIT_CONCURRENCY` in
+`pipeline.ts` for the measurements that rule out concurrency and worker threads as answers to it.
+
 **Split on failure, not up front.** Pre-sizing every tile with an Overpass `out count` costs one
 query per tile forever — measured at 3.2 s and one request for `120221203` — to save a wasted run on
 the small minority that are dense. Deadline exhaustion is free and it is the exact signal: the tile
@@ -892,14 +919,20 @@ Muir Trail — is a trail in its own right, keeps its own row, and yields the co
 fighting for it on every ingest.
 
 **The primary key on `trail_ways.wayId` is the concurrency control.** Two tiles racing for one way is
-the expected case: `COMMIT_CONCURRENCY` is 6, so the one drainer has six commits in flight at once.
-The loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because
-the line and every statistic derived from it were built on a resolution that is now stale — and the
-retry re-reads the claims and adopts the row the winner created.
+the expected case: `COMMIT_CONCURRENCY` is 6, so the one drainer prepares six trails at once. The
+loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because the
+line and every statistic derived from it were built on a resolution that is now stale — and the retry
+re-reads the claims and adopts the row the winner created.
+
+Batching does not weaken that. `planCommitBatches` closes a batch rather than admit two trails
+claiming the same way, so the one read `writeCommitBatch` makes covers a set where no member can
+shadow another, and per-way arbitration keeps happening per trail against a live view. Two trails
+that do contend land in successive batches, where the second resolves against the first's committed
+row — better ordering than the concurrent resolution it replaces.
 
 **The rollback is one setting, and it is a rollback of behaviour, not of state.** `osm-id` never
 writes `trail_ways` or `trail_slug_aliases` and never reads `trail_ways`, so the default path
-depends on neither table's contents. It does read `trail_slug_aliases` — `uniqueSlug` and
+depends on neither table's contents. It does read `trail_slug_aliases` — `assignSlugs` and
 `trails.bySlug` both consult it in every mode, which is what keeps a retired URL answering after the
 flag goes off — but both tolerate `P2021` and treat a missing table as no aliases, so a runtime that
 reaches a database where the DDL has not been applied still ingests and still serves. That mattered

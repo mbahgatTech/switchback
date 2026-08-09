@@ -52,6 +52,13 @@ export const HANDLER_DEADLINE_MS = 540_000;
  * 2026-08-08 that logged `assembled` and finished inside the handler budget, the work after
  * assembly took 32.9 s to 381.2 s, median ~133 s. The reserve clears the median; it is not a
  * promise that every tile fits, which is subdivision's job and not a budget's.
+ *
+ * **Batching the writes does not move it.** The reserve covers the whole commit phase, and that
+ * phase is compute: on quadkey 023010230 the per-trail scans in `attachWaypoints` are 99.5% of
+ * it, and batching touches only the round trips underneath. Measured on a local PostGIS over the
+ * same 105 trails, batching took the phase from 2,735 statements and 3,053 ms inside transactions
+ * to 1,547 and 1,887 — and left wall clock at 34.8 s against 36.6 s, inside the run-to-run
+ * spread. What it buys is the failure mode, not the budget.
  */
 export const COMMIT_RESERVE_MS = 150_000;
 

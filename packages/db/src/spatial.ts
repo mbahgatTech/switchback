@@ -101,10 +101,7 @@ export async function writeWaypointPoints(db: Db, trailId: string): Promise<void
 }
 
 /** The same projection for a batch of trails, still one statement. */
-export async function writeWaypointPointsFor(
-  db: Db,
-  trailIds: readonly string[],
-): Promise<void> {
+export async function writeWaypointPointsFor(db: Db, trailIds: readonly string[]): Promise<void> {
   if (trailIds.length === 0) return;
   await db.$executeRaw`
     UPDATE waypoints

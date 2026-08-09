@@ -14,7 +14,6 @@ import {
   backgroundPrisma,
   mergeTrailGeometry,
 } from '@switchback/db';
-import { Prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import {
   INGEST_ZOOM,
@@ -63,7 +62,7 @@ import {
   trailIdentityMode,
 } from './identity';
 import type { ClaimPolicy, TrailIdentityMode } from './identity';
-import { COMMIT_BATCH_SIZE, planCommitBatches, writeCommitBatch } from './commit-batch';
+import { planCommitBatches, writeCommitBatch } from './commit-batch';
 import type { PreparedTrail } from './commit-batch';
 import {
   CHILDREN_PER_TILE,
@@ -97,11 +96,20 @@ const MAX_PROFILE_POINTS = 6_000;
 const MAX_RENDER_VERTICES = 3_000;
 
 /**
- * How many trails are committed at once, process-wide. The ceiling is not our CPU but the two
- * scarce resources underneath — `TerrainSource` caps its own fetches at six, and the ingest
- * holds `BACKGROUND_POOL_SIZE` connections less the four the queue's bookkeeping needs. On
- * quadkey 021231030 (144 trails): 490.5 s sequential, 88.0 s at six, 95.5 s at twelve. Raise
- * this only by raising `BACKGROUND_POOL_SIZE` and `TerrainSource.maxConcurrent` together.
+ * How many trails are prepared at once, process-wide. The ceiling is `TerrainSource`, which caps
+ * its own fetches at six; the phase this bounds is now compute and terrain, not database work.
+ *
+ * **What six buys is overlapped terrain fetching, and nothing else.** Quadkey 021231030 (144
+ * trails) recorded 490.5 s sequential, 88.0 s at six, 95.5 s at twelve — but replayed with
+ * terrain served from memory the same tile runs 2.3 / 2.2 / 2.2 s, flat, at `cpu/wall` 1.1. The
+ * 5.6× was waiting, not parallelism: `forEachConcurrent` is single-threaded async and the
+ * enrichment it interleaves is synchronous.
+ *
+ * **That is why the shape does not extrapolate to a dense tile.** A z9 tile needs at most 256 z13
+ * terrain tiles however many trails it holds, so on 023010230 (1,519 trails, 30,837 features) the
+ * fetches amortise away and only the compute is left: 129.8 / 126.9 / 148.0 s at one, six and
+ * twelve over 150 trails, `cpu/wall` 0.99 — one thread saturated, twelve measurably worse than
+ * six. Raising this cannot help a dense tile; see `attachWaypoints` for where that time goes.
  */
 const COMMIT_CONCURRENCY = Math.max(1, Math.min(6, BACKGROUND_POOL_SIZE - 4));
 
@@ -1283,7 +1291,7 @@ async function prepareCommit(
       osmId,
       sourceUpdatedAt: ctx.now,
       quadkey: ctx.quadkey,
-      geometryJson: { type: 'LineString', coordinates: rendered } as Prisma.InputJsonValue,
+      geometryJson: { type: 'LineString', coordinates: rendered },
       centroidLng: derived.centroid[0],
       centroidLat: derived.centroid[1],
       bboxW: derived.bbox[0],

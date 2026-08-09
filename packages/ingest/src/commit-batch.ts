@@ -1,5 +1,5 @@
 import type { Prisma } from '@prisma/client';
-import { OsmElementType, Prisma as PrismaNamespace } from '@prisma/client';
+import { type OsmElementType, Prisma as PrismaNamespace } from '@prisma/client';
 import type { ElevationPoint, LineString, LngLat } from '@switchback/core';
 import { writeTrailGeometries, writeWaypointPointsFor } from '@switchback/db';
 import type { AssembledTrail } from './assemble';
@@ -167,9 +167,9 @@ async function claimBatchWays(
   tx: Prisma.TransactionClient,
   entries: ReadonlyArray<{ prepared: PreparedTrail; trailId: string }>,
 ): Promise<void> {
-  const wanted = [
-    ...new Set(entries.flatMap(({ prepared }) => prepared.trail.memberWayIds)),
-  ].map((id) => BigInt(id));
+  const wanted = [...new Set(entries.flatMap(({ prepared }) => prepared.trail.memberWayIds))].map(
+    (id) => BigInt(id),
+  );
   if (wanted.length === 0) return;
 
   const held = new Map<bigint, string>();
@@ -213,7 +213,11 @@ export interface BatchWriteContext {
   identity: 'claim' | 'osm-id';
   /** `uniqueSlug`'s ladder for one trail, injected so the rungs are defined in one place. */
   slugCandidates: (prepared: PreparedTrail) => string[];
-  mergeTrails: (tx: Prisma.TransactionClient, winnerId: string, loserIds: string[]) => Promise<void>;
+  mergeTrails: (
+    tx: Prisma.TransactionClient,
+    winnerId: string,
+    loserIds: string[],
+  ) => Promise<void>;
 }
 
 /**
@@ -255,7 +259,13 @@ export async function writeCommitBatch(
     const saved = entry.trailId
       ? await tx.trail.update({
           where: { id: entry.trailId },
-          data: { ...row, slug: undefined, osmType: undefined, osmId: undefined, quadkey: undefined },
+          data: {
+            ...row,
+            slug: undefined,
+            osmType: undefined,
+            osmId: undefined,
+            quadkey: undefined,
+          },
         })
       : await tx.trail.upsert({
           where: { osmType_osmId: { osmType: entry.osmType, osmId: entry.osmId } },
@@ -284,7 +294,7 @@ export async function writeCommitBatch(
   await tx.elevationProfile.createMany({
     data: written.map(({ prepared: entry, trailId }) => ({
       trailId,
-      points: entry.profile as unknown as Prisma.InputJsonValue,
+      points: entry.profile,
       spacingM: entry.spacingM,
       highPointIndex: entry.highPointIndex,
     })),

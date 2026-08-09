@@ -126,6 +126,14 @@ function positionOf(element: OverpassElement): LngLat | null {
  * Attach nearby OSM features to a trail line. `distM` is null past `WAYPOINT_BUFFER_M`,
  * because a car park 400 m away has no meaningful distance *along* the trail — and the
  * elevation chart plots by `distM`, so a parking pin at 0 m would sit on it as if hiked through.
+ *
+ * **This scan is where a dense tile's ingest time goes.** It walks every feature in the tile and
+ * `nearestPointOnLine` walks every segment, so with `terminusFeatures` below a tile costs
+ * O(trails x features x vertices). Emptying `elements` over quadkey 023010230's first 150 trails
+ * takes them from 865 ms to 4 ms each — 99.5% of the commit phase's compute — because that tile
+ * carries 30,837 features against 021231030's 556. A spatial index over `elements`, built once
+ * per tile and keyed to `PARKING_BUFFER_M`, is what removes it; concurrency and worker threads
+ * cannot, and `COMMIT_CONCURRENCY` in `pipeline.ts` records the measurements that show why.
  */
 export function attachWaypoints(
   coords: readonly LngLat[],

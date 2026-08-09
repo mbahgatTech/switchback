@@ -477,10 +477,7 @@ describe('processTile, a trail that would not commit', () => {
     return {
       tilesFor: () =>
         new Promise((resolve) => {
-          setTimeout(
-            () => resolve({ get: () => FLAT_TERRAIN } as unknown as Map<string, TerrariumTile>),
-            delayMs,
-          );
+          setTimeout(() => resolve({ get: () => FLAT_TERRAIN }), delayMs);
         }),
     } as unknown as TerrainSource;
   }
@@ -1018,7 +1015,11 @@ describe('assignSlugs', () => {
   function txWith(
     retired: readonly string[],
     options: {
-      trails?: ReadonlyArray<{ slug: string; osmType: OsmElementType | null; osmId: bigint | null }>;
+      trails?: ReadonlyArray<{
+        slug: string;
+        osmType: OsmElementType | null;
+        osmId: bigint | null;
+      }>;
       aliasLookup?: () => Promise<never>;
     } = {},
   ): Prisma.TransactionClient {
@@ -1152,4 +1153,3 @@ describe('planCommitBatches', () => {
     expect(batches).toHaveLength(1);
   });
 });
-
