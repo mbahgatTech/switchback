@@ -1160,12 +1160,13 @@ database access is needed; `az login` as any principal holding that role is enou
 ```bash
 SUB=5cb9e7c3-0e31-4388-94e9-b36eab4bf977
 
-# 1. List the open instances and take their alert ids.
+# 1. List the open instances. The key must not be `id`: the table formatter
+#    drops a column named exactly that, and the command still exits 0.
 az rest --method GET \
   --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.AlertsManagement/alerts?api-version=2019-03-01&timeRange=7d" \
-  --query "value[?name=='switchback-ingest-drain-failed' && properties.essentials.alertState!='Closed'].{id:id,started:properties.essentials.startDateTime}" -o table
+  --query "value[?name=='switchback-ingest-drain-failed' && properties.essentials.alertState!='Closed'].{alertId:id,started:properties.essentials.startDateTime}" -o table
 
-# 2. Close one, by the GUID on the end of its id.
+# 2. Close one, by the GUID on the end of its AlertId.
 az rest --method POST \
   --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.AlertsManagement/alerts/<alert-guid>/changestate?api-version=2019-03-01&newState=Closed"
 ```
