@@ -333,12 +333,13 @@ ten minutes, no value satisfies both.
 
 So the repair is the reaper, not the broker. `reclaimExpiredJobs` returns an expired lease to
 `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `ingestPump` sweeps before
-it selects — so the tick that takes a lease back is the tick that republishes the row, whatever any
-delivery decided, which bounds recovery at `LEASE_TIMEOUT_MS` plus one tick. Without that elevation
-the row would rejoin the tail of its own priority band and wait for the backlog ahead of it to
-drain. The relation that makes the republish durable is the dedupe window below: it has to be
-shorter than the lease, or the republish is discarded as a duplicate of the message a redelivery
-already completed, and the tile is lost with nothing logged.
+it selects — so the row clears the ordinary backlog, whatever any delivery decided, instead of
+rejoining the tail of its own priority band and waiting for that backlog to drain. It does not
+clear the reclaimed band: reclaimed rows share one fixed priority and are published at the pump's
+per-tick window like any other, so recovery costs one tick while that band fits in a tick and the
+band's own drain when it does not. The relation that makes the republish durable is the dedupe
+window below: it has to be shorter than the lease, or the republish is discarded as a duplicate of
+the message a redelivery already completed, and the tile is lost with nothing logged.
 
 All of these numbers live in different files, so `apps/ingest-worker/test/drain.test.ts` reads
 `lockDuration`, `duplicateDetectionHistoryTimeWindow` and `defaultMessageTimeToLive` from this
@@ -988,9 +989,13 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
             name: 'SERVICE_BUS_QUEUE_RESOURCE_ID'
             value: queue.id
           }
-          // The instant brake. Setting this to false stops the pump publishing in seconds with no
-          // deploy anywhere. It does not stop the drain — in-flight messages finish and the
-          // maintenance sweep keeps running, which is what makes it safe to leave on.
+          // The instant brake. Setting this to false stops new work reaching the queue in seconds
+          // with no deploy anywhere. It does not stop the drain, and it does not stop the pump
+          // republishing a lease the sweep has just reclaimed — `classifyDisposition` completes a
+          // message on the strength of that republish and cannot take the completion back, so a
+          // brake that suppressed it would leave the row `queued` with nothing to carry it to the
+          // broker until an operator lifted the brake. Nothing is lost either way; what the
+          // republish buys is a bound on when it comes back.
           {
             name: 'INGEST_PUMP_ENABLED'
             value: 'true'

@@ -1,16 +1,17 @@
 import { app } from '@azure/functions';
 import type { InvocationContext, Timer } from '@azure/functions';
 import { backgroundPrisma } from '@switchback/db';
-import { TILE_WEDGED_MARKER, pruneFinishedJobs, sweepQueue } from '@switchback/ingest';
+import {
+  RECLAIM_PRIORITY,
+  TILE_WEDGED_MARKER,
+  pruneFinishedJobs,
+  sweepQueue,
+} from '@switchback/ingest';
 import { reportQueueHealth } from '../health';
-import { runPump } from '../pump';
+import { pumpBounds, runPump } from '../pump';
 import { serviceBusQueue } from '../service-bus';
 
-/**
- * The brake. `INGEST_PUMP_ENABLED=false` stops new work reaching the queue in seconds with no
- * deploy anywhere; in-flight messages finish, because each is idempotent and dropping one
- * mid-tile would leave a lease to expire for nothing.
- */
+/** `INGEST_PUMP_ENABLED=false` — see `refill` for what the brake does and does not stop. */
 function braked(): boolean {
   return process.env.INGEST_PUMP_ENABLED === 'false';
 }
@@ -31,12 +32,33 @@ app.timer('ingestPump', {
     await maintain(context);
 
     if (braked()) {
-      context.warn('ingest pump: disabled by INGEST_PUMP_ENABLED');
+      context.warn('ingest pump: disabled by INGEST_PUMP_ENABLED — reclaimed leases only');
+      await refill(context, RECLAIM_PRIORITY);
       return;
     }
-    await runPump(backgroundPrisma, serviceBusQueue(), context);
+    await refill(context);
   },
 });
+
+/**
+ * Publish the runnable head, optionally narrowed to one priority band.
+ *
+ * **The brake narrows this rather than skipping it, and that is what keeps the drain's settlement
+ * honest.** `classifyDisposition` completes a Service Bus message — irreversibly — on the strength
+ * of the reaper returning the row to `queued` at `RECLAIM_PRIORITY` and the pump republishing it.
+ * A brake that stopped publishing outright would leave the first half of that true and the second
+ * half false: the row would persist, so nothing is lost, but nothing would carry it back to the
+ * broker until an operator lifted the brake, and how long that takes is not a bound.
+ *
+ * Reclaimed work is not new work, which is what the brake is for. The bleed is bounded twice over:
+ * only a row that lost a lease reaches this band, and `reclaimExpiredJobs` spends an attempt each
+ * time it does, so a tile that reliably kills its handler is retired rather than republished
+ * forever. A brake that must stop the ingestion of a tile outright is
+ * `AzureWebJobs.ingestDrain.Disabled`, and the one that must stop everything is stopping the host.
+ */
+async function refill(log: InvocationContext, minPriority?: number): Promise<void> {
+  await runPump(backgroundPrisma, serviceBusQueue(), log, new Date(), pumpBounds(), minPriority);
+}
 
 /**
  * Reclaim expired leases, clear orphaned split markers, collect finished jobs.

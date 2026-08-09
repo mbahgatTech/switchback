@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
-import { LEASE_TIMEOUT_MS } from '../src/jobs';
+import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS } from '../src/jobs';
 import {
   LEASE_SWEEP_GRACE_MS,
   TILE_WEDGED_MARKER,
@@ -426,13 +426,13 @@ describe('countWedgedTiles', () => {
     expect(sql()).toContain("job.status IN ('queued', 'running')");
   });
 
-  it('waits out a lease and a pump tick before counting anything', async () => {
-    // The other half of not pinning: a tile is only wedged once everything that would ordinarily
-    // rescue it — the reclaim, then the republish — has had its chance.
+  it('waits out a whole invocation before counting anything', async () => {
+    // `updatedAt` is stamped when an attempt begins, so anything shorter than the handler's own
+    // bound would count a tile a live invocation is still working on.
     const { db, sql } = capturing();
     await countWedgedTiles(db);
     expect(sql()).toContain('"updatedAt" <');
-    expect(WEDGE_GRACE_MS).toBeGreaterThan(LEASE_TIMEOUT_MS);
+    expect(WEDGE_GRACE_MS).toBeGreaterThan(HOST_FUNCTION_TIMEOUT_MS);
   });
 
   it('reads zero rather than undefined on an empty result', async () => {

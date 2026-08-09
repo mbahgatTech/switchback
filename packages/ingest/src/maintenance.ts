@@ -5,7 +5,7 @@
 
 import { JobStatus, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
+import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
 
@@ -208,12 +208,15 @@ export async function countWedgedTiles(
 /**
  * How long a tile may sit `running` with no job before it counts as wedged.
  *
- * One lease plus one pump tick plus slack: everything that legitimately rescues such a tile —
- * `reclaimExpiredJobs` returning the lease at `RECLAIM_PRIORITY`, then the same tick's `runPump`
- * publishing it from the head of the queue — has completed inside that. Below it the gauge would
- * count tiles that are about to be repaired by the ordinary path.
+ * **Sized from one invocation, not from a recovery bound.** `processTile` stamps `updatedAt` when
+ * an attempt begins and the row stays `running` for the rest of it, so the window has to cover a
+ * whole handler — `HOST_FUNCTION_TIMEOUT_MS` — before an absent job means anything, plus a sweep
+ * interval of slack. What keeps the gauge off a tile the ordinary path will repair is the
+ * `NOT EXISTS` join, which holds for as long as that path takes; a window is the wrong instrument
+ * for it, and the recovery bound it was previously derived from is a backlog drain with no
+ * constant behind it.
  */
-export const WEDGE_GRACE_MS = LEASE_TIMEOUT_MS + 5 * 60 * 1000;
+export const WEDGE_GRACE_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_SWEEP_GRACE_MS;
 
 /**
  * The literal `switchback-ingest-drain-failed` greps for, written into the tile's `lastError`.

@@ -245,10 +245,32 @@ describe('enqueue', () => {
     });
 
     const args = recorded.upserts[0] as { update: Record<string, unknown> };
-    // `runAfter` untouched on collision, or a fresh page load clears a backoff. Priority may
-    // rise, because somebody is now waiting on the tile.
+    // `runAfter` untouched on collision, or a fresh page load clears a backoff. The upsert writes
+    // nothing at all on collision: priority moves only through the guarded raise below.
     expect(args.update).not.toHaveProperty('runAfter');
-    expect(args.update.priority).toBe(5);
+    expect(args.update).not.toHaveProperty('priority');
+  });
+
+  it('raises priority only when the incoming band is higher', async () => {
+    // A viewport asking again for a tile whose lease the reaper has just taken back is the
+    // ordinary case, and `VIEWPORT_PRIORITY` sits below `RECLAIM_PRIORITY` — so an unconditional
+    // write would demote the one row that has to reach the head of the queue.
+    expect(VIEWPORT_PRIORITY).toBeLessThan(RECLAIM_PRIORITY);
+
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+      priority: VIEWPORT_PRIORITY,
+    });
+
+    const raise = recorded.updateManys.at(-1);
+    expect(raise?.where).toEqual({
+      dedupeKey: 'ingest_tile:0333',
+      priority: { lt: VIEWPORT_PRIORITY },
+    });
+    expect(raise?.data).toEqual({ priority: VIEWPORT_PRIORITY });
   });
 
   it('revives a finished job so the same work can be requested again later', async () => {

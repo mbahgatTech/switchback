@@ -114,14 +114,29 @@ message. There is no second driver and no flag selecting between them — the Ve
 
 **So there is no rollback switch for ingestion, and that is the operational story.** Nothing can be
 flipped to make Vercel drain again; the code is not there to run. What an operator has instead is
-three brakes of increasing severity, all on the Function App, none of them a deploy — and the honest
-last one is _stop the Function App_:
+three brakes of increasing severity, all on the Function App — and the honest last one is _stop the
+Function App_:
 
-| Symptom                                                                    | Do this                                  | Reverse it with                           | What it costs                                                                                       |
-| -------------------------------------------------------------------------- | ---------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| The queue is filling faster than it drains, or a bad tile is being retried | `INGEST_PUMP_ENABLED=false`              | `INGEST_PUMP_ENABLED=true`                | new work stops reaching the queue; in-flight messages finish, each idempotent                       |
-| Overpass is rate-limiting, or the drain itself is the fault                | `AzureWebJobs.ingestDrain.Disabled=true` | `AzureWebJobs.ingestDrain.Disabled=false` | nothing drains, but the pump keeps reporting queue health, so there is still a gauge                |
-| Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | `az functionapp start`                    | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped |
+| Symptom                                                                    | Do this                                  | Reverse it with                                        | What it costs                                                                                                                      |
+| -------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| The queue is filling faster than it drains, or a bad tile is being retried | `INGEST_PUMP_ENABLED=false`              | `INGEST_PUMP_ENABLED=true`                             | new work stops reaching the queue; in-flight messages finish, each idempotent, and a lease the sweep reclaims is still republished |
+| Overpass is rate-limiting, or the drain itself is the fault                | `AzureWebJobs.ingestDrain.Disabled=true` | `AzureWebJobs.ingestDrain.Disabled=false`              | nothing drains, but the pump keeps reporting queue health, so there is still a gauge                                               |
+| Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | `az functionapp start` — **or any deploy to `master`** | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped                                |
+
+**The stop does not survive a deploy, and that is the one an operator has to know.**
+`.github/scripts/deploy-worker.sh` reads the host's state and starts it when it is not `Running`,
+because a stopped host emits no heartbeat and the deploy has no other way to tell a bad package
+from a deliberate stop. `ci.yml` runs `deploy ingest worker` on every push to `master`, so merging
+anything restarts a stopped worker and ingestion resumes. Stopping the host is a brake against a
+bad build or a bad hour, not a way to hold ingestion off across a release.
+
+The first brake narrows the pump to reclaimed leases rather than silencing it. `classifyDisposition`
+completes a Service Bus message on the strength of the reaper returning the row to `queued` at
+`RECLAIM_PRIORITY` and the pump republishing it, and a completion cannot be taken back — so
+suppressing the republish would leave the row correct and unreachable until someone lifted the
+brake. Reclaimed work is not new work; the band is bounded by rows that lost a lease, and each
+reclaim spends an attempt, so a tile that reliably kills its handler is retired rather than
+republished forever.
 
 None loses a tile. `ingest_jobs` is the record and the pump re-derives the runnable head every two
 minutes, so a brake costs the queue its throughput and not its contents — though work queued while
@@ -149,14 +164,20 @@ is the one lever that moves it to the head, because `priority DESC` leads both t
 
 **A reclaimed lease is the one exception, and the reaper pulls that lever for it.**
 `reclaimExpiredJobs` returns an expired lease to `queued` at `RECLAIM_PRIORITY`, above every band
-`enqueue` assigns, and `runPump` sweeps before it selects — so the tick that takes a lease back is
-the tick that republishes the row. Two things depend on that bound and would be wrong without it:
-`classifyDisposition` completes a Service Bus message on the strength of the reclaim, which the
-broker will never undo, and `WEDGE_GRACE_MS` sizes the wedged-tile gauge at one lease plus one tick.
-The elevation is a fixed value rather than an increment, so repeated reclaims form one band ordered
-by `runAfter` instead of a ladder, and a retired row keeps the priority it had so a later revival
-does not inherit the head of the queue. `apps/ingest-worker/test/pump.test.ts` runs `runPump` over an
-ordered backlog and asserts both halves: the elevated row is reached, an unelevated one is not.
+`enqueue` assigns, and `runPump` sweeps before it selects — so the row clears the ordinary backlog
+instead of rejoining the tail of its own band. `classifyDisposition` completes a Service Bus
+message on the strength of that, which the broker will never undo.
+
+**What the elevation does not buy is the head of the queue.** It is a fixed value, so reclaimed
+rows form one band ordered among themselves by `runAfter`, and that band is published at the same
+`PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` rows a tick as any other. Recovery therefore costs one tick
+while the band fits inside a tick's window and the band's own drain when it does not — never the
+five-figure backlog, which is the bound the elevation exists to escape. A fixed value rather than
+an increment is also what keeps repeated reclaims idempotent instead of a ladder, and a retired row
+keeps the priority it had so a later revival does not inherit the head of the queue.
+`apps/ingest-worker/test/pump.test.ts` runs `runPump` over an ordered backlog and asserts all
+three: the elevated row is reached, an unelevated one is not, and an elevated row behind a backlog
+of its own band is not either.
 
 **What happens if Service Bus is unreachable.** With no fallback path the failure has to be explicit
 rather than silent, so `publishIngestSignals` does not swallow it: the row is already committed to
@@ -201,14 +222,17 @@ distress rule reports.
 
 **Stopping it.** There is no driver flag and no second path, so "roll back the cutover" is not a
 thing that can be done — there is nowhere to roll back _to_. What exists instead is three brakes,
-and the right one depends on what has gone wrong. None needs a deploy.
+and the right one depends on what has gone wrong. None needs a deploy to _pull_. The third is
+undone by one: `deploy-worker.sh` starts a host it finds stopped, and `deploy ingest worker` runs
+on every push to `master`, so a merge restarts a stopped worker whether or not that was the intent.
 
 ```bash
 RG=rg-switchback-prod-northcentralus
 APP=func-switchback-ingest-37ywppu5p7fri
 
 # The queue is filling faster than it drains, or a bad tile is being retried.
-# Stops new work reaching the queue. In-flight messages finish; each is idempotent.
+# Stops new work reaching the queue. In-flight messages finish; each is idempotent. A lease the
+# sweep reclaims is still republished, because the drain already completed its message.
 az functionapp config appsettings set -g "$RG" -n "$APP" --settings INGEST_PUMP_ENABLED=false -o none
 
 # Overpass is rate-limiting, or the drain itself is the fault.
@@ -216,7 +240,8 @@ az functionapp config appsettings set -g "$RG" -n "$APP" --settings INGEST_PUMP_
 az functionapp config appsettings set -g "$RG" -n "$APP" \
   --settings AzureWebJobs.ingestDrain.Disabled=true -o none
 
-# Everything is wrong. Nothing drains and nothing is observed.
+# Everything is wrong. Nothing drains and nothing is observed. This one is undone by the next
+# merge to master as well as by the command below: `deploy ingest worker` starts a stopped host.
 az functionapp stop -g "$RG" -n "$APP"
 
 # And back. Messages that expired against the PT1H TTL while it was down are gone; their

@@ -117,10 +117,12 @@ export interface JobLease {
  * invocation still working" is not something this can infer from the row. What it can rely on is
  * `reclaimExpiredJobs`: off its own timer, whatever any delivery decided, it returns the row to
  * `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `runPump` sweeps before
- * it selects. So the tick that takes the lease back is the tick that republishes the row, and
- * recovery is bounded by `LEASE_TIMEOUT_MS` plus one tick even when the holder is already dead.
- * Without that elevation the row would rejoin the tail of its own priority band and be reached
- * only when the backlog ahead of it drained — a bound no delivery could complete a message on.
+ * it selects. So the row the reaper takes back clears the ordinary backlog instead of rejoining
+ * the tail of its own priority band, where it would be reached only when five figures of due work
+ * drained — a bound no delivery could complete a message on. It does not clear the reclaimed band:
+ * that band is published at the same `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` rows a tick as any
+ * other, so recovery costs one tick while the band fits in a tick's window and the band's own
+ * drain when it does not. `apps/ingest-worker/test/pump.test.ts` asserts both.
  *
  * **Abandoning instead is rejected, and it is the alternative worth naming.** Completing is
  * irreversible, so throwing looks like the conservative choice; it is not. The common reason a

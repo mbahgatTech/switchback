@@ -13,6 +13,7 @@ import {
   PUMP_LOW_WATER,
   PUMP_QUEUE_DEPTH,
   planPump,
+  pumpBounds,
   runPump,
 } from '../src/pump';
 import type { SignalQueue } from '../src/pump';
@@ -25,7 +26,12 @@ interface KindFilter {
 type OrderBy = ReadonlyArray<Record<string, 'asc' | 'desc'>>;
 
 interface FindManyArgs {
-  where: { status: JobStatus; runAfter: { lte: Date }; kind: KindFilter };
+  where: {
+    status: JobStatus;
+    runAfter: { lte: Date };
+    kind: KindFilter;
+    priority?: { gte: number };
+  };
   orderBy: OrderBy;
   take: number;
 }
@@ -109,10 +115,13 @@ function compare(orderBy: OrderBy, left: JobRow, right: JobRow): number {
  */
 function backlogged(rows: readonly JobRow[], reclaims?: string): Db {
   let current = [...rows];
+  const due = (args: FindManyArgs, row: JobRow): boolean =>
+    row.runAfter <= args.where.runAfter.lte &&
+    (args.where.priority === undefined || row.priority >= args.where.priority.gte);
   return {
     ingestJob: {
       findMany: async (args: FindManyArgs) =>
-        (args.where.kind.in ? [] : current.filter((row) => row.runAfter <= args.where.runAfter.lte))
+        (args.where.kind.in ? [] : current.filter((row) => due(args, row)))
           .slice()
           .sort((a, b) => compare(args.orderBy, a, b))
           .slice(0, args.take)
@@ -321,5 +330,54 @@ describe('a lease the reaper took back', () => {
 
     expect(queue.published).not.toContain(LOST_DOORBELL);
     expect(queue.published[0]).toBe('ingest_tile:backlog-0');
+  });
+});
+
+/**
+ * `ingestPump` passes `RECLAIM_PRIORITY` here while `INGEST_PUMP_ENABLED=false`. Completing a
+ * message is irreversible and is justified by the reclaim reaching the broker, so the brake has to
+ * narrow the pump rather than silence it.
+ */
+describe('a braked pump', () => {
+  it('still publishes a lease the sweep reclaimed', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(
+      backlogged(withBacklog(40), LOST_DOORBELL),
+      queue,
+      silent,
+      QUEUED_AT,
+      pumpBounds(),
+      RECLAIM_PRIORITY,
+    );
+
+    expect(queue.published).toEqual([LOST_DOORBELL]);
+  });
+
+  it('publishes nothing else', async () => {
+    const queue = fakeQueue(0);
+
+    // The same backlog with no reclaim: every row sits at `VIEWPORT_PRIORITY`, which the band
+    // excludes, so a brake admits no new work.
+    await runPump(
+      backlogged(withBacklog(40)),
+      queue,
+      silent,
+      QUEUED_AT,
+      pumpBounds(),
+      RECLAIM_PRIORITY,
+    );
+
+    expect(queue.published).toEqual([]);
+  });
+
+  it('is the only thing that narrows the selects', async () => {
+    const { db, calls } = fakeDb({ primary: ['ingest_tile:a'] });
+
+    await runPump(db, fakeQueue(0), silent);
+
+    // Unbraked the predicate carries no priority term at all, so an ordinary tick still reads the
+    // whole runnable head.
+    expect(calls[0]?.where.priority).toBeUndefined();
   });
 });

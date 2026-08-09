@@ -88,6 +88,9 @@ export interface SignalQueue {
  * disagree. Nothing here is claimed or written: a row stays `queued` until a worker takes it, so
  * a lost message costs a row its position and never the row. How long that position takes to
  * reach the head is the backlog's business, not this tick's.
+ *
+ * `minPriority` narrows both selects to a band and nothing else — see `ingestPump`, which passes
+ * `RECLAIM_PRIORITY` while the brake is on.
  */
 export async function runPump(
   db: Db,
@@ -95,12 +98,15 @@ export async function runPump(
   log: WorkerLog,
   now = new Date(),
   bounds: PumpBounds = pumpBounds(),
+  minPriority?: number,
 ): Promise<{ published: number }> {
   /*
    * Before the selects, not after, and the ordering is load-bearing: the sweep raises a reclaimed
-   * row to `RECLAIM_PRIORITY`, so the tick that takes a lease back is the tick that republishes
-   * the row rather than the one after it. It also stops the pump re-signalling a row whose killed
-   * holder still nominally owns the lease. Cheap — one UPDATE over an indexed predicate.
+   * row to `RECLAIM_PRIORITY`, so this tick selects with the reclaim already applied rather than
+   * the tick after it. That puts the row ahead of the ordinary backlog, not at the head of the
+   * queue — reclaimed rows share one band and are published at the same per-tick window as any
+   * other. It also stops the pump re-signalling a row whose killed holder still nominally owns the
+   * lease. Cheap — one UPDATE over an indexed predicate.
    */
   const reclaimed = await reclaimExpiredJobs(db, now);
   if (reclaimed.requeued > 0 || reclaimed.retired > 0) {
@@ -113,7 +119,11 @@ export async function runPump(
   const plan = planPump(active, bounds.depth, bounds.lowWater);
   if (plan.primary === 0 && plan.derived === 0) return { published: 0 };
 
-  const runnable = { status: JobStatus.queued, runAfter: { lte: now } };
+  const runnable = {
+    status: JobStatus.queued,
+    runAfter: { lte: now },
+    ...(minPriority === undefined ? {} : { priority: { gte: minPriority } }),
+  };
   const order = [{ priority: 'desc' as const }, { runAfter: 'asc' as const }];
   const derivedKinds = [...DERIVED_JOB_KINDS];
 

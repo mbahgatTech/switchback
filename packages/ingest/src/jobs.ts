@@ -38,7 +38,11 @@ export const LEASE_MARGIN_MS = 2 * 60 * 1000;
  *
  * So the redelivery is not the repair. The reaper is: `reclaimExpiredJobs` returns the row to
  * `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `runPump` sweeps before
- * it selects — so the tick that takes a lease back is the tick that republishes the row.
+ * it selects — so the row clears the ordinary backlog rather than rejoining the tail of its own
+ * band. It does not clear the reclaimed band: that elevation is a fixed value, so reclaimed rows
+ * sort among themselves by `runAfter` and a tick publishes at most
+ * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` of them. `apps/ingest-worker/test/pump.test.ts` asserts
+ * both halves.
  * `apps/ingest-worker/test/drain.test.ts` asserts the template relation that makes the republish
  * durable: the broker's duplicate detection window has to be *shorter* than this, or the republish
  * is discarded as a duplicate of the message a delivery already completed and the work is lost
@@ -73,9 +77,9 @@ export interface EnqueueInput {
  *   and a tile whose attempts landed during an outage stays `dead`. `attempts` is cleared too:
  *   this is a new request, not a sixth try.
  *
- * Two statements, and the order matters. The revival is a single conditional `UPDATE ... WHERE
- * status IN (terminal)`, which Postgres applies atomically — a read-then-write would let two
- * concurrent enqueues both revive and reset `attempts` twice.
+ * Three statements, each a single conditional `UPDATE` Postgres applies atomically. A
+ * read-then-write would let two concurrent enqueues both revive and reset `attempts` twice, and
+ * would let either of them write back a priority the other had already raised.
  */
 export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
   const priority = input.priority ?? 0;
@@ -108,11 +112,16 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
       runAfter,
       maxAttempts: input.maxAttempts ?? 5,
     },
-    update: {
-      // Only ever raised, never lowered: a background refresh enqueues at 0, which leaves
-      // whatever a live viewport already set in place.
-      priority: priority > 0 ? priority : undefined,
-    },
+    // Priority is raised by the statement below, never here. `update` cannot read the row it is
+    // writing, so any value set here is unconditional — and an enqueue at `VIEWPORT_PRIORITY` (5)
+    // landing on a lease the reaper had just raised to `RECLAIM_PRIORITY` (6) would demote the one
+    // row in the table that has to reach the head of the queue.
+    update: {},
+  });
+
+  await db.ingestJob.updateMany({
+    where: { dedupeKey: input.dedupeKey, priority: { lt: priority } },
+    data: { priority },
   });
 }
 
@@ -329,22 +338,23 @@ const MARKER_KEY_LIMIT = 10;
 
 /**
  * Priority a requeued lease is raised to: above every band `enqueue` assigns, so the next pump
- * tick publishes the row from the head of `priority DESC` rather than from wherever the backlog
- * had put it.
+ * tick reaches the row ahead of the backlog rather than from wherever that backlog had put it.
  *
  * **Returning the row to `queued` is not on its own enough to get it re-run.** `runPump` publishes
  * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` primary rows a tick from the head of
  * `priority DESC, "runAfter" ASC`, and every viewport tile shares one priority — so a row put back
  * at the priority it had sorts to the tail of its own band and is reached when the backlog ahead of
- * it drains. Two things are built on the tighter bound and would be wrong without this:
- * `classifyDisposition` completes a Service Bus message on the strength of the reclaim, which is
- * irreversible, and `WEDGE_GRACE_MS` sizes the wedged-tile gauge at one lease plus one tick.
+ * it drains. `classifyDisposition` completes a Service Bus message on the strength of this
+ * elevation, and that decision is irreversible.
  *
- * Raised to a fixed value rather than incremented, so repeated reclaims are idempotent: reclaimed
- * rows form one band ordered among themselves by `runAfter`, never a ladder that climbs away from
- * the queue. Retired rows keep the priority they had — `enqueue` revives a `dead` row without
- * lowering priority, and a row that is never going to run again must not carry the head of the
- * queue into that revival.
+ * **What it buys is the ordinary backlog, not the head of the queue.** Raised to a fixed value
+ * rather than incremented, so repeated reclaims are idempotent: reclaimed rows form one band
+ * ordered among themselves by `runAfter`, never a ladder that climbs away from the queue. The band
+ * is therefore subject to the same per-tick window as any other — one tick while it fits inside
+ * that window, its own drain when it does not. `apps/ingest-worker/test/pump.test.ts` asserts each
+ * half against an ordered backlog. Retired rows keep the priority they had, and `enqueue` raises
+ * but never lowers, so a row that is never going to run again does not carry the head of the queue
+ * into a later revival.
  *
  * It cannot starve ordinary work: a row only arrives here by losing a lease, the host runs one
  * handler at a time, and the attempt this sweep spends retires a reliably fatal job rather than
