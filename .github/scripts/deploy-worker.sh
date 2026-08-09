@@ -26,19 +26,34 @@
 #
 # **The verification is the point.** An exit code says a blob was uploaded and a setting was
 # written; it says nothing about what the host is executing, which is exactly the gap that left a
-# five-week-old build in production under a green pipeline. So this asserts three independent things,
-# and fails if any is missing:
+# five-week-old build in production under a green pipeline. So this asserts two independent things,
+# and fails if either is missing:
 #
 #   1. the live setting names the blob this run uploaded — the ARM write landed, on this app;
-#   2. the host is `Running`, because `az functionapp stop` is one of the brakes an operator is
-#      told to pull and a stopped host emits nothing;
-#   3. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
+#   2. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
 #      timestamp after the deploy began. The marker is emitted by the first statement of the
 #      `ingestPump` handler, on a two-minute timer; the
 #      commit is substituted into the bundle by `apps/ingest-worker/scripts/bundle.ts`, so it
 #      travels inside the zip. Without it the check degrades to liveness — any build already
 #      carrying the current `health.ts` satisfies a bare marker, so a package that failed to mount
 #      would pass on the previous build's heartbeat.
+#
+# **The host is brought up before the app is told about the new package, and that ordering is
+# load-bearing.** Two steps here need a host that is serving: `syncfunctiontriggers`, which ARM
+# does not perform itself but proxies to the host's own extensions endpoint, and the heartbeat,
+# which only a running host emits. Everything before them — the blob upload, the size read, the
+# settings read-back — is ARM and storage, and answers the same on a host that is Stopped.
+#
+# `az functionapp stop` is the last of the three brakes in `docs/architecture.md` and `worker-deploy`
+# runs on every push to `master`, so a deploy arriving against a stopped host is ordinary rather than
+# exceptional. Run 31301084801 is what the order is written from: the settings write landed against a
+# Stopped host, the trigger sync was then refused with `Unauthorized … Forbidden from extensions API`,
+# and `set -e` took the script out before the start it was carrying — leaving
+# `WEBSITE_RUN_FROM_PACKAGE` naming a build the host was not up to run. Starting first means a
+# failure before the settings write leaves the app on its previous package, which is a state an
+# operator can reason about. It does not make the window impossible: a brake pulled between the state
+# read and the heartbeat still stops the host mid-deploy, which is why the wait below re-reads the
+# state rather than blaming the package.
 #
 # Usage: deploy-worker.sh <zip-path> <commit>
 # Environment: RESOURCE_GROUP, FUNCTION_APP, APP_INSIGHTS, STORAGE_ACCOUNT.
@@ -64,6 +79,11 @@ CONTAINER=function-releases
 # roughly three chances rather than a margin on one.
 HEARTBEAT_TIMEOUT_S="${HEARTBEAT_TIMEOUT_S:-720}"
 HEARTBEAT="switchback-ingest-queue-health build=${COMMIT}"
+
+# How long the host has to report `Running` after `az functionapp start` returns. The call is
+# synchronous against ARM but the site's own state lags it, and a single read that catches the lag
+# would fail a deploy that was about to be fine.
+START_TIMEOUT_S="${START_TIMEOUT_S:-120}"
 
 test -f "$ZIP" || { echo "::error::no bundle at $ZIP"; exit 1; }
 
@@ -109,15 +129,53 @@ if [ "$uploaded" != "$local_size" ]; then
 fi
 echo "uploaded ${BLOB} (${uploaded} bytes)"
 
+app_state() {
+  az functionapp show -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" --query state -o tsv
+}
+
+# Leaves a running host alone; otherwise starts it and waits for the site to agree. Everything
+# after this point either needs the host serving or must not be reached without it.
+ensure_running() {
+  local state deadline
+  state="$(app_state)"
+  if [ "$state" = "Running" ]; then
+    echo "host state: ${state}"
+    return 0
+  fi
+
+  echo "the host is ${state}; starting it, because a stopped host refuses the extensions API and"
+  echo "emits no heartbeat."
+  az functionapp start -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none || return 1
+
+  deadline=$(( $(date +%s) + START_TIMEOUT_S ))
+  while :; do
+    state="$(app_state)"
+    if [ "$state" = "Running" ]; then
+      echo "host state: ${state}"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# Before the settings write, not after it. The two steps below reach the host's extensions
+# endpoint and its telemetry, and neither answers while it is Stopped; the blob above did, which is
+# why the upload runs first and a truncated bundle fails without disturbing a brake somebody pulled
+# on purpose.
+if ! ensure_running; then
+  echo "::error::${FUNCTION_APP} is $(app_state || echo unknown) and did not come up within"
+  echo "::error::${START_TIMEOUT_S}s, so nothing can run the package this run uploaded."
+  echo "::error::WEBSITE_RUN_FROM_PACKAGE is untouched — the app still names its previous package —"
+  echo "::error::so this is the host failing to start, not a bad build."
+  echo "::error::  az functionapp start -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+  exit 1
+fi
+
 az functionapp config appsettings set -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none \
   --settings "WEBSITE_RUN_FROM_PACKAGE=${PACKAGE_URL}"
-
-# Not optional. After the package changes, a Consumption app whose scale controller still holds the
-# old trigger set comes back reporting `0 functions loaded`, `az functionapp function list` returns
-# nothing, and nothing ever wakes it — a restart does not fix it because there is no trigger to
-# scale on.
-az rest --method POST -o none --url \
-  "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}/syncfunctiontriggers?api-version=2023-12-01"
 
 after="$(az functionapp config appsettings list -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
   --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)"
@@ -127,29 +185,20 @@ if [ "$after" != "$PACKAGE_URL" ]; then
 fi
 echo "package after this run: ${PACKAGE_URL}"
 
-# A Stopped host cannot emit the heartbeat below, so without this the wait spends
-# `HEARTBEAT_TIMEOUT_S` and then reports a package that failed to mount — the wrong cause for the
-# one state an operator deliberately puts this app in. `az functionapp stop` is the last of the
-# three brakes in `docs/architecture.md`, and `worker-deploy` runs on every push to master, so a
-# deploy arriving while a brake is pulled is ordinary rather than exceptional. This is also the
-# reverse of that brake, which is why the runbook names them together.
-app_state() {
-  az functionapp show -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" --query state -o tsv
-}
-
-state="$(app_state)"
-if [ "$state" != "Running" ]; then
-  echo "the host is ${state}; starting it, because a stopped host emits no heartbeat."
-  az functionapp start -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none
-  state="$(app_state)"
-fi
-if [ "$state" != "Running" ]; then
-  echo "::error::${FUNCTION_APP} is ${state} after 'az functionapp start', so nothing can run the"
-  echo "::error::package this run uploaded. The package is fine; the host is not up."
-  echo "::error::  az functionapp start -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+# Not optional. After the package changes, a Consumption app whose scale controller still holds the
+# old trigger set comes back reporting `0 functions loaded`, `az functionapp function list` returns
+# nothing, and nothing ever wakes it — a restart does not fix it because there is no trigger to
+# scale on.
+if ! sync_error="$(az rest --method POST -o none --url \
+  "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${FUNCTION_APP}/syncfunctiontriggers?api-version=2023-12-01" 2>&1)"; then
+  echo "::error::syncfunctiontriggers was refused, so the scale controller still holds the previous"
+  echo "::error::trigger set and nothing will wake the package this run uploaded."
+  echo "::error::ARM does not perform this itself — it proxies to the host's own extensions"
+  echo "::error::endpoint, which answers 'Unauthorized … Forbidden from extensions API' whenever the"
+  echo "::error::host is not serving. The host reads $(app_state || echo unknown) now."
+  printf '%s\n' "$sync_error"
   exit 1
 fi
-echo "host state: ${state}"
 
 echo "waiting up to ${HEARTBEAT_TIMEOUT_S}s for '${HEARTBEAT}' emitted after ${started_at}"
 deadline=$(( $(date +%s) + HEARTBEAT_TIMEOUT_S ))

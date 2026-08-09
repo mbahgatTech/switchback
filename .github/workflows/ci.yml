@@ -708,10 +708,24 @@ jobs:
           exit 1
 
       # A smoke test, because "the alias moved" and "the site works" are different claims and
-      # only one of them has been proven so far. These six are the load-bearing routes: the
-      # map that is now the front page, the alias every shared link still carries, the list of
-      # trails near the reader, a trail read out of Postgres, the attribution ODbL requires,
-      # and the manifest without which none of it installs.
+      # only one of them has been proven so far.
+      #
+      # **Every assertion here has to be one the architecture guarantees on an empty corpus.**
+      # Ingestion is on demand — nothing is seeded, tiles fill when a reader opens ground — so a
+      # route naming one trail asserts a fact about history rather than about the deployment. This
+      # list held `/trails/llanberis-path` until the production corpus was wiped, and then failed
+      # run 31301084801 against a web tier that had deployed perfectly: all five other routes 200,
+      # `/api/version` reporting the pushed commit, and one 404 that was the correct answer.
+      #
+      # What the design does promise is that the site serves its own pages and that a trail lookup
+      # reaches Postgres, so those are what this asserts. The 404 is the second one: `trails.bySlug`
+      # queries `trails` and falls through to `trail_slug_aliases`, so an unreachable schema is a
+      # 500 and only a schema that answered "no such row" is a 404.
+      #
+      # The other two halves of "production is healthy" are proven upstream and not repeated here —
+      # that this commit is the one serving, by the alias poll above; that the worker is running
+      # this build, by the heartbeat `deploy ingest worker` waits for. Neither belongs in a curl
+      # loop, and the second has no Azure credential on this job to ask with.
       #
       # No `-L`, deliberately. `%{http_code}` reports the first response, so a redirect anywhere
       # in this list fails the job — which is the point: `/explore` must serve the sheet itself
@@ -721,12 +735,25 @@ jobs:
           SITE: https://switchback-three.vercel.app
         run: |
           failed=0
-          for path in / /explore /nearby /trails/llanberis-path /attribution /manifest.webmanifest; do
-            status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$SITE$path" || echo 000)
-            printf '%s  %s\n' "$status" "$path"
-            [ "$status" = "200" ] || failed=1
+          check() {
+            status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$SITE$2" || echo 000)
+            printf '%s  want %s  %s\n' "$status" "$1" "$2"
+            [ "$status" = "$1" ] || failed=1
+          }
+
+          # The map that is now the front page, the alias every shared link still carries, the
+          # list of trails near the reader, the attribution ODbL requires, and the manifest
+          # without which none of it installs.
+          for path in / /explore /nearby /attribution /manifest.webmanifest; do
+            check 200 "$path"
           done
+
+          # A slug carried by no OpenStreetMap feature, so the lookup misses whatever has been
+          # ingested. Asserting the miss rather than a hit is what makes this hold the day after a
+          # wipe and the day after a full re-ingest.
+          check 404 /trails/switchback-smoke-test-no-such-trail
+
           [ "$failed" -eq 0 ] || {
-            echo "::error::A production route did not return 200."
+            echo "::error::A production route did not answer as the design requires."
             exit 1
           }

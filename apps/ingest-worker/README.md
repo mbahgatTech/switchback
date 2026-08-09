@@ -184,9 +184,10 @@ az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ing
 
 **A merge to `master` reverses it too, and that is not optional.** `ci.yml` gates
 `deploy ingest worker` on a push to `refs/heads/master`, and `.github/scripts/deploy-worker.sh`
-starts a host it finds stopped, then fails the run if the host is not `Running` afterwards — a
-stopped host emits no heartbeat, so the deploy has no other way to tell a bad package from a
-deliberate stop. This brake holds ingestion off until the next merge, not across a release.
+starts a host it finds stopped — before it points the app at the new package, because ARM proxies
+`syncfunctiontriggers` to the host's own extensions endpoint and a stopped host refuses it — then
+fails the run if the host is not `Running`. This brake holds ingestion off until the next merge, not
+across a release.
 
 **The new build is the problem.** Roll the code back by pointing `WEBSITE_RUN_FROM_PACKAGE` at the
 previous zip; `.github/scripts/deploy-worker.sh` is what writes it, and the blob container keeps

@@ -124,11 +124,12 @@ Function App_:
 | Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | `az functionapp start` — **or any deploy to `master`** | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped                                |
 
 **The stop does not survive a deploy, and that is the one an operator has to know.**
-`.github/scripts/deploy-worker.sh` reads the host's state and starts it when it is not `Running`,
-because a stopped host emits no heartbeat and the deploy has no other way to tell a bad package
-from a deliberate stop. `ci.yml` runs `deploy ingest worker` on every push to `master`, so merging
-anything restarts a stopped worker and ingestion resumes. Stopping the host is a brake against a
-bad build or a bad hour, not a way to hold ingestion off across a release.
+`.github/scripts/deploy-worker.sh` reads the host's state and starts it when it is not `Running` —
+before it points the app at the new package, because ARM proxies `syncfunctiontriggers` to the
+host's own extensions endpoint and a stopped host refuses it. `ci.yml` runs `deploy ingest worker`
+on every push to `master`, so merging anything restarts a stopped worker and ingestion resumes.
+Stopping the host is a brake against a bad build or a bad hour, not a way to hold ingestion off
+across a release.
 
 The first brake narrows the pump to reclaimed leases rather than silencing it. `classifyDisposition`
 completes a Service Bus message on the strength of the reaper returning the row to `queued` at
@@ -195,10 +196,12 @@ inside `drainJobs`, and a drain was a side effect of traffic on cold ground plus
 allows to fire once a day. So a cron tick that claimed ten jobs at 04:51 UTC on 2026-08-07, then
 died on Vercel's 60 s wall clock still holding them, left ten leases 5.9 h old against the
 thirty-minute lease of that regime — four of them at their last attempt, so the next reclaim would
-have buried them. Recovery now runs from two places that do not require a drain: `ingestPump`'s
-two-minute `maintain()` calls `sweepQueue` in `packages/ingest/src/maintenance.ts`, which is that
-reclaim plus the split-marker repair below, and `drainSlotGate` calls `reclaimExpiredJobs` inside
-the transaction that admits a drainer, so a dead drainer cannot hold the slot shut.
+have buried them. Recovery now runs from three places that do not require a drain, two of them on
+the pump's two-minute tick: `maintain()` calls `sweepQueue` in `packages/ingest/src/maintenance.ts`,
+which is that reclaim plus the split-marker repair below; `runPump` reclaims again before it selects
+the head, so a tick publishes with the reclaim already applied rather than one tick behind it; and
+`drainSlotGate` calls `reclaimExpiredJobs` inside the transaction that admits a drainer, so a dead
+drainer cannot hold the slot shut.
 
 **A parent can claim a subdivision that has nothing behind it.** `splitTile` upserts four child
 rows, enqueues four jobs and only then marks the parent, so the marker is the _last_ write and a
@@ -228,8 +231,9 @@ distress rule reports.
 **Stopping it.** There is no driver flag and no second path, so "roll back the cutover" is not a
 thing that can be done — there is nowhere to roll back _to_. What exists instead is three brakes,
 and the right one depends on what has gone wrong. None needs a deploy to _pull_. The third is
-undone by one: `deploy-worker.sh` starts a host it finds stopped, and `deploy ingest worker` runs
-on every push to `master`, so a merge restarts a stopped worker whether or not that was the intent.
+undone by one: `deploy-worker.sh` starts a host it finds stopped, ahead of everything it writes to
+the app, and `deploy ingest worker` runs on every push to `master`, so a merge restarts a stopped
+worker whether or not that was the intent.
 
 ```bash
 RG=rg-switchback-prod-northcentralus
@@ -246,7 +250,8 @@ az functionapp config appsettings set -g "$RG" -n "$APP" \
   --settings AzureWebJobs.ingestDrain.Disabled=true -o none
 
 # Everything is wrong. Nothing drains and nothing is observed. This one is undone by the next
-# merge to master as well as by the command below: `deploy ingest worker` starts a stopped host.
+# merge to master as well as by the command below: `deploy ingest worker` starts a stopped host
+# before it publishes anything to it.
 az functionapp stop -g "$RG" -n "$APP"
 
 # And back. Messages that expired against the PT1H TTL while it was down are gone; their
@@ -381,19 +386,19 @@ select "lockedBy", count(*), min("lockedAt"), max("completedAt") from ingest_job
 45,225 rows, these are forensic queries rather than a hot path, and a second index would cost a
 write on every job outcome to save a sequential scan nobody runs in a request.
 
-**The gate is `drainIngest`'s default, not a call site's to remember.** Three entry points on
-Vercel reach the queue — `trails.ts` for viewport tiles, `routes.ts` for the route planner's
-network tiles, and the cron route — and `routes.ts` shipped without a gate for as long as passing
-one was a caller's decision, which left the `ingest_network` path (a real Overpass query, reachable
-from the public `routes.coverage` procedure) bounded by nothing. `drainIngest` now supplies
+**The gate is `drainIngest`'s default, not a call site's to remember.** Two entry points on Vercel
+reach the queue — `trails.ts:394` for viewport tiles and `routes.ts:119` for the route planner's
+network tiles — and both publish a signal rather than drain; the maintenance cron is not a third,
+because it touches the auth tables and R2 and never the ingest queue. `drainIngest` supplies
 `drainSlotGate` unless the caller passes `gate: null`, and `packages/ingest/test/drain-slot.test.ts`
 holds that: a caller that asks for no gate is still refused while another process holds the slot.
 
-One caller opts out, and only one: `apps/ingest-worker/src/drain.ts`, where the process is the whole
-fleet by Azure configuration and a cross-process lock would serialise invocations the platform has
-already made safe. `scripts/ingest.ts` does not opt out — an operator draining from a laptop against
-this database counts against the same slot, which is conservative rather than exact, since that run
-leaves from a different egress IP.
+No process opts out. `gate: null` appears at exactly one place in the tree — that test — and both
+production callers, `apps/ingest-worker/src/drain.ts:211` and `scripts/ingest.ts:56`, take the
+default. The worker used to opt out on the argument that `functionAppScaleLimit=1` made it the whole
+fleet; that argument holds only while exactly one host is running, and across a Consumption instance
+replacement two overlap. An operator draining from a laptop counts against the same slot, which is
+conservative rather than exact, since that run leaves from a different egress IP.
 
 The cost is honest and deliberate: a drainer that dies holding claims keeps the slot shut until its
 lease expires. That is why the gate sweeps inside its own transaction, and why `sweepQueue` runs off
@@ -440,6 +445,15 @@ both dense alpine tiles, killed at 612,947 ms and 615,938 ms. The same window ha
 `ingestPump` ticks of 19,901 ms and 57,939 ms in the same process, so a saturated single instance
 with the timer contending against the queue trigger is a second, independent term — and one
 `maxConcurrentCalls: 1` does not cover, because the pump is not a queue message.
+
+**The saturation is not confined to that window, and it tracks the commit rather than the fetch.**
+Over the 24 hours to 2026-08-09T09:08Z the host wrote `Host CPU threshold exceeded` in 130 distinct
+minutes; 47 of those also carried a `prisma.trail.upsert` trace and 12 carried an Overpass one,
+against 50 minutes carrying any Overpass trace at all. That is a coincidence count rather than a
+mechanism — traces are sampled, and those upsert lines are `slug` collisions rather than healthy
+writes, so both figures undercount — but what pins a Consumption instance is the tile committing its
+thousand-odd trails, not the query that fetched them. Read it as a capacity fact: more Overpass
+window buys nothing here, and relief is a plan tier or a smaller commit.
 
 So there is now one wall clock rather than one per subsystem: `INGEST_DEADLINE_MS` (540 s) is passed
 to every phase as `PipelineDeps.deadlineAt`. Past it terrain refuses to start a fetch, the commit
@@ -706,11 +720,11 @@ whatever the ceiling says, so the combination that cuts fresh seam while trail i
 `min(wayId)` cannot be reached by setting one variable.
 
 **Both settings have to be set on the process that is actually draining, which is the Function App.**
-Both are declared in `apps/web/src/env.ts` as well as in `ingest.bicep`, each defaulting to off, so a
-value set on one side and not the other is a difference an operator can see rather than a flag that
-appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
-of a silent fallback, which is why they exist at all: `@switchback/ingest` reads both from
-`process.env` itself.
+`ingest.bicep` is the only place either is declared — `apps/web/src/env.ts` declares neither, and the
+Function App is the only process that drains `ingest_jobs`, so there is no second copy for a value to
+drift from. Both entries read a template parameter rather than a literal, because an
+application-settings write replaces the collection whole and a baked-in value would re-enable a
+control an operator had turned off. `@switchback/ingest` reads both from `process.env` itself.
 
 **And `claim` needs a database privilege the flag cannot grant.** `resolveTrail` reads `TrailWay`
 before it decides anything, so a runtime role without SELECT on `trail_ways` fails every trail in
@@ -831,9 +845,9 @@ Muir Trail — is a trail in its own right, keeps its own row, and yields the co
 fighting for it on every ingest.
 
 **The primary key on `trail_ways.wayId` is the concurrency control.** Two tiles racing for one way is
-the expected case: `COMMIT_CONCURRENCY` is 6 inside each drainer and there are two drainers. The
-loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because the
-line and every statistic derived from it were built on a resolution that is now stale — and the
+the expected case: `COMMIT_CONCURRENCY` is 6, so the one drainer has six commits in flight at once.
+The loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because
+the line and every statistic derived from it were built on a resolution that is now stale — and the
 retry re-reads the claims and adopts the row the winner created.
 
 **The rollback is one setting, and it is a rollback of behaviour, not of state.** `osm-id` never
@@ -1035,10 +1049,10 @@ has no fallback: `INGEST_PACKAGE_URL` must be read off the live app first, and a
 fails the build with `BCP427` rather than pointing production at another build. What a template
 cannot do is upload `function-releases/<commit>-<utc>.zip`, so both steps still exist:
 
-| Step | Command                                                                 | Why the order                                                                                                                   |
-| ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, including the package URL it was handed. Harmless when that URL is the live one; wrong when it is not. |
-| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.            |
+| Step | Command                                                                 | Why the order                                                                                                                            |
+| ---- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, including the package URL it was handed. Harmless when that URL is the live one; wrong when it is not.          |
+| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, brings the host up, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`. |
 
 Step 2 alone is the routine case; step 1 is only needed when the template changes. Step 1 no longer
 leaves the app codeless, so the two are independent — but the trigger cache still has to be synced
@@ -1118,10 +1132,9 @@ left to scale on.
 ## Rolling a control back
 
 Two environment variables change what ingest does, and **only the Function App's copies matter.** It
-is the only process that drains, so it is the only process whose value changes behaviour —
-`apps/web/src/env.ts` declares them on the Vercel side purely so a typo is a startup error rather
-than a silent misread, and nothing there reads them for behaviour. Every rollback below is therefore
-one write, against the Function App.
+is the only process that drains, so it is the only process whose value changes behaviour;
+`apps/web/src/env.ts` declares neither, and nothing the web app serves reads them. Every rollback
+below is therefore one write, against the Function App.
 
 Both are **not fully reversible**, and the table says which part is not. Reversing the setting is
 never the same as reversing what happened while it was on.
@@ -1231,24 +1244,18 @@ one is already `running`; wait out the lease (12 minutes at most) and run it aga
 
 ### `INGEST_TRAIL_IDENTITY` → `osm-id`
 
+One surface, because the Function App is the only process that reads it. Vercel carries the name
+with an empty value and reaches no code that resolves an identity mode, so there is nothing to
+change there and no redeploy to wait on.
+
 ```bash
-# 1. Vercel. Production carries the variable; Preview does not, and `env rm` on an absent name
-#    exits non-zero — check before removing rather than removing blind.
-vercel env ls production | grep INGEST_TRAIL_IDENTITY && \
-  vercel env rm INGEST_TRAIL_IDENTITY production --yes
-
-# 2. Promote a deployment built without it, or merges continue on the running one.
-vercel redeploy switchback-three.vercel.app --target production
-
-# 3. The Function App. `ingest.bicep` declares this setting explicitly, so set it rather than
-#    delete it — a deleted setting is written back by the next template deploy from whatever the
-#    deploying shell exports, and the two states would otherwise read as drift.
+# `ingest.bicep` declares this setting explicitly, so set it rather than delete it — a deleted
+# setting is written back by the next template deploy from whatever the deploying shell exports,
+# and the two states would otherwise read as drift.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_TRAIL_IDENTITY=osm-id -o none
 
-# 4. Verify. Anything other than the exact string `claim` is osm-id, but say it explicitly.
-vercel env ls production | grep INGEST_TRAIL_IDENTITY       # expect no output
-vercel ls --environment production                          # newest row's Age younger than step 1
+# Verify. Anything other than the exact string `claim` is osm-id, but say it explicitly.
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
   --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv                     # expect osm-id
@@ -1885,15 +1892,26 @@ them needs a backfill that picks a winner per hash, moves user content onto it a
 loser's slug through `trail_slug_aliases`. Both tables are writable, so what blocks the backfill is
 that nobody has written it.
 
-`INGEST_TRAIL_IDENTITY` reads `claim` on the Function App and in Vercel **Production**, and is
-**absent in Vercel Preview** — `identity.ts` resolves anything that is not exactly `claim`, absence
-included, to `osm-id`. Preview carries no `DATABASE_URL`, so nothing there ingests and the asymmetry
-changes no behaviour; it starts to matter the day Preview is given a database of its own.
+`INGEST_TRAIL_IDENTITY` reads `claim` on the Function App, which is the only surface where it does
+anything. Vercel **Production** still carries the name with an empty value; nothing there reads it.
+`trailIdentityMode` resolves the flag at four call sites, all inside `packages/ingest`;
+`pipelineDeps` at three, one there and two in `scripts/ingest.ts`, the operator drain that runs from
+a shell rather than from a workspace the site builds — the root `workspaces` are `apps/*` and
+`packages/*`, and `scripts/` has no manifest of its own. What confines the flag to the worker is not
+their number but where they are:
+`git grep -n -E "trailIdentityMode|pipelineDeps" -- apps/web packages/api` returns nothing, against
+195 files under `apps/web` alone that the same traversal reads. The fifteen value symbols the
+routers do import — `ensureCoverage`, `publishIngestSignals`, `requestArea`, `surveyArea`,
+`tileJobKey`, `VERCEL_OIDC_HEADER`, `centroidOf`, `elevateLine`, `ensureNetworkCoverage`,
+`getTerrain`, `loadNetworkSegments`, `networkJobKey`, `getGeocoder`, `TerrainSource` and `fillGaps`
+— queue work and shape geometry; none resolves an identity mode. `apps/web/src/env.ts` does not
+declare it, and the empty Vercel entry is residue that can be deleted whenever somebody is in the
+project settings.
 
 | Surface      | Read it back with                                                                                                             |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
 | Function App | `az functionapp config appsettings list -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri -o json` |
-| Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone (see the runbook note on `--no-sensitive`)          |
+| Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone and reports an empty value as `Encrypted`           |
 
 **A deploy of `ingest.bicep` from a shell that has not exported the flag fails the build.**
 `ingest.bicepparam` resolves `ingestTrailIdentity` through

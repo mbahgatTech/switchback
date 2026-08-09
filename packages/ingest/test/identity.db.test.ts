@@ -191,8 +191,9 @@ describe.skipIf(!IS_LOCAL).sequential('trail identity across a tile seam', () =>
   });
 
   it('produces one row when both tiles commit at once', async () => {
-    // Two drainers on one `ingest_jobs` table is the documented operating state, and
-    // `COMMIT_CONCURRENCY` is 6 inside each. The claim insert is the only thing serialising them.
+    // The drainer commits up to `COMMIT_CONCURRENCY` trails at once, which is 6, so two tiles
+    // reach the claim insert together in the ordinary course. That insert is the only thing
+    // serialising them.
     await Promise.all([processTile(WEST, deps([W1, W2])), processTile(EAST, deps([W2, W3]))]);
     expect(await fixtureTrails()).toHaveLength(1);
   });

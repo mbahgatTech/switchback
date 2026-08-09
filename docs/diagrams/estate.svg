@@ -108,7 +108,7 @@
   <use href="#i-lambda" x="306" y="136" width="18" height="18"/>
   <text class="nlabel" x="330" y="149">Production</text>
   <text class="nsub" x="306" y="168">Next.js + tRPC · enqueues and publishes, never drains</text>
-  <text class="nsub" x="306" y="181">INGEST_TRAIL_IDENTITY = claim</text>
+  <text class="nsub" x="306" y="181">reads no INGEST_* setting — the worker owns those</text>
   <text class="nsub" x="306" y="192">carries id-switchback-vercel-publisher</text>
 
   <rect class="node" x="296" y="210" width="188" height="44" rx="6" stroke="#94a3b8" stroke-dasharray="5 3"/>
@@ -124,7 +124,7 @@
   <text class="zsub" x="296" y="348">Both environments federate to one Entra identity,</text>
   <text class="zsub" x="296" y="362">so Azure sees a single caller and cannot tell them</text>
   <text class="zsub" x="296" y="376">apart. Preview also sits behind Vercel Authentication.</text>
-  <text class="zsub" x="296" y="396">INGEST_TRAIL_IDENTITY is absent on Preview.</text>
+  <text class="zsub" x="296" y="396">INGEST_TRAIL_IDENTITY belongs to the Function App.</text>
 
   <!-- ============================== THIRD PARTY ============================== -->
   <rect class="zone" x="24" y="444" width="476" height="112" rx="10" stroke="#94a3b8" stroke-dasharray="6 4"/>
