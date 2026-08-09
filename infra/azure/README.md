@@ -913,9 +913,9 @@ side and stays `true` until every consumer has been proved on a token.
    `ingest_jobs`: `dead=1 staleLeases=1` at 17:45:12Z and `staleLeases=0` at 17:46:00Z.
 
    Reverting is `databaseAuth='password'` with a `databaseUrl` carrying `sbapp`'s password,
-   redeployed, then `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces
-   the collection whole and takes `WEBSITE_RUN_FROM_PACKAGE` with it, leaving the app codeless
-   until the package is pushed again.
+   redeployed. That deployment rewrites the whole application-settings collection, so export the
+   live `INGEST_PACKAGE_URL` with it — the parameter has no fallback, so an unset one fails the
+   build rather than moving the app onto another package.
 
    **Do not move the Function App onto the shared identity.** The shared identity's
    Service Bus Data Receiver was revoked on 2026-08-08 precisely because it is drain capability for
@@ -954,9 +954,9 @@ side and stays `true` until every consumer has been proved on a token.
 4. Deploy `ingest.bicep` with the step-1 parameters and prove a tile ingests end to end. Use the
    export set in [Deploying it](#deploying-it) rather than a shorter one: every variable there has
    no fallback, so a missing one fails the build instead of writing a wrong value. Confirm the
-   settings landed with `az functionapp config appsettings list -o json`, and re-run
-   `.github/scripts/deploy-worker.sh` — an ARM application-settings write replaces the collection
-   whole and erases `WEBSITE_RUN_FROM_PACKAGE`.
+   settings landed with `az functionapp config appsettings list -o json` — an ARM
+   application-settings write replaces the collection whole, and that read is the only thing that
+   can confirm what it wrote.
 5. Re-prove **both** administrator doors in the same hour: `Postgres identity` → `inspect` from
    `master`, and the owner connecting from their own machine with ProtonVPN disconnected. Not "it
    worked last week".
@@ -1074,12 +1074,11 @@ that directly. Every link in the chain that stops it is readable from configurat
 multiplies that by the instance's core count. The load-bearing property is that Consumption runs one
 host instance for the whole app, so every invocation shares one Node process and one client.
 
-**This table bounds the Function App, which drains nothing today.** `INGEST_QUEUE_DRIVER` is
-`postgres`, so Vercel owns the drain and every row above except the last is a property of the wrong
-process — a lambda is a process, and Vercel starts as many as the traffic wants. What bounds the
-fleet is `INGEST_MAX_DRAINERS = 1`, enforced across processes by an advisory lock in
-`packages/ingest/src/drain-slot.ts`; `docs/architecture.md` states the resulting bound in full and
-is the one place that does.
+**This table bounds the Function App, which is now the only thing that drains.** The Vercel path is
+deleted, so every row above describes the process that actually makes Overpass requests rather than
+one side of a fan-out. The last row is what holds the bound across host instances:
+`INGEST_MAX_DRAINERS = 1`, enforced by an advisory lock in `packages/ingest/src/drain-slot.ts`.
+`docs/architecture.md` states the resulting bound in full and is the one place that does.
 
 **`functionAppScaleLimit` caps scale-out, not instance count.** Consumption still replaces instances,
 and for a few seconds around a replacement two hosts of this app run at once with a client each — the
@@ -1088,25 +1087,20 @@ starting 13 s later and taking sequence 2, with no evidence the first had stoppe
 sustained, up to 4 across a recycle. Fair use is about sustained load, so that is the honest number to
 quote rather than an unqualified deployment-wide 2.
 
-Vercel makes **zero** Overpass requests in an environment where `INGEST_QUEUE_DRIVER=servicebus`.
-Three call sites in a Vercel process can reach Overpass — `/api/cron/drain`, `trails.kickIngest` and
-`routes.kickNetwork` — and all three branch on the flag.
+Vercel makes **zero** Overpass requests, and that is now a property of the deployment rather than of
+an environment variable. The three call sites that could reach Overpass from a Vercel process —
+`/api/cron/drain`, `trails.kickIngest` and `routes.kickNetwork` — are deleted rather than gated. A
+Vercel process enqueues a row and publishes a Service Bus message; it holds no `OverpassClient` and
+has no drain to run.
 
-**That is per Vercel environment, not per deployment, and the difference is the whole number.** The
-flag is an environment variable and Production and Preview hold it independently. An environment on
-`postgres`, or with the variable simply absent (`ingestQueueDriver()` reads anything unrecognised as
-`postgres`), drains `ingest_jobs` with its own `OverpassClient` at 2 on every warm lambda. Only
-Production can do that now — Preview holds no `DATABASE_URL` and fails its startup environment
-check — but the flag is still per environment, so give Preview a database and the second drainer
-returns. Check it, do not assume it:
+That is what makes the number checkable. While the path existed behind a flag, the bound was a
+property of _a Vercel environment_: Production and Preview held the flag independently, an
+environment with it absent read as `postgres` and drained inline at 2 per warm lambda, and giving
+Preview a database was enough to bring a second drainer back. None of those states is reachable now
+— the code that would drain is not in the bundle.
 
-```bash
-vercel env ls production | grep INGEST_QUEUE_DRIVER
-vercel env ls preview    | grep INGEST_QUEUE_DRIVER   # absent is the failure mode, and looks like nothing
-```
-
-With both environments on `servicebus` the deployment-wide figure is the Azure one: 2 sustained, up
-to 4 across a recycle. Raising any row in the table above is not a throughput knob.
+The deployment-wide figure is therefore the Azure one: 2 sustained, up to 4 across a recycle.
+Raising any row in the table above is not a throughput knob.
 
 ### Deploying it
 
@@ -1115,8 +1109,11 @@ az provider register --namespace Microsoft.ServiceBus --wait   # NotRegistered b
 
 export INGEST_DATABASE_URL="…"                       # the sbapp connection string
 export INGEST_OVERPASS_USER_AGENT="Switchback/0.1 (+https://switchback-three.vercel.app/attribution)"
-export INGEST_QUEUE_DRIVER=postgres                  # or servicebus — no default, state it
 export INGEST_TRAIL_IDENTITY=claim                   # the live value — no default, state it
+export INGEST_SUBDIVIDE_MAX_ZOOM=11                  # the live value — no default, state it
+export INGEST_PACKAGE_URL="$(az functionapp config appsettings list \
+  -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?name=='WEBSITE_RUN_FROM_PACKAGE'].value | [0]" -o tsv)"
 
 az deployment group create \
   --name switchback-ingest --resource-group rg-switchback-prod-northcentralus \
@@ -1126,21 +1123,29 @@ az deployment group create \
 unset INGEST_DATABASE_URL
 ```
 
-Those four exports are the whole set with no fallback, and a missing one fails the build with
-`BCP427` naming the variable — before ARM is called. `ingest.bicepparam` reads three more from the
-environment — `INGEST_SUBDIVIDE_MAX_ZOOM`, `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` — and each of
-those falls back to what the app already holds (`9`, and absent for the other two), so leaving them
-unexported deploys the deployed value.
+Those five exports are the whole set with no fallback, and a missing one fails the build with
+`BCP427` naming the variable — before ARM is called. Every one of them names a live control, and an
+application-settings write replaces the collection whole, so any default would revert one:
 
-`INGEST_TRAIL_IDENTITY` is in the block, and has no fallback, because for it that was not true: the
-app reads `claim` and an application-settings write replaces the collection whole, so any default
-would revert a live control. Confirm the value landed rather than assuming it — `identity.ts` reads
-an absent variable and `osm-id` identically, so a reverted app looks unchanged:
+| Export                       | Live value                              | What a default would do                                                                                                   |
+| ---------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `INGEST_DATABASE_URL`        | the `sbapp` connection string           | deploy a worker that cannot reach Postgres                                                                                |
+| `INGEST_OVERPASS_USER_AGENT` | a contact URL that reaches this project | run unattended under a placeholder, which is what mirrors block for                                                       |
+| `INGEST_TRAIL_IDENTITY`      | `claim`                                 | revert to `osm-id`, silently — `identity.ts` reads an absent variable and `osm-id` identically                            |
+| `INGEST_SUBDIVIDE_MAX_ZOOM`  | `11`                                    | write `9`, which turns subdivision **off**: `canSubdivide(9, 9)` is false, so a dense z9 tile is failed rather than split |
+| `INGEST_PACKAGE_URL`         | the zip the host currently runs         | point the app at another build, or leave it codeless                                                                      |
+
+`ingest.bicepparam` reads two more from the environment — `TERRAIN_TILE_URL` and `MAPILLARY_TOKEN` —
+and both fall back to absent, which is what the app already holds, so leaving them unexported
+deploys the deployed value.
+
+Confirm the two flags landed rather than assuming it:
 
 ```bash
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
-  --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv   # expect claim
+  --query "[?name=='INGEST_TRAIL_IDENTITY' || name=='INGEST_SUBDIVIDE_MAX_ZOOM'].[name,value]" -o tsv
+# expect: INGEST_TRAIL_IDENTITY claim / INGEST_SUBDIVIDE_MAX_ZOOM 11
 ```
 
 `INGEST_OVERPASS_USER_AGENT` is the one an operator has to get right rather than copy, and it has
@@ -1151,17 +1156,24 @@ deliveries with a message that names the database rather than the user agent. `s
 that rejected list by name: it reads like ours, is registered to somebody else, and was what the
 Function App actually sent on every Overpass request until 2026-08-03. Only the shape can be checked
 in code — that a URL reaches you is the one thing the operator has to get right.
-`INGEST_QUEUE_DRIVER` has no default on purpose: the deployment overwrites the Function App's setting
-with whatever the parameter resolves to, and a default would let a routine deploy re-arm the
-Postgres/Service Bus fan-out that an operator had just rolled back.
+`INGEST_TRAIL_IDENTITY` has no default on purpose: the deployment overwrites the Function App's
+setting with whatever the parameter resolves to, and a default would let a routine deploy silently
+change how trails are identified across a tile seam.
 
-**The template deploy and the package push always run together, template first — and the push is a
-script, not a command.** Linux Consumption runs the code from a package URL that
-`.github/scripts/deploy-worker.sh` writes into the same application-settings collection an
-ARM deployment replaces wholesale. `ingest.bicep` therefore does not declare `WEBSITE_RUN_FROM_PACKAGE`
-— and a Bicep deployment on its own leaves the app codeless until the next push. For the same reason,
-a setting added by hand in the portal is erased by the next deployment: worker environment belongs in
-the template.
+**The template declares the package URL; the package itself is pushed by a script.** Linux
+Consumption runs the code from `WEBSITE_RUN_FROM_PACKAGE`, which `ingest.bicep` declares from
+`packageUrl` — so a template-only deploy writes back the URL that is already live, provided
+`INGEST_PACKAGE_URL` names it. What no template can do is upload the per-commit zip, which is what
+the script below is for. For the same reason a setting added by hand in the portal is erased by the
+next deployment: worker environment belongs in the template.
+
+**`az deployment group what-if` cannot check any of this.** ARM redacts `siteConfig.appSettings` to
+`*******` in both the before and after payloads, because the collection can hold secrets — so no
+application setting appears in a what-if at any confidence level, and a plan that looks clean says
+nothing about `WEBSITE_RUN_FROM_PACKAGE`, `DATABASE_AUTH` or the two ingest flags. What-if is still
+worth running for the resource-level change list, and it is what proves no
+`Microsoft.DBforPostgreSQL` resource is in the change set. Settings are confirmed after the fact,
+with the `az functionapp config appsettings list` reads below.
 
 ```bash
 bash .github/scripts/deploy-worker.sh apps/ingest-worker/dist.zip "$(git rev-parse HEAD)"
@@ -1213,8 +1225,8 @@ az rest --method PUT --body @/tmp/grant.json \
 container: it reaches neither `azure-webjobs-secrets`, where the host keys live, nor the lease blobs
 beside it.
 
-The trigger sync inside it is not optional and cost half an hour to find. After an ARM deployment has
-removed `WEBSITE_RUN_FROM_PACKAGE` and the push has put it back, the host comes up reporting
+The trigger sync inside it is not optional and cost half an hour to find. When the package the app
+runs from changes, the host comes up reporting
 `0 functions loaded` / "No functions were found", `az functionapp function list` returns `[]`, and
 nothing ever wakes it — a Consumption app with no registered triggers has nothing to scale on, so it
 sits there indefinitely and a restart does not help. The call the script makes is:
@@ -1296,6 +1308,25 @@ Sender alone for the publisher `c9bfba39-…`. Two things must **not** appear:
 that was assignment `0090d328-0cee-592f-8359-e4cc64940694`, revoked 2026-08-08, and its return would
 mean a template or a hand edit put drain capability back on Vercel's identity.
 
+**Finish by leaving the host running, or nothing you just deployed does anything.** The last of the
+three brakes is `az functionapp stop`, and a stopped host runs no package however new it is. The
+deploy script starts it and refuses if it does not come up — a stopped host and a package that
+failed to mount produce the same silence, and only the state read tells them apart. By hand:
+
+```bash
+az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
+az functionapp show  -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
+  --query state -o tsv
+# expect: Running
+```
+
+A stop is not free in both directions. `defaultMessageTimeToLive` is `PT1H` and
+`deadLetteringOnMessageExpiration` is `false`, so wake-up signals older than an hour are deleted
+silently while the host is down — fifteen expired that way across one maintenance stop. The
+`ingest_jobs` rows survive, and the pump republishes from the head of `priority DESC, "runAfter" ASC`
+on its next tick, so what a stop costs is the queue's ordering position for anything enqueued during
+it rather than the work itself.
+
 ### The two things Bicep cannot express
 
 Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
@@ -1358,10 +1389,10 @@ az deployment group show -g rg-switchback-prod-northcentralus -n switchback-inge
 client:publisherClientId.value,tenant:publisherTenantId.value}" -o json
 ```
 
-→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` on the Vercel project, plus
-`INGEST_QUEUE_DRIVER=servicebus`. The exchange fails silently at Entra if the Vercel **team or
-project is renamed** — the `sub` claim follows the new name and the federated credential does not.
-Fixing that is a one-parameter redeploy of this template.
+→ `SERVICE_BUS_NAMESPACE`, `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` on the Vercel project. The
+exchange fails silently at Entra if the Vercel **team or project is renamed** — the `sub` claim
+follows the new name and the federated credential does not. Fixing that is a one-parameter redeploy
+of this template.
 
 ---
 

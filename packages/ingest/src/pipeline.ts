@@ -139,10 +139,27 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
 /** Re-exported from their own module so subdivision can ask the same question without a cycle. */
 export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
 
+/**
+ * The literal `switchback-ingest-overpass-skipped` greps for.
+ *
+ * Three of a tile's four Overpass queries fail soft — region, waypoints, parent routes — so a
+ * budget that refuses them costs metadata silently: the tile still reaches `ready`, the request row
+ * still reads success, and no job row records anything. This token is what makes the loss
+ * countable, and it is why `lookupRegion` logs at all.
+ */
+export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
+
 export interface PipelineDeps {
   db?: PrismaClient;
   /** The shared client, or a `withDeadline` view of it — never a second client. */
   overpass: OverpassQuerier;
+  /**
+   * The same client for the phases that run *after* the commit loop, bounded only by
+   * `deadlineAt`. `overpass` gives up early to leave the commit loop its reserve; a query that
+   * runs once the commits are done has nothing left to reserve for, and gating it on that
+   * deadline refuses work the invocation still has minutes to do. Defaults to `overpass`.
+   */
+  overpassAfterCommits?: OverpassQuerier;
   terrain?: TerrainSource;
   /**
    * Epoch milliseconds after which this handler stops doing work. Overpass has its own budget
@@ -320,7 +337,6 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   }
 
   const region = await lookupRegion(bbox, deps);
-
   /**
    * Waypoints for the whole tile in one query rather than one per trail: forty trails would
    * be forty Overpass requests at two concurrent, for overlapping data. `attachWaypoints`
@@ -333,7 +349,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       features = response.elements ?? [];
     } catch (error) {
       // Waypoints are decoration; a trail without them is still a trail.
-      log('features failed', { quadkey, error: String(error) });
+      log(`${OVERPASS_SKIPPED_MARKER} features failed`, { quadkey, error: String(error) });
     }
   }
 
@@ -522,6 +538,11 @@ async function rollUpSplitTile(
  * Queue the long-distance routes this tile's trails turn out to be pieces of. Runs after the
  * tile is marked ready and swallows its own failures: it is strictly additive, and marking
  * the tile failed would re-run the expensive half to retry the cheap half.
+ *
+ * Uses `overpassAfterCommits` because it runs past the commit loop the ordinary Overpass deadline
+ * reserves clock for. Measured on the deployed budget: five of five invocations that reached here
+ * on 2026-08-08 between 22:34 and 22:48 UTC were refused, at 181, 207, 214, 249 and 253 s into a
+ * handler bounded at 540 s.
  */
 async function discoverParentRoutes(
   db: PrismaClient,
@@ -532,8 +553,9 @@ async function discoverParentRoutes(
   const relationIds = assembled.filter((t) => t.osmType === 'relation').map((t) => t.osmId);
   if (relationIds.length === 0) return;
 
+  const overpass = deps.overpassAfterCommits ?? deps.overpass;
   try {
-    const response = await deps.overpass.query(buildParentRouteQuery(relationIds));
+    const response = await overpass.query(buildParentRouteQuery(relationIds));
     const parents = (response.elements ?? []).filter(
       (element): element is OverpassRelation => element.type === 'relation',
     );
@@ -555,7 +577,7 @@ async function discoverParentRoutes(
       log('queued route', { osmId: parent.id, name: parent.tags.name });
     }
   } catch (error) {
-    log('parent route lookup failed', { error: String(error) });
+    log(`${OVERPASS_SKIPPED_MARKER} parent route lookup failed`, { error: String(error) });
   }
 }
 
@@ -1304,14 +1326,18 @@ export interface RegionInfo {
 /**
  * Country and region for a tile, from one `is_in` query at its centre. Fails soft to nulls: a
  * trail with no region name is fully usable, and a boundary lookup is not worth failing a
- * tile of otherwise good data over.
+ * tile of otherwise good data over. Soft, not silent — an empty catch here was the one Overpass
+ * refusal in the pipeline that left no trace at all.
  */
 async function lookupRegion(bbox: BBox, deps: PipelineDeps): Promise<RegionInfo> {
   const centre: LngLat = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
   try {
     const response = await deps.overpass.query(buildRegionQuery(centre));
     return pickRegion(response.elements ?? []);
-  } catch {
+  } catch (error) {
+    (deps.logger ?? (() => {}))(`${OVERPASS_SKIPPED_MARKER} region lookup failed`, {
+      error: String(error),
+    });
     return { regionName: null, countryCode: null };
   }
 }

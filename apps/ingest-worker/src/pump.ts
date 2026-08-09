@@ -9,9 +9,18 @@ import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from './log';
 
 /**
- * How many messages the pump will leave in flight. One worker takes them at ~10-30 s each, so
- * eight is under three minutes of work — long enough that the queue never runs dry between
- * ticks, short enough that a tile someone is looking at is not stuck behind a day of backlog.
+ * How many messages the pump will leave in flight.
+ *
+ * Not a work-time budget — that reading does not survive measurement. Over the 50 `ingestDrain`
+ * invocations of 2026-08-08 the distribution is bimodal: a median of 2.1 s for the ones that find
+ * nothing claimable, a mean of 126.2 s and a p90 of 540.1 s for the ones that drain a tile. At
+ * `maxConcurrentCalls: 1` a queue eight deep is therefore ~15 minutes of work at the mean and over
+ * an hour at p90, which is past `defaultMessageTimeToLive`.
+ *
+ * Eight is a *wake-up* depth, and it is safe at that dwell because the queue holds no state: a
+ * message that expires is deleted silently, its `ingest_jobs` row is still `queued`, and the next
+ * tick republishes it. What the depth actually buys is that the queue never runs dry between ticks;
+ * what `PUMP_LOW_WATER` buys is that a backlog of duplicates cannot build up behind a slow tile.
  */
 export const PUMP_QUEUE_DEPTH = 8;
 
@@ -76,8 +85,12 @@ export interface SignalQueue {
  *
  * The two selects are the two arms of `drainJobs`, in the same order and with the same
  * predicate, so what the pump considers most important and what a worker then claims cannot
- * disagree. Nothing here is claimed or written: a row stays `queued` until a worker takes it,
- * which is why a lost message costs a wait rather than a job.
+ * disagree. Nothing here is claimed or written: a row stays `queued` until a worker takes it, so
+ * a lost message costs a row its position and never the row. How long that position takes to
+ * reach the head is the backlog's business, not this tick's.
+ *
+ * `minPriority` narrows both selects to a band and nothing else — see `ingestPump`, which passes
+ * `RECLAIM_PRIORITY` while the brake is on.
  */
 export async function runPump(
   db: Db,
@@ -85,13 +98,15 @@ export async function runPump(
   log: WorkerLog,
   now = new Date(),
   bounds: PumpBounds = pumpBounds(),
+  minPriority?: number,
 ): Promise<{ published: number }> {
   /*
-   * Before publishing, not after: a job whose worker the host killed mid-drain still holds its
-   * lease, and the pump would otherwise keep re-signalling a row no worker can claim. Recovery
-   * used to belong to the daily Vercel cron alone, which meant an invocation that outran
-   * `functionTimeout` stranded its tile for up to a day. Cheap — one UPDATE over an indexed
-   * predicate — and it runs on the same two-minute tick.
+   * Before the selects, not after, and the ordering is load-bearing: the sweep raises a reclaimed
+   * row to `RECLAIM_PRIORITY`, so this tick selects with the reclaim already applied rather than
+   * the tick after it. That puts the row ahead of the ordinary backlog, not at the head of the
+   * queue — reclaimed rows share one band and are published at the same per-tick window as any
+   * other. It also stops the pump re-signalling a row whose killed holder still nominally owns the
+   * lease. Cheap — one UPDATE over an indexed predicate.
    */
   const reclaimed = await reclaimExpiredJobs(db, now);
   if (reclaimed.requeued > 0 || reclaimed.retired > 0) {
@@ -104,7 +119,11 @@ export async function runPump(
   const plan = planPump(active, bounds.depth, bounds.lowWater);
   if (plan.primary === 0 && plan.derived === 0) return { published: 0 };
 
-  const runnable = { status: JobStatus.queued, runAfter: { lte: now } };
+  const runnable = {
+    status: JobStatus.queued,
+    runAfter: { lte: now },
+    ...(minPriority === undefined ? {} : { priority: { gte: minPriority } }),
+  };
   const order = [{ priority: 'desc' as const }, { runAfter: 'asc' as const }];
   const derivedKinds = [...DERIVED_JOB_KINDS];
 

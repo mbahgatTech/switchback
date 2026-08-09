@@ -11,7 +11,6 @@
  * The on-demand coverage pattern is `trails.ts`'s, unchanged.
  */
 
-import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import {
@@ -55,18 +54,15 @@ import {
 import type { RouteGraph, SnapResult } from '@switchback/geo';
 import {
   centroidOf,
-  drainIngest,
   elevateLine,
   ensureNetworkCoverage,
   getTerrain,
-  ingestQueueDriver,
   loadNetworkSegments,
   networkJobKey,
   publishIngestSignals,
   VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
 import type { IngestRefusal } from '@switchback/ingest';
-import { createInlineDrain } from '../inline-drain';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
@@ -94,12 +90,6 @@ const FREEHAND_SAMPLE_M = 50;
  */
 const PLAN_PAD_M = 1_000;
 
-/** How many queued routing tiles one request will drain on its response's coattails. */
-const MAX_INLINE_DRAIN = 3;
-
-/** This lambda's name on the queue — see `INLINE_WORKER_ID` in `trails.ts`, same reason. */
-const NETWORK_WORKER_ID = `inline-network-${randomUUID().slice(0, 8)}`;
-
 /**
  * The built-graph cache. Dragging one waypoint replans the whole route, and rebuilding a
  * nine-tile graph each frame would make the planner feel like a batch job. The key is the
@@ -113,46 +103,23 @@ const GRAPH_CACHE_TTL_MS = 5 * 60_000;
 /** How many saved routes one hiker's index returns. */
 const MAX_ROUTES_LISTED = 200;
 
-/** One inline drain at a time, process-wide — the scheduler `trails.ts` keeps, same reason. */
-const inlineDrain = createInlineDrain((keys) =>
-  drainIngest({
-    limit: Math.min(keys.length, MAX_INLINE_DRAIN),
-    // Random per process. `drainSlotGate` counts drainers with `count(distinct "lockedBy")`, so
-    // the fixed string this used to send made a fleet of any size read as one drainer.
-    workerId: NETWORK_WORKER_ID,
-    dedupeKeys: keys,
-    // The Overpass bound comes from `drainIngest`'s default gate. Nothing here may opt out:
-    // `ingest_network` runs `fetchNetwork`, a real Overpass query, and `routes.coverage` fires
-    // it from a public procedure on every viewport settle.
-    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
-  }),
-);
-
 /**
- * Start the queued routing tiles, the same way `trails.ts` starts viewport tiles.
+ * Ring the doorbell for the routing tiles this request queued, the same way `trails.ts` does for
+ * viewport tiles.
  *
- * `ingest_network` jobs run a real Overpass query (`network.ts`, `fetchNetwork`), and this is
- * reached from `routes.coverage`, a public procedure the planner fires on every viewport
- * settle. So it has to answer to `INGEST_QUEUE_DRIVER` exactly as `kickIngest` does: on
- * `servicebus` this process publishes and makes no Overpass request, which is the other half of
- * the claim that the worker's clamp is the only ceiling. Leaving it inline would have been
- * worse than the old path, not better — the pump also publishes `ingest_network`, so the kind
- * would have had two independent drainers.
+ * `ingest_network` runs a real Overpass query in `fetchNetwork`, and `routes.coverage` is a public
+ * procedure the planner fires on every viewport settle — so this process publishes and fetches
+ * nothing. `ensureNetworkCoverage` has already written the rows; a lost signal leaves them queued
+ * behind whatever the pump's order already puts ahead of them.
  */
 function kickNetwork(ctx: Context, queued: readonly string[]): void {
   if (!ctx.waitUntil || queued.length === 0) return;
 
-  if (ingestQueueDriver() === 'servicebus') {
-    ctx.waitUntil(
-      publishIngestSignals(queued.map(networkJobKey), {
-        oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
-      }),
-    );
-    return;
-  }
-
-  const work = inlineDrain.request(queued.map(networkJobKey));
-  if (work) ctx.waitUntil(work);
+  ctx.waitUntil(
+    publishIngestSignals(queued.map(networkJobKey), {
+      oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
+    }),
+  );
 }
 
 interface CachedGraph {

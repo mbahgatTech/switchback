@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
+import { AREA_PRIORITY, VIEWPORT_PRIORITY } from '../src/coverage';
+import { NETWORK_PRIORITY } from '../src/network';
+import { SPLIT_PRIORITY } from '../src/subdivide';
 import {
+  LEASE_EXPIRED_MARKER,
   LEASE_TIMEOUT_MS,
+  RECLAIM_PRIORITY,
   claimJobs,
   completeJob,
   deferJob,
@@ -240,10 +245,32 @@ describe('enqueue', () => {
     });
 
     const args = recorded.upserts[0] as { update: Record<string, unknown> };
-    // `runAfter` untouched on collision, or a fresh page load clears a backoff. Priority may
-    // rise, because somebody is now waiting on the tile.
+    // `runAfter` untouched on collision, or a fresh page load clears a backoff. The upsert writes
+    // nothing at all on collision: priority moves only through the guarded raise below.
     expect(args.update).not.toHaveProperty('runAfter');
-    expect(args.update.priority).toBe(5);
+    expect(args.update).not.toHaveProperty('priority');
+  });
+
+  it('raises priority only when the incoming band is higher', async () => {
+    // A viewport asking again for a tile whose lease the reaper has just taken back is the
+    // ordinary case, and `VIEWPORT_PRIORITY` sits below `RECLAIM_PRIORITY` — so an unconditional
+    // write would demote the one row that has to reach the head of the queue.
+    expect(VIEWPORT_PRIORITY).toBeLessThan(RECLAIM_PRIORITY);
+
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+      priority: VIEWPORT_PRIORITY,
+    });
+
+    const raise = recorded.updateManys.at(-1);
+    expect(raise?.where).toEqual({
+      dedupeKey: 'ingest_tile:0333',
+      priority: { lt: VIEWPORT_PRIORITY },
+    });
+    expect(raise?.data).toEqual({ priority: VIEWPORT_PRIORITY });
   });
 
   it('revives a finished job so the same work can be requested again later', async () => {
@@ -272,6 +299,34 @@ describe('enqueue', () => {
     expect(revive?.data.lockedAt).toBeNull();
     // Kept: until this attempt writes its own outcome it is the row's only diagnostic.
     expect(revive?.data).not.toHaveProperty('lastError');
+  });
+
+  it('returns a revived job to the band its request asks for', async () => {
+    /*
+     * The reaper raises an expired lease to `RECLAIM_PRIORITY`, and the retirement branch leaves
+     * that elevation on the buried row. Reviving without writing `priority` left it there for the
+     * row's whole remaining life: the raise below is guarded on `priority < incoming`, so a
+     * viewport enqueue at 5 is a no-op against 6, and nothing else in the estate lowers it. The
+     * row then outranked ordinary work until `FAILED_JOB_TTL_MS` collected it, thirty days on.
+     */
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+      priority: VIEWPORT_PRIORITY,
+    });
+
+    const revive = recorded.updateManys[0];
+    expect(revive?.data.priority).toBe(VIEWPORT_PRIORITY);
+    expect(VIEWPORT_PRIORITY).toBeLessThan(RECLAIM_PRIORITY);
+  });
+
+  it('defaults a revived job to the base band when the request names none', async () => {
+    const { db, recorded } = fakeDb();
+    await enqueue(db, { kind: JobKind.ingest_tile, dedupeKey: tileJobKey('0333'), payload: {} });
+
+    expect(recorded.updateManys[0]?.data.priority).toBe(0);
   });
 });
 
@@ -368,6 +423,43 @@ describe('reclaimExpiredJobs', () => {
   const stale = new Date(now.getTime() - LEASE_TIMEOUT_MS - 60_000);
   const fresh = new Date(now.getTime() - 60_000);
 
+  /** The reap statement's SQL, with its indentation flattened so it can be matched literally. */
+  function reapSql(recorded: Recorded): string {
+    const found = recorded.rawSql.find((sql) => sql.includes('RETURNING status'));
+    if (!found) throw new Error('the lease sweep did not run');
+    return found.replace(/\s+/g, ' ');
+  }
+
+  it('outranks every band enqueue assigns, or the row it freed stays behind the backlog', () => {
+    /*
+     * `priority DESC` leads both `runPump`'s order and `claimJobs`, and returning a row to
+     * `queued` at the priority it had puts it at the tail of its own band. A band added above
+     * this constant would falsify the recovery bound `classifyDisposition` completes a Service
+     * Bus message on, and nothing else in the estate would notice.
+     */
+    for (const band of [VIEWPORT_PRIORITY, SPLIT_PRIORITY, NETWORK_PRIORITY, AREA_PRIORITY]) {
+      expect(RECLAIM_PRIORITY).toBeGreaterThan(band);
+    }
+  });
+
+  it('raises a requeued lease to the head of the queue, and never lowers a higher one', async () => {
+    const { db, recorded } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+
+    await reclaimExpiredJobs(db, now);
+
+    // Bound rather than inlined, so the statement carries the constant the pump's order is
+    // asserted against rather than a copy of its value. The elevation sits inside the retirement
+    // test, so a row out of attempts keeps the priority it had — the band exists to reach a
+    // worker, and a buried row is not going to one.
+    expect(recorded.reapValues).toContain(RECLAIM_PRIORITY);
+    expect(reapSql(recorded)).toContain(
+      'priority = CASE WHEN attempts + 1 >= "maxAttempts" ' +
+        'THEN priority ELSE GREATEST(priority, ?::int) END',
+    );
+  });
+
   it('takes back a job locked beyond the timeout and spends an attempt on it', async () => {
     const { db, recorded } = fakeDb([], {
       running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
@@ -375,10 +467,40 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 1, retired: 0 });
+    expect(result.requeued).toBe(1);
+    expect(result.retired).toBe(0);
     // Back to `queued` with the attempt counted — a job that keeps killing its worker has to
     // move towards its budget, or the sweep that recovers it is also the loop that repeats it.
     expect(recorded.reaped).toEqual([{ id: 'stuck', attempts: 2, status: JobStatus.queued }]);
+  });
+
+  it('names the lease it took back, so the alert has something to match on', async () => {
+    /*
+     * The signal that closes the killed-handler gap. This reaper is the only participant that
+     * observes the death: by the time a redelivered message is classified, the reclaim below has
+     * already returned the row to `queued`, so the delivery sees a healthy queue.
+     */
+    const { db } = fakeDb([], {
+      running: [{ id: 'stuck', lockedAt: stale, attempts: 1, maxAttempts: 5 }],
+    });
+    const lines: string[] = [];
+
+    const result = await reclaimExpiredJobs(db, now, LEASE_TIMEOUT_MS, (line) => lines.push(line));
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(LEASE_EXPIRED_MARKER);
+    expect(result.reclaimed).toHaveLength(1);
+  });
+
+  it('says nothing when no lease had expired, so the alert is not a light left on', async () => {
+    const { db } = fakeDb([], {
+      running: [{ id: 'working', lockedAt: fresh, attempts: 1, maxAttempts: 5 }],
+    });
+    const lines: string[] = [];
+
+    await reclaimExpiredJobs(db, now, LEASE_TIMEOUT_MS, (line) => lines.push(line));
+
+    expect(lines).toEqual([]);
   });
 
   it('leaves a freshly locked job alone', async () => {
@@ -390,13 +512,14 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 0, retired: 0 });
+    expect(result.requeued).toBe(0);
+    expect(result.retired).toBe(0);
     expect(recorded.reaped).toEqual([]);
   });
 
   it('retires a job that has run out of attempts rather than requeueing it forever', async () => {
     // A job whose handler takes the worker down with it never reaches `failJob`, so without
-    // this the sweep would hand it back every half hour for as long as the table exists.
+    // this the sweep would hand it back every lease period for as long as the table exists.
     const { db, recorded } = fakeDb([], {
       running: [
         { id: 'poison', lockedAt: stale, attempts: 4, maxAttempts: 5 },
@@ -406,7 +529,8 @@ describe('reclaimExpiredJobs', () => {
 
     const result = await reclaimExpiredJobs(db, now);
 
-    expect(result).toEqual({ requeued: 1, retired: 1 });
+    expect(result.requeued).toBe(1);
+    expect(result.retired).toBe(1);
     expect(recorded.reaped[0]).toEqual({ id: 'poison', attempts: 5, status: JobStatus.dead });
   });
 
@@ -421,7 +545,7 @@ describe('reclaimExpiredJobs', () => {
     // These rows carried a null `lastError` for three days and nothing on them said what
     // happened; the lease itself has already spaced the retry, so `runAfter` stays put.
     expect(recorded.reapValues).toContainEqual(
-      expect.stringContaining('lease expired after 30 min'),
+      expect.stringContaining('lease expired after 12 min'),
     );
     expect(recorded.reapValues).toContainEqual(new Date(now.getTime() - LEASE_TIMEOUT_MS));
     expect(sql).toContain('"lastError"');
@@ -507,8 +631,11 @@ describe('which process ran a job', () => {
     await reclaimExpiredJobs(db, new Date(LEASE_TIMEOUT_MS * 2));
 
     const sweep = recorded.rawSql.find((sql) => sql.includes('RETURNING status'))!;
-    expect(sweep).not.toContain('"lockedBy"');
-    expect(sweep).not.toContain('"lockedAt"    = NULL');
+    // Scoped to the assignments: the sweep *reads* `lockedBy` back to say who died, and must
+    // not write over either column — they are the only record of which process held the lease.
+    const assignments = sweep.slice(sweep.indexOf('SET'), sweep.indexOf('WHERE'));
+    expect(assignments).not.toContain('"lockedBy"');
+    expect(assignments).not.toContain('"lockedAt"');
     // What releases it instead — the sweep writes `queued` or `dead` over `running`.
     expect(sweep).toContain("status = 'running'");
   });

@@ -1,22 +1,54 @@
 /**
- * The durable half of the ingest queue: every `waitUntil` kick also writes a row here and a
- * cron drains it, both through the same idempotent handler. See `docs/architecture.md`.
+ * The durable record of the ingest queue: every enqueue writes a row here, and the Function App
+ * drains it through the idempotent handlers. See `docs/architecture.md`.
  */
 
 import { JobKind, JobStatus, Prisma, backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 
 /**
- * How long a claim holds a job before `reclaimExpiredJobs` may take it back. Sized above the
- * slowest honest run, because reclaiming live work runs it twice: `processTile` may spend the
- * query's own `[timeout:180]` plus 90 s on features and 60 s on the region before it commits
- * anything, and its commit loop measured 88 s over a 144-trail tile with each trail's
- * transaction allowed 30 s. `processRoute` is worse — a continental relation is refetched as
- * thousands of ways, 250 to a request, through a client capped at two concurrent. Ten minutes
- * sat inside that envelope. Thirty is outside it and still bounds a dead worker to half an
- * hour, against the seventy-five hours one managed in production.
+ * The host's kill deadline, mirrored from `apps/ingest-worker/host.json` `functionTimeout`.
+ * `apps/ingest-worker/test/drain.test.ts` reads that file and fails if the two disagree.
  */
-export const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
+export const HOST_FUNCTION_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Margin above the host's kill deadline, covering clock skew between the app and Postgres and the
+ * bookkeeping after the last phase.
+ */
+export const LEASE_MARGIN_MS = 2 * 60 * 1000;
+
+/**
+ * How long a claim holds a job before `reclaimExpiredJobs` may take it back.
+ *
+ * **Bounded by the host, not by the work, and not by the broker.** One process claims — the
+ * Function App's `ingestDrain` — so a lease older than `functionTimeout` has provably lost its
+ * holder. Deriving it from that constant is what stops the two drifting apart: raising
+ * `functionTimeout` without raising this would let a reclaim fire under a handler still working,
+ * and a second process would then commit the same trails alongside it.
+ *
+ * **A redelivery cannot be relied on to find this expired, and no value of it would change that.**
+ * The broker's redelivery gap starts at `lockDuration` — auto-renewal stops the instant the process
+ * dies, and an eviction can kill it before the first renewal — while this must exceed
+ * `functionTimeout` to be safe under a live handler. `lockDuration` (300 s) is below
+ * `functionTimeout` (600 s), so the two requirements have no common value. Measured over
+ * 2026-08-08's six redeliveries, the gaps were 299.9, 300.0, 455.0, 592.8, 708.1 and 1012.7 s:
+ * five of the six arrived while the lease was still live, and the two at the floor came back at
+ * exactly `lockDuration`.
+ *
+ * So the redelivery is not the repair. The reaper is: `reclaimExpiredJobs` returns the row to
+ * `queued` at `RECLAIM_PRIORITY`, above every band `enqueue` assigns, and `runPump` sweeps before
+ * it selects — so the row clears the ordinary backlog rather than rejoining the tail of its own
+ * band. It does not clear the reclaimed band: that elevation is a fixed value, so reclaimed rows
+ * sort among themselves by `runAfter` and a tick publishes at most
+ * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` of them. `apps/ingest-worker/test/pump.test.ts` asserts
+ * both halves.
+ * `apps/ingest-worker/test/drain.test.ts` asserts the template relation that makes the republish
+ * durable: the broker's duplicate detection window has to be *shorter* than this, or the republish
+ * is discarded as a duplicate of the message a delivery already completed and the work is lost
+ * with nothing logged.
+ */
+export const LEASE_TIMEOUT_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS;
 
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -42,12 +74,18 @@ export interface EnqueueInput {
  *   resets the backoff and a rate-limited tile becomes one we hammer once per render.
  * - **Finished** (`done`, `failed`, `dead`) — reset and run again. A `dedupeKey` lives
  *   forever, so without this each tile is ingestable exactly once in the database's lifetime
- *   and a tile whose attempts landed during an outage stays `dead`. `attempts` is cleared too:
- *   this is a new request, not a sixth try.
+ *   and a tile whose attempts landed during an outage stays `dead`. `attempts` and `priority`
+ *   are both reset: this is a new request, not a sixth try, so it starts at the band its caller
+ *   asks for. Leaving `priority` alone would let a row the reaper had raised to
+ *   `RECLAIM_PRIORITY` keep that elevation for the rest of its life, because the raise below
+ *   cannot lower it and nothing else writes the column.
  *
- * Two statements, and the order matters. The revival is a single conditional `UPDATE ... WHERE
- * status IN (terminal)`, which Postgres applies atomically — a read-then-write would let two
- * concurrent enqueues both revive and reset `attempts` twice.
+ * Three statements, each a single conditional `UPDATE` Postgres applies atomically. A
+ * read-then-write would let two concurrent enqueues both revive and reset `attempts` twice, and
+ * would let either of them write back a priority the other had already raised. The reset above
+ * is the one write that lowers, and it is safe under concurrency because the revive clears the
+ * very status it selects on: one of two racing enqueues performs it, and every raise that
+ * follows — the loser's included — only climbs.
  */
 export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
   const priority = input.priority ?? 0;
@@ -61,6 +99,7 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
     data: {
       status: JobStatus.queued,
       attempts: 0,
+      priority,
       runAfter,
       lockedAt: null,
       lockedBy: null,
@@ -80,11 +119,16 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
       runAfter,
       maxAttempts: input.maxAttempts ?? 5,
     },
-    update: {
-      // Only ever raised, never lowered: a background refresh enqueues at 0, which leaves
-      // whatever a live viewport already set in place.
-      priority: priority > 0 ? priority : undefined,
-    },
+    // Priority is raised by the statement below, never here. `update` cannot read the row it is
+    // writing, so any value set here is unconditional — and an enqueue at `VIEWPORT_PRIORITY` (5)
+    // landing on a lease the reaper had just raised to `RECLAIM_PRIORITY` (6) would demote the one
+    // row in the table that has to reach the head of the queue.
+    update: {},
+  });
+
+  await db.ingestJob.updateMany({
+    where: { dedupeKey: input.dedupeKey, priority: { lt: priority } },
+    data: { priority },
   });
 }
 
@@ -111,9 +155,9 @@ export interface ClaimedJob {
  * reached the top four in seventy-five hours. `reclaimExpiredJobs` owns that transition now,
  * under no limit and no ordering, and it is the only way out of `running`.
  *
- * `dedupeKeys` narrows the claim to specific work: a request drain wants the tiles under the
- * map in front of somebody, and the global answer is usually not that, since every pending
- * tile shares one viewport priority and ordering falls through to the oldest `runAfter`.
+ * `dedupeKeys` narrows the claim to specific work: a message names one tile, and the global
+ * answer is usually not that, since every pending tile shares one viewport priority and ordering
+ * falls through to the oldest `runAfter`.
  *
  * `kinds` narrows it the other way, because `ORDER BY priority DESC` is a starvation order:
  * derived work sits at `-10` and is never claimed while any request job is runnable. See
@@ -269,7 +313,62 @@ export interface ReclaimResult {
   requeued: number;
   /** Leases whose job was out of attempts and is now `dead`. */
   retired: number;
+  /** The units of work that lost their holder, in the order the reaper found them. */
+  reclaimed: ReclaimedLease[];
 }
+
+/** A lease that expired with no outcome, and the process that held it when it died. */
+export interface ReclaimedLease {
+  dedupeKey: string;
+  /** Where the reaper put it: `queued` to run again, or `dead` if it was out of attempts. */
+  status: JobStatus;
+  lockedBy: string | null;
+}
+
+/**
+ * The literal `switchback-ingest-lease-expired` greps for.
+ *
+ * A handler the host kills mid-tile writes no request row and no error — the invocation stops
+ * between two awaits — so a rule reading `requests | success == false` is structurally incapable
+ * of firing on it. What it does leave behind is a `running` row nothing will renew, and the
+ * reaper below is the process that discovers it.
+ *
+ * The token belongs here rather than on the redelivery that finds the tile busy. A redelivery
+ * mostly arrives while the lease is still live — measured 2026-08-08, five of six did — so it sees
+ * a `running` row it cannot distinguish from healthy work and has nothing to report. The reaper is
+ * the only participant that observes the death itself, whenever it happens to run.
+ */
+export const LEASE_EXPIRED_MARKER = 'switchback-ingest-lease-expired';
+
+/** How many keys the marker line names before it stops; the count is always exact. */
+const MARKER_KEY_LIMIT = 10;
+
+/**
+ * Priority a requeued lease is raised to: above every band `enqueue` assigns, so the next pump
+ * tick reaches the row ahead of the backlog rather than from wherever that backlog had put it.
+ *
+ * **Returning the row to `queued` is not on its own enough to get it re-run.** `runPump` publishes
+ * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` primary rows a tick from the head of
+ * `priority DESC, "runAfter" ASC`, and every viewport tile shares one priority — so a row put back
+ * at the priority it had sorts to the tail of its own band and is reached when the backlog ahead of
+ * it drains. `classifyDisposition` completes a Service Bus message on the strength of this
+ * elevation, and that decision is irreversible.
+ *
+ * **What it buys is the ordinary backlog, not the head of the queue.** Raised to a fixed value
+ * rather than incremented, so repeated reclaims are idempotent: reclaimed rows form one band
+ * ordered among themselves by `runAfter`, never a ladder that climbs away from the queue. The band
+ * is therefore subject to the same per-tick window as any other — one tick while it fits inside
+ * that window, its own drain when it does not. `apps/ingest-worker/test/pump.test.ts` asserts each
+ * half against an ordered backlog.
+ *
+ * It cannot starve ordinary work, and two things hold that. `reclaimExpiredJobs` is the only
+ * writer of this band and spends an attempt every time it writes, so `maxAttempts` retires a
+ * reliably fatal job rather than republishing it forever. Retirement leaves the elevation on the
+ * row, so `enqueue` resets `priority` when it revives a finished one — the elevation cannot
+ * outlive the lease that earned it, and a revived row competes at the band its request asks for.
+ * `packages/ingest/test/jobs.test.ts` asserts both halves.
+ */
+export const RECLAIM_PRIORITY = 6;
 
 /**
  * Take back every job whose lease has expired: the reaper, and the only route out of `running`
@@ -279,15 +378,16 @@ export interface ReclaimResult {
  *
  * The increment is what makes a job that kills its worker terminate: it costs an attempt per
  * crash, on top of the one the claim spent, so `maxAttempts` retires a reliably fatal job in
- * two crashes rather than five. `runAfter` is deliberately left where it is — a crash is not
- * an upstream saying "slow down", and the lease itself has already spaced the retry by half an
- * hour. `lastError` is set on both paths because these rows carried a null one for seventy-five
- * hours and nothing on them said why.
+ * two crashes rather than five. `runAfter` is deliberately left where it is — a crash is not an
+ * upstream saying "slow down", and `LEASE_TIMEOUT_MS` has already spaced the retry by twelve
+ * minutes. `lastError` is set on both paths because these rows carried a null one for
+ * seventy-five hours and nothing on them said why.
  */
 export async function reclaimExpiredJobs(
   db: Db,
   now = new Date(),
   timeoutMs = LEASE_TIMEOUT_MS,
+  log: (line: string) => void = (line) => console.warn(line),
 ): Promise<ReclaimResult> {
   const cutoff = new Date(now.getTime() - timeoutMs);
   const reason = `lease expired after ${Math.round(timeoutMs / 60_000)} min with no outcome`;
@@ -299,20 +399,31 @@ export async function reclaimExpiredJobs(
   //
   // `lockedAt` and `lockedBy` are left alone: the status change is what releases the lease, and
   // they are the record of which process held it when it died.
-  const rows = await db.$queryRaw<Array<{ status: JobStatus }>>`
+  const rows = await db.$queryRaw<ReclaimedLease[]>`
     UPDATE ingest_jobs SET
       attempts      = attempts + 1,
       status        = CASE WHEN attempts + 1 >= "maxAttempts"
                            THEN 'dead'::"JobStatus" ELSE 'queued'::"JobStatus" END,
+      priority      = CASE WHEN attempts + 1 >= "maxAttempts"
+                           THEN priority ELSE GREATEST(priority, ${RECLAIM_PRIORITY}::int) END,
       "completedAt" = CASE WHEN attempts + 1 >= "maxAttempts"
                            THEN ${now} ELSE "completedAt" END,
       "lastError"   = ${reason}
     WHERE status = 'running' AND "lockedAt" < ${cutoff}
-    RETURNING status
+    RETURNING status, "dedupeKey", "lockedBy"
   `;
 
+  if (rows.length > 0) {
+    const named = rows
+      .slice(0, MARKER_KEY_LIMIT)
+      .map((row) => `${row.dedupeKey} (held by ${row.lockedBy ?? 'nobody'} -> ${row.status})`)
+      .join('; ');
+    const rest = rows.length > MARKER_KEY_LIMIT ? `; +${rows.length - MARKER_KEY_LIMIT} more` : '';
+    log(`${LEASE_EXPIRED_MARKER} ${rows.length} lease(s) expired with no outcome: ${named}${rest}`);
+  }
+
   const retired = rows.filter((row) => row.status === JobStatus.dead).length;
-  return { requeued: rows.length - retired, retired };
+  return { requeued: rows.length - retired, retired, reclaimed: rows };
 }
 
 export type JobHandler = (job: ClaimedJob) => Promise<void>;
@@ -363,8 +474,8 @@ const DERIVED_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as const;
  * drains is `commitGate` in `pipeline.ts`, over the `backgroundPrisma` pool.
  *
  * **`derivedLimit` is a fairness reservation, and without it derived work never runs.** A
- * plain claim orders by `priority DESC` and derived jobs sit at `-10`, while both inline kicks
- * scope their claim to the tile keys they just queued and so cannot reach one at all. The
+ * plain claim orders by `priority DESC` and derived jobs sit at `-10`, while a message-scoped
+ * drain narrows its claim to the one tile the message named and so cannot reach one at all. The
  * second, kind-scoped claim costs one more indexed statement and makes the backlog fall at the
  * rate of the traffic that creates it.
  */
@@ -396,9 +507,9 @@ export async function drainJobs(
    * Before claiming, not after: a lease that expired a moment ago should be claimable in this
    * same tick rather than the next one.
    *
-   * No longer the *only* sweep, and that is the point: `sweepQueue` runs it on paths that drain
-   * nothing, because a drain is a side effect of traffic plus a once-a-day cron, and leases were
-   * sitting six hours past a thirty-minute lease waiting for one.
+   * No longer the *only* sweep, and that is the point: `sweepQueue` runs it from `ingestPump`'s
+   * two-minute tick, which drains nothing, so a lease left by a killed handler is reclaimed on a
+   * schedule of its own rather than waiting for the next drainer to arrive.
    *
    * Its own try/catch for the same reason the derived claim below has one: bookkeeping must not
    * be able to stop the drain.

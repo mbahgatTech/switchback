@@ -133,7 +133,7 @@ async function main(): Promise<void> {
     prisma.ingestJob.count({ where: { status: 'queued' } }),
   ]);
   console.log(`\n${tiles} tiles registered, ${jobs} jobs queued.`);
-  console.log('Run the drain to fetch them: npm run dev, then hit /api/cron/drain');
+  console.log('The ingest worker drains them from Service Bus; locally, npm run ingest:drain.');
 }
 
 main()

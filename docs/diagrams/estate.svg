@@ -47,8 +47,6 @@
     <symbol id="i-lambda" viewBox="0 0 24 24">
       <rect x="2.5" y="5" width="19" height="14" rx="2" class="ico"/>
       <path d="M7 15l4-6 2 3 1.5-2 2.5 5" class="ico"/></symbol>
-    <symbol id="i-clock" viewBox="0 0 24 24">
-      <circle cx="12" cy="12" r="8.5" class="ico"/><path d="M12 7v5.5l3.5 2" class="ico"/></symbol>
     <symbol id="i-db" viewBox="0 0 24 24">
       <ellipse cx="12" cy="5.8" rx="7.5" ry="3.1" class="ico"/>
       <path d="M4.5 5.8v12.4c0 1.7 3.4 3.1 7.5 3.1s7.5-1.4 7.5-3.1V5.8" class="ico"/>
@@ -109,19 +107,18 @@
   <rect class="node" x="296" y="126" width="188" height="72" rx="6"/>
   <use href="#i-lambda" x="306" y="136" width="18" height="18"/>
   <text class="nlabel" x="330" y="149">Production</text>
-  <text class="nsub" x="306" y="168">Next.js + tRPC · inline and cron drainers</text>
+  <text class="nsub" x="306" y="168">Next.js + tRPC · enqueues and publishes, never drains</text>
   <text class="nsub" x="306" y="181">INGEST_TRAIL_IDENTITY = claim</text>
   <text class="nsub" x="306" y="192">carries id-switchback-vercel-publisher</text>
 
-  <rect class="node" x="296" y="210" width="188" height="44" rx="6"/>
-  <use href="#i-clock" x="306" y="220" width="18" height="18"/>
-  <text class="nlabel" x="330" y="229">Cron drainer</text>
-  <text class="nsub" x="306" y="246">/api/cron/drain · CRON_SECRET</text>
+  <rect class="node" x="296" y="210" width="188" height="44" rx="6" stroke="#94a3b8" stroke-dasharray="5 3"/>
+  <text class="nlabel" x="306" y="229" fill="#475569">No ingestion path</text>
+  <text class="nsub" x="306" y="246">no cron route, no inline drain, no Overpass</text>
 
   <rect class="node" x="296" y="266" width="188" height="60" rx="6" stroke="#94a3b8" stroke-dasharray="5 3"/>
   <use href="#i-lambda" x="306" y="276" width="18" height="18"/>
   <text class="nlabel" x="330" y="285" fill="#475569">Preview</text>
-  <text class="nsub" x="306" y="302">no DATABASE_URL, no CRON_SECRET</text>
+  <text class="nsub" x="306" y="302">no DATABASE_URL of its own</text>
   <text class="nsub" x="306" y="315">reaches no database — env.ts refuses the host</text>
 
   <text class="zsub" x="296" y="348">Both environments federate to one Entra identity,</text>
@@ -178,7 +175,7 @@
   <text class="nlabel" x="652" y="323">Functions worker — Y1 Linux</text>
   <text class="nsub" x="626" y="342">func-switchback-ingest-37ywppu5p7fri</text>
   <text class="nsub" x="626" y="356">system-assigned 3db30cfd-… · identity = claim</text>
-  <text class="nsub" x="626" y="370">queue driver postgres — idle, draining nothing</text>
+  <text class="nsub" x="626" y="370">the only drainer — Service Bus trigger, one at a time</text>
 
   <rect class="node" x="904" y="300" width="256" height="80" rx="6"/>
   <use href="#i-blob" x="914" y="309" width="20" height="20"/>
@@ -191,7 +188,7 @@
   <use href="#i-logs" x="626" y="409" width="20" height="20"/>
   <text class="nlabel" x="652" y="423">Log Analytics + App Insights</text>
   <text class="nsub" x="626" y="441">workspace c188de03 — query it, not App Insights</text>
-  <text class="nsub" x="626" y="453">6 alert rules: 2 Postgres · 1 queue · 3 ingest</text>
+  <text class="nsub" x="626" y="453">7 alert rules: 2 Postgres · 5 ingest (1 metric, 4 query)</text>
 
   <rect class="node" x="904" y="400" width="256" height="60" rx="6"/>
   <use href="#i-badge" x="914" y="409" width="20" height="20"/>
@@ -220,8 +217,8 @@
   <text class="nsub" x="318" y="654">id-switchback-worker-deploy → function-releases</text>
 
   <text class="zsub" x="600" y="628">infrastructure.yml only compiles templates — its deploy job is gated on a variable that is unset.</text>
-  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which must be followed by</text>
-  <text class="zsub" x="600" y="656">deploy-worker.sh — an ARM settings write erases WEBSITE_RUN_FROM_PACKAGE and leaves it codeless.</text>
+  <text class="zsub" x="600" y="642">ingest.bicep reaches Azure by a human-run az deployment group create, which writes back the package</text>
+  <text class="zsub" x="600" y="656">URL it is handed; deploy-worker.sh is what uploads a new bundle and syncs the trigger cache.</text>
 
   <!-- ============================== EDGES ============================== -->
   <path class="edge" d="M228 192 H 274"/>

@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { JobKind, JobStatus } from '@switchback/db';
+import { RECLAIM_PRIORITY, VIEWPORT_PRIORITY } from '@switchback/ingest';
 import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from '../src/log';
 import {
@@ -12,6 +13,7 @@ import {
   PUMP_LOW_WATER,
   PUMP_QUEUE_DEPTH,
   planPump,
+  pumpBounds,
   runPump,
 } from '../src/pump';
 import type { SignalQueue } from '../src/pump';
@@ -21,8 +23,16 @@ interface KindFilter {
   notIn?: JobKind[];
 }
 
+type OrderBy = ReadonlyArray<Record<string, 'asc' | 'desc'>>;
+
 interface FindManyArgs {
-  where: { status: JobStatus; runAfter: { lte: Date }; kind: KindFilter };
+  where: {
+    status: JobStatus;
+    runAfter: { lte: Date };
+    kind: KindFilter;
+    priority?: { gte: number };
+  };
+  orderBy: OrderBy;
   take: number;
 }
 
@@ -69,6 +79,79 @@ function fakeQueue(active: number): SignalQueue & { published: string[]; counted
     publish: async (keys: readonly string[]) => void state.published.push(...keys),
   };
   return state;
+}
+
+interface JobRow {
+  dedupeKey: string;
+  priority: number;
+  runAfter: Date;
+}
+
+/** The key of the tile whose wake-up never reached the broker. */
+const LOST_DOORBELL = 'ingest_tile:never-signalled';
+
+const QUEUED_AT = new Date('2026-08-08T12:00:00.000Z');
+
+function compare(orderBy: OrderBy, left: JobRow, right: JobRow): number {
+  for (const term of orderBy) {
+    const [field, direction] = Object.entries(term)[0]!;
+    const a = left[field as keyof JobRow];
+    const b = right[field as keyof JobRow];
+    const delta = a < b ? -1 : a > b ? 1 : 0;
+    if (delta !== 0) return direction === 'asc' ? delta : -delta;
+  }
+  return 0;
+}
+
+/**
+ * A `findMany` that applies the `orderBy` it is given before taking, so a row's position in the
+ * backlog decides whether the pump reaches it. `fakeDb` slices from the head of an array and
+ * cannot see ordering at all, which is why it can hold no opinion on reachability.
+ *
+ * `reclaims` names the row the sweep frees. `$queryRaw` here *is* `reclaimExpiredJobs`, so it
+ * applies that statement's effect — raising the row to `RECLAIM_PRIORITY` — to the same rows the
+ * selects read. Sharing the row set is what puts the sweep's position inside `runPump` under test:
+ * move it after the selects and the elevation lands too late to be published.
+ */
+function backlogged(rows: readonly JobRow[], reclaims?: string): Db {
+  let current = [...rows];
+  const due = (args: FindManyArgs, row: JobRow): boolean =>
+    row.runAfter <= args.where.runAfter.lte &&
+    (args.where.priority === undefined || row.priority >= args.where.priority.gte);
+  return {
+    ingestJob: {
+      findMany: async (args: FindManyArgs) =>
+        (args.where.kind.in ? [] : current.filter((row) => due(args, row)))
+          .slice()
+          .sort((a, b) => compare(args.orderBy, a, b))
+          .slice(0, args.take)
+          .map(({ dedupeKey }) => ({ dedupeKey })),
+    },
+    $queryRaw: async () => {
+      if (reclaims === undefined) return [];
+      current = current.map((row) =>
+        row.dedupeKey === reclaims ? { ...row, priority: RECLAIM_PRIORITY } : row,
+      );
+      return [{ status: JobStatus.queued }];
+    },
+  } as unknown as Db;
+}
+
+/**
+ * `depth` tiles already due at `VIEWPORT_PRIORITY`, and behind them the one somebody is waiting
+ * on. Every viewport tile carries that same priority, so a freshly queued tile is the newest
+ * `runAfter` of its band — the tail of the pump's order, not the head.
+ */
+function withBacklog(depth: number): JobRow[] {
+  const backlog = Array.from({ length: depth }, (_, index) => ({
+    dedupeKey: `ingest_tile:backlog-${index}`,
+    priority: VIEWPORT_PRIORITY,
+    runAfter: new Date(QUEUED_AT.getTime() - (depth - index) * 60_000),
+  }));
+  return [
+    ...backlog,
+    { dedupeKey: LOST_DOORBELL, priority: VIEWPORT_PRIORITY, runAfter: QUEUED_AT },
+  ];
 }
 
 describe('planPump', () => {
@@ -144,5 +227,157 @@ describe('runPump', () => {
 
     expect(await runPump(fakeDb().db, queue, silent)).toEqual({ published: 0 });
     expect(queue.published).toEqual([]);
+  });
+});
+
+/**
+ * How far a lost wake-up gets without one. The pump publishes from the head of `priority DESC,
+ * "runAfter" ASC`, so what it recovers is the head of the queue and not a particular row.
+ */
+describe('a wake-up that never reached the broker', () => {
+  it('selects on the row alone, so no publish outcome is what moves a job on', async () => {
+    const { db, calls } = fakeDb({ primary: [LOST_DOORBELL] });
+    const queue = fakeQueue(0);
+
+    await runPump(db, queue, silent);
+
+    /*
+     * The predicate is `status` and `runAfter` and nothing else. A column recording whether a
+     * signal was ever sent — or a successful publish being what moves the row on — would make a
+     * dropped message permanent rather than late.
+     */
+    const primary = calls[0];
+    expect(Object.keys(primary?.where ?? {}).sort()).toEqual(['kind', 'runAfter', 'status']);
+    expect(primary?.where.status).toBe(JobStatus.queued);
+    expect(queue.published).toEqual([LOST_DOORBELL]);
+  });
+
+  it('republishes the same key on the next tick, because publishing claims nothing', async () => {
+    const rows = { primary: ['ingest_tile:a'] };
+    const first = fakeQueue(0);
+    const second = fakeQueue(0);
+
+    // Two ticks against a row no worker has claimed: the pump must name it both times, or a
+    // message lost between them is lost for good.
+    await runPump(fakeDb(rows).db, first, silent);
+    await runPump(fakeDb(rows).db, second, silent);
+
+    expect(first.published).toEqual(['ingest_tile:a']);
+    expect(second.published).toEqual(['ingest_tile:a']);
+  });
+
+  it('reaches the tile on the next tick when nothing of its priority is due ahead of it', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(backlogged(withBacklog(0)), queue, silent, QUEUED_AT);
+
+    expect(queue.published).toEqual([LOST_DOORBELL]);
+  });
+
+  it('does not reach it behind a backlog of its own priority', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(backlogged(withBacklog(40)), queue, silent, QUEUED_AT);
+
+    /*
+     * The tick is spent on the oldest rows of the same band, so recovery is bounded by the
+     * backlog draining rather than by the two-minute cadence. The reading `DRAIN_SILENCE_MS` is
+     * sized against is 44,884 due `queued` rows, oldest since 2026-07-30, against a window of
+     * `PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` rows a tick.
+     */
+    expect(queue.published).not.toContain(LOST_DOORBELL);
+    expect(queue.published).toHaveLength(PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE);
+    expect(queue.published[0]).toBe('ingest_tile:backlog-0');
+  });
+
+  it('reaches it once its priority is raised above the backlog', async () => {
+    const rows = withBacklog(40).map((row) =>
+      row.dedupeKey === LOST_DOORBELL ? { ...row, priority: VIEWPORT_PRIORITY + 1 } : row,
+    );
+    const queue = fakeQueue(0);
+
+    // `priority DESC` leads the order, so raising the row is the one lever that moves a named
+    // tile to the head — the same column `claimJobs` reads.
+    await runPump(backlogged(rows), queue, silent, QUEUED_AT);
+
+    expect(queue.published[0]).toBe(LOST_DOORBELL);
+  });
+});
+
+/**
+ * The bound `classifyDisposition` completes a Service Bus message on. Completing is irreversible,
+ * so a killed handler's tile has to be reachable from the row alone — and reachable in a tick,
+ * not when a five-figure backlog drains.
+ */
+describe('a lease the reaper took back', () => {
+  it('is published on the tick that reclaimed it, from behind a full backlog', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(backlogged(withBacklog(40), LOST_DOORBELL), queue, silent, QUEUED_AT);
+
+    // The same fixture the case above proves unreachable, differing only in that the sweep ran.
+    // `runPump` sweeps before it selects, so the elevated row is at the head of this tick's order.
+    expect(queue.published[0]).toBe(LOST_DOORBELL);
+  });
+
+  it('does not outrank a backlog that shares its own elevated priority', async () => {
+    const rows = withBacklog(40).map((row) => ({ ...row, priority: RECLAIM_PRIORITY }));
+    const queue = fakeQueue(0);
+
+    // The elevation is a band, not a queue jump: reclaimed rows sort among themselves by
+    // `runAfter`, oldest first, rather than each new one climbing above the last.
+    await runPump(backlogged(rows, LOST_DOORBELL), queue, silent, QUEUED_AT);
+
+    expect(queue.published).not.toContain(LOST_DOORBELL);
+    expect(queue.published[0]).toBe('ingest_tile:backlog-0');
+  });
+});
+
+/**
+ * `ingestPump` passes `RECLAIM_PRIORITY` here while `INGEST_PUMP_ENABLED=false`. Completing a
+ * message is irreversible and is justified by the reclaim reaching the broker, so the brake has to
+ * narrow the pump rather than silence it.
+ */
+describe('a braked pump', () => {
+  it('still publishes a lease the sweep reclaimed', async () => {
+    const queue = fakeQueue(0);
+
+    await runPump(
+      backlogged(withBacklog(40), LOST_DOORBELL),
+      queue,
+      silent,
+      QUEUED_AT,
+      pumpBounds(),
+      RECLAIM_PRIORITY,
+    );
+
+    expect(queue.published).toEqual([LOST_DOORBELL]);
+  });
+
+  it('publishes nothing else', async () => {
+    const queue = fakeQueue(0);
+
+    // The same backlog with no reclaim: every row sits at `VIEWPORT_PRIORITY`, which the band
+    // excludes, so a brake admits no new work.
+    await runPump(
+      backlogged(withBacklog(40)),
+      queue,
+      silent,
+      QUEUED_AT,
+      pumpBounds(),
+      RECLAIM_PRIORITY,
+    );
+
+    expect(queue.published).toEqual([]);
+  });
+
+  it('is the only thing that narrows the selects', async () => {
+    const { db, calls } = fakeDb({ primary: ['ingest_tile:a'] });
+
+    await runPump(db, fakeQueue(0), silent);
+
+    // Unbraked the predicate carries no priority term at all, so an ordinary tick still reads the
+    // whole runnable head.
+    expect(calls[0]?.where.priority).toBeUndefined();
   });
 });

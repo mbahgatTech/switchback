@@ -130,6 +130,78 @@ describe('the heartbeat the deploy waits for', () => {
   });
 });
 
+const STORAGE = 'stfake';
+const scratch = () => mkdtempSync(path.join(tmpdir(), 'deploy-worker-'));
+
+/** A stub `az` that records every invocation and answers the queries the script makes. */
+function stubAz(
+  dir: string,
+  {
+    heartbeats = '1',
+    uploadedBytes = '',
+    settingsWritesLand = true,
+    startWorks = true,
+    stopsDuringWait = false,
+  },
+) {
+  const at = dir.replace(/\\/g, '/');
+  writeFileSync(
+    path.join(dir, 'az'),
+    `#!/usr/bin/env bash
+echo "$@" >>"${at}/argv"
+args="$*"
+case "$args" in
+  *"account show"*) echo 00000000-0000-0000-0000-000000000000 ;;
+  *"functionapp show"*) cat "${at}/state" ;;
+  ${/* `:` is a start that reports success and leaves the host down. */ ''}
+  *"functionapp start"*) ${startWorks ? `echo Running >"${at}/state"` : ':'} ;;
+  *"appsettings list"*) cat "${at}/setting" 2>/dev/null ;;
+  *"appsettings set"*)
+    ${settingsWritesLand ? '' : 'exit 0 # the write silently does not land\n    '}for a in "$@"; do
+      case "$a" in WEBSITE_RUN_FROM_PACKAGE=*) echo "\${a#WEBSITE_RUN_FROM_PACKAGE=}" >"${at}/setting" ;; esac
+    done ;;
+  *"blob show"*) echo "${uploadedBytes}" ;;
+  *"app-insights query"*)
+    ${stopsDuringWait ? `echo Stopped >"${at}/state"` : ':'}
+    echo "${heartbeats}" ;;
+esac
+exit 0
+`,
+    'utf8',
+  );
+  chmodSync(path.join(dir, 'az'), 0o755);
+}
+
+function deploy(
+  overrides: Parameters<typeof stubAz>[1] & { bundle?: string; appState?: string } = {},
+) {
+  const dir = scratch();
+  const bundle = path.join(dir, 'ingest-worker.zip');
+  writeFileSync(bundle, overrides.bundle ?? 'x'.repeat(64));
+  const size = String((overrides.bundle ?? 'x'.repeat(64)).length);
+  stubAz(dir, { uploadedBytes: size, ...overrides });
+  writeFileSync(path.join(dir, 'state'), `${overrides.appState ?? 'Running'}\n`);
+  writeFileSync(
+    path.join(dir, 'setting'),
+    'https://old.blob.core.windows.net/c/old.zip?sig=REDACTED\n',
+  );
+  const result = spawnSync('bash', ['.github/scripts/deploy-worker.sh', bundle, 'c0ffee'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${dir}${path.delimiter}${process.env.PATH}`,
+      STORAGE_ACCOUNT: STORAGE,
+      HEARTBEAT_TIMEOUT_S: '0',
+    },
+  });
+  return {
+    ...result,
+    argv: readFileSync(path.join(dir, 'argv'), 'utf8'),
+    setting: readFileSync(path.join(dir, 'setting'), 'utf8').trim(),
+  };
+}
+
 /**
  * How the package reaches the app, exercised rather than read.
  *
@@ -144,63 +216,6 @@ describe('the heartbeat the deploy waits for', () => {
  * assert on a path whose live form is one production Function App.
  */
 describe('the mechanism the deploy uses', () => {
-  const STORAGE = 'stfake';
-  const state = () => mkdtempSync(path.join(tmpdir(), 'deploy-worker-'));
-
-  /** A stub `az` that records every invocation and answers the six queries the script makes. */
-  function stubAz(
-    dir: string,
-    { heartbeats = '1', uploadedBytes = '', settingsWritesLand = true },
-  ) {
-    writeFileSync(
-      path.join(dir, 'az'),
-      `#!/usr/bin/env bash
-echo "$@" >>"${dir.replace(/\\/g, '/')}/argv"
-args="$*"
-case "$args" in
-  *"account show"*) echo 00000000-0000-0000-0000-000000000000 ;;
-  *"appsettings list"*) cat "${dir.replace(/\\/g, '/')}/setting" 2>/dev/null ;;
-  *"appsettings set"*)
-    ${settingsWritesLand ? '' : 'exit 0 # the write silently does not land\n    '}for a in "$@"; do
-      case "$a" in WEBSITE_RUN_FROM_PACKAGE=*) echo "\${a#WEBSITE_RUN_FROM_PACKAGE=}" >"${dir.replace(/\\/g, '/')}/setting" ;; esac
-    done ;;
-  *"blob show"*) echo "${uploadedBytes}" ;;
-  *"app-insights query"*) echo "${heartbeats}" ;;
-esac
-exit 0
-`,
-      'utf8',
-    );
-    chmodSync(path.join(dir, 'az'), 0o755);
-  }
-
-  function deploy(overrides: Parameters<typeof stubAz>[1] & { bundle?: string } = {}) {
-    const dir = state();
-    const bundle = path.join(dir, 'ingest-worker.zip');
-    writeFileSync(bundle, overrides.bundle ?? 'x'.repeat(64));
-    const size = String((overrides.bundle ?? 'x'.repeat(64)).length);
-    stubAz(dir, { uploadedBytes: size, ...overrides });
-    writeFileSync(
-      path.join(dir, 'setting'),
-      'https://old.blob.core.windows.net/c/old.zip?sig=REDACTED\n',
-    );
-    const result = spawnSync('bash', ['.github/scripts/deploy-worker.sh', bundle, 'c0ffee'], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${dir}${path.delimiter}${process.env.PATH}`,
-        STORAGE_ACCOUNT: STORAGE,
-        HEARTBEAT_TIMEOUT_S: '0',
-      },
-    });
-    return {
-      ...result,
-      argv: readFileSync(path.join(dir, 'argv'), 'utf8'),
-      setting: readFileSync(path.join(dir, 'setting'), 'utf8').trim(),
-    };
-  }
-
   it('uploads the bundle to function-releases rather than calling config-zip', () => {
     const { status, argv, stdout, stderr } = deploy({});
     expect(stdout + stderr).not.toContain('command not found');
@@ -241,6 +256,45 @@ exit 0
     const { status, stdout, stderr } = deploy({ heartbeats: '0' });
     expect(status).toBe(1);
     expect(stdout + stderr).toContain('no heartbeat naming c0ffee');
+  });
+});
+
+/**
+ * A stopped host is a state an operator is told to produce — `az functionapp stop` is the last of
+ * the three brakes — and `worker-deploy` fires on every push to master. Without the start below, a
+ * merge landing while a brake is pulled turns master red after the whole heartbeat wait, blaming
+ * the package for a host that was never up.
+ */
+describe('a deploy that arrives while the host is stopped', () => {
+  it('starts it rather than waiting out a heartbeat it cannot emit', () => {
+    const { status, argv, stdout } = deploy({ appState: 'Stopped' });
+    expect(argv).toContain('functionapp start');
+    expect(stdout).toContain('the host is Stopped; starting it');
+    expect(status).toBe(0);
+  });
+
+  it('leaves a running host alone', () => {
+    expect(deploy({}).argv).not.toContain('functionapp start');
+  });
+
+  it('blames the host, not the package, when it will not come up', () => {
+    const { status, stdout, stderr, argv } = deploy({ appState: 'Stopped', startWorks: false });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('The package is fine; the host is not up');
+    // And it says so before the wait, rather than twelve minutes into it.
+    expect(argv).not.toContain('app-insights query');
+  });
+
+  it('blames the package when a running host emits nothing', () => {
+    const { status, stdout, stderr } = deploy({ heartbeats: '0' });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('the package did not mount');
+  });
+
+  it('blames the host when a brake is pulled during the wait', () => {
+    const { status, stdout, stderr } = deploy({ heartbeats: '0', stopsDuringWait: true });
+    expect(status).toBe(1);
+    expect(stdout + stderr).toContain('it was stopped during the wait');
   });
 });
 

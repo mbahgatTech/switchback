@@ -21,10 +21,22 @@ let terrainSource: TerrainSource | null = null;
  * one for every process this repo deploys: on the retry ladder an unbounded query is ~24 minutes,
  * longer than the Functions host will let an invocation live. It used to be supplied only by the
  * `appSettings` array in `infra/azure/ingest.bicep`, and an ARM application-settings write replaces
- * that collection whole — so dropping one entry silently restored the unbounded case. Paired with
- * `OVERPASS_DEADLINE_MS` in `apps/ingest-worker/src/drain.ts`, which is where the two are added up.
+ * that collection whole — so dropping one entry silently restored the unbounded case.
+ *
+ * **190 s is `OverpassClient.requestTimeoutMs`, and that is the derivation.** Budget above one
+ * attempt's abort window can only fund a *second* attempt, and a retry starting past 190 s of a
+ * 190 s window cannot finish a query whose server-side `[timeout:]` is up to 180 s — so the excess
+ * bought nothing and came straight out of `overpassDeadlineMs`'s start-by. Fast failures still
+ * retry: a 429 at one second plus backoff leaves most of the window.
+ *
+ * Sized against measurement rather than assumed. The tile query is the largest of the four a tile
+ * makes; over the 34 invocations that logged `assembled` between 2026-08-05 and 2026-08-08 it
+ * completed at a median of 8.3 s, p90 65 s and a maximum of 168.4 s — inside this on every one.
+ *
+ * Paired with `overpassDeadlineMs` in `apps/ingest-worker/src/drain.ts`, where the three numbers
+ * are added up.
  */
-export const OVERPASS_MAX_TOTAL_MS = 240_000;
+export const OVERPASS_MAX_TOTAL_MS = 190_000;
 
 /**
  * Requests one `OverpassClient` will have in flight when `OVERPASS_MAX_CONCURRENT` does not say

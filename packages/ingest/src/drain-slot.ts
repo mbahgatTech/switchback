@@ -3,12 +3,12 @@
  * across processes, in the database.
  *
  * `OVERPASS_MAX_CONCURRENT` bounds one `OverpassClient`, and `config.ts` makes that a per-process
- * singleton. On the Function App that is the whole fleet, because `functionAppScaleLimit=1` and
- * `FUNCTIONS_WORKER_PROCESS_COUNT=1` mean there is one process. On Vercel it is one *lambda*: the
- * platform starts as many as the traffic asks for, each with its own singleton, so the setting
- * bounded a fraction of the drainer and nothing bounded the drainer. Overpass allots slots per
- * client IP and every Vercel instance shares one egress IP, so the fleet was one client with no
- * ceiling — the failure mode being an IP block, which takes the product down.
+ * singleton, so a platform argument about process count is the only thing that could turn it into
+ * a fleet bound. `functionAppScaleLimit=1` and `FUNCTIONS_WORKER_PROCESS_COUNT=1` come close, but
+ * they hold only while exactly one host is running: across a recycle two overlap, each with its
+ * own singleton, and several processes each honouring "two concurrent" locally is not two
+ * concurrent. Overpass allots slots per client IP and the whole estate shares one egress IP, so
+ * the failure mode is an IP block, which takes the product down.
  */
 
 import { prisma } from '@switchback/db';
@@ -53,29 +53,35 @@ export function maxDrainers(source: NodeJS.ProcessEnv = process.env): number {
  * `pg_advisory_xact_lock` serialises the pair; the count that follows it takes a fresh snapshot,
  * so it sees the rows the previous holder committed.
  *
- * Expired leases are reclaimed inside the lock, before the count. A drainer that died still holds
- * `running` rows and would otherwise hold the slot shut until something else swept — which, on
- * Vercel's 60 s wall clock, is most drains. That makes the worst-case block `LEASE_TIMEOUT_MS`
- * rather than a day, and it is the reason `sweepQueue` exists as well.
+ * Expired leases are reclaimed *before* the transaction opens, not inside it. A drainer that died
+ * still holds `running` rows and would otherwise hold the slot shut until something else swept, so
+ * sweeping here makes the worst-case block `LEASE_TIMEOUT_MS` rather than indefinite. Outside the
+ * transaction because a statement that errors inside one aborts it (`25P02`): catching the sweep in
+ * place would leave every statement after it failing anyway, so the gate would die on a failed
+ * sweep rather than carry on. Committing the reclaim first also means the count below sees its
+ * effect, which is the only reason it runs here at all. `sweepQueue` on the pump's two-minute tick
+ * is the other half, and it runs whether or not anything drains.
+ *
+ * A sweep that fails leaves the count pessimistic, never optimistic — dead drainers stay counted,
+ * which refuses admission — and leaves `classifyDisposition` a `running` row past its lease to
+ * report as `stranded`. That is the reachability `switchback-ingest-signal-stranded` depends on.
  *
  * Drainers are counted by `count(distinct "lockedBy")`, so **every caller must pass a `workerId`
- * unique to its process.** A fleet sharing the string `inline` counts as one drainer however many
- * lambdas are running, which is the bug this replaces wearing a lock. The three application
- * entry points — `trails.ts`, `routes.ts` and the cron route — derive theirs from `randomUUID`;
- * `drainJobs` falls back to a timestamp, which is unique enough for the same reason.
+ * unique to its process.** A fleet sharing one string counts as one drainer however many processes
+ * are running, which is the bug this replaces wearing a lock. `runIngestSignal` derives its from
+ * the host's `invocationId`; `drainJobs` falls back to a timestamp, which is unique enough for the
+ * same reason.
  */
 export function drainSlotGate(db: PrismaClient = prisma, limit = maxDrainers()): ClaimGate {
-  return (claim) =>
-    db.$transaction(async (tx) => {
-      await tx.$executeRaw`select pg_advisory_xact_lock(${DRAIN_ADMISSION_KEY})`;
+  return async (claim) => {
+    try {
+      await reclaimExpiredJobs(db);
+    } catch (error) {
+      console.warn('[ingest] lease sweep ahead of the drain gate failed', error);
+    }
 
-      try {
-        await reclaimExpiredJobs(tx);
-      } catch (error) {
-        // A failed sweep makes the count pessimistic, never optimistic: it can only leave dead
-        // drainers counted, which refuses admission. Safe to carry on.
-        console.warn('[ingest] lease sweep inside the drain gate failed', error);
-      }
+    return db.$transaction(async (tx) => {
+      await tx.$executeRaw`select pg_advisory_xact_lock(${DRAIN_ADMISSION_KEY})`;
 
       const [counted] = await tx.$queryRaw<Array<{ drainers: number }>>`
         select count(distinct "lockedBy")::int as drainers from ingest_jobs where status = 'running'
@@ -84,6 +90,7 @@ export function drainSlotGate(db: PrismaClient = prisma, limit = maxDrainers()):
 
       return claim(tx);
     });
+  };
 }
 
 const EMPTY_BATCH: ClaimedBatch = { primary: [], derived: [] };

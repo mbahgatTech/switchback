@@ -1,25 +1,13 @@
 /**
- * Queue maintenance that has to happen whether or not anything is being drained.
- *
- * Both sweeps below used to run only inside `drainJobs`, which is a side effect of traffic on
- * cold ground plus a once-a-day cron. That is not a schedule: on 2026-08-07 the cron claimed ten
- * jobs at 04:51 UTC, its invocation died on Vercel's 60 s wall clock still holding them, and the
- * next thing able to take the leases back was the following day's cron — 5.9 h and counting
- * against a 30-minute lease.
+ * Queue maintenance that has to happen whether or not anything is being drained. `ingestPump`
+ * runs it every two minutes, which is the estate's only maintenance schedule.
  */
 
-import { JobStatus, prisma } from '@switchback/db';
+import { JobStatus, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
+import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
-
-/**
- * How often one process will run the sweep off the back of a request. Half a lease, so an expired
- * one is never more than `LEASE_TIMEOUT_MS * 1.5` old while anything at all is being served, and
- * two indexed statements per fifteen minutes per process is a cost that does not show up.
- */
-export const SWEEP_INTERVAL_MS = LEASE_TIMEOUT_MS / 2;
 
 export interface SweepResult {
   /** Expired leases returned to the queue. */
@@ -28,14 +16,17 @@ export interface SweepResult {
   retired: number;
   /** Split markers cleared from parents that have no children — see `reconcileOrphanedSplits`. */
   unsplit: OrphanedSplitRepair[];
+  /** Tiles left `running` by a handler that never came back — see `repairWedgedTiles`. */
+  unwedged: string[];
 }
 
 /**
- * Take back expired leases and clear split markers left by a subdivision that produced nothing.
+ * Take back expired leases, clear split markers left by a subdivision that produced nothing, and
+ * correct tiles whose handler never came back.
  *
- * Each half is caught separately: these are bookkeeping, and neither is worth failing a request
- * or a cron tick for. What they return is counted by the caller, which is the only place the
- * result is worth a log line.
+ * Each part is caught separately: these are bookkeeping, and none is worth failing a request or a
+ * cron tick for. What they return is counted by the caller, which is the only place the result is
+ * worth a log line.
  */
 export async function sweepQueue(
   db: PrismaClient = prisma,
@@ -56,38 +47,28 @@ export async function sweepQueue(
     console.warn('[ingest] split reconciliation failed', error);
   }
 
-  return { requeued, retired, unsplit };
-}
+  /*
+   * After the lease sweep, never before: a reclaim turns a job back to `queued`, which is exactly
+   * the condition that makes its tile not wedged. Running this first would fail tiles the sweep
+   * was about to rescue.
+   */
+  let unwedged: string[] = [];
+  try {
+    unwedged = await repairWedgedTiles(db, now);
+  } catch (error) {
+    console.warn('[ingest] wedged tile repair failed', error);
+  }
 
-/**
- * A sweep hung off request traffic, at most once per `SWEEP_INTERVAL_MS` per process.
- *
- * Module state rather than a database column: the throttle exists to keep one process from
- * writing the same two statements on every request, and a second instance sweeping in the same
- * window is harmless — both statements are conditional updates over rows the other has already
- * left alone.
- */
-export function createThrottledSweep(
-  run: (now: Date) => Promise<SweepResult> = (now) => sweepQueue(prisma, now),
-  intervalMs = SWEEP_INTERVAL_MS,
-): (now?: Date) => Promise<SweepResult> | null {
-  let sweptAt: number | null = null;
-
-  return (now = new Date()) => {
-    if (sweptAt !== null && now.getTime() - sweptAt < intervalMs) return null;
-    // Stamped before the await, so a slow sweep does not admit a second one behind it.
-    sweptAt = now.getTime();
-    return run(now);
-  };
+  return { requeued, retired, unsplit, unwedged };
 }
 
 /**
  * The literal an operator greps for, and the token `infra/azure/ingest.bicep` alerts on.
  *
- * The drainer that actually runs is on Vercel, which has no Application Insights, so its console
- * lines reach nobody who is not already looking. Every one of the conditions below is a *row* in
- * Postgres, though, and the Function App's `ingestPump` timer reads Postgres from inside the
- * subscription that owns the alert — so the distress is republished where a rule can see it.
+ * Every condition below is a *row*, not an event, so none of it appears in the telemetry of the
+ * invocation that caused it — a tile wedged by a killed handler is discovered by whatever reads
+ * the table next. `ingestPump` republishes the reading on every tick, which is what puts it
+ * somewhere a rule can query.
  */
 export const QUEUE_DISTRESS_MARKER = 'switchback-ingest-queue-distress';
 
@@ -107,7 +88,7 @@ export const QUEUE_HEALTH_MARKER = 'switchback-ingest-queue-health';
 export interface QueueHealth {
   /** Jobs buried within `DISTRESS_WINDOW_MS`. Nothing retries these. */
   dead: number;
-  /** Leases past `LEASE_TIMEOUT_MS` that no sweep has taken back yet. */
+  /** Leases past `LEASE_TIMEOUT_MS` that survived a sweep — see `LEASE_SWEEP_GRACE_MS`. */
   staleLeases: number;
   /** Unfinished or freshly buried jobs whose last failure names a rate limit. */
   rateLimited: number;
@@ -115,6 +96,8 @@ export interface QueueHealth {
   orphanedSplits: number;
   /** Subtrees whose leaves have given up, with a z9 ancestor somebody is polling. */
   stuckSubtrees: number;
+  /** Tiles left mid-fetch with no job that will ever finish them — see `wedgedTiles`. */
+  wedgedTiles: number;
   /** 1 when work is due and nothing has finished in `DRAIN_SILENCE_MS` — the drain has stopped. */
   stalledDrain: number;
 }
@@ -133,6 +116,19 @@ export interface QueueHealth {
 export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
 
 /**
+ * How long past `LEASE_TIMEOUT_MS` a lease may sit before its survival is distress rather than
+ * ordinary timing.
+ *
+ * `reportQueueHealth` runs at the top of the `ingestPump` handler and the sweep runs just after it,
+ * so every reading catches the leases that tick is about to reclaim. Measured over the 24 h to
+ * 2026-08-08: `staleLeases` was non-zero in 376 of 685 readings, against 52 for `dead` and 3 for
+ * `wedgedTiles` — so this one field decided `isDistressed` more than half the time and the rule
+ * reading it was a light left on. A lease younger than one sweep interval has not yet had a sweep
+ * to survive; one older than that has, and something is wrong with the reaper.
+ */
+export const LEASE_SWEEP_GRACE_MS = 5 * 60 * 1000;
+
+/**
  * How long the drain may go without finishing anything, while work is due, before that is a
  * stoppage rather than a quiet patch.
  *
@@ -143,13 +139,18 @@ export const DISTRESS_WINDOW_MS = 60 * 60 * 1000;
  * forever: the pinned gauge `DISTRESS_WINDOW_MS` exists to prevent, rebuilt.
  *
  * What separates a stopped drain from a slow one is throughput, so this measures the gap since
- * the last terminal transition. Over the 14 days to 2026-08-07 there were 341 of them, p95 gap
- * 0.70 h and maximum 27.90 h. Thirty-six hours clears that maximum and clears a whole missed
- * `/api/cron/drain` period — it fires once a day at 04:17 and the rest is request-driven — so a
- * quiet weekend does not page anybody, while a drain that has genuinely stopped is named within
- * a day and a half instead of never.
+ * the last terminal transition. Six hours is roughly forty tiles at the 9-minute handler bound,
+ * so a drain that is merely slow clears it comfortably while one that has stopped is named the
+ * same working day.
+ *
+ * **The old thirty-six hours was sized for a schedule that no longer exists.** It cleared a
+ * missed `/api/cron/drain` period — a once-a-day cron, with the rest request-driven — and the
+ * 27.90 h maximum gap measured over the fortnight to 2026-08-08 is an artefact of that regime,
+ * not a baseline for this one. `ingestPump` now runs every two minutes and the queue trigger
+ * drains continuously, so a day and a half of silence is not a quiet weekend any more. This
+ * number is due a re-measurement once the continuous regime has a fortnight of history.
  */
-export const DRAIN_SILENCE_MS = 36 * 60 * 60 * 1000;
+export const DRAIN_SILENCE_MS = 6 * 60 * 60 * 1000;
 
 /** Whether anything in this reading is worth waking somebody for. */
 export function isDistressed(health: QueueHealth): boolean {
@@ -161,8 +162,103 @@ export function formatQueueHealth(health: QueueHealth): string {
   return (
     `dead=${health.dead} staleLeases=${health.staleLeases} rateLimited=${health.rateLimited} ` +
     `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees} ` +
-    `stalledDrain=${health.stalledDrain}`
+    `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain}`
   );
+}
+
+/**
+ * Tiles stuck mid-fetch: `running` with nothing fetched and no job that can finish them.
+ *
+ * `processTile` writes `running` before it queries and every exit rewrites the row, so a tile left
+ * `running` is one whose invocation did not come back. `staleLeases` does not see them: it counts
+ * `ingest_jobs`, and the job beneath a wedged tile is frequently *not* stale — it was completed, or
+ * reclaimed and buried — which is why the tile is the thing that has to be counted. Measured on
+ * 2026-08-08, the first day this gauge ran in production: six of 37 readings non-zero, peak six.
+ *
+ * The join is what keeps the gauge from pinning on a tile that is merely mid-flight. A tile is only
+ * wedged if no job of its own is `queued` or `running`; while one is, the tile is on its way to
+ * `ready`, which is the state every tile passes through.
+ *
+ * `WEDGE_GRACE_MS` is what keeps it from pinning on a tile nothing will ever repair. `runPump`
+ * selects only `queued` jobs and `reclaimExpiredJobs` only moves `running` to `queued` or `dead`,
+ * so a tile whose job was buried on its last attempt has no route back and would otherwise be
+ * counted forever. `repairWedgedTiles` is the route back; this window is how long a tile waits for
+ * it before it is worth reporting.
+ */
+export async function countWedgedTiles(
+  db: PrismaClient,
+  now: Date = new Date(),
+  graceMs: number = WEDGE_GRACE_MS,
+): Promise<number> {
+  const wedgedBefore = new Date(now.getTime() - graceMs);
+  const [row] = await db.$queryRaw<Array<{ count: number }>>`
+    SELECT count(*)::int AS count
+      FROM ingest_tiles tile
+     WHERE tile.status = 'running'
+       AND tile."fetchedAt" IS NULL
+       AND tile."updatedAt" < ${wedgedBefore}
+       AND NOT EXISTS (
+             SELECT 1 FROM ingest_jobs job
+              WHERE job."dedupeKey" = 'ingest_tile:' || tile.quadkey
+                AND job.status IN ('queued', 'running'))
+  `;
+  return row?.count ?? 0;
+}
+
+/**
+ * How long a tile may sit `running` with no job before it counts as wedged.
+ *
+ * **Sized from one invocation, not from a recovery bound.** `processTile` stamps `updatedAt` when
+ * an attempt begins and the row stays `running` for the rest of it, so the window has to cover a
+ * whole handler — `HOST_FUNCTION_TIMEOUT_MS` — before an absent job means anything, plus a sweep
+ * interval of slack. What keeps the gauge off a tile the ordinary path will repair is the
+ * `NOT EXISTS` join, which holds for as long as that path takes; a window is the wrong instrument
+ * for it, and the recovery bound it was previously derived from is a backlog drain with no
+ * constant behind it.
+ */
+export const WEDGE_GRACE_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_SWEEP_GRACE_MS;
+
+/**
+ * The literal `switchback-ingest-drain-failed` greps for, written into the tile's `lastError`.
+ *
+ * A wedged tile is repaired by correcting the row rather than by retrying it, so nothing else
+ * would record that it happened.
+ */
+export const TILE_WEDGED_MARKER = 'switchback-ingest-tile-wedged';
+
+/**
+ * Take tiles out of `running` when nothing is running them.
+ *
+ * `running` is a claim that a handler holds this tile. A tile whose handler the host killed on its
+ * last attempt has no such holder and no route back: `runPump` publishes only `queued` jobs and
+ * `reclaimExpiredJobs` only moves `running` to `queued` or `dead`, so neither reaches it. Left
+ * alone the row states something false forever and `wedgedTiles` never falls.
+ *
+ * `failed` is the repair rather than a re-enqueue: a tile that has exhausted its attempts is
+ * exactly what re-enqueueing loops on. `isTileFresh` treats `failed` as re-fetchable, so the next
+ * request for that area picks it up on the ordinary path, with the reason still on the row.
+ */
+export async function repairWedgedTiles(
+  db: PrismaClient = prisma,
+  now: Date = new Date(),
+  graceMs: number = WEDGE_GRACE_MS,
+): Promise<string[]> {
+  const wedgedBefore = new Date(now.getTime() - graceMs);
+  const repaired = await db.$queryRaw<Array<{ quadkey: string }>>`
+    UPDATE ingest_tiles tile
+       SET status = ${TileStatus.failed}::"TileStatus",
+           "lastError" = ${`${TILE_WEDGED_MARKER}: left running with no job that could finish it`},
+           "updatedAt" = ${now}
+     WHERE tile.status = 'running'
+       AND tile."fetchedAt" IS NULL
+       AND tile."updatedAt" < ${wedgedBefore}
+       AND NOT EXISTS (
+             SELECT 1 FROM ingest_jobs job
+              WHERE job."dedupeKey" = 'ingest_tile:' || tile.quadkey
+                AND job.status IN ('queued', 'running'))
+    RETURNING tile.quadkey
+  `;
+  return repaired.map((row) => row.quadkey);
 }
 
 /**
@@ -184,34 +280,43 @@ export async function queueHealth(
   now: Date = new Date(),
   leaseTimeoutMs = LEASE_TIMEOUT_MS,
 ): Promise<QueueHealth> {
-  const staleBefore = new Date(now.getTime() - leaseTimeoutMs);
+  const staleBefore = new Date(now.getTime() - leaseTimeoutMs - LEASE_SWEEP_GRACE_MS);
   const recent = new Date(now.getTime() - DISTRESS_WINDOW_MS);
   const silentBefore = new Date(now.getTime() - DRAIN_SILENCE_MS);
 
-  const [dead, staleLeases, rateLimited, orphanedSplits, stuckSubtrees, oldestDue, lastFinished] =
-    await Promise.all([
-      db.ingestJob.count({ where: { status: JobStatus.dead, completedAt: { gte: recent } } }),
-      db.ingestJob.count({
-        where: { status: JobStatus.running, lockedAt: { lt: staleBefore } },
-      }),
-      db.ingestJob.count({
-        where: {
-          lastError: { contains: '429' },
-          OR: [{ completedAt: { gte: recent } }, { runAfter: { gte: recent } }],
-        },
-      }),
-      countOrphanedSplits(db),
-      db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
-      db.ingestJob.findFirst({
-        where: { status: JobStatus.queued, runAfter: { lte: now } },
-        orderBy: { runAfter: 'asc' },
-        select: { runAfter: true },
-      }),
-      db.ingestJob.aggregate({
-        where: { status: { in: [JobStatus.done, JobStatus.dead] } },
-        _max: { completedAt: true },
-      }),
-    ]);
+  const [
+    dead,
+    staleLeases,
+    rateLimited,
+    orphanedSplits,
+    stuckSubtrees,
+    wedgedTiles,
+    oldestDue,
+    lastFinished,
+  ] = await Promise.all([
+    db.ingestJob.count({ where: { status: JobStatus.dead, completedAt: { gte: recent } } }),
+    db.ingestJob.count({
+      where: { status: JobStatus.running, lockedAt: { lt: staleBefore } },
+    }),
+    db.ingestJob.count({
+      where: {
+        lastError: { contains: '429' },
+        OR: [{ completedAt: { gte: recent } }, { runAfter: { gte: recent } }],
+      },
+    }),
+    countOrphanedSplits(db),
+    db.ingestTile.count({ where: { lastError: { contains: SUBTREE_STUCK_MARKER } } }),
+    countWedgedTiles(db, now),
+    db.ingestJob.findFirst({
+      where: { status: JobStatus.queued, runAfter: { lte: now } },
+      orderBy: { runAfter: 'asc' },
+      select: { runAfter: true },
+    }),
+    db.ingestJob.aggregate({
+      where: { status: { in: [JobStatus.done, JobStatus.dead] } },
+      _max: { completedAt: true },
+    }),
+  ]);
 
   return {
     dead,
@@ -219,6 +324,7 @@ export async function queueHealth(
     rateLimited,
     orphanedSplits,
     stuckSubtrees,
+    wedgedTiles,
     stalledDrain: stalledDrain(
       oldestDue?.runAfter ?? null,
       lastFinished._max.completedAt,

@@ -2,11 +2,11 @@
 #
 # Publish the ingest worker bundle to the Function App, and then prove the app is running it.
 #
-# This is the only thing that writes `WEBSITE_RUN_FROM_PACKAGE`. `infra/azure/ingest.bicep`
-# deliberately does not declare that setting — an ARM application-settings write replaces the
-# collection whole and would fight the package push — so a template deploy leaves the app codeless
-# until this script runs. Template first, then this. Both CI and a human invoke this same file so
-# the sequence cannot exist in two versions.
+# This is the only thing that uploads the bundle and points `WEBSITE_RUN_FROM_PACKAGE` at it.
+# `infra/azure/ingest.bicep` declares that setting from its `packageUrl` parameter, so a template
+# deploy writes back whatever `INGEST_PACKAGE_URL` names — it cannot upload a per-commit zip, which
+# is what this does. Both CI and a human invoke this same file so the sequence cannot exist in two
+# versions.
 #
 # **Upload the blob, then name it — never `az functionapp deployment source config-zip`.** Linux
 # Consumption runs from an external package URL and has no `scm` site to extract into, so the CLI
@@ -26,13 +26,15 @@
 #
 # **The verification is the point.** An exit code says a blob was uploaded and a setting was
 # written; it says nothing about what the host is executing, which is exactly the gap that left a
-# five-week-old build in production under a green pipeline. So this asserts two independent things,
-# and fails if either is missing:
+# five-week-old build in production under a green pipeline. So this asserts three independent things,
+# and fails if any is missing:
 #
 #   1. the live setting names the blob this run uploaded — the ARM write landed, on this app;
-#   2. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
+#   2. the host is `Running`, because `az functionapp stop` is one of the brakes an operator is
+#      told to pull and a stopped host emits nothing;
+#   3. `switchback-ingest-queue-health build=<commit>` appears in Application Insights with a
 #      timestamp after the deploy began. The marker is emitted by the first statement of the
-#      `ingestPump` handler, on a two-minute timer, ahead of the `INGEST_QUEUE_DRIVER` guard; the
+#      `ingestPump` handler, on a two-minute timer; the
 #      commit is substituted into the bundle by `apps/ingest-worker/scripts/bundle.ts`, so it
 #      travels inside the zip. Without it the check degrades to liveness — any build already
 #      carrying the current `health.ts` satisfies a bare marker, so a package that failed to mount
@@ -125,6 +127,30 @@ if [ "$after" != "$PACKAGE_URL" ]; then
 fi
 echo "package after this run: ${PACKAGE_URL}"
 
+# A Stopped host cannot emit the heartbeat below, so without this the wait spends
+# `HEARTBEAT_TIMEOUT_S` and then reports a package that failed to mount — the wrong cause for the
+# one state an operator deliberately puts this app in. `az functionapp stop` is the last of the
+# three brakes in `docs/architecture.md`, and `worker-deploy` runs on every push to master, so a
+# deploy arriving while a brake is pulled is ordinary rather than exceptional. This is also the
+# reverse of that brake, which is why the runbook names them together.
+app_state() {
+  az functionapp show -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" --query state -o tsv
+}
+
+state="$(app_state)"
+if [ "$state" != "Running" ]; then
+  echo "the host is ${state}; starting it, because a stopped host emits no heartbeat."
+  az functionapp start -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" -o none
+  state="$(app_state)"
+fi
+if [ "$state" != "Running" ]; then
+  echo "::error::${FUNCTION_APP} is ${state} after 'az functionapp start', so nothing can run the"
+  echo "::error::package this run uploaded. The package is fine; the host is not up."
+  echo "::error::  az functionapp start -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+  exit 1
+fi
+echo "host state: ${state}"
+
 echo "waiting up to ${HEARTBEAT_TIMEOUT_S}s for '${HEARTBEAT}' emitted after ${started_at}"
 deadline=$(( $(date +%s) + HEARTBEAT_TIMEOUT_S ))
 while :; do
@@ -145,9 +171,19 @@ while :; do
   fi
 
   if [ "$(date +%s)" -ge "$deadline" ]; then
+    # Two causes, one silence. The host was Running when the wait began, so if it still is the
+    # package did not mount; if it is not, a brake was pulled under the deploy and the package has
+    # not been tried at all. Only the state read tells them apart, and they send the on-caller to
+    # different places.
+    ended="$(app_state || echo unknown)"
     echo "::error::no heartbeat naming ${COMMIT} in Application Insights within ${HEARTBEAT_TIMEOUT_S}s."
-    echo "::error::The package was replaced but the host is not running it. Check the host log:"
-    echo "::error::  az webapp log tail -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+    if [ "$ended" = "Running" ]; then
+      echo "::error::The host is running and did not emit it, so the package did not mount."
+      echo "::error::  az webapp log tail -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+    else
+      echo "::error::The host is ${ended}: it was stopped during the wait, so nothing ran the package."
+      echo "::error::  az functionapp start -g ${RESOURCE_GROUP} -n ${FUNCTION_APP}"
+    fi
     exit 1
   fi
   sleep 30

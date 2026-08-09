@@ -4,7 +4,6 @@
  * Lazy ingest and the indexed-bbox viewport predicate are in `docs/architecture.md`.
  */
 
-import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import {
@@ -27,10 +26,7 @@ import type {
 import { Prisma, trailIdsNear } from '@switchback/db';
 import { encodeBase64, toFitCourse, toRouteGpx } from '@switchback/geo';
 import {
-  createThrottledSweep,
-  drainIngest,
   ensureCoverage,
-  ingestQueueDriver,
   publishIngestSignals,
   requestArea,
   surveyArea,
@@ -39,7 +35,6 @@ import {
 } from '@switchback/ingest';
 import type { AreaCoverage, CoverageResult } from '@switchback/ingest';
 import { decodeCursor, encodeCursor } from '../cursor';
-import { createInlineDrain } from '../inline-drain';
 import { readProfile } from '../profiles';
 import { summarySelect, toSummary } from '../trail-shape';
 import { deliberateServerError, publicProcedure, router } from '../trpc';
@@ -58,9 +53,6 @@ const NEAR_CANDIDATE_CAP = 300;
 
 /** Radius for "near me" when the client does not say. Roughly a half-hour drive. */
 const DEFAULT_RADIUS_M = 30_000;
-
-/** How many queued tiles one request will try to drain on its response's coattails. */
-const MAX_INLINE_DRAIN = 4;
 
 const mapSelect = { ...summarySelect, geometryJson: true } satisfies Prisma.TrailSelect;
 type MapRow = Prisma.TrailGetPayload<{ select: typeof mapSelect }>;
@@ -382,86 +374,27 @@ async function surveyIfWide(ctx: Context, bbox: BBox, coverage: CoverageResult) 
 }
 
 /**
- * This lambda's name on the queue. Random per process, because `drainSlotGate` counts drainers
- * with `count(distinct "lockedBy")` — the fixed string `inline` made a fleet of any size read as
- * one drainer, which is the bound it is there to enforce.
- */
-const INLINE_WORKER_ID = `inline-${randomUUID().slice(0, 8)}`;
-
-/**
- * The process's one inline drain. Module state is the right scope for the *serialisation*: it
- * keeps this process from starting a second drain on every poll, since `coverage.queued` reports
- * every outstanding tile rather than only newly enqueued ones.
+ * Ring the doorbell for the tiles this request queued.
  *
- * It is not the Overpass bound, and treating it as one is what left Vercel unbounded. Each lambda
- * has its own module state and its own `OverpassClient`, so the fleet's concurrency was
- * instances × `OVERPASS_MAX_CONCURRENT`. `drainSlotGate` is the bound that crosses processes, and
- * `drainIngest` applies it whether or not this call asks for it.
- */
-const inlineDrain = createInlineDrain((keys) =>
-  drainIngest({
-    limit: Math.min(keys.length, MAX_INLINE_DRAIN),
-    workerId: INLINE_WORKER_ID,
-    dedupeKeys: keys,
-    // Vercel has no Application Insights, so `TILE_SPLIT_MARKER` and `SUBTREE_STUCK_MARKER`
-    // would go nowhere on the drainer that is actually running. Console is where they land, and
-    // `queueHealth` is what makes the same distress reach an alert.
-    deps: { logger: (message, detail) => console.warn(message, detail ?? '') },
-  }),
-);
-
-/**
- * Lease recovery and split-marker repair, hung off request traffic rather than off a drain.
+ * `ensureCoverage` has already written the `ingest_jobs` rows, so this is the wake-up and not the
+ * work: no Overpass request is made in a Vercel function at all, which is what lets the Function
+ * App's clamp be the only Overpass ceiling in the estate. A publish that fails is logged rather
+ * than thrown, under `PUBLISH_FAILED_MARKER`, and costs the tile its place in the queue: `runPump`
+ * publishes from the head of `priority DESC, "runAfter" ASC` and these rows are the newest of
+ * their band.
  *
- * Throttled to one sweep per `SWEEP_INTERVAL_MS` per process — see `createThrottledSweep`. It has
- * to be here rather than inside `kickIngest`'s work: a viewport with nothing outstanding queues
- * nothing and drains nothing, and those are exactly the hours in which a dead worker's leases sat.
- */
-const sweepIngestQueue = createThrottledSweep();
-
-/**
- * Start the queued work now, if the platform will let us. An optimisation over the cron,
- * never a replacement: it runs the same idempotent drain, so anything it drops to a timeout
- * or a deploy is picked up a minute later. Errors are swallowed because the response has
- * already gone out and the reason is on the job row.
- *
- * Scoped to `coverage.queued` rather than claiming the head of the table: viewport tiles all
- * carry the same priority, so an unscoped claim orders by `runAfter` and takes the oldest
- * pending tiles — the ones nobody is looking at any more. That scoping is also why
- * `drainIngest` reserves a derived share on top; a tile-key list cannot reach an
- * `enrich_trail` row, so the fan-out these tiles produce had no drainer in the request path
- * at all. See `drainJobs` and `DERIVED_QUEUE_WARN_DEPTH`.
- *
- * Under `INGEST_QUEUE_DRIVER=servicebus` the kick is a published signal instead and this
- * process makes no Overpass call at all — which is what lets the worker's clamp be the only
- * ceiling that matters. The tiles are already on `ingest_jobs` either way: `ensureCoverage`
- * wrote them before this ran, so a broker that refuses the signal costs the wake-up and
- * nothing else.
+ * Scoped to `coverage.queued` rather than to the head of the table: viewport tiles all carry the
+ * same priority, so an unscoped signal would wake the oldest pending tiles instead of the ones
+ * somebody is looking at.
  */
 function kickIngest(ctx: Context, queued: readonly string[]): void {
-  if (!ctx.waitUntil) return;
+  if (!ctx.waitUntil || queued.length === 0) return;
 
-  // Before the early return below, deliberately: the sweep's whole point is that it happens on
-  // ticks that drain nothing.
-  const sweep = sweepIngestQueue();
-  if (sweep)
-    ctx.waitUntil(sweep.catch((error: unknown) => console.warn('queue sweep failed', error)));
-
-  if (queued.length === 0) return;
-
-  if (ingestQueueDriver() === 'servicebus') {
-    // Not gated on `inlineDrain`: that scheduler bounds this process's Overpass concurrency, and
-    // publishing has none to bound.
-    ctx.waitUntil(
-      publishIngestSignals(queued.map(tileJobKey), {
-        oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
-      }),
-    );
-    return;
-  }
-
-  const work = inlineDrain.request(queued.map(tileJobKey));
-  if (work) ctx.waitUntil(work);
+  ctx.waitUntil(
+    publishIngestSignals(queued.map(tileJobKey), {
+      oidcToken: ctx.headers.get(VERCEL_OIDC_HEADER),
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------

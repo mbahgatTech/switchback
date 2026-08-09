@@ -8,8 +8,13 @@ import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import {
+  LEASE_EXPIRED_MARKER,
+  LEASE_MARGIN_MS,
+  LEASE_TIMEOUT_MS,
+  HOST_FUNCTION_TIMEOUT_MS,
   OVERPASS_MAX_CONCURRENT,
   OVERPASS_MAX_TOTAL_MS,
+  OVERPASS_STRAIN_MARKER,
   OverpassDeadlineError,
   SUBTREE_STUCK_MARKER,
   TILE_SPLIT_MARKER,
@@ -17,10 +22,13 @@ import {
   withDeadline,
 } from '@switchback/ingest';
 import { MAX_INGEST_ZOOM } from '@switchback/geo';
+import type { PrismaClient } from '@switchback/db';
 import {
+  COMMIT_RESERVE_MS,
   HANDLER_DEADLINE_MS,
   JOB_FAILED_MARKER,
-  OVERPASS_DEADLINE_MS,
+  SIGNAL_STRANDED_MARKER,
+  overpassDeadlineMs,
   runIngestSignal,
 } from '../src/drain';
 import type { Drain } from '../src/drain';
@@ -54,6 +62,14 @@ function fakeLog(): WorkerLog & { lines: Array<[string, string]> } {
   return { lines, info: at('info'), warn: at('warn'), error: at('error') };
 }
 
+/**
+ * A job row that reads as finished, so `assertSettleable` completes the message. Cases that mean
+ * to exercise the stranded path live in `settlement.test.ts` and supply their own.
+ */
+const settledDb = {
+  ingestJob: { findUnique: async () => ({ status: 'done', lockedAt: null, lockedBy: null }) },
+} as unknown as PrismaClient;
+
 function drainReturning(result: DrainResult): Drain {
   return vi.fn(async () => result);
 }
@@ -63,18 +79,21 @@ describe('runIngestSignal', () => {
     const drain = drainReturning(outcome({ claimed: 1, succeeded: 1 }));
     const before = Date.now();
 
-    await runIngestSignal({ dedupeKey: KEY }, fakeLog(), { workerId: 'sb-1', drain, overpass });
+    await runIngestSignal({ dedupeKey: KEY }, fakeLog(), {
+      workerId: 'sb-1',
+      drain,
+      overpass,
+      db: settledDb,
+    });
 
     expect(drain).toHaveBeenCalledWith({
       limit: 1,
       derivedLimit: 0,
       dedupeKeys: [KEY],
       workerId: 'sb-1',
-      // Asserted, not incidental: this host is the whole fleet by Azure configuration, and it is
-      // the only caller entitled to skip `drainSlotGate`. Every Vercel path takes the default.
-      gate: null,
       deps: {
         overpass,
+        overpassAfterCommits: overpass,
         deadlineAt: expect.any(Number) as number,
         logger: expect.any(Function) as () => void,
       },
@@ -110,13 +129,13 @@ describe('runIngestSignal', () => {
     let clock = 0;
     const view = withDeadline(
       { query: async () => ({ elements: [] }) },
-      OVERPASS_DEADLINE_MS,
+      overpassDeadlineMs({}),
       () => clock,
     );
 
     await expect(view.query('[out:json];')).resolves.toBeDefined();
 
-    clock = OVERPASS_DEADLINE_MS;
+    clock = overpassDeadlineMs({});
     await expect(view.query('[out:json];')).rejects.toBeInstanceOf(OverpassDeadlineError);
   });
 
@@ -129,6 +148,7 @@ describe('runIngestSignal', () => {
       overpass,
       workerId: 'sb-1',
       drain: drainReturning(outcome()),
+      db: settledDb,
     });
 
     expect(log.lines).toEqual([['info', expect.stringContaining('nothing claimable') as string]]);
@@ -161,6 +181,7 @@ describe('runIngestSignal', () => {
       overpass,
       workerId: 'sb-1',
       drain: drainReturning(result),
+      db: settledDb,
     });
 
     expect(log.lines.map(([, line]) => line).join('\n')).toContain(expected);
@@ -207,14 +228,23 @@ describe('the invocation budget the host enforces', () => {
   it('deploys the two budgets the code falls back to', () => {
     // Drift on either side is the failure. A template that stops setting them lands on these
     // defaults; a template that sets something else is no longer the thing reasoned about.
-    expect(appSetting('INGEST_OVERPASS_DEADLINE_MS')).toBe(OVERPASS_DEADLINE_MS);
     expect(appSetting('OVERPASS_MAX_TOTAL_MS')).toBe(OVERPASS_MAX_TOTAL_MS);
     expect(appSetting('INGEST_DEADLINE_MS')).toBe(HANDLER_DEADLINE_MS);
+    expect(appSetting('INGEST_COMMIT_RESERVE_MS')).toBe(COMMIT_RESERVE_MS);
+  });
+
+  it('leaves the Overpass start-by moment to the derivation, not the template', () => {
+    // `overpassDeadlineMs` takes min(configured, derived), so a template value can only be inert
+    // or — if the three budgets above ever move — a loosening of the one bound whose failure mode
+    // is an Overpass IP block. The derivation already guarantees the three add up, so the setting
+    // has no safe value to hold. It stays absent, and an operator tightening the clamp during an
+    // incident still works because the code reads the variable.
+    expect(bicep).not.toMatch(/name: 'INGEST_OVERPASS_DEADLINE_MS'/);
   });
 
   it('leaves the handler time to write the tile after Overpass is done', () => {
     expect(functionTimeoutMs).toBe(600_000);
-    expect(OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
+    expect(overpassDeadlineMs({}) + OVERPASS_MAX_TOTAL_MS).toBeLessThan(functionTimeoutMs);
   });
 
   it('stops every phase, not only Overpass, before the host stops the process', () => {
@@ -222,7 +252,7 @@ describe('the invocation budget the host enforces', () => {
     // own deadline and finish outside the handler's — and it has to leave the host room for
     // whichever phase was mid-flight when it struck.
     expect(HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(
-      OVERPASS_DEADLINE_MS + OVERPASS_MAX_TOTAL_MS,
+      overpassDeadlineMs({}) + OVERPASS_MAX_TOTAL_MS,
     );
     expect(functionTimeoutMs - HANDLER_DEADLINE_MS).toBeGreaterThanOrEqual(60_000);
   });
@@ -289,6 +319,21 @@ describe('the drain-failure alert, from the template', () => {
     expect(query).toContain(SUBTREE_STUCK_MARKER);
   });
 
+  it('fires on a handler the host killed, which writes no request row at all', () => {
+    /*
+     * The arm that closes B4. A killed handler is discovered by `reclaimExpiredJobs`, not by the
+     * redelivery — the reclaim runs ahead of the claim, so by the time a redelivered message is
+     * classified the row is already back to `queued`. Watching the redelivery would be watching a
+     * signal the fix itself stopped emitting.
+     */
+    expect(query).toContain(LEASE_EXPIRED_MARKER);
+  });
+
+  it('keeps a separate arm for the strand no reclaim can free', () => {
+    // `lockedAt < cutoff` never matches NULL, so a `running` row with no `lockedAt` is permanent.
+    expect(query).toContain(SIGNAL_STRANDED_MARKER);
+  });
+
   it('exempts traces from sampling, since both trace arms are what it reads', () => {
     const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
       logging: { applicationInsights: { samplingSettings: { excludedTypes?: string } } };
@@ -296,13 +341,14 @@ describe('the drain-failure alert, from the template', () => {
     expect(host.logging.applicationInsights.samplingSettings.excludedTypes).toContain('Trace');
   });
 
-  it('takes the subdivision ceiling from a parameter, so a deploy cannot re-enable it', () => {
+  it('takes the subdivision ceiling from a parameter with no default on either side', () => {
     /*
-     * The rollback the docs promise is `az functionapp config appsettings set
-     * INGEST_SUBDIVIDE_MAX_ZOOM=9`, and an ARM application-settings write replaces the collection
-     * whole — so a literal in the template would undo that operator's 3am decision on the next
-     * routine deploy. `ingest.bicepparam` resolves the parameter to `9` unless the deploying shell
-     * says otherwise, which puts the accident on the safe side.
+     * A literal in the template would undo an operator's `az functionapp config appsettings set
+     * INGEST_SUBDIVIDE_MAX_ZOOM=9` on the next routine deploy, because an application-settings
+     * write replaces the collection whole. A *fallback* in `ingest.bicepparam` is the same defect
+     * inverted: the live app holds `11`, so a deploy from a shell that forgot to export it would
+     * silently write `9` — and `9` is off, not safe. `canSubdivide(9, 9)` is false, so a dense z9
+     * tile is failed rather than split, which is the 540 s overrun this exists to bound.
      */
     const setting = /name: 'INGEST_SUBDIVIDE_MAX_ZOOM'\s*\r?\n\s*value: ([^\s]+)/.exec(bicep)?.[1];
     expect(setting).toBe('ingestSubdivideMaxZoom');
@@ -314,8 +360,29 @@ describe('the drain-failure alert, from the template', () => {
       'utf8',
     );
     expect(params).toContain(
-      "param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', '9')",
+      "param ingestSubdivideMaxZoom = readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM')",
     );
+    expect(params).not.toContain("readEnvironmentVariable('INGEST_SUBDIVIDE_MAX_ZOOM', ");
+  });
+
+  it('declares the package URL, so a template deploy does not leave the app codeless', () => {
+    /*
+     * An application-settings write replaces the collection whole, so omitting
+     * `WEBSITE_RUN_FROM_PACKAGE` meant any deployment that ran without a package push unmounted the
+     * code. No fallback for the same reason as the ceiling above: a default would point the app at
+     * some other build.
+     */
+    expect(bicep).toContain("name: 'WEBSITE_RUN_FROM_PACKAGE'");
+    expect(bicep).toContain('value: packageUrl');
+    expect(bicep).toContain('param packageUrl string');
+    expect(bicep).not.toContain('param packageUrl string =');
+
+    const params = readFileSync(
+      resolve(__dirname, '../../../infra/azure/ingest.bicepparam'),
+      'utf8',
+    );
+    expect(params).toContain("param packageUrl = readEnvironmentVariable('INGEST_PACKAGE_URL')");
+    expect(params).not.toContain("readEnvironmentVariable('INGEST_PACKAGE_URL', ");
   });
 
   it('reads a deployed ceiling of 11 as two levels of subdivision, and 9 as off', () => {
@@ -357,5 +424,144 @@ describe('the drain-failure alert, from the template', () => {
     expect(
       subdivideMaxZoom({ INGEST_SUBDIVIDE_MAX_ZOOM: '11', INGEST_TRAIL_IDENTITY: 'osm-id' }),
     ).toBe(9);
+  });
+});
+
+/**
+ * The numbers that decide whether a killed handler's work is re-run or silently dropped. They live
+ * in three separate files — `host.json`, `ingest.bicep`, `jobs.ts` — so nothing but this test stops
+ * one of them moving alone. That the freed row is then *reached* is a property of `runPump`, and is
+ * asserted in `apps/ingest-worker/test/pump.test.ts`, which runs it.
+ */
+describe('the lease, the lock and the host clock', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const host = JSON.parse(readFileSync(resolve(__dirname, '../host.json'), 'utf8')) as {
+    functionTimeout: string;
+    extensions: { serviceBus: { maxAutoLockRenewalDuration: string } };
+  };
+
+  function clockToMs(value: string): number {
+    const [hours = 0, minutes = 0, seconds = 0] = value.split(':').map(Number);
+    return (hours * 3600 + minutes * 60 + seconds) * 1000;
+  }
+
+  /** `PT5M`, `PT30S`, `PT1H` — the ISO-8601 durations ARM accepts for a queue. */
+  function durationToMs(value: string): number {
+    const found = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(value);
+    if (!found) throw new Error(`${value} is not a duration this test understands`);
+    const [, hours, minutes, seconds] = found;
+    return (Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0)) * 1000;
+  }
+
+  function queueSetting(name: string): string {
+    const found = new RegExp(`${name}: '([^']+)'`).exec(bicep)?.[1];
+    if (!found) throw new Error(`${name} is not set in infra/azure/ingest.bicep`);
+    return found;
+  }
+
+  const functionTimeoutMs = clockToMs(host.functionTimeout);
+  const lockDurationMs = durationToMs(queueSetting('lockDuration'));
+  const dedupeWindowMs = durationToMs(queueSetting('duplicateDetectionHistoryTimeWindow'));
+
+  it('mirrors the host timeout the lease is derived from', () => {
+    // `LEASE_TIMEOUT_MS` is `HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS`, and the first of those is
+    // a copy of a value that lives in host.json. This is what stops the copy going stale.
+    expect(HOST_FUNCTION_TIMEOUT_MS).toBe(functionTimeoutMs);
+    expect(LEASE_TIMEOUT_MS).toBe(functionTimeoutMs + LEASE_MARGIN_MS);
+  });
+
+  it('stops the handler before the host kills it', () => {
+    // Past `HANDLER_DEADLINE_MS` no phase begins, which leaves the host's remaining budget for
+    // whichever phase was already running plus the bookkeeping that writes the outcome.
+    expect(HANDLER_DEADLINE_MS).toBeLessThan(functionTimeoutMs);
+  });
+
+  it('keeps a live handler from losing its lease while it is still working', () => {
+    /*
+     * If the lease could expire under a running handler, another process would reclaim the row and
+     * claim the tile, and both would commit the same trails.
+     */
+    expect(functionTimeoutMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('renews a running handler lock well past the moment the host would kill it', () => {
+    const renewalMs = clockToMs(host.extensions.serviceBus.maxAutoLockRenewalDuration);
+    expect(renewalMs).toBeGreaterThan(functionTimeoutMs);
+  });
+
+  it('records that a redelivery cannot be the repair, because no lease value would make it one', () => {
+    /*
+     * The redelivery gap starts at `lockDuration`: auto-renewal stops the instant the process dies,
+     * and an eviction can kill it before the first renewal, so the message can return one whole
+     * `lockDuration` after delivery and no later bound applies. Measured over 2026-08-08's six
+     * redeliveries the gaps were 299.9, 300.0, 455.0, 592.8, 708.1 and 1012.7 s — the two at the
+     * floor are exactly `lockDuration`, and five of the six landed while the lease was still live.
+     *
+     * For a redelivery to always find an expired lease the lease would have to be shorter than
+     * `lockDuration`; to be safe under a live handler it must be longer than `functionTimeout`.
+     * This asserts those two requirements really do conflict, so the fix is never to retune the
+     * lease — it is `ingestPump`, below.
+     */
+    expect(lockDurationMs).toBeLessThan(functionTimeoutMs);
+    expect(lockDurationMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('keeps the dedupe window shorter than the lease, so a republish is not read as a duplicate', () => {
+    /*
+     * **The template relation the durability of a reclaimed row rests on.** A redelivery that finds
+     * a live-looking lease completes the message, so what re-runs the work is the reaper's
+     * republish. Duplicate detection is keyed on `messageId = dedupeKey` and measured from the
+     * original enqueue, and the reclaim cannot fire before `LEASE_TIMEOUT_MS` — so if that window
+     * outlived the lease, the republish would be discarded as a duplicate of the message that was
+     * already completed, and the tile would be lost with nothing logged anywhere.
+     *
+     * Raising `duplicateDetectionHistoryTimeWindow` to PT15M is the plausible tuning that would do
+     * it, and this is what refuses it.
+     */
+    expect(dedupeWindowMs).toBeLessThan(LEASE_TIMEOUT_MS);
+  });
+
+  it('expires stale signals rather than dead-lettering them, so the pump is not suppressed', () => {
+    /*
+     * **Both halves of the expiry policy are chosen against the pump, and each looks safer moved
+     * the other way.** `runPump` publishes nothing while `activeMessageCount` is at or above
+     * `PUMP_LOW_WATER`, and `service-bus.ts` reads that count from the queue's ARM `countDetails`,
+     * where an expired message no longer appears. So a finite TTL is what returns the pump to
+     * work after a stoppage: raise it and stale doorbells hold the active count up, suppressing
+     * the one process that can re-derive the rows.
+     *
+     * Dead-lettering them instead would clear the active count and cost the dead-letter alert its
+     * meaning — `switchback-ingest-deadletter` exists to say the worker could not reach Postgres
+     * five times, and a DLQ full of stale wake-ups says nothing.
+     */
+    const ttlMs = durationToMs(queueSetting('defaultMessageTimeToLive'));
+    // Anchored to the property, not the prose above it, which names the rejected value too.
+    expect(bicep).toMatch(/^\s+deadLetteringOnMessageExpiration: false$/m);
+
+    // A republish after expiry has to be a fresh message, not one the dedupe window collapses.
+    expect(dedupeWindowMs).toBeLessThan(ttlMs);
+
+    // The count the pump reads must exclude expired messages, or the TTL buys nothing.
+    const serviceBus = readFileSync(resolve(__dirname, '../src/service-bus.ts'), 'utf8');
+    expect(serviceBus).toContain('countDetails?.activeMessageCount');
+  });
+});
+
+/**
+ * The rule that watches Overpass rate limiting — the failure mode that gets the egress IP blocked
+ * and takes ingestion down for the whole product.
+ */
+describe('the Overpass rate-limit alert, from the template', () => {
+  const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
+
+  it('reads the request path, which is where a 429 arrives', () => {
+    /*
+     * `queueHealth.rateLimited` counts `lastError` containing '429', so it sees only a rate limit
+     * that outlived the retry budget and failed a job. Failover absorbs most of them first.
+     */
+    const rule = bicep.slice(bicep.indexOf("name: 'switchback-ingest-overpass-limited'"));
+    const query = /query: '([^']+)'/.exec(rule)?.[1] ?? '';
+    expect(query).toContain(OVERPASS_STRAIN_MARKER);
+    expect(query).toContain('status=429');
   });
 });

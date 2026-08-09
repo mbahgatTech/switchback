@@ -126,8 +126,7 @@ export interface OverpassOptions {
  *
  * What an alert can watch is the subset that *does* leave a row: a 429 that outlives the retry
  * budget fails the job, and `queueHealth`'s `rateLimited` counts it. These lines are for the
- * reader of whichever platform log the drainer writes to, which on `INGEST_QUEUE_DRIVER=postgres`
- * is Vercel's.
+ * reader of the Function App's own telemetry, which is where the one drainer writes.
  */
 export const OVERPASS_STRAIN_MARKER = 'switchback-ingest-overpass-strain';
 

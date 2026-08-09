@@ -23,11 +23,11 @@ The full chain, so it can be checked rather than believed:
 `test/drain.test.ts` reads all four out of `infra/azure/ingest.bicep` and asserts them, so the table
 is checked rather than believed — the failure of any row costs the egress IP, not one invocation.
 
-**Four rows about this app, which drains nothing while `INGEST_QUEUE_DRIVER` is `postgres`.** The
-drainer that runs is Vercel, where every lambda is a process with its own client, so rows one to
-three do not apply to it and row four bounds a fraction of it. `INGEST_MAX_DRAINERS = 1`, enforced
-across processes by an advisory lock in `packages/ingest/src/drain-slot.ts`, is what makes the
-fleet-wide figure true; `docs/architecture.md` is the one place that states it.
+**Four rows about this app, which is now the only thing that drains.** The Vercel path is deleted,
+so rows one to three describe the whole deployment rather than one side of it, and row four is what
+holds the bound across host instances — `INGEST_MAX_DRAINERS = 1`, enforced by an advisory lock in
+`packages/ingest/src/drain-slot.ts`. `docs/architecture.md` is the one place that states the
+resulting fleet-wide figure.
 
 The first two rows are a template property and an app setting that this workspace does not own —
 both live in `infra/azure/ingest.bicep`, alongside
@@ -129,23 +129,78 @@ So a timer function re-derives the top of the queue every two minutes and publis
 `PUMP_QUEUE_DEPTH` signals, rather than publishing the backlog once and freezing its order for
 weeks. It makes no Overpass request and so does not enter the arithmetic above.
 
-`INGEST_PUMP_ENABLED=false` stops it within seconds and needs no deploy — the fast brake, next to
-`az functionapp stop`. Messages already in flight still finish, because each one is idempotent.
+Its reach is the head of that order and nothing else. Viewport tiles all share one priority, so a
+tile queued a moment ago is the newest `runAfter` of its band and waits for the rows ahead of it —
+44,884 of them were due, oldest since 2026-07-30, in the reading `DRAIN_SILENCE_MS` is sized
+against. Bringing a named tile forward means raising its `priority`, which is the column both this
+order and `claimJobs` read first.
 
-`INGEST_QUEUE_DRIVER=postgres` is the other brake and a different one: it stands the whole worker
-down, pump and trigger both, so a rollback that turns Vercel's inline drain back on does not leave
-two drainers claiming from `ingest_jobs` at once. The trigger drops the messages it reads rather
-than abandoning them — the row stays `queued` and Postgres runs the work — so nothing accumulates
-in the dead-letter queue while the flag is off.
+## Stopping it
 
-Two instances can disagree across the host restart, and the observed cutover did: the drain rejected
-the flag from 23:04:52 (`INGEST_QUEUE_DRIVER is not servicebus - dropping the signal`) while a
-surviving instance's pump published seven more signals at 23:06:08, about 74 s later. The drops are
-safe. What is not free is re-flipping to `servicebus` inside ten minutes: the queue carries
-`duplicateDetectionHistoryTimeWindow: PT10M` and the pump republishes the same `dedupeKey` as
-`messageId`, so those republished signals are silently swallowed and the first tick after the
-re-flip does nothing. The rows are still there and the next tick picks them up — but it looks like a
-dead worker, so wait the window out or expect one empty tick.
+There is no flag that hands the drain back to Vercel, because there is no Vercel drain to hand it
+to. What used to be a rollback is now three brakes of different blast radius, and the right one
+depends on what has gone wrong.
+
+**The queue is filling faster than it drains, or a bad tile is being retried.** Stop the pump:
+
+```bash
+az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_PUMP_ENABLED=false -o none
+```
+
+Seconds, no deploy. New work stops reaching the queue, with one exception: a lease the sweep has
+just reclaimed is still republished. `classifyDisposition` completes a Service Bus message on the
+strength of that republish and cannot take the completion back, so suppressing it would leave the
+row correct and unreachable until someone lifted the brake. The exception stays narrow because
+`enqueue` resets `priority` when it revives a finished row, so a tile that was once reclaimed and is
+requested again re-enters at its own band. Reverse the brake with `INGEST_PUMP_ENABLED=true`.
+
+It does **not** stop the trigger draining what is already there — messages in flight finish, which
+is deliberate, because each is idempotent and dropping one mid-tile strands a lease for nothing.
+
+**Overpass is rate-limiting, or the drain itself is the problem.** Disable the trigger and leave the
+pump's health reporting running, so the queue still has a gauge while the drain is stopped:
+
+```bash
+az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri --settings AzureWebJobs.ingestDrain.Disabled=true -o none
+```
+
+Reverse it with `AzureWebJobs.ingestDrain.Disabled=false`.
+
+**Everything is wrong and it needs to stop now.** Stop the app:
+
+```bash
+az functionapp stop -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
+```
+
+Nothing drains and nothing is observed. Messages stay on the queue — TTL is `PT1H`, so a stop
+longer than an hour loses the wake-up signals, though not the work: the rows are still in
+`ingest_jobs` and the pump republishes them when it comes back. Reverse it with:
+
+```bash
+az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
+```
+
+**A merge to `master` reverses it too, and that is not optional.** `ci.yml` gates
+`deploy ingest worker` on a push to `refs/heads/master`, and `.github/scripts/deploy-worker.sh`
+starts a host it finds stopped, then fails the run if the host is not `Running` afterwards — a
+stopped host emits no heartbeat, so the deploy has no other way to tell a bad package from a
+deliberate stop. This brake holds ingestion off until the next merge, not across a release.
+
+**The new build is the problem.** Roll the code back by pointing `WEBSITE_RUN_FROM_PACKAGE` at the
+previous zip; `.github/scripts/deploy-worker.sh` is what writes it, and the blob container keeps
+prior releases under their commit SHA.
+
+Application-settings writes replace the collection wholesale, so read, modify and write the full
+set — `az functionapp config appsettings set` with a single `--settings` pair does that correctly,
+but anything scripted around `list` must not drop the rest.
+
+Whichever brake is used, the queue carries `duplicateDetectionHistoryTimeWindow: PT10M` and the pump
+republishes the same `dedupeKey` as `messageId`. Restarting inside that window silently swallows the
+republished signals and the first tick after the restart does nothing. The rows are still there and
+the next tick picks them up — but it looks like a dead worker, so wait the window out or expect one
+empty tick.
 
 ## Configuration
 
@@ -154,12 +209,11 @@ dead worker, so wait the window out or expect one empty tick.
 | `ServiceBusConnection__fullyQualifiedNamespace` | —             | the trigger, and `src/service-bus.ts`          |
 | `SERVICE_BUS_QUEUE`                             | `ingest-jobs` | both                                           |
 | `SERVICE_BUS_QUEUE_RESOURCE_ID`                 | —             | the pump, to read queue depth through ARM      |
-| `INGEST_QUEUE_DRIVER`                           | `postgres`    | the pump and the trigger                       |
 | `INGEST_PUMP_ENABLED`                           | `true`        | the pump                                       |
 | `DATABASE_URL`                                  | —             | `backgroundPrisma`, as the web app connects    |
 | `INGEST_DEADLINE_MS`                            | `540000`      | `runIngestSignal`, and every phase under it    |
-| `INGEST_OVERPASS_DEADLINE_MS`                   | `300000`      | `runIngestSignal`, for the Overpass view only  |
-| `OVERPASS_MAX_TOTAL_MS`                         | `240000`      | `getOverpass`, per query                       |
+| `INGEST_COMMIT_RESERVE_MS`                      | `150000`      | `overpassDeadlineMs`, held back for the commit |
+| `OVERPASS_MAX_TOTAL_MS`                         | `190000`      | `getOverpass`, per query                       |
 | `OVERPASS_MAX_CONCURRENT`                       | `2`           | `getOverpass`, per client                      |
 | `INGEST_MAX_DRAINERS`                           | `1`           | `drainSlotGate`, per fleet                     |
 | `OVERPASS_USER_AGENT`                           | —             | required — `OverpassClient` refuses without it |
@@ -170,17 +224,20 @@ Receiver** on the queue — not Data Owner. Reading the depth is why Data Owner 
 `queues/read` action, so `src/service-bus.ts` asks ARM for `countDetails` instead. At queue scope
 Data Owner would also have allowed rewriting or deleting the queue.
 
-Identity reaches Postgres too, and the door is already open. The server has `activeDirectoryAuth:
+Identity reaches Postgres too, and it is what the worker uses. The server has `activeDirectoryAuth:
 Enabled`, and role `sbapp_func` is Entra-mapped to this app's own system-assigned principal
 `3db30cfd-ea61-47ce-9b03-8b34ebc420b0` and is a member of `sbapp`, so it inherits the table grants
-the password role holds. The worker connects by password only because `DATABASE_AUTH` is unset.
+the password role holds. `DATABASE_AUTH=entra` is set on the Function App, and `databaseUrl` names
+`sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that still carries one, so a
+half-done flip fails at connect rather than quietly preferring the password.
 
-Flipping it is **two application settings on this Function App and no write to the server**:
-`databaseAuth: 'entra'` in `ingest.bicepparam`, which emits `DATABASE_AUTH=entra`, and a
-`databaseUrl` naming `sbapp_func` with no password in it — `entraPoolConfig` refuses a URL that
-still carries one, so a half-done flip fails at connect rather than quietly preferring the
-password. Nothing is provisioned and no `Microsoft.DBforPostgreSQL` resource is touched, so the
-server restart that enabling Entra authentication once required is not in this path.
+Both halves are declared: `databaseAuth = 'entra'` in `ingest.bicepparam` is what emits the setting.
+It is a literal there rather than an environment read because an application-settings write replaces
+the collection whole, so a deployment that let it fall back to the template's `password` default
+would delete `DATABASE_AUTH` from the live app and leave the worker holding a passwordless URL it
+could not authenticate with. Nothing is provisioned and no `Microsoft.DBforPostgreSQL` resource is
+touched by that setting, so the server restart that enabling Entra authentication once required is
+not in this path.
 
 ## Building
 

@@ -1,9 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
-import { LEASE_TIMEOUT_MS } from '../src/jobs';
-import { createThrottledSweep, isDistressed, queueHealth, sweepQueue } from '../src/maintenance';
+import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS } from '../src/jobs';
+import {
+  LEASE_SWEEP_GRACE_MS,
+  TILE_WEDGED_MARKER,
+  WEDGE_GRACE_MS,
+  countWedgedTiles,
+  isDistressed,
+  queueHealth,
+  repairWedgedTiles,
+  sweepQueue,
+} from '../src/maintenance';
 import type { QueueHealth } from '../src/maintenance';
 
 /** A tile row as the sweep reads it. */
@@ -173,8 +184,10 @@ describe('the sweep both live entry points call', () => {
 
     expect(result).toMatchObject({ requeued: 2, retired: 1 });
     // The cutoff the reclaim bound, not merely that something ran: `now` has to reach it, or a
-    // sweep would take back leases measured from some other moment.
-    const [, , cutoff] = recorded.rawBinds[0] ?? [];
+    // sweep would take back leases measured from some other moment. Picked out by type rather
+    // than by position — the statement binds two dates, `now` then `cutoff`, and anything else it
+    // binds would silently shift an index.
+    const [, cutoff] = (recorded.rawBinds[0] ?? []).filter((bind) => bind instanceof Date);
     expect(cutoff).toEqual(new Date(NOW.getTime() - LEASE_TIMEOUT_MS));
   });
 
@@ -188,37 +201,6 @@ describe('the sweep both live entry points call', () => {
     expect(result).toMatchObject({ requeued: 0, retired: 0 });
     expect(result.unsplit).toHaveLength(1);
     expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:031313112`]);
-  });
-});
-
-describe('the throttled sweep', () => {
-  const at = (iso: string) => new Date(iso);
-  const noop = () => vi.fn(async () => ({ requeued: 0, retired: 0, unsplit: [] }));
-
-  it('runs the first time it is asked', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    expect(sweep(at('2026-08-07T10:00:00Z'))).not.toBeNull();
-    expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it('declines inside the window, so a busy process does not sweep on every request', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    void sweep(at('2026-08-07T10:00:00Z'));
-    expect(sweep(at('2026-08-07T10:14:59Z'))).toBeNull();
-    expect(run).toHaveBeenCalledTimes(1);
-  });
-
-  it('runs again once the window has passed', () => {
-    const run = noop();
-    const sweep = createThrottledSweep(run, 900_000);
-
-    void sweep(at('2026-08-07T10:00:00Z'));
-    void sweep(at('2026-08-07T10:15:00Z'));
-    expect(run).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -236,7 +218,11 @@ describe('the queue health report', () => {
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
       ingestTile: { count: async () => reading.stuckSubtrees },
-      $queryRaw: async () => [{ count: reading.orphanedSplits }],
+      // Two correlated counts share this seam; the child-set subquery names the split one.
+      $queryRaw: async (strings: TemplateStringsArray) =>
+        strings.join('').includes('ingest_tiles child')
+          ? [{ count: reading.orphanedSplits }]
+          : [{ count: reading.wedgedTiles }],
     } as unknown as PrismaClient;
   }
 
@@ -259,14 +245,22 @@ describe('the queue health report', () => {
     rateLimited: 3,
     orphanedSplits: 6,
     stuckSubtrees: 1,
+    wedgedTiles: 4,
     stalledDrain: 1,
   };
 
-  it('reads the six conditions the drainer leaves behind', async () => {
+  it('reads every condition the drainer leaves behind', async () => {
     expect(await queueHealth(countingDb(reading), NOW)).toEqual(reading);
   });
 
-  it('counts a lease as stale only once it is past the lease timeout', async () => {
+  /**
+   * The gauge has to survive a sweep before it means anything. `reportQueueHealth` runs at the top
+   * of the `ingestPump` handler and the sweep runs immediately after, so a reading taken without
+   * the grace catches the leases that same tick is about to reclaim — measured over the 24 h to
+   * 2026-08-08, `staleLeases` was non-zero in 376 of 685 readings and decided `isDistressed` more
+   * often than every other field combined.
+   */
+  it('counts a lease as stale only once it has outlived a sweep as well as the timeout', async () => {
     const now = new Date('2026-08-07T10:44:00Z');
     const seen: TileWhere[] = [];
     const db = {
@@ -284,8 +278,11 @@ describe('the queue health report', () => {
 
     await queueHealth(db, now, 30 * 60_000);
 
+    // 10:44 back thirty minutes of lease, then back the sweep grace on top.
     const stale = seen.find((where) => where.status === JobStatus.running);
-    expect(stale?.lockedAt?.lt).toEqual(new Date('2026-08-07T10:14:00Z'));
+    expect(stale?.lockedAt?.lt).toEqual(
+      new Date(now.getTime() - 30 * 60_000 - LEASE_SWEEP_GRACE_MS),
+    );
   });
 
   /**
@@ -329,11 +326,20 @@ describe('the queue health report', () => {
       rateLimited: 0,
       orphanedSplits: 0,
       stuckSubtrees: 0,
+      wedgedTiles: 0,
       stalledDrain: 0,
     };
     expect(isDistressed(clean)).toBe(false);
     expect(isDistressed({ ...clean, rateLimited: 1 })).toBe(true);
     expect(isDistressed({ ...clean, stalledDrain: 1 })).toBe(true);
+    // Every field is an OR term, so every field has to be able to raise it on its own — and a
+    // field that could never fall would pin the alert on forever. `repairWedgedTiles` is what makes
+    // this one fall.
+    expect(isDistressed({ ...clean, dead: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, staleLeases: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, orphanedSplits: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, stuckSubtrees: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, wedgedTiles: 1 })).toBe(true);
   });
 
   /**
@@ -354,11 +360,24 @@ describe('the queue health report', () => {
       expect(health.stalledDrain).toBe(1);
     });
 
-    // 27.90 h was the widest gap between terminal transitions over the 14 days to 2026-08-07,
-    // across 341 of them. A threshold under that pages somebody for ordinary quiet.
-    it('tolerates the widest gap production has actually shown', async () => {
-      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(27.9)), NOW);
+    /*
+     * The threshold is six hours, and it is bounded by the drain schedule rather than by a
+     * historical gap. `ingestPump` ticks every two minutes and the queue trigger drains
+     * continuously, so six hours is roughly forty tiles at the 9-minute handler bound — a drain
+     * that is merely slow clears it, one that has stopped does not.
+     *
+     * The 27.90 h maximum gap measured to 2026-08-08 belongs to the previous regime, where a
+     * once-a-day cron did the draining and the rest was request-driven. It is not a baseline for
+     * this one, and tolerating it now would mean a stopped drain going unnamed for a day.
+     */
+    it('tolerates quiet inside the threshold', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(5.9)), NOW);
       expect(health.stalledDrain).toBe(0);
+    });
+
+    it('fires on quiet past it, which continuous draining should never produce', async () => {
+      const health = await queueHealth(drainDb(hoursAgo(200), hoursAgo(6.1)), NOW);
+      expect(health.stalledDrain).toBe(1);
     });
 
     it('stays quiet when nothing is due, however long the drain has been idle', async () => {
@@ -372,5 +391,121 @@ describe('the queue health report', () => {
       expect((await queueHealth(drainDb(hoursAgo(1), null), NOW)).stalledDrain).toBe(0);
       expect((await queueHealth(drainDb(hoursAgo(40), null), NOW)).stalledDrain).toBe(1);
     });
+  });
+});
+
+/**
+ * The gauge for the state a killed handler leaves behind: a tile stuck at `running` because its
+ * invocation never came back. `staleLeases` reads `ingest_jobs`, and the job under a wedged tile is
+ * often not stale at all — it was completed, or reclaimed and buried.
+ */
+describe('countWedgedTiles', () => {
+  function capturing(): { db: PrismaClient; sql: () => string } {
+    let captured = '';
+    const db = {
+      $queryRaw: async (strings: TemplateStringsArray) => {
+        captured = String(strings);
+        return [{ count: 3 }];
+      },
+    } as unknown as PrismaClient;
+    return { db, sql: () => captured };
+  }
+
+  it('counts tiles mid-fetch with nothing left to finish them', async () => {
+    const { db, sql } = capturing();
+    expect(await countWedgedTiles(db)).toBe(3);
+    expect(sql()).toContain("tile.status = 'running'");
+    expect(sql()).toContain('"fetchedAt" IS NULL');
+  });
+
+  it('exempts a tile whose job is still queued or running', async () => {
+    // Without this the gauge pins: every tile passes through `running` on the way to `ready`.
+    const { db, sql } = capturing();
+    await countWedgedTiles(db);
+    expect(sql()).toContain('NOT EXISTS');
+    expect(sql()).toContain("job.status IN ('queued', 'running')");
+  });
+
+  it('waits out a whole invocation before counting anything', async () => {
+    // `updatedAt` is stamped when an attempt begins, so anything shorter than the handler's own
+    // bound would count a tile a live invocation is still working on.
+    const { db, sql } = capturing();
+    await countWedgedTiles(db);
+    expect(sql()).toContain('"updatedAt" <');
+    expect(WEDGE_GRACE_MS).toBeGreaterThan(HOST_FUNCTION_TIMEOUT_MS);
+  });
+
+  it('reads zero rather than undefined on an empty result', async () => {
+    const empty = { $queryRaw: async () => [] } as unknown as PrismaClient;
+    expect(await countWedgedTiles(empty)).toBe(0);
+  });
+});
+
+/**
+ * The repair the gauge would otherwise have no route to. `runPump` publishes only `queued` jobs and
+ * `reclaimExpiredJobs` only moves `running` to `queued` or `dead`, so a tile whose job was buried on
+ * its last attempt has nothing that reaches it.
+ */
+describe('repairWedgedTiles', () => {
+  function capturing(rows: Array<{ quadkey: string }>): {
+    db: PrismaClient;
+    sql: () => string;
+    values: () => unknown[];
+  } {
+    let captured = '';
+    let bound: unknown[] = [];
+    const db = {
+      $queryRaw: async (strings: TemplateStringsArray, ...args: unknown[]) => {
+        captured = String(strings);
+        bound = args;
+        return rows;
+      },
+    } as unknown as PrismaClient;
+    return { db, sql: () => captured, values: () => bound };
+  }
+
+  it('takes a wedged tile out of running and says why', async () => {
+    const { db, sql, values } = capturing([{ quadkey: '120221203' }]);
+    expect(await repairWedgedTiles(db)).toEqual(['120221203']);
+    expect(sql()).toContain('UPDATE ingest_tiles');
+    expect(values()).toContain(TileStatus.failed);
+    expect(values()).toContain(
+      `${TILE_WEDGED_MARKER}: left running with no job that could finish it`,
+    );
+  });
+
+  it('matches exactly what the gauge counts, so the repair cannot miss a counted tile', async () => {
+    const counted = capturing([]);
+    await countWedgedTiles(counted.db);
+    const repaired = capturing([]);
+    await repairWedgedTiles(repaired.db);
+
+    for (const clause of [
+      "status = 'running'",
+      '"fetchedAt" IS NULL',
+      '"updatedAt" <',
+      "job.status IN ('queued', 'running')",
+    ]) {
+      expect(counted.sql()).toContain(clause);
+      expect(repaired.sql()).toContain(clause);
+    }
+  });
+
+  it('fails the tile rather than re-enqueueing it, so the repair cannot loop', async () => {
+    // A tile is only wedged after its job was buried out of attempts, which is precisely the input
+    // a re-enqueue would spin on. `failed` is re-fetchable by the ordinary freshness path.
+    const { db, sql, values } = capturing([]);
+    await repairWedgedTiles(db);
+    expect(values()).toContain(TileStatus.failed);
+    expect(sql()).not.toContain('ingest_jobs job\n               WHERE job."dedupeKey" = INSERT');
+    expect(sql()).not.toContain('INSERT INTO');
+  });
+
+  it('runs from the sweep, after the reclaim that would otherwise rescue the tile', async () => {
+    const source = readFileSync(resolve(__dirname, '../src/maintenance.ts'), 'utf8');
+    const reclaim = source.indexOf('reclaimExpiredJobs(db, now)');
+    const repair = source.indexOf('repairWedgedTiles(db, now)');
+    expect(reclaim).toBeGreaterThan(-1);
+    expect(repair).toBeGreaterThan(reclaim);
   });
 });
