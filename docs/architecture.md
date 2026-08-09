@@ -720,11 +720,11 @@ whatever the ceiling says, so the combination that cuts fresh seam while trail i
 `min(wayId)` cannot be reached by setting one variable.
 
 **Both settings have to be set on the process that is actually draining, which is the Function App.**
-Both are declared in `apps/web/src/env.ts` as well as in `ingest.bicep`, each defaulting to off, so a
-value set on one side and not the other is a difference an operator can see rather than a flag that
-appears to be on and is not. The zod entries also turn a mistyped value into a startup error instead
-of a silent fallback, which is why they exist at all: `@switchback/ingest` reads both from
-`process.env` itself.
+`ingest.bicep` is the only place either is declared — `apps/web/src/env.ts` declares neither, and the
+Function App is the only process that drains `ingest_jobs`, so there is no second copy for a value to
+drift from. Both entries read a template parameter rather than a literal, because an
+application-settings write replaces the collection whole and a baked-in value would re-enable a
+control an operator had turned off. `@switchback/ingest` reads both from `process.env` itself.
 
 **And `claim` needs a database privilege the flag cannot grant.** `resolveTrail` reads `TrailWay`
 before it decides anything, so a runtime role without SELECT on `trail_ways` fails every trail in
@@ -845,9 +845,9 @@ Muir Trail — is a trail in its own right, keeps its own row, and yields the co
 fighting for it on every ingest.
 
 **The primary key on `trail_ways.wayId` is the concurrency control.** Two tiles racing for one way is
-the expected case: `COMMIT_CONCURRENCY` is 6 inside each drainer and there are two drainers. The
-loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because the
-line and every statistic derived from it were built on a resolution that is now stale — and the
+the expected case: `COMMIT_CONCURRENCY` is 6, so the one drainer has six commits in flight at once.
+The loser's insert raises P2002, which unwinds the whole commit — not just the transaction, because
+the line and every statistic derived from it were built on a resolution that is now stale — and the
 retry re-reads the claims and adopts the row the winner created.
 
 **The rollback is one setting, and it is a rollback of behaviour, not of state.** `osm-id` never
@@ -1132,10 +1132,9 @@ left to scale on.
 ## Rolling a control back
 
 Two environment variables change what ingest does, and **only the Function App's copies matter.** It
-is the only process that drains, so it is the only process whose value changes behaviour —
-`apps/web/src/env.ts` declares them on the Vercel side purely so a typo is a startup error rather
-than a silent misread, and nothing there reads them for behaviour. Every rollback below is therefore
-one write, against the Function App.
+is the only process that drains, so it is the only process whose value changes behaviour;
+`apps/web/src/env.ts` declares neither, and nothing the web app serves reads them. Every rollback
+below is therefore one write, against the Function App.
 
 Both are **not fully reversible**, and the table says which part is not. Reversing the setting is
 never the same as reversing what happened while it was on.
@@ -1895,8 +1894,11 @@ that nobody has written it.
 
 `INGEST_TRAIL_IDENTITY` reads `claim` on the Function App, which is the only surface where it does
 anything. Vercel **Production** still carries the name with an empty value; nothing there reads it.
-`trailIdentityMode` resolves the flag at four call sites and `pipelineDeps` at three, all of them
-inside `packages/ingest`. What confines it to the worker is not their number but where they are:
+`trailIdentityMode` resolves the flag at four call sites, all inside `packages/ingest`;
+`pipelineDeps` at three, one there and two in `scripts/ingest.ts`, the operator drain that runs from
+a shell rather than from a workspace the site builds — the root `workspaces` are `apps/*` and
+`packages/*`, and `scripts/` has no manifest of its own. What confines the flag to the worker is not
+their number but where they are:
 `git grep -n -E "trailIdentityMode|pipelineDeps" -- apps/web packages/api` returns nothing, against
 195 files under `apps/web` alone that the same traversal reads. The fifteen value symbols the
 routers do import — `ensureCoverage`, `publishIngestSignals`, `requestArea`, `surveyArea`,

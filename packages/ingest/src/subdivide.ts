@@ -58,9 +58,9 @@ export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
 /**
  * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision, and
  * that is what an absent or unusable variable returns — it has to be switched on deliberately,
- * which is also what makes deleting the setting a rollback. Both processes that drain
- * `ingest_jobs` declare it (`apps/web/src/env.ts` and `infra/azure/ingest.bicep`), so a value
- * set on one and not the other is visible rather than silently half-applied.
+ * which is also what makes deleting the setting a rollback. `infra/azure/ingest.bicep` declares it
+ * on the Function App, the only process that drains `ingest_jobs`, and an application-settings write
+ * replaces the collection whole — so a deploy that drops the entry reads as off rather than stale.
  *
  * Subdividing cuts fresh interior seam, and a seam fragments any trail crossing it unless
  * `TrailWay` is deciding identity. So the ceiling is held at `INGEST_ZOOM` whenever

@@ -124,8 +124,8 @@ describe('subdivideMaxZoom', () => {
   });
 
   it('is off when nothing declares it, so it has to be switched on deliberately', () => {
-    // Vercel drains `ingest_jobs` whenever the queue driver is rolled back, and both flags are
-    // declared in `apps/web/src/env.ts`, so that drainer can read them too — a default of
+    // An application-settings write replaces the Function App's collection whole, so a deploy that
+    // drops the entry leaves the drainer reading an empty environment. A default of
     // `MAX_INGEST_ZOOM` would turn subdivision on there without anyone choosing it.
     expect(subdivideMaxZoom({})).toBe(INGEST_ZOOM);
     expect(canSubdivide(INGEST_ZOOM, subdivideMaxZoom({}))).toBe(false);
