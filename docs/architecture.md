@@ -117,32 +117,42 @@ flipped to make Vercel drain again; the code is not there to run. What an operat
 three brakes of increasing severity, all on the Function App, none of them a deploy — and the honest
 last one is _stop the Function App_:
 
-| Symptom                                                                    | Do this                                  | What it costs                                                                                       |
-| -------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| The queue is filling faster than it drains, or a bad tile is being retried | `INGEST_PUMP_ENABLED=false`              | new work stops reaching the queue; in-flight messages finish, each idempotent                       |
-| Overpass is rate-limiting, or the drain itself is the fault                | `AzureWebJobs.ingestDrain.Disabled=true` | nothing drains, but the pump keeps reporting queue health, so there is still a gauge                |
-| Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped |
+| Symptom                                                                    | Do this                                  | Reverse it with                           | What it costs                                                                                       |
+| -------------------------------------------------------------------------- | ---------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| The queue is filling faster than it drains, or a bad tile is being retried | `INGEST_PUMP_ENABLED=false`              | `INGEST_PUMP_ENABLED=true`                | new work stops reaching the queue; in-flight messages finish, each idempotent                       |
+| Overpass is rate-limiting, or the drain itself is the fault                | `AzureWebJobs.ingestDrain.Disabled=true` | `AzureWebJobs.ingestDrain.Disabled=false` | nothing drains, but the pump keeps reporting queue health, so there is still a gauge                |
+| Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | `az functionapp start`                    | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped |
 
 None loses a tile. `ingest_jobs` is the record and the pump re-derives the runnable head every two
-minutes, so every brake costs latency and nothing else. Reading trails, browsing and every other
-request path are untouched by all three — ingestion is the only thing that stops.
+minutes, so a brake costs the queue its throughput and not its contents — though work queued while
+one is pulled joins the tail of its priority band and is reached in that order. Reading trails,
+browsing and every other request path are untouched by all three — ingestion is the only thing that
+stops.
 
 The commands, and the read-back that proves each landed, are under _Rolling a control back_ below.
 A bad _build_ is a different lever from a bad _tile_: see the code rollback there.
 
 `ingest_jobs` stays the queue of record: a message names work, it never carries it, so a lost
-message costs a wait rather than a tile. A timer pump in the worker re-derives the runnable head of
-`ingest_jobs` every two minutes and tops the queue back up, which is what keeps `priority DESC`
-meaningful behind a FIFO broker — and what recovers any tile whose message was lost, dropped or
-never published.
+message costs a row its position and never the row. A timer pump in the worker re-derives the
+runnable head of `ingest_jobs` every two minutes and tops the queue back up, which is what keeps
+`priority DESC` meaningful behind a FIFO broker.
+
+**What the pump does not do is reach a particular tile.** It publishes at most
+`PUMP_QUEUE_DEPTH - PUMP_DERIVED_SHARE` primary rows a tick, taken from the head of
+`priority DESC, "runAfter" ASC`. Every viewport tile carries the same `VIEWPORT_PRIORITY`, so a
+freshly queued one is the newest `runAfter` of its band and sorts to the tail — behind the 44,884
+due `queued` rows, oldest since 2026-07-30, that `DRAIN_SILENCE_MS` in
+`packages/ingest/src/maintenance.ts` records and is sized against. A tile whose doorbell was lost is
+therefore reached when the backlog ahead of it drains, not on the next tick. Raising its `priority`
+is the one lever that moves it to the head, because `priority DESC` leads both this order and
+`claimJobs`.
 
 **What happens if Service Bus is unreachable.** With no fallback path the failure has to be explicit
 rather than silent, so `publishIngestSignals` does not swallow it: the row is already committed to
-`ingest_jobs` before any publish is attempted, the publish failure is logged under
-`PUBLISH_FAILED_MARKER`, and the tile is picked up by the pump's next two-minute tick. A broker
-outage therefore costs latency — up to two minutes — and never a tile. The marker is written by a
-Vercel process, which has no Application Insights, so it is visible in Vercel's logs only; the
-durability of the tile does not depend on anyone reading it.
+`ingest_jobs` before any publish is attempted, and the publish failure is logged under
+`PUBLISH_FAILED_MARKER`. That marker is written by a Vercel process, which has no Application
+Insights, so it is visible in Vercel's logs only — and since the pump's reach is the head of the
+queue rather than the affected tile, it is the only place a lost doorbell is named.
 
 **Lease recovery does not depend on a drain happening.** It used to: `reclaimExpiredJobs` ran only
 inside `drainJobs`, and a drain was a side effect of traffic on cold ground plus a cron that Hobby
@@ -197,6 +207,11 @@ az functionapp config appsettings set -g "$RG" -n "$APP" \
 
 # Everything is wrong. Nothing drains and nothing is observed.
 az functionapp stop -g "$RG" -n "$APP"
+
+# And back. Messages that expired against the PT1H TTL while it was down are gone; their
+# `ingest_jobs` rows are not, and the pump republishes from the head of the queue on its next tick.
+az functionapp start -g "$RG" -n "$APP"
+az functionapp show -g "$RG" -n "$APP" --query state -o tsv   # expect: Running
 ```
 
 Verify by reading the setting back, not by assuming the write took:
@@ -208,7 +223,8 @@ az functionapp config appsettings list -g "$RG" -n "$APP" \
 
 **A stop longer than an hour loses wake-up signals, not work.** Queue TTL is `PT1H`. The
 `ingest_jobs` rows outlive any message, and the pump republishes the runnable head every two minutes
-once it is back, so the cost of a long stop is the latency of one pump tick.
+once it is back — so what a long stop costs is one pump tick at the head of the queue and a place in
+line for everything queued while it was down.
 
 **Rolling the code back is a separate lever, and it is a script rather than a setting.**
 `WEBSITE_RUN_FROM_PACKAGE` names the zip the host runs, and the release container keeps prior builds
@@ -254,8 +270,8 @@ The access token is cached in module scope, so a warm lambda pays one exchange r
 request and a cold one pays a single extra round trip before the send. When the exchange fails the
 publisher logs and returns a failure count; it never throws. That is deliberate and load-bearing:
 the `ingest_jobs` rows were written before the publish, so an Entra or Service Bus incident costs the
-wake-up and the pump re-derives the same rows within two minutes. A broker outage must not empty the
-map, and it cannot.
+wake-up and leaves the rows queued for the pump to reach in its own order. A broker outage must not
+empty the map, and it cannot.
 
 **Two concurrent Overpass requests, fleet-wide, and `packages/ingest/src/drain-slot.ts` is what
 makes that true.** This paragraph is the one statement of the bound; everything else that quotes a
@@ -365,9 +381,9 @@ Consumption ends an invocation at ten minutes and will not raise it; `OverpassCl
 case on the defaults is six attempts of 190 s plus backoff — about 24 minutes for one query, and
 `processTile` makes several. That is not theoretical: `ingest_tile:120221221` ran 600008 ms on
 2026-08-03 and the host killed the worker mid-tile. Two numbers bound the Overpass part of it.
-`OVERPASS_MAX_TOTAL_MS` (240 s), set in `ingest.bicep`, is the most one query may spend across every
+`OVERPASS_MAX_TOTAL_MS` (190 s), set in `ingest.bicep`, is the most one query may spend across every
 retry; the last moment the worker will _start_ a query is derived rather than set, as
-`INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS` — 150 s — so the budgets
+`INGEST_DEADLINE_MS - OVERPASS_MAX_TOTAL_MS - INGEST_COMMIT_RESERVE_MS` — 200 s — so the budgets
 cannot fail to add up. Past that moment the Overpass view throws, `drainJobs`
 catches it per job, writes `lastError` and releases the lease, which is a far cheaper failure than
 the host killing the process. And the pump calls `reclaimExpiredJobs` on its two-minute tick, so a

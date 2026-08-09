@@ -243,6 +243,26 @@ describe('the commit reserve', () => {
     expect(client).toContain(`options.requestTimeoutMs ?? 190_000`);
   });
 
+  /**
+   * The three numbers live in `config.ts`, `ingest.bicep` and two prose passages, and the prose is
+   * the copy nothing compiles. It has drifted: both sites named the 240,000 that `OVERPASS_MAX_TOTAL_MS`
+   * carried before it was sized against the 168.4 s query, and with it a start-by of 150 s rather
+   * than the 200 s the shipped trio derives.
+   */
+  it('is described by the docs in the numbers the code ships', () => {
+    const startBySeconds = overpassDeadlineMs(budget) / 1000;
+    const maxTotalSeconds = OVERPASS_MAX_TOTAL_MS / 1000;
+
+    const architecture = readFileSync(resolve(__dirname, '../../../docs/architecture.md'), 'utf8');
+    expect(architecture).toContain(`\`OVERPASS_MAX_TOTAL_MS\` (${maxTotalSeconds} s)`);
+    expect(architecture).toContain(`INGEST_COMMIT_RESERVE_MS\` — ${startBySeconds} s —`);
+
+    const readme = readFileSync(resolve(__dirname, '../README.md'), 'utf8');
+    expect(readme).toMatch(
+      new RegExp(`\\|\\s*\`OVERPASS_MAX_TOTAL_MS\`\\s*\\|\\s*\`${OVERPASS_MAX_TOTAL_MS}\`\\s*\\|`),
+    );
+  });
+
   it('leaves the commit loop its share whatever Overpass spends', () => {
     /*
      * Stated as the property rather than as the subtraction that produced it: a query starting at

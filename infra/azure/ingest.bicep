@@ -276,9 +276,10 @@ an Entra identity — the worker with the Function App's system-assigned one, Ve
 user-assigned one below — and with local auth off no SAS key would work even if one leaked. Turning
 it back on is a one-line revert. There is no longer a flag that bypasses the broker: Service Bus is
 the only route a tile takes. That makes the broker a hard dependency for *latency* but not for
-durability — `ensureCoverage` writes the `ingest_jobs` row before anything publishes, so
-`publishIngestSignals` logs a failed send and returns rather than throwing, and `ingestPump`
-re-derives the row on its next tick.
+durability — `ensureCoverage` writes the `ingest_jobs` row before anything publishes, and
+`publishIngestSignals` logs a failed send and returns rather than throwing. What the row then waits
+on is `ingestPump` reaching it from the head of `priority DESC, "runAfter" ASC`, which is the
+backlog's cadence and not the pump's.
 
 It is not a claim about this file, but this file is now close to it. **One** long-lived credential
 is deployed from here and a maintainer needs to know it is there to rotate: `DATABASE_URL`, passed

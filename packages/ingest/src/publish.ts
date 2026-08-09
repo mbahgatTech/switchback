@@ -58,15 +58,16 @@ export interface PublishResult {
 /**
  * The literal an operator greps for when a wake-up did not reach the broker.
  *
- * **A diagnostic, not an alarm.** Every caller writes its `ingest_jobs` rows before ringing this
- * doorbell and `runPump` re-derives the runnable head from those rows every two minutes, so a lost
- * signal costs latency and no tile. Nothing has to observe it for the work to happen.
+ * **The only signal a lost doorbell produces.** Every caller writes its `ingest_jobs` row before
+ * ringing this, so the work is not lost — but `runPump` publishes from the head of `priority DESC,
+ * "runAfter" ASC`, and a freshly queued tile is the newest `runAfter` of its priority band. Behind
+ * a backlog of that band the pump reaches the oldest rows instead, so what a lost signal costs is
+ * the tile's place in the queue rather than one pump tick. `apps/ingest-worker/test/pump.test.ts`
+ * holds both halves of that.
  *
- * What is watched instead is the pump, from Azure where the telemetry is:
- * `switchback-ingest-worker-silent` on a missing heartbeat, and an `ingestPump … success == false`
- * arm of `switchback-ingest-drain-failed` for a pump that starts and then cannot publish. This line
- * lands in Vercel's runtime logs and nowhere else — Vercel writes to no Application Insights — so it
- * explains *why* latency rose after one of those has already fired.
+ * This line lands in Vercel's runtime logs and nowhere else — Vercel writes to no Application
+ * Insights — so no Azure rule reads it and none can. Raising the row's `priority` is what brings a
+ * named tile back to the head; `ingest_jobs` still holds it either way.
  */
 export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
 

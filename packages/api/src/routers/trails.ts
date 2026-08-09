@@ -378,9 +378,10 @@ async function surveyIfWide(ctx: Context, bbox: BBox, coverage: CoverageResult) 
  *
  * `ensureCoverage` has already written the `ingest_jobs` rows, so this is the wake-up and not the
  * work: no Overpass request is made in a Vercel function at all, which is what lets the Function
- * App's clamp be the only Overpass ceiling in the estate. A publish that fails costs the doorbell
- * — `runPump` re-derives the top of `ingest_jobs` every two minutes and republishes — so it is
- * logged rather than thrown, and `PUBLISH_FAILED_MARKER` is what makes it visible.
+ * App's clamp be the only Overpass ceiling in the estate. A publish that fails is logged rather
+ * than thrown, under `PUBLISH_FAILED_MARKER`, and costs the tile its place in the queue: `runPump`
+ * publishes from the head of `priority DESC, "runAfter" ASC` and these rows are the newest of
+ * their band.
  *
  * Scoped to `coverage.queued` rather than to the head of the table: viewport tiles all carry the
  * same priority, so an unscoped signal would wake the oldest pending tiles instead of the ones

@@ -129,6 +129,12 @@ So a timer function re-derives the top of the queue every two minutes and publis
 `PUMP_QUEUE_DEPTH` signals, rather than publishing the backlog once and freezing its order for
 weeks. It makes no Overpass request and so does not enter the arithmetic above.
 
+Its reach is the head of that order and nothing else. Viewport tiles all share one priority, so a
+tile queued a moment ago is the newest `runAfter` of its band and waits for the rows ahead of it —
+44,884 of them were due, oldest since 2026-07-30, in the reading `DRAIN_SILENCE_MS` is sized
+against. Bringing a named tile forward means raising its `priority`, which is the column both this
+order and `claimJobs` read first.
+
 ## Stopping it
 
 There is no flag that hands the drain back to Vercel, because there is no Vercel drain to hand it
@@ -189,7 +195,7 @@ empty tick.
 | `DATABASE_URL`                                  | —             | `backgroundPrisma`, as the web app connects    |
 | `INGEST_DEADLINE_MS`                            | `540000`      | `runIngestSignal`, and every phase under it    |
 | `INGEST_COMMIT_RESERVE_MS`                      | `150000`      | `overpassDeadlineMs`, held back for the commit |
-| `OVERPASS_MAX_TOTAL_MS`                         | `240000`      | `getOverpass`, per query                       |
+| `OVERPASS_MAX_TOTAL_MS`                         | `190000`      | `getOverpass`, per query                       |
 | `OVERPASS_MAX_CONCURRENT`                       | `2`           | `getOverpass`, per client                      |
 | `INGEST_MAX_DRAINERS`                           | `1`           | `drainSlotGate`, per fleet                     |
 | `OVERPASS_USER_AGENT`                           | —             | required — `OverpassClient` refuses without it |

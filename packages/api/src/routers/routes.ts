@@ -109,8 +109,8 @@ const MAX_ROUTES_LISTED = 200;
  *
  * `ingest_network` runs a real Overpass query in `fetchNetwork`, and `routes.coverage` is a public
  * procedure the planner fires on every viewport settle — so this process publishes and fetches
- * nothing. `ensureNetworkCoverage` has already written the rows; the pump re-derives them if the
- * signal is lost.
+ * nothing. `ensureNetworkCoverage` has already written the rows; a lost signal leaves them queued
+ * behind whatever the pump's order already puts ahead of them.
  */
 function kickNetwork(ctx: Context, queued: readonly string[]): void {
   if (!ctx.waitUntil || queued.length === 0) return;

@@ -85,8 +85,9 @@ export interface SignalQueue {
  *
  * The two selects are the two arms of `drainJobs`, in the same order and with the same
  * predicate, so what the pump considers most important and what a worker then claims cannot
- * disagree. Nothing here is claimed or written: a row stays `queued` until a worker takes it,
- * which is why a lost message costs a wait rather than a job.
+ * disagree. Nothing here is claimed or written: a row stays `queued` until a worker takes it, so
+ * a lost message costs a row its position and never the row. How long that position takes to
+ * reach the head is the backlog's business, not this tick's.
  */
 export async function runPump(
   db: Db,

@@ -1308,6 +1308,25 @@ Sender alone for the publisher `c9bfba39-…`. Two things must **not** appear:
 that was assignment `0090d328-0cee-592f-8359-e4cc64940694`, revoked 2026-08-08, and its return would
 mean a template or a hand edit put drain capability back on Vercel's identity.
 
+**Finish by leaving the host running, or nothing you just deployed does anything.** The last of the
+three brakes is `az functionapp stop`, and a stopped host runs no package however new it is. The
+deploy script starts it and refuses if it does not come up — a stopped host and a package that
+failed to mount produce the same silence, and only the state read tells them apart. By hand:
+
+```bash
+az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
+az functionapp show  -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri \
+  --query state -o tsv
+# expect: Running
+```
+
+A stop is not free in both directions. `defaultMessageTimeToLive` is `PT1H` and
+`deadLetteringOnMessageExpiration` is `false`, so wake-up signals older than an hour are deleted
+silently while the host is down — fifteen expired that way across one maintenance stop. The
+`ingest_jobs` rows survive, and the pump republishes from the head of `priority DESC, "runAfter" ASC`
+on its next tick, so what a stop costs is the queue's ordering position for anything enqueued during
+it rather than the work itself.
+
 ### The two things Bicep cannot express
 
 Recorded here for the same reason the `sbapp` role is: they are real steps, they are not in a
