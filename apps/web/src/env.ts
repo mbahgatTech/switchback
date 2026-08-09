@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { INGEST_ZOOM, MAX_INGEST_ZOOM } from '@switchback/geo';
 
 /**
  * The single server-side allowlist for environment variables, parsed once at module load so a
@@ -111,24 +110,6 @@ const base = z.object({
   INGEST_MAX_DRAINERS: z.coerce.number().int().positive().optional(),
 
   /**
-   * How ingest decides what a trail is, and how deep a dense tile may split. Both are read from
-   * `process.env` by `@switchback/ingest` itself and both default to off; they are declared here
-   * only so a typo is a startup error. **The values that matter are the Function App's** — it is
-   * the only process that ingests — and `infra/azure/ingest.bicep` sets them there.
-   *
-   * The ceiling is inert without `INGEST_TRAIL_IDENTITY=claim`: `subdivideMaxZoom` clamps it to
-   * `INGEST_ZOOM` rather than refusing to start, because a fail-safe clamp beats taking the site
-   * down over a variable that only makes ingest slower when it is wrong.
-   */
-  INGEST_TRAIL_IDENTITY: z.enum(['claim', 'osm-id']).default('osm-id'),
-  INGEST_SUBDIVIDE_MAX_ZOOM: z.coerce
-    .number()
-    .int()
-    .min(INGEST_ZOOM)
-    .max(MAX_INGEST_ZOOM)
-    .optional(),
-
-  /**
    * Cloudflare R2. All optional — `packages/api/storage` falls back to a local filesystem driver,
    * so uploads work with no Cloudflare account. Filling in *some* of them is refused below.
    */
@@ -183,12 +164,11 @@ const schema = base.superRefine((env, ctx) => {
    * A Vercel environment that is not Production must not point at the production database.
    *
    * The Postgres firewall is a single rule spanning 0.0.0.0–255.255.255.255, so reachability is
-   * not the control; holding the connection string is. A Preview deployment runs unreviewed
-   * branch code, and `drainIfOwned` drains `ingest_jobs` on any `trails.browse` request, so a
-   * Preview holding this string is a second writer into the production corpus — and its
-   * `INGEST_TRAIL_IDENTITY` is a separate variable that can disagree with Production's, which
-   * makes the writes fragmenting rather than merely surplus. Refusing at startup is what stops
-   * the variable being re-added later without anyone noticing.
+   * not the control; holding the connection string is. A Preview deployment runs unreviewed branch
+   * code against whatever that string names, with nothing between a push and the write. Ingestion
+   * is not part of that exposure — the Vercel-side drainers are deleted and the Function App is
+   * the only process that ingests — but every table a request can reach is. Refusing at startup is
+   * what stops the variable being re-added later without anyone noticing.
    */
   for (const key of ['DATABASE_URL', 'DIRECT_DATABASE_URL'] as const) {
     if (env.VERCEL_ENV && env.VERCEL_ENV !== 'production') {

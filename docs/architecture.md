@@ -124,11 +124,12 @@ Function App_:
 | Everything is wrong, or a bad build is running                             | `az functionapp stop`                    | `az functionapp start` — **or any deploy to `master`** | nothing drains and nothing is observed; wake-up signals older than the `PT1H` queue TTL are dropped                                |
 
 **The stop does not survive a deploy, and that is the one an operator has to know.**
-`.github/scripts/deploy-worker.sh` reads the host's state and starts it when it is not `Running`,
-because a stopped host emits no heartbeat and the deploy has no other way to tell a bad package
-from a deliberate stop. `ci.yml` runs `deploy ingest worker` on every push to `master`, so merging
-anything restarts a stopped worker and ingestion resumes. Stopping the host is a brake against a
-bad build or a bad hour, not a way to hold ingestion off across a release.
+`.github/scripts/deploy-worker.sh` reads the host's state and starts it when it is not `Running` —
+before it points the app at the new package, because ARM proxies `syncfunctiontriggers` to the
+host's own extensions endpoint and a stopped host refuses it. `ci.yml` runs `deploy ingest worker`
+on every push to `master`, so merging anything restarts a stopped worker and ingestion resumes.
+Stopping the host is a brake against a bad build or a bad hour, not a way to hold ingestion off
+across a release.
 
 The first brake narrows the pump to reclaimed leases rather than silencing it. `classifyDisposition`
 completes a Service Bus message on the strength of the reaper returning the row to `queued` at
@@ -228,8 +229,9 @@ distress rule reports.
 **Stopping it.** There is no driver flag and no second path, so "roll back the cutover" is not a
 thing that can be done — there is nowhere to roll back _to_. What exists instead is three brakes,
 and the right one depends on what has gone wrong. None needs a deploy to _pull_. The third is
-undone by one: `deploy-worker.sh` starts a host it finds stopped, and `deploy ingest worker` runs
-on every push to `master`, so a merge restarts a stopped worker whether or not that was the intent.
+undone by one: `deploy-worker.sh` starts a host it finds stopped, ahead of everything it writes to
+the app, and `deploy ingest worker` runs on every push to `master`, so a merge restarts a stopped
+worker whether or not that was the intent.
 
 ```bash
 RG=rg-switchback-prod-northcentralus
@@ -246,7 +248,8 @@ az functionapp config appsettings set -g "$RG" -n "$APP" \
   --settings AzureWebJobs.ingestDrain.Disabled=true -o none
 
 # Everything is wrong. Nothing drains and nothing is observed. This one is undone by the next
-# merge to master as well as by the command below: `deploy ingest worker` starts a stopped host.
+# merge to master as well as by the command below: `deploy ingest worker` starts a stopped host
+# before it publishes anything to it.
 az functionapp stop -g "$RG" -n "$APP"
 
 # And back. Messages that expired against the PT1H TTL while it was down are gone; their
@@ -1035,10 +1038,10 @@ has no fallback: `INGEST_PACKAGE_URL` must be read off the live app first, and a
 fails the build with `BCP427` rather than pointing production at another build. What a template
 cannot do is upload `function-releases/<commit>-<utc>.zip`, so both steps still exist:
 
-| Step | Command                                                                 | Why the order                                                                                                                   |
-| ---- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, including the package URL it was handed. Harmless when that URL is the live one; wrong when it is not. |
-| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`.            |
+| Step | Command                                                                 | Why the order                                                                                                                            |
+| ---- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `az deployment group create … --template-file infra/azure/ingest.bicep` | Writes the app settings, including the package URL it was handed. Harmless when that URL is the live one; wrong when it is not.          |
+| 2    | `bash .github/scripts/deploy-worker.sh <bundle>.zip <commit>`           | Uploads the package, brings the host up, points the setting at it, syncs the trigger cache, and waits for a heartbeat naming `<commit>`. |
 
 Step 2 alone is the routine case; step 1 is only needed when the template changes. Step 1 no longer
 leaves the app codeless, so the two are independent — but the trigger cache still has to be synced
@@ -1231,24 +1234,18 @@ one is already `running`; wait out the lease (12 minutes at most) and run it aga
 
 ### `INGEST_TRAIL_IDENTITY` → `osm-id`
 
+One surface, because the Function App is the only process that reads it. Vercel carries the name
+with an empty value and reaches no code that resolves an identity mode, so there is nothing to
+change there and no redeploy to wait on.
+
 ```bash
-# 1. Vercel. Production carries the variable; Preview does not, and `env rm` on an absent name
-#    exits non-zero — check before removing rather than removing blind.
-vercel env ls production | grep INGEST_TRAIL_IDENTITY && \
-  vercel env rm INGEST_TRAIL_IDENTITY production --yes
-
-# 2. Promote a deployment built without it, or merges continue on the running one.
-vercel redeploy switchback-three.vercel.app --target production
-
-# 3. The Function App. `ingest.bicep` declares this setting explicitly, so set it rather than
-#    delete it — a deleted setting is written back by the next template deploy from whatever the
-#    deploying shell exports, and the two states would otherwise read as drift.
+# `ingest.bicep` declares this setting explicitly, so set it rather than delete it — a deleted
+# setting is written back by the next template deploy from whatever the deploying shell exports,
+# and the two states would otherwise read as drift.
 az functionapp config appsettings set -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri --settings INGEST_TRAIL_IDENTITY=osm-id -o none
 
-# 4. Verify. Anything other than the exact string `claim` is osm-id, but say it explicitly.
-vercel env ls production | grep INGEST_TRAIL_IDENTITY       # expect no output
-vercel ls --environment production                          # newest row's Age younger than step 1
+# Verify. Anything other than the exact string `claim` is osm-id, but say it explicitly.
 az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
   -n func-switchback-ingest-37ywppu5p7fri \
   --query "[?name=='INGEST_TRAIL_IDENTITY'].value | [0]" -o tsv                     # expect osm-id
@@ -1885,15 +1882,19 @@ them needs a backfill that picks a winner per hash, moves user content onto it a
 loser's slug through `trail_slug_aliases`. Both tables are writable, so what blocks the backfill is
 that nobody has written it.
 
-`INGEST_TRAIL_IDENTITY` reads `claim` on the Function App and in Vercel **Production**, and is
-**absent in Vercel Preview** — `identity.ts` resolves anything that is not exactly `claim`, absence
-included, to `osm-id`. Preview carries no `DATABASE_URL`, so nothing there ingests and the asymmetry
-changes no behaviour; it starts to matter the day Preview is given a database of its own.
+`INGEST_TRAIL_IDENTITY` reads `claim` on the Function App, which is the only surface where it does
+anything. Vercel **Production** still carries the name with an empty value; nothing there reads it.
+`pipelineDeps` in `packages/ingest/src/config.ts` is the only caller of `trailIdentityMode`,
+`ingestHandlers` is the only caller of `pipelineDeps`, and neither `apps/web` nor `packages/api`
+imports either — the routers take `ensureCoverage`, `publishIngestSignals`, `requestArea`,
+`surveyArea` and the geocoder, none of which resolve an identity mode. `apps/web/src/env.ts` does
+not declare it, and the empty Vercel entry is residue that can be deleted whenever somebody is in
+the project settings.
 
 | Surface      | Read it back with                                                                                                             |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------- |
 | Function App | `az functionapp config appsettings list -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri -o json` |
-| Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone (see the runbook note on `--no-sensitive`)          |
+| Vercel       | `vercel env pull` — **not** `vercel env ls`, which answers presence alone and reports an empty value as `Encrypted`           |
 
 **A deploy of `ingest.bicep` from a shell that has not exported the flag fails the build.**
 `ingest.bicepparam` resolves `ingestTrailIdentity` through

@@ -1586,8 +1586,10 @@ resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
 Every other rule in this file is armed by something the Function App emits, so all of them read a
 host that is down, wedged, or running a build that predates the code they watch as an estate with
 nothing wrong. That is not a hypothetical: the zip `WEBSITE_RUN_FROM_PACKAGE` names is uploaded by
-`.github/scripts/deploy-worker.sh` and by nothing else, so any failure of that path leaves the app
-serving whatever zip it last received, indefinitely and silently.
+`.github/scripts/deploy-worker.sh` and by nothing else, so a failure of that path leaves the app on
+whatever it was doing before — serving the previous zip, or, when the host is stopped under the
+deploy, serving nothing while the setting names a build it never ran. Run 31301084801 left the
+second state. Both read as silence, and this is the rule that reports either.
 
 `reportQueueHealth` logs `switchback-ingest-queue-health` on **every** reading — the first statement
 in the `ingestPump` handler, ahead of the `INGEST_PUMP_ENABLED` brake, on a two-minute timer.

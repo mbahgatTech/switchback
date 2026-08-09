@@ -525,10 +525,11 @@ required on a laptop, in CI and in Production, where the fix is the missing vari
 
 It held all three until 2026-08-08. The Postgres firewall is a single rule spanning
 `0.0.0.0`–`255.255.255.255`, so reachability was never the boundary — holding the connection string
-was. Preview runs unreviewed branch code, `drainIfOwned` drains `ingest_jobs` on any `trails.browse`
-request, and `INGEST_TRAIL_IDENTITY` is a per-environment variable that Preview did not carry while
-Production ran `claim`, so those writes resolved trail identity in the opposite mode and could insert
-duplicates into the production corpus.
+was. Preview runs unreviewed branch code, and at the time `drainIfOwned` drained `ingest_jobs` on
+any `trails.browse` request while `INGEST_TRAIL_IDENTITY` was a per-environment variable Preview did
+not carry and Production ran on `claim`, so those writes resolved trail identity in the opposite mode
+and could insert duplicates into the production corpus. That drainer is deleted and no Vercel process
+ingests, so what the rule below now closes is write access to every table a request can reach.
 
 The env vars are the containment; the durable control is in code. `apps/web/src/env.ts` refuses to
 start when `VERCEL_ENV` is set to anything but `production` and `DATABASE_URL` or
@@ -1310,8 +1311,9 @@ mean a template or a hand edit put drain capability back on Vercel's identity.
 
 **Finish by leaving the host running, or nothing you just deployed does anything.** The last of the
 three brakes is `az functionapp stop`, and a stopped host runs no package however new it is. The
-deploy script starts it and refuses if it does not come up — a stopped host and a package that
-failed to mount produce the same silence, and only the state read tells them apart. By hand:
+deploy script starts it before it names the new package, and refuses if it does not come up — a
+stopped host and a package that failed to mount produce the same silence, and only the state read
+tells them apart. By hand:
 
 ```bash
 az functionapp start -g rg-switchback-prod-northcentralus -n func-switchback-ingest-37ywppu5p7fri
