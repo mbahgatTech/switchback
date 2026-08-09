@@ -58,33 +58,24 @@ export interface PublishResult {
 /**
  * The literal an operator greps for when a wake-up did not reach the broker.
  *
- * **A diagnostic, not an alarm, and the distinction is the whole design.** Every caller writes its
- * `ingest_jobs` rows before ringing this doorbell, so a failed publish costs the doorbell and not
- * the tile: `runPump` re-derives the runnable head of `ingest_jobs` on a two-minute timer and
- * publishes it again. Nothing needs to observe a lost signal for the work to happen.
+ * **A diagnostic, not an alarm.** Every caller writes its `ingest_jobs` rows before ringing this
+ * doorbell and `runPump` re-derives the runnable head from those rows every two minutes, so a lost
+ * signal costs latency and no tile. Nothing has to observe it for the work to happen.
  *
- * What that argument depends on is the pump, so the pump is what is watched — from Azure, where the
- * telemetry actually is. `switchback-ingest-worker-silent` fires when no queue-health heartbeat
- * arrives for 30 minutes, and `switchback-ingest-drain-failed` carries an arm for
- * `ingestPump` invocations that end `success == false`, which is how a pump that starts and then
- * fails to publish is caught. A drain that has stopped for any reason shows up in the
- * `stalledDrain` gauge behind `switchback-ingest-queue-distress`.
- *
- * This marker lands in Vercel's runtime logs and only there — Vercel writes to no Application
- * Insights, so no rule in `infra/azure/ingest.bicep` can read it and none tries. Its use is telling
- * an operator *why* ingest latency rose to the pump's cadence, after one of the rules above has
- * already said that something is wrong.
+ * What is watched instead is the pump, from Azure where the telemetry is:
+ * `switchback-ingest-worker-silent` on a missing heartbeat, and an `ingestPump … success == false`
+ * arm of `switchback-ingest-drain-failed` for a pump that starts and then cannot publish. This line
+ * lands in Vercel's runtime logs and nowhere else — Vercel writes to no Application Insights — so it
+ * explains *why* latency rose after one of those has already fired.
  */
 export const PUBLISH_FAILED_MARKER = 'switchback-ingest-publish-failed';
 
 /**
  * Publish one signal per key, best effort.
  *
- * **It never throws and never rejects.** The row is written by `queueTiles` before anything
- * calls this, so a broker outage — or a token exchange the identity provider refuses — costs
- * the wake-up and nothing else: the work is still queued, still deduped, still priority-ordered,
- * and `runPump` re-derives it from `ingest_jobs` on its next two-minute tick. Failing the request
- * instead would let a Service Bus incident empty the map.
+ * **It never throws and never rejects.** A broker outage — or a token exchange the identity
+ * provider refuses — costs the wake-up and nothing else, because the row is already written.
+ * Failing the request instead would let a Service Bus incident empty the map.
  */
 export async function publishIngestSignals(
   dedupeKeys: readonly string[],
