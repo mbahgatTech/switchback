@@ -871,9 +871,9 @@ returns normally and `report()` logs `done`, so an operator would read 8/8 tiles
 two of them ingested nothing. `switchback-ingest-ground-lost` therefore has an arm matching
 `switchback-ingest-subtree-stuck`.
 
-That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so both
-markers land where the rule can read them — including `switchback-ingest-subtree-stuck`, the
-edge-triggered "five failures, a human is needed" signal. That was not true while the drain ran on
+That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so
+`switchback-ingest-subtree-stuck` — the edge-triggered "five failures, a human is needed" signal —
+lands where the rule can read it. That was not true while the drain ran on
 Vercel: the markers went to `console` because there was nowhere else for them to go, and there is no
 Vercel log drain in the estate or in any template. Deleting the Vercel drain is what closed that
 gap, rather than any change to the rule.

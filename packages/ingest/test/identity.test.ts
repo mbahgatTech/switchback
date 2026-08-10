@@ -356,7 +356,7 @@ describe('claimWays', () => {
  * Ordering the insert is what turns that collision into a wait; the repoint is sorted for
  * determinism, and `commitTrail`'s `40P01` retry is what covers it.
  */
-describe('the order claimWays takes way locks in', () => {
+describe('the order claimWays writes way ids in', () => {
   it('reads and inserts ascending, whatever order the caller assembled the members in', async () => {
     // `assembleTrails` emits member ids in relation order, which is the mapper's order — never
     // sorted, and different for the two tiles that share a way.

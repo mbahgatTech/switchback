@@ -1144,7 +1144,7 @@ az monitor scheduled-query delete -g rg-switchback-prod-northcentralus \
 
 Deleting it takes the same three steps as any other delete in this group — lift, delete, re-PUT —
 and lifting the lock is a deliberate act the lock's own notes require a pull request for. Read the
-body out of `lockNotes` in `main.bicep` rather than typing it: a paraphrase left production drifted
+body out of `lockNotes` in `main.bicep` rather than typing it: a paraphrase left production drifting
 from the template for eight hours. See [The delete lock](#the-delete-lock).
 
 ```bash
