@@ -597,6 +597,47 @@ describe('the outcome fence', () => {
 });
 
 /**
+ * `failJob` reschedules below `maxAttempts` and buries only the last attempt, and the row cannot be
+ * read back afterwards to tell which happened. Counting them apart is what lets a burial page on
+ * `switchback-ingest-ground-lost` while a retry stays on `switchback-ingest-drain-degraded`.
+ */
+describe('a burial, counted apart from a retry', () => {
+  const throwing = { [JobKind.ingest_tile]: async () => Promise.reject(new Error('handler')) };
+
+  it('leaves a job with an attempt left out of the buried count', async () => {
+    const { db, recorded } = fakeDb([job({ attempts: 1, maxAttempts: 5 })]);
+
+    const result = await drainJobs(throwing, { db });
+
+    expect(result.failed).toBe(1);
+    expect(result.buried).toBe(0);
+    // The counter and the row have to agree, or the alert describes something that did not happen.
+    expect(recorded.updates.at(-1)?.data.status).toBe(JobStatus.queued);
+  });
+
+  it('counts the attempt that exhausts the budget, which is the one nothing retries', async () => {
+    const { db, recorded } = fakeDb([job({ attempts: 5, maxAttempts: 5 })]);
+
+    const result = await drainJobs(throwing, { db });
+
+    expect(result.failed).toBe(1);
+    expect(result.buried).toBe(1);
+    expect(recorded.updates.at(-1)?.data.status).toBe(JobStatus.dead);
+  });
+
+  it('does not count a failure the fence dropped, since that row belongs to another worker', async () => {
+    // `lost`, not `buried`: the outcome was never written, so nothing was buried.
+    const { db } = fakeDb([job({ attempts: 5, maxAttempts: 5 })], { outcomeCount: 0 });
+
+    const result = await drainJobs(throwing, { db });
+
+    expect(result.lost).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.buried).toBe(0);
+  });
+});
+
+/**
  * `INGEST_MAX_DRAINERS` is enforced by `drainSlotGate` counting `distinct "lockedBy"` over
  * `running` rows — a reading that exists only while something is mid-drain, and eight samples over
  * seventy seconds of production caught zero. Leaving the lease pair on the row after the outcome

@@ -50,15 +50,21 @@ function txWith(claims: readonly Claim[]): Prisma.TransactionClient {
 
 /** Records what `claimWays` wrote, and answers its read from `held`. */
 function claimTx(held: Record<number, string>) {
+  const reads: bigint[][] = [];
   const inserted: Array<{ wayId: number; trailId: string }> = [];
   const repointed: Array<{ wayIds: number[]; trailId: string }> = [];
   const trailWay = {
-    findMany: ({ where }: { where: { wayId: { in: bigint[] } } }) =>
-      Promise.resolve(
+    findMany: ({ where }: { where: { wayId: { in: bigint[] } } }) => {
+      reads.push([...where.wayId.in]);
+      return Promise.resolve(
         where.wayId.in
           .filter((id) => held[Number(id)] !== undefined)
-          .map((id) => ({ wayId: id, trailId: held[Number(id)]! })),
-      ),
+          .map((id) => ({ wayId: id, trailId: held[Number(id)]! }))
+          // Descending, because Postgres promises no order on an `IN` read without `ORDER BY`.
+          // Anything downstream that needs an order has to impose it rather than inherit it.
+          .reverse(),
+      );
+    },
     createMany: ({ data }: { data: Array<{ wayId: bigint; trailId: string }> }) => {
       for (const row of data) inserted.push({ wayId: Number(row.wayId), trailId: row.trailId });
       return Promise.resolve({ count: data.length });
@@ -68,7 +74,13 @@ function claimTx(held: Record<number, string>) {
       return Promise.resolve({ count: args.where.wayId.in.length });
     },
   };
-  return { trailWay, tx: { trailWay } as unknown as Prisma.TransactionClient, inserted, repointed };
+  return {
+    trailWay,
+    tx: { trailWay } as unknown as Prisma.TransactionClient,
+    reads,
+    inserted,
+    repointed,
+  };
 }
 
 function way(id: number, from: number, to: number): OverpassElement {
@@ -334,6 +346,38 @@ describe('claimWays', () => {
     await claimWays(tx, 'mine', [1, 2], 'fail');
     expect(inserted).toEqual([]);
     expect(repointed).toEqual([]);
+  });
+});
+
+/**
+ * Postgres holds every row a transaction touches until it ends, so two committers that take the
+ * same ways in opposite orders deadlock instead of queueing. Production 2026-08-10T05:29:56Z and
+ * 05:35:57Z: three relations lost to `40P01` on `trail_ways`, across tiles 120221220 and 120221201.
+ * Ordering both writes is what turns that collision into a wait.
+ */
+describe('the order claimWays takes way locks in', () => {
+  it('reads and inserts ascending, whatever order the caller assembled the members in', async () => {
+    // `assembleTrails` emits member ids in relation order, which is the mapper's order — never
+    // sorted, and different for the two tiles that share a way.
+    const { tx, reads, inserted } = claimTx({});
+
+    await claimWays(tx, 'mine', [300, 100, 200], 'fail');
+
+    expect(reads[0]).toEqual([100n, 200n, 300n]);
+    expect(inserted.map((row) => row.wayId)).toEqual([100, 200, 300]);
+  });
+
+  it('repoints ascending, rather than in the order the read happened to return', async () => {
+    /*
+     * A separate sort from the one above, and it needs its own case: the rows come back from the
+     * database, so sorting the read does not sort these. The fake returns them descending for that
+     * reason.
+     */
+    const { tx, repointed } = claimTx({ 100: 'other', 200: 'other', 300: 'other' });
+
+    await claimWays(tx, 'the-route', [300, 100, 200], 'take');
+
+    expect(repointed).toEqual([{ wayIds: [100, 200, 300], trailId: 'the-route' }]);
   });
 });
 

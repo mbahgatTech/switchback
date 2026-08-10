@@ -67,7 +67,16 @@ export const COMMIT_RESERVE_MS = 150_000;
  * Derived from `TRAIL_TX_TIMEOUT_MS` (30 s, the transaction's own ceiling) doubled, which leaves
  * the terrain fetches feeding that transaction the same again. It is not measured against a
  * finished route, because no `ingest_route` job has ever completed in production — 38 rows, 0
- * `done` as at 2026-08-10T17:00Z. Re-derive it from a real one once any succeed.
+ * `done` and 0 `completedAt` as at 2026-08-10T19:14Z. Re-derive it from a real one once any succeed.
+ *
+ * **What widening the window is measured to do, and what it is not.** With the deployed budget the
+ * start-by is 200 s; this moves it to 290 s. Of the ten `ingest_route` refusals recorded to
+ * 2026-08-10T19:14Z, five were refused at 229–262 s and so would have been admitted, and five at
+ * 306–385 s and still would not. Admitted is not completed: the five late refusals follow a query
+ * that ran the full `OVERPASS_MAX_TOTAL_MS` and aborted — `ingest_route:5183682` logged its last
+ * good `route batch` at t≈116 s and was refused at t≈306 s, 190 s of one query — so the residual
+ * limiter is upstream latency and mirror rotation, which no reserve reaches. Whether a route
+ * finishes inside 540 s is **UNVERIFIED** until one does.
  */
 export const DERIVED_COMMIT_RESERVE_MS = 60_000;
 
@@ -254,6 +263,7 @@ export async function runIngestSignal(
     workerId: string;
     deliveryCount?: number;
     drain?: Drain;
+    /** The client both views wrap. Substituted by tests; production always takes the shared one. */
     overpass?: OverpassQuerier;
     db?: PrismaClient;
   },
@@ -262,12 +272,16 @@ export async function runIngestSignal(
   const db = options.db ?? backgroundPrisma;
   const startedAt = Date.now();
   const handlerDeadline = startedAt + handlerDeadlineMs();
-  // Views of the shared client, not second ones: the queue and the breaker stay the singleton's,
-  // so the concurrency ceiling is unchanged.
-  const overpass =
-    options.overpass ??
-    withDeadline(getOverpass(), startedAt + overpassDeadlineMs(process.env, signal.dedupeKey));
-  const overpassAfterCommits = options.overpass ?? withDeadline(getOverpass(), handlerDeadline);
+  // Views of one client, not second clients: the queue and the breaker stay the singleton's, so the
+  // concurrency ceiling is unchanged. A substituted client is wrapped like the shared one rather
+  // than passed through — the deadline below is production behaviour, and a test that skipped it
+  // would leave the only line that reads `dedupeKey` unexercised.
+  const client = options.overpass ?? getOverpass();
+  const overpass = withDeadline(
+    client,
+    startedAt + overpassDeadlineMs(process.env, signal.dedupeKey),
+  );
+  const overpassAfterCommits = withDeadline(client, handlerDeadline);
 
   let result: DrainResult;
   try {

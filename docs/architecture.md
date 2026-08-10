@@ -503,8 +503,8 @@ that means the reaper itself has stopped, so `assertSettleable` throws and
 `switchback-ingest-signal-stranded` says so.
 
 Reading `requests | where success == false` alone is blind to the failure mode these rules exist
-for. `drainJobs` catches every handler error,
-writes it to the job row and returns normally, so the 2026-08-04 run was 14/14 successful
+for. `drainJobs` catches every handler error, writes it to the job row and returns normally, so the
+2026-08-04 run was 14/14 successful
 invocations while six Alps tiles were failing — the failure existed only as six `traces` lines. The
 rule now unions the request arm with a `traces` arm keyed on the literal `ingest-job-failed` that
 `runIngestSignal` logs beside every job-level failure. Matching a token rather than a sentence is
@@ -571,14 +571,17 @@ Measured read-only against production on 2026-08-07 17:50 UTC, every field reads
 `dead` 0 windowed against 25 unwindowed, `staleLeases` 0, `rateLimited` 0, and no `ingest_tiles` row
 carries a split marker or a stuck-subtree marker. The gauge is clear and can fire on the next real 429.
 
-**All three rules are deployed, and so is the code that arms them.**
-`az resource list -g rg-switchback-prod-northcentralus --resource-type
-Microsoft.Insights/scheduledqueryrules` returns `switchback-ingest-ground-lost`,
-`switchback-ingest-drain-degraded`, `switchback-ingest-pump-failing`,
-`switchback-ingest-queue-distress` and `switchback-ingest-worker-silent`. The Function App runs a
-bundle published by `.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest
-worker` job will invoke on every push to master — and which refuses to report success until the
-running host emits a heartbeat naming the commit it just pushed.
+**The code that arms these rules is deployed; three of the rules themselves are not yet.** Read on
+2026-08-10T19:20Z, `az monitor scheduled-query list -g rg-switchback-prod-northcentralus` returns
+`switchback-ingest-drain-failed`, `switchback-ingest-queue-distress`,
+`switchback-ingest-worker-silent`, `switchback-ingest-overpass-limited`,
+`switchback-ingest-overpass-skipped` and `switchback-db-token-alarm`. `ground-lost`,
+`drain-degraded` and `pump-failing` are declared in `infra/azure/ingest.bicep` and arrive with the
+next deployment of it, which also leaves `drain-failed` running until it is deleted by hand —
+`infra/azure/README.md` carries that command. The Function App runs a bundle published by
+`.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest worker` job will
+invoke on every push to master — and which refuses to report success until the running host emits a
+heartbeat naming the commit it just pushed.
 
 **The distress rule alone would still read a dead worker as a healthy estate**, because its whole
 firing condition is a log line and a host that is down or serving an old bundle produces none.

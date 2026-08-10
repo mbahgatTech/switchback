@@ -97,8 +97,9 @@ describe('runIngestSignal', () => {
       dedupeKeys: [KEY],
       workerId: 'sb-1',
       deps: {
-        overpass,
-        overpassAfterCommits: overpass,
+        // Deadline views over the injected client, not the client itself — see `runIngestSignal`.
+        overpass: { query: expect.any(Function) as () => void },
+        overpassAfterCommits: { query: expect.any(Function) as () => void },
         deadlineAt: expect.any(Number) as number,
         logger: expect.any(Function) as () => void,
       },
@@ -280,6 +281,81 @@ describe('the commit reserve, per job kind', () => {
 });
 
 /**
+ * The reserve arithmetic above is a pure function; this is the wiring that carries it to the
+ * pipeline. Both were needed, because the whole `ingest_route` defect lived in one call site that
+ * every test of the arithmetic leaves green.
+ */
+describe('the start-by the drain hands the pipeline', () => {
+  /*
+   * A budget with a deliberate 90 s gap between the two branches, so one clock reading tells them
+   * apart: a tile may start a pre-commit query for 60 s, a route for 150 s.
+   */
+  const gapped = {
+    INGEST_DEADLINE_MS: '400000',
+    OVERPASS_MAX_TOTAL_MS: '190000',
+    INGEST_COMMIT_RESERVE_MS: '150000',
+  };
+  const TILE_START_BY = 60_000;
+  const ROUTE_START_BY = 150_000;
+  const BETWEEN = 90_000;
+
+  /** What the pipeline's pre-commit Overpass view does with a query `atMs` into the invocation. */
+  async function preCommitQueryAt(dedupeKey: string, atMs: number): Promise<'ran' | 'refused'> {
+    for (const [name, value] of Object.entries(gapped)) vi.stubEnv(name, value);
+    vi.useFakeTimers();
+    try {
+      const startedAt = Date.now();
+      let verdict: 'ran' | 'refused' = 'ran';
+      await runIngestSignal({ dedupeKey }, fakeLog(), {
+        workerId: 'sb-1',
+        overpass,
+        db: settledDb,
+        drain: async (options) => {
+          vi.setSystemTime(startedAt + atMs);
+          try {
+            await options!.deps!.overpass!.query('[out:json];');
+          } catch (error) {
+            if (!(error instanceof OverpassDeadlineError)) throw error;
+            verdict = 'refused';
+          }
+          return outcome({ claimed: 1, succeeded: 1 });
+        },
+      });
+      return verdict;
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  }
+
+  it('reads the budget from the env the deployment actually sets', () => {
+    // Anchors the two constants below, so a moved default cannot leave this describe vacuous.
+    expect(overpassDeadlineMs(gapped, 'ingest_tile:021231321')).toBe(TILE_START_BY);
+    expect(overpassDeadlineMs(gapped, 'ingest_route:120118')).toBe(ROUTE_START_BY);
+  });
+
+  it('refuses a tile query once the tile reserve says the commit loop needs the rest', async () => {
+    await expect(preCommitQueryAt('ingest_tile:021231321', BETWEEN)).resolves.toBe('refused');
+  });
+
+  it('lets a route query through at the same moment, which is the whole fix', async () => {
+    /*
+     * The line this pins is the `signal.dedupeKey` argument in `runIngestSignal`. Drop it and the
+     * route is charged the tile's reserve, this query is refused 90 s into a 540 s invocation, and
+     * production records "Overpass deadline for this invocation passed Ns ago" — 10 of the 11
+     * `ingest_route` attempts as at 2026-08-10T19:14Z, 0 of 38 rows ever `done`.
+     */
+    await expect(preCommitQueryAt('ingest_route:120118', BETWEEN)).resolves.toBe('ran');
+  });
+
+  it('still refuses a route query past the route reserve, so the fix is a wider bound not none', async () => {
+    await expect(preCommitQueryAt('ingest_route:120118', ROUTE_START_BY + 1_000)).resolves.toBe(
+      'refused',
+    );
+  });
+});
+
+/**
  * The reconciliation `src/drain.ts` documents, checked against the files that actually carry the
  * numbers. Asserting `300_000 + 240_000 < 600_000` on literals proves only that the author can
  * add: it stays green when a deployed value moves, which is the only way this can break.
@@ -448,19 +524,26 @@ describe('the drain alerts, from the template', () => {
     expect(pumpFailing).not.toContain('ingestDrain');
   });
 
-  it('gives every drain rule a query that returns a row when nothing matches', () => {
+  it('gives every drain rule a query whose count the alert payload can carry', () => {
     /*
-     * `summarize` with no `by` yields exactly one row holding 0, so a quiet window is a measurement
-     * below threshold. The bare `| project timestamp` form yields none, and an alert that never
-     * observes "below threshold" never resolves — which is how ten `overpass-limited` instances
-     * came to sit `Fired` under `autoMitigate: true`.
+     * `summarize` with no `by` names a column, which is what `metricMeasureColumn` needs to put the
+     * event count in the alert itself. It is not what makes a rule clear — `autoMitigate` is, and
+     * the case below is the one that guards that.
      */
     for (const query of [groundLost, degraded, pumpFailing]) {
       expect(query).toMatch(/\|\s*summarize\s+\w+\s*=\s*count\(\)\s*$/);
     }
   });
 
-  it('lets every scheduled rule in the template clear itself', () => {
+  it('leaves no rule in this template that only a person can close', () => {
+    /*
+     * `autoMitigate: false` is the whole reason instances pile up: the platform never resolves one,
+     * so it waits for `alerts/changestate/action`. Measured in the production resource group,
+     * `switchback-ingest-queue-distress` clears itself under `true` while projecting rather than
+     * summarizing, and the ten `overpass-limited` instances of 2026-08-08/09 sat `Fired` under
+     * `false`. This guards the template only — a rule already deployed keeps its own flag until it
+     * is redeployed or deleted, which `infra/azure/README.md` carries the command for.
+     */
     const autoMitigate = bicep
       .split('\n')
       .map((line) => /^\s*autoMitigate: (true|false)$/.exec(line)?.[1])

@@ -1165,9 +1165,25 @@ and watching a real condition — just not the one a split failure produces.
 
 ### Acting on an ingest alert
 
-Every ingest rule auto-clears, so an instance that is still `Fired` is a condition that is still
-true. Closing one by hand is for clearing a backlog left by a rule that could not resolve itself,
-not for silencing a live fault.
+**Whether an instance clears itself is decided by `autoMitigate` on the rule that fired it, and by
+nothing else.** Every rule this template declares sets it `true`, so an instance of one of those is
+a condition still true at the last evaluation. Two things break that inference, and both are live:
+
+- `switchback-ingest-drain-failed` is still running in Azure with `autoMitigate: false` and is not
+  deleted by deploying this template — see the deletion command above. Its instances never clear.
+- An instance carries the configuration of the rule **as it was when it fired**. The ten
+  `switchback-ingest-overpass-limited` instances of 2026-08-08/09 are still `Fired` because that
+  rule had `autoMitigate: false` until 2026-08-09T23:50:53Z; the flag has been `true` since, and
+  they will not resolve retroactively.
+
+`switchback-ingest-queue-distress` is the counter-example worth knowing, because it refutes the
+tempting theory that a query ending `| project timestamp` cannot resolve: it uses exactly that form,
+`autoMitigate: true`, and resolved itself at 2026-08-10T17:55:42Z having fired at 17:09:41Z.
+
+```bash
+az monitor scheduled-query list -g rg-switchback-prod-northcentralus \
+  --query "[].{name:name,autoMitigate:autoMitigate}" -o json
+```
 
 #### `switchback-ingest-ground-lost` — Sev2, act now
 

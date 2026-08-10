@@ -1309,12 +1309,19 @@ Measured on the component this rule scopes to, seven days to 2026-08-10T17:00Z:
 state with no other reporter, but none has been observed firing, so none is known to work. Prove
 one with a synthetic trigger before trusting it.
 
-**`summarize` with no `by` clause is what lets this clear itself**, and it is not cosmetic. It
-returns exactly one row holding `0` when nothing matches, so a quiet window is a measurement below
-threshold; the bare `| project timestamp` form returns no row and leaves the platform's empty-result
-handling to decide. Ten `switchback-ingest-overpass-limited` instances sat `Fired` under
-`autoMitigate: true` while that rule used the projecting form. Read the instances back with:
+**`autoMitigate` is what lets this clear itself, and nothing about the query text does.** An
+instance under `autoMitigate: false` stays `Fired` for ever and waits for a person; the ten
+`switchback-ingest-overpass-limited` instances between 2026-08-08T22:44:37Z and
+2026-08-09T21:29:45Z all predate that rule's flip to `true` at 2026-08-09T23:50:53Z, which is why
+they sat. `switchback-ingest-queue-distress` settles the question the other way in the same
+resource group: it projects rather than summarizes, and it resolved itself at 2026-08-10T17:55:42Z
+having fired at 17:09:41Z. Read both back with:
+`az monitor scheduled-query list -g rg-switchback-prod-northcentralus -o json` and
 `az rest --method get --url "https://management.azure.com/subscriptions/5cb9e7c3-0e31-4388-94e9-b36eab4bf977/providers/Microsoft.AlertsManagement/alerts?api-version=2019-05-05-preview&timeRange=7d" -o json`
+
+The `summarize` form is here for a different reason: it names a column, so `metricMeasureColumn`
+carries the count into the alert payload and an operator sees how many events fired the rule
+without re-running the query.
 
 **Fires** on one event in fifteen minutes. **Clears** by itself once fifteen minutes pass without
 one. Auto-clearing discards no evidence — the `traces` row outlives the alert instance and the
@@ -1370,11 +1377,18 @@ severity 3 and `switchback-ingest-ground-lost` is severity 2.
 | `switchback-ingest-lease-expired` | `reclaimExpiredJobs` returns the row to `queued` at `RECLAIM_PRIORITY` | runs off `ingestPump`'s two-minute timer |
 | `ingestDrain` request failure | the host abandons and redelivers the message | `maxDeliveryCount`, 5; then the dead-letter queue and its own metric alert |
 
-**Severity, not threshold, is what stops the paging.** The condition is still `> 0` over fifteen
-minutes, so a single transient is still detected and still recorded; what changed is that it no
-longer wakes anybody and no longer needs a human to close it. Raising the threshold instead would
-make the rule blind to the first few instances of a real fault, which is the opposite of what a
+**Severity is a triage label, not a mute.** The condition is still `> 0` over fifteen minutes, so a
+single transient is still detected and still recorded. Raising the threshold instead would make the
+rule blind to the first few instances of a real fault, which is the opposite of what a
 degraded-state signal is for.
+
+**What it does not do is stop the notification, and that is worth being exact about.** This rule
+carries the same `ag-switchback-prod` action group as `switchback-ingest-ground-lost`, and that
+group holds one enabled email receiver — so an arm below still sends the owner mail, at severity 3
+under a rule name that says the system is repairing itself. What the split buys is that the subject
+line distinguishes lost ground from a retry, and that this rule clears itself instead of needing a
+person to close it. Routing severity 3 somewhere quieter needs a second action group, which this
+template does not declare.
 
 `switchback-ingest-lease-expired` is the reaper doing its job, not a fault: a Service Bus lock
 expires mid-handler, the redelivery finds the database lease still held and logs "nothing
@@ -1520,15 +1534,24 @@ allowance it enforces with a block, and only a block stops ingestion outright. R
 onto 504 would replace a signal for the one unrecoverable upstream failure with a busier signal for
 the recoverable one.
 
-The threshold has been crossed, which is the evidence that it is set somewhere real: ten instances
-between 2026-08-08T22:44:37Z and 2026-08-09T21:29:45Z, and none since. Over the 48 h to
-2026-08-10T17:00Z the busiest hour held 3, so the rule is correctly quiet rather than inert.
+**A threshold of 8 has never been reached, and nothing here should be read as saying it has.** The
+ten instances between 2026-08-08T22:44:37Z and 2026-08-09T21:29:45Z were fired by the *previous*
+setting — `> 0` over fifteen minutes — which this rule replaced at 2026-08-09T23:50:53Z. Measured
+over the seven days to 2026-08-10T19:20Z the busiest hour held **3**:
+
+```
+traces | where message has "switchback-ingest-overpass-strain" and message has "status=429"
+       | summarize n = count() by bin(timestamp, 1h) | order by n desc
+2026-08-08T22:00Z 3 | 2026-08-10T05:00Z 3 | 2026-08-09T20:00Z 3 | 2026-08-09T21:00Z 3
+```
+
+So 8 is derived from the block arithmetic above, not calibrated against an observed breach, and the
+rule is **unproven at this setting** — quiet is consistent with a correct threshold and with an
+inert one, and only a real block would tell them apart.
 
 **Fires** when Overpass returns more than 8 rate limits in any rolling hour. **Clears** by itself
-once the trailing hour falls back to 8 or fewer — the `summarize` form returns a row holding the
-count when nothing matches, so "below threshold" is a measurement the rule can act on rather than
-an empty result. The projecting form returns no row, and all ten instances above sat `Fired` under
-`autoMitigate: true` while it was in use.
+once the trailing hour falls back to 8 or fewer, because `autoMitigate` is on — see the note on
+`switchback-ingest-ground-lost` for why that flag, and not the query's shape, is what decides it.
 ''')
 resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-overpass-limited'
