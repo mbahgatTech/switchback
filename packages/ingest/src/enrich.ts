@@ -116,7 +116,7 @@ export function parseEleM(value: string | undefined): number | null {
 }
 
 /** `out center` gives ways a synthetic centre point; nodes have their own position. */
-function positionOf(element: OverpassElement): LngLat | null {
+export function featurePosition(element: OverpassElement): LngLat | null {
   if (element.type === 'node') return [element.lon, element.lat];
   if (element.type === 'way' && element.center) return [element.center.lon, element.center.lat];
   return null;
@@ -145,7 +145,7 @@ export function attachWaypoints(
     const kind = classifyWaypoint(tags);
     if (!kind) continue;
 
-    const position = positionOf(element);
+    const position = featurePosition(element);
     if (!position) continue;
 
     const nearest = nearestPointOnLine(position, coords);
@@ -197,7 +197,7 @@ export function terminusFeatures(
     if (element.type !== 'node' && element.type !== 'way') continue;
     const kind = classifyTerminus(element.tags ?? {});
     if (!kind) continue;
-    const at = positionOf(element);
+    const at = featurePosition(element);
     if (at) placed.push({ at, kind });
   }
 

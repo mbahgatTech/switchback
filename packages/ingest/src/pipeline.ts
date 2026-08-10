@@ -42,6 +42,7 @@ import {
   terminusFeatures,
 } from './enrich';
 import type { EnrichedWaypoint } from './enrich';
+import { buildFeatureIndex, type FeatureIndex } from './feature-index';
 import { TerrainSource, elevateLine } from './elevate';
 import { IngestDeadlineError, assertBefore } from './deadline';
 import {
@@ -363,8 +364,8 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const region = await lookupRegion(bbox, deps);
   /**
    * Waypoints for the whole tile in one query rather than one per trail: forty trails would
-   * be forty Overpass requests at two concurrent, for overlapping data. `attachWaypoints`
-   * does the per-trail assignment locally.
+   * be forty Overpass requests at two concurrent, for overlapping data. The per-trail assignment
+   * is local, through the grid `buildFeatureIndex` puts over the answer.
    */
   let features: OverpassElement[] = [];
   if (deps.enrichWaypoints !== false) {
@@ -376,6 +377,14 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       log(`${OVERPASS_SKIPPED_MARKER} features failed`, { quadkey, error: String(error) });
     }
   }
+  /*
+   * Built once for the tile, not once per trail. Unindexed, the two enrichment passes scan every
+   * feature for every trail: on tile 023010230 (30,838 features, 1,518 trails) that is 349.45 ms
+   * a trail and 530.5 s for the tile, against a nine-minute INGEST_DEADLINE_MS that also has to
+   * cover Overpass and elevation. Indexed it is 0.509 ms a trail and 0.79 s for the tile, and
+   * attaches the same 14,881 waypoints.
+   */
+  const featureIndex = buildFeatureIndex(features);
 
   let committed = 0;
   let skipped = 0;
@@ -399,7 +408,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       const outcome = await commitGate.run(() =>
         commitTrail(db, trail, {
           quadkey,
-          features,
+          features: featureIndex,
           region,
           terrain,
           now: now(),
@@ -959,10 +968,12 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
   const quadkey = tileToQuadkey(lngLatToTile(start[0], start[1], INGEST_ZOOM));
 
   // No waypoint query: `buildFeatureQuery` over a Mexico-to-Canada bbox would ask a public
-  // Overpass instance for every gate and viewpoint in the western United States.
+  // Overpass instance for every gate and viewpoint in the western United States. An empty index
+  // reads the same way a failed feature query does, which is what this route wants — the trail's
+  // existing title and waypoints must survive a re-ingest that never looked for features.
   const outcome = await commitTrail(db, assembled, {
     quadkey,
-    features: [],
+    features: buildFeatureIndex([]),
     region,
     terrain,
     now: now(),
@@ -983,7 +994,7 @@ export async function processRoute(osmId: number, deps: PipelineDeps): Promise<P
 
 interface CommitContext {
   quadkey: string;
-  features: readonly OverpassElement[];
+  features: FeatureIndex;
   region: RegionInfo;
   terrain: TerrainSource;
   now: Date;
@@ -1163,6 +1174,19 @@ async function attemptCommit(
   // Storing it would publish a flat sea-level trail with zero gain, which reads as fact.
   if (gapCount === points.length) return 'skipped';
 
+  /*
+   * One index query for both enrichment passes. `oriented` below is `resolved.coords` possibly
+   * reversed, so the two lines hold the same points and one answer serves both — which is also
+   * why the answer cannot depend on direction.
+   *
+   * Neither call needs the old "did the feature query return anything" guard any more: both
+   * answer empty for an empty list, and an empty `TerminusKinds` reaches every branch of
+   * `deriveTrail` exactly as `undefined` did. `displayName` below still needs it, and asks
+   * `sourceCount` — the count of features *offered*, which an empty tile and a failed query
+   * differ on and the index's own size does not.
+   */
+  const near = ctx.features.near(resolved.coords);
+
   const derived = deriveTrail({
     coords: resolved.coords,
     profile: points,
@@ -1170,7 +1194,7 @@ async function attemptCommit(
     tags: trail.tags,
     // Read off the un-oriented line, before `deriveTrail` may flip it — see
     // `terminusFeatures` for why that is safe.
-    termini: ctx.features.length ? terminusFeatures(resolved.coords, ctx.features) : undefined,
+    termini: terminusFeatures(resolved.coords, near),
   });
 
   // `derived.coords` and `derived.profile`, never `trail.coords` and `points`. OSM stores
@@ -1179,7 +1203,7 @@ async function attemptCommit(
   const oriented = derived.coords;
   const profile = [...derived.profile];
 
-  const waypoints = ctx.features.length ? attachWaypoints(oriented, ctx.features) : [];
+  const waypoints = attachWaypoints(oriented, near);
   const trailhead = synthesiseTrailhead(oriented);
   const allWaypoints = trailhead ? [trailhead, ...waypoints] : waypoints;
   // Elevations are resolved once here rather than inside the insert below, because the display
@@ -1192,7 +1216,7 @@ async function attemptCommit(
   // Guarded like `waypoints` and `termini` above: a failed feature query is indistinguishable
   // here from a trail with nothing near it, and deriving null from no evidence would write
   // that null over a good title on re-ingest — dragging the search vector with it.
-  const displayName = ctx.features.length
+  const displayName = ctx.features.sourceCount
     ? deriveDisplayName({
         name: trail.name,
         routeType: derived.routeType,
