@@ -49,6 +49,9 @@ const PLATE: Readonly<Record<AttributionKey, string>> = {
   openFreeMap: theme.color.ink,
   protomaps: theme.color.ink,
   openMeteo: theme.color.water,
+  // Photographs are photographs, not a plate this app draws — the same reasoning as satellite.
+  wikimediaCommons: theme.color.bezel,
+  mapillary: theme.color.bezel,
 };
 
 /**

@@ -33,6 +33,7 @@ import type { TrailPhoto } from '@switchback/api/routers/photos';
 import { useTRPC } from '../../trpc/react';
 import { useUnitsOr } from '../units';
 import { PhotoUploader } from './uploader';
+import { PhotoCreditLine } from './credit';
 import { Photograph, PhotographMissing, PhotographUnavailable } from './photograph';
 import { ModerateControl, ReportControl } from '../moderation/report-control';
 import { BUTTON_COLLAR, DANGER, HEIGHT, OUTLINE, SECONDARY } from '../controls';
@@ -211,8 +212,15 @@ export function PhotoGallery({
                      * distinguishes "taken down" from "the file 404s", which are otherwise
                      * the same picture.
                      */}
-                    {photo.hidden ? 'Removed' : creditOf(photo)}
-                    {photo.license && !photo.hidden ? ` · ${photo.license}` : ''}
+                    {photo.hidden ? (
+                      'Removed'
+                    ) : (
+                      <PhotoCreditLine
+                        credit={creditOf(photo)}
+                        sourceUrl={photo.sourceUrl}
+                        licence={photo.license}
+                      />
+                    )}
                   </span>
                   {photo.distM !== null ? (
                     <span className="shrink-0 text-contour">
@@ -316,8 +324,11 @@ export function PhotoGallery({
                 ) : null}
 
                 <p className="mt-sm font-mono text-micro text-ink-muted">
-                  {creditOf(open)}
-                  {open.license ? ` · ${open.license}` : ''}
+                  <PhotoCreditLine
+                    credit={creditOf(open)}
+                    sourceUrl={open.sourceUrl}
+                    licence={open.license}
+                  />
                   {monthOf(open.capturedAt) ? ` · ${monthOf(open.capturedAt)}` : ''}
                   {open.distM !== null
                     ? ` · ${formatDistance(open.distM, units)} along the trail`

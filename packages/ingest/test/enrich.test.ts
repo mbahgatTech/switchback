@@ -9,7 +9,7 @@ import {
   fetchCommonsPhotos,
   fetchMapillaryPhotos,
   fetchSeedPhotos,
-  isOrbitalImagery,
+  fileNameOf,
   parkingCapacity,
   parseEleM,
   synthesiseTrailhead,
@@ -243,72 +243,29 @@ describe('featureSearchBBox', () => {
   });
 });
 
-describe('isOrbitalImagery', () => {
-  const orbital = (attribution: string | null, url = 'https://upload.wikimedia.org/x.jpg') =>
-    isOrbitalImagery({ url, attribution });
+/**
+ * What `imageinfo` appends to every `url` and `thumburl`. Reproduced verbatim from a live
+ * geosearch response, because a paraphrase of it is what let this ship.
+ */
+const CAMPAIGN = '?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=original';
 
-  it('recognises the two credits that outnumber every photographer on Commons', () => {
-    // The top two attributions in a 127,000-photograph seed corpus, and they differ only by
-    // a space before the comma — which is why the rule keys on the organisation and not on
-    // the string. Between them, 17,777 pictures of cloud.
-    expect(orbital('Earth Science and Remote Sensing Unit , Lyndon B. Johnson Space Center')).toBe(
-      true,
+describe('fileNameOf', () => {
+  it('reads the name out of a plain URL', () => {
+    expect(fileNameOf('https://upload.wikimedia.org/wikipedia/commons/8/8e/Ben_Nevis.jpg')).toBe(
+      'Ben_Nevis.jpg',
     );
-    expect(orbital('Earth Science and Remote Sensing Unit, NASA Johnson Space Center')).toBe(true);
   });
 
-  it('recognises the agencies and their programmes', () => {
-    expect(orbital('NASA')).toBe(true);
-    expect(orbital('NASA/USGS (Landsat)')).toBe(true);
-    expect(orbital('NASA/METI/AIST/Japan Space Systems, and U.S./Japan ASTER Science Team')).toBe(
-      true,
+  it('drops the campaign parameters Commons appends', () => {
+    expect(fileNameOf(`https://upload.wikimedia.org/a/bc/Ben_Nevis.jpg${CAMPAIGN}`)).toBe(
+      'Ben_Nevis.jpg',
     );
-    expect(orbital('Contains modified Copernicus Sentinel-2 data 2023')).toBe(true);
-    expect(orbital('ESA')).toBe(true);
-    expect(orbital('NASA Goddard Space Flight Center')).toBe(true);
   });
 
-  it('recognises a frame designator even when the credit says nothing', () => {
-    // The catalogue number the Johnson Space Center assigns, carried into the filename.
-    const named = (file: string) => orbital(null, `https://upload.wikimedia.org/a/bc/${file}`);
-    expect(named('ISS042-E-107916_-_View_of_Earth.jpg')).toBe(true);
-    expect(named('Iss040e091208.jpeg')).toBe(true); // the same thing, unpunctuated
-    expect(named('SL2-11-92_-_View_of_Earth.jpg')).toBe(true); // Skylab
-    expect(named('STS061A-101-005.jpg')).toBe(true); // Shuttle
-    expect(named('AS17-148-22727.jpg')).toBe(true); // Apollo
-  });
-
-  it('does not mistake a photographer whose name contains an acronym', () => {
-    // Three letters is a very small target and `\b` is ASCII-only, so this is the whole
-    // reason the agency rule is fenced with Unicode look-arounds rather than word breaks.
-    for (const name of ['Caesar', 'Teresa', 'Mesa', 'Chiesa', 'Katormesa', 'jamesadney']) {
-      expect(orbital(name)).toBe(false);
-    }
-    // And the reason it is case-sensitive: Esa is a Finnish given name, and a hyphen is not
-    // a letter, so a look-around alone would not have saved this one.
-    expect(orbital('Esa-Pekka Salonen')).toBe(false);
-  });
-
-  it('keeps the ground survey agency whose pictures are of the ground', () => {
-    // USGS photography is very nearly a description of this product's subject. Their few
-    // genuine satellite scenes say Landsat on them and are caught by that.
-    expect(orbital('United States Geological Survey (USGS)')).toBe(false);
-    expect(orbital('USGS, Department of the Interior')).toBe(false);
-    expect(orbital('USGS Landsat')).toBe(true);
-  });
-
-  it('does not read a mission word out of a place name or a wildflower', () => {
-    // Sentinel Dome is one of the most photographed viewpoints in Yosemite, and Aster is a
-    // genus that grows beside half the trails in the corpus. A filename-word rule would
-    // have deleted both, which is why there isn't one.
-    const named = (file: string, by: string) =>
-      orbital(by, `https://upload.wikimedia.org/a/bc/${file}`);
-    expect(named('View_from_Sentinel_Dome.jpg', 'Supercarwaar')).toBe(false);
-    expect(named('Yosemite_National_Park%2C_Sentinel_Rock.jpg', 'Matthew Dillon')).toBe(false);
-    expect(named('Aster_family_with_bee_pollinators.jpg', 'brewbooks from near Seattle, USA')).toBe(
-      false,
-    );
-    expect(named('Issaquah_Alps_trail.jpg', 'Ruth Hartnup')).toBe(false);
+  it('does not read a file name out of a query string or a fragment', () => {
+    // A `.jpg` sitting in a parameter's value must not make a PDF look like a photograph.
+    expect(fileNameOf('https://example.test/scan.pdf?preview=thumb.jpg')).toBe('scan.pdf');
+    expect(fileNameOf('https://example.test/plan.svg#Ben_Nevis.jpg')).toBe('plan.svg');
   });
 });
 
@@ -330,6 +287,9 @@ describe('fetchCommonsPhotos', () => {
       },
     ],
     coordinates: [{ lat: 56.797, lon: -5.003 }],
+    // Every real geosearch response carries these, and the subject test reads them. A fixture
+    // without them describes a response Commons does not send.
+    categories: [{ title: 'Category:Ben Nevis' }, { title: 'Category:Mountains of Scotland' }],
   };
 
   it('maps a geosearch result onto our photo shape', async () => {
@@ -374,9 +334,48 @@ describe('fetchCommonsPhotos', () => {
     expect(photos).toEqual([]);
   });
 
+  it('keeps a photograph whose URL carries the campaign parameters imageinfo appends', async () => {
+    // Commons stopped returning bare file URLs. Every `url` and `thumburl` now ends in a query
+    // string, so a file-type guard reading the whole URL rejects the entire response — which is
+    // what left 17,753 trails with no photograph while every enrich job recorded success.
+    const tagged = {
+      ...page,
+      imageinfo: [
+        {
+          ...page.imageinfo[0],
+          url: `https://upload.wikimedia.org/ben-nevis.jpg${CAMPAIGN}`,
+          thumburl: `https://upload.wikimedia.org/thumb/ben-nevis.jpg${CAMPAIGN}`,
+        },
+      ],
+    };
+    const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
+      fetchImpl: (async () =>
+        jsonResponse({ query: { pages: [tagged] } })) as unknown as typeof fetch,
+    });
+
+    expect(photos).toHaveLength(1);
+    // Stored as Commons returned it: nothing downstream reads the path, and rewriting an
+    // upstream URL needs a better reason than tidiness.
+    expect(photos[0]!.url).toBe(`https://upload.wikimedia.org/ben-nevis.jpg${CAMPAIGN}`);
+  });
+
+  it('still skips a diagram when the campaign parameters are present', async () => {
+    // The fix must widen the guard, not remove it.
+    const svg = {
+      ...page,
+      pageid: 9,
+      imageinfo: [{ url: `https://upload.wikimedia.org/plan.svg${CAMPAIGN}` }],
+    };
+    const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
+      fetchImpl: (async () => jsonResponse({ query: { pages: [svg] } })) as unknown as typeof fetch,
+    });
+    expect(photos).toEqual([]);
+  });
+
   it('drops the Earth as seen from orbit, which geosearch returns as a local photograph', async () => {
     // Geosearch answers "what is tagged with coordinates near here", and an astronaut's
-    // frame of the Cascades is tagged with the coordinates of the Cascades.
+    // frame of the Cascades is tagged with the coordinates of the Cascades. Dropped on its
+    // category, so a commercial operator's scene goes the same way as a NASA one.
     const fromSpace = {
       ...page,
       pageid: 42,
@@ -384,13 +383,10 @@ describe('fetchCommonsPhotos', () => {
       imageinfo: [
         {
           url: 'https://upload.wikimedia.org/wikipedia/commons/4/4d/ISS042-E-107916_-_View_of_Earth.jpg',
-          extmetadata: {
-            Artist: {
-              value: 'Earth Science and Remote Sensing Unit , Lyndon B. Johnson Space Center',
-            },
-          },
+          extmetadata: { Artist: { value: 'NASA Johnson' } },
         },
       ],
+      categories: [{ title: 'Category:ISS Expedition 42 Crew Earth Observations (dump)' }],
     };
     const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
       fetchImpl: (async () =>
@@ -460,6 +456,7 @@ describe('fetchSeedPhotos', () => {
       pageid: i,
       title: `File:${i}.jpg`,
       imageinfo: [{ url: `https://upload.wikimedia.org/${i}.jpg` }],
+      categories: [{ title: 'Category:Mountains of Scotland' }],
     }));
 
   it('does not call Mapillary when Commons already has enough', async () => {

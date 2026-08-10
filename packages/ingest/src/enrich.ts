@@ -6,6 +6,7 @@
 import type { BBox, LngLat, WaypointKind } from '@switchback/core';
 import type { PlacedFeature, TerminusKinds } from '@switchback/geo';
 import { nearestPointOnLine, padBBox, terminusKinds } from '@switchback/geo';
+import { offSubjectReason } from './photo-subject';
 import type { OverpassElement } from './overpass';
 
 /**
@@ -280,44 +281,23 @@ interface CommonsPage {
     extmetadata?: Record<string, { value?: string } | undefined>;
   }>;
   coordinates?: Array<{ lat: number; lon: number }>;
+  categories?: Array<{ title: string }>;
 }
 
 /**
- * Space agencies. Both the case-sensitivity and the Unicode look-arounds are load-bearing:
- * `\b` is ASCII-only and a loose `/ESA/` finds Teresa, Mesa and Chiesa, while an `/i` flag
- * would delete Esa-Pekka Salonen. The agencies write themselves in capitals every time.
+ * The file name inside a URL. Commons `imageinfo` appends campaign parameters to every `url` and
+ * `thumburl` it returns (`?utm_source=commons.wikimedia.org&utm_campaign=imageinfo`), so anything
+ * asking what kind of file this is has to drop the query string first or it is reading the last
+ * parameter's value. Total by construction — a malformed URL yields whatever follows the last
+ * slash, which is what the caller below wants.
  */
-const ORBITAL_AGENCY = /(?<![\p{L}\p{N}])(?:NASA|ESA|JAXA|MODIS)(?![\p{L}\p{N}])/u;
-
-/**
- * Earth-observation programmes. Three entries carry a qualifier against real trail subjects:
- * Goddard is a surname, Aster is a trailside wildflower, and Sentinel Dome in Yosemite is one
- * of the most photographed viewpoints in the corpus. USGS is deliberately absent — it is a
- * *ground* survey agency whose Commons corpus is nearly a description of this product.
- */
-const ORBITAL_PROGRAMME =
-  /remote sensing|earth science|earth observatory|johnson space|goddard space|copernicus|landsat|sentinel-\d|aster science/i;
-
-/**
- * Astronaut-photography frame designators (`ISS042-E-107916`, `STS061A-101-005`). Machine
- * identifiers, so they collide with nothing — matching a mission *word* instead would delete
- * every photograph taken from Sentinel Dome. Matched against the raw basename, which needs no
- * decoding: a designator is ASCII, and `decodeURIComponent` throws on the malformed escapes
- * Commons filenames occasionally carry.
- */
-const ORBITAL_FRAME = /^(?:iss\d+(?:-e-|e)\d+|sl\d+-\d+-\d+|sts\d+|as\d+-\d+-\d+)/i;
-
-/**
- * Is this a picture of the Earth from space rather than of somewhere on it? Commons geosearch
- * tags an astronaut's photograph of the Cascades with the coordinates of the Cascades, and
- * nothing in the response distinguishes the two. Two independent tests, either sufficient: the
- * credit catches Landsat and ASTER scenes, the designator catches astronaut photography whose
- * credit is missing or simply says `NASA`.
- */
-export function isOrbitalImagery(photo: { url: string; attribution?: string | null }): boolean {
-  const credit = photo.attribution ?? '';
-  if (ORBITAL_AGENCY.test(credit) || ORBITAL_PROGRAMME.test(credit)) return true;
-  return ORBITAL_FRAME.test(photo.url.split('/').pop() ?? '');
+export function fileNameOf(url: string): string {
+  return (
+    url
+      .replace(/[?#].*$/, '')
+      .split('/')
+      .pop() ?? ''
+  );
 }
 
 /**
@@ -345,10 +325,14 @@ export async function fetchCommonsPhotos(
     ggsradius: String(Math.min(Math.max(Math.round(radiusM), 10), 10_000)),
     ggslimit: String(limit),
     ggsnamespace: '6', // File:
-    prop: 'imageinfo|coordinates',
+    prop: 'imageinfo|coordinates|categories',
     iiprop: 'url|size|extmetadata',
     iiurlwidth: '1600',
-    iiextmetadatafilter: 'LicenseShortName|Artist|Credit|LicenseUrl',
+    iiextmetadatafilter: 'LicenseShortName|Artist|Credit|LicenseUrl|ImageDescription',
+    // Categories are what Commons files an image *as*, and the subject test's main evidence.
+    // Hidden ones are maintenance bookkeeping and say nothing about the subject.
+    cllimit: 'max',
+    clshow: '!hidden',
   }).toString();
 
   const body = await getJson<{ query?: { pages?: CommonsPage[] } }>(
@@ -362,14 +346,24 @@ export async function fetchCommonsPhotos(
   for (const page of body.query.pages) {
     const info = page.imageinfo?.[0];
     if (!info?.url) continue;
-    // Commons hosts maps, diagrams and scanned documents alongside photographs.
-    if (!/\.(jpe?g|png|webp)$/i.test(info.url)) continue;
+    // Commons hosts maps, diagrams and scanned documents alongside photographs. Asked of the file
+    // name, not the URL: `imageinfo` appends campaign parameters, and a guard anchored on the
+    // extension matched nothing at all once it did.
+    if (!/\.(jpe?g|png|webp)$/i.test(fileNameOf(info.url))) continue;
 
     const meta = info.extmetadata ?? {};
     const attribution = stripHtml(meta.Artist?.value ?? meta.Credit?.value) ?? null;
-    // ...and a great deal of the Earth as seen from orbit, tagged with the coordinates of the
-    // ground it shows, which geosearch cannot tell from a photograph taken standing on it.
-    if (isOrbitalImagery({ url: info.url, attribution })) continue;
+    // Geosearch answers "what carries coordinates near here", which is not "what is a photograph
+    // of here" — a knitted cowl shot in a house 400 m off the path is a valid hit.
+    const offSubject = offSubjectReason({
+      title: page.title,
+      description: stripHtml(meta.ImageDescription?.value),
+      attribution,
+      categories: (page.categories ?? []).map((category) =>
+        category.title.replace(/^Category:/, ''),
+      ),
+    });
+    if (offSubject) continue;
 
     const coordinate = page.coordinates?.[0];
     photos.push({

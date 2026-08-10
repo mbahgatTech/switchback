@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 // one mode where the native side overwrites the `content-type` our signature covers.
 import { UploadType } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
+import * as WebBrowser from 'expo-web-browser';
 import {
   ActivityIndicator,
   Image,
@@ -23,6 +24,7 @@ import {
   blurhashAverageColor,
   formatBytes,
   formatDistance,
+  licenceUri,
 } from '@switchback/core';
 import { nativeTheme } from '@switchback/ui';
 import { GALLERY_LIMIT } from '@/api/pages';
@@ -403,8 +405,19 @@ function Frame({
       </Pressable>
       <View style={styles.creditRow}>
         <Text style={styles.credit} numberOfLines={1}>
-          {creditOf(photo)}
-          {photo.license ? ` · ${photo.license}` : ''}
+          {photo.sourceUrl ? (
+            <Text style={styles.creditLink} onPress={() => openCredit(photo.sourceUrl)}>
+              {creditOf(photo)}
+            </Text>
+          ) : (
+            creditOf(photo)
+          )}
+          {photo.license ? ' · ' : ''}
+          {photo.license ? (
+            <Text style={styles.creditLink} onPress={() => openCredit(licenceUri(photo.license))}>
+              {photo.license}
+            </Text>
+          ) : null}
         </Text>
         {photo.distM === null ? null : (
           <Text style={styles.creditDist}>{`${formatDistance(photo.distM, units)} in`}</Text>
@@ -664,6 +677,15 @@ function creditOf(photo: TrailPhoto): string {
   return photo.source.charAt(0).toUpperCase() + photo.source.slice(1);
 }
 
+/**
+ * Open a credit or a licence deed in the in-app browser. Swallows its own rejection: a credit
+ * that will not open must not take the gallery down with it.
+ */
+function openCredit(href: string | null | undefined): void {
+  if (!href) return;
+  void WebBrowser.openBrowserAsync(href).catch(() => {});
+}
+
 /** `September 2024` — the month is as precise as a photograph's date needs to be. */
 function monthOf(value: Date | string | null): string | null {
   if (!value) return null;
@@ -708,6 +730,9 @@ const styles = StyleSheet.create({
   },
   creditRow: { flexDirection: 'row', alignItems: 'baseline', gap: theme.space.sm },
   credit: { ...theme.text('micro', { family: 'mono' }), color: theme.color.inkMuted, flex: 1 },
+  // Underlined because a credit is a licence obligation and has to read as reachable, not as
+  // decoration — CC BY-SA 4.0 §3.a.1 wants the material and its licence linked, not just named.
+  creditLink: { textDecorationLine: 'underline' },
   // Contour, the plate that means distance everywhere else on this screen.
   creditDist: { ...theme.text('micro', { family: 'mono' }), color: theme.color.contour },
 
