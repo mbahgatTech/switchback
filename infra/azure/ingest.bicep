@@ -1688,10 +1688,11 @@ subdivision. `photoSeedBlackout` reports only unanimity over `MIN_ENRICH_SAMPLE`
 because most trails have no Commons photograph within radius — 25 of 40 sampled from the corpus —
 and a gauge counting one empty trail would never fall.
 
-`autoMitigate` is **on**, unlike the rule above, and the difference is deliberate. That one is
-edge-triggered — a thing happened. This is a gauge: distress is present or it is not, the pump
-re-reads it every two minutes, and a fixed queue should clear the alert rather than leave a
-resolved condition open. Severity 3 for the same reason: it is a backlog, not an outage.
+`autoMitigate` is **on**, as it is on every rule in this file. What differs here is the reason: the
+edge-triggered rules above clear once their window empties, whereas this is a gauge — distress is
+present or it is not, the pump re-reads it every two minutes, and a fixed queue should clear the
+alert rather than leave a resolved condition open. Severity 3 for the same reason: it is a backlog,
+not an outage.
 
 `apps/ingest-worker/test/health.test.ts` asserts this query and the marker the code logs agree, so
 a reworded log line fails the build instead of silently disarming the rule.

@@ -408,10 +408,10 @@ describe('processTile, out of clock', () => {
 
   it('reports an exhausted descendant once, not on every drain', async () => {
     /*
-     * The alert this feeds is Count > 0 over fifteen minutes with `autoMitigate` off, and a
-     * blocked parent is `pending` — so `ensureCoverage` re-queues it on every viewport poll and
-     * the client polls precisely *because* it is pending. A line per drain would page every
-     * quarter of an hour for as long as anyone left that map open.
+     * `switchback-ingest-ground-lost` fires on one event in fifteen minutes, and a blocked parent
+     * is `pending` — so `ensureCoverage` re-queues it on every viewport poll and the client polls
+     * precisely *because* it is pending. A line per drain would page every quarter of an hour for
+     * as long as anyone left that map open.
      */
     const children = ['1202212030', '1202212031', '1202212032', '1202212033'].map(
       (quadkey, index) => ({

@@ -133,7 +133,7 @@ export async function resolveTrail(
   };
 }
 
-/** Ascending, so every committer takes `trail_ways` locks in one order. See `claimWays`. */
+/** Ascending, so a way-id list has one canonical order however the caller assembled it. */
 function byWayId(a: bigint, b: bigint): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -142,12 +142,14 @@ function byWayId(a: bigint, b: bigint): number {
  * Point ways at this trail, in two round trips rather than one upsert each — a long relation's
  * member list runs to hundreds of ways inside a transaction with a 30 s ceiling.
  *
- * **Both writes take way ids in ascending order, and that ordering is load-bearing.** Two tiles
- * sharing a way commit concurrently at `COMMIT_CONCURRENCY`, and Postgres holds each touched row
- * until its transaction ends; committers that acquire the same ids in opposite orders deadlock
- * rather than queue. Ordering makes the second committer wait instead. It does not cover a
- * `contested` set that overlaps another committer's `fresh` set, which is why `commitTrail`
- * also retries `40P01`.
+ * **The insert's order is load-bearing; the repoint's is not.** Two tiles sharing a way commit
+ * concurrently at `COMMIT_CONCURRENCY`, and Postgres holds each touched row until its transaction
+ * ends. `createMany` sends one `VALUES` list and takes the new primary keys in the order written,
+ * so sorting makes the second committer wait rather than deadlock. `updateMany` sends one
+ * `WHERE "wayId" = ANY (…)`, where the planner picks the visit order — a bitmap heap scan takes
+ * physical order, an index scan sorts the array itself — so sorting there buys determinism, not
+ * lock order, and a `contested` update racing another committer's insert is covered by
+ * `commitTrail`'s `40P01` retry instead.
  */
 export async function claimWays(
   tx: Prisma.TransactionClient,

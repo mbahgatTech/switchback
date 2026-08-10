@@ -1064,23 +1064,29 @@ stops firing when they no longer should. The **48 h** column counts clock-aligne
 buckets carrying that rule's arming signal between 2026-08-07T21:12Z and 2026-08-09T21:12Z, read
 from `AppTraces`/`AppRequests` in `log-switchback-prod` — `appi-switchback-ingest` is the only
 component writing there, so those tables and the `traces`/`requests` the rules themselves query are
-the same rows. `worker-silent` evaluates over 30 min and `overpass-limited` over an hour, so for
-those two a bucket measures pressure rather than an instance the rule would have raised.
+the same rows.
+
+**It measures pressure, not pages.** A rule whose threshold is above zero, or whose window is longer
+than the bucket, can carry its signal in many buckets and still never fire: `overpass-limited` needs
+more than 8 in a rolling hour and `overpass-skipped` more than 4 in fifteen minutes, and neither was
+reached over this window. `worker-silent` reads a 30-minute absence, so its 35 are the single
+524-minute gap of 2026-08-08/09 — 34 consecutive buckets from 23:15Z — plus one isolated bucket at
+2026-08-08T17:30Z, not 35 pages.
 
 | Rule                                 | Sev | Fires when                                                                                           | Clears when                           | 48 h |
 | ------------------------------------ | --- | ---------------------------------------------------------------------------------------------------- | ------------------------------------- | ---- |
-| `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                                               | A heartbeat lands                     | 34   |
+| `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                                               | A heartbeat lands                     | 35   |
 | `switchback-db-token-alarm`          | 1   | A Vercel token renewal failed, or a token is nearly expired                                          | The 15-min window comes back empty    | 1    |
 | `switchback-ingest-ground-lost`      | 2   | Trails uncommitted, a job buried, a subtree stuck, a signal stranded, a double commit, a tile wedged | 15 min pass with none of them         | 2    |
 | `switchback-ingest-pump-failing`     | 2   | 3 of the last 4 windows carried a rejected `ingestPump`                                              | Two consecutive clean windows         | 0    |
-| `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                                          | The trailing hour drops to 8 or fewer | 0    |
+| `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                                          | The trailing hour drops to 8 or fewer | 15   |
 | `switchback-ingest-deadletter`       | 2   | A message is sitting in the dead-letter queue                                                        | The queue is drained                  | 0    |
 | `switchback-ingest-drain-degraded`   | 3   | A job failed and was rescheduled, a lease expired, a drain was rejected                              | The 15-min window comes back empty    | 5    |
 | `switchback-ingest-queue-distress`   | 3   | Any distress gauge non-zero                                                                          | Every gauge returns to zero           | 61   |
-| `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                                           | The window falls back to 4 or fewer   | 0    |
+| `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                                           | The window falls back to 4 or fewer   | 4    |
 
-The two rules this template adds re-derive from the workspace, and the same shape re-derives the
-rest by substituting the arming predicate:
+The two rules this template adds re-derive from the workspace, and substituting the arming predicate
+re-derives every other row but one:
 
 ```bash
 az monitor log-analytics query -w c188de03-100d-4608-9502-65e12323d986 -o json --analytics-query '
@@ -1095,6 +1101,19 @@ union
 # ground-lost 2, drain-degraded 5   (exit 0)
 ```
 
+`worker-silent` is the exception, because its arming signal is an absence: there is no row to count,
+so the buckets have to be generated and then the ones carrying a heartbeat subtracted.
+
+```bash
+az monitor log-analytics query -w c188de03-100d-4608-9502-65e12323d986 -o json --analytics-query '
+let s = datetime(2026-08-07T21:12:00Z);
+let e = datetime(2026-08-09T21:12:00Z);
+let all = range t from bin(s,15m) to bin(e,15m) step 15m | where t >= s and t < e;
+let seen = AppTraces | where TimeGenerated >= s and TimeGenerated < e | where Message has "switchback-ingest-queue-health" | summarize by t = bin(TimeGenerated, 15m);
+all | join kind=leftanti seen on t | summarize silent = count()'
+# silent 35   (exit 0)
+```
+
 **The live estate is behind this template, and the table describes the template.** Read from Azure on
 2026-08-10 the resource group holds six scheduled query rules — `drain-failed`, `queue-distress`,
 `worker-silent`, `overpass-limited`, `overpass-skipped`, `switchback-db-token-alarm` — plus three
@@ -1107,15 +1126,44 @@ metric alerts. `switchback-ingest-drain-failed` is the rule this template replac
 failure.
 
 **Deploying this template does not delete `switchback-ingest-drain-failed`.** Resource-group
-deployments are incremental, so a rule dropped from the template is left running in Azure and will
-keep paging on the old union. Delete it by hand once the replacements are deployed and confirmed:
+deployments are incremental, so a rule dropped from the template is left running in Azure and keeps
+paging on the old union — and its instances never clear, because it is the one live rule carrying
+`autoMitigate: false`.
+
+**The group's `CanNotDelete` lock refuses that delete, and it refuses it before it checks the rule
+exists.** So the one-line form cannot succeed at any point, and its error names the lock rather than
+the rule — the same `ScopeLocked` comes back for a name that was never there:
 
 ```bash
 az monitor scheduled-query delete -g rg-switchback-prod-northcentralus \
   -n switchback-ingest-drain-failed --yes
+# (ScopeLocked) The scope '.../scheduledQueryRules/switchback-ingest-drain-failed' cannot perform
+# delete operation because following scope(s) are locked:
+# '/subscriptions/.../resourceGroups/rg-switchback-prod-northcentralus'                    (exit 1)
+```
+
+Deleting it takes the same three steps as any other delete in this group — lift, delete, re-PUT —
+and lifting the lock is a deliberate act the lock's own notes require a pull request for. Read the
+body out of `lockNotes` in `main.bicep` rather than typing it: a paraphrase left production drifted
+from the template for eight hours. See [The delete lock](#the-delete-lock).
+
+```bash
+SUB=5cb9e7c3-0e31-4388-94e9-b36eab4bf977
+LOCK=/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Authorization/locks/switchback-prod-no-delete
+RULE=/subscriptions/$SUB/resourceGroups/rg-switchback-prod-northcentralus/providers/Microsoft.Insights/scheduledQueryRules/switchback-ingest-drain-failed
+
+az rest --method DELETE --url "https://management.azure.com$LOCK?api-version=2020-05-01"
+az rest --method DELETE --url "https://management.azure.com$RULE?api-version=2023-03-15-preview"
+az rest --method PUT    --url "https://management.azure.com$LOCK?api-version=2020-05-01" --body @lock.json
+
 az monitor scheduled-query list -g rg-switchback-prod-northcentralus \
   --query "[].name" -o json    # must not contain switchback-ingest-drain-failed
+az lock list -g rg-switchback-prod-northcentralus \
+  --query "[].{name:name,level:level}" -o json   # switchback-prod-no-delete must be back, CanNotDelete
 ```
+
+Both checks matter, and the second more than the first: a lift that is not re-PUT leaves the
+Postgres server and its only backups deletable.
 
 **`switchback-postgres-connections` is Sev1 at a threshold nothing derived.** It fires on
 `active_connections > 300` averaged over 15 minutes. The server's `max_connections` is 429, so 300 is

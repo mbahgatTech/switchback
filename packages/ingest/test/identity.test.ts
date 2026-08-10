@@ -353,7 +353,8 @@ describe('claimWays', () => {
  * Postgres holds every row a transaction touches until it ends, so two committers that take the
  * same ways in opposite orders deadlock instead of queueing. Production 2026-08-10T05:29:56Z and
  * 05:35:57Z: three relations lost to `40P01` on `trail_ways`, across tiles 120221220 and 120221201.
- * Ordering both writes is what turns that collision into a wait.
+ * Ordering the insert is what turns that collision into a wait; the repoint is sorted for
+ * determinism, and `commitTrail`'s `40P01` retry is what covers it.
  */
 describe('the order claimWays takes way locks in', () => {
   it('reads and inserts ascending, whatever order the caller assembled the members in', async () => {
@@ -371,7 +372,8 @@ describe('the order claimWays takes way locks in', () => {
     /*
      * A separate sort from the one above, and it needs its own case: the rows come back from the
      * database, so sorting the read does not sort these. The fake returns them descending for that
-     * reason.
+     * reason. What this pins is the argument the call is given, which is determinism — the planner,
+     * not the array, decides the order `ANY (…)` is visited in.
      */
     const { tx, repointed } = claimTx({ 100: 'other', 200: 'other', 300: 'other' });
 
