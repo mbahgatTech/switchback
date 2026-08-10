@@ -155,16 +155,27 @@ const OUTDOOR_TERMS = [
 const OUTDOOR = new RegExp(`\\b(?:${OUTDOOR_TERMS.join('|')})(?:s|es)?\\b`, 'i');
 
 /**
- * `Genus species`, optionally qualified — Commons files a photograph of a species under it.
- * Two words only: allowing a third matched `Fluvial sediment transport`, and allowing a trailing
- * ` in <place>` matched `Low tide in Canada`. Both cost real landscape photographs.
+ * The shapes Commons gives a taxon category. `Genus species` is only one of them, and matching it
+ * alone let a flowering tree filed under `Koelreuteria` / `Unidentified Sapindaceae` and a wallflower
+ * under `Erysimum (flowers)` reach two trail galleries as their only photograph.
+ *
+ * The Latin suffixes are the reliable half: a family or order name ends in one of them and a place
+ * name does not. A bare single-word genus — `Koelreuteria`, `Haliaeetus` — is *not* matched here,
+ * because nothing in the string separates it from a commune like `Frangy`; those are caught by a
+ * sibling category or not at all.
  */
-const BINOMIAL = /^[A-Z][a-z]+ (?:×\s*)?[a-z-]+(?: \(.+\))?$/;
+const TAXON_SHAPES: readonly RegExp[] = [
+  /^unidentified\b/i,
+  /\b\w{4,}(?:aceae|idae|inae|ales|oideae)\b/i,
+  /^[A-Z][a-z]+ (?:×\s*)?[a-z-]+(?: \(.+\))?$/,
+  // The parenthetical must name a plant part, not a disambiguator: `Bonnevaux (Doubs)` and
+  // `Missionpeak (cropped)` are a commune and a crop, and accepting any bracket dropped both.
+  /^[A-Z][a-z]+ \((?:flowers?|plants?|fruits?|leaves|seeds?|insects?|birds?)\)$/i,
+];
 
 /**
- * The noun Commons leads a wildlife category with. This is what catches an animal whose species
- * category is qualified out of the binomial shape — a coyote filed under both
- * `Canis latrans in California` and `Animals at Santa Teresa County Park`.
+ * The noun Commons leads a wildlife category with, for an animal whose species category is
+ * qualified out of every shape above — a coyote filed under `Canis latrans in California`.
  */
 const WILDLIFE =
   /^(?:animals|fauna|flora|birds|mammals|reptiles|amphibians|insects|arachnids|fungi|lichens|mosses)\b/i;
@@ -174,12 +185,24 @@ const PEOPLE =
   /^(?:husbands and wives|pioneers of|mountaineers from|portraits of|people of|men of|women of|children of|families)/i;
 
 /**
- * A category naming a species rather than a place. The outdoor test settles the collision:
- * `Quarry lakes` and `Marine layer` wear the same two-word shape as `Crotalus horridus`, and only
- * the first is describing ground.
+ * Subjects a photograph is *of* rather than a place it was taken in, matched against the file name
+ * only.
+ *
+ * The name is the uploader's own statement of subject, and it is the one field where these words
+ * are decisive: `Fleur @ Mieussy` is a flower and `Toits et clocher de Sainte-Foy` is a bell tower,
+ * whatever else their categories mention. Deliberately *not* matched against categories, where the
+ * same words appear incidentally — `Blooming flowers with snowy mountains` is a mountain range.
  */
-function namesASpecies(category: string): boolean {
-  return BINOMIAL.test(category) && !OUTDOOR.test(category);
+const CLOSE_UP_SUBJECT =
+  /\b(?:fleur|flower|blossom|mushroom|champignon|fungus|insect|butterfly|papillon|beetle|spider|clocher|bell tower|church tower|statue|vierge|dortoir|panneau|road sign)\b/i;
+
+/**
+ * A field naming a species rather than a place. The outdoor test settles the collision: `Quarry
+ * lakes` and `Marine layer` wear the same two-word shape as `Crotalus horridus`, and only the
+ * first is describing ground.
+ */
+function namesATaxon(field: string): boolean {
+  return TAXON_SHAPES.some((shape) => shape.test(field)) && !OUTDOOR.test(field);
 }
 
 /** The file name, which carries the subject when a file's categories are only a commune. */
@@ -188,11 +211,16 @@ function nameOf(photo: PhotoSubject): string {
 }
 
 /**
- * Everything that can *disqualify* a file. Free text counts here — "Puplinge, aerial view" is the
- * only place that aerial photograph admits what it is.
+ * What a subject rule may read.
+ *
+ * **The invariant: this must be a superset of `qualifying`.** A term that can admit a photograph
+ * has to be visible to the rules that reject one, or the filter fails open — while the file name
+ * could qualify but not disqualify, a flowering tree qualified on the word "tree" in its own name
+ * and no rule could see the `Unidentified Sapindaceae` beside it. Widen `qualifying` and this
+ * widens with it, or the hole comes back.
  */
 function disqualifying(photo: PhotoSubject): string[] {
-  return [...(photo.categories ?? []), nameOf(photo), photo.description ?? ''];
+  return [...qualifying(photo), photo.description ?? ''];
 }
 
 /**
@@ -210,15 +238,23 @@ function qualifying(photo: PhotoSubject): string[] {
  * A reason rather than a boolean so a drop can be counted and read back; "it returned false" is
  * what made the previous filter's total ineffectiveness invisible for 997 jobs.
  *
- * Ordered so the reason names the strongest evidence. The species and people tests run last
+ * Ordered so the reason names the strongest evidence. The subject rules run after the outdoor test
  * because they exist to overturn outdoor evidence, not to stand in for its absence — `Knitted
- * objects` wears the same shape as `Crotalus horridus`, and reporting a cowl as a species would
- * be a true verdict for a false reason.
+ * objects` wears the same shape as `Crotalus horridus`, and reporting a cowl as a species would be
+ * a true verdict for a false reason.
  */
 export function offSubjectReason(photo: PhotoSubject): string | null {
-  const above = disqualifying(photo).find((field) => FROM_ABOVE.test(field));
+  const fields = disqualifying(photo);
+
+  const above = fields.find((field) => FROM_ABOVE.test(field));
   if (above) return `imagery from above (${above.slice(0, 60)})`;
 
+  /*
+   * A convenience, not a control. The operator list is unbounded — Satellogic, BlackSky, ICEYE,
+   * Capella and every operator founded next year are absent from it — so the category test above
+   * is what actually has to catch imagery from orbit. This only shortens the reason when the
+   * credit happens to say so.
+   */
   if (photo.attribution && ORBITAL_OPERATOR.test(photo.attribution)) {
     return 'credited to a spacecraft operator';
   }
@@ -227,16 +263,19 @@ export function offSubjectReason(photo: PhotoSubject): string | null {
     return 'nothing names a landform, a place type or an outdoor setting';
   }
 
-  const categories = photo.categories ?? [];
+  const subject = disqualifying(photo);
 
-  const wildlife = categories.find((category) => WILDLIFE.test(category));
-  if (wildlife) return `subject is wildlife (${wildlife})`;
+  const wildlife = subject.find((field) => WILDLIFE.test(field));
+  if (wildlife) return `subject is wildlife (${wildlife.slice(0, 60)})`;
 
-  const species = categories.find(namesASpecies);
-  if (species) return `subject is a species (${species})`;
+  const taxon = subject.find(namesATaxon);
+  if (taxon) return `subject is a species (${taxon.slice(0, 60)})`;
 
-  const person = categories.find((category) => PEOPLE.test(category));
-  if (person) return `subject is a person (${person})`;
+  const person = subject.find((field) => PEOPLE.test(field));
+  if (person) return `subject is a person (${person.slice(0, 60)})`;
+
+  const closeUp = CLOSE_UP_SUBJECT.exec(nameOf(photo));
+  if (closeUp) return `subject is a close-up of ${closeUp[0]}`;
 
   return null;
 }

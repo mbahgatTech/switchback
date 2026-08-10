@@ -94,24 +94,31 @@ describe('imagery taken from above', () => {
     expect(offSubjectReason({ ...etna, attribution: null })).toMatch(/from above/);
   });
 
-  it('drops every commercial operator the credit-only filter kept', () => {
-    // None of these appear in the previous filter's four acronyms.
+  /*
+   * Operators absent from `ORBITAL_OPERATOR`'s alternation, on purpose. Feeding that regex its own
+   * literals proves only that a list contains what was put in it — the construction that let the
+   * previous filter ship. The category is the control being tested; the credit list is a
+   * convenience that cannot be completed, and these nine are the proof of that.
+   */
+  it('drops an operator its credit list has never heard of, on the category', () => {
     for (const operator of [
-      'Planet Labs',
-      'Maxar Technologies',
-      'DigitalGlobe',
-      'Airbus Defence and Space',
-      'European Space Agency',
-      'Roscosmos',
-      'ISRO',
+      'Satellogic',
+      'BlackSky',
+      'ICEYE',
+      'Capella Space',
+      'GeoEye',
+      'SPOT Image',
+      'Deimos Imaging',
+      'Nearmap',
+      'Vexcel Imaging',
     ]) {
       expect(
         offSubjectReason({
-          title: 'File:Somewhere from orbit.jpg',
+          title: 'File:A place from orbit.jpg',
           attribution: operator,
-          categories: ['Mountains of somewhere'],
+          categories: ['Satellite pictures of Sicily', 'Mountains of Sicily'],
         }),
-      ).toMatch(/spacecraft operator/);
+      ).toMatch(/from above/);
     }
   });
 
@@ -194,10 +201,74 @@ describe('subjects that are not places', () => {
 
   /*
    * The French region `Auvergne-Rhône-Alpes` contains `Alpes`, so a bare `alp` in the outdoor
-   * vocabulary admitted three photographs of a viper. The term is gone; this holds it gone.
+   * vocabulary would admit anything filed under it. Asserting the exact reason is what makes this
+   * a guard: `.not.toBeNull()` passed with `alp` restored, because a sibling rule answered instead.
+   * This record has no sibling rule to fall back on — the region is its only would-be qualifier.
    */
   it('does not read a landform out of the name of a French region', () => {
-    expect(offSubjectReason(find('Vipera aspis 146935719'))).not.toBeNull();
+    expect(
+      offSubjectReason({
+        title: 'File:Vipera aspis 146935719.jpg',
+        categories: ['Vipera aspis in Auvergne-Rhône-Alpes'],
+      }),
+    ).toBe('nothing names a landform, a place type or an outdoor setting');
+  });
+});
+
+/**
+ * The five records that reached live trail galleries because a term in the file name could
+ * qualify a photograph while no rejecting rule could read that same file name. Two of them were
+ * a trail's entire gallery. The invariant restored is that disqualification sees at least
+ * everything qualification sees.
+ */
+describe('what qualification can see, disqualification can see', () => {
+  it('drops a flowering tree that qualified on the word "tree" in its own name', () => {
+    expect(
+      offSubjectReason({
+        title: 'File:Three sided pod flowering tree - panoramio.jpg',
+        categories: ['Koelreuteria', 'Unidentified Sapindaceae'],
+      }),
+    ).toMatch(/species/);
+  });
+
+  it('drops a wallflower whose species category carries a plant-part qualifier', () => {
+    expect(
+      offSubjectReason({
+        title: 'File:Erysimum teretifolium 2.jpg',
+        categories: ['Erysimum (flowers)', 'Parks in Santa Cruz County, California'],
+      }),
+    ).toMatch(/species/);
+  });
+
+  it('drops a close-up the uploader named as one, whatever its categories mention', () => {
+    expect(
+      offSubjectReason({
+        title: 'File:Fleur @ Mieussy (51091330231).jpg',
+        categories: ['Nature of Mieussy'],
+      }),
+    ).toMatch(/close-up/);
+    expect(
+      offSubjectReason({
+        title: 'File:Toits et clocher de Sainte-Foy-Tarentaise enneiges.JPG',
+        categories: ['Church towers in Savoie', 'Snow in Savoie'],
+      }),
+    ).toMatch(/close-up/);
+  });
+
+  /*
+   * The counterweight. `Blooming flowers with snowy mountains` is a category on a real mountain
+   * photograph, so the close-up vocabulary reads the file name only — where it is the uploader's
+   * own statement of subject rather than an incidental mention.
+   */
+  it('does not read a close-up out of a category on a landscape photograph', () => {
+    expect(offSubjectReason(find('The Triplets from Sahale Arm.jpg'))).toBeNull();
+  });
+
+  it('does not mistake a disambiguated place name for a species', () => {
+    // `Bonnevaux (Doubs)` is a commune and `Missionpeak (cropped)` is a crop; accepting any
+    // bracketed qualifier as taxonomic dropped both.
+    expect(offSubjectReason(find('Bonnevaux (Doubs) - vue générale'))).toBeNull();
+    expect(offSubjectReason(find('Missionpeak (cropped)'))).toBeNull();
   });
 });
 
