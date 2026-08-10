@@ -27,8 +27,12 @@ function fakeDb(reading: QueueHealth): PrismaClient {
       aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
     },
     ingestTile: { count: async () => reading.stuckSubtrees },
-    // `orphanedSplits` is a correlated count over the child set, not a Prisma predicate.
-    $queryRaw: async () => [{ count: reading.orphanedSplits }],
+    // `orphanedSplits` is a correlated count over the child set, not a Prisma predicate, and the
+    // enrichment window is a second raw read — told apart by the only table its query names.
+    $queryRaw: async (strings: TemplateStringsArray) =>
+      strings.join('').includes('photos photo')
+        ? [{ completed: reading.photoSeedBlackout ? 1_000 : 0, seeded: 0 }]
+        : [{ count: reading.orphanedSplits }],
   } as unknown as PrismaClient;
 }
 
@@ -40,6 +44,7 @@ const CLEAN: QueueHealth = {
   stuckSubtrees: 0,
   wedgedTiles: 0,
   stalledDrain: 0,
+  photoSeedBlackout: 0,
 };
 
 function silentLog() {
@@ -102,6 +107,21 @@ describe('the queue health report', () => {
     expect(log.info).toHaveBeenCalledTimes(1);
     expect((log.info.mock.calls[0] as [string])[0]).toContain(QUEUE_HEALTH_MARKER);
     expect((log.warn.mock.calls[0] as [string])[0]).toContain(QUEUE_DISTRESS_MARKER);
+  });
+
+  /*
+   * The fault this gauge exists for produces no error row and no failed request, so the distress
+   * line is the only place it can appear. A seeder writing nothing looked identical to a healthy
+   * one for 973 jobs.
+   */
+  it('names a photo-seed blackout on the distress line', async () => {
+    const log = silentLog();
+
+    await reportQueueHealth(fakeDb({ ...CLEAN, photoSeedBlackout: 1 }), log);
+
+    const [line] = log.warn.mock.calls[0] as [string];
+    expect(line).toContain(QUEUE_DISTRESS_MARKER);
+    expect(line).toContain('photoSeedBlackout=1');
   });
 
   it('survives a database it cannot read, because the pump hangs off it', async () => {

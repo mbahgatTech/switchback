@@ -3,7 +3,7 @@
  * runs it every two minutes, which is the estate's only maintenance schedule.
  */
 
-import { JobStatus, TileStatus, prisma } from '@switchback/db';
+import { JobKind, JobStatus, PhotoSource, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
@@ -100,6 +100,8 @@ export interface QueueHealth {
   wedgedTiles: number;
   /** 1 when work is due and nothing has finished in `DRAIN_SILENCE_MS` — the drain has stopped. */
   stalledDrain: number;
+  /** 1 when a whole window of finished enrichment seeded no photograph — see `photoSeedBlackout`. */
+  photoSeedBlackout: number;
 }
 
 /**
@@ -162,7 +164,8 @@ export function formatQueueHealth(health: QueueHealth): string {
   return (
     `dead=${health.dead} staleLeases=${health.staleLeases} rateLimited=${health.rateLimited} ` +
     `orphanedSplits=${health.orphanedSplits} stuckSubtrees=${health.stuckSubtrees} ` +
-    `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain}`
+    `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain} ` +
+    `photoSeedBlackout=${health.photoSeedBlackout}`
   );
 }
 
@@ -225,6 +228,67 @@ export const WEDGE_GRACE_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_SWEEP_GRACE_MS;
  * would record that it happened.
  */
 export const TILE_WEDGED_MARKER = 'switchback-ingest-tile-wedged';
+
+/** One window of finished enrichment, and how much of it produced a photograph. */
+export interface EnrichWindow {
+  /** `enrich_trail` jobs that reached `done` inside the window. */
+  completed: number;
+  /** How many of those jobs' trails now hold at least one photograph. */
+  seeded: number;
+}
+
+/**
+ * How many finished enrichments a window needs before all of them seeding nothing means anything.
+ *
+ * A trail with no photograph is the ordinary case, not a fault: of 40 trails drawn at random from
+ * the production corpus on 2026-08-09, 25 had nothing on Commons within their search radius. So a
+ * run of empties says nothing and only unanimity over a decent sample does — at that measured
+ * 62.5% the odds of twenty-five consecutive empties are about 8 in a million.
+ */
+export const MIN_ENRICH_SAMPLE = 25;
+
+/**
+ * Whether enrichment is finishing jobs and seeding nothing whatsoever.
+ *
+ * This is the one fault in the pipeline that leaves no trace anywhere else. `enrichTrailPhotos`
+ * returns before its first write when its sources answer with nothing, so the job records `done`
+ * with a null `lastError` and reads exactly like one that seeded a gallery — 973 ran that way
+ * against an empty `photos` table, and no gauge, log line or error column showed it.
+ */
+export function photoSeedBlackout(
+  window: EnrichWindow,
+  minSample: number = MIN_ENRICH_SAMPLE,
+): number {
+  return window.completed >= minSample && window.seeded === 0 ? 1 : 0;
+}
+
+/**
+ * Finished enrichments in the window, against the photographs they were supposed to produce.
+ *
+ * Counts rows in `photos` rather than reading `Trail.photoCount`: the counter is written by the
+ * same handler whose silence this measures, so a gauge trusting it would take that handler's
+ * bookkeeping as evidence about that handler's writes. Restricted to the sources enrichment
+ * actually seeds, so a reader's own upload cannot report a dead seeder as healthy.
+ */
+export async function readEnrichWindow(db: PrismaClient, since: Date): Promise<EnrichWindow> {
+  const [row] = await db.$queryRaw<Array<{ completed: number; seeded: number }>>`
+    SELECT count(*)::int AS completed,
+           count(*) FILTER (
+             WHERE EXISTS (
+               SELECT 1 FROM photos photo
+                WHERE photo."trailId" = trail.id
+                  AND photo.source IN (${PhotoSource.wikimedia}::"PhotoSource",
+                                       ${PhotoSource.mapillary}::"PhotoSource")
+             )
+           )::int AS seeded
+      FROM ingest_jobs job
+      JOIN trails trail ON trail.id = split_part(job."dedupeKey", ':', 2)
+     WHERE job.kind = ${JobKind.enrich_trail}::"JobKind"
+       AND job.status = ${JobStatus.done}::"JobStatus"
+       AND job."completedAt" >= ${since}
+  `;
+  return { completed: row?.completed ?? 0, seeded: row?.seeded ?? 0 };
+}
 
 /**
  * Take tiles out of `running` when nothing is running them.
@@ -293,6 +357,7 @@ export async function queueHealth(
     wedgedTiles,
     oldestDue,
     lastFinished,
+    enrichWindow,
   ] = await Promise.all([
     db.ingestJob.count({ where: { status: JobStatus.dead, completedAt: { gte: recent } } }),
     db.ingestJob.count({
@@ -316,6 +381,7 @@ export async function queueHealth(
       where: { status: { in: [JobStatus.done, JobStatus.dead] } },
       _max: { completedAt: true },
     }),
+    readEnrichWindow(db, recent),
   ]);
 
   return {
@@ -330,6 +396,7 @@ export async function queueHealth(
       lastFinished._max.completedAt,
       silentBefore,
     ),
+    photoSeedBlackout: photoSeedBlackout(enrichWindow),
   };
 }
 

@@ -1555,16 +1555,18 @@ handler the host killed, a tile that deferred itself to four children. This rule
 
 Six of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
 `lastError` naming a 429, a tile carrying a split marker with no children, a subtree marked stuck,
-a tile left mid-fetch that no job can finish. The seventh is the absence of rows changing — a drain
+a tile left mid-fetch that no job can finish. The other two are the absence of something — a drain
 that has stopped leaves no error behind, so
-`stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`.
+`stalledDrain` reports due work with no terminal transition inside `DRAIN_SILENCE_MS`, and a
+photo seeder that fetches nothing leaves none either, so `photoSeedBlackout` reports a whole
+window of `enrich_trail` jobs finishing without one photograph landing.
 `ingestPump` runs every two minutes and already reads that database, so
-`apps/ingest-worker/src/health.ts` reads the seven counts and logs `switchback-ingest-queue-distress`
+`apps/ingest-worker/src/health.ts` reads the eight counts and logs `switchback-ingest-queue-distress`
 when any is non-zero. The report runs ahead of the `INGEST_PUMP_ENABLED` brake in
 `functions/pump.ts`: a queue somebody has deliberately stopped feeding is exactly when its depth
 still needs watching.
 
-**Each of the seven can return to zero, which is what makes this a rule rather than a light left
+**Each of the eight can return to zero, which is what makes this a rule rather than a light left
 on.** Three of them would not have: `failJob` buries a job as `dead` instead of deleting it, and
 `pruneFinishedJobs` keeps that row for thirty days, so an unwindowed count reads the same
 twenty-five for a month and a new 429 changes nothing an operator can see. `DISTRESS_WINDOW_MS` in
@@ -1574,7 +1576,9 @@ which measures silence rather than depth for the same reason: 44,884 jobs are qu
 will be for months, so a gauge counting them is a light left on by construction.
 `orphanedSplits` counts
 only parents whose children are actually missing, not every parent midway through a legitimate
-subdivision.
+subdivision. `photoSeedBlackout` reports only unanimity over `MIN_ENRICH_SAMPLE` finished jobs,
+because most trails have no Commons photograph within radius — 25 of 40 sampled from the corpus —
+and a gauge counting one empty trail would never fall.
 
 `autoMitigate` is **on**, unlike the rule above, and the difference is deliberate. That one is
 edge-triggered — a thing happened. This is a gauge: distress is present or it is not, the pump

@@ -308,6 +308,22 @@ const ORBITAL_PROGRAMME =
 const ORBITAL_FRAME = /^(?:iss\d+(?:-e-|e)\d+|sl\d+-\d+-\d+|sts\d+|as\d+-\d+-\d+)/i;
 
 /**
+ * The file name inside a URL. Commons `imageinfo` appends campaign parameters to every `url` and
+ * `thumburl` it returns (`?utm_source=commons.wikimedia.org&utm_campaign=imageinfo`), so anything
+ * asking what kind of file this is has to drop the query string first or it is reading the last
+ * parameter's value. Total by construction — a malformed URL yields whatever follows the last
+ * slash, which is what both callers below want.
+ */
+export function fileNameOf(url: string): string {
+  return (
+    url
+      .replace(/[?#].*$/, '')
+      .split('/')
+      .pop() ?? ''
+  );
+}
+
+/**
  * Is this a picture of the Earth from space rather than of somewhere on it? Commons geosearch
  * tags an astronaut's photograph of the Cascades with the coordinates of the Cascades, and
  * nothing in the response distinguishes the two. Two independent tests, either sufficient: the
@@ -317,7 +333,7 @@ const ORBITAL_FRAME = /^(?:iss\d+(?:-e-|e)\d+|sl\d+-\d+-\d+|sts\d+|as\d+-\d+-\d+
 export function isOrbitalImagery(photo: { url: string; attribution?: string | null }): boolean {
   const credit = photo.attribution ?? '';
   if (ORBITAL_AGENCY.test(credit) || ORBITAL_PROGRAMME.test(credit)) return true;
-  return ORBITAL_FRAME.test(photo.url.split('/').pop() ?? '');
+  return ORBITAL_FRAME.test(fileNameOf(photo.url));
 }
 
 /**
@@ -362,8 +378,10 @@ export async function fetchCommonsPhotos(
   for (const page of body.query.pages) {
     const info = page.imageinfo?.[0];
     if (!info?.url) continue;
-    // Commons hosts maps, diagrams and scanned documents alongside photographs.
-    if (!/\.(jpe?g|png|webp)$/i.test(info.url)) continue;
+    // Commons hosts maps, diagrams and scanned documents alongside photographs. Asked of the file
+    // name, not the URL: `imageinfo` appends campaign parameters, and a guard anchored on the
+    // extension matched nothing at all once it did.
+    if (!/\.(jpe?g|png|webp)$/i.test(fileNameOf(info.url))) continue;
 
     const meta = info.extmetadata ?? {};
     const attribution = stripHtml(meta.Artist?.value ?? meta.Credit?.value) ?? null;

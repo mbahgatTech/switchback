@@ -7,10 +7,12 @@ import { reconcileOrphanedSplits } from '../src/subdivide';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS } from '../src/jobs';
 import {
   LEASE_SWEEP_GRACE_MS,
+  MIN_ENRICH_SAMPLE,
   TILE_WEDGED_MARKER,
   WEDGE_GRACE_MS,
   countWedgedTiles,
   isDistressed,
+  photoSeedBlackout,
   queueHealth,
   repairWedgedTiles,
   sweepQueue,
@@ -218,11 +220,16 @@ describe('the queue health report', () => {
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
       ingestTile: { count: async () => reading.stuckSubtrees },
-      // Two correlated counts share this seam; the child-set subquery names the split one.
-      $queryRaw: async (strings: TemplateStringsArray) =>
-        strings.join('').includes('ingest_tiles child')
+      // Three correlated reads share this seam; each is named by a table only its query mentions.
+      $queryRaw: async (strings: TemplateStringsArray) => {
+        const sql = strings.join('');
+        if (sql.includes('photos photo')) {
+          return [{ completed: MIN_ENRICH_SAMPLE, seeded: reading.photoSeedBlackout ? 0 : 1 }];
+        }
+        return sql.includes('ingest_tiles child')
           ? [{ count: reading.orphanedSplits }]
-          : [{ count: reading.wedgedTiles }],
+          : [{ count: reading.wedgedTiles }];
+      },
     } as unknown as PrismaClient;
   }
 
@@ -247,6 +254,7 @@ describe('the queue health report', () => {
     stuckSubtrees: 1,
     wedgedTiles: 4,
     stalledDrain: 1,
+    photoSeedBlackout: 1,
   };
 
   it('reads every condition the drainer leaves behind', async () => {
@@ -328,6 +336,7 @@ describe('the queue health report', () => {
       stuckSubtrees: 0,
       wedgedTiles: 0,
       stalledDrain: 0,
+      photoSeedBlackout: 0,
     };
     expect(isDistressed(clean)).toBe(false);
     expect(isDistressed({ ...clean, rateLimited: 1 })).toBe(true);
@@ -340,6 +349,7 @@ describe('the queue health report', () => {
     expect(isDistressed({ ...clean, orphanedSplits: 1 })).toBe(true);
     expect(isDistressed({ ...clean, stuckSubtrees: 1 })).toBe(true);
     expect(isDistressed({ ...clean, wedgedTiles: 1 })).toBe(true);
+    expect(isDistressed({ ...clean, photoSeedBlackout: 1 })).toBe(true);
   });
 
   /**
@@ -390,6 +400,35 @@ describe('the queue health report', () => {
     it('dates silence from the oldest due job when nothing has ever finished', async () => {
       expect((await queueHealth(drainDb(hoursAgo(1), null), NOW)).stalledDrain).toBe(0);
       expect((await queueHealth(drainDb(hoursAgo(40), null), NOW)).stalledDrain).toBe(1);
+    });
+  });
+
+  /**
+   * The one fault in the pipeline that leaves no trace anywhere else. `enrichTrailPhotos` returns
+   * before its first write when its sources answer with nothing, so a broken seeder records `done`
+   * with a null `lastError` on every job and is indistinguishable from a working one.
+   */
+  describe('the photo-seed blackout gauge', () => {
+    const window = (completed: number, seeded: number) => ({ completed, seeded });
+
+    it('fires when a full window of finished enrichment produced no photograph at all', () => {
+      expect(photoSeedBlackout(window(MIN_ENRICH_SAMPLE, 0))).toBe(1);
+    });
+
+    /*
+     * The reason this counts a window rather than a job. Of 40 trails drawn at random from the
+     * production corpus on 2026-08-09, 25 had nothing on Commons within their search radius — so
+     * a job that seeds nothing is the ordinary case, and a gauge reading one would never fall.
+     */
+    it('stays quiet while anything at all is being seeded', () => {
+      expect(photoSeedBlackout(window(MIN_ENRICH_SAMPLE, 1))).toBe(0);
+      expect(photoSeedBlackout(window(1_000, 1))).toBe(0);
+    });
+
+    it('withholds judgement on a sample too small to be unanimous by accident', () => {
+      expect(photoSeedBlackout(window(MIN_ENRICH_SAMPLE - 1, 0))).toBe(0);
+      // An idle window is the stalled-drain gauge's business, not this one's.
+      expect(photoSeedBlackout(window(0, 0))).toBe(0);
     });
   });
 });

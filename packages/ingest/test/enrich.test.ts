@@ -9,6 +9,7 @@ import {
   fetchCommonsPhotos,
   fetchMapillaryPhotos,
   fetchSeedPhotos,
+  fileNameOf,
   isOrbitalImagery,
   parkingCapacity,
   parseEleM,
@@ -243,6 +244,32 @@ describe('featureSearchBBox', () => {
   });
 });
 
+/**
+ * What `imageinfo` appends to every `url` and `thumburl`. Reproduced verbatim from a live
+ * geosearch response, because a paraphrase of it is what let this ship.
+ */
+const CAMPAIGN = '?utm_source=commons.wikimedia.org&utm_campaign=imageinfo&utm_content=original';
+
+describe('fileNameOf', () => {
+  it('reads the name out of a plain URL', () => {
+    expect(fileNameOf('https://upload.wikimedia.org/wikipedia/commons/8/8e/Ben_Nevis.jpg')).toBe(
+      'Ben_Nevis.jpg',
+    );
+  });
+
+  it('drops the campaign parameters Commons appends', () => {
+    expect(fileNameOf(`https://upload.wikimedia.org/a/bc/Ben_Nevis.jpg${CAMPAIGN}`)).toBe(
+      'Ben_Nevis.jpg',
+    );
+  });
+
+  it('does not read a file name out of a query string or a fragment', () => {
+    // A `.jpg` sitting in a parameter's value must not make a PDF look like a photograph.
+    expect(fileNameOf('https://example.test/scan.pdf?preview=thumb.jpg')).toBe('scan.pdf');
+    expect(fileNameOf('https://example.test/plan.svg#Ben_Nevis.jpg')).toBe('plan.svg');
+  });
+});
+
 describe('isOrbitalImagery', () => {
   const orbital = (attribution: string | null, url = 'https://upload.wikimedia.org/x.jpg') =>
     isOrbitalImagery({ url, attribution });
@@ -276,6 +303,15 @@ describe('isOrbitalImagery', () => {
     expect(named('SL2-11-92_-_View_of_Earth.jpg')).toBe(true); // Skylab
     expect(named('STS061A-101-005.jpg')).toBe(true); // Shuttle
     expect(named('AS17-148-22727.jpg')).toBe(true); // Apollo
+  });
+
+  it('recognises a frame designator through the campaign parameters', () => {
+    expect(
+      isOrbitalImagery({
+        url: `https://upload.wikimedia.org/a/bc/ISS042-E-107916_-_View_of_Earth.jpg${CAMPAIGN}`,
+        attribution: null,
+      }),
+    ).toBe(true);
   });
 
   it('does not mistake a photographer whose name contains an acronym', () => {
@@ -367,6 +403,44 @@ describe('fetchCommonsPhotos', () => {
       ...page,
       pageid: 9,
       imageinfo: [{ url: 'https://upload.wikimedia.org/plan.svg' }],
+    };
+    const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
+      fetchImpl: (async () => jsonResponse({ query: { pages: [svg] } })) as unknown as typeof fetch,
+    });
+    expect(photos).toEqual([]);
+  });
+
+  it('keeps a photograph whose URL carries the campaign parameters imageinfo appends', async () => {
+    // Commons stopped returning bare file URLs. Every `url` and `thumburl` now ends in a query
+    // string, so a file-type guard reading the whole URL rejects the entire response — which is
+    // what left 17,753 trails with no photograph while every enrich job recorded success.
+    const tagged = {
+      ...page,
+      imageinfo: [
+        {
+          ...page.imageinfo[0],
+          url: `https://upload.wikimedia.org/ben-nevis.jpg${CAMPAIGN}`,
+          thumburl: `https://upload.wikimedia.org/thumb/ben-nevis.jpg${CAMPAIGN}`,
+        },
+      ],
+    };
+    const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
+      fetchImpl: (async () =>
+        jsonResponse({ query: { pages: [tagged] } })) as unknown as typeof fetch,
+    });
+
+    expect(photos).toHaveLength(1);
+    // Stored as Commons returned it: nothing downstream reads the path, and rewriting an
+    // upstream URL needs a better reason than tidiness.
+    expect(photos[0]!.url).toBe(`https://upload.wikimedia.org/ben-nevis.jpg${CAMPAIGN}`);
+  });
+
+  it('still skips a diagram when the campaign parameters are present', async () => {
+    // The fix must widen the guard, not remove it.
+    const svg = {
+      ...page,
+      pageid: 9,
+      imageinfo: [{ url: `https://upload.wikimedia.org/plan.svg${CAMPAIGN}` }],
     };
     const photos = await fetchCommonsPhotos([-5, 56.8], 2000, {
       fetchImpl: (async () => jsonResponse({ query: { pages: [svg] } })) as unknown as typeof fetch,

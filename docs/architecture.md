@@ -528,7 +528,9 @@ path directly rather than relying on the `rateLimited` gauge below.
 What covers the rest is `switchback-ingest-queue-distress`. Six of those conditions are a row —
 a job buried inside the last hour, a lease past `LEASE_TIMEOUT_MS`, a `lastError` naming a 429, a
 tile carrying a split marker with no children, a subtree marked stuck, a tile left mid-fetch that no
-job can finish — and `ingestPump` runs inside
+job can finish — and two are the absence of one: `stalledDrain` for due work with no terminal
+transition, and `photoSeedBlackout` for a window of `enrich_trail` jobs that all finished without a
+photograph landing. `ingestPump` runs inside
 the alert's own subscription every two minutes and already reads that database.
 `apps/ingest-worker/src/health.ts`
 counts them and logs the token when any is non-zero, ahead of the pump's `INGEST_PUMP_ENABLED`

@@ -1,9 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
-import { LEASE_TIMEOUT_MS, RECLAIM_PRIORITY, tileJobKey } from '../src/jobs';
+import { LEASE_TIMEOUT_MS, RECLAIM_PRIORITY, tileJobKey, trailEnrichJobKey } from '../src/jobs';
 import { VIEWPORT_PRIORITY } from '../src/coverage';
-import { DISTRESS_WINDOW_MS, queueHealth, sweepQueue } from '../src/maintenance';
+import { DISTRESS_WINDOW_MS, queueHealth, readEnrichWindow, sweepQueue } from '../src/maintenance';
 
 /**
  * The queue sweep against a real Postgres.
@@ -271,3 +271,136 @@ async function buryJob(quadkey: string, completedAt: Date): Promise<void> {
     },
   });
 }
+
+/**
+ * The enrichment window against a real database.
+ *
+ * The only place the gauge's SQL is executed. Its unit tests hand `photoSeedBlackout` a window
+ * directly, so nothing else would catch the join — `ingest_jobs` has no foreign key to `trails`
+ * and the trail id has to be split back out of the dedupe key, which no fake client can show.
+ */
+describe.runIf(IS_LOCAL).sequential('what the enrichment window counts', () => {
+  const TRAIL_PREFIX = 'Maintenance Window Fixture';
+
+  async function seedEnrichedTrail(suffix: string, photographs: number): Promise<string> {
+    const trail = await prisma.trail.create({
+      data: {
+        slug: `maintenance-window-fixture-${suffix}`,
+        name: `${TRAIL_PREFIX} ${suffix}`,
+        osmType: 'way',
+        osmId: BigInt(`99000000${suffix}`),
+        quadkey: `${NS}000000`,
+        geometryJson: {
+          type: 'LineString',
+          coordinates: [
+            [0, 0],
+            [0.01, 0],
+          ],
+        },
+        centroidLng: 0,
+        centroidLat: 0,
+        bboxW: 0,
+        bboxS: 0,
+        bboxE: 0.01,
+        bboxN: 0,
+        lengthM: 1,
+        gainM: 0,
+        lossM: 0,
+        minEleM: 0,
+        maxEleM: 0,
+        estimatedTimeS: 1,
+        difficulty: 'easy',
+        difficultyScore: 0,
+        routeType: 'point_to_point',
+      },
+      select: { id: true },
+    });
+
+    await prisma.ingestJob.create({
+      data: {
+        kind: JobKind.enrich_trail,
+        dedupeKey: trailEnrichJobKey(trail.id),
+        payload: { trailId: trail.id },
+        status: JobStatus.done,
+        completedAt: new Date(NOW.getTime() - 60_000),
+      },
+    });
+
+    for (let i = 0; i < photographs; i += 1) {
+      await prisma.photo.create({
+        data: {
+          trailId: trail.id,
+          source: 'wikimedia',
+          sourceId: `fixture-${suffix}-${i}`,
+          url: 'https://upload.wikimedia.org/fixture.jpg',
+        },
+      });
+    }
+    return trail.id;
+  }
+
+  async function reset(): Promise<void> {
+    const doomed = await prisma.trail.findMany({
+      where: { name: { startsWith: TRAIL_PREFIX } },
+      select: { id: true },
+    });
+    const ids = doomed.map((row) => row.id);
+    await prisma.ingestJob.deleteMany({ where: { dedupeKey: { in: ids.map(trailEnrichJobKey) } } });
+    await prisma.trail.deleteMany({ where: { id: { in: ids } } });
+  }
+
+  beforeEach(reset);
+  afterAll(async () => {
+    await reset();
+    await prisma.$disconnect();
+  });
+
+  it('joins a finished job to its trail and counts the photographs that landed', async () => {
+    const since = new Date(NOW.getTime() - DISTRESS_WINDOW_MS);
+    const before = await readEnrichWindow(prisma, since);
+
+    await seedEnrichedTrail('01', 0);
+    await seedEnrichedTrail('02', 3);
+
+    const after = await readEnrichWindow(prisma, since);
+    expect(after.completed - before.completed).toBe(2);
+    // Two jobs finished, one trail holds photographs — which is the ordinary corpus, not a fault.
+    expect(after.seeded - before.seeded).toBe(1);
+  });
+
+  it('ignores a job that finished before the window opened', async () => {
+    const since = new Date(NOW.getTime() - DISTRESS_WINDOW_MS);
+    const before = await readEnrichWindow(prisma, since);
+
+    const trailId = await seedEnrichedTrail('03', 0);
+    await prisma.ingestJob.update({
+      where: { dedupeKey: trailEnrichJobKey(trailId) },
+      data: { completedAt: new Date(NOW.getTime() - DISTRESS_WINDOW_MS - 60_000) },
+    });
+
+    expect((await readEnrichWindow(prisma, since)).completed).toBe(before.completed);
+  });
+
+  /*
+   * The gauge measures the seeder, so a photograph the seeder did not produce must not answer for
+   * it. Without this a single reader upload would report a dead Commons path as healthy.
+   */
+  it('does not count a reader’s own upload as a seeded photograph', async () => {
+    const since = new Date(NOW.getTime() - DISTRESS_WINDOW_MS);
+    const before = await readEnrichWindow(prisma, since);
+
+    const trailId = await seedEnrichedTrail('04', 0);
+    await prisma.photo.create({
+      data: {
+        trailId,
+        source: 'user',
+        sourceId: 'fixture-upload',
+        url: 'https://uploads.test/mine.jpg',
+      },
+    });
+
+    const after = await readEnrichWindow(prisma, since);
+    expect(after.completed - before.completed).toBe(1);
+    expect(after.seeded - before.seeded).toBe(0);
+  });
+});
