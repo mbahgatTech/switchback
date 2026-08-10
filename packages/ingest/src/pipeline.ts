@@ -154,9 +154,9 @@ export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
 /**
  * The literal an operator greps for when a tile could not commit a trail it had fetched.
  *
- * `switchback-ingest-drain-failed` reads it, and the split exit is why. On the failing exit the
- * tile rethrows and the worker logs `ingest-job-failed` beside this token, so the union counts one
- * window and the pair cannot page twice. On the split exit `splitTile` returns `pending` and
+ * `switchback-ingest-ground-lost` reads it, and the split exit is why. On the failing exit the
+ * tile rethrows and the worker logs `ingest-job-failed` beside this token; the two land on
+ * different rules, so the pair pages once. On the split exit `splitTile` returns `pending` and
  * `failJob` never runs, so this token is the only thing marking the ground that did not commit.
  */
 export const TRAIL_LOST_MARKER = 'switchback-ingest-trail-lost';
@@ -1381,16 +1381,24 @@ async function attemptCommit(
  * three reaching a closed transaction from a later statement. No value short of a multiple covers
  * that tail, and a multiple holds one of `BACKGROUND_POOL_SIZE` connections for over a minute
  * while `COMMIT_CONCURRENCY` commits run, buying one trail's success with other trails' failures.
- * The thirtieth failure is the reason to suspect contention rather than slow work: a Postgres
- * `40P01` deadlock between two committers on `trail_ways`. Whether the body is slow because of
+ * Whether the body is slow because of
  * database work or because six concurrent commits starve the event loop between its awaits is
  * **UNVERIFIED** — 418 `[HostMonitor] Host CPU threshold exceeded (100 >= 80)` lines over the same
  * window are consistent with starvation but do not establish it. Measure that before moving this.
+ *
+ * Contention on `trail_ways` is a separate fault with a separate remedy: `claimWays` orders its
+ * writes and `commitWithSlugRetry` re-runs the loser of a deadlock. Neither is a timeout question.
  */
 const TRAIL_TX_TIMEOUT_MS = 30_000;
 
 /** Prisma's code for a unique-constraint violation. */
 const UNIQUE_VIOLATION = 'P2002';
+
+/** Postgres' SQLSTATE for a deadlock the server broke by rolling one participant back. */
+const DEADLOCK_DETECTED = '40P01';
+
+/** Prisma's mapped code for the same class, on the paths where it maps rather than passes through. */
+const WRITE_CONFLICT = 'P2034';
 
 /**
  * Attempts allowed per trail — must stay equal to the number of slugs `uniqueSlug` can offer,
@@ -1400,25 +1408,64 @@ const UNIQUE_VIOLATION = 'P2002';
 const MAX_SLUG_ATTEMPTS = 4;
 
 /**
- * Run a trail's transaction, retrying when it loses a race for a slug. `uniqueSlug` reads and
- * the upsert writes; with six trails in flight and several called "Lake Trail" in one valley,
- * another worker takes the name in between. A retry is the whole fix because the read is
- * inside the transaction, and the last candidate is unique by construction, so this
- * terminates. Only unique violations are retried — everything else belongs to that trail.
+ * Attempts allowed per trail against a deadlock, on its own budget rather than the slug one.
+ * Sharing a counter would let a tile of same-named trails spend the deadlock allowance on slug
+ * races and then lose ground to the first contended way.
+ */
+const MAX_DEADLOCK_ATTEMPTS = 3;
+
+/**
+ * Whether the loser of a deadlock is looking at it. Postgres has already rolled this transaction
+ * back, so nothing it wrote survives and re-running it is safe.
+ *
+ * **The message is checked as well as the code, and that is not belt-and-braces.** A deadlock
+ * raised inside `createMany`/`updateMany` reaches the caller as `PrismaClientUnknownRequestError`,
+ * whose `code` is undefined — the SQLSTATE appears only in the message text. Production
+ * 2026-08-10T05:29:56Z: `Invalid prisma.trailWay.createMany() invocation: ... PostgresError {
+ * code: "40P01", message: "deadlock detected" }`. Keying on `P2034` alone matches none of the
+ * three failures measured that morning.
+ */
+function isDeadlock(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code;
+  if (code === WRITE_CONFLICT) return true;
+  const message = error instanceof Error ? error.message : '';
+  return message.includes(DEADLOCK_DETECTED);
+}
+
+/**
+ * Run a trail's transaction, retrying when it loses a race for a slug or a way.
+ *
+ * *Slug*: `uniqueSlug` reads and the upsert writes; with six trails in flight and several called
+ * "Lake Trail" in one valley, another worker takes the name in between. The read is inside the
+ * transaction and the last candidate is unique by construction, so this terminates.
+ *
+ * *Way*: two committers touching one way in an order `claimWays`' sort cannot align — a
+ * `contested` update against another's insert. The rollback is complete, so the retry re-reads
+ * and either takes the way or concedes it.
+ *
+ * Nothing else is retried, because everything else belongs to that trail.
  */
 async function commitWithSlugRetry(
   db: PrismaClient,
   body: (tx: Prisma.TransactionClient) => Promise<string>,
 ): Promise<string> {
-  for (let attempt = 1; ; attempt++) {
+  let slugAttempts = 0;
+  let deadlockAttempts = 0;
+  for (;;) {
     try {
       return await db.$transaction(body, {
         timeout: TRAIL_TX_TIMEOUT_MS,
         maxWait: TRAIL_TX_TIMEOUT_MS,
       });
     } catch (error) {
+      if (isDeadlock(error)) {
+        deadlockAttempts += 1;
+        if (deadlockAttempts >= MAX_DEADLOCK_ATTEMPTS) throw error;
+        continue;
+      }
+      slugAttempts += 1;
       const code = (error as { code?: string } | null)?.code;
-      if (code !== UNIQUE_VIOLATION || attempt >= MAX_SLUG_ATTEMPTS) throw error;
+      if (code !== UNIQUE_VIOLATION || slugAttempts >= MAX_SLUG_ATTEMPTS) throw error;
     }
   }
 }

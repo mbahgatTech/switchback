@@ -502,8 +502,8 @@ does _not_ complete is the one whose row is past `LEASE_TIMEOUT_MS` or has no `l
 that means the reaper itself has stopped, so `assertSettleable` throws and
 `switchback-ingest-signal-stranded` says so.
 
-The first version of `switchback-ingest-drain-failed` read `requests | where success == false`, and
-that was blind to the failure mode it was written for. `drainJobs` catches every handler error,
+Reading `requests | where success == false` alone is blind to the failure mode these rules exist
+for. `drainJobs` catches every handler error,
 writes it to the job row and returns normally, so the 2026-08-04 run was 14/14 successful
 invocations while six Alps tiles were failing — the failure existed only as six `traces` lines. The
 rule now unions the request arm with a `traces` arm keyed on the literal `ingest-job-failed` that
@@ -573,7 +573,8 @@ carries a split marker or a stuck-subtree marker. The gauge is clear and can fir
 
 **All three rules are deployed, and so is the code that arms them.**
 `az resource list -g rg-switchback-prod-northcentralus --resource-type
-Microsoft.Insights/scheduledqueryrules` returns `switchback-ingest-drain-failed`,
+Microsoft.Insights/scheduledqueryrules` returns `switchback-ingest-ground-lost`,
+`switchback-ingest-drain-degraded`, `switchback-ingest-pump-failing`,
 `switchback-ingest-queue-distress` and `switchback-ingest-worker-silent`. The Function App runs a
 bundle published by `.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest
 worker` job will invoke on every push to master — and which refuses to report success until the
@@ -861,8 +862,8 @@ setting that the next deploy revokes, which is the correct asymmetry.
 **A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
 its deadline threw, `drainJobs` recorded a failure, and the drain-failure alert armed. Now it
 returns normally and `report()` logs `done`, so an operator would read 8/8 tiles succeeded while
-two of them ingested nothing. `switchback-ingest-drain-failed` therefore has a third arm matching
-`switchback-ingest-tile-split` and `switchback-ingest-subtree-stuck`.
+two of them ingested nothing. `switchback-ingest-ground-lost` therefore has an arm matching
+`switchback-ingest-subtree-stuck`.
 
 That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so both
 markers land where the rule can read them — including `switchback-ingest-subtree-stuck`, the

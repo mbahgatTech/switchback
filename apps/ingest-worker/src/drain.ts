@@ -55,6 +55,46 @@ export const HANDLER_DEADLINE_MS = 540_000;
  */
 export const COMMIT_RESERVE_MS = 150_000;
 
+/**
+ * The same reserve for a job whose handler commits at most one trail.
+ *
+ * `COMMIT_RESERVE_MS` is sized for a tile's commit fan-out — `COMMIT_CONCURRENCY` workers over up
+ * to four figures of assembled trails. `processRoute` ends in a single `commitTrail`, and
+ * `enrichTrailPhotos` commits no trail at all, so charging either the tile's reserve takes 150 s
+ * off a fetch window for a commit loop it does not run. That is what a route job spends its whole
+ * budget on: `processRoute` walks the relation tree serially, one Overpass query per level.
+ *
+ * Derived from `TRAIL_TX_TIMEOUT_MS` (30 s, the transaction's own ceiling) doubled, which leaves
+ * the terrain fetches feeding that transaction the same again. It is not measured against a
+ * finished route, because no `ingest_route` job has ever completed in production — 38 rows, 0
+ * `done` as at 2026-08-10T17:00Z. Re-derive it from a real one once any succeed.
+ */
+export const DERIVED_COMMIT_RESERVE_MS = 60_000;
+
+/**
+ * Job kinds whose handler commits at most one trail, keyed by the `dedupeKey` prefix the pump
+ * publishes. `handlers.ts` is the map from kind to handler; this is the subset whose handler has
+ * no commit fan-out to reserve for.
+ */
+const SINGLE_COMMIT_KINDS: readonly string[] = ['ingest_route', 'enrich_trail'];
+
+/** The kind half of a `dedupeKey` — `tileJobKey` and friends build `<kind>:<id>`. */
+export function jobKindOf(dedupeKey: string): string {
+  return dedupeKey.slice(0, dedupeKey.indexOf(':'));
+}
+
+/** The wall clock a job of this kind holds back for its commits. See the two constants. */
+export function commitReserveMs(
+  dedupeKey: string,
+  source: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = positive(source.INGEST_COMMIT_RESERVE_MS, COMMIT_RESERVE_MS);
+  if (!SINGLE_COMMIT_KINDS.includes(jobKindOf(dedupeKey))) return configured;
+  // Never above the tile reserve: an operator who tightens the budget must not find that
+  // tightening it widened this one.
+  return Math.min(DERIVED_COMMIT_RESERVE_MS, configured);
+}
+
 function positive(value: unknown, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -76,9 +116,18 @@ export function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): numb
  * Only the pre-commit queries. `discoverParentRoutes` runs after the tile is `ready` and after the
  * commit loop has finished, so refusing it reserves nothing for anybody; it gets the handler
  * deadline instead, through `PipelineDeps.overpassAfterCommits`.
+ *
+ * `dedupeKey` selects the reserve — see `commitReserveMs`. Omitted means the tile reserve, which
+ * is the conservative one.
  */
-export function overpassDeadlineMs(source: NodeJS.ProcessEnv = process.env): number {
-  const reserve = positive(source.INGEST_COMMIT_RESERVE_MS, COMMIT_RESERVE_MS);
+export function overpassDeadlineMs(
+  source: NodeJS.ProcessEnv = process.env,
+  dedupeKey?: string,
+): number {
+  const reserve =
+    dedupeKey === undefined
+      ? positive(source.INGEST_COMMIT_RESERVE_MS, COMMIT_RESERVE_MS)
+      : commitReserveMs(dedupeKey, source);
   const maxTotal = positive(source.OVERPASS_MAX_TOTAL_MS, OVERPASS_MAX_TOTAL_MS);
   const derived = handlerDeadlineMs(source) - maxTotal - reserve;
   const configured = Number(source.INGEST_OVERPASS_DEADLINE_MS);
@@ -164,8 +213,9 @@ export class StrandedSignalError extends Error {
  * Written on the delivery that finds a `running` row the reaper should already have freed — a lease
  * past `LEASE_TIMEOUT_MS`, or a `lockedAt` of NULL that no cutoff can match. It is not the
  * killed-handler signal; `LEASE_EXPIRED_MARKER` in `packages/ingest/src/jobs.ts` is, and the two
- * are separate arms of `switchback-ingest-drain-failed` because they are separate faults: one says
- * a handler died, this one says the process that repairs that has stopped.
+ * sit on different rules because they are different faults: a lease that expired is the reaper
+ * about to do its job, which `switchback-ingest-drain-degraded` records at severity 3, while this
+ * says the reaper itself has stopped, which pages on `switchback-ingest-ground-lost`.
  */
 export const SIGNAL_STRANDED_MARKER = 'switchback-ingest-signal-stranded';
 
@@ -215,7 +265,8 @@ export async function runIngestSignal(
   // Views of the shared client, not second ones: the queue and the breaker stay the singleton's,
   // so the concurrency ceiling is unchanged.
   const overpass =
-    options.overpass ?? withDeadline(getOverpass(), startedAt + overpassDeadlineMs());
+    options.overpass ??
+    withDeadline(getOverpass(), startedAt + overpassDeadlineMs(process.env, signal.dedupeKey));
   const overpassAfterCommits = options.overpass ?? withDeadline(getOverpass(), handlerDeadline);
 
   let result: DrainResult;
@@ -286,7 +337,7 @@ async function assertSettleable(
 }
 
 /**
- * The literal `switchback-ingest-drain-failed` greps for.
+ * The literal `switchback-ingest-drain-degraded` greps for.
  *
  * A job failure is invisible at the invocation level: `drainJobs` catches every handler error,
  * writes it to the row and returns normally, so the request row is `success == true`. On
@@ -298,7 +349,21 @@ async function assertSettleable(
 export const JOB_FAILED_MARKER = 'ingest-job-failed';
 
 /**
- * The literal `switchback-ingest-drain-failed` greps for when a handler committed under a lease
+ * The literal `switchback-ingest-ground-lost` greps for when a job failed with no attempt left.
+ *
+ * Separate from `JOB_FAILED_MARKER` because the two need different severities and the row alone
+ * cannot tell them apart after the fact: `failJob` writes `dead` on the last attempt and `queued`
+ * on every other, and a rule reading `ingest-job-failed` sees both. A job below `maxAttempts`
+ * re-runs on its own and is a Sev3 observation; a buried one is the retry budget exhausted and
+ * nothing will pick it up.
+ *
+ * The token deliberately does not contain `ingest-job-failed`, so the recoverable rule's
+ * `has "ingest-job-failed"` cannot match a burial.
+ */
+export const JOB_BURIED_MARKER = 'switchback-ingest-job-buried';
+
+/**
+ * The literal `switchback-ingest-ground-lost` greps for when a handler committed under a lease
  * that had already been taken back — the work ran twice.
  *
  * This is the condition `writeOutcome`'s lease fence exists to detect, and the fence's own count
@@ -339,9 +404,17 @@ function report(signal: IngestSignal, result: DrainResult, log: WorkerLog): void
     log.info(`ingest ${key}: done`);
   }
 
-  if (result.failed > 0) {
+  // `buried` is a subset of `failed`, so the retry line counts the remainder rather than repeating
+  // a job the burial line has already reported.
+  if (result.failed - result.buried > 0) {
     log.error(
       `${JOB_FAILED_MARKER} ${key}: handler failed — see "lastError" on the job row; retry scheduled`,
+    );
+  }
+
+  if (result.buried > 0) {
+    log.error(
+      `${JOB_BURIED_MARKER} ${key}: handler failed with no attempt left — the row is "dead" and nothing will retry it`,
     );
   }
 

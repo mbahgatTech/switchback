@@ -1284,116 +1284,50 @@ resource workerDeployerTelemetry 'Microsoft.Authorization/roleAssignments@2022-0
 }
 
 @description('''
-**A failed drain has to page somebody, and neither of the obvious signals sees one.**
+**Ground that is gone, where nothing in the system will bring it back.** Every arm is a state no
+retry, reaper or redelivery repairs, so each one is a person's work and each one pages.
 
-`switchback-ingest-deadletter` fires on `DeadletteredMessages`, and a drain the host kills never
-dead-letters: the redelivery finds the `ingest_jobs` row still under the dead invocation's lease,
-logs "nothing claimable" and *completes* the message in ~165 ms, so `DeliveryCount` never reaches 2.
+| arm | written by | what is unrecoverable |
+|---|---|---|
+| `switchback-ingest-trail-lost` | `describeLost`, `pipeline.ts` | trails a tile assembled and could not commit |
+| `switchback-ingest-job-buried` | `report`, `drain.ts` | a job that failed with no attempt left; the row is `dead` |
+| `switchback-ingest-subtree-stuck` | `subdivide.ts` | a parent whose children cannot proceed |
+| `switchback-ingest-signal-stranded` | `assertSettleable`, `drain.ts` | a `running` row the reaper can never date |
+| `switchback-ingest-double-commit` | `report`, `drain.ts` | a handler that finished under a reclaimed lease |
+| `switchback-ingest-tile-wedged` | `repairWedgedTiles` | a tile taken out of `running` that no job could finish |
 
-The `requests` table does not see one either, and that is the trap this rule was caught by. A
-handler error is caught inside `drainJobs`, written to the job row, and the invocation returns
-normally — so on 2026-08-04 `requests | success == true` was 14/14 while six Alps tiles failed.
-The first arm below is still worth keeping (a host kill *is* a failed request), but on its own it
-was a rule that could not fire on the failure mode it was written for.
+**`ingest-job-failed` is deliberately not an arm here, and the distinction is the point of the
+split.** `failJob` reschedules a job below `maxAttempts` and buries only the last attempt, so a rule
+matching the failure alone pages for work that re-runs unaided. `report` writes `JOB_BURIED_MARKER`
+for `DrainResult.buried` and `JOB_FAILED_MARKER` for the remainder, and the buried token contains
+no substring of the other, so `switchback-ingest-drain-degraded` cannot match a burial nor this rule
+a retry. `apps/ingest-worker/test/drain.test.ts` asserts each token against the query that reads it.
 
-The second arm reads `traces` for the token `runIngestSignal` logs beside every job-level failure.
-Matching a token rather than the sentence is deliberate: a reworded log line must not silently
-disarm the alert, and `apps/ingest-worker/test/drain.test.ts` asserts the two agree.
+Measured on the component this rule scopes to, seven days to 2026-08-10T17:00Z:
+`ingest-job-failed` 16, `trail-lost` 4, `lease-expired` 3, and **zero** for `subtree-stuck`,
+`signal-stranded`, `double-commit` and `tile-wedged`. Those four are kept because each names a
+state with no other reporter, but none has been observed firing, so none is known to work. Prove
+one with a synthetic trigger before trusting it.
 
-**The third arm is ground a tile could not commit, and subdivision is why it needs its own token.**
-A tile that runs out of clock splits: `processTile` returns `TileStatus.pending`, `failJob` never
-runs, and no `ingest-job-failed` is written. When that tile also lost trails on its own account,
-`describeLost` puts `switchback-ingest-trail-lost` inside the split line, and that token is the only
-thing in the estate marking it. Tile `023010230` at 2026-08-09T20:53:32Z took exactly that path —
-4 of 1519 trails did not commit, and `AppTraces` holds no `ingest-job-failed` within ten minutes
-either side. On the other exit, where the tile fails and rethrows, the same token rides alongside
-`ingest-job-failed`; a union counts the window once, so the pair cannot page twice.
+**`summarize` with no `by` clause is what lets this clear itself**, and it is not cosmetic. It
+returns exactly one row holding `0` when nothing matches, so a quiet window is a measurement below
+threshold; the bare `| project timestamp` form returns no row and leaves the platform's empty-result
+handling to decide. Ten `switchback-ingest-overpass-limited` instances sat `Fired` under
+`autoMitigate: true` while that rule used the projecting form. Read the instances back with:
+`az rest --method get --url "https://management.azure.com/subscriptions/5cb9e7c3-0e31-4388-94e9-b36eab4bf977/providers/Microsoft.AlertsManagement/alerts?api-version=2019-05-05-preview&timeRange=7d" -o json`
 
-Subdivision itself is not on this rule. A split is the designed answer to a dense tile, not a
-fault: 9 splits in the 48 h to 2026-08-09T21:12Z, against 7 events across every other arm combined.
-What task #224 asked for — that a split must not read as a clean success — is carried by the status
-write rather than by a page. `splitTile` leaves the parent `pending`, so `ensureCoverage` still
-counts it outstanding and the client still polls it. A split that dies before writing its children
-is not silent either: `splitTile` upserts all four children ahead of the parent's marker, so a
-partial run throws, `failJob` records it, and the `ingest-job-failed` arm above catches it.
-
-**`switchback-ingest-subtree-stuck` is edge-triggered, and the rule depends on it.** It is written
-only when the parent's stored
-`lastError` does not already say so — without that it would be logged on every drain of a blocked
-parent, and a blocked parent is `pending`, so `ensureCoverage` re-queues it on every viewport poll
-and `explore.tsx` polls *because* it is pending. One stuck subtree would then page every fifteen
-minutes for as long as anyone left that map open, on the same rule as the genuine failure signal,
-which trains an operator to ignore exactly the signal this rule was created for.
-
-Both trace arms depend on `traces` arriving at all. `host.json` samples Application Insights at
-five items per second and adaptive sampling drops correlated *sets*, so a dense tile's dependency
-telemetry could take the one line these arms match with it. `excludedTypes` there now holds
-`Trace`, which is what makes this rule's evidence non-droppable.
-
-`Count`/`GreaterThan 0` over fifteen minutes, so a single failure is enough.
-
-**Fires** when any arm below records one event in a fifteen-minute window: a job buried, ground not
-committed, a subtree stuck, a lease expired with no outcome, a stranded signal, a double commit, a
-wedged tile, or a rejected `ingestDrain`/`ingestPump`. **Clears** only when an operator closes it —
-`autoMitigate` is off, because every one of those is "this happened" rather than "this is
-happening", and there is no later observation that would mean the lost ground came back. An alert
-that resolved itself the moment the tile stopped being retried would be an alert nobody reads.
-
-**The fourth arm is the one that sees a killed handler.** A handler the host kills writes no
-request row at all — the process stops between two awaits — so the first arm is structurally
-incapable of firing on it. Measured on 2026-08-08 16:00–20:00 UTC: `Functions.ingestDrain` logged
-42 `Executing` against 37 `Executed`, and the five invocations that logged a start and no end
-(16:32:42, 17:06:37, 17:28:19, 17:45:12 and 18:24:00 UTC) have no `AppRequests` row under their
-invocation ids — the query returns zero.
-
-A slow handler that *does* return is a separate fault the first arm also misses, for the opposite
-reason: six other invocations ran 540,111 ms to 548,954 ms past the 540,000 ms bound and every
-one recorded `Success=True`. Overrunning is not failing, as far as the host is concerned.
-
-The fault arms are **not** silent over that window — run verbatim they return one match, the
-`ingest-job-failed` for `ingest_tile:120222201` at 16:56:39. The four `switchback-ingest-tile-split`
-lines at 17:55:05, 18:04:14, 18:13:20 and 18:22:30 are subdivision, which no longer arms this rule.
-Neither set is the killed handler, and the `Executing`-minus-`Executed` gap of five is invisible to
-both.
-
-The signal the fourth arm watches is written by the reaper rather than by the redelivery, because
-the reaper is the only participant that observes the death. `reclaimExpiredJobs` runs ahead of the
-claim in both `drainJobs` and `drainSlotGate`, so by the time a redelivered message is classified
-the row has already been returned to `queued` and that delivery has nothing left to report — which
-is the repair working, not a gap. The reclaim emits `switchback-ingest-lease-expired`, and it fires
-on the real event: inside the same window the pump logged three non-zero reclaims, at 17:45:12,
-17:58:22 and 18:16:20 UTC, plus a retirement at 17:04:00. Each was a lease whose holder had died,
-and none carried a token any rule could match.
-
-**The fifth arm is narrower than it looks, deliberately.** `switchback-ingest-signal-stranded`
-covers the one state no reclaim can free — a `running` row whose `lockedAt` is NULL, which
-`lockedAt < cutoff` never matches however long it sits. That is a different fault from a killed
-handler and it needs its own arm; it is not a second chance at the same one.
-
-**The sixth arm is the one condition `writeOutcome`'s lease fence exists to detect.**
-`switchback-ingest-double-commit` is written when a handler finished under a lease that had already
-been taken back, so the same trails were committed twice. The count lives only in `DrainResult.lost`
-and the row belongs to whoever reclaimed it, so without this line nothing anywhere records it.
-
-**The seventh arm is a repair, reported because nothing else would show it happened.**
-`switchback-ingest-tile-wedged` is written by `repairWedgedTiles` when it takes a tile out of
-`running` that no job could have finished. A tile reaches that state only by having its handler
-killed on its last attempt, so the repair firing means the killing is still happening.
-
-**The eighth arm covers the pump, which is now the only route from `ingest_jobs` to a drainer.**
-`runPump` reads the queue depth through ARM and publishes; if either throws, `ingestPump` rejects.
-`reportQueueHealth` has already run by then, so `switchback-ingest-worker-silent` stays quiet on its
-heartbeat and the estate looks alive while nothing reaches the queue. Unlike the drain, a rejected
-timer invocation does write a request row — the process is not killed — so `success == false` is the
-right predicate here even though it is the wrong one four arms up.
+**Fires** on one event in fifteen minutes. **Clears** by itself once fifteen minutes pass without
+one. Auto-clearing discards no evidence — the `traces` row outlives the alert instance and the
+runbook query still finds it — and an instance left `Fired` for ever is what makes the next real
+one invisible.
 ''')
-resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
-  name: 'switchback-ingest-drain-failed'
+resource groundLostAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-ground-lost'
   location: location
   tags: tags
   properties: {
-    displayName: 'switchback-ingest-drain-failed'
-    description: 'An ingest job failed, was killed by the host, could not commit ground it had fetched, or the pump could not publish. None of these dead-letters, so this rule is the only signal. Subdivision is not on it: a split is the designed answer to a dense tile.'
+    displayName: 'switchback-ingest-ground-lost'
+    description: 'Ingest lost ground that nothing will recover on its own: trails that did not commit, a job out of attempts, a stuck subtree, a stranded signal, a double commit or a wedged tile. Retryable failures are on switchback-ingest-drain-degraded instead.'
     severity: 2
     enabled: true
     scopes: [
@@ -1404,8 +1338,9 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
     criteria: {
       allOf: [
         {
-          query: 'union (requests | where name == "ingestDrain" and success == false | project timestamp), (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-trail-lost" | project timestamp), (traces | where message has "switchback-ingest-subtree-stuck" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-signal-stranded" | project timestamp), (traces | where message has "switchback-ingest-double-commit" | project timestamp), (traces | where message has "switchback-ingest-tile-wedged" | project timestamp), (requests | where name == "ingestPump" and success == false | project timestamp)'
-          timeAggregation: 'Count'
+          query: 'traces | where message has "switchback-ingest-trail-lost" or message has "switchback-ingest-job-buried" or message has "switchback-ingest-subtree-stuck" or message has "switchback-ingest-signal-stranded" or message has "switchback-ingest-double-commit" or message has "switchback-ingest-tile-wedged" | summarize events = count()'
+          metricMeasureColumn: 'events'
+          timeAggregation: 'Total'
           operator: 'GreaterThan'
           threshold: 0
           failingPeriods: {
@@ -1415,7 +1350,129 @@ resource drainFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pr
         }
       ]
     }
-    autoMitigate: false
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
+@description('''
+**Faults the system repairs by itself, reported so a person can see a rate rather than woken for a
+single instance.** Each arm below has a named repair that runs without help, which is why this is
+severity 3 and `switchback-ingest-ground-lost` is severity 2.
+
+| arm | repair | bound on the repair |
+|---|---|---|
+| `ingest-job-failed` | `failJob` reschedules on the `RETRY_DELAYS_MS` ladder | `maxAttempts`, 5; the last one becomes `switchback-ingest-job-buried` |
+| `switchback-ingest-lease-expired` | `reclaimExpiredJobs` returns the row to `queued` at `RECLAIM_PRIORITY` | runs off `ingestPump`'s two-minute timer |
+| `ingestDrain` request failure | the host abandons and redelivers the message | `maxDeliveryCount`, 5; then the dead-letter queue and its own metric alert |
+
+**Severity, not threshold, is what stops the paging.** The condition is still `> 0` over fifteen
+minutes, so a single transient is still detected and still recorded; what changed is that it no
+longer wakes anybody and no longer needs a human to close it. Raising the threshold instead would
+make the rule blind to the first few instances of a real fault, which is the opposite of what a
+degraded-state signal is for.
+
+`switchback-ingest-lease-expired` is the reaper doing its job, not a fault: a Service Bus lock
+expires mid-handler, the redelivery finds the database lease still held and logs "nothing
+claimable", the reaper reclaims, the requeue finishes. Three in the seven days to 2026-08-10T17:00Z,
+all of which completed that way.
+
+**Fires** on one event in fifteen minutes. **Clears** by itself after a quiet window — see the
+`summarize` note on `switchback-ingest-ground-lost` for why the query returns a row rather than
+nothing.
+''')
+resource drainDegradedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-drain-degraded'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-drain-degraded'
+    description: 'An ingest job failed and was rescheduled, a lease expired and was reclaimed, or a drain invocation was rejected and redelivered. All three recover unaided; a sustained rate is what deserves a look.'
+    severity: 3
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'union (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (requests | where name == "ingestDrain" and success == false | project timestamp) | summarize events = count()'
+          metricMeasureColumn: 'events'
+          timeAggregation: 'Total'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
+@description('''
+**The pump is the only route from `ingest_jobs` to the queue, so a pump that cannot publish stops
+ingestion while everything else looks healthy.** `runPump` reads the queue depth through ARM and
+publishes; if either throws, `ingestPump` rejects.
+
+**`switchback-ingest-worker-silent` does not cover this, despite watching the same function.**
+`reportQueueHealth` is the first statement in the handler and runs ahead of both the
+`INGEST_PUMP_ENABLED` brake and the publish, so a pump that heartbeats and then fails to publish
+leaves that rule reading a live worker. Unlike the drain, a rejected timer invocation does write a
+request row — the process is not killed — so `success == false` is a sound predicate here.
+
+**Sustained, not single, and that is a sharpening rather than a relaxation.** One rejected tick is
+answered by the next one two minutes later; three of four consecutive fifteen-minute windows
+carrying a rejection is a pump that is not recovering, which is an outage of ingestion. A `> 0`
+single-window rule on the same signal would page for the transient and, mixed in with them, read
+identically to the outage.
+
+**Fires** when three of the last four fifteen-minute windows contain a rejected `ingestPump`.
+**Clears** by itself once two consecutive windows are clean.
+''')
+resource pumpFailingAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-pump-failing'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-pump-failing'
+    description: 'ingestPump has been rejecting for 45 minutes of the last hour. Nothing is reaching the Service Bus queue, so nothing is draining, and the worker heartbeat still reads healthy because it is written before the publish.'
+    severity: 2
+    enabled: true
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT15M'
+    criteria: {
+      allOf: [
+        {
+          query: 'requests | where name == "ingestPump" and success == false | summarize failures = count()'
+          metricMeasureColumn: 'failures'
+          timeAggregation: 'Total'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 4
+            minFailingPeriodsToAlert: 3
+          }
+        }
+      ]
+    }
+    autoMitigate: true
     actions: {
       actionGroups: [
         actionGroup.id
@@ -1451,13 +1508,27 @@ of 0.33, and it is still well inside what a real block produces. `maxAttempts` i
 `max(6, endpoints x 2)` = 6, and a tile spends up to four Overpass queries, so one tile against a
 blocked IP emits up to 24 refusals — the threshold is crossed inside a single tile, long before an
 hour of it. Exhaustion past that point is not this rule's job: when failover runs out the request
-throws, the tile fails, and `switchback-ingest-drain-failed` reads the `ingest-job-failed` it
+throws, the tile fails, and `switchback-ingest-drain-degraded` reads the `ingest-job-failed` it
 writes.
 
+**The scope stays on 429 even though 504 is the commoner refusal, and the counts are the argument
+for it rather than against.** Over the 48 h to 2026-08-10T17:00Z the strain marker recorded 155
+504s, 20 429s and 204 failovers carrying no status. A 504 is a slow mirror; `OverpassClient`
+rotates to the next endpoint and the tile proceeds, and the data loss a rotation cannot absorb is
+`switchback-ingest-overpass-skipped`'s to report. Only a 429 is the upstream saying we are over an
+allowance it enforces with a block, and only a block stops ingestion outright. Re-scoping this rule
+onto 504 would replace a signal for the one unrecoverable upstream failure with a busier signal for
+the recoverable one.
+
+The threshold has been crossed, which is the evidence that it is set somewhere real: ten instances
+between 2026-08-08T22:44:37Z and 2026-08-09T21:29:45Z, and none since. Over the 48 h to
+2026-08-10T17:00Z the busiest hour held 3, so the rule is correctly quiet rather than inert.
+
 **Fires** when Overpass returns more than 8 rate limits in any rolling hour. **Clears** by itself
-once the trailing hour falls back to 8 or fewer — `autoMitigate` is on, because unlike lost ground
-this is a condition that is either present or over, the client recovers without help, and an
-operator arriving at a resolved rate-limit alert has nothing left to do.
+once the trailing hour falls back to 8 or fewer — the `summarize` form returns a row holding the
+count when nothing matches, so "below threshold" is a measurement the rule can act on rather than
+an empty result. The projecting form returns no row, and all ten instances above sat `Fired` under
+`autoMitigate: true` while it was in use.
 ''')
 resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-overpass-limited'
@@ -1476,8 +1547,9 @@ resource overpassLimitedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
     criteria: {
       allOf: [
         {
-          query: 'traces | where message has "switchback-ingest-overpass-strain" and message has "status=429" | project timestamp'
-          timeAggregation: 'Count'
+          query: 'traces | where message has "switchback-ingest-overpass-strain" and message has "status=429" | summarize refusals = count()'
+          metricMeasureColumn: 'refusals'
+          timeAggregation: 'Total'
           operator: 'GreaterThan'
           threshold: 8
           failingPeriods: {
@@ -1549,8 +1621,9 @@ resource overpassSkippedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15
 @description('''
 **The queue needs a gauge as well as an event stream, and this is it.**
 
-`switchback-ingest-drain-failed` above fires on things that *happened* — a job that failed, a
-handler the host killed, a tile that deferred itself to four children. This rule watches what is
+`switchback-ingest-ground-lost` and `switchback-ingest-drain-degraded` above fire on things that
+*happened* — a job that failed, a handler the host killed, a tile that deferred itself to four
+children. This rule watches what is
 *true*: conditions that persist, and that nothing would report until somebody went looking.
 
 Six of those conditions are a *row*: a job buried recently, a lease past `LEASE_TIMEOUT_MS`, a
