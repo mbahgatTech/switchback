@@ -1304,7 +1304,7 @@ no substring of the other, so `switchback-ingest-drain-degraded` cannot match a 
 a retry. `apps/ingest-worker/test/drain.test.ts` asserts each token against the query that reads it.
 
 Measured on the component this rule scopes to, seven days to 2026-08-10T17:00Z:
-`ingest-job-failed` 16, `trail-lost` 4, `lease-expired` 3, and **zero** for `subtree-stuck`,
+`ingest-job-failed` 14, `trail-lost` 4, `lease-expired` 3, and **zero** for `subtree-stuck`,
 `signal-stranded`, `double-commit` and `tile-wedged`. Those four are kept because each names a
 state with no other reporter, but none has been observed firing, so none is known to work. Prove
 one with a synthetic trigger before trusting it.
@@ -1323,10 +1323,12 @@ The `summarize` form is here for a different reason: it names a column, so `metr
 carries the count into the alert payload and an operator sees how many events fired the rule
 without re-running the query.
 
-**Fires** on one event in fifteen minutes. **Clears** by itself once fifteen minutes pass without
-one. Auto-clearing discards no evidence — the `traces` row outlives the alert instance and the
-runbook query still finds it — and an instance left `Fired` for ever is what makes the next real
-one invisible.
+**Fires** on one event in fifteen minutes. **Clears** by itself once an evaluation finds the
+fifteen-minute window empty. Fifteen minutes is the query window, not a bound on how quickly Azure
+mitigates: the `switchback-ingest-queue-distress` instance of 2026-08-10 fired at 17:09:41.7Z and
+resolved unaided at 17:55:42.6Z. Auto-clearing discards no evidence — the `traces` row outlives the
+alert instance and the runbook query still finds it — and an instance left `Fired` for ever is what
+makes the next real one invisible.
 ''')
 resource groundLostAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-ground-lost'
@@ -1395,9 +1397,10 @@ expires mid-handler, the redelivery finds the database lease still held and logs
 claimable", the reaper reclaims, the requeue finishes. Three in the seven days to 2026-08-10T17:00Z,
 all of which completed that way.
 
-**Fires** on one event in fifteen minutes. **Clears** by itself after a quiet window — see the
-`summarize` note on `switchback-ingest-ground-lost` for why the query returns a row rather than
-nothing.
+**Fires** on one event in fifteen minutes. **Clears** by itself once an evaluation finds the
+fifteen-minute window empty, on the mitigation timing described on
+`switchback-ingest-ground-lost` — see also the `summarize` note there for why the query returns a
+row rather than nothing.
 ''')
 resource drainDegradedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
   name: 'switchback-ingest-drain-degraded'
@@ -1526,13 +1529,22 @@ throws, the tile fails, and `switchback-ingest-drain-degraded` reads the `ingest
 writes.
 
 **The scope stays on 429 even though 504 is the commoner refusal, and the counts are the argument
-for it rather than against.** Over the 48 h to 2026-08-10T17:00Z the strain marker recorded 155
-504s, 20 429s and 204 failovers carrying no status. A 504 is a slow mirror; `OverpassClient`
-rotates to the next endpoint and the tile proceeds, and the data loss a rotation cannot absorb is
-`switchback-ingest-overpass-skipped`'s to report. Only a 429 is the upstream saying we are over an
-allowance it enforces with a block, and only a block stops ingestion outright. Re-scoping this rule
-onto 504 would replace a signal for the one unrecoverable upstream failure with a busier signal for
-the recoverable one.
+for it rather than against.** Over the 48 h to 2026-08-10T17:00Z the strain marker recorded 144
+504s, 20 429s and 190 failovers carrying no status:
+
+```
+az monitor app-insights query --app e01856b9-3721-4c05-921f-9cb2fcc398c4 \
+  --start-time 2026-08-08T17:00:00Z --end-time 2026-08-10T17:00:00Z -o json --analytics-query \
+  'traces | where message has "switchback-ingest-overpass-strain"
+         | extend st = extract("status=([0-9]+)", 1, message) | summarize n = count() by st'
+504 144 | no status 190 | 429 20     (exit 0)
+```
+
+A 504 is a slow mirror; `OverpassClient` rotates to the next endpoint and the tile proceeds, and the
+data loss a rotation cannot absorb is `switchback-ingest-overpass-skipped`'s to report. Only a 429 is
+the upstream saying we are over an allowance it enforces with a block, and only a block stops
+ingestion outright. Re-scoping this rule onto 504 would replace a signal for the one unrecoverable
+upstream failure with a busier signal for the recoverable one.
 
 **A threshold of 8 has never been reached, and nothing here should be read as saying it has.** The
 ten instances between 2026-08-08T22:44:37Z and 2026-08-09T21:29:45Z were fired by the *previous*

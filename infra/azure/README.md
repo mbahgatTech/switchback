@@ -1060,21 +1060,40 @@ az storage blob list --account-name stsbingest37ywppu5p7fri --container-name fun
 ### What each alert means
 
 Every rule here is meant to satisfy one test: it fires only when a human should do something, and it
-stops firing when they no longer should. Counts are breaching fifteen-minute evaluation windows over
-the 48 h to 2026-08-09T21:12Z, measured against `AppTraces`/`AppRequests` in
-`log-switchback-prod`.
+stops firing when they no longer should. The **48 h** column counts clock-aligned fifteen-minute
+buckets carrying that rule's arming signal between 2026-08-07T21:12Z and 2026-08-09T21:12Z, read
+from `AppTraces`/`AppRequests` in `log-switchback-prod` — `appi-switchback-ingest` is the only
+component writing there, so those tables and the `traces`/`requests` the rules themselves query are
+the same rows. `worker-silent` evaluates over 30 min and `overpass-limited` over an hour, so for
+those two a bucket measures pressure rather than an instance the rule would have raised.
 
 | Rule                                 | Sev | Fires when                                                                                           | Clears when                           | 48 h |
 | ------------------------------------ | --- | ---------------------------------------------------------------------------------------------------- | ------------------------------------- | ---- |
 | `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                                               | A heartbeat lands                     | 34   |
 | `switchback-db-token-alarm`          | 1   | A Vercel token renewal failed, or a token is nearly expired                                          | The 15-min window comes back empty    | 1    |
-| `switchback-ingest-ground-lost`      | 2   | Trails uncommitted, a job buried, a subtree stuck, a signal stranded, a double commit, a tile wedged | 15 min pass with none of them         | 5    |
+| `switchback-ingest-ground-lost`      | 2   | Trails uncommitted, a job buried, a subtree stuck, a signal stranded, a double commit, a tile wedged | 15 min pass with none of them         | 2    |
 | `switchback-ingest-pump-failing`     | 2   | 3 of the last 4 windows carried a rejected `ingestPump`                                              | Two consecutive clean windows         | 0    |
 | `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                                          | The trailing hour drops to 8 or fewer | 0    |
 | `switchback-ingest-deadletter`       | 2   | A message is sitting in the dead-letter queue                                                        | The queue is drained                  | 0    |
-| `switchback-ingest-drain-degraded`   | 3   | A job failed and was rescheduled, a lease expired, a drain was rejected                              | The 15-min window comes back empty    | 6    |
+| `switchback-ingest-drain-degraded`   | 3   | A job failed and was rescheduled, a lease expired, a drain was rejected                              | The 15-min window comes back empty    | 5    |
 | `switchback-ingest-queue-distress`   | 3   | Any distress gauge non-zero                                                                          | Every gauge returns to zero           | 61   |
 | `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                                           | The window falls back to 4 or fewer   | 0    |
+
+The two rules this template adds re-derive from the workspace, and the same shape re-derives the
+rest by substituting the arming predicate:
+
+```bash
+az monitor log-analytics query -w c188de03-100d-4608-9502-65e12323d986 -o json --analytics-query '
+let s = datetime(2026-08-07T21:12:00Z);
+let e = datetime(2026-08-09T21:12:00Z);
+let T = AppTraces | where TimeGenerated >= s and TimeGenerated < e;
+let R = AppRequests | where TimeGenerated >= s and TimeGenerated < e;
+union
+  (T | where Message has "switchback-ingest-trail-lost" or Message has "switchback-ingest-job-buried" or Message has "switchback-ingest-subtree-stuck" or Message has "switchback-ingest-signal-stranded" or Message has "switchback-ingest-double-commit" or Message has "switchback-ingest-tile-wedged" | summarize by bin(TimeGenerated, 15m) | summarize windows = count() | extend rule = "ground-lost"),
+  (union (T | where Message has "ingest-job-failed" | project TimeGenerated), (T | where Message has "switchback-ingest-lease-expired" | project TimeGenerated), (R | where Name == "ingestDrain" and Success == false | project TimeGenerated) | summarize by bin(TimeGenerated, 15m) | summarize windows = count() | extend rule = "drain-degraded")
+| project rule, windows'
+# ground-lost 2, drain-degraded 5   (exit 0)
+```
 
 **The live estate is behind this template, and the table describes the template.** Read from Azure on
 2026-08-10 the resource group holds six scheduled query rules — `drain-failed`, `queue-distress`,
@@ -1159,9 +1178,8 @@ split marker with fewer than four children, and `splitTile` upserts all four chi
 writes the marker — so a split that dies partway leaves no marker at all and this gauge sees
 nothing. That failure is caught elsewhere: the exception propagates, `failJob` runs, and
 `ingest-job-failed` arms `drain-degraded`. What `orphanedSplits` does detect is a subtree deleted
-after
-a successful split, which is how the six production rows of 2026-08-05 arose. It is wired correctly
-and watching a real condition — just not the one a split failure produces.
+after a successful split, which is how the six production rows of 2026-08-05 arose. It is wired
+correctly and watching a real condition — just not the one a split failure produces.
 
 ### Acting on an ingest alert
 
@@ -1172,9 +1190,9 @@ a condition still true at the last evaluation. Two things break that inference, 
 - `switchback-ingest-drain-failed` is still running in Azure with `autoMitigate: false` and is not
   deleted by deploying this template — see the deletion command above. Its instances never clear.
 - An instance carries the configuration of the rule **as it was when it fired**. The ten
-  `switchback-ingest-overpass-limited` instances of 2026-08-08/09 are still `Fired` because that
-  rule had `autoMitigate: false` until 2026-08-09T23:50:53Z; the flag has been `true` since, and
-  they will not resolve retroactively.
+  `switchback-ingest-overpass-limited` instances of 2026-08-08/09 never resolved on their own
+  because that rule had `autoMitigate: false` until 2026-08-09T23:50:53Z; flipping the flag `true`
+  did not reach them, and all ten read `Closed` only because an operator closed them by hand.
 
 `switchback-ingest-queue-distress` is the counter-example worth knowing, because it refutes the
 tempting theory that a query ending `| project timestamp` cannot resolve: it uses exactly that form,
@@ -1221,7 +1239,7 @@ rate means the recovery is not keeping up. Break it down by arm before doing any
 
 ```bash
 az monitor app-insights query --app $APP --offset 24h -o json \
-  --analytics-query 'traces | where message has "ingest-job-failed" or message has "switchback-ingest-lease-expired" | extend arm = iff(message has "switchback-ingest-lease-expired", "lease-expired", "job-failed") | summarize n = count() by arm, kind = extract("(ingest_tile|refresh_tile|ingest_route|enrich_trail|ingest_network)", 1, message) | order by n desc'
+  --analytics-query 'traces | where message has "ingest-job-failed" or message has "switchback-ingest-lease-expired" | extend arm = iff(message has "switchback-ingest-lease-expired", "lease-expired", "job-failed") | summarize n = count() by arm, jobKind = extract("(ingest_tile|refresh_tile|ingest_route|enrich_trail|ingest_network)", 1, message) | order by n desc'
 ```
 
 A single job kind dominating is a defect in that handler, not a queue problem. Read what the rows

@@ -500,15 +500,16 @@ describe('processTile, a trail that would not commit', () => {
     '1443536 waits for ShareLock on transaction 293451; blocked by process 1443535.") }), ' +
     'transient: false })';
 
-  /** Deadlocks `attempts` times, then commits — the loser of a race whose winner has finished. */
-  function deadlockingTransaction(attempts: number): PrismaClient {
+  /** Fails `attempts` times with `makeError`, then commits — the loser of a race whose winner has finished. */
+  function deadlockingTransaction(
+    attempts: number,
+    makeError: () => Error = () => new Error(DEADLOCK_MESSAGE),
+  ): PrismaClient {
     const { db, recorded } = fakeDb();
     let calls = 0;
     (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
       calls += 1;
-      return calls <= attempts
-        ? Promise.reject(new Error(DEADLOCK_MESSAGE))
-        : Promise.resolve('trail-1');
+      return calls <= attempts ? Promise.reject(makeError()) : Promise.resolve('trail-1');
     };
     return Object.assign(db, { recorded, calls: () => calls });
   }
@@ -535,6 +536,32 @@ describe('processTile, a trail that would not commit', () => {
     expect((db as unknown as { calls: () => number }).calls()).toBe(2);
     // The retry succeeded, so nothing about the deadlock reaches the row an operator reads.
     expect(recorded.updates.at(-1)?.data.lastError).toBeNull();
+  });
+
+  it('re-runs a trail whose rollback Prisma reported as a write conflict', async () => {
+    /*
+     * `P2034` is Prisma's own mapping of the same complete rollback, raised on the paths where it
+     * maps rather than passing the SQLSTATE through. Its message carries no `40P01`, so the code
+     * is the only thing that names it and a message-only check loses the trail.
+     */
+    const db = deadlockingTransaction(1, () =>
+      Object.assign(new Error('Transaction failed due to a write conflict or a deadlock.'), {
+        code: 'P2034',
+      }),
+    );
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: flatTerrain,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() + 600_000,
+    });
+
+    expect(result.status).toBe(TileStatus.ready);
+    expect(result.failed).toBe(0);
+    expect((db as unknown as { calls: () => number }).calls()).toBe(2);
   });
 
   it('gives up on a trail that deadlocks every time, rather than retrying for ever', async () => {
