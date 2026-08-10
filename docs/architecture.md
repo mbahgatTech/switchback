@@ -502,15 +502,16 @@ does _not_ complete is the one whose row is past `LEASE_TIMEOUT_MS` or has no `l
 that means the reaper itself has stopped, so `assertSettleable` throws and
 `switchback-ingest-signal-stranded` says so.
 
-The first version of `switchback-ingest-drain-failed` read `requests | where success == false`, and
-that was blind to the failure mode it was written for. `drainJobs` catches every handler error,
-writes it to the job row and returns normally, so the 2026-08-04 run was 14/14 successful
-invocations while six Alps tiles were failing — the failure existed only as six `traces` lines. The
-rule now unions the request arm with a `traces` arm keyed on the literal `ingest-job-failed` that
-`runIngestSignal` logs beside every job-level failure. Matching a token rather than a sentence is
-deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code and the template still
-agree on it. Severity 2, onto the same action group, `autoMitigate: false` — the condition is "this
-happened", not "this is happening".
+Reading `requests | where success == false` alone is blind to the failure mode these rules exist
+for. `drainJobs` catches every handler error, writes it to the job row and returns normally, so the
+2026-08-04 run was 14/14 successful
+invocations while six Alps tiles were failing — the failure existed only as six `traces` lines.
+`switchback-ingest-drain-degraded` unions the request arm with a `traces` arm keyed on the literal
+`ingest-job-failed` that `runIngestSignal` logs beside every job-level failure. Matching a token
+rather than a sentence is deliberate, and `apps/ingest-worker/test/drain.test.ts` asserts the code
+and the template still agree on it. Severity 3, onto the same action group, `autoMitigate: true` —
+each arm names a repair that runs unaided, so what deserves a look is a sustained rate, and a drain
+that recovers clears the alert instead of leaving it open for a person to close.
 
 **Every arm of that rule reads telemetry the Function App emits, and the Function App is now the
 drainer.** That was not always true: while the drain ran on Vercel, which has no Application
@@ -537,8 +538,8 @@ counts them and logs the token when any is non-zero, ahead of the pump's `INGEST
 brake, because a queue somebody has deliberately stopped feeding is exactly when its depth still
 needs watching.
 `apps/ingest-worker/test/health.test.ts` asserts the token, the query and that ordering. Severity 3
-and `autoMitigate: true`, unlike the rule above: this is a gauge re-read every two minutes, so a
-queue that has been repaired should clear it rather than leave a resolved condition open.
+and `autoMitigate: true`: this is a gauge re-read every two minutes, so a queue that has been
+repaired should clear it rather than leave a resolved condition open.
 
 **The sixth condition is the absence of one.** A drain that has stopped writes no error, takes no
 lease and marks no tile: jobs simply stay `queued`, which is what they do while a healthy drain
@@ -571,13 +572,19 @@ Measured read-only against production on 2026-08-07 17:50 UTC, every field reads
 `dead` 0 windowed against 25 unwindowed, `staleLeases` 0, `rateLimited` 0, and no `ingest_tiles` row
 carries a split marker or a stuck-subtree marker. The gauge is clear and can fire on the next real 429.
 
-**All three rules are deployed, and so is the code that arms them.**
-`az resource list -g rg-switchback-prod-northcentralus --resource-type
-Microsoft.Insights/scheduledqueryrules` returns `switchback-ingest-drain-failed`,
-`switchback-ingest-queue-distress` and `switchback-ingest-worker-silent`. The Function App runs a
-bundle published by `.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest
-worker` job will invoke on every push to master — and which refuses to report success until the
-running host emits a heartbeat naming the commit it just pushed.
+**The code that arms these rules is deployed; three of the rules themselves are not yet.** Read on
+2026-08-10T19:20Z, `az monitor scheduled-query list -g rg-switchback-prod-northcentralus` returns
+`switchback-ingest-drain-failed`, `switchback-ingest-queue-distress`,
+`switchback-ingest-worker-silent`, `switchback-ingest-overpass-limited`,
+`switchback-ingest-overpass-skipped` and `switchback-db-token-alarm`. `ground-lost`,
+`drain-degraded` and `pump-failing` are declared in `infra/azure/ingest.bicep` and arrive with the
+next deployment of it, which also leaves `drain-failed` running until it is deleted by hand. That
+deletion is not a one-liner — the resource-group lock refuses a delete at any scope inside the
+group, so it has to be lifted and re-PUT around it, and `infra/azure/README.md` carries the three
+steps. The Function App runs a bundle published by
+`.github/scripts/deploy-worker.sh`, which is the file `ci.yml`'s `deploy ingest worker` job will
+invoke on every push to master — and which refuses to report success until the running host emits a
+heartbeat naming the commit it just pushed.
 
 **The distress rule alone would still read a dead worker as a healthy estate**, because its whole
 firing condition is a log line and a host that is down or serving an old bundle produces none.
@@ -802,7 +809,7 @@ returns the revived-from-dead children as `exhausted`; `rollUpSplitTile` writes 
 `lastError` and logs `switchback-ingest-subtree-stuck` — but only when that message differs from what
 the row already says. Edge-triggering is load-bearing rather than tidy: a blocked parent is `pending`,
 so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
-pending, and the alert is `Count > 0` over fifteen minutes with `autoMitigate` off. A line per drain
+pending, and `switchback-ingest-ground-lost` fires on one event in fifteen minutes. A line per drain
 would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
 genuine failure signal — which trains an operator to ignore the signal the rule exists to carry.
 `promoteFrom` nulls `lastError` when the roll-up lands, so the edge re-arms itself.
@@ -861,12 +868,12 @@ setting that the next deploy revokes, which is the correct asymmetry.
 **A split is a deferral and must not read as a success.** Before subdivision a tile that exhausted
 its deadline threw, `drainJobs` recorded a failure, and the drain-failure alert armed. Now it
 returns normally and `report()` logs `done`, so an operator would read 8/8 tiles succeeded while
-two of them ingested nothing. `switchback-ingest-drain-failed` therefore has a third arm matching
-`switchback-ingest-tile-split` and `switchback-ingest-subtree-stuck`.
+two of them ingested nothing. `switchback-ingest-ground-lost` therefore has an arm matching
+`switchback-ingest-subtree-stuck`.
 
-That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so both
-markers land where the rule can read them — including `switchback-ingest-subtree-stuck`, the
-edge-triggered "five failures, a human is needed" signal. That was not true while the drain ran on
+That alert is scoped to `appi-switchback-ingest`, and the Function App is the drainer, so
+`switchback-ingest-subtree-stuck` — the edge-triggered "five failures, a human is needed" signal —
+lands where the rule can read it. That was not true while the drain ran on
 Vercel: the markers went to `console` because there was nowhere else for them to go, and there is no
 Vercel log drain in the estate or in any template. Deleting the Vercel drain is what closed that
 gap, rather than any change to the rule.

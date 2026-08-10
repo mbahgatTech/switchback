@@ -179,7 +179,12 @@ describe('the alert that watches it', () => {
  */
 describe('the rules that page a human', () => {
   const bicep = readFileSync(resolve(here, '../../../infra/azure/ingest.bicep'), 'utf8');
-  const drainQuery = bicep.split('\n').find((line) => line.includes('name == "ingestDrain"')) ?? '';
+  const queryLine = (token: string): string =>
+    bicep.split('\n').find((line) => line.includes('query:') && line.includes(token)) ?? '';
+  // Located by a token each rule alone carries: `ground-lost` reads the unrecoverable arms,
+  // `drain-degraded` the ones with a repair behind them.
+  const groundLostQuery = queryLine(TRAIL_LOST_MARKER);
+  const drainQuery = queryLine('name == "ingestDrain"');
 
   /*
    * The split exit returns `pending` without throwing, so `failJob` never runs and no
@@ -187,13 +192,19 @@ describe('the rules that page a human', () => {
    * 1519 trails, and this token was the only thing in the estate that marked it.
    */
   it('reads lost ground, which the split exit reports through no other token', () => {
-    expect(drainQuery).toContain(`message has "${TRAIL_LOST_MARKER}"`);
+    expect(groundLostQuery).toContain(`message has "${TRAIL_LOST_MARKER}"`);
+  });
+
+  /* A tile that lost ground pages; a job that will retry does not. The two rules must not both
+   * match one event, or the split buys nothing. */
+  it('keeps lost ground off the rule that does not page', () => {
+    expect(drainQuery).not.toContain(TRAIL_LOST_MARKER);
   });
 
   /* Subdivision is the designed answer to a dense tile. It outnumbered every real fault 9 to 7 in
    * the 48 h to 2026-08-09T21:12Z, and a Sev2 on it is a Sev2 on healthy operation. */
   it('does not page on subdivision', () => {
-    expect(drainQuery).not.toContain(TILE_SPLIT_MARKER);
+    expect(groundLostQuery).not.toContain(TILE_SPLIT_MARKER);
   });
 
   /* 16 rate limits in 48 h, peaking at 4 in any rolling hour, is the ambient behaviour of a free

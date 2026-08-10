@@ -408,10 +408,10 @@ describe('processTile, out of clock', () => {
 
   it('reports an exhausted descendant once, not on every drain', async () => {
     /*
-     * The alert this feeds is Count > 0 over fifteen minutes with `autoMitigate` off, and a
-     * blocked parent is `pending` — so `ensureCoverage` re-queues it on every viewport poll and
-     * the client polls precisely *because* it is pending. A line per drain would page every
-     * quarter of an hour for as long as anyone left that map open.
+     * `switchback-ingest-ground-lost` fires on one event in fifteen minutes, and a blocked parent
+     * is `pending` — so `ensureCoverage` re-queues it on every viewport poll and the client polls
+     * precisely *because* it is pending. A line per drain would page every quarter of an hour for
+     * as long as anyone left that map open.
      */
     const children = ['1202212030', '1202212031', '1202212032', '1202212033'].map(
       (quadkey, index) => ({
@@ -484,6 +484,104 @@ describe('processTile, a trail that would not commit', () => {
       );
     return Object.assign(db, { recorded });
   }
+
+  /**
+   * The production deadlock, verbatim. Two committers touched one `trail_ways` row from opposite
+   * directions and Postgres broke the cycle by rolling one back: tiles 120221220 and 120221201 on
+   * 2026-08-10 at 05:29:56Z and 05:35:57Z, three relations lost between them.
+   *
+   * Prisma surfaces this as `PrismaClientUnknownRequestError` with no `code`, so the SQLSTATE is
+   * only in the message — a retry keyed on `P2034` alone would not have caught any of the three.
+   */
+  const DEADLOCK_MESSAGE =
+    'Invalid `prisma.trailWay.createMany()` invocation:\n\nError occurred during query execution:\n' +
+    'ConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError ' +
+    '{ code: "40P01", message: "deadlock detected", severity: "ERROR", detail: Some("Process ' +
+    '1443536 waits for ShareLock on transaction 293451; blocked by process 1443535.") }), ' +
+    'transient: false })';
+
+  /** Fails `attempts` times with `makeError`, then commits — the loser of a race whose winner has finished. */
+  function deadlockingTransaction(
+    attempts: number,
+    makeError: () => Error = () => new Error(DEADLOCK_MESSAGE),
+  ): PrismaClient {
+    const { db, recorded } = fakeDb();
+    let calls = 0;
+    (db as unknown as { $transaction: () => Promise<string> }).$transaction = () => {
+      calls += 1;
+      return calls <= attempts ? Promise.reject(makeError()) : Promise.resolve('trail-1');
+    };
+    return Object.assign(db, { recorded, calls: () => calls });
+  }
+
+  it('re-runs a trail whose transaction Postgres rolled back to break a deadlock', async () => {
+    /*
+     * The rollback is complete, so the retry re-reads and either takes the contended way or
+     * concedes it. Without it the trail is simply lost and the tile reports `failed`.
+     */
+    const db = deadlockingTransaction(1);
+    const { recorded } = db as unknown as { recorded: Recorded };
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: flatTerrain,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() + 600_000,
+    });
+
+    expect(result.status).toBe(TileStatus.ready);
+    expect(result.failed).toBe(0);
+    expect((db as unknown as { calls: () => number }).calls()).toBe(2);
+    // The retry succeeded, so nothing about the deadlock reaches the row an operator reads.
+    expect(recorded.updates.at(-1)?.data.lastError).toBeNull();
+  });
+
+  it('re-runs a trail whose rollback Prisma reported as a write conflict', async () => {
+    /*
+     * `P2034` is Prisma's own mapping of the same complete rollback, raised on the paths where it
+     * maps rather than passing the SQLSTATE through. Its message carries no `40P01`, so the code
+     * is the only thing that names it and a message-only check loses the trail.
+     */
+    const db = deadlockingTransaction(1, () =>
+      Object.assign(new Error('Transaction failed due to a write conflict or a deadlock.'), {
+        code: 'P2034',
+      }),
+    );
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: flatTerrain,
+      enrichWaypoints: false,
+      deadlineAt: Date.now() + 600_000,
+    });
+
+    expect(result.status).toBe(TileStatus.ready);
+    expect(result.failed).toBe(0);
+    expect((db as unknown as { calls: () => number }).calls()).toBe(2);
+  });
+
+  it('gives up on a trail that deadlocks every time, rather than retrying for ever', async () => {
+    // A bounded budget is what keeps a genuinely pathological trail from holding one of
+    // `BACKGROUND_POOL_SIZE` connections while the rest of the tile waits behind it.
+    const db = deadlockingTransaction(Number.MAX_SAFE_INTEGER);
+    const overpass = { query: async () => ({ elements: oneTrail }) } as unknown as OverpassClient;
+
+    await expect(
+      processTile(DENSE, {
+        db,
+        overpass,
+        terrain: flatTerrain,
+        enrichWaypoints: false,
+        deadlineAt: Date.now() + 600_000,
+      }),
+    ).rejects.toThrow(TRAIL_LOST_MARKER);
+
+    expect((db as unknown as { calls: () => number }).calls()).toBeLessThanOrEqual(4);
+  });
 
   /** Two named ways, so a fixture can commit one and lose the other. */
   const twoTrails: OverpassElement[] = [

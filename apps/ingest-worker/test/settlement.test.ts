@@ -26,6 +26,7 @@ function outcome(overrides: Partial<DrainResult> = {}): DrainResult {
     claimed: 0,
     succeeded: 0,
     failed: 0,
+    buried: 0,
     deferred: 0,
     lost: 0,
     derived: 0,

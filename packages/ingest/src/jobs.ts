@@ -261,6 +261,15 @@ export async function completeJob(db: Db, job: Lease, now = new Date()): Promise
 }
 
 /**
+ * Whether this attempt is the job's last, so `failJob` buries it rather than rescheduling.
+ * Exported because the drain reports burial and retry as different events and must not re-derive
+ * the predicate: two copies drifting would make the alert disagree with the row.
+ */
+export function isFinalAttempt(job: Pick<ClaimedJob, 'attempts' | 'maxAttempts'>): boolean {
+  return job.attempts >= job.maxAttempts;
+}
+
+/**
  * Record a failure and either reschedule or bury the job. `dead` rather than deleted: a job
  * that failed five times names a tile Overpass cannot serve, or a bug, and deleting it deletes
  * the evidence.
@@ -272,7 +281,7 @@ export async function failJob(
   now = new Date(),
 ): Promise<boolean> {
   const message = error instanceof Error ? error.message : String(error);
-  const exhausted = job.attempts >= job.maxAttempts;
+  const exhausted = isFinalAttempt(job);
   const delay = RETRY_DELAYS_MS[Math.min(job.attempts - 1, RETRY_DELAYS_MS.length - 1)]!;
 
   return writeOutcome(db, job, {
@@ -448,6 +457,11 @@ export interface DrainResult {
   claimed: number;
   succeeded: number;
   failed: number;
+  /**
+   * How many of `failed` had no attempt left, so the row is now `dead`. The distinction the
+   * alerting rests on: a job below `maxAttempts` re-runs on its own, a buried one never does.
+   */
+  buried: number;
   /** Claimed but handed back untried — a kind this build has no handler for. */
   deferred: number;
   /** Claimed, run, and the outcome dropped because the lease had expired — see `writeOutcome`. */
@@ -562,6 +576,7 @@ export async function drainJobs(
   const jobs = [...primary, ...derived];
   let succeeded = 0;
   let failed = 0;
+  let buried = 0;
   let deferred = 0;
   let lost = 0;
 
@@ -586,8 +601,13 @@ export async function drainJobs(
       if (await completeJob(db, job, now())) succeeded += 1;
       else lost += 1;
     } catch (error) {
-      if (await failJob(db, job, error, now())) failed += 1;
-      else lost += 1;
+      // Read before the write: `failJob` does not report which branch it took, and afterwards the
+      // row's `attempts` has moved on.
+      const final = isFinalAttempt(job);
+      if (await failJob(db, job, error, now())) {
+        failed += 1;
+        if (final) buried += 1;
+      } else lost += 1;
     }
   }
 
@@ -595,6 +615,7 @@ export async function drainJobs(
     claimed: jobs.length,
     succeeded,
     failed,
+    buried,
     deferred,
     lost,
     derived: derived.length,

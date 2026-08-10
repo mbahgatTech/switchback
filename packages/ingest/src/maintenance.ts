@@ -222,7 +222,7 @@ export async function countWedgedTiles(
 export const WEDGE_GRACE_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_SWEEP_GRACE_MS;
 
 /**
- * The literal `switchback-ingest-drain-failed` greps for, written into the tile's `lastError`.
+ * The literal `switchback-ingest-ground-lost` greps for, written into the tile's `lastError`.
  *
  * A wedged tile is repaired by correcting the row rather than by retrying it, so nothing else
  * would record that it happened.

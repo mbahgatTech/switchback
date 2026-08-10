@@ -113,10 +113,13 @@ for it. The tile comes back on the lease sweep and is killed
 again — an indefinite loop costing one wasted ten-minute invocation per turn. Two of five
 tiles did this on 2026-08-03 with `deadLetterMessageCount` at 0 throughout, and the only signal was
 `requests | where name == "ingestDrain" and success == false` in Application Insights, which nobody
-was running. `switchback-ingest-drain-failed` in `infra/azure/ingest.bicep` is that query as a
-scheduled query rule on `appi-switchback-ingest`: severity 2, same action group,
-`autoMitigate: false`. `INGEST_DEADLINE_MS` should mean it never fires — which is the reason to keep
-it, because a deadline that stops working looks exactly like this and nothing else would say so.
+was running. `switchback-ingest-drain-degraded` in `infra/azure/ingest.bicep` is that query as one
+arm of a scheduled query rule on `appi-switchback-ingest`: severity 3, same action group,
+`autoMitigate: true`, because the host redelivers the message and the drain recovers unaided.
+`INGEST_DEADLINE_MS` should mean it never fires — which is the reason to keep it, because a
+deadline that stops working looks exactly like this and nothing else would say so. A pump that
+cannot publish is the one non-recoverable case and has its own rule,
+`switchback-ingest-pump-failing`, at severity 2.
 
 Nothing is passed over: `failed`, `deferred`, `lost`, `requeued` and `retired` each get their own
 line, because `lost` — work that finished after its lease was given away — is recorded nowhere

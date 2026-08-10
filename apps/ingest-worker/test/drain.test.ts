@@ -26,9 +26,12 @@ import { MAX_INGEST_ZOOM } from '@switchback/geo';
 import type { PrismaClient } from '@switchback/db';
 import {
   COMMIT_RESERVE_MS,
+  DERIVED_COMMIT_RESERVE_MS,
   HANDLER_DEADLINE_MS,
+  JOB_BURIED_MARKER,
   JOB_FAILED_MARKER,
   SIGNAL_STRANDED_MARKER,
+  commitReserveMs,
   overpassDeadlineMs,
   runIngestSignal,
 } from '../src/drain';
@@ -45,6 +48,7 @@ function outcome(overrides: Partial<DrainResult> = {}): DrainResult {
     claimed: 0,
     succeeded: 0,
     failed: 0,
+    buried: 0,
     deferred: 0,
     lost: 0,
     derived: 0,
@@ -93,8 +97,9 @@ describe('runIngestSignal', () => {
       dedupeKeys: [KEY],
       workerId: 'sb-1',
       deps: {
-        overpass,
-        overpassAfterCommits: overpass,
+        // Deadline views over the injected client, not the client itself — see `runIngestSignal`.
+        overpass: { query: expect.any(Function) as () => void },
+        overpassAfterCommits: { query: expect.any(Function) as () => void },
         deadlineAt: expect.any(Number) as number,
         logger: expect.any(Function) as () => void,
       },
@@ -168,9 +173,25 @@ describe('runIngestSignal', () => {
       }),
     ).resolves.toBeDefined();
 
-    // The token, not the prose: `switchback-ingest-drain-failed` reads this arm, and a tile that
-    // could not commit a trail rethrows into exactly this counter.
+    // The token, not the prose: `switchback-ingest-drain-degraded` reads this arm, and a job whose
+    // retry is still scheduled must not reach the rule that pages.
     expect(log.lines).toContainEqual(['error', expect.stringContaining(JOB_FAILED_MARKER)]);
+    expect(log.lines).not.toContainEqual(['error', expect.stringContaining(JOB_BURIED_MARKER)]);
+  });
+
+  it('reports a burial with its own token, so the paging rule can tell it from a retry', async () => {
+    const log = fakeLog();
+
+    await runIngestSignal({ dedupeKey: KEY }, log, {
+      overpass,
+      workerId: 'sb-1',
+      drain: drainReturning(outcome({ claimed: 1, failed: 1, buried: 1 })),
+    });
+
+    // `buried` is a subset of `failed`, so the retry line must not also appear — an operator
+    // reading both would see two events where one job died.
+    expect(log.lines).toContainEqual(['error', expect.stringContaining(JOB_BURIED_MARKER)]);
+    expect(log.lines).not.toContainEqual(['error', expect.stringContaining(JOB_FAILED_MARKER)]);
   });
 
   it.each([
@@ -203,6 +224,134 @@ describe('runIngestSignal', () => {
     ).rejects.toThrow('connection refused');
 
     expect(log.lines).toContainEqual(['error', expect.stringContaining('could not claim')]);
+  });
+});
+
+/**
+ * The reserve exists to protect a tile's commit fan-out. Charging it to a job that has no fan-out
+ * takes the wall clock off the only phase that job spends any in.
+ */
+describe('the commit reserve, per job kind', () => {
+  it('holds back the tile reserve for a tile', () => {
+    expect(commitReserveMs('ingest_tile:021231321', {})).toBe(COMMIT_RESERVE_MS);
+    expect(commitReserveMs('refresh_tile:021231321', {})).toBe(COMMIT_RESERVE_MS);
+  });
+
+  it('holds back far less for a job that commits at most one trail', () => {
+    // `processRoute` ends in a single `commitTrail`; `enrichTrailPhotos` commits no trail at all.
+    expect(commitReserveMs('ingest_route:120118', {})).toBe(DERIVED_COMMIT_RESERVE_MS);
+    expect(commitReserveMs('enrich_trail:abc123', {})).toBe(DERIVED_COMMIT_RESERVE_MS);
+    expect(DERIVED_COMMIT_RESERVE_MS).toBeLessThan(COMMIT_RESERVE_MS);
+  });
+
+  it('gives a route a wider start-by than a tile, out of the same handler budget', () => {
+    /*
+     * The defect this pins. A route job's whole budget goes on `processRoute`'s recursive relation
+     * fetches, and the tile reserve refuses them 150 s early. Production 2026-08-10: 11 of 11
+     * `ingest_route` attempts failed, 10 of them with "Overpass deadline for this invocation
+     * passed Ns ago" against a 200 s start-by.
+     */
+    const route = overpassDeadlineMs({}, 'ingest_route:120118');
+    const tile = overpassDeadlineMs({}, 'ingest_tile:021231321');
+    expect(route).toBeGreaterThan(tile);
+    expect(route - tile).toBe(COMMIT_RESERVE_MS - DERIVED_COMMIT_RESERVE_MS);
+
+    // Still inside the handler's own clock, reserve included — widening the window must not push
+    // the last query past the point the process is killed.
+    expect(route + OVERPASS_MAX_TOTAL_MS + DERIVED_COMMIT_RESERVE_MS).toBeLessThanOrEqual(
+      HANDLER_DEADLINE_MS,
+    );
+  });
+
+  it('never lets a tightened reserve widen the derived one', () => {
+    // An operator lowering `INGEST_COMMIT_RESERVE_MS` is tightening a budget; it must not
+    // accidentally relax the branch that already sits below it.
+    expect(commitReserveMs('ingest_route:1', { INGEST_COMMIT_RESERVE_MS: '30000' })).toBe(30_000);
+    expect(commitReserveMs('ingest_route:1', { INGEST_COMMIT_RESERVE_MS: '400000' })).toBe(
+      DERIVED_COMMIT_RESERVE_MS,
+    );
+  });
+
+  it('falls back to the tile reserve for a key it cannot classify', () => {
+    // An unknown or malformed key must not silently buy itself a wider window.
+    expect(commitReserveMs('something-with-no-colon', {})).toBe(COMMIT_RESERVE_MS);
+    expect(commitReserveMs('ingest_network:0213', {})).toBe(COMMIT_RESERVE_MS);
+    expect(overpassDeadlineMs({})).toBe(overpassDeadlineMs({}, 'ingest_tile:0213'));
+  });
+});
+
+/**
+ * The reserve arithmetic above is a pure function; this is the wiring that carries it to the
+ * pipeline. Both were needed, because the whole `ingest_route` defect lived in one call site that
+ * every test of the arithmetic leaves green.
+ */
+describe('the start-by the drain hands the pipeline', () => {
+  /*
+   * A budget with a deliberate 90 s gap between the two branches, so one clock reading tells them
+   * apart: a tile may start a pre-commit query for 60 s, a route for 150 s.
+   */
+  const gapped = {
+    INGEST_DEADLINE_MS: '400000',
+    OVERPASS_MAX_TOTAL_MS: '190000',
+    INGEST_COMMIT_RESERVE_MS: '150000',
+  };
+  const TILE_START_BY = 60_000;
+  const ROUTE_START_BY = 150_000;
+  const BETWEEN = 90_000;
+
+  /** What the pipeline's pre-commit Overpass view does with a query `atMs` into the invocation. */
+  async function preCommitQueryAt(dedupeKey: string, atMs: number): Promise<'ran' | 'refused'> {
+    for (const [name, value] of Object.entries(gapped)) vi.stubEnv(name, value);
+    vi.useFakeTimers();
+    try {
+      const startedAt = Date.now();
+      let verdict: 'ran' | 'refused' = 'ran';
+      await runIngestSignal({ dedupeKey }, fakeLog(), {
+        workerId: 'sb-1',
+        overpass,
+        db: settledDb,
+        drain: async (options) => {
+          vi.setSystemTime(startedAt + atMs);
+          try {
+            await options!.deps!.overpass!.query('[out:json];');
+          } catch (error) {
+            if (!(error instanceof OverpassDeadlineError)) throw error;
+            verdict = 'refused';
+          }
+          return outcome({ claimed: 1, succeeded: 1 });
+        },
+      });
+      return verdict;
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
+  }
+
+  it('reads the budget from the env the deployment actually sets', () => {
+    // Anchors the two constants below, so a moved default cannot leave this describe vacuous.
+    expect(overpassDeadlineMs(gapped, 'ingest_tile:021231321')).toBe(TILE_START_BY);
+    expect(overpassDeadlineMs(gapped, 'ingest_route:120118')).toBe(ROUTE_START_BY);
+  });
+
+  it('refuses a tile query once the tile reserve says the commit loop needs the rest', async () => {
+    await expect(preCommitQueryAt('ingest_tile:021231321', BETWEEN)).resolves.toBe('refused');
+  });
+
+  it('lets a route query through at the same moment, which is the whole fix', async () => {
+    /*
+     * The line this pins is the `signal.dedupeKey` argument in `runIngestSignal`. Drop it and the
+     * route is charged the tile's reserve, this query is refused 90 s into a 540 s invocation, and
+     * production records "Overpass deadline for this invocation passed Ns ago" — 10 of the 11
+     * `ingest_route` attempts as at 2026-08-10T19:14Z, 0 of 38 rows ever `done`.
+     */
+    await expect(preCommitQueryAt('ingest_route:120118', BETWEEN)).resolves.toBe('ran');
+  });
+
+  it('still refuses a route query past the route reserve, so the fix is a wider bound not none', async () => {
+    await expect(preCommitQueryAt('ingest_route:120118', ROUTE_START_BY + 1_000)).resolves.toBe(
+      'refused',
+    );
   });
 });
 
@@ -297,30 +446,48 @@ describe('the Overpass concurrency clamp, from the template', () => {
 });
 
 /**
- * The alert has to fire on the failure this worker actually produces. A job that fails is caught
- * by `drainJobs`, recorded on the row, and returned as a successful invocation — so a rule reading
- * only `requests` was structurally blind to it, and was, for the whole of the 2026-08-04 run.
+ * The alerts have to fire on the failures this worker actually produces, and the split between them
+ * has to hold. A job that fails is caught by `drainJobs`, recorded on the row, and returned as a
+ * successful invocation — so a rule reading only `requests` is structurally blind to it.
+ *
+ * The two queries are located by a token each rule alone contains, not by position: the template
+ * holds several scheduled rules and a bare `query:` match binds to whichever is declared first.
  */
-describe('the drain-failure alert, from the template', () => {
+describe('the drain alerts, from the template', () => {
   const bicep = readFileSync(resolve(__dirname, '../../../infra/azure/ingest.bicep'), 'utf8');
-  // Anchored on the rule's own first arm, not on the first `query:` in the file — the template
-  // holds six scheduled rules and a bare match binds to whichever happens to be declared first.
-  const query =
-    bicep
-      .split('\n')
-      .map((line) => /query: '([^']+)'/.exec(line)?.[1] ?? '')
-      .find((q) => q.includes('name == "ingestDrain"')) ?? '';
+  const queries = bicep
+    .split('\n')
+    .map((line) => /query: '([^']+)'/.exec(line)?.[1] ?? '')
+    .filter(Boolean);
+  const queryContaining = (token: string): string => queries.find((q) => q.includes(token)) ?? '';
 
-  it('greps traces for the token the worker logs, not for its prose', () => {
+  const groundLost = queryContaining(TRAIL_LOST_MARKER);
+  const degraded = queryContaining('name == "ingestDrain"');
+  const pumpFailing = queryContaining('name == "ingestPump"');
+
+  it('reads the recoverable arms on the rule that does not page', () => {
     // The coupling that keeps this honest: reword the sentence and the test still passes;
     // change the token on either side alone and it does not.
-    expect(query).toContain(JOB_FAILED_MARKER);
-    expect(query).toContain('traces');
+    expect(degraded).toContain(JOB_FAILED_MARKER);
+    expect(degraded).toContain(LEASE_EXPIRED_MARKER);
+    expect(degraded).toContain('success == false');
+    expect(degraded).toContain('traces');
   });
 
-  it('still catches an invocation the host killed, which logs nothing at all', () => {
-    expect(query).toContain('ingestDrain');
-    expect(query).toContain('success == false');
+  it('routes a burial to the paging rule and a retry away from it', () => {
+    /*
+     * The whole point of the split. `failJob` reschedules below `maxAttempts` and buries only the
+     * last attempt, so a rule matching the failure alone pages for work that re-runs unaided.
+     */
+    expect(groundLost).toContain(JOB_BURIED_MARKER);
+    expect(groundLost).not.toContain(JOB_FAILED_MARKER);
+    expect(degraded).not.toContain(JOB_BURIED_MARKER);
+  });
+
+  it('keeps the buried token free of the retry token as a substring', () => {
+    // `has "ingest-job-failed"` would match a burial line that embedded the same phrase, which
+    // would put every buried job on both rules and undo the split silently.
+    expect(JOB_BURIED_MARKER).not.toContain(JOB_FAILED_MARKER);
   });
 
   /*
@@ -330,24 +497,59 @@ describe('the drain-failure alert, from the template', () => {
    * `TRAIL_LOST_MARKER` inside the split line is the only token left marking it.
    */
   it('separates a subtree that is stuck from a tile that merely split', () => {
-    expect(query).toContain(SUBTREE_STUCK_MARKER);
-    expect(query).toContain(TRAIL_LOST_MARKER);
-    expect(query).not.toContain(TILE_SPLIT_MARKER);
+    expect(groundLost).toContain(SUBTREE_STUCK_MARKER);
+    expect(groundLost).toContain(TRAIL_LOST_MARKER);
+    expect(groundLost).not.toContain(TILE_SPLIT_MARKER);
   });
 
-  it('fires on a handler the host killed, which writes no request row at all', () => {
+  it('reads a killed handler through the reaper, not through the redelivery', () => {
     /*
-     * The arm that closes B4. A killed handler is discovered by `reclaimExpiredJobs`, not by the
-     * redelivery — the reclaim runs ahead of the claim, so by the time a redelivered message is
-     * classified the row is already back to `queued`. Watching the redelivery would be watching a
-     * signal the fix itself stopped emitting.
+     * A killed handler is discovered by `reclaimExpiredJobs`, not by the redelivery — the reclaim
+     * runs ahead of the claim, so by the time a redelivered message is classified the row is
+     * already back to `queued`. That reclaim is the repair working, so it sits on the Sev3 rule.
      */
-    expect(query).toContain(LEASE_EXPIRED_MARKER);
+    expect(degraded).toContain(LEASE_EXPIRED_MARKER);
+    expect(groundLost).not.toContain(LEASE_EXPIRED_MARKER);
   });
 
   it('keeps a separate arm for the strand no reclaim can free', () => {
     // `lockedAt < cutoff` never matches NULL, so a `running` row with no `lockedAt` is permanent.
-    expect(query).toContain(SIGNAL_STRANDED_MARKER);
+    expect(groundLost).toContain(SIGNAL_STRANDED_MARKER);
+  });
+
+  it('watches the pump for a sustained rejection rather than a single tick', () => {
+    // One rejected tick is answered by the next one two minutes later; `worker-silent` cannot see
+    // either, because the heartbeat is written before the publish.
+    expect(pumpFailing).toContain('success == false');
+    expect(pumpFailing).not.toContain('ingestDrain');
+  });
+
+  it('gives every drain rule a query whose count the alert payload can carry', () => {
+    /*
+     * `summarize` with no `by` names a column, which is what `metricMeasureColumn` needs to put the
+     * event count in the alert itself. It is not what makes a rule clear — `autoMitigate` is, and
+     * the case below is the one that guards that.
+     */
+    for (const query of [groundLost, degraded, pumpFailing]) {
+      expect(query).toMatch(/\|\s*summarize\s+\w+\s*=\s*count\(\)\s*$/);
+    }
+  });
+
+  it('leaves no rule in this template that only a person can close', () => {
+    /*
+     * `autoMitigate: false` is the whole reason instances pile up: the platform never resolves one,
+     * so it waits for `alerts/changestate/action`. Measured in the production resource group,
+     * `switchback-ingest-queue-distress` clears itself under `true` while projecting rather than
+     * summarizing, and the ten `overpass-limited` instances of 2026-08-08/09 sat `Fired` under
+     * `false`. This guards the template only — a rule already deployed keeps its own flag until it
+     * is redeployed or deleted, which `infra/azure/README.md` carries the command for.
+     */
+    const autoMitigate = bicep
+      .split('\n')
+      .map((line) => /^\s*autoMitigate: (true|false)$/.exec(line)?.[1])
+      .filter((v): v is string => v !== undefined);
+    expect(autoMitigate.length).toBeGreaterThan(0);
+    expect(autoMitigate).not.toContain('false');
   });
 
   it('exempts traces from sampling, since both trace arms are what it reads', () => {

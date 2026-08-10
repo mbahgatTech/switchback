@@ -133,9 +133,23 @@ export async function resolveTrail(
   };
 }
 
+/** Ascending, so a way-id list has one canonical order however the caller assembled it. */
+function byWayId(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /**
  * Point ways at this trail, in two round trips rather than one upsert each — a long relation's
  * member list runs to hundreds of ways inside a transaction with a 30 s ceiling.
+ *
+ * **The insert's order is load-bearing; the repoint's is not.** Two tiles sharing a way commit
+ * concurrently at `COMMIT_CONCURRENCY`, and Postgres holds each touched row until its transaction
+ * ends. `createMany` sends one `VALUES` list and takes the new primary keys in the order written,
+ * so sorting makes the second committer wait rather than deadlock. `updateMany` sends one
+ * `WHERE "wayId" = ANY (…)`, where the planner picks the visit order — a bitmap heap scan takes
+ * physical order, an index scan sorts the array itself — so sorting there buys determinism, not
+ * lock order, and a `contested` update racing another committer's insert is covered by
+ * `commitTrail`'s `40P01` retry instead.
  */
 export async function claimWays(
   tx: Prisma.TransactionClient,
@@ -145,7 +159,7 @@ export async function claimWays(
   conceded: readonly number[] = [],
 ): Promise<void> {
   if (wayIds.length === 0) return;
-  const ids = [...new Set(wayIds)].map((id) => BigInt(id));
+  const ids = [...new Set(wayIds)].map((id) => BigInt(id)).sort(byWayId);
   const allowed = new Set(conceded.map((id) => BigInt(id)));
 
   const held = await tx.trailWay.findMany({
@@ -157,7 +171,7 @@ export async function claimWays(
   if (policy === 'take') {
     if (contested.length > 0) {
       await tx.trailWay.updateMany({
-        where: { wayId: { in: contested.map((row) => row.wayId) } },
+        where: { wayId: { in: contested.map((row) => row.wayId).sort(byWayId) } },
         data: { trailId },
       });
     }
