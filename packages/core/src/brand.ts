@@ -54,6 +54,16 @@ export const ATTRIBUTION = {
     href: 'https://www.arcgis.com/home/item.html?id=10df2279f9684e4a9f6a7f08febac2a9',
     licence: 'Esri terms of use',
   },
+  wikimediaCommons: {
+    label: 'Trail photographs from Wikimedia Commons',
+    href: 'https://commons.wikimedia.org/',
+    licence: 'CC BY, CC BY-SA and public domain (varies per photograph)',
+  },
+  mapillary: {
+    label: 'Street-level photographs © Mapillary contributors',
+    href: 'https://www.mapillary.com/',
+    licence: 'CC BY-SA 4.0',
+  },
 } as const;
 
 export type AttributionKey = keyof typeof ATTRIBUTION;
@@ -105,6 +115,18 @@ export const ATTRIBUTION_SOURCES: readonly AttributionSource[] = [
     what: 'Weather along the trail',
     detail:
       'Forecasts are requested for sample points along the route at the hour you are predicted to reach each one, with our own DEM elevations passed in for downscaling.',
+  },
+  {
+    key: 'wikimediaCommons',
+    what: 'Photographs on trail pages',
+    detail:
+      'Seeded per trail from a geographic search of Commons. Each photograph keeps its own licence and its own photographer, both printed under the frame and both linked — the licence to its deed, the credit to the file page on Commons, which carries the full notices.',
+  },
+  {
+    key: 'mapillary',
+    what: 'Photographs where Commons has none',
+    detail:
+      'Used only as a fallback for trails a Commons search comes back thin on, and only where a deployment configures a Mapillary key.',
   },
 ] as const;
 

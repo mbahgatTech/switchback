@@ -1,4 +1,5 @@
 export * from './brand';
+export * from './licence';
 export * from './difficulty';
 export * from './destination-name';
 export * from './units';
