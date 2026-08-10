@@ -252,8 +252,8 @@ export const MIN_ENRICH_SAMPLE = 25;
  *
  * This is the one fault in the pipeline that leaves no trace anywhere else. `enrichTrailPhotos`
  * returns before its first write when its sources answer with nothing, so the job records `done`
- * with a null `lastError` and reads exactly like one that seeded a gallery — 973 ran that way
- * against an empty `photos` table, and no gauge, log line or error column showed it.
+ * with a null `lastError` and reads exactly like one that seeded a gallery — 997 had run that way
+ * by 2026-08-09 against an empty `photos` table, and no gauge, log line or error column showed it.
  */
 export function photoSeedBlackout(
   window: EnrichWindow,

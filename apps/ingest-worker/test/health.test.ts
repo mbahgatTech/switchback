@@ -112,7 +112,7 @@ describe('the queue health report', () => {
   /*
    * The fault this gauge exists for produces no error row and no failed request, so the distress
    * line is the only place it can appear. A seeder writing nothing looked identical to a healthy
-   * one for 973 jobs.
+   * one for 997 jobs.
    */
   it('names a photo-seed blackout on the distress line', async () => {
     const log = silentLog();
