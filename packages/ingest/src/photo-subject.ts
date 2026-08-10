@@ -146,6 +146,10 @@ const OUTDOOR_TERMS = [
   'nature',
   'landscape',
   'panorama',
+  // Commons writes `Water Fall` as two words as often as one, and on `Water Fall in the Desert`
+  // it is the only surviving qualifier once `subjectOf` has cut the locative tail and masked the
+  // county out of the sole category.
+  'water fall',
   'scenery',
   'viewpoint',
   'countryside',
@@ -211,25 +215,77 @@ function nameOf(photo: PhotoSubject): string {
 }
 
 /**
- * What a subject rule may read.
+ * Where a field stops naming its subject and starts naming where the subject stands.
  *
- * **The invariant: this must be a superset of `qualifying`.** A term that can admit a photograph
- * has to be visible to the rules that reject one, or the filter fails open — while the file name
- * could qualify but not disqualify, a flowering tree qualified on the word "tree" in its own name
- * and no rule could see the `Unidentified Sapindaceae` beside it. Widen `qualifying` and this
- * widens with it, or the hole comes back.
+ * Commons categories are largely place containers, so most of what geosearch returns is already
+ * known to be *near* the trail — that is what geosearch measured. In `<X> at <Y>`, `<X> in <Y>`,
+ * `<X> of <Y>` and `<X> from <Y>` only `<X>` asserts a subject, and reading `<Y>` for landform
+ * vocabulary re-derives the coordinate rather than describing the photograph. `Little Free Library
+ * at Lake Wilderness Arboretum` is a book box and `Hair ice of Whidbey Island` is a macro of ice.
  */
-function disqualifying(photo: PhotoSubject): string[] {
-  return [...qualifying(photo), photo.description ?? ''];
+const LOCATIVE_TAIL = / (?:at|in|of|from) /i;
+
+/**
+ * A head that names a way of depicting rather than a thing depicted, so the subject is still to
+ * come and the tail has to be read after all.
+ *
+ * `North-west side of Mont Blanc` and `Views of Mount Rainier from Seattle` are photographs of the
+ * mountain; cutting at the preposition would leave "north-west side" and discard the only subject
+ * either field states. English puts the head noun last, so the final word decides.
+ */
+const ASPECT_HEAD = /(?:^|\s)(?:views?|sides?|panoramics?)$/i;
+
+/**
+ * `<Anything> County` is an administrative unit, not a landform.
+ *
+ * Island, Grant and Lake Counties in Washington and California each carry a landform word in a
+ * name that describes a jurisdiction hundreds of square kilometres wide. Masked rather than
+ * dropped, so a genuine landform elsewhere in the same field still counts — `Joseph D. Grant
+ * County Park` is a park whichever county it is in.
+ */
+const ADMINISTRATIVE_COUNTY = /\b\p{Lu}[\p{L}'-]* County\b/gu;
+
+/** What a field claims the photograph is *of*, with the place it was taken in removed. */
+function subjectOf(field: string): string {
+  const segments = field.split(LOCATIVE_TAIL);
+  const subject = segments.find((segment) => !ASPECT_HEAD.test(segment)) ?? field;
+  return subject.replace(ADMINISTRATIVE_COUNTY, ' ');
 }
 
 /**
- * What can *qualify* a file: what Commons filed it as, and what its uploader named it. Free text
- * is deliberately excluded — "Bus stop on a hill in Albertville" is a bus stop, and a description
- * mentioning a landform in passing is not evidence that the landform is the subject.
+ * What a subject rule may read: every field, whole.
+ *
+ * **The invariant: this must see at least everything `qualifying` sees.** A term that can admit a
+ * photograph has to be visible to the rules that reject one, or the filter fails open — while the
+ * file name could qualify but not disqualify, a flowering tree qualified on the word "tree" in its
+ * own name and no rule could see the `Unidentified Sapindaceae` beside it.
+ *
+ * `qualifying` reads a *narrowed* view of these same fields, so the invariant now holds by
+ * construction: narrowing only removes words, and `photo-subject.test.ts` asserts over the whole
+ * corpus that every word qualification reads is one of these. Reading the whole field here is also
+ * what keeps the tail rules working — `Aurora viewed from space` and `Maps of the Alps` are
+ * imagery from above, and both say so only after the preposition.
+ */
+function disqualifying(photo: PhotoSubject): string[] {
+  return [...(photo.categories ?? []), nameOf(photo), photo.description ?? ''];
+}
+
+/**
+ * What can *qualify* a file: what Commons filed it as, and what its uploader named it, each cut
+ * back to the part that states a subject. Free text is deliberately excluded — "Bus stop on a hill
+ * in Albertville" is a bus stop, and a description mentioning a landform in passing is not evidence
+ * that the landform is the subject.
  */
 function qualifying(photo: PhotoSubject): string[] {
-  return [...(photo.categories ?? []), nameOf(photo)];
+  return [...(photo.categories ?? []), nameOf(photo)].map(subjectOf);
+}
+
+/** The two field views the rules read, so the superset invariant can be asserted over a corpus. */
+export function subjectFields(photo: PhotoSubject): {
+  qualifying: string[];
+  disqualifying: string[];
+} {
+  return { qualifying: qualifying(photo), disqualifying: disqualifying(photo) };
 }
 
 /**
