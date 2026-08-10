@@ -627,6 +627,59 @@ So the honest statement is: a z9 tile in dense alpine terrain does not fit in on
 invocation, and no bound on the handler can change that — the bound only decides whether the
 failure is clean and visible or a silent ten-minute kill loop.
 
+### What the commit phase was actually spending its clock on
+
+Almost all of it went on two scans that had nothing to do with the database. `attachWaypoints` and
+`terminusFeatures` each looped every feature the tile-wide waypoint query returned, once per trail,
+and `attachWaypoints` called `nearestPointOnLine` on each — a full segment walk. The tile cost
+`O(trails × features × vertices)`, and the two densities the fixtures hold are 55× apart in feature
+count:
+
+| tile        | features | trails | ms per trail | whole tile |
+| ----------- | -------- | ------ | ------------ | ---------- |
+| `021231030` | 556      | 144    | 11.75        | 1.7 s      |
+| `023010230` | 30,838   | 1,518  | 349.45       | 530.5 s    |
+
+530.5 s of single-core arithmetic, inside a 540 s budget that also has to pay for Overpass and
+elevation. That is the shape of the alpine failures above, and it is not I/O: Postgres sat at 8–12%
+CPU and consumed no burst credits through the whole window.
+
+`buildFeatureIndex` puts a uniform grid over the tile's features once, after the feature query, and
+each trail sweeps only the cells its own segments pass through, grown by the widest buffer any
+consumer applies. The same tiles then cost 0.193 and 0.509 ms per trail — 0.77 s for the dense one
+against 530.5 s, on a 16.4 ms build holding 2.5 MiB. Both tiles attach exactly what they attached
+before: 146 waypoints over all 144 trails of the sparse tile, 14,881 over all 1,518 of the dense one.
+
+**The index decides nothing; it only decides what to look at.** `near` returns a _subset of the
+tile's own feature array, in the tile's own order_, and `attachWaypoints` and `terminusFeatures` then
+run exactly as before. That is what makes the output byte-identical rather than approximately equal:
+the buffer test, the dedupe key that keeps whichever duplicate it sees first, and the stable sort all
+see the same sequence they would have seen unindexed. A wider sweep than necessary costs a few
+candidates and cannot change an answer; a narrower one loses waypoints silently, which is why the
+swept box is derived from what `nearestPointOnSegment` can answer rather than from a cell count.
+
+**A PostGIS spatial join was implemented and measured against it, and lost on the numbers.** Both
+forms are byte-identical to the baseline over both whole tiles, so accuracy did not decide it. The
+whole of `023010230`, build counted apart from the queries it serves:
+
+| candidate                | build   | ms per trail | tile total |
+| ------------------------ | ------- | ------------ | ---------- |
+| unindexed baseline       | —       | 349.454      | 530.5 s    |
+| in-memory grid           | 16.4 ms | 0.509        | 0.79 s     |
+| PostGIS, one query/trail | 362 ms  | 2.228        | 3.74 s     |
+| PostGIS, one bulk join   | 868 ms  | 0.332        | 1.37 s     |
+
+The features are not table rows — they are an Overpass response held in memory — so either PostGIS
+form has to upload 30,838 points per tile before it can answer anything, and that upload is most of
+its cost. The bulk join is the only form that beats the grid per query, and it cannot be used here:
+it needs every trail's line before the first commit, and the line `attemptCommit` asks about is
+`resolved.coords` — the union `resolveIdentity` computes against rows other tiles wrote, per trail,
+inside the loop, under a claim that can be lost and retried. A join keyed on the assembled geometry
+would silently miss features beside the merged extension of any seam-crossing trail. It also needs a
+session held for the tile's whole life, because the staging table is temporary and the commit loop's
+pool hands out a different connection each time. Both candidates are kept and exercised against the
+same fixtures in `packages/ingest/test/enrich-association.test.ts`; the grid is what ships.
+
 ### Subdivision: a tile that will not fit is replaced by its four children
 
 A quadkey is a prefix code, so the four z10 tiles covering `120221203` are that string with `0`,

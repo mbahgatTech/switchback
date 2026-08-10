@@ -10,6 +10,7 @@ export * from './assemble';
 export * from './elevate';
 export * from './derive';
 export * from './enrich';
+export * from './feature-index';
 export * from './geocode';
 export * from './jobs';
 export * from './backpressure';

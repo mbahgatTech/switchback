@@ -18,3 +18,8 @@
 # already disables conversion, but it keeps `git check-attr` from reporting an inherited `eol: lf`
 # on a path that must never be converted.
 apps/web/public/vendor/** -text -eol
+
+# Cached Overpass answers for the enrichment benchmark. `text=auto` above would leave the decision
+# to git's binary heuristic, which is right about gzip but is a heuristic; a fixture silently
+# renormalised is a corrupt archive that fails at `gunzipSync` with nothing pointing here.
+packages/ingest/test/fixtures/enrich/*.gz -text -eol
