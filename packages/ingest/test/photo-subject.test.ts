@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { offSubjectReason } from '../src/photo-subject';
+import { offSubjectReason, subjectFields } from '../src/photo-subject';
 import type { PhotoSubject } from '../src/photo-subject';
 
 /**
- * 105 real Commons geosearch records, collected over production trail centroids on 2026-08-10.
+ * 123 real Commons geosearch records, collected over production trail centroids on 2026-08-10.
  * Real payloads on purpose: the filter this replaces was tested only against credits containing
  * its own regex literals, which is why it passed CI while keeping 13 of 19 satellite operators.
  */
@@ -167,6 +167,13 @@ describe('subjects that are not places', () => {
     ).toMatch(/landform/);
   });
 
+  /*
+   * Its own categories, verbatim from Commons. Rejected on the outdoor test rather than on the
+   * wildlife rule: `Animals at Santa Teresa County Park` states its subject before the preposition,
+   * and "animals" is not outdoor vocabulary, so nothing here qualifies in the first place. The
+   * wildlife rule still guards the case where something else in the record does qualify — see the
+   * ducks below.
+   */
   it('drops an animal filed under a subspecies as well as a species', () => {
     expect(
       offSubjectReason({
@@ -178,7 +185,16 @@ describe('subjects that are not places', () => {
           'Canis latrans ochropus',
         ],
       }),
-    ).toMatch(/wildlife/);
+    ).toBe('nothing names a landform, a place type or an outdoor setting');
+  });
+
+  /*
+   * The wildlife rule's live case: `Alameda Creek` qualifies the record on a real landform, and
+   * `Birds of California in water` overturns it. Both are this file's own Commons categories, so
+   * the rule is being asked about a photograph rather than about its own alternation.
+   */
+  it('overturns a real landform category when the file is filed under birds', () => {
+    expect(offSubjectReason(find('Ducks in Alameda Creek'))).toMatch(/wildlife/);
   });
 
   /*
@@ -269,6 +285,98 @@ describe('what qualification can see, disqualification can see', () => {
     // bracketed qualifier as taxonomic dropped both.
     expect(offSubjectReason(find('Bonnevaux (Doubs) - vue générale'))).toBeNull();
     expect(offSubjectReason(find('Missionpeak (cropped)'))).toBeNull();
+  });
+});
+
+/**
+ * The class that reached live trail galleries after the subject filter shipped: a landform word
+ * that was never the subject, reached through the locative tail of a category or through a county
+ * name. Twelve of 56 live photographs, two whole galleries among them.
+ *
+ * Every record here is the payload Commons returns for a file that was live on a trail page, and
+ * every assertion below fails if its rule is removed from `photo-subject.ts`.
+ */
+describe('a place a photograph was taken is not its subject', () => {
+  /*
+   * Both were the entire gallery of `Trail of Two Kitties`. The photograph is a macro of ice
+   * filaments on rotting wood; "Island" reaches the outdoor test only as part of the county the
+   * camera stood in, and again as the tail of the file's own name.
+   */
+  it('drops a macro whose only landform word is the county it was shot in', () => {
+    for (const record of [
+      'Hair ice of Whidbey Island (1 of 7)',
+      'Hair ice of Whidbey Island (7 of 7)',
+    ]) {
+      expect(offSubjectReason(find(record))).toBe(
+        'nothing names a landform, a place type or an outdoor setting',
+      );
+    }
+  });
+
+  /* A book box. `Lake` is in the arboretum's name, which is where the box stands. */
+  it('drops an artefact whose category names the place it stands in', () => {
+    expect(
+      offSubjectReason(find('Little Free Library at Lake Wilderness Arboretum (2024) - 1')),
+    ).toBe('nothing names a landform, a place type or an outdoor setting');
+  });
+
+  /*
+   * The counterweight, and the reason the cut is not simply "take the text before the preposition".
+   * `North-west side of Mont Blanc` and `Panoramics of Jura mountains` name a way of looking at a
+   * mountain, so the subject is in the tail and cutting at the preposition would discard the only
+   * evidence either file carries. Both are real Mont Blanc / Jura landscape photographs.
+   */
+  it('keeps a landscape whose category states an aspect before naming the landform', () => {
+    expect(offSubjectReason(find('MassifDuMontBlanc00'))).toBeNull();
+    expect(offSubjectReason(find('Pano Morez vu Dade nuageux'))).toBeNull();
+  });
+
+  /*
+   * Masking a county must not cost the landform beside it. `Joseph D. Grant County Park` is a
+   * park, `Grant Lake (Santa Clara County, California)` is a lake, and `Water Fall in the Desert`
+   * survives on its own name alone once `Grant County, Washington` — its only category — is gone.
+   */
+  it('keeps a landform that shares a field with a county name', () => {
+    expect(offSubjectReason(find('Joseph D. Grant Santa Clara County Park'))).toBeNull();
+    expect(offSubjectReason(find('MG 1145'))).toBeNull();
+    expect(offSubjectReason(find('Water Fall in the Desert'))).toBeNull();
+    expect(
+      offSubjectReason(find('2022-05-20, Lake Alice, King County, Washington, 01')),
+    ).toBeNull();
+  });
+
+  /*
+   * Still admitted, and recorded here so the residue is visible rather than assumed closed.
+   * `Lake Wilderness Arboretum` carries no preposition and no county — "Lake" is simply part of a
+   * proper name — so no rule in this file separates a book box shot there from a lakeside view.
+   * The playground is the vocabulary's own coarseness: "park" cannot tell a municipal one from a
+   * national one.
+   */
+  it('still admits what no rule here can separate from a genuine place name', () => {
+    expect(offSubjectReason(find('2025-01-18, Lake Wilderness Arboretum, 093934'))).toBeNull();
+    expect(offSubjectReason(find('Fruitland Park, 2010 Kennewick Washington'))).toBeNull();
+  });
+});
+
+/**
+ * The superset invariant, asserted rather than argued.
+ *
+ * Qualification reads a narrowed view of the fields disqualification reads, so a term can never
+ * admit a photograph that no rejecting rule can see. Narrowing only ever removes words, which is
+ * what this checks over every record in the corpus.
+ */
+describe('what qualification reads, disqualification reads', () => {
+  it('never lets a qualifying field carry a word no disqualifying field carries', () => {
+    const words = (text: string) => text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+    for (const photo of CORPUS) {
+      const { qualifying, disqualifying } = subjectFields(photo);
+      const available = new Set(disqualifying.flatMap(words));
+      for (const field of qualifying) {
+        for (const word of words(field)) {
+          expect(available, `${photo.title}: "${field}"`).toContain(word);
+        }
+      }
+    }
   });
 });
 
