@@ -729,13 +729,21 @@ something else, and the failure names nothing useful. Hex has no such characters
 
 ```bash
 openssl rand -hex 32 > "$TMP/pgpw"
-export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
+# The deploy is inside the guard because an empty PGADMIN_PASSWORD is not an error anywhere
+# downstream: postgres.bicep omits `administratorLoginPassword` rather than failing, so the run
+# creates the server with no administrator password and reports success. `export VAR="$(cat …)"`
+# cannot carry the guard — export reports its own status, not the substitution's.
+if PGADMIN_PASSWORD=$(cat "$TMP/pgpw") && [ -n "$PGADMIN_PASSWORD" ]; then
+  export PGADMIN_PASSWORD
 
-az deployment sub create \
-  --name switchback-db \
-  --location northcentralus \
-  --template-file infra/azure/main.bicep \
-  --parameters infra/azure/main.bicepparam
+  az deployment sub create \
+    --name switchback-db \
+    --location northcentralus \
+    --template-file infra/azure/main.bicep \
+    --parameters infra/azure/main.bicepparam
+else
+  echo "ABORT: $TMP/pgpw is empty or unreadable. Nothing was deployed."
+fi
 ```
 
 **Record that password now, before going any further**, in the places [Read this
@@ -952,8 +960,11 @@ the thing it must not be able to do — the version that a misread catalogue can
 against any rebuilt server; **it is supposed to fail**:
 
 ```bash
-psql "postgresql://sbapp:PASSWORD@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full" \
-  -v ON_ERROR_STOP=1 -c 'CREATE TABLE least_privilege_probe (id int)'
+# -d rather than a bare positional URI: psql reads the first non-option argument as the database
+# and the second as the user, then warns and ignores the rest — so options written after the URI
+# leave the CREATE TABLE unrun and the command exits 0, which reads here as the failure verdict.
+psql -v ON_ERROR_STOP=1 -c 'CREATE TABLE least_privilege_probe (id int)' \
+  -d "postgresql://sbapp:PASSWORD@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full"
 ```
 
 A `permission denied` error and a non-zero exit is the pass. A created table is the failure: drop
@@ -1032,19 +1043,52 @@ neither can authenticate any way but by token, and `sbapp` is what Vercel presen
 
    ```bash
    # As an Entra administrator. The value is generated and recorded already; never echo it.
-   printf "ALTER ROLE sbapp PASSWORD '%s';\n" "$(cat ~/.switchback/pg-sbapp-password)" \
-     > "$TMPDIR/alter.sql" && bash scripts/pgenv.sh -X -f "$TMPDIR/alter.sql"; rm -f "$TMPDIR/alter.sql"
+   (
+     set -euo pipefail
+     sbapp_pw=$(cat ~/.switchback/pg-sbapp-password)
+     [ -n "$sbapp_pw" ] || { echo 'ABORT: the recorded sbapp password is empty' >&2; exit 1; }
+     # SQL escapes a single quote by doubling it. Unescaped, a quote in the value either fails the
+     # parse or ends the literal early and installs a password nobody holds.
+     printf "ALTER ROLE sbapp PASSWORD '%s';\n" "${sbapp_pw//\'/\'\'}" | bash scripts/pgenv.sh -X -f -
+   )
    ```
 
-   That statement is what turns the rollback below from a sentence into a procedure, and it is also
-   an outage until the same value reaches Vercel — every `sbapp` connection made after it fails —
-   so it is run here and not a day earlier. `~/.switchback/pg-sbapp-scram-verifier` puts the old
-   credential back verbatim if the step is abandoned part way.
+   The statement arrives on standard input, so the password reaches no file and no argument list.
+   The subshell is what makes the step fail closed: `set -euo pipefail` ends it non-zero on an
+   unreadable file or a rejected statement, and the emptiness guard covers the one case an exit
+   code cannot — a file that reads empty, where `ALTER ROLE sbapp PASSWORD ''` succeeds and
+   installs a credential nobody holds. **Do not write the statement to a temp file and clean up
+   with a trailing `rm -f`**: `rm` is then the last command in the list and reports 0 whether or
+   not the `ALTER` ran at all.
 
-   Then set `DATABASE_AUTH=entra-vercel` and rewrite
-   `DATABASE_URL` to the password-free form naming `sbapp_vercel`. `AZURE_TENANT_ID` and
-   `AZURE_CLIENT_ID` are already set there, which is the whole of what `entra-vercel` needs beyond
-   the URL. Redeploy, then prove a signed-in read and a write — `session.findUnique` is the canary.
+   The `ALTER` is what turns the rollback below from a sentence into a procedure, and it is also an
+   outage until the same value reaches Vercel — every `sbapp` connection made after it fails — so it
+   is run here and not a day earlier. `~/.switchback/pg-sbapp-scram-verifier` puts the old credential
+   back verbatim if the step is abandoned part way.
+
+   Now prove the recorded value is the one the server accepts. This is the gate rather than the exit
+   code above, because it is the only check that tests what the rollback depends on — that this
+   exact recorded string authenticates as `sbapp` — instead of testing that a statement ran.
+   **Do not touch Vercel until it prints `sbapp` at exit 0:**
+
+   ```bash
+   # PGSSLROOTCERT as in Connecting by hand; the path differs per platform.
+   PGPASSWORD=$(cat ~/.switchback/pg-sbapp-password) \
+   PGSSLROOTCERT=$(cygpath -w /usr/ssl/certs/ca-bundle.crt) \
+   psql -X -A -t \
+     -d "postgresql://sbapp@psql-switchback-prod-37ywppu5p7fri.postgres.database.azure.com:5432/switchback?sslmode=verify-full" \
+     -c 'select current_user'
+   ```
+
+   Then set `DATABASE_AUTH=entra-vercel` and rewrite `DATABASE_URL` to the password-free form naming
+   `sbapp_vercel`. `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` are already set there.
+   `APPLICATIONINSIGHTS_CONNECTION_STRING` is the third variable, and it is a precondition rather
+   than a follow-up: without it `packages/db/src/token-alarm.ts` degrades to a console line, which
+   reaches no Azure rule and does not outlive the request, so a failing renewal of the credential
+   every request has just been moved onto would raise nothing. Nothing on the database side shows
+   that degradation; `/api/version` reports `alarms` as `application-insights` or `console`, and
+   that reading is what tells the two apart before the flip rather than after it.
+   Redeploy, then prove a signed-in read and a write — `session.findUnique` is the canary.
    The way back is deleting `DATABASE_AUTH`, restoring a `DATABASE_URL` carrying `sbapp` and the
    recorded password, and redeploying: absent resolves to `password`, but neither variable reaches
    the running deployment until a new build.
@@ -1130,7 +1174,13 @@ If the reversal is instead done by deploying the template, export the recorded p
 
 ```bash
 # The recorded value. Without it the deploy omits the property and writes no password.
-export PGADMIN_PASSWORD="$(cat ~/.switchback/pg-sbadmin-password)"
+# `export VAR="$(cat …)"` cannot be used here: export reports its own status, so an unreadable
+# file leaves the variable empty at exit 0 — the same silent omission this block exists to stop.
+if PGADMIN_PASSWORD=$(cat ~/.switchback/pg-sbadmin-password) && [ -n "$PGADMIN_PASSWORD" ]; then
+  export PGADMIN_PASSWORD
+else
+  echo 'ABORT: the recorded sbadmin password is empty or unreadable. Do not deploy.'
+fi
 ```
 
 The export is not optional politeness. `writeAdministratorPassword` in `postgres.bicep` is
