@@ -6,12 +6,19 @@
 // is supplied at all, which is the one place that is neither this file, nor argv, nor a log line:
 //
 //   openssl rand -hex 32 > "$TMP/pgpw"
-//   export PGADMIN_PASSWORD="$(cat "$TMP/pgpw")"
-//   az deployment sub create \
-//     --name switchback-db --location northcentralus \
-//     --template-file infra/azure/main.bicep \
-//     --parameters infra/azure/main.bicepparam
+//   if PGADMIN_PASSWORD=$(cat "$TMP/pgpw") && [ -n "$PGADMIN_PASSWORD" ]; then
+//     export PGADMIN_PASSWORD
+//     az deployment sub create \
+//       --name switchback-db --location northcentralus \
+//       --template-file infra/azure/main.bicep \
+//       --parameters infra/azure/main.bicepparam
+//   fi
 //   unset PGADMIN_PASSWORD
+//
+// The deploy sits inside that guard because an empty value is not an error here: the fallback
+// below omits the property and the run reports success on a server with no administrator
+// password. `export VAR="$(cat …)"` cannot carry the guard, because export reports its own
+// status rather than the substitution's.
 //
 // A `$( )` substitution never reaches the process table, and what lands in shell history is
 // the variable name rather than its value. **Record the password before deleting the file** —
@@ -265,6 +272,11 @@ param vercelProjectName = 'switchback'
 // having been proved on a token *and* both administrator doors re-proved in the same hour — see
 // infra/azure/README.md. It is a separate, reviewable deployment on purpose: the way back from a
 // wrong flip is an ARM write that itself needs Entra to be working.
+//
+// The value is compared against the server's live `authConfig.passwordAuth` before every `main`
+// deployment — `.github/scripts/assert-password-auth-param.sh`, called by `infra-deploy.sh`. The
+// flip itself is a targeted `az` call, so a parameter left at `true` after it is what would switch
+// password authentication back on, and that comparison is what refuses to.
 param passwordAuthEnabled = true
 
 // The owner is here as break-glass: a human who can reach the database with a token and no
