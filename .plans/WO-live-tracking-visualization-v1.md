@@ -77,6 +77,7 @@ page highlighted from one gesture over a chart.
 | D6  | A press-and-drag beginning on either elevation graphic selects nothing.                                                                      | `window.getSelection().toString()` is `''` after the drag — before/after screenshots, and `npx vitest run apps/web/test/conventions.test.ts` covering the class's presence |
 | D7  | Selection elsewhere on the trail page is unaffected.                                                                                         | screenshot of a drag over the caption below the graphic, still highlighting                                                                                                |
 | D8  | The section marker is reachable and readable without sight or a pointer.                                                                     | `apps/web/test/record-progress.test.ts` asserts the summary string; screenshot of the readout text                                                                         |
+| D10 | The line hierarchy D1 rests on is asserted, not only photographed — the track's casing is narrower than the trail line beneath it.           | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                                                                                                           |
 | D9  | Nothing already green goes red.                                                                                                              | `npx vitest run` exits 0; `npm run typecheck` exits 0; `npm run lint` exits 0; `npm run format:check` exits 0                                                              |
 
 ---
@@ -185,6 +186,7 @@ selectable, announced, and set in the real type ladder.
 | T-005 | The recording map's line hierarchy and the progress mark.                                                                 | `npx vitest run apps/web/test/record-progress.test.ts` exits 0; screenshot        | `done` |
 | T-006 | `<ProgressProfile>` — silhouette, marker, and the two figures in HTML.                                                    | same file, exits 0; screenshot                                                    | `done` |
 | T-007 | `.plot-surface` on both graphics' interaction surfaces.                                                                   | `npx vitest run apps/web/test/conventions.test.ts` exits 0; selection screenshots | `done` |
+| T-009 | `addRecordLayers` exported and the hierarchy asserted, so D1 does not rest on a screenshot alone.                         | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                  | `done` |
 | T-008 | Full suite, lint, typecheck, format.                                                                                      | each exits 0                                                                      | `done` |
 
 ---
@@ -250,4 +252,27 @@ selectable, announced, and set in the real type ladder.
   detail: T-001..T-008 done, each with its acceptance check run.
   decision: Hand to the Review Board.
   budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 3
+  at: 2026-08-29T01:45:00-07:00
+  state: SELF_VERIFY
+  event: work_recovered
+  detail: >
+    Seq 2 was recorded by an agent that did not survive its own evidence pass; the tree it
+    describes was uncommitted when it stopped. Committed as found at 865d890 after typecheck,
+    lint, format and the touched suites were re-run rather than inherited. `origin/master` had
+    not moved past the recorded base, so there was nothing to rebase.
+  decision: Amend rather than re-plan. The design stands; the gap is evidence.
+  budget: { implement: 2/3, review: 0/3, replan: 0/2, total: 2/8 }
+
+- seq: 4
+  at: 2026-08-29T01:56:00-07:00
+  state: SELF_VERIFY
+  event: work_order_amended
+  detail: >
+    D1 rested on a screenshot and nothing else — no test named a line width, so a later edit
+    could put the track's casing back over the trail and every suite would stay green. T-009
+    and D10 added, and `addRecordLayers` exported to carry them.
+  decision: Amendment before implementation, per the Architect's scope rule.
+  budget: { implement: 2/3, review: 0/3, replan: 0/2, total: 2/8 }
 ```

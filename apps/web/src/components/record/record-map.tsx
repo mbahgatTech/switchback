@@ -277,7 +277,11 @@ export function RecordMap({
   );
 }
 
-function addRecordLayers(instance: MapLibreMap): void {
+/**
+ * Add the sources and the layers, in draw order. Idempotent, because a base-map change tears
+ * the style down and this runs again on the far side of it.
+ */
+export function addRecordLayers(instance: MapLibreMap): void {
   const field = SCHEMES.field;
 
   for (const id of [ROUTE_SOURCE, TRACK_SOURCE, PROGRESS_SOURCE, POSITION_SOURCE]) {
