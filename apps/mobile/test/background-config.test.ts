@@ -113,7 +113,7 @@ describe('the Info.plist expo prebuild would write', () => {
   async function generatedPlist(): Promise<Record<string, unknown>> {
     const options = locationPluginOptions() ?? {};
     const seeded = { ...config, _internal: { projectRoot: '.' } };
-    const applied = withLocation(seeded as never, options as never) as unknown as {
+    const applied = withLocation(seeded, options) as unknown as {
       mods: {
         ios: { infoPlist: (c: unknown) => Promise<{ modResults: Record<string, unknown> }> };
       };

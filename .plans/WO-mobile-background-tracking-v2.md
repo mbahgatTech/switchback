@@ -8,7 +8,7 @@
 | --------------- | ------------------------------------------------------------------ |
 | id              | `WO-mobile-background-tracking`                                    |
 | version         | `2`                                                                |
-| status          | `Active`                                                           |
+| status          | `In Review`                                                        |
 | repo_target     | `switchback`                                                       |
 | base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`                         |
 | created_at      | `2026-08-29T00:00:00-04:00`                                        |
@@ -208,16 +208,16 @@ impossible to forget.
 
 | id    | task                                                                                                                                                 | acceptance check                                                    | status |
 | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ------ |
-| U-001 | `packages/geo`: incremental accumulator + equivalence and cost tests (B3, E4, E5)                                                                    | `npx vitest run packages/geo/test/track.test.ts` exits 0            | `todo` |
-| U-002 | `journal.ts`: `trackFixSchema` validation, `JournalStore` interface, torn-tail repair, `ownerId` in the head (M12, E17, E18, identity)               | `npx vitest run apps/mobile/test/record-journal.test.ts` exits 0    | `todo` |
-| U-003 | `journal-files.ts`: staged head write, legacy erasure, documented storage class (B2, M7, M10, E3, E16)                                               | `npm run typecheck` exits 0                                         | `todo` |
-| U-004 | `background.ts`: error surfacing, coded probe, probe-before-prompt, Always re-read (M1, M2, M8, M3, E7–E9)                                           | `npx vitest run apps/mobile/test/record-background.test.ts` exits 0 | `todo` |
-| U-005 | `store.ts`: batch stamping, incremental stats, injected store, flush guard, hydrate/reconcile, identity, extracted adoption (B1, B2, B3, M3–M6, M14) | `npm run typecheck` exits 0                                         | `todo` |
-| U-006 | `record-store.test.ts`: the coverage gap that let all of this through (M15, E1–E3, E6, E10–E16)                                                      | `npx vitest run apps/mobile/test/record-store.test.ts` exits 0      | `todo` |
-| U-007 | `record.tsx` + `_layout.tsx`: exhaustive note mapping, honest pre-start copy, entry-side registration (B4, M13, E6, E19)                             | `npx vitest run apps/mobile/test/background-config.test.ts` exits 0 | `todo` |
-| U-008 | `app.config.ts`, `lifeline.ts`, `docs/mobile.md`: purpose string, the two false statements, retention and at-rest (M9, M10, M11)                     | `npx vitest run apps/mobile/test/background-config.test.ts` exits 0 | `todo` |
-| U-009 | Minors, and the ones deliberately declined with a reason                                                                                             | recorded in §9                                                      | `todo` |
-| U-010 | Full verification                                                                                                                                    | `npm run test`, `npm run typecheck`, `npm run lint` exit 0          | `todo` |
+| U-001 | `packages/geo`: incremental accumulator + equivalence and cost tests (B3, E4, E5)                                                                    | `npx vitest run packages/geo/test/track-stats.test.ts` exits 0      | `done` |
+| U-002 | `journal.ts`: `trackFixSchema` validation, `JournalStore` interface, torn-tail repair, `ownerId` in the head (M12, E17, E18, identity)               | `npx vitest run apps/mobile/test/record-journal.test.ts` exits 0    | `done` |
+| U-003 | `journal-files.ts`: staged head write, legacy erasure, documented storage class (B2, M7, M10, E3, E16)                                               | `npm run typecheck` exits 0                                         | `done` |
+| U-004 | `background.ts`: error surfacing, coded probe, probe-before-prompt, Always re-read (M1, M2, M8, M3, E7–E9)                                           | `npx vitest run apps/mobile/test/record-background.test.ts` exits 0 | `done` |
+| U-005 | `store.ts`: batch stamping, incremental stats, injected store, flush guard, hydrate/reconcile, identity, extracted adoption (B1, B2, B3, M3–M6, M14) | `npm run typecheck` exits 0                                         | `done` |
+| U-006 | `record-store.test.ts`: the coverage gap that let all of this through (M15, E1–E3, E6, E10–E16)                                                      | `npx vitest run apps/mobile/test/record-store.test.ts` exits 0      | `done` |
+| U-007 | `record.tsx` + `_layout.tsx`: exhaustive note mapping, honest pre-start copy, entry-side registration (B4, M13, E6, E19)                             | `npx vitest run apps/mobile/test/background-config.test.ts` exits 0 | `done` |
+| U-008 | `app.config.ts`, `lifeline.ts`, `docs/mobile.md`: purpose string, the two false statements, retention and at-rest (M9, M10, M11)                     | `npx vitest run apps/mobile/test/background-config.test.ts` exits 0 | `done` |
+| U-009 | Minors, and the ones deliberately declined with a reason                                                                                             | recorded in §9                                                      | `done` |
+| U-010 | Full verification                                                                                                                                    | `npm run test`, `npm run typecheck`, `npm run lint` exit 0          | `done` |
 
 ---
 
@@ -276,4 +276,50 @@ or edited here.
     stay — they are the right idiom for "this code does not exist". Behaviour is asserted
     against the module under test or not asserted at all.
   budget: { implement: 1/3, review: 1/3, replan: 1/2, total: 1/8 }
+
+- seq: 6
+  at: 2026-08-29T01:00:00-04:00
+  state: WORK_ORDER -> IMPLEMENT
+  event: tasks_complete
+  detail: >-
+    U-001..U-008 done. `packages/geo` gained an incremental accumulator pinned to
+    `summariseTrack` over 500 randomised tracks; `store.ts` gained a `JournalStore` seam and 31
+    tests where it had none. Every blocker was reintroduced as a mutation and watched failing
+    before being recorded as closed.
+  decision: >-
+    Intra-directory imports in `src/record/**` were made relative rather than adding a global
+    `@/` alias to the shared `vitest.config.ts`. Same unlock, and it matches what `src/offline`
+    and `src/auth` already do — a global alias would have resolved `@/` to mobile for every
+    workspace, including apps/web.
+  budget: { implement: 2/3, review: 1/3, replan: 1/2, total: 1/8 }
+
+- seq: 7
+  at: 2026-08-29T01:45:00-04:00
+  state: IMPLEMENT -> IMPLEMENT
+  event: interrupted_and_resumed
+  detail: >-
+    A platform-wide API outage terminated the run mid-task. The working tree was inspected on
+    resume — no truncated writes — and committed before any further work. `origin/master` was
+    re-fetched and had *not* moved: it is still 1789198, the base this branch was cut from, so
+    no rebase was performed and none is claimed.
+  decision: commit early on resume, then continue.
+  budget: { implement: 2/3, review: 1/3, replan: 1/2, total: 1/8 }
+
+- seq: 8
+  at: 2026-08-29T02:00:00-04:00
+  state: IMPLEMENT -> SELF_VERIFY
+  event: minors_declined
+  detail: >-
+    Taken - `timeInterval` dropped from the task options (inert on iOS), `distanceInterval`
+    comment corrected, `JOURNAL_DIR` derived from `JOURNAL_VERSION`, the torn tail now costs one
+    fix rather than two, `startWatch`/`stopWatch` renamed to `startTracking`/`stopTracking`, the
+    duplicated adoption body extracted, `MAX_BUFFERED` re-justified against the reason it is now
+    genuinely load-bearing, and the positive source-spelling assertions removed from the config
+    gate. Declined - `Math.min(...elevations)` in `packages/geo/src/track.ts:227` is left alone
+    - the recorder no longer reaches it, since the fold never spreads an array, and changing
+    `summariseTrack` would touch the server's path for a limit UNVERIFIED on Hermes.
+  decision: >-
+    The Hermes argument-count ceiling is recorded as UNVERIFIED with a one-line device repro
+    rather than guessed at.
+  budget: { implement: 2/3, review: 1/3, replan: 1/2, total: 1/8 }
 ```
