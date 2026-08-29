@@ -4,17 +4,17 @@
 
 ## 1. Metadata
 
-| Field           | Value                                                                        |
-| --------------- | ---------------------------------------------------------------------------- |
-| id              | `WO-auth-session-refresh`                                                    |
-| version         | `1`                                                                          |
-| status          | `In Review`                                                                  |
-| repo_target     | `switchback`                                                                 |
-| base_sha        | `d7c2fad3f260ecc2add7c95f588e9a8a6aa144e0` (rebased at v1r4; was `1789198f`) |
-| created_at      | `2026-08-29T06:40:00+00:00`                                                  |
-| harness_version | `3.1.0`                                                                      |
-| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in `switchback`                         |
-| supersedes      | N/A                                                                          |
+| Field           | Value                                                                           |
+| --------------- | ------------------------------------------------------------------------------- |
+| id              | `WO-auth-session-refresh`                                                       |
+| version         | `1`                                                                             |
+| status          | `In Review`                                                                     |
+| repo_target     | `switchback`                                                                    |
+| base_sha        | `d11b1cd` (rebased at v1r4 onto #80 `d7c2fad`, then #84; originally `1789198f`) |
+| created_at      | `2026-08-29T06:40:00+00:00`                                                     |
+| harness_version | `3.1.0`                                                                         |
+| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in `switchback`                            |
+| supersedes      | N/A                                                                             |
 
 The dispatch brief named `7d593956` as the base. This worktree branched from `origin/master`,
 which had moved on to `1789198f`; `7d593956` is an ancestor of it. The later SHA is recorded
