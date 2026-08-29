@@ -89,7 +89,9 @@ export async function presignQueryV4(
     SIGV4_UNSIGNED_PAYLOAD,
   ].join('\n');
 
-  const stringToSign = [SIGV4_ALGORITHM, stamp, scope, await sha256Hex(canonicalRequest)].join('\n');
+  const stringToSign = [SIGV4_ALGORITHM, stamp, scope, await sha256Hex(canonicalRequest)].join(
+    '\n',
+  );
 
   // Annotated rather than inferred: `TextEncoder.encode` is typed as backed by a plain
   // `ArrayBuffer` while `crypto.subtle.sign` returns the wider `ArrayBufferLike`.

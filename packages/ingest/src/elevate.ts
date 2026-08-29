@@ -36,9 +36,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
  * tile. `denied` is a 403, which says nothing about terrain and must never reach the cache.
  */
 type OriginTerrain =
-  | { kind: 'tile'; body: Buffer; tile: TerrariumTile }
-  | { kind: 'absent' }
-  | { kind: 'denied' };
+  { kind: 'tile'; body: Buffer; tile: TerrariumTile } | { kind: 'absent' } | { kind: 'denied' };
 
 export interface TerrainSourceOptions {
   urlTemplate?: string;

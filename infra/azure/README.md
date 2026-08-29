@@ -1690,8 +1690,17 @@ through the same `getTerrain()`, so a blob cache would serve one surface and not
 reachable from both over plain HTTPS and charges no egress in either direction — $0.015/GB-month,
 $7.50 at full world coverage.
 
-Vercel needs the same four names in its project environment for the route planner to share the
-cache. It works without them — that surface simply keeps fetching from the origin.
+Vercel needs the same four names for the route planner to read the cache, but **a read-only token
+there, not this one.** The worker populates the bucket; Vercel only elevates planned routes, and
+`TerrainCache.write` swallows every write failure by design — a bucket that refuses writes and
+serves reads is still worth reading. So a read-only token costs that surface nothing and keeps a
+Vercel-side leak from being able to write terrain at all. It works without any of them: that
+surface simply keeps fetching from the origin.
+
+**The worker populates the bucket; Vercel only reads it.** That is deliberate on both counts. The
+worker walks whole z9 footprints and is where a cold tile is first wanted, and a serverless request
+is frozen at response time — an unawaited write-back there is not guaranteed to land anyway. So
+Vercel gets the warm cache without being trusted to fill it.
 
 Read the group back after a deploy, because an application-settings write replaces the collection
 whole:

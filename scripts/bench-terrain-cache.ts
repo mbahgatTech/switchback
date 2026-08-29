@@ -18,13 +18,16 @@ import { join } from 'node:path';
 import { TERRARIUM_ZOOM, quadkeyToTile } from '@switchback/geo';
 import { TerrainCache, TerrainSource, directoryTerrainStore } from '@switchback/ingest';
 
+/** Mirrors `TerrainCache`'s default, stated here so the figures below say what they measured. */
+const SHARED_LOOKUP_CONCURRENCY = 48;
+
 interface Pass {
   label: string;
   elapsedMs: number;
   tiles: number;
   nulls: number;
   perTileMs: number[];
-  stats: { hits: number; misses: number; unavailable: number };
+  stats: { hits: number; misses: number; unavailable: number; corrupt: number };
 }
 
 async function main(): Promise<void> {
@@ -33,7 +36,13 @@ async function main(): Promise<void> {
   const footprint = terrainFootprint(quadkey).slice(0, limit);
   const root = await mkdtemp(join(tmpdir(), 'sb-terrain-bench-'));
 
-  console.log(`quadkey ${quadkey} — ${footprint.length} z${TERRARIUM_ZOOM} tiles, store ${root}`);
+  console.log(
+    `quadkey ${quadkey} — ${footprint.length} z${TERRARIUM_ZOOM} tiles, store ${root}
+` +
+      `origin fetches run 6 at a time, shared lookups ${SHARED_LOOKUP_CONCURRENCY} — so a warm ` +
+      `pass removes both the round trip and most of the origin's queue, and the two are not ` +
+      `separable from the totals below`,
+  );
 
   try {
     const cold = await pass('cold  (empty store)', root, footprint);
@@ -94,14 +103,14 @@ async function pass(
 }
 
 function report(run: Pass): void {
-  const { hits, misses, unavailable } = run.stats;
+  const { hits, misses, unavailable, corrupt } = run.stats;
   const rate = hits + misses === 0 ? 0 : (hits / (hits + misses)) * 100;
   const sorted = [...run.perTileMs].sort((a, b) => a - b);
   const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] ?? 0;
 
   console.log(
     `${run.label}  ${(run.elapsedMs / 1000).toFixed(1)} s  ` +
-      `hit rate ${rate.toFixed(1)}% (${hits} hit, ${misses} miss, ${unavailable} unavailable)  ` +
+      `hit rate ${rate.toFixed(1)}% (${hits} hit, ${misses} miss, ${unavailable} unavailable, ${corrupt} corrupt)  ` +
       `per tile p50 ${at(0.5)} ms p90 ${at(0.9)} ms max ${at(1)} ms  ` +
       `${run.nulls} with no tile`,
   );

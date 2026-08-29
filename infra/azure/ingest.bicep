@@ -105,6 +105,9 @@ broken cache as a miss rather than an error.
 **Deliberately not the `R2_*` variables Vercel holds for photographs.** A token scoped to the
 terrain bucket alone cannot reach user uploads, and terrain written to the photo bucket would be
 served from the origin that fronts it.
+
+This is the write-capable half. The worker populates the bucket; Vercel reads it and is given a
+read-only token of its own, because a surface that never writes should not hold a key that can.
 ''')
 param terrainCacheAccountId string = ''
 param terrainCacheAccessKeyId string = ''

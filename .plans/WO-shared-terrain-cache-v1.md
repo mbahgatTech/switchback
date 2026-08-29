@@ -73,7 +73,7 @@ fanning out makes ingest slower.
 | D2  | A cache miss falls through to the origin and stores what it fetched.                                                                | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'falls through to the origin on a miss'` exits 0            |
 | D3  | A cache that throws, times out or is absent degrades to the origin fetch rather than failing the ingest.                            | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'unavailable'` exits 0                                      |
 | D4  | A tile the origin does not have (`null`) is stored and read back as `null`, distinctly from an unavailable cache.                   | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'no tile'` exits 0                                          |
-| D5  | The in-process LRU is still served past the deadline, and the shared tier is not started past it.                                   | `npx vitest run packages/ingest/test/elevate.test.ts -t 'deadline'` exits 0                                               |
+| D5  | The in-process LRU is still served past the deadline, and the shared tier is not started past it.                                   | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'deadline'` exits 0                                         |
 | D6  | One lookup is bounded by its own timeout, tighter than the origin's, and clamped by the invocation deadline.                        | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'timeout'` exits 0                                          |
 | D7  | Repeated lookup failure stops the tier being consulted, and it recovers after the cool-down.                                        | `npx vitest run packages/ingest/test/terrain-cache.test.ts -t 'breaker'` exits 0                                          |
 | D8  | A cold and a warm pass over the same z9 tile's terrain footprint are measured against the real origin, and the warm pass is faster. | `npx tsx scripts/bench-terrain-cache.ts 021231030 --tiles 64` prints both timings and a hit rate                          |
@@ -205,7 +205,7 @@ it found or throws, and only the policy layer may answer "the cache could not be
 | T-001 | `terrain-cache.ts`: types, `TerrainCache` policy (timeout, breaker, fail-open), `terrainCacheFromEnv`   | `npx vitest run packages/ingest/test/terrain-cache.test.ts` exits 0              | `done` |
 | T-002 | `terrain-cache-dir.ts`: directory store, atomic write, zero-length absent marker                        | same file, directory-store cases exit 0                                          | `done` |
 | T-003 | `terrain-cache-r2.ts`: R2 store with GET/PUT SigV4, 404 as miss                                         | same file, R2-store cases exit 0                                                 | `done` |
-| T-004 | `elevate.ts`: consult the tier inside the dedup path, write back unawaited, preserve the deadline rules | `npx vitest run packages/ingest/test/elevate.test.ts` exits 0                    | `done` |
+| T-004 | `elevate.ts`: consult the tier inside the dedup path, write back unawaited, preserve the deadline rules | `npx vitest run packages/ingest/test/terrain-cache.test.ts` exits 0              | `done` |
 | T-005 | `config.ts`: `getTerrain()` builds the tier from environment                                            | `npx vitest run packages/ingest/test/config.test.ts` exits 0                     | `env`  |
 | T-006 | `infra/azure/ingest.bicep` + `.bicepparam` + README: four settings, gated on all four                   | `npm test` exits 0; the gate is visible in `optionalWorkerSettings`              | `done` |
 | T-007 | `scripts/bench-terrain-cache.ts`: cold/warm over a real z9 footprint against the real origin            | `npx tsx scripts/bench-terrain-cache.ts 021231030 --tiles 64` prints both passes | `done` |
@@ -243,7 +243,7 @@ the same two causes, evidenced in §9 seq 5:
 - `terrainCacheFromEnv`: R2 when all four are set, directory for `TERRAIN_CACHE_DIR`, `null` when
   neither, R2 when both
 
-**Integration — `packages/ingest/test/elevate.test.ts`**
+**Integration — `packages/ingest/test/terrain-cache.test.ts`**
 
 - one shared lookup for forty concurrent callers of one tile — the tier sits inside the dedup path
 - `elevateLine` end to end against a warm store with no origin at all
@@ -354,4 +354,59 @@ the same two causes, evidenced in §9 seq 5:
     commit that ever added a `WO-*.md` sits on a branch that never merged. Both references now
     point at `infra/azure/README.md`, which carries the argument in full and does ship.
   decision: No other departure from the predecessor's design.
+
+- seq: 8
+  at: 2026-08-29T11:00:00Z
+  state: REVIEW_BOARD -> IMPLEMENT
+  event: review_findings
+  detail: >
+    Four reviewers: 1 Pass, 3 Fail, 3 Blockers. The write path could convert a real tile into
+    permanent ocean by two routes — an origin 403 collapsed to the same `null` as a 404, and a 200
+    with an empty body, whose zero-length `Buffer` is truthy — because zero bytes is the no-tile
+    marker and no key is ever deleted, expired or versioned. Neither shipped store's timeout
+    handling was tested: dropping `signal` from all four store operations gave 53/53. A coordinate
+    transposition in the directory key passed the whole suite, because every directory case was a
+    symmetric round-trip and the one exact-path assertion used x == y.
+  decision: Implement round 2. Fix the write path, then the store timeouts, then the predicates.
+
+- seq: 9
+  at: 2026-08-29T11:30:00Z
+  state: IMPLEMENT
+  event: correction
+  detail: >
+    Correcting seq 4, which recorded the four observed failures as sufficient. They were sound as
+    far as they went — the board recounted all four and matched exactly — but every one of them
+    mutated `elevate.ts` or `terrain-cache.ts`, so none could have caught a store that ignores its
+    abort signal or a key built from transposed coordinates. Mutation coverage was mistaken for
+    behaviour coverage. Round 2 adds the mutations that were missing: dropping the signal from all
+    four store operations now fails 4, transposing the directory key fails 1, writing back before
+    validating fails 1, removing the concurrency bound fails 1, arming the breaker on a clamped
+    lookup fails 1, and returning origin bytes undecoded fails 9.
+  decision: The tier's promise is held by tests against the shipped stores, not only against doubles.
+
+- seq: 10
+  at: 2026-08-29T11:45:00Z
+  state: IMPLEMENT
+  event: correction
+  detail: >
+    Correcting §4 D5 and §7 T-004, which named `elevate.test.ts` as their verification. That file
+    is not in the diff and cannot fail either predicate: removing `assertBefore` from
+    `elevate.ts:169` leaves `elevate.test.ts -t 'deadline'` at 3 passed, exit 0, while the same
+    mutation fails `terrain-cache.test.ts -t 'deadline'`. The behaviour was covered; the predicate
+    pointed at the wrong file, which made a green check meaningless. §8's integration heading named
+    the same wrong file and is corrected with it. The tests are unchanged — only the predicates.
+  decision: A verification that cannot fail is not a verification.
+
+- seq: 11
+  at: 2026-08-29T12:00:00Z
+  state: IMPLEMENT
+  event: correction
+  detail: >
+    Correcting seq 7 and the commit body of `65ff5f0`, both of which argued that a doc comment
+    citing this Work Order by path would dangle on `master` because `.plans/` has never been in
+    master's tree. The premise is true and the inference does not follow: this branch ships its own
+    Work Order, so a reader after the merge does find it. The action stands on its own merits —
+    `infra/azure/README.md` carries the argument in full and is where an operator looks — but it
+    was reached by an argument that did not hold.
+  decision: Reference stays repointed. The reasoning is corrected here rather than edited away.
 ```

@@ -661,14 +661,19 @@ describe('the shared lookup, under fan-out', () => {
 
   it('says so once, when it stops consulting a failing store', async () => {
     const lines: string[] = [];
-    const cache = new TerrainCache(scriptedStore({ read: () => Promise.reject(new Error('down')) }), {
-      failureLimit: 2,
-      logImpl: (line) => lines.push(line),
-    });
+    const cache = new TerrainCache(
+      scriptedStore({ read: () => Promise.reject(new Error('down')) }),
+      {
+        failureLimit: 2,
+        logImpl: (line) => lines.push(line),
+      },
+    );
 
     for (let i = 0; i < 5; i++) await cache.read(13, i, 0);
 
-    expect(lines).toEqual([expect.stringContaining('[ingest] terrain-cache directory lookups failing')]);
+    expect(lines).toEqual([
+      expect.stringContaining('[ingest] terrain-cache directory lookups failing'),
+    ]);
   });
 });
 
@@ -776,11 +781,11 @@ describe('the R2 signature', () => {
       accessKeyId: 'key',
       secretAccessKey: 'secret',
       bucket: 'terrain',
-      fetchImpl: (async () =>
+      fetchImpl: async () =>
         new Response(new Uint8Array(8), {
           status: 200,
           headers: { 'content-length': String(64 * 1024 * 1024) },
-        })) as unknown as typeof fetch,
+        }),
     });
 
     await expect(store.read(13, 1, 2, AbortSignal.timeout(5_000))).rejects.toThrow(/not a tile/u);
