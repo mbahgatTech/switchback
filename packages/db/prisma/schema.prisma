@@ -1,6 +1,6 @@
 // Switchback data model.
 //
-// Two conventions run through this file and are worth reading before the models:
+// Three conventions run through this file and are worth reading before the models:
 //
 // 1. PostGIS geometry lives in `Unsupported(...)` columns. Prisma has no geometry type,
 //    and fields declared `Unsupported` are invisible to Prisma Client — they cannot be
@@ -18,6 +18,15 @@
 // 2. Enum values match the string literals in `@switchback/core` exactly — lowercase,
 //    snake_case. `Difficulty.moderate` here is `'moderate'` there. No mapping layer, and
 //    a `zod` schema from core validates a database enum without translation.
+//
+// 3. Timestamps are `timestamp without time zone` by default, and that is safe only while
+//    Prisma is the sole reader — it writes and reads UTC on both ends. **Any column that raw
+//    SQL also compares against a `timestamptz` must be declared `@db.Timestamptz`**, because
+//    Postgres converts an unzoned column using each session's own zone and the two readers then
+//    disagree by that offset. `IngestRateBucket.refilledAt` is the one such column today and
+//    carries the measurement on its own doc comment; it reads seven hours of elapsed time for
+//    one hour in one direction, and negative elapsed — a bucket that never refills — in the
+//    other. Add the attribute when you add the second reader, not after the defect.
 //
 // Indexes that Prisma cannot express (GIST on geometry, GIN on tsvector and trigram)
 // live in `prisma/spatial.sql`, applied by `npm run db:push`.

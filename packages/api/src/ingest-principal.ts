@@ -24,6 +24,12 @@ const ADDRESS_HEADERS = ['x-vercel-forwarded-for', 'x-forwarded-for', 'x-real-ip
 const KEY_LENGTH = 32;
 
 /**
+ * Domain separation for the HMAC. `AUTH_SECRET` also signs sessions, so tagging what this digest
+ * is *for* keeps a bucket key from ever colliding with another use of the same secret.
+ */
+const KEY_DOMAIN = 'ingest-principal|';
+
+/**
  * Every caller the platform did not identify, in one bucket. Not an exemption: a limit that a
  * missing header switches off is a limit whose bypass is a missing header.
  */
@@ -47,7 +53,7 @@ function addressKey(address: string): string | null {
     }
     return null;
   }
-  const digest = createHmac('sha256', secret).update(address).digest('hex');
+  const digest = createHmac('sha256', secret).update(`${KEY_DOMAIN}${address}`).digest('hex');
   return `a:${digest.slice(0, KEY_LENGTH)}`;
 }
 

@@ -121,10 +121,9 @@ describe('ingestPrincipalFor', () => {
     expect(warn).toHaveBeenCalledOnce();
   });
 
-  it('cannot be pushed into another caller’s bucket by a header the caller chose', () => {
-    // The only headers read are ones Vercel overwrites, so an `x-real-ip` a client sends is
-    // only ever consulted when the platform wrote nothing above it — and a signed-in caller's
-    // bucket is their account id, which no header reaches at all.
+  it('ignores a client-settable header whenever the platform wrote one of its own', () => {
+    // Named for what it proves: with `x-vercel-forwarded-for` present, nothing a client sends
+    // below it moves the bucket. What happens when it is *absent* is the test below.
     const forged = ingestPrincipalFor(
       headers({ 'x-vercel-forwarded-for': '203.0.113.4', 'x-real-ip': '198.51.100.9' }),
       null,
@@ -134,5 +133,17 @@ describe('ingestPrincipalFor', () => {
 
     expect(forged.key).toBe(honest.key);
     expect(forged.key).not.toBe(victim.key);
+  });
+
+  it('lets the client choose the bucket wherever the platform is not the front door', () => {
+    // The uncomfortable half, pinned rather than left to a docstring. `ADDRESS_HEADERS` falls
+    // back to `x-forwarded-for`, which only Vercel overwrites — so on a preview host, a local
+    // run, or anywhere this deploys behind something else, the caller's own header decides its
+    // bucket and it can walk into anybody's. The whole address-keying model rests on that one
+    // platform guarantee; this fails if the deployment ever moves off it.
+    const victim = ingestPrincipalFor(headers({ 'x-vercel-forwarded-for': '198.51.100.9' }), null);
+    const chosen = ingestPrincipalFor(headers({ 'x-forwarded-for': '198.51.100.9' }), null);
+
+    expect(chosen.key).toBe(victim.key);
   });
 });
