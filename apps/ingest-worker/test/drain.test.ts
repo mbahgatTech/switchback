@@ -8,6 +8,8 @@ import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { DrainResult, OverpassQuerier } from '@switchback/ingest';
 import {
+  JOB_ABANDONED_MARKER,
+  JOB_REVIVED_MARKER,
   LEASE_EXPIRED_MARKER,
   LEASE_MARGIN_MS,
   LEASE_TIMEOUT_MS,
@@ -36,6 +38,7 @@ import {
   runIngestSignal,
 } from '../src/drain';
 import type { Drain } from '../src/drain';
+import { DEAD_LETTER_MARKER } from '../src/dead-letter';
 import type { WorkerLog } from '../src/log';
 
 const KEY = 'ingest_tile:021231321';
@@ -482,6 +485,24 @@ describe('the drain alerts, from the template', () => {
     expect(groundLost).toContain(JOB_BURIED_MARKER);
     expect(groundLost).not.toContain(JOB_FAILED_MARKER);
     expect(degraded).not.toContain(JOB_BURIED_MARKER);
+  });
+
+  it('routes a revival to the recoverable rule and an abandonment to the paging one', () => {
+    /*
+     * The two ends of `reconcileDeadJobs`. A revival is a repair with a bound — `REVIVAL_CEILING`
+     * — so it belongs beside the reclaim on Sev3; an abandonment is the end of every automatic
+     * path, which is the definition of the Sev2 rule.
+     */
+    expect(degraded).toContain(JOB_REVIVED_MARKER);
+    expect(groundLost).toContain(JOB_ABANDONED_MARKER);
+    expect(degraded).not.toContain(JOB_ABANDONED_MARKER);
+    expect(groundLost).not.toContain(JOB_REVIVED_MARKER);
+  });
+
+  it('names the dead-letter alert with the token its drain writes', () => {
+    // The metric alert says a message was there; the trace says which job it named. An operator
+    // opening the alert greps its own name, so the two must be the same string.
+    expect(bicep).toContain(`name: '${DEAD_LETTER_MARKER}'`);
   });
 
   it('keeps the buried token free of the retry token as a substring', () => {

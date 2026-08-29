@@ -3,11 +3,17 @@
  * outer bound that every other phase — terrain, commits — is measured against.
  */
 
+/**
+ * How a deadline overrun names itself. Named because `classifyDeath` reads it off a buried job to
+ * tell a tile that ran out of clock — worth another attempt — from one whose query is wrong.
+ */
+export const DEADLINE_PASSED = 'deadline for this invocation passed';
+
 /** Thrown by any phase that would run past the invocation's deadline. */
 export class IngestDeadlineError extends Error {
   /** `note` carries anything else that went wrong in the same phase, so one message holds both. */
   constructor(phase: string, overrunMs: number, note = '') {
-    super(`ingest deadline for this invocation passed ${Math.round(overrunMs / 1000)}s ago${note}`);
+    super(`ingest ${DEADLINE_PASSED} ${Math.round(overrunMs / 1000)}s ago${note}`);
     this.name = 'IngestDeadlineError';
     this.phase = phase;
   }

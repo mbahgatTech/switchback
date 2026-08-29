@@ -568,14 +568,21 @@ messages arriving at once read identically.
 **Fires** when the dead-letter queue holds a message at any point in a fifteen-minute window.
 **Clears** when the queue has been emptied and the next window sees only zeros.
 
-Draining it is `infra/azure/README.md`, "A message dead-lettered".
+**Emptying it no longer needs a person, and the alert is still worth having.** `reconcileDeadLetters`
+runs on `ingestPump`'s two-minute tick: it reads each message's `ingest_jobs` row, writes one
+`switchback-ingest-deadletter` trace naming what it found, and completes the message. The row is
+what carries the work — `runPump` re-derives the runnable head from it — so the message was only ever
+a doorbell. Two minutes is well inside this rule's fifteen-minute window, so a dead-letter still
+fires it; what changed is that the reading returns to zero on its own, and a reading that does not
+means the drain has stopped as well. `infra/azure/README.md`, "A message dead-lettered", is still the
+manual procedure for when it has.
 ''')
 resource deadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: 'switchback-ingest-deadletter'
   location: 'global'
   tags: tags
   properties: {
-    description: 'A message on ingest-jobs was dead-lettered and is still sitting there: the worker could not process it in ${queue.properties.maxDeliveryCount} deliveries. Nothing drains the dead-letter queue, so this stays open until an operator does — and clears once they have.'
+    description: 'A message on ingest-jobs was dead-lettered: the worker could not reach Postgres in ${queue.properties.maxDeliveryCount} deliveries. ingestPump drains the queue on its two-minute tick and writes what it found under switchback-ingest-deadletter, so this clears by itself; a reading that stays non-zero means the drain is not running either.'
     severity: 2
     enabled: true
     scopes: [
@@ -1385,7 +1392,7 @@ resource groundLostAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-prev
   tags: tags
   properties: {
     displayName: 'switchback-ingest-ground-lost'
-    description: 'Ingest lost ground that nothing will recover on its own: trails that did not commit, a job out of attempts, a stuck subtree, a stranded signal, a double commit or a wedged tile. Retryable failures are on switchback-ingest-drain-degraded instead.'
+    description: 'Ingest lost ground that nothing will recover on its own: trails that did not commit, a job out of attempts, a burial the reconciler has given up on, a stuck subtree, a stranded signal, a double commit or a wedged tile. Retryable failures are on switchback-ingest-drain-degraded instead.'
     severity: 2
     enabled: true
     scopes: [
@@ -1396,7 +1403,7 @@ resource groundLostAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-prev
     criteria: {
       allOf: [
         {
-          query: 'traces | where message has "switchback-ingest-trail-lost" or message has "switchback-ingest-job-buried" or message has "switchback-ingest-subtree-stuck" or message has "switchback-ingest-signal-stranded" or message has "switchback-ingest-double-commit" or message has "switchback-ingest-tile-wedged" | summarize events = count()'
+          query: 'traces | where message has "switchback-ingest-trail-lost" or message has "switchback-ingest-job-buried" or message has "switchback-ingest-job-abandoned" or message has "switchback-ingest-subtree-stuck" or message has "switchback-ingest-signal-stranded" or message has "switchback-ingest-double-commit" or message has "switchback-ingest-tile-wedged" | summarize events = count()'
           metricMeasureColumn: 'events'
           timeAggregation: 'Total'
           operator: 'GreaterThan'
@@ -1426,7 +1433,8 @@ severity 3 and `switchback-ingest-ground-lost` is severity 2.
 |---|---|---|
 | `ingest-job-failed` | `failJob` reschedules on the `RETRY_DELAYS_MS` ladder | `maxAttempts`, 5; the last one becomes `switchback-ingest-job-buried` |
 | `switchback-ingest-lease-expired` | `reclaimExpiredJobs` returns the row to `queued` at `RECLAIM_PRIORITY` | runs off `ingestPump`'s two-minute timer |
-| `ingestDrain` request failure | the host abandons and redelivers the message | `maxDeliveryCount`, 5; then the dead-letter queue and its own metric alert |
+| `switchback-ingest-job-revived` | `reconcileDeadJobs` grants a buried job one further attempt | only for a failure it can name as transient, and only `REVIVAL_CEILING` times; then `switchback-ingest-job-abandoned` on the paging rule |
+| `ingestDrain` request failure | the host abandons and redelivers the message | `maxDeliveryCount`, 5; then the dead-letter queue, drained on the same two-minute timer |
 
 **Severity is a triage label, not a mute.** The condition is still `> 0` over fifteen minutes, so a
 single transient is still detected and still recorded. Raising the threshold instead would make the
@@ -1457,7 +1465,7 @@ resource drainDegradedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
   tags: tags
   properties: {
     displayName: 'switchback-ingest-drain-degraded'
-    description: 'An ingest job failed and was rescheduled, a lease expired and was reclaimed, or a drain invocation was rejected and redelivered. All three recover unaided; a sustained rate is what deserves a look.'
+    description: 'An ingest job failed and was rescheduled, a lease expired and was reclaimed, a buried job was given another attempt, or a drain invocation was rejected and redelivered. All four recover unaided; a sustained rate is what deserves a look.'
     severity: 3
     enabled: true
     scopes: [
@@ -1468,7 +1476,7 @@ resource drainDegradedAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
     criteria: {
       allOf: [
         {
-          query: 'union (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (requests | where name == "ingestDrain" and success == false | project timestamp) | summarize events = count()'
+          query: 'union (traces | where message has "ingest-job-failed" | project timestamp), (traces | where message has "switchback-ingest-lease-expired" | project timestamp), (traces | where message has "switchback-ingest-job-revived" | project timestamp), (requests | where name == "ingestDrain" and success == false | project timestamp) | summarize events = count()'
           metricMeasureColumn: 'events'
           timeAggregation: 'Total'
           operator: 'GreaterThan'

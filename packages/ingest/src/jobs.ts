@@ -53,6 +53,19 @@ export const LEASE_TIMEOUT_MS = HOST_FUNCTION_TIMEOUT_MS + LEASE_MARGIN_MS;
 /** Backoff between attempts, indexed by attempt number. Capped at the last entry. */
 const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 
+/**
+ * Attempts a job gets when its caller does not say. Exported because `reconcileDeadJobs` counts
+ * revivals as the distance above it, and a second copy of the number would let the two disagree
+ * about how much budget a buried job has left.
+ */
+export const DEFAULT_MAX_ATTEMPTS = 5;
+
+/**
+ * How a handler reports a payload it cannot read. Lives here rather than in `handlers.ts` because
+ * `classifyDeath` has to read it and must not import the pipeline to do so.
+ */
+export const PAYLOAD_INCOMPLETE = 'job payload missing';
+
 export type Db = PrismaClient | Prisma.TransactionClient;
 
 export interface EnqueueInput {
@@ -75,8 +88,8 @@ export interface EnqueueInput {
  * - **Finished** (`done`, `failed`, `dead`) — reset and run again. A `dedupeKey` lives
  *   forever, so without this each tile is ingestable exactly once in the database's lifetime
  *   and a tile whose attempts landed during an outage stays `dead`. `attempts` and `priority`
- *   are both reset: this is a new request, not a sixth try, so it starts at the band its caller
- *   asks for. Leaving `priority` alone would let a row the reaper had raised to
+ *   are both reset, and `maxAttempts` with them: this is a new request, not a sixth try, so it
+ *   starts at the band and the budget its caller asks for. Leaving `priority` alone would let a row the reaper had raised to
  *   `RECLAIM_PRIORITY` keep that elevation for the rest of its life, because the raise below
  *   cannot lower it and nothing else writes the column.
  *
@@ -99,6 +112,12 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
     data: {
       status: JobStatus.queued,
       attempts: 0,
+      // Reset with `attempts`, and for the same reason. `reconcileDeadJobs` raises this column by
+      // one per revival and past the ceiling when it gives up, so a row arriving here can carry a
+      // budget of nine. Leaving it would hand a fresh request nearly twice the ladder it asked for
+      // and, once re-buried above the ceiling, would put the row outside every rung of that
+      // reconciler with nothing left to report it. A revive here is a new request, not a tenth try.
+      maxAttempts: input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
       priority,
       runAfter,
       lockedAt: null,
@@ -117,7 +136,7 @@ export async function enqueue(db: Db, input: EnqueueInput): Promise<void> {
       payload: input.payload as Prisma.InputJsonValue,
       priority,
       runAfter,
-      maxAttempts: input.maxAttempts ?? 5,
+      maxAttempts: input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     },
     // Priority is raised by the statement below, never here. `update` cannot read the row it is
     // writing, so any value set here is unconditional — and an enqueue at `VIEWPORT_PRIORITY` (5)
@@ -349,8 +368,25 @@ export interface ReclaimedLease {
  */
 export const LEASE_EXPIRED_MARKER = 'switchback-ingest-lease-expired';
 
-/** How many keys the marker line names before it stops; the count is always exact. */
+/**
+ * How the reaper opens the `lastError` it writes. One constant, because `classifyDeath` reads
+ * this row to tell a job the host killed from one whose own query is wrong, and a reworded
+ * sentence would silently reclassify every such death as unexplained.
+ */
+export const LEASE_EXPIRED_REASON_PREFIX = 'lease expired after';
+
+/** How many keys a marker line names before it stops; the count beside it is always exact. */
 const MARKER_KEY_LIMIT = 10;
+
+/**
+ * A key list for a log line, capped so one sweep of a five-figure backlog cannot write a
+ * five-figure trace. Shared because the queue writes this shape from several places and a reader
+ * greps all of them the same way.
+ */
+export function namedKeys(values: readonly string[], limit = MARKER_KEY_LIMIT): string {
+  const shown = values.slice(0, limit).join('; ');
+  return values.length > limit ? `${shown}; +${values.length - limit} more` : shown;
+}
 
 /**
  * Priority a requeued lease is raised to: above every band `enqueue` assigns, so the next pump
@@ -399,7 +435,7 @@ export async function reclaimExpiredJobs(
   log: (line: string) => void = (line) => console.warn(line),
 ): Promise<ReclaimResult> {
   const cutoff = new Date(now.getTime() - timeoutMs);
-  const reason = `lease expired after ${Math.round(timeoutMs / 60_000)} min with no outcome`;
+  const reason = `${LEASE_EXPIRED_REASON_PREFIX} ${Math.round(timeoutMs / 60_000)} min with no outcome`;
 
   // One statement, so a job cannot be requeued and buried by two racing sweeps. Every
   // `attempts + 1` here reads the *old* row — Postgres evaluates the whole SET against the row
@@ -423,12 +459,10 @@ export async function reclaimExpiredJobs(
   `;
 
   if (rows.length > 0) {
-    const named = rows
-      .slice(0, MARKER_KEY_LIMIT)
-      .map((row) => `${row.dedupeKey} (held by ${row.lockedBy ?? 'nobody'} -> ${row.status})`)
-      .join('; ');
-    const rest = rows.length > MARKER_KEY_LIMIT ? `; +${rows.length - MARKER_KEY_LIMIT} more` : '';
-    log(`${LEASE_EXPIRED_MARKER} ${rows.length} lease(s) expired with no outcome: ${named}${rest}`);
+    const named = namedKeys(
+      rows.map((row) => `${row.dedupeKey} (held by ${row.lockedBy ?? 'nobody'} -> ${row.status})`),
+    );
+    log(`${LEASE_EXPIRED_MARKER} ${rows.length} lease(s) expired with no outcome: ${named}`);
   }
 
   const retired = rows.filter((row) => row.status === JobStatus.dead).length;
@@ -459,7 +493,8 @@ export interface DrainResult {
   failed: number;
   /**
    * How many of `failed` had no attempt left, so the row is now `dead`. The distinction the
-   * alerting rests on: a job below `maxAttempts` re-runs on its own, a buried one never does.
+   * alerting rests on: a job below `maxAttempts` re-runs on its own, a buried one only if
+   * `reconcileDeadJobs` can name its failure as something other than the query being wrong.
    */
   buried: number;
   /** Claimed but handed back untried — a kind this build has no handler for. */

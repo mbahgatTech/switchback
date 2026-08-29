@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
@@ -287,9 +287,142 @@ describe('where the report is called from', () => {
   });
 
   it("is the estate's only queue-maintenance schedule", () => {
-    // `sweepQueue` reclaims expired leases and clears orphaned split markers. It ran on Vercel
-    // until the ingestion path there was removed; nothing else calls it on a schedule now.
-    expect(pump).toContain('sweepQueue(backgroundPrisma)');
+    // `sweepQueue` reclaims expired leases, clears orphaned split markers and triages buried
+    // jobs. It ran on Vercel until the ingestion path there was removed; nothing else calls it
+    // on a schedule now.
+    expect(pump).toContain('sweepQueue(backgroundPrisma');
     expect(pump).toContain('pruneFinishedJobs(backgroundPrisma)');
+  });
+
+  it('lets the brake stop revivals without stopping the rest of the sweep', () => {
+    /*
+     * `maintain` runs ahead of `braked()`, deliberately — a stopped pump that also stopped
+     * reclaiming would strand every lease a killed invocation held. But reviving is the one part
+     * of the sweep that puts work back on the queue, which is exactly what the brake means to
+     * stop, so it is the one part the brake reaches.
+     *
+     * A source-text match, and therefore not the guard — it reds on a rename that changes no
+     * behaviour, and a maintainer who "fixes" the string would otherwise be left with nothing.
+     * The guard is behavioural and lives in `pump-handler.test.ts`: *stops revivals while the
+     * brake is on* and *leaves revivals running while the brake is off* assert the argument
+     * `sweepQueue` is actually called with, in both directions. Update this string freely; do not
+     * delete those.
+     */
+    expect(pump).toContain('{ revive: !braked() }');
+  });
+
+  it('drains the dead-letter queue from the same maintenance pass', () => {
+    // `maintain` is already pinned ahead of the brake above, so being inside it is the whole
+    // claim: the queue is drained on a tick that publishes nothing.
+    expect(pump).toContain('reconcileDeadLetters(backgroundPrisma');
+  });
+});
+
+/**
+ * Directories that hold no request path, so scanning them would only add noise: build output,
+ * dependencies, and the tests that talk *about* these functions rather than calling them.
+ */
+const UNSCANNED = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.next-e2e',
+  '.expo',
+  '.turbo',
+  'test',
+  '__tests__',
+]);
+
+/**
+ * Every `.ts` and `.tsx` this repository ships, as paths relative to its root.
+ *
+ * **Walks each workspace whole, not its `src`.** Next's App Router lives at `apps/web/app`, a
+ * *sibling* of `src` — twelve `route.ts` HTTP handlers, and every server component and action
+ * beside them. A walk rooted at `src` cannot see the tree the deleted Vercel drainer lived in,
+ * which is the one tree this assertion exists to watch. Root `scripts/` and `e2e/` are scanned
+ * for the same reason: a call is a call wherever it is written.
+ */
+function sourceFiles(): string[] {
+  const root = resolve(here, '../../..');
+  const found: string[] = [];
+
+  const walk = (directory: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      // A root this repository does not have. Not a failure of the assertion below.
+      return;
+    }
+    for (const entry of entries) {
+      const path = `${directory}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (!UNSCANNED.has(entry.name)) walk(path);
+      } else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
+        found.push(path.slice(root.length + 1));
+      }
+    }
+  };
+
+  for (const workspace of ['packages', 'apps']) {
+    for (const entry of readdirSync(`${root}/${workspace}`, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(`${root}/${workspace}/${entry.name}`);
+    }
+  }
+  walk(`${root}/scripts`);
+  walk(`${root}/e2e`);
+  return found;
+}
+
+/**
+ * **Recovery must not ride on somebody opening a map, and this is the assertion that holds it.**
+ *
+ * The repairs are reachable from one timer and from nowhere else. A request path that called any
+ * of them would make recovery a function of traffic — the state this estate has already been in,
+ * where a cold region with no readers had no reclaim, no split repair and no way back from a
+ * burial. Naming the whole permitted set rather than checking the request routers is what makes a
+ * *new* caller fail this rather than only a caller in a place somebody thought to look.
+ */
+describe('what the repairs are reachable from', () => {
+  /*
+   * Both tests below read every `.ts`/`.tsx` in the repository from disk. Observed between 251 ms
+   * and 7.2 s depending on what else is running, which straddles vitest's 5 s default — and this
+   * guard failing for the machine's load rather than for a real call is how a guard gets disabled.
+   */
+  const WALKS_THE_REPO = { timeout: 30_000 };
+
+  // Calls, not mentions: half the ingest package refers to these by name in prose about them.
+  const REPAIRS = /(sweepQueue|reconcileDeadJobs|reconcileDeadLetters)\(/;
+
+  const ALLOWED = new Set([
+    // Where they are declared — a declaration is a call site to this pattern.
+    'packages/ingest/src/maintenance.ts',
+    'packages/ingest/src/dead-jobs.ts',
+    'apps/ingest-worker/src/dead-letter.ts',
+    // The one caller: the timer.
+    'apps/ingest-worker/src/functions/pump.ts',
+  ]);
+
+  it('reaches the tree the deleted Vercel drainer lived in', WALKS_THE_REPO, () => {
+    /*
+     * The guard is only worth what it scans, and the walk it replaces rooted at `<workspace>/src`
+     * — which does not contain `apps/web/app`, where `api/cron/drain/route.ts` used to be. A call
+     * re-added at the historical location passed. These two are the floor.
+     */
+    const scanned = sourceFiles();
+    expect(scanned).toContain('apps/web/app/api/auth/mobile/refresh/route.ts');
+    expect(scanned.filter((file) => file.startsWith('apps/web/app/')).length).toBeGreaterThan(20);
+    expect(scanned.some((file) => file.startsWith('scripts/'))).toBe(true);
+  });
+
+  it('is the timer, and nothing a request can reach', WALKS_THE_REPO, () => {
+    const root = resolve(here, '../../..');
+    const mentions = sourceFiles().filter((file) =>
+      REPAIRS.test(readFileSync(`${root}/${file}`, 'utf8')),
+    );
+
+    expect(new Set(mentions)).toEqual(ALLOWED);
   });
 });

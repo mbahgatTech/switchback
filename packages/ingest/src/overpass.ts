@@ -17,6 +17,7 @@
 
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { BBox, LngLat } from '@switchback/core';
+import { DEADLINE_PASSED } from './deadline';
 
 /** An `is_in` result: an administrative area, returned by `buildRegionQuery`. */
 export interface OverpassArea {
@@ -160,13 +161,42 @@ export class OverpassFatalError extends Error {
 /** Thrown when the breaker is open. Callers treat this as "serve cache, queue for later". */
 export class OverpassUnavailableError extends Error {
   constructor(readonly retryAfterMs: number) {
-    super(`Overpass circuit breaker open; retry in ${Math.round(retryAfterMs / 1000)}s`);
+    super(`Overpass ${OVERPASS_BREAKER_OPEN}; retry in ${Math.round(retryAfterMs / 1000)}s`);
     this.name = 'OverpassUnavailableError';
   }
 }
 
-/** Statuses meaning "come back later". `Retry-After` is in seconds when it is sent at all. */
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+/**
+ * Statuses meaning "come back later". `Retry-After` is in seconds when it is sent at all.
+ *
+ * Exported because `classifyDeath` decides whether to revive a buried job on the same question
+ * this set answers. Two hand-kept lists would drift, and the drift that matters is silent: 500 is
+ * deliberately absent here, so a copy that included it would have the reconciler retrying the
+ * broken query this set exists to stop retrying.
+ */
+export const RETRYABLE_STATUS: ReadonlySet<number> = new Set([429, 502, 503, 504]);
+
+/**
+ * Fragments of the messages this module raises, named because `classifyDeath` reads them off a
+ * buried job's `lastError` to decide whether running it again is a different request. A reworded
+ * sentence would silently reclassify the failure it describes, and nothing would go red.
+ */
+export const OVERPASS_MALFORMED_QL = 'malformed Overpass QL';
+export const OVERPASS_UA_REFUSED = 'refused this User-Agent';
+export const OVERPASS_UA_UNUSABLE = 'OVERPASS_USER_AGENT must include';
+/** The sibling of the above: a User-Agent that carries a URL, but not one that reaches anybody. */
+export const OVERPASS_UA_UNREACHABLE = 'does not reach this project';
+export const OVERPASS_BUDGET_SPENT = 'Overpass gave up after';
+export const OVERPASS_BREAKER_OPEN = 'circuit breaker open';
+export const OVERPASS_NON_JSON = 'Overpass returned a non-JSON body';
+export const OVERPASS_UNPARSEABLE = 'Overpass returned unparseable JSON';
+export const OVERPASS_REMARK = 'Overpass reported';
+export const OVERPASS_REQUEST_FAILED = 'Overpass request failed';
+
+/** How every status failure names itself, so the raiser and the classifier share one shape. */
+export function overpassStatusText(status: number, endpoint: string): string {
+  return `Overpass ${status} from ${endpoint}`;
+}
 
 /**
  * Overpass phrasings that mean "this answer is not the answer to your query". Matched against
@@ -205,13 +235,13 @@ function assertUsableUserAgent(userAgent: string): void {
     'It must carry a URL or address that reaches a human — Overpass operators block clients they cannot contact.';
 
   if (!/https?:\/\/\S/.test(userAgent)) {
-    throw new Error(`OVERPASS_USER_AGENT must include a contact URL. ${hint}`);
+    throw new Error(`${OVERPASS_UA_UNUSABLE} a contact URL. ${hint}`);
   }
 
   const unreachable = UNREACHABLE_HOSTS.find((host) => userAgent.toLowerCase().includes(host));
   if (unreachable) {
     throw new Error(
-      `OVERPASS_USER_AGENT names "${unreachable}", which does not reach this project — a mirror ` +
+      `OVERPASS_USER_AGENT names "${unreachable}", which ${OVERPASS_UA_UNREACHABLE} — a mirror ` +
         `answers such a client 406 Not Acceptable, or blocks it. Replace it with a real contact — ${hint}`,
     );
   }
@@ -344,7 +374,7 @@ export class OverpassClient implements OverpassQuerier {
        */
       const left = remaining();
       if (attempt > 1 && left <= 0) {
-        lastError ??= new Error(`Overpass gave up after ${this.maxTotalMs} ms`);
+        lastError ??= new Error(`${OVERPASS_BUDGET_SPENT} ${this.maxTotalMs} ms`);
         break;
       }
 
@@ -384,12 +414,12 @@ export class OverpassClient implements OverpassQuerier {
           // Overpass — retrying a broken query is exactly what gets a client blocked.
           this.recordFailure();
           throw new OverpassFatalError(
-            `Overpass ${answer.status} from ${endpoint}: ${explain(answer.status)}${answer.text.slice(0, 300)}`,
+            `${overpassStatusText(answer.status, endpoint)}: ${explain(answer.status)}${answer.text.slice(0, 300)}`,
             answer.status,
           );
         }
 
-        lastError = new Error(`Overpass ${answer.status} from ${endpoint}`);
+        lastError = new Error(overpassStatusText(answer.status, endpoint));
         retryAfter = answer.retryAfter;
         this.reportStrain(
           `status=${answer.status} endpoint=${endpoint} attempt=${attempt}` +
@@ -410,7 +440,7 @@ export class OverpassClient implements OverpassQuerier {
     }
 
     this.recordFailure();
-    throw lastError instanceof Error ? lastError : new Error('Overpass request failed');
+    throw lastError instanceof Error ? lastError : new Error(OVERPASS_REQUEST_FAILED);
   }
 
   /**
@@ -521,7 +551,7 @@ export class OverpassClient implements OverpassQuerier {
 /** Thrown by a `withDeadline` view once its window has closed. */
 export class OverpassDeadlineError extends Error {
   constructor(overrunMs: number) {
-    super(`Overpass deadline for this invocation passed ${Math.round(overrunMs / 1000)}s ago`);
+    super(`Overpass ${DEADLINE_PASSED} ${Math.round(overrunMs / 1000)}s ago`);
     this.name = 'OverpassDeadlineError';
   }
 }
@@ -574,20 +604,18 @@ function assertUsable(text: string, endpoint: string): OverpassResponse {
   if (text.trimStart().slice(0, 1) !== '{') {
     // The `<strong>Error</strong>: …` line, when this is Overpass's own error page.
     const detail = /error<\/strong>\s*:?\s*([^<]{0,200})/i.exec(text)?.[1]?.trim();
-    throw new Error(
-      `Overpass returned a non-JSON body from ${endpoint}${detail ? `: ${detail}` : ''}`,
-    );
+    throw new Error(`${OVERPASS_NON_JSON} from ${endpoint}${detail ? `: ${detail}` : ''}`);
   }
 
   let body: OverpassResponse;
   try {
     body = JSON.parse(text) as OverpassResponse;
   } catch {
-    throw new Error(`Overpass returned unparseable JSON from ${endpoint}`);
+    throw new Error(`${OVERPASS_UNPARSEABLE} from ${endpoint}`);
   }
 
   if (body.remark && REMARK_FAILURE.test(body.remark)) {
-    throw new Error(`Overpass reported "${body.remark.slice(0, 200)}" from ${endpoint}`);
+    throw new Error(`${OVERPASS_REMARK} "${body.remark.slice(0, 200)}" from ${endpoint}`);
   }
   return body;
 }
@@ -600,10 +628,10 @@ function assertUsable(text: string, endpoint: string): OverpassResponse {
  */
 function explain(status: number): string {
   if (status === 406) {
-    return 'the mirror refused this User-Agent before running the query — check OVERPASS_USER_AGENT. ';
+    return `the mirror ${OVERPASS_UA_REFUSED} before running the query — check OVERPASS_USER_AGENT. `;
   }
   if (status === 400) {
-    return 'malformed Overpass QL. ';
+    return `${OVERPASS_MALFORMED_QL}. `;
   }
   return '';
 }
