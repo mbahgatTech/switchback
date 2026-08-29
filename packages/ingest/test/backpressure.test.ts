@@ -9,13 +9,17 @@ import type { PrismaClient } from '@switchback/db';
 import {
   DERIVED_JOB_KINDS,
   DERIVED_QUEUE_WARN_DEPTH,
+  MAX_QUEUE_WAIT_HOURS,
   MAX_STORAGE_FRACTION,
   MAX_TILE_QUEUE_DEPTH,
   REQUEST_JOB_KINDS,
   admitIngest,
   resetStorageCache,
 } from '../src/backpressure';
-import { ensureCoverage, queueTiles } from '../src/coverage';
+import { MAX_AREA_TILES, ensureCoverage, queueTiles } from '../src/coverage';
+import { REVIVAL_OUTSTANDING_MAX } from '../src/dead-jobs';
+import { ESTATE_DRAIN_TILES_PER_HOUR, hoursToDrain } from '../src/drain-rate';
+import { PRINCIPAL_QUEUE_SHARE } from '../src/rate-limit';
 import { ensureNetworkCoverage, queueNetworkTiles } from '../src/network';
 
 /** A bbox small enough to need exactly one tile at either zoom. */
@@ -464,5 +468,46 @@ describe('what the reader is told', () => {
 
     // The number it tripped on, not just the fact that it tripped.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(String(MAX_TILE_QUEUE_DEPTH + 5)));
+  });
+});
+
+describe('what the ceiling is worth in hours', () => {
+  it('refuses at the depth the wait horizon buys, and not one job sooner', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Recomputed from the two inputs rather than read off the constant: this is the assertion that
+    // goes red if the rate is re-measured and the ceiling is left where it was, which is the drift
+    // that let a 21-hour backlog be documented as an hour.
+    const atHorizon = Math.floor(ESTATE_DRAIN_TILES_PER_HOUR * MAX_QUEUE_WAIT_HOURS);
+
+    expect(await admitIngest(fakeDb({ depth: atHorizon }).db)).toBe('queue-depth');
+    expect(await admitIngest(fakeDb({ depth: atHorizon - 1 }).db)).toBeNull();
+  });
+
+  it('admits no tile into a longer wait than the horizon promises', async () => {
+    const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH - 1 });
+
+    const { queued } = await queueTiles(db, ['0213012']);
+
+    // The last tile the ceiling lets through is the one that waits longest, so its wait is the
+    // whole promise. Asserted on the depth admission actually produced, not on the constant.
+    expect(queued).toHaveLength(1);
+    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH - 1 + queued.length)).toBeLessThanOrEqual(
+      MAX_QUEUE_WAIT_HOURS,
+    );
+  });
+
+  it('stays deep enough that a caller share still covers one deliberate area fetch', () => {
+    // Below this the allowance in `rate-limit.ts` is `MIN_BUCKET_CAPACITY` clamping *above* its own
+    // share of this ceiling, and one press of "fetch this area" would pin the product-wide ceiling
+    // for everybody. A shorter horizon needs a smaller `MAX_AREA_TILES` first.
+    expect(MAX_TILE_QUEUE_DEPTH * PRINCIPAL_QUEUE_SHARE).toBeGreaterThanOrEqual(MAX_AREA_TILES);
+  });
+
+  it('never refuses a viewport on revived work alone, whatever the ceiling is retuned to', async () => {
+    // `REVIVAL_OUTSTANDING_MAX` is a share of the same ceiling; the property is that spending all
+    // of it leaves admission open. Red if either the share or the ceiling moves without the other.
+    const { db } = fakeDb({ depth: REVIVAL_OUTSTANDING_MAX });
+
+    expect(await admitIngest(db)).toBeNull();
   });
 });

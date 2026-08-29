@@ -1,7 +1,8 @@
 -- Ingest metrics 04 (Q4): queue depth now, queue depth historically, and what the backlog is worth
 -- in hours. SELECT only: no write, no DDL.
 --
--- `MAX_TILE_QUEUE_DEPTH` is 600 and `admitIngest` compares it against exactly one number: rows
+-- `MAX_TILE_QUEUE_DEPTH` is 513 — `MAX_QUEUE_WAIT_HOURS` (18) of drain at the measured 28.5
+-- tiles an hour — and `admitIngest` compares it against exactly one number: rows
 -- whose `kind` is one of `ingest_tile`, `refresh_tile`, `ingest_network` and whose `status` is
 -- `queued` or `running`. Q2 reproduces that number and nothing else; every other section is
 -- context around it.
@@ -25,12 +26,12 @@ select kind,
  order by kind nulls last;
 
 \echo ''
-\echo '=== Q2: the number admitIngest actually compares to 600 ==='
+\echo '=== Q2: the number admitIngest actually compares to 513 ==='
 select sum(case when kind in ('ingest_tile', 'refresh_tile', 'ingest_network') then 1 else 0 end)
                                                                        as request_depth,
-       600                                                             as ceiling,
+       513                                                             as ceiling,
        round(100.0 * sum(case when kind in ('ingest_tile', 'refresh_tile', 'ingest_network')
-                              then 1 else 0 end) / 600.0, 1)           as pct_of_ceiling,
+                              then 1 else 0 end) / 513.0, 1)           as pct_of_ceiling,
        sum(case when kind in ('enrich_trail', 'ingest_route') then 1 else 0 end)
                                                                        as derived_depth,
        20000                                                           as derived_warn_depth
@@ -92,16 +93,17 @@ with edges as (
   select at, sum(delta) over (order by at, delta desc) as depth from edges
 )
 select max(depth)                                  as all_time_peak,
-       min(at) filter (where depth >= 600) at time zone 'utc' as first_at_or_past_600,
-       max(at) filter (where depth >= 600) at time zone 'utc' as last_at_or_past_600,
-       count(*) filter (where depth >= 600)        as edges_at_or_past_600,
-       count(*) filter (where depth >= 480)        as edges_past_80pct,
-       count(distinct date_trunc('day', at)) filter (where depth >= 600) as days_at_or_past_600
+       min(at) filter (where depth >= 513) at time zone 'utc' as first_at_or_past_513,
+       max(at) filter (where depth >= 513) at time zone 'utc' as last_at_or_past_513,
+       count(*) filter (where depth >= 513)        as edges_at_or_past_513,
+       count(*) filter (where depth >= 410)        as edges_past_80pct,
+       count(distinct date_trunc('day', at)) filter (where depth >= 513) as days_at_or_past_513
   from swept;
 
 \echo ''
 \echo '=== Q6: the backlog in hours, at the rate the last seven days actually achieved ==='
--- `MAX_TILE_QUEUE_DEPTH` is documented as "roughly an hour of drain". This is that claim, checked:
+-- `MAX_TILE_QUEUE_DEPTH` is derived as `MAX_QUEUE_WAIT_HOURS` of drain at the rate measured on
+-- 2026-08-08. This is that derivation checked against the rate the last seven days actually ran at:
 -- request depth divided by the request-kind completion rate over active hours in the last week.
 with rate as (
   select count(*)::numeric
@@ -121,5 +123,5 @@ select depth.request_depth,
        depth.derived_depth,
        round(rate.per_active_hour, 1)                                          as request_jobs_per_active_hour,
        round(depth.request_depth / nullif(rate.per_active_hour, 0), 1)         as backlog_hours,
-       round(600 / nullif(rate.per_active_hour, 0), 1)                         as hours_the_600_ceiling_buys
+       round(513 / nullif(rate.per_active_hour, 0), 1)                         as hours_the_513_ceiling_buys
   from depth, rate;

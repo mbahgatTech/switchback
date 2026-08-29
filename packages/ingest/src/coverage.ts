@@ -299,8 +299,9 @@ export async function queueTiles(
 
 /**
  * How much ground one press of "fetch this area" may queue. Ninety-six z9 tiles is roughly
- * Washington State plus its neighbours, and at two Overpass queries in flight it is minutes of
- * background work — the UI says so.
+ * Washington State plus its neighbours, and at `ESTATE_DRAIN_TILES_PER_HOUR` it is 3.4 hours of
+ * serial drain — the floor under `MAX_QUEUE_WAIT_HOURS`, because no ceiling can promise a shorter
+ * wait than one press of this button already costs.
  */
 export const MAX_AREA_TILES = 96;
 

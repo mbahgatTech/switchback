@@ -5,12 +5,26 @@
 
 import { JobKind, JobStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
+import { hoursToDrain, queueDepthForHours } from './drain-rate';
 
 /**
- * Refuse new ingest past this many *requested* jobs already waiting. Roughly an hour of drain
- * at the Overpass client's concurrency limit, past which queueing buys no earlier fetch.
+ * How long a tile admitted at the ceiling may still be waiting to be fetched.
+ *
+ * The primitive, with `MAX_TILE_QUEUE_DEPTH` its consequence: a job count states no promise a
+ * reader can check against the drain, and an hours figure does. Eighteen sits just above a floor
+ * rather than being a preference. One press of "fetch this area" is `MAX_AREA_TILES` = 96 tiles =
+ * 3.4 hours of serial drain, and below `MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs, or
+ * 16.8 hours, the per-caller allowance in `rate-limit.ts` stops being a share of this ceiling and
+ * becomes a clamp above it. A shorter horizon needs a smaller area fetch first: that is the lever.
  */
-export const MAX_TILE_QUEUE_DEPTH = 600;
+export const MAX_QUEUE_WAIT_HOURS = 18;
+
+/**
+ * Refuse new ingest past this many *requested* jobs already waiting, past which queueing buys no
+ * earlier fetch. Derived from measured throughput so the wait it admits cannot drift from the wait
+ * the estate delivers.
+ */
+export const MAX_TILE_QUEUE_DEPTH = queueDepthForHours(MAX_QUEUE_WAIT_HOURS);
 
 /**
  * The kinds a *request* can put on the queue — all that `MAX_TILE_QUEUE_DEPTH` counts.
@@ -170,9 +184,11 @@ export async function admitIngest(
 
   const requested = depthOf(REQUEST_JOB_KINDS);
   if (requested >= MAX_TILE_QUEUE_DEPTH) {
-    // Every refusal names the number it tripped, so a grep can tell a correct fire from a bug.
+    // Every refusal names the number it tripped, so a grep can tell a correct fire from a bug, and
+    // the wait that number stands for, so a log line can be judged without opening this file.
     console.warn(
-      `ingest refused: queue depth ${requested} at or past the ${MAX_TILE_QUEUE_DEPTH} ceiling`,
+      `ingest refused: queue depth ${requested} at or past the ${MAX_TILE_QUEUE_DEPTH} ceiling, ` +
+        `${hoursToDrain(requested).toFixed(1)} h of drain at the measured rate`,
     );
     return 'queue-depth';
   }

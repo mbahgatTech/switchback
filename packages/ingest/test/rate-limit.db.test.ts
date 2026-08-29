@@ -3,10 +3,10 @@ import { PrismaClient } from '@prisma/client';
 import { JobKind, JobStatus, prisma } from '@switchback/db';
 import { MAX_TILE_QUEUE_DEPTH, admitIngest } from '../src/backpressure';
 import { MAX_AREA_TILES, queueTiles } from '../src/coverage';
+import { ESTATE_DRAIN_TILES_PER_HOUR } from '../src/drain-rate';
 import {
   BUCKET_CAPACITY,
   BUCKET_REFILL_MS,
-  ESTATE_DRAIN_TILES_PER_HOUR,
   MIN_BUCKET_CAPACITY,
   PRINCIPAL_QUEUE_SHARE,
   PRINCIPAL_TILES_PER_HOUR,

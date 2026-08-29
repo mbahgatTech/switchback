@@ -39,7 +39,7 @@ in each table — the span every other file's numbers are only meaningful inside
 | `01-tile-cost.sql`         | What a tile costs          | `fetchMs` percentiles by zoom, `trailCount` distribution, the cross-tabulation of the two, a linearity regression, where the tail starts |
 | `02-drain-concurrency.sql` | Concurrency achieved       | The sweep line over `lockedAt`/`completedAt` from `docs/architecture.md`, peak per day, time spent at each level, lease durations        |
 | `03-throughput.sql`        | Jobs and tiles per hour    | Hourly and daily completion rates, active-hour distribution, the ceiling the measured fetch time implies                                 |
-| `04-queue-depth.sql`       | Depth now and historically | The exact number `admitIngest` compares to 600, reconstructed depth per day, the backlog in hours at the observed rate                   |
+| `04-queue-depth.sql`       | Depth now and historically | The exact number `admitIngest` compares to 513, reconstructed depth per day, the backlog in hours at the observed rate                   |
 | `05-failure-taxonomy.sql`  | What fails                 | Failures bucketed on the literal messages the code writes, plus every distinct message normalised as the check on those buckets          |
 | `06-split-cycle.sql`       | Subdivision                | Tiles by zoom, split parents and their children's outcomes, orphaned splits, the Overpass time the cycle discards                        |
 
@@ -61,7 +61,7 @@ them understates dense tiles and overstates the median. Every percentile in `01-
 separates them on the split marker in `lastError`.
 
 **A refused ingest leaves no row.** `admitIngest` returns `'queue-depth'` and writes a
-`console.warn`; nothing is persisted. Whether the 600 ceiling has ever actually refused a request is
+`console.warn`; nothing is persisted. Whether the 513 ceiling has ever actually refused a request is
 answerable only from the drainer's runtime logs — grep for `ingest refused: queue depth`. Section Q4
 of `04-queue-depth.sql` reconstructs when the ceiling _would_ have been tripped from enqueue and
 completion edges, which is the nearest the database can come and is a weaker claim.
@@ -77,14 +77,15 @@ Literals appear inline rather than being read from the environment, because the 
 know them and a script that guessed would be worse than one that states its assumption. Each is
 named where it is used.
 
-| Value  | Meaning                                      | Source                                |
-| ------ | -------------------------------------------- | ------------------------------------- |
-| 600    | `MAX_TILE_QUEUE_DEPTH`                       | `packages/ingest/src/backpressure.ts` |
-| 20,000 | `DERIVED_QUEUE_WARN_DEPTH`                   | `packages/ingest/src/backpressure.ts` |
-| 0.85   | `MAX_STORAGE_FRACTION`                       | `packages/ingest/src/backpressure.ts` |
-| 12 min | `LEASE_TIMEOUT_MS`, host timeout plus margin | `packages/ingest/src/jobs.ts`         |
-| 5      | `maxAttempts` default                        | `packages/db/prisma/schema.prisma`    |
-| 190 s  | `OVERPASS_MAX_TOTAL_MS` default              | `packages/ingest/src/config.ts`       |
-| 9      | `INGEST_ZOOM`, the tile grain                | `packages/geo/src/tiles.ts`           |
+| Value  | Meaning                                       | Source                                |
+| ------ | --------------------------------------------- | ------------------------------------- |
+| 513    | `MAX_TILE_QUEUE_DEPTH`, 18 h of drain at 28.5 | `packages/ingest/src/backpressure.ts` |
+| 28.5   | `ESTATE_DRAIN_TILES_PER_HOUR`                 | `packages/ingest/src/drain-rate.ts`   |
+| 20,000 | `DERIVED_QUEUE_WARN_DEPTH`                    | `packages/ingest/src/backpressure.ts` |
+| 0.85   | `MAX_STORAGE_FRACTION`                        | `packages/ingest/src/backpressure.ts` |
+| 12 min | `LEASE_TIMEOUT_MS`, host timeout plus margin  | `packages/ingest/src/jobs.ts`         |
+| 5      | `maxAttempts` default                         | `packages/db/prisma/schema.prisma`    |
+| 190 s  | `OVERPASS_MAX_TOTAL_MS` default               | `packages/ingest/src/config.ts`       |
+| 9      | `INGEST_ZOOM`, the tile grain                 | `packages/geo/src/tiles.ts`           |
 
 Changing any of them in the code changes what these scripts should compare against.

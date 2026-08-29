@@ -7,7 +7,7 @@
 import { JobStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { INGEST_ZOOM } from '@switchback/geo';
-import { REQUEST_JOB_KINDS } from './backpressure';
+import { MAX_TILE_QUEUE_DEPTH, REQUEST_JOB_KINDS } from './backpressure';
 import { DEADLINE_PASSED } from './deadline';
 import {
   OVERPASS_BREAKER_OPEN,
@@ -88,20 +88,24 @@ export const ABANDONED_MAX_ATTEMPTS = REVIVAL_CEILING + 1;
  */
 export const REVIVAL_PRIORITY = 0;
 
+/** The share of the request ceiling revival may hold — see `REVIVAL_OUTSTANDING_MAX`. */
+export const REVIVAL_QUEUE_SHARE = 0.05;
+
 /**
  * How many revived request jobs may be outstanding — `queued` or `running` — at once.
  *
  * **This is the bound that keeps recovery from becoming an outage.** `admitIngest` counts
  * `REQUEST_JOB_KINDS` in `{queued, running}` against `MAX_TILE_QUEUE_DEPTH`; a `dead` row is not
  * counted and a revived one is, so *revival is the act that re-fills the ceiling*. The drain is
- * serial at a measured mean of 126.2 s (see `PUMP_QUEUE_DEPTH`), about 28 tiles an hour, while an
- * unbounded triage at 64 a tick injects 1,920 — sixty-eight times faster than the queue empties.
+ * serial at `ESTATE_DRAIN_TILES_PER_HOUR`, while an unbounded triage at 64 a tick injects 1,920 —
+ * sixty-eight times faster than the queue empties.
  * An Overpass outage burying a few hundred request tiles would then revive all of them inside
  * twenty minutes, return the depth to its ceiling, and have `admitIngest` refuse every new
  * viewport estate-wide for as long as the backlog took to drain.
  *
- * Thirty-two is a twentieth of the request ceiling, which is the property that matters: revival can
- * never be the reason `admitIngest` refuses a viewport.
+ * A twentieth of the request ceiling, and derived from it rather than written down, so re-measuring
+ * the drain cannot leave this one behind at a fraction nobody rechecked. The fraction is the
+ * property that matters: revival can never be the reason `admitIngest` refuses a viewport.
  *
  * **The batch does not free in an hour, because of where these rows sort.**
  * `revive` writes `REVIVAL_PRIORITY`, below every request band, so a revived row is claimed after
@@ -125,7 +129,7 @@ export const REVIVAL_PRIORITY = 0;
  * worst case is that revival pauses — which is the state the estate was in before any of this
  * existed. The failure mode is the status quo ante, never a new one.
  */
-export const REVIVAL_OUTSTANDING_MAX = 32;
+export const REVIVAL_OUTSTANDING_MAX = Math.floor(MAX_TILE_QUEUE_DEPTH * REVIVAL_QUEUE_SHARE);
 
 /**
  * How many buried jobs one pass considers.

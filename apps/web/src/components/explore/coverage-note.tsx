@@ -88,9 +88,12 @@ function describe(
      * Which refusal decides the second half of the sentence, because none of them share an
      * instruction: a deep queue drains on its own, a full database needs somebody to decide
      * what to delete, and a spent allowance is this reader's own and says nothing about the
-     * product. `'queue-depth'` means only the 600-job request queue, which does drain in
-     * minutes — the derived backlog no longer refuses anything, see `DERIVED_QUEUE_WARN_DEPTH`
-     * in `backpressure.ts`. A new reason needs a new sentence.
+     * product. `'queue-depth'` means only the request queue, and "a few minutes" is the wait
+     * for *readmission* — the depth falls back under the ceiling as soon as one tile completes,
+     * which is minutes. It is not the wait for this reader's own tile: at the ceiling that is
+     * `MAX_QUEUE_WAIT_HOURS`, and no sentence here should be read as promising otherwise. The
+     * derived backlog refuses nothing, see `DERIVED_QUEUE_WARN_DEPTH`. A new reason needs a new
+     * sentence.
      */
     const why =
       coverage.busyReason === 'storage'

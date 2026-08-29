@@ -205,6 +205,20 @@ keyed on the signed-in account or, failing that, on an HMAC of the address Verce
 fifth of the queue ceiling and is _derived_ from it, so re-measuring the ceiling re-tunes the share.
 Only new ground is priced, so a reader panning over tiles we already hold never touches it.
 
+**The queue ceiling is a wait, not a job count.** `MAX_TILE_QUEUE_DEPTH` is
+`MAX_QUEUE_WAIT_HOURS` × `ESTATE_DRAIN_TILES_PER_HOUR` (`ingest/drain-rate.ts`) — 18 hours at the
+28.5 tiles an hour measured on 2026-08-08 — so the promise the ceiling makes is stated in the unit
+it is judged in, and one re-measurement retunes the ceiling, the per-caller allowance and the
+revival bound together. A count could not be checked against the drain, and the count that stood
+here described 21 hours of backlog as one hour.
+
+**Eighteen hours is near a floor, not a preference.** One press of "fetch this area" is
+`MAX_AREA_TILES` = 96 tiles, which at a serial drain is 3.4 hours on its own; below
+`MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs the per-caller allowance stops being a share of
+the ceiling and becomes a clamp above it, so one area fetch would pin the product-wide ceiling.
+Shortening the wait meaningfully means shrinking the area fetch first, or draining faster; it is not
+reachable from this constant. `packages/ingest/test/backpressure.test.ts` holds that floor.
+
 State lives in Postgres because Vercel runs many instances: an in-process counter would hand each
 instance a full allowance and forget it on the next cold start. The spend is one
 `INSERT … ON CONFLICT … WHERE`, which makes the check and the decrement the same operation without
