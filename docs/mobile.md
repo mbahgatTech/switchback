@@ -110,6 +110,21 @@ wins. Everything normally hand-edited in Xcode — bundle identifier, the `NSLoc
 
 ## Recording with the screen off
 
+```mermaid
+flowchart TB
+    OS(["iOS CoreLocation<br/>UIBackgroundModes: location"]) --> BG["record/background.ts<br/>task + probe + failures"]
+    FG["watchPositionAsync<br/>fallback"] --> ST
+    BG -->|"readings, failures"| ST["record/store.ts<br/>state machine"]
+    AUTH(["auth status + me.get<br/>via record/bridge.tsx"]) -->|"confirmSignedInUser"| ST
+    ST -->|"one leg"| ACC["geo: advanceTrackStats<br/>(incremental)"]
+    ACC -->|"stats"| ST
+    ST -->|"append one batch"| JF["record/journal-files.ts<br/>JournalStore"]
+    ST -->|"stage then rename head"| JF
+    J["record/journal.ts<br/>pure codec, owner rule"] --- ST
+    J -.->|"interface"| JF
+    ST -->|"batch/minute"| API[["activities.append"]]
+```
+
 A hike is recorded by a CoreLocation task the OS owns, not by anything the app schedules.
 `Location.watchPositionAsync` is a foreground subscription: iOS suspends the JavaScript runtime
 when the screen locks, and a track recorded that way is a straight line between the two moments
@@ -151,10 +166,20 @@ Continuous GPS is the heaviest thing a phone does; a long day out wants a batter
 Record screen says so before anybody sets off. The journal is the other half of that cost, which
 is why it appends rather than rewrites: `Documents/recording-v2/` holds a small `head.json` and an
 append-only `fixes.ndjson`, so a fix costs one line instead of re-serialising six hours of track
-once a second. The head is written to a staging name and renamed into place — `expo-file-system`'s
+once a second. CoreLocation delivers readings in batches and each batch is **one** append, not one
+per reading — an eight-hour hike costs roughly five hundred writes rather than twenty-eight
+thousand, and a kill loses the same readings either way, because the ones in a batch arrived
+together. The head is written to a staging name and renamed into place — `expo-file-system`'s
 string write is not atomic, and a head cut in half by a kill is a hike thrown away. A torn
 `fixes.ndjson` tail is dropped by `src/record/journal.ts` and the file repaired at restore, so the
 recording loses the last second, not the hike.
+
+A write the phone refuses — a full disk, most likely — does not stop the hike: the track stays in
+memory and keeps being uploaded on the same minute tick. It is no longer silent either.
+`JournalStore`'s writes report whether they landed, one that did not sets `journalDegraded` on the
+recorder snapshot, and the Record screen says so where the hike can still be saved. Carrying on
+quietly was the right call for the hiker mid-climb; carrying on with **nothing anywhere** recording
+that durability had gone was not.
 
 Running totals are folded one leg at a time (`advanceTrackStats` in `packages/geo`), not
 recomputed. `summariseTrack` walks the whole buffer, which is right for a finished recording and
@@ -173,8 +198,16 @@ A journal is a per-second location history. Three rules follow, and each is enfo
   shown where somebody has been. Signing out seals it — nothing of it is presented and the OS
   subscription stops — but does not destroy it, because a refresh token expiring mid-hike is an
   ordinary event on a mountain and losing a hike to it would teach people not to sign out.
-- **Nothing outlives its format.** `recording-v1.json`, written by builds before this, is deleted
-  at launch rather than ignored.
+- **An unsettled identity shows nothing.** `me.get` is a network call, and at a trailhead it may
+  not answer for the whole session — so "nobody is confirmed yet" is a state that lasts, not an
+  instant. A journal read back in that state is **withheld**: readings from the OS keep reaching
+  the disk, so a hike in progress loses nothing while the network is out, but no part of the track
+  reaches the screen, the tab bar or the Lifeline until an identity is confirmed, and it is handed
+  over whole or erased whole. Treating "unknown" as "the owner" is how one person's per-second
+  location history reaches the next person to pick the phone up.
+- **Nothing outlives its format.** Journals from every version below this one are deleted at
+  launch rather than ignored — the sweep is derived from `JOURNAL_VERSION`, the same constant the
+  live directory name is, so bumping the format cannot strand a trace behind a hardcoded list.
 - **Nothing outlives the hike by more than a day.** The directory is cleared on finish, on
   discard, and on an identity that does not own it — and a journal whose hike began more than
   48 hours ago is erased at the next launch, whether or not it was ever finished. That horizon is
