@@ -103,7 +103,7 @@ export const REVIVAL_PRIORITY = 0;
  * Thirty-two is a twentieth of the request ceiling, which is the property that matters: revival can
  * never be the reason `admitIngest` refuses a viewport.
  *
- * **It is not an hour of drain, and the earlier claim that it was ignored where these rows sort.**
+ * **The batch does not free in an hour, because of where these rows sort.**
  * `revive` writes `REVIVAL_PRIORITY`, below every request band, so a revived row is claimed after
  * everything else runnable — the batch frees at the rate the *whole* request queue drains, which
  * against a full queue is the better part of a day rather than an hour. Recovery of a large burial
@@ -134,17 +134,14 @@ export const REVIVAL_OUTSTANDING_MAX = 32;
  * bounds is the work of *deciding*: a handful of statements and, at most, this many small writes
  * per window.
  *
- * Only `revivalBudget`'s count rides an index. The two selections filter on `status` and sort on
- * `completedAt`, which no index on `IngestJob` covers, so each is a scan of the dead rows and a
- * sort — against thirty days of burials at the measured rate, some thousands of rows. That is
- * affordable here and nowhere else: this runs on a two-minute background timer and never behind
- * `trails.browse`. An index on `(status, completedAt)` is the fix if the table grows past it.
+ * **The window has to be sized against thirty days, not against an hour.** `queueHealth`'s
+ * `dead` gauge is `completedAt >= now - DISTRESS_WINDOW_MS`, so it reports burials *per hour* and
+ * not a standing population. The set this selects from is every `dead` request row past its rung,
+ * bounded only by `FAILED_JOB_TTL_MS` — three orders of magnitude more than the gauge shows.
  *
- * **The earlier sizing argument was wrong and is worth naming.** It read `queueHealth`'s
- * `dead=25` as a standing population of twenty-five rows; that gauge is
- * `completedAt >= now - DISTRESS_WINDOW_MS`, an hour, so the number is twenty-five burials *per
- * hour*. The eligible set is every `dead` row past its rung, bounded only by `FAILED_JOB_TTL_MS`,
- * which is thirty days — three orders of magnitude away from what that reading was taken to mean.
+ * Both selections filter on `(kind, status)` and sort on `completedAt`, which is why that index
+ * carries `completedAt` as its third column: without it each pass is a scan of the dead partition
+ * and a sort over some thousands of rows, on a timer that runs ahead of the tick's publish.
  */
 export const TRIAGE_LIMIT = 64;
 
@@ -268,9 +265,9 @@ function nonRetryableStatus(): RegExp {
  * matters most here. `OverpassClient` treats a busy dispatcher's XHTML error page, an unparseable
  * body and a `runtime error: Query timed out` remark as retryable and rotates mirrors on each —
  * they are the *signature* of the overload this ladder exists to span — yet none of them is a
- * phrasing worth enumerating, and an earlier version abandoned every one of them half an hour
- * into the outage. Enumerating the permanent side and defaulting the rest to the ladder puts the
- * burden of proof on the terminal write, where it belongs.
+ * phrasing worth enumerating. Enumerating the permanent side and defaulting the rest to the
+ * ladder puts the burden of proof on the terminal write, where it belongs — an enumerated
+ * transient side retires exactly these rows half an hour into the outage they describe.
  */
 export function classifyDeath(lastError: string | null): Death {
   if (lastError === null || lastError.trim() === '') {
@@ -330,6 +327,16 @@ export interface TriageOptions {
  * Decide what happens to every buried job that is due one, reviving the transient and retiring
  * the rest.
  *
+ * **Only `REQUEST_JOB_KINDS` are selected, because that is the population the budget bounds.**
+ * `revivalBudget` counts outstanding revivals of request kinds alone — what `admitIngest` weighs —
+ * so selecting a derived kind would spend a slot in memory that the next pass never counts back,
+ * and the cap would refill in full every tick. Nothing downstream absorbs that: `REVIVAL_PRIORITY`
+ * is ten bands above the floor derived work enqueues at, so a revived row would outrank the whole
+ * overdue backlog inside `runPump`'s two-message reservation, and `revive` clears `completedAt`,
+ * which is the column `pruneFinishedJobs` deletes on — an unclaimed revival would escape both TTLs
+ * on a table `trails.browse` counts on the hot path. A dead derived row therefore keeps the
+ * behaviour it has today: buried, and collected at `FAILED_JOB_TTL_MS`.
+ *
  * **Due-ness is a pair, not a date.** Each rung of `REVIVAL_DELAYS_MS` names the `maxAttempts` it
  * applies to, so a job waiting out its eight-hour rung is not selected at all rather than selected
  * and skipped — which is what keeps a long-waiting row from filling the window and starving the
@@ -341,14 +348,14 @@ export interface TriageOptions {
  * `lastError`, so selecting on the job row alone would be a second automatic path through the
  * population that cap exists to close.
  *
- * Skipping one looked like the lighter touch and was the worse bug. The `continue` wrote nothing,
- * so the row kept its status, its rung and its `completedAt`, satisfied the same predicate on the
- * next tick and sorted to the head of the window again — for ever, since nothing else clears it
- * either: `queueStaleChildren` refuses it for the same cap, `ensureCoverage` never sees a z10 row,
- * and `enqueue` is never reached. Sixteen fully-capped parents are sixty-four such rows, which is
- * the whole window, and at that point the reconciler did nothing at all until `pruneFinishedJobs`
- * deleted them thirty days later. Retiring records the decision the cap already made, and takes
- * the row out of the predicate that selected it. `unsplitTile` is the way back.
+ * Retiring rather than skipping is what keeps the window moving. A `continue` writes nothing, so
+ * the row keeps its status, its rung and its `completedAt`, satisfies the same predicate next tick
+ * and sorts to the head again — for ever, since nothing else clears it either: `queueStaleChildren`
+ * refuses it for the same cap, `ensureCoverage` never sees a z10 row, and `enqueue` is never
+ * reached. Sixteen fully-capped parents are sixty-four such rows, which is the whole window, and a
+ * reconciler that skipped them would do nothing at all until `pruneFinishedJobs` deleted them
+ * thirty days later. Retiring records the decision the cap already made, and takes the row out of
+ * the predicate that selected it. `unsplitTile` is the way back.
  *
  * A `maxAttempts` outside the ladder is left alone in both directions — an unrecognised budget is
  * not a licence to retry against. Nothing enqueues one at rest, and the two paths that raise it,
@@ -372,7 +379,11 @@ export async function reconcileDeadJobs(
    */
   const retiring = await db.ingestJob.findMany({
     // The ladder is spent: no delay left to wait out, no budget needed, nothing to classify.
-    where: { status: JobStatus.dead, maxAttempts: REVIVAL_CEILING },
+    where: {
+      kind: { in: [...REQUEST_JOB_KINDS] },
+      status: JobStatus.dead,
+      maxAttempts: REVIVAL_CEILING,
+    },
     orderBy: { completedAt: 'asc' },
     select,
     take: limit,
@@ -391,7 +402,7 @@ export async function reconcileDeadJobs(
    * the same immovable transient rows every tick and never reach them.
    */
   const laddering = await db.ingestJob.findMany({
-    where: { status: JobStatus.dead, OR: due },
+    where: { kind: { in: [...REQUEST_JOB_KINDS] }, status: JobStatus.dead, OR: due },
     orderBy: { completedAt: budget > 0 ? 'asc' : 'desc' },
     select,
     take: limit,
@@ -437,7 +448,8 @@ export async function reconcileDeadJobs(
  * `maxAttempts` above the default *is* the marker for a revived row, and it is exact because
  * `enqueue` resets the column: a row counted here was revived by this reconciler and has not since
  * been re-requested. Only `REQUEST_JOB_KINDS` are counted, because only those are what
- * `admitIngest` weighs against the ceiling this exists to protect.
+ * `admitIngest` weighs against the ceiling this exists to protect — and `reconcileDeadJobs`
+ * selects on the same list, so what is spent here is what is counted back next pass.
  */
 async function revivalBudget(db: PrismaClient): Promise<number> {
   /*

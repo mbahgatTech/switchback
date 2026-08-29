@@ -113,13 +113,21 @@ function fakeDb(rows: JobRow[], tiles: TileRow[] = [], weaken: Weaken = {}): Pri
         orderBy,
         take,
       }: {
-        where: { status?: JobStatus; OR?: Clause[]; maxAttempts?: number };
+        where: {
+          kind?: { in: JobKind[] };
+          status?: JobStatus;
+          OR?: Clause[];
+          maxAttempts?: number;
+        };
         orderBy?: { completedAt: 'asc' | 'desc' };
         take?: number;
       }) => {
         const found = rows
           .filter(
             (row) =>
+              // Optional for the reason `status` is: dropping the kind filter in the source must
+              // make this double select *more*, so the tests written for that filter go red.
+              (where.kind === undefined || where.kind.in.includes(row.kind)) &&
               (weaken.select === true ||
                 where.status === undefined ||
                 row.status === where.status) &&
@@ -540,6 +548,57 @@ describe('what revival is allowed to cost the queue', () => {
 
     // Self-clearing, which is what separates this from a latch: the count falls as work drains.
     expect(second.revived).toHaveLength(20);
+  });
+
+  it('leaves a buried derived job to the ladder that already bounds it', async () => {
+    /*
+     * The budget counts `REQUEST_JOB_KINDS` only, so reviving a derived kind would spend a slot in
+     * memory that the next pass never counts back and the cap would refill in full every tick.
+     */
+    const derived = job({ id: 'enrich-1', kind: JobKind.enrich_trail, dedupeKey: 'enrich:way/1' });
+
+    const triage = await reconcileDeadJobs(fakeDb([derived]), NOW, { limit: 10 });
+
+    expect(triage.revived).toEqual([]);
+    expect(triage.abandoned).toEqual([]);
+    // Still collectable: `completedAt` is what `pruneFinishedJobs` deletes on, and `revive` clears it.
+    expect(derived.status).toBe(JobStatus.dead);
+    expect(derived.completedAt).toBe(LONG_AGO);
+  });
+
+  it('leaves a spent derived burial in the retiring window alone too', async () => {
+    // The retiring window needs no budget, so it is scoped by kind for its own reason: retiring a
+    // derived row would write a `JOB_ABANDONED_MARKER` page for work no operator can requeue.
+    const derived = job({
+      id: 'route-1',
+      kind: JobKind.ingest_route,
+      dedupeKey: 'route:relation/9',
+      maxAttempts: REVIVAL_CEILING,
+    });
+
+    const triage = await reconcileDeadJobs(fakeDb([derived]), NOW, { limit: 10 });
+
+    expect(triage.abandoned).toEqual([]);
+    expect(derived.maxAttempts).toBe(REVIVAL_CEILING);
+  });
+
+  it('spends the budget on request jobs rather than on derived ones ahead of them', async () => {
+    // The starvation case: derived work enqueues at -10 and `REVIVAL_PRIORITY` is 0, so a revived
+    // derived row would outrank the whole overdue backlog in `runPump`'s two-message reservation.
+    const rows = [
+      ...Array.from({ length: REVIVAL_OUTSTANDING_MAX }, (_, index) =>
+        job({
+          id: `enrich-${index}`,
+          kind: JobKind.enrich_trail,
+          dedupeKey: `enrich:way/${index}`,
+        }),
+      ),
+      job({ id: 'tile-1', dedupeKey: tileJobKey('021301202') }),
+    ];
+
+    const triage = await reconcileDeadJobs(fakeDb(rows), NOW, { limit: rows.length });
+
+    expect(triage.revived).toEqual([tileJobKey('021301202')]);
   });
 
   it('does not abandon a job for the queue being busy', async () => {
