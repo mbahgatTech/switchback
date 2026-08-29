@@ -20,6 +20,7 @@
     "db:migrate": "npm run migrate --workspace=@switchback/db",
     "db:studio": "npm run studio --workspace=@switchback/db",
     "db:seed": "npm run seed --workspace=@switchback/db",
+    "db:seed:e2e": "npm run seed:e2e --workspace=@switchback/db --",
     "db:seed:reviews": "npm run seed:reviews --workspace=@switchback/db",
     "db:seed:tracks": "npm run seed:tracks --workspace=@switchback/db",
     "db:backfill:display-names": "npm run backfill:display-names --workspace=@switchback/db",

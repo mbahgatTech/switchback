@@ -24,9 +24,9 @@ const PAGES = [
   '/offline',
   '/signin',
   `/trails/${VESPER.slug}`,
-  `/trails/${REPORT_TRAIL.slug}`,
-  // The two seeded fixtures. The second carries a few thousand profile samples, so it is the
+  // The three seeded fixtures. The last carries a few thousand profile samples, so it is the
   // slowest page in the suite to compile and the one most worth asking for early.
+  `/trails/${REPORT_TRAIL.slug}`,
   `/trails/${PHOTOGRAPHED.slug}`,
   `/trails/${LONG_TRAIL.slug}`,
 ];

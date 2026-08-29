@@ -5,8 +5,11 @@ import {
   type Locator,
   type Page,
 } from '@playwright/test';
+import * as trails from './trails';
 
 /** Shared ground for the browser suite: a way to be signed in, and a way to talk to the map. */
+
+export * from './trails';
 
 /**
  * A database session row, not a sign-in flow — driving Entra ID headless would test
@@ -15,38 +18,6 @@ import {
  * Created by `seedProbeAccount`, so `npm run db:seed` is all a fresh clone needs.
  */
 export const PROBE_SESSION_TOKEN = 'probe-session-token-switchback';
-
-/** Vesper Peak: at z13 the sheet holds twenty-odd trails from an already-ingested tile. */
-export const VESPER = {
-  slug: 'vesper-peak-summit-trail',
-  name: 'Vesper Peak summit trail',
-  /** `map=zoom/lat/lng`, the same format the sheet writes back into the address bar. */
-  view: 'map=13/48.01213/-121.51188',
-} as const;
-
-/** A quieter trail on the same sheet, used where a spec has to write to the database. */
-export const REPORT_TRAIL = { slug: 'greider-lakes-trail' } as const;
-
-/**
- * The two trails below are on no single tile, and CI makes one Overpass query — so both are
- * seeded offline instead, under reserved `fixture-` slugs that nothing ingested can collide with:
- *
- *     npx tsx --env-file-if-exists=.env packages/db/scripts/seed-e2e.ts
- *
- * Without that, both pages 404 and the two specs fail on the first thing they look for.
- */
-
-/** Twelve photographs, every one a row with no file behind it. The gallery spec's whole subject. */
-export const PHOTOGRAPHED = { slug: 'fixture-photographed-trail' } as const;
-
-/**
- * A long through-hike with its high point 7% along, which is where the two weather callouts
- * overprinted — the fraction is what crowds them, since the collar is laid out in viewBox units.
- * A day hike puts its summit halfway and proves nothing about this.
- */
-export const LONG_TRAIL = { slug: 'fixture-early-high-point' } as const;
-
-export const SHEET_AT_VESPER = `/?${VESPER.view}`;
 
 interface Fixtures {
   /** A page whose context already carries the probe session cookie. */
@@ -83,7 +54,10 @@ export function sheetOf(page: Page): Locator {
  * Open the sheet and hand back the map region. `domcontentloaded`, not `load`: a MapLibre
  * canvas streams tiles for as long as it is on screen, so `load` here resolves late or never.
  */
-export async function openSheet(page: Page, search: string = SHEET_AT_VESPER): Promise<Locator> {
+export async function openSheet(
+  page: Page,
+  search: string = trails.SHEET_AT_VESPER,
+): Promise<Locator> {
   await page.goto(search, { waitUntil: 'domcontentloaded' });
   const sheet = sheetOf(page);
   await expect(sheet).toBeVisible();
@@ -190,10 +164,12 @@ export async function trailBySlug(
     return await trpcQuery<{ id: string; name: string; slug: string }>(request, 'trails.bySlug', {
       slug,
     });
-  } catch {
-    throw new Error(
-      `No trail "${slug}" in this database. The suite reads the Vesper Peak sheet; ` +
-        `run \`npm run db:seed\` or \`npm run ingest:tile\` over that area first.`,
-    );
+  } catch (cause) {
+    // `cause` is carried because this branch also catches a dead port and a 500, and the missing
+    // row is only the likeliest of the three. Without it the reader is told confidently to reseed
+    // a database that was never the problem.
+    throw new Error(`No trail "${slug}" in this database. ${trails.missingTrailAdvice(slug)}`, {
+      cause,
+    });
   }
 }

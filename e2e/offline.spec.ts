@@ -107,6 +107,9 @@ test.describe('Offline', () => {
       .toBe(true);
 
     await context.setOffline(true);
+    // A slug the database must NOT hold: seeding or ingesting it would delete the subject of this
+    // test, which is what a browser gets for a trail that was never downloaded.
+    // not-in-suite: exempt from the declaration test/e2e-trail-sources.test.ts holds trails to.
     await page.goto('/trails/mount-dickerman-trail', { waitUntil: 'domcontentloaded' });
 
     /*
