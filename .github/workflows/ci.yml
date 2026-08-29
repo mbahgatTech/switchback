@@ -24,7 +24,9 @@
 #
 # Which trail belongs to which of those two is a declaration, in `e2e/trails.ts`, and
 # `test/e2e-trail-sources.test.ts` holds it to this file — in `gates`, so a trail this workflow
-# cannot produce fails a pull request rather than the next nightly run.
+# cannot produce fails a pull request rather than the next nightly run. It also reads `e2e/` for
+# slugs written straight into a `page.goto`, which no declaration would otherwise cover; one is
+# exempt by a marked comment, because its subject is a trail the database must not hold.
 #
 # ---------------------------------------------------------------------------------------
 #
@@ -447,11 +449,11 @@ jobs:
       # Three trails the suite opens by slug that the one tile below does not contain — a gallery
       # whose photographs 404 on purpose, a long route whose high point comes early enough that
       # the section's weather callouts fight for room, and the trail the reports are filed
-      # against. All are offline fixtures under reserved `fixture-` slugs; the script explains
-      # why they are invented rather than ingested. Without this step six cases fail on every
-      # run regardless of the commit.
+      # against. All are offline fixtures under reserved `fixture-` slugs; `e2e-shapes.ts`
+      # explains why they are invented rather than ingested. Without this step six cases fail on
+      # every run regardless of the commit.
       - name: Seed the browser suite's fixtures
-        run: npx tsx --env-file-if-exists=.env packages/db/scripts/seed-e2e.ts
+        run: npm run db:seed:e2e
 
       # The one Overpass query this workflow makes. Vesper Peak, because that is the sheet
       # every spec opens on — the reader's original report was "I search Vesper peak and get

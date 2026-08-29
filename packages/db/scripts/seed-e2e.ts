@@ -1,6 +1,6 @@
 /**
  * Writes the browser suite's offline fixture trails. The shapes, and why they are invented, are
- * in `e2e-fixtures.ts`; everything here derives a row from one of them.
+ * in `e2e-shapes.ts`; everything here derives a row from one of them.
  */
 import { classifyDifficulty } from '@switchback/core';
 import type { ElevationPoint, LngLat } from '@switchback/core';
@@ -15,7 +15,7 @@ import {
 } from '@switchback/geo';
 import type { Prisma } from '@switchback/db';
 import { ActivityType, PhotoSource, RouteType, prisma, writeTrailGeometry } from '@switchback/db';
-import { SHAPES, type Shape } from './e2e-fixtures';
+import { SHAPES, type Shape } from './e2e-shapes';
 import { looksLikeHostedDatabase } from './local-database';
 
 /** Spacing rule copied from `pipeline.ts`, so a fixture profile is shaped like a real one. */

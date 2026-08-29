@@ -94,11 +94,12 @@ export const SHAPES: readonly Shape[] = [
   },
   {
     /**
-     * The reviews specs' trail, and the only one of the three whose row those specs *write* to.
-     * Its own shape rather than a share of one of the above: a report changes `rating` and
-     * `reviewCount`, and the gallery spec asserts on the trail it reads. No photographs, for the
-     * same reason in reverse — the report form sits below the photo strip, and twelve missing
-     * frames above it are twelve requests before the thing under test is on screen.
+     * The reviews specs' trail, and the only fixture any spec writes to. Its own shape rather than
+     * a share of one of the others because `photographs.spec.ts` asserts that no image anywhere on
+     * its trail page is broken — a whole-page assertion, which a report left behind by a run that
+     * died mid-test would land inside. No photographs of its own: the reports specs never look at
+     * any, and twelve rows with no file behind them are twelve failed requests on a page where
+     * those specs are timing a hydration window.
      */
     slug: 'fixture-report-trail',
     name: 'Report trail fixture',

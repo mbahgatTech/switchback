@@ -19,6 +19,7 @@
     "deploy": "prisma migrate deploy && tsx scripts/apply-spatial.ts",
     "studio": "dotenv -e ../../.env -- prisma studio",
     "seed": "dotenv -e ../../.env -- tsx scripts/seed.ts",
+    "seed:e2e": "dotenv -e ../../.env -- tsx scripts/seed-e2e.ts",
     "seed:reviews": "dotenv -e ../../.env -- tsx scripts/seed-reviews.ts",
     "seed:tracks": "dotenv -e ../../.env -- tsx scripts/seed-tracks.ts",
     "backfill:display-names": "dotenv -e ../../.env -- tsx scripts/backfill-display-names.ts",

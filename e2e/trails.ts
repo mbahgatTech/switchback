@@ -1,9 +1,10 @@
 /**
  * The trails the browser suite opens by slug, and where a CI run gets each one.
  *
- * Separate from `fixtures.ts` so that `test/e2e-trail-sources.test.ts` can read the declarations
- * under Node without loading Playwright's runner. The specs import them from `fixtures.ts` as
- * before.
+ * Separate from `fixtures.ts` so `test/e2e-trail-sources.test.ts` can read these declarations
+ * without loading Playwright's runner. Keep it free of DOM and Playwright for a second reason the
+ * import does not show: the root `tsconfig.json` excludes `e2e/` because that project alone needs
+ * `lib: ["DOM"]`, and the guard's import pulls this file into the root program regardless.
  */
 
 /** lng, lat. The sheet's centre, and the point `ci.yml` ingests its one tile around. */
@@ -19,12 +20,9 @@ export const VESPER = {
 } as const;
 
 /**
- * The trails below are on no single tile, and CI makes one Overpass query — so they are seeded
- * offline instead, under reserved `fixture-` slugs that nothing ingested can collide with:
- *
- *     npx tsx --env-file-if-exists=.env packages/db/scripts/seed-e2e.ts
- *
- * Without that, their pages 404 and the specs fail on the first thing they look for.
+ * The trails below are on no single tile, and CI makes one Overpass query — so `npm run db:seed:e2e`
+ * writes them offline instead, under reserved `fixture-` slugs that nothing ingested can collide
+ * with. Without it their pages 404 and the specs fail on the first thing they look for.
  */
 
 /** The trail the reports are filed against, and the only fixture a spec writes to. */
@@ -43,15 +41,10 @@ export const LONG_TRAIL = { slug: 'fixture-early-high-point' } as const;
 export const SHEET_AT_VESPER = `/?${VESPER.view}`;
 
 /**
- * Where CI gets each trail above. A `seeded` one is written offline by
- * `packages/db/scripts/seed-e2e.ts`; an `ingested` one has to lie inside the single z9 tile
- * `.github/workflows/ci.yml` queries, because that is the only Overpass request the workflow
- * makes. `test/e2e-trail-sources.test.ts` holds every entry to whichever claim it makes.
- *
- * The reports specs used to name a real trail 3 km south of that tile's edge. It reached the
- * database only because the web app ingested neighbouring tiles inline while the suite browsed
- * them; once ingestion moved behind a queue the suite failed nightly for a fortnight, and no
- * gate before this one had anything to say about it.
+ * Where CI gets each trail above: `seeded` by `npm run db:seed:e2e`, or `ingested` — which means
+ * inside the single z9 tile `.github/workflows/ci.yml` queries, the only Overpass request the
+ * workflow makes. `test/e2e-trail-sources.test.ts` holds every entry to its claim, and its header
+ * records the incident that made the declaration necessary.
  */
 export type SuiteTrail =
   | { readonly slug: string; readonly from: 'seeded' }
