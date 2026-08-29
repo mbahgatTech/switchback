@@ -350,4 +350,18 @@ full browser runs, because a suite that passes once has not been shown to be det
     reading is the `gates` job, which runs the identical command on a clean runner.
   decision: do not retry locally; take CI's gates as the verification, cite it either way.
   budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 9
+  at: 2026-08-29T10:40:00-07:00
+  state: SELF_VERIFY
+  event: intermediate_commit_pushed_unformatted
+  detail: >-
+    Commit 16720a0 was pushed with `npm run format:check` exiting 1. The Work Order edits
+    made after seq 6's commit reflowed a table cell past prettier's width, and the check was
+    run in the same command as the commit rather than before it — so the failure was visible
+    only after the push. Corrected in 81bcfaf; format:check exits 0 there. Recorded rather
+    than quietly amended: the branch was momentarily red on a gate this Work Order claims,
+    and the tip is the only commit whose green is asserted.
+  decision: dispatch a fresh CI run on 81bcfaf; the run on b3be0c9 no longer describes the head.
+  budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 1/8 }
 ```
