@@ -56,3 +56,16 @@ export const SUITE_TRAILS: readonly SuiteTrail[] = [
   { slug: PHOTOGRAPHED.slug, from: 'seeded' },
   { slug: LONG_TRAIL.slug, from: 'seeded' },
 ];
+
+/**
+ * What to tell a reader whose trail is not in the database. Lives here rather than beside its
+ * caller so `test/e2e-trail-sources.test.ts` can hold both branches: naming the wrong remedy
+ * sends someone to reseed a database that was never the problem.
+ */
+export function missingTrailAdvice(slug: string): string {
+  const seeded = SUITE_TRAILS.find((trail) => trail.slug === slug)?.from === 'seeded';
+  return seeded
+    ? 'Run `npm run db:seed:e2e`.'
+    : 'The suite reads the Vesper Peak sheet; run `npm run db:seed` or `npm run ingest:tile` ' +
+        'over that area first.';
+}

@@ -94,12 +94,10 @@ export const SHAPES: readonly Shape[] = [
   },
   {
     /**
-     * The reviews specs' trail, and the only fixture any spec writes to. Its own shape rather than
-     * a share of one of the others because `photographs.spec.ts` asserts that no image anywhere on
-     * its trail page is broken — a whole-page assertion, which a report left behind by a run that
-     * died mid-test would land inside. No photographs of its own: the reports specs never look at
-     * any, and twelve rows with no file behind them are twelve failed requests on a page where
-     * those specs are timing a hydration window.
+     * The reviews specs' trail. Its own shape because those specs time a hydration window — they
+     * re-click a button until its handler arrives — and neither trail above is a quiet page to
+     * time anything on: one carries twelve photographs with no file behind them, the other a few
+     * thousand profile samples.
      */
     slug: 'fixture-report-trail',
     name: 'Report trail fixture',

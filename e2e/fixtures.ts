@@ -5,7 +5,7 @@ import {
   type Locator,
   type Page,
 } from '@playwright/test';
-import { SHEET_AT_VESPER, SUITE_TRAILS } from './trails';
+import * as trails from './trails';
 
 /** Shared ground for the browser suite: a way to be signed in, and a way to talk to the map. */
 
@@ -54,7 +54,10 @@ export function sheetOf(page: Page): Locator {
  * Open the sheet and hand back the map region. `domcontentloaded`, not `load`: a MapLibre
  * canvas streams tiles for as long as it is on screen, so `load` here resolves late or never.
  */
-export async function openSheet(page: Page, search: string = SHEET_AT_VESPER): Promise<Locator> {
+export async function openSheet(
+  page: Page,
+  search: string = trails.SHEET_AT_VESPER,
+): Promise<Locator> {
   await page.goto(search, { waitUntil: 'domcontentloaded' });
   const sheet = sheetOf(page);
   await expect(sheet).toBeVisible();
@@ -162,20 +165,11 @@ export async function trailBySlug(
       slug,
     });
   } catch (cause) {
-    // The remedy differs by where the trail comes from, and naming the wrong one costs whoever
-    // reads this a detour — `npm run ingest:tile` will never produce a seeded fixture.
-    //
     // `cause` is carried because this branch also catches a dead port and a 500, and the missing
     // row is only the likeliest of the three. Without it the reader is told confidently to reseed
     // a database that was never the problem.
-    const seeded = SUITE_TRAILS.find((trail) => trail.slug === slug)?.from === 'seeded';
-    throw new Error(
-      `No trail "${slug}" in this database. ` +
-        (seeded
-          ? 'Run `npm run db:seed:e2e`.'
-          : 'The suite reads the Vesper Peak sheet; run `npm run db:seed` or ' +
-            '`npm run ingest:tile` over that area first.'),
-      { cause },
-    );
+    throw new Error(`No trail "${slug}" in this database. ${trails.missingTrailAdvice(slug)}`, {
+      cause,
+    });
   }
 }

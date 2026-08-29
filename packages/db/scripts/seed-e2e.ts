@@ -123,6 +123,7 @@ function sampleAt(profile: readonly ElevationPoint[], distM: number): ElevationP
  * is not a fixture, and there is no work here to credit.
  */
 async function writeFrames(
+  tx: Prisma.TransactionClient,
   trailId: string,
   profile: readonly ElevationPoint[],
   count: number,
@@ -154,7 +155,7 @@ async function writeFrames(
       capturedAt: new Date(Date.UTC(2024, 8, n, 9)),
     };
 
-    const saved = await prisma.photo.upsert({
+    const saved = await tx.photo.upsert({
       where: { source_sourceId_trailId: { source: PhotoSource.wikimedia, sourceId, trailId } },
       create: data,
       update: data,
@@ -163,7 +164,7 @@ async function writeFrames(
     ids.push(saved.id);
   }
 
-  await prisma.trail.update({
+  await tx.trail.update({
     where: { id: trailId },
     data: { photoCount: ids.length, primaryPhotoId: ids[0] ?? null },
   });
@@ -213,29 +214,39 @@ async function writeFixture(shape: Shape): Promise<void> {
     activityTypes: [ActivityType.hiking],
   };
 
-  const trail = await prisma.trail.upsert({
-    where: { slug: shape.slug },
-    create: { slug: shape.slug, ...row },
-    update: row,
-    select: { id: true },
-  });
+  // One transaction per fixture, because a half-written one is worse than a missing one: the row
+  // alone satisfies `trails.bySlug`, so the suite's "run the seed" message never fires and the
+  // specs fail somewhere inside the page render instead. Ctrl-C is the realistic way in.
+  await prisma.$transaction(
+    async (tx) => {
+      const trail = await tx.trail.upsert({
+        where: { slug: shape.slug },
+        create: { slug: shape.slug, ...row },
+        update: row,
+        select: { id: true },
+      });
 
-  // `geom` is what every spatial query reads and `searchVector` is what search reads; neither is
-  // written by the upsert above, and a trail missing them looks fine until something asks.
-  await writeTrailGeometry(prisma, {
-    trailId: trail.id,
-    geometry: { type: 'LineString', coordinates: coords },
-    centroid,
-  });
+      // `geom` is what every spatial query reads and `searchVector` is what search reads; neither
+      // is written by the upsert above, and a trail missing them looks fine until something asks.
+      await writeTrailGeometry(tx, {
+        trailId: trail.id,
+        geometry: { type: 'LineString', coordinates: coords },
+        centroid,
+      });
 
-  const profileRow = { points: profile, spacingM, highPointIndex: top };
-  await prisma.elevationProfile.upsert({
-    where: { trailId: trail.id },
-    create: { trailId: trail.id, ...profileRow },
-    update: profileRow,
-  });
+      const profileRow = { points: profile, spacingM, highPointIndex: top };
+      await tx.elevationProfile.upsert({
+        where: { trailId: trail.id },
+        create: { trailId: trail.id, ...profileRow },
+        update: profileRow,
+      });
 
-  if (shape.photographs > 0) await writeFrames(trail.id, profile, shape.photographs);
+      if (shape.photographs > 0) await writeFrames(tx, trail.id, profile, shape.photographs);
+    },
+    // The long fixture resamples to a few thousand profile points; the 5 s default is not a
+    // budget it reliably fits inside on a cold runner.
+    { timeout: 60_000, maxWait: 60_000 },
+  );
 
   const highAt = stats.lengthM > 0 ? (profile[top]!.distM / stats.lengthM) * 100 : 0;
   console.log(

@@ -79,6 +79,11 @@ green PR does not mean Playwright passed. Filling an ingest tile means querying 
 instance, and doing that on every push is how a project gets blocked. Run it locally, where the
 tile is already there.
 
+It needs two seeds, not one. `npm run db:seed` writes the probe account the signed-in specs use;
+`npm run db:seed:e2e` writes three offline fixture trails that no ingested tile contains. Skip the
+second and six cases fail — three of them on a bare locator timeout, because they open their trail
+by URL and a 404 has no remedy to print. `npm run db:seed:e2e -- --reset` removes them again.
+
 `npm test` prints a Prisma error mid-run: `packages/db/test/spatial.test.ts` deliberately asserts
 that `rating: 6` violates the `reviews_rating_range` constraint. The run is green.
 
