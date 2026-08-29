@@ -134,7 +134,7 @@ flowchart TB
     end
     subgraph after [After]
         A2[claim → adopt] --> B2["session.ts<br/>announce(true)"]
-        B2 --> H2["forgetAnswersOnIdentityChange<br/>queryClient.clear()"]
+        B2 --> H2["forgetAnswersOnIdentityChange<br/>queryClient.resetQueries()"]
         B2 --> C2[AuthProvider status]
         C2 --> D2["signin.tsx<br/>replace('/you')"]
         D2 --> E2[You]
@@ -401,10 +401,59 @@ nesting in place.
     contaminated by a `.env` I created in the worktree; it is deleted and no number from that
     run survives into §10. Second, this host's suite is load-unstable — three runs of one tree
     gave 38, 43 and 27 failures — so the differential rests on the set of failing files and the
-    arithmetic, not on a headline count. The one file that differs between the two runs,
+    arithmetic, not on a headline count. Corrected at seq 8: that holds at *file* granularity,
+    where the set is always the same, and not at test granularity, where the counts within a
+    file move between runs. The one file that differs between the two runs,
     `packages/db/test/entra-client.test.ts`, passes 4/4 alone on the branch and is untouched by
     a diff confined to `apps/mobile`, `docs/` and this file.
   budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 8
+  at: 2026-08-29T11:30:00+00:00
+  state: IN_REVIEW -> IMPLEMENT
+  event: review_board_returned_fail
+  detail: >-
+    Round-2 board: six of six FAIL. The round-1 Blocker was not closed — I restored the seed's
+    data but not its status. `resetQueries` refetches active queries unconditionally, ignoring
+    `staleTime`; nothing in the repo wires `onlineManager`, so offline that refetch fails rather
+    than pauses, and query-core keeps `data` while setting `status: 'error'`. Every fatal screen
+    branch read `isError`, so a downloaded trail drew and then flipped to "Trail not found"
+    seconds later. The root cause was a sentence in `offline/hydrate.ts` asserting query-core
+    keeps `status: 'success'` in that case. Measured on 5.101.4, it does not. The belief, not the
+    code, is what made this invisible. A second Blocker found by the tests reviewer is worse:
+    `actedOn` deduped on a boolean, so a sign-in arriving while a session was already live was
+    swallowed entirely — reachable through `signin.tsx`'s cold-start effect, which gates
+    `resumeSignIn` on a ref and not on `status`, and it served one reader's record to another.
+  decision: >-
+    Measured before choosing, rather than reasoning about the library again. Three fix surfaces
+    were offered; a probe against the installed query-core rejected the one I would otherwise
+    have picked — resetting without a forced refetch leaves every observer `pending` with zero
+    fetches even after a re-render, so the forced refetch is load-bearing and the screens are
+    what must change. Fatal branches now ask whether they hold data. The dedupe is
+    one-directional: only a repeated sign-*out* is a duplicate. `watchGeneration` is exported so
+    the notify path can be tested at all, and three structural gates stand in for the behavioural
+    tests a renderer would allow — each written by making the mutation and watching it fail.
+
+- seq: 9
+  at: 2026-08-29T11:35:00+00:00
+  state: IMPLEMENT
+  event: record_corrected
+  detail: >-
+    Correcting two claims in §10 written at seq 7. **The `/bin/bash` explanation was wrong.** I
+    wrote that the residual failures shell out to a `/bin/bash` this Windows host lacks, and
+    quoted a WSL relay error to support it. `which bash` returns `/usr/bin/bash` and it runs;
+    every one of those failures is `Test timed out in 5000ms`, including a synchronous one-liner
+    measured at 25,267 ms. They are load timeouts. I read one error line out of a noisy log and
+    generalised it into a mechanism I never checked — the same failure that produced the Blocker
+    above, in the evidence rather than in the code. **And the stability claim needed its
+    granularity stated:** resting on "the set of failing files" is sound at file granularity,
+    where the set is identical across runs, but not at test granularity, where counts within a
+    file move.
+  decision: >-
+    Both corrected in §10 in place, each pointing here. The differential's conclusion is
+    unchanged and was independently reproduced on a reviewer's host — base 10 failed / 2194
+    passed, branch 10 failed / 2208 passed, +14 exactly and only the new mobile tests.
+  budget: { implement: 3/3, review: 2/3, replan: 0/2, total: 1/8 }
 ```
 
 ---
@@ -466,6 +515,20 @@ branch e8a4496 : Test Files 3 failed | 117 passed | 5 skipped (125)
                       Tests 27 failed | 2191 passed | 105 skipped (2323)
 ```
 
+**Round 3, same host, same base.** The mobile suite grows from 5 tests on the base to 29:
+
+```
+base   1789198f: Test Files 2 failed | 115 passed | 5 skipped (122)
+                      Tests 24 failed | 2180 passed | 105 skipped (2309)
+branch 8e1c576 : Test Files 3 failed | 117 passed | 5 skipped (125)
+                      Tests  6 failed | 2222 passed | 105 skipped (2333)
+```
+
+**+24 tests, which is exactly the mobile suite's growth** (29 − 5). The failed _count_ moved from
+24 to 6 between these two runs, which is the host instability again and not an improvement this
+change earned — the failing _file_ set is what is stable, and it is the same three as before:
+`ci-steps-runnable`, `worker-deploy-path`, and the known-flaky `entra-client` (4/4 alone, twice).
+
 Read it as: **+14 tests, all of them passing.** The arithmetic closes exactly — total +14,
 passed +11, failed +3 — because one file that passed on the base run failed on the branch run.
 
@@ -482,8 +545,10 @@ The whole diff against the base is `apps/mobile/**`, `docs/mobile.md` and this f
 under `packages/db` — so there is no path by which this change reaches that test.
 
 The remaining failures are pre-existing and identical on both sides: `ci-steps-runnable` and
-`worker-deploy-path`, which shell out to workflow scripts through a `/bin/bash` this Windows
-host does not have (`execvpe(/bin/bash) failed: No such file or directory`). Neither touches
+`worker-deploy-path`. **The explanation first recorded for them was wrong** and is corrected at
+seq 8: they do not fail for want of `/bin/bash`. `which bash` returns `/usr/bin/bash` on this
+host and it runs. Every one of those failures is `Test timed out in 5000ms` — including a
+synchronous one-liner measured at 25,267 ms. They are load timeouts, and neither file touches
 authentication.
 
 **Two cautions on these numbers, both mine to declare.**
