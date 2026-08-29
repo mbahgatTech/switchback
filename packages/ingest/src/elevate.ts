@@ -6,8 +6,10 @@
 import { PNG } from 'pngjs';
 import type { ElevationPoint, LngLat } from '@switchback/core';
 import { IngestDeadlineError, assertBefore, requestBudgetMs } from './deadline';
+import type { TerrainCache } from './terrain-cache';
 import {
   NO_DATA_ELEVATION,
+  TERRARIUM_TILE_SIZE,
   TERRARIUM_ZOOM,
   cumulativeDistancesM,
   requiredTiles,
@@ -30,6 +32,13 @@ const DEFAULT_CACHE_SIZE = 256;
  */
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
+/**
+ * What one origin request produced. `absent` is a 404 and is data — the DEM does not cover this
+ * tile. `denied` is a 403, which says nothing about terrain and must never reach the cache.
+ */
+type OriginTerrain =
+  { kind: 'tile'; body: Buffer; tile: TerrariumTile } | { kind: 'absent' } | { kind: 'denied' };
+
 export interface TerrainSourceOptions {
   urlTemplate?: string;
   cacheSize?: number;
@@ -38,11 +47,20 @@ export interface TerrainSourceOptions {
   requestTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<unknown>;
+  /**
+   * Shared tier behind the in-process LRU, outliving the invocation. Absent is the default and
+   * leaves every tile coming from the origin, which is what the estate did before it existed.
+   */
+  cache?: TerrainCache;
 }
 
 /**
  * Fetches and caches terrarium tiles. `Map` iterates in insertion order, which is all an LRU
  * needs: delete-then-set on read moves an entry to the end, and the victim is the first key.
+ *
+ * Two tiers, and they are not interchangeable. The LRU is free and covers one z9 tile's terrain;
+ * the shared tier is a network round trip that survives the invocation and is what makes a retry,
+ * a subdivided child or a cold start cheap. See `terrain-cache.ts`.
  */
 export class TerrainSource {
   private readonly urlTemplate: string | undefined;
@@ -52,10 +70,17 @@ export class TerrainSource {
   private readonly requestTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<unknown>;
+  private readonly shared: TerrainCache | undefined;
 
   private readonly cache = new Map<string, TerrariumTile | null>();
   /** In-flight requests, so 40 trails asking for one tile at once make one request. */
   private readonly inflight = new Map<string, Promise<TerrariumTile | null>>();
+  /** Unawaited write-backs, held only so `flushWrites` can settle them. */
+  private readonly writes = new Set<Promise<void>>();
+  private sharedHits = 0;
+  private sharedMisses = 0;
+  private sharedOutages = 0;
+  private sharedCorrupt = 0;
   private active = 0;
   private readonly waiting: Array<() => void> = [];
 
@@ -68,10 +93,38 @@ export class TerrainSource {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.sleepImpl =
       options.sleepImpl ?? ((ms) => new Promise((r) => globalThis.setTimeout(r, ms)));
+    this.shared = options.cache;
   }
 
   get cachedCount(): number {
     return this.cache.size;
+  }
+
+  /**
+   * Shared-tier outcomes since construction. `unavailable` and `corrupt` are counted apart from
+   * `misses` deliberately: folding either into the miss rate reports a healthy cache during an
+   * outage, or during the one failure that does not heal on its own.
+   */
+  get sharedCacheStats(): {
+    hits: number;
+    misses: number;
+    unavailable: number;
+    corrupt: number;
+  } {
+    return {
+      hits: this.sharedHits,
+      misses: this.sharedMisses,
+      unavailable: this.sharedOutages,
+      corrupt: this.sharedCorrupt,
+    };
+  }
+
+  /**
+   * Settle the write-backs the pipeline deliberately does not await. The benchmark and the test
+   * suite need them landed before they measure; production has nothing to wait for.
+   */
+  async flushWrites(): Promise<void> {
+    await Promise.all([...this.writes]);
   }
 
   private url(z: number, x: number, y: number): string {
@@ -131,6 +184,83 @@ export class TerrainSource {
     y: number,
     deadlineAt?: number,
   ): Promise<TerrariumTile | null> {
+    // A shared lookup is a network round trip, so the deadline gates it exactly as it gates the
+    // origin. The always-serve rule belongs to the in-process cache above, where a hit is free.
+    assertBefore(deadlineAt, 'terrain');
+
+    const shared = await this.readShared(z, x, y, deadlineAt);
+    if (shared) return shared.tile;
+
+    const origin = await this.fetchOrigin(z, x, y, deadlineAt);
+    if (origin.kind === 'absent') {
+      this.writeBack(z, x, y, null);
+      return null;
+    }
+    // A 403 is an answer about access, not about terrain. It reads as a gap here exactly as it
+    // did before this tier existed, but storing it would write the no-tile marker — and since
+    // nothing expires a key, one misconfigured mirror would turn a region into permanent ocean
+    // for every process that reads the bucket afterwards.
+    if (origin.kind === 'denied') return null;
+
+    this.writeBack(z, x, y, origin.body);
+    return origin.tile;
+  }
+
+  /**
+   * What the shared tier knows, boxed so a tile the origin does not have stays distinguishable
+   * from the tier having no answer. `null` means go to the origin.
+   */
+  private async readShared(
+    z: number,
+    x: number,
+    y: number,
+    deadlineAt?: number,
+  ): Promise<{ tile: TerrariumTile | null } | null> {
+    if (!this.shared) return null;
+
+    const found = await this.shared.read(z, x, y, deadlineAt);
+    if (found.kind === 'absent') {
+      this.sharedHits += 1;
+      return { tile: null };
+    }
+    if (found.kind === 'tile') {
+      try {
+        const tile = decodeTerrarium(found.body, z, x, y);
+        this.sharedHits += 1;
+        return { tile };
+      } catch {
+        // An object that will not decode is a corrupt cache entry, not a corrupt DEM. Going to
+        // the origin re-fetches it, and the write-back replaces what was stored.
+        this.sharedCorrupt += 1;
+        return null;
+      }
+    }
+    if (found.kind === 'unavailable') this.sharedOutages += 1;
+    else this.sharedMisses += 1;
+    return null;
+  }
+
+  /**
+   * Unawaited on purpose: a cache write is not part of anyone's answer, and making the pipeline
+   * wait for one would spend the deadline this tier exists to save.
+   */
+  private writeBack(z: number, x: number, y: number, body: Buffer | null): void {
+    if (!this.shared) return;
+    const write = this.shared.write(z, x, y, body);
+    this.writes.add(write);
+    void write.finally(() => this.writes.delete(write));
+  }
+
+  /**
+   * What the origin said, kept apart rather than collapsed to `null`. Only a 404 is evidence
+   * that the DEM has no tile here; a 403 is evidence about the request.
+   */
+  private async fetchOrigin(
+    z: number,
+    x: number,
+    y: number,
+    deadlineAt?: number,
+  ): Promise<OriginTerrain> {
     // Before the queue, not after: waiting for a slot is time too, and a caller that has
     // already run out of clock should not take one from a caller that has not.
     assertBefore(deadlineAt, 'terrain');
@@ -143,10 +273,14 @@ export class TerrainSource {
           const response = await this.fetchImpl(this.url(z, x, y), {
             signal: AbortSignal.timeout(requestBudgetMs(this.requestTimeoutMs, deadlineAt)),
           });
-          if (response.status === 404 || response.status === 403) return null;
+          if (response.status === 404) return { kind: 'absent' };
+          if (response.status === 403) return { kind: 'denied' };
           if (!response.ok) throw new Error(`terrain tile ${z}/${x}/${y}: ${response.status}`);
-          const buffer = Buffer.from(await response.arrayBuffer());
-          return decodeTerrarium(buffer, z, x, y);
+          // Decoded here, inside the attempt, for two reasons: a truncated body is transient and
+          // retrying it is the right answer, and nothing may be handed to the cache until it has
+          // been proved to be a tile — the store's empty-object marker makes a bad write eternal.
+          const body = Buffer.from(await response.arrayBuffer());
+          return { kind: 'tile', body, tile: decodeTerrarium(body, z, x, y) };
         } catch (error) {
           // A deadline is not a transient fault and retrying it cannot help — the next
           // attempt would fail the same assertion, three backoffs later.
@@ -201,9 +335,22 @@ export class TerrainSource {
   }
 }
 
-/** Decode a terrarium PNG into the raster shape `@switchback/geo` samples. */
+/**
+ * Decode a terrarium PNG into the raster shape `@switchback/geo` samples.
+ *
+ * The size is checked, not trusted. `PNG.sync.read` succeeding says the bytes are a PNG, not that
+ * they are a tile, and the coordinates are stamped from the arguments rather than read from the
+ * body — so a well-formed 1x1 PNG decodes into a plausible tile whose every sample
+ * `elevationAtPixel` clamps to pixel (0,0). In the LRU alone that was one bad invocation; stored,
+ * it is that elevation for the whole estate until somebody finds the key by hand.
+ */
 export function decodeTerrarium(buffer: Buffer, z: number, x: number, y: number): TerrariumTile {
   const png = PNG.sync.read(buffer);
+  if (png.width !== TERRARIUM_TILE_SIZE || png.height !== TERRARIUM_TILE_SIZE) {
+    throw new Error(
+      `terrain tile ${z}/${x}/${y}: ${png.width}x${png.height} is not a ${TERRARIUM_TILE_SIZE}px terrarium tile`,
+    );
+  }
   return {
     z,
     x,

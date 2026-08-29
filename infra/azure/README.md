@@ -1659,6 +1659,69 @@ application-settings write replaces the collection whole, so any default would r
 and both fall back to absent, which is what the app already holds, so leaving them unexported
 deploys the deployed value.
 
+### The shared terrarium tile cache
+
+Terrain fetching is what an ingest invocation spends its clock on, and the 256-tile LRU in
+`packages/ingest/src/elevate.ts` dies with the process — so a retry, a subdivided child tile, a
+30-day refresh and every cold start re-fetch terrain the fleet already had. A Cloudflare R2 bucket
+holds those tiles between invocations. It is a separate bucket from the one that serves user
+photographs, and a separate credential, so a token that can write terrain cannot reach uploads.
+
+Four more exports, all with an empty fallback:
+
+```bash
+export TERRAIN_CACHE_R2_ACCOUNT_ID="…"
+export TERRAIN_CACHE_R2_ACCESS_KEY_ID="…"
+export TERRAIN_CACHE_R2_SECRET_ACCESS_KEY="…"
+export TERRAIN_CACHE_R2_BUCKET=switchback-terrain
+```
+
+**All four or none.** `ingest.bicep` emits the group only when every one is non-empty, and
+`terrainCacheFromEnv` reads a partial set the same way, so a half-configured deploy turns the cache
+off rather than half on. Off means every tile comes from the origin, which is what the worker did
+before the cache existed — the same thing a slow bucket, a 403 or an outage degrades to, because
+`TerrainCache` answers `unavailable` and the caller reads that as a miss.
+
+R2 rather than Postgres or the worker's own storage account. The server above has a 64 GiB disk at
+240 IOPS shared with every trail, and world coverage of z13 terrain is 250–500 GB, so the cache
+would outgrow the database it lived in and spend the IOPS the commit loop needs. The worker's blob
+storage is reached by a managed identity Vercel does not hold, and Vercel elevates planned routes
+through the same `getTerrain()`, so a blob cache would serve one surface and not the other. R2 is
+reachable from both over plain HTTPS and charges no egress in either direction — $0.015/GB-month,
+$7.50 at full world coverage.
+
+Vercel needs the same four names for the route planner to read the cache, but **a read-only token
+there, not this one.** The worker populates the bucket; Vercel only elevates planned routes, and
+`TerrainCache.write` swallows every write failure by design — a bucket that refuses writes and
+serves reads is still worth reading. So a read-only token costs that surface nothing and keeps a
+Vercel-side leak from being able to write terrain at all. It works without any of them: that
+surface simply keeps fetching from the origin.
+
+**The worker populates the bucket; Vercel only reads it.** That is deliberate on both counts. The
+worker walks whole z9 footprints and is where a cold tile is first wanted, and a serverless request
+is frozen at response time — an unawaited write-back there is not guaranteed to land anyway. So
+Vercel gets the warm cache without being trusted to fill it.
+
+Set `TERRAIN_CACHE_READ_ONLY=1` alongside the four on Vercel. The token already refuses writes, so
+this changes no outcome — it stops the attempt. Without it every miss sends a PUT that cannot
+succeed and is swallowed, which is a request per uncached tile and a failure nothing reports.
+
+Read the group back after a deploy, because an application-settings write replaces the collection
+whole:
+
+```bash
+az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?starts_with(name,'TERRAIN_CACHE_')].name" -o tsv
+# expect four names, or none at all
+```
+
+A laptop drain can point at a directory instead, which is the same tier with a different store:
+
+```bash
+TERRAIN_CACHE_DIR=.terrain-cache npm run ingest:tile -- --quadkey 021231030
+```
+
 Confirm the two flags landed rather than assuming it:
 
 ```bash

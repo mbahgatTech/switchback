@@ -4,11 +4,23 @@
  * `docs/architecture.md`), and a local filesystem in development that mimics the presigned-PUT
  * contract exactly, so the client code has no branch in it.
  *
- * **SigV4 is implemented here rather than pulled in.** `@aws-sdk/client-s3` plus the presigner
- * is ~1.5 MB of bundle to produce one string, and its credential-provider chain will go looking
- * for EC2 instance metadata. The algorithm is public, fixed, and has published test vectors.
+ * **SigV4 is hand-rolled rather than pulled in.** `@aws-sdk/client-s3` plus the presigner is
+ * ~1.5 MB of bundle to produce one string, and its credential-provider chain will go looking for
+ * EC2 instance metadata. The algorithm itself lives in `@switchback/core` because the terrain
+ * cache signs against R2 too; what stays here is this bucket's key layout and the decision to
+ * sign `content-type`.
  */
-import { PHOTO_CONTENT_TYPES, type PhotoContentType } from '@switchback/core';
+import {
+  PHOTO_CONTENT_TYPES,
+  amzDate,
+  hmac,
+  presignQueryV4,
+  toHex,
+  uriEncode,
+  type PhotoContentType,
+} from '@switchback/core';
+
+export { amzDate, uriEncode };
 
 export interface R2Config {
   accountId: string;
@@ -18,20 +30,6 @@ export interface R2Config {
   /** Public origin the objects are served from — a custom domain or the r2.dev subdomain. */
   publicUrl: string;
 }
-
-/**
- * R2 signs against `auto`, not a real region. Its buckets have a location hint rather than a
- * region, and anything else produces a signature mismatch with no useful message.
- */
-const R2_REGION = 'auto';
-const R2_SERVICE = 's3';
-const ALGORITHM = 'AWS4-HMAC-SHA256';
-
-/**
- * Presigned PUTs are signed without hashing the body — the signature has to exist before the
- * browser has read the file.
- */
-const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
 
 function readR2Config(): R2Config | null {
   const accountId = process.env.R2_ACCOUNT_ID?.trim();
@@ -87,55 +85,6 @@ export interface StorageDriver {
   publicUrl(key: string): string;
 }
 
-const encoder = new TextEncoder();
-
-function toHex(bytes: Uint8Array): string {
-  let out = '';
-  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
-  return out;
-}
-
-async function hmac(key: Uint8Array, data: string): Promise<Uint8Array> {
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    key as unknown as ArrayBuffer,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  return new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data)));
-}
-
-async function sha256Hex(data: string): Promise<string> {
-  return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(data))));
-}
-
-/**
- * AWS's percent-encoding, which is *not* `encodeURIComponent`. The unreserved set is exactly
- * `A-Za-z0-9-_.~`, encoded with uppercase hex; `encodeURIComponent` leaves `!*'()` alone, and
- * those four are why a hand-rolled signer works until it meets a key with an apostrophe.
- */
-export function uriEncode(value: string, encodeSlash = true): string {
-  let out = '';
-  for (const char of value) {
-    if (/[A-Za-z0-9\-_.~]/u.test(char)) {
-      out += char;
-    } else if (char === '/' && !encodeSlash) {
-      out += char;
-    } else {
-      for (const byte of encoder.encode(char)) {
-        out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
-      }
-    }
-  }
-  return out;
-}
-
-/** `20260727T113045Z` — SigV4's timestamp format, which is ISO-8601 with the punctuation gone. */
-export function amzDate(now: Date): string {
-  return `${now.toISOString().replace(/[-:]/gu, '').split('.')[0]}Z`;
-}
-
 /**
  * Sign a request as a URL — SigV4 "query string" authentication. Exported for the test suite,
  * which runs it against AWS's published `aws4_request` vectors.
@@ -153,9 +102,6 @@ export async function presignV4(
   },
 ): Promise<SignedRequest> {
   const host = `${config.accountId}.r2.cloudflarestorage.com`;
-  const stamp = amzDate(options.now ?? new Date());
-  const dateStamp = stamp.slice(0, 8);
-  const scope = `${dateStamp}/${R2_REGION}/${R2_SERVICE}/aws4_request`;
 
   // Path-style, `/<bucket>/<key>`: virtual-hosted style needs the bucket in the hostname, which
   // R2 supports only on custom domains. An empty key addresses the bucket itself, which is how
@@ -171,44 +117,18 @@ export async function presignV4(
   const headers: Record<string, string> = { host };
   if (options.contentType) headers['content-type'] = options.contentType;
 
-  const names = Object.keys(headers).sort();
-  const signedHeaders = names.join(';');
-  const canonicalHeaders = names.map((name) => `${name}:${headers[name]?.trim() ?? ''}\n`).join('');
-
-  const query: Record<string, string> = {
-    ...options.query,
-    'X-Amz-Algorithm': ALGORITHM,
-    'X-Amz-Credential': `${config.accessKeyId}/${scope}`,
-    'X-Amz-Date': stamp,
-    'X-Amz-Expires': String(options.expiresInS),
-    'X-Amz-SignedHeaders': signedHeaders,
-  };
-  const canonicalQuery = Object.keys(query)
-    .sort()
-    .map((name) => `${uriEncode(name)}=${uriEncode(query[name] ?? '')}`)
-    .join('&');
-
-  const canonicalRequest = [
+  const { url } = await presignQueryV4(config, {
     method,
+    host,
     canonicalUri,
-    canonicalQuery,
-    canonicalHeaders,
-    signedHeaders,
-    UNSIGNED_PAYLOAD,
-  ].join('\n');
-
-  const stringToSign = [ALGORITHM, stamp, scope, await sha256Hex(canonicalRequest)].join('\n');
-
-  // Annotated rather than inferred: `TextEncoder.encode` is typed as backed by a plain
-  // `ArrayBuffer` while `crypto.subtle.sign` returns the wider `ArrayBufferLike`.
-  let signing: Uint8Array = encoder.encode(`AWS4${config.secretAccessKey}`);
-  for (const part of [dateStamp, R2_REGION, R2_SERVICE, 'aws4_request']) {
-    signing = await hmac(signing, part);
-  }
-  const signature = toHex(await hmac(signing, stringToSign));
+    headers,
+    expiresInS: options.expiresInS,
+    ...(options.query ? { query: options.query } : {}),
+    ...(options.now ? { now: options.now } : {}),
+  });
 
   return {
-    url: `https://${host}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`,
+    url,
     headers: options.contentType ? { 'Content-Type': options.contentType } : {},
   };
 }
@@ -346,7 +266,7 @@ function localSecret(): Uint8Array {
   if (!secret || secret.length < 32) {
     throw new Error('AUTH_SECRET must be set and at least 32 characters');
   }
-  return encoder.encode(secret);
+  return new TextEncoder().encode(secret);
 }
 
 /**

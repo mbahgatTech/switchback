@@ -79,6 +79,15 @@ param overpassUserAgent = readEnvironmentVariable('INGEST_OVERPASS_USER_AGENT')
 param databaseUrl = readEnvironmentVariable('INGEST_DATABASE_URL')
 param mapillaryToken = readEnvironmentVariable('MAPILLARY_TOKEN', '')
 
+// The shared terrarium tile cache. Fallbacks are empty on all four, because the safe direction
+// here is unambiguous: an unset variable turns the cache off and the worker fetches from the
+// origin, which is what it did before the cache existed. Nothing is lost but the speed-up, so a
+// `BCP427` would refuse a deploy over something no operator has to remember.
+param terrainCacheAccountId = readEnvironmentVariable('TERRAIN_CACHE_R2_ACCOUNT_ID', '')
+param terrainCacheAccessKeyId = readEnvironmentVariable('TERRAIN_CACHE_R2_ACCESS_KEY_ID', '')
+param terrainCacheSecretAccessKey = readEnvironmentVariable('TERRAIN_CACHE_R2_SECRET_ACCESS_KEY', '')
+param terrainCacheBucket = readEnvironmentVariable('TERRAIN_CACHE_R2_BUCKET', '')
+
 // A literal, not an environment read, because this is the one parameter whose omission is silent
 // and fatal. `optionalWorkerSettings` emits `DATABASE_AUTH` only when this is not `password`, and
 // an application-settings write replaces the collection whole — so a deployment that left this at

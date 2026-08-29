@@ -21,3 +21,4 @@ export * from './heatmap';
 export * from './routing';
 export * from './map-bridge';
 export * from './transport';
+export * from './sigv4';
