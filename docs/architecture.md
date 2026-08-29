@@ -196,6 +196,23 @@ would exhaust a serverless pool. Admission control (`ingest/backpressure.ts`) is
 `queueTiles` — the choke point every writing path crosses — rather than at the one button that has a
 person behind it.
 
+**Two admissions, in that order: the estate's, then the caller's.** `admitIngest` answers whether
+the product can take more work at all; `spendIngestBudget` (`ingest/rate-limit.ts`) answers whether
+_this_ caller may have any of it. The ceilings alone were a shared failure domain — one client
+panning random cold ground could drive the request queue to `MAX_TILE_QUEUE_DEPTH` and the refusal
+that followed was product-wide. The allowance is a token bucket of tiles in `ingest_rate_buckets`,
+keyed on the signed-in account or, failing that, on an HMAC of the address Vercel observed; it is a
+fifth of the queue ceiling and is _derived_ from it, so re-measuring the ceiling re-tunes the share.
+Only new ground is priced, so a reader panning over tiles we already hold never touches it.
+
+State lives in Postgres because Vercel runs many instances: an in-process counter would hand each
+instance a full allowance and forget it on the next cold start. The spend is one
+`INSERT … ON CONFLICT … WHERE`, which makes the check and the decrement the same operation without
+holding a lock across the enqueue loop. Refill is a function of the clock and the row's
+`refilledAt`, so a spent bucket recovers unaided and a refusal — which writes nothing — cannot hold
+one empty. A full bucket and a missing row are the same answer, which is why the daily maintenance
+cron can delete settled rows and why `DELETE FROM ingest_rate_buckets` is a safe operator escape.
+
 **Service Bus is the only way a tile is ingested.** A request publishes one `{dedupeKey}` message
 per queued tile and makes no Overpass call at all; the Azure Functions worker drains one job per
 message. There is no second driver and no flag selecting between them — the Vercel-side drainers
@@ -2244,4 +2261,6 @@ and one of the three is a database URL, which is why it is not simply added to t
   can overshoot by `MAX_BATCH_SIZE` × `MAX_TILES_PER_REQUEST`. The obvious fix — an advisory lock
   around the count and the enqueue loop — becomes a global mutex held across up to 96 tile upserts
   and 96 job enqueues on the deliberate-area path, on a serverless deploy, past Prisma's interactive
-  transaction budget. A rate limiter in front is the prerequisite, and does not exist yet.
+  transaction budget. The per-caller allowance in `ingest/rate-limit.ts` is what bounds the
+  overshoot instead: a batch that races past the ceiling still spends real tokens, so a caller
+  cannot repeat the trick.

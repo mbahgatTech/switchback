@@ -19,6 +19,7 @@ export * from './geocode';
 export * from './jobs';
 export * from './dead-jobs';
 export * from './backpressure';
+export * from './rate-limit';
 export * from './pool';
 export * from './subdivide';
 export * from './coverage';

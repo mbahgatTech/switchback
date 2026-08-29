@@ -17,8 +17,9 @@ import {
 import { fillGaps } from './elevate';
 import { TerrainSource } from './elevate';
 import { admitIngest } from './backpressure';
-import type { IngestRefusal } from './backpressure';
-import type { QueueOutcome } from './coverage';
+import type { QueueOutcome, QueueRefusal } from './coverage';
+import { spendIngestBudget } from './rate-limit';
+import type { IngestPrincipal } from './rate-limit';
 import { enqueue, networkJobKey } from './jobs';
 import { OverpassUnavailableError } from './overpass';
 import type { OverpassElement, OverpassWay } from './overpass';
@@ -502,9 +503,10 @@ export interface NetworkCoverage {
   busy: boolean;
   /**
    * Which refusal, when `busy`. Null otherwise. `/plan` needs the distinction: "try again
-   * later" is right for a deep queue and wrong for a full database, which nobody can wait out.
+   * later" is right for a deep queue, wrong for a full database, which nobody can wait out,
+   * and wrong again for a spent allowance, which is about this caller and nobody else.
    */
-  busyReason: IngestRefusal | null;
+  busyReason: QueueRefusal | null;
   tooLarge: boolean;
   requiredTiles: number;
   maxTiles: number;
@@ -516,6 +518,8 @@ export interface NetworkCoverageOptions {
   maxTiles?: number;
   /** Set false to survey without queueing — the read half, for a "what do we hold" probe. */
   queue?: boolean;
+  /** Who to charge new ground to. Null leaves only the product-wide ceilings applying. */
+  principal?: IngestPrincipal | null;
 }
 
 /**
@@ -590,7 +594,11 @@ export async function ensureNetworkCoverage(
   const enqueued =
     options.queue === false
       ? { queued: [] as string[], refused: null }
-      : await queueNetworkTiles(db, needsWork, { newGround });
+      : await queueNetworkTiles(db, needsWork, {
+          newGround,
+          principal: options.principal ?? null,
+          now,
+        });
   const queued = enqueued.queued;
 
   /*
@@ -631,6 +639,9 @@ export async function queueNetworkTiles(
     priority?: number;
     /** The subset of `quadkeys` with nothing already on the queue. Defaults to all of them. */
     newGround?: readonly string[];
+    /** Who to charge the new ground to. Null leaves only the product-wide ceilings applying. */
+    principal?: IngestPrincipal | null;
+    now?: Date;
   } = {},
 ): Promise<QueueOutcome> {
   if (quadkeys.length === 0) return { queued: [], refused: null };
@@ -645,6 +656,14 @@ export async function queueNetworkTiles(
     // depth guard once did not count. See `backpressure.ts`.
     const refused = await admitIngest(db);
     if (refused !== null) return { queued: [], refused };
+
+    // The caller's own share, from the same bucket the trail side spends: a planner and a map
+    // pointed at the same cold ground are one person asking for it twice.
+    const principal = options.principal ?? null;
+    if (principal !== null) {
+      const budget = await spendIngestBudget(db, principal, newGround.length, options.now);
+      if (!budget.spent) return { queued: [], refused: 'rate-limit' };
+    }
   }
 
   for (const quadkey of quadkeys) {

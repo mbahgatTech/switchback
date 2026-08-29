@@ -85,16 +85,19 @@ function describe(
    */
   if (coverage?.busy) {
     /*
-     * Which refusal decides the second half of the sentence, because the two do not share an
+     * Which refusal decides the second half of the sentence, because none of them share an
      * instruction: a deep queue drains on its own, a full database needs somebody to decide
-     * what to delete. `'queue-depth'` means only the 600-job request queue, which does drain
-     * in minutes — the derived backlog no longer refuses anything, see
-     * `DERIVED_QUEUE_WARN_DEPTH` in `backpressure.ts`. A new reason needs a new sentence.
+     * what to delete, and a spent allowance is this reader's own and says nothing about the
+     * product. `'queue-depth'` means only the 600-job request queue, which does drain in
+     * minutes — the derived backlog no longer refuses anything, see `DERIVED_QUEUE_WARN_DEPTH`
+     * in `backpressure.ts`. A new reason needs a new sentence.
      */
     const why =
       coverage.busyReason === 'storage'
         ? 'fetching new ground is paused: there is no room left to store it. Everything already mapped still works.'
-        : 'fetching new ground is paused while the queue clears. Try again in a few minutes.';
+        : coverage.busyReason === 'rate-limit'
+          ? 'that is a lot of new ground at once, so fetching more is paused for a few minutes. Everything already mapped still works.'
+          : 'fetching new ground is paused while the queue clears. Try again in a few minutes.';
     return {
       text: shown > 0 ? `${count(shown, total)} · ${why}` : capitalise(why),
       pending: false,

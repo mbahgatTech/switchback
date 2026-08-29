@@ -16,11 +16,20 @@ import {
 import type { BBox } from '@switchback/core';
 import { admitIngest } from './backpressure';
 import type { IngestRefusal } from './backpressure';
+import { spendIngestBudget } from './rate-limit';
+import type { IngestPrincipal, RateRefusal } from './rate-limit';
 import { enqueue, tileJobKey } from './jobs';
 import { isTileFresh, isTileSettled } from './freshness';
 
 /** Priority for a tile someone is looking at, above the 0 a scheduled refresh enqueues with. */
 export const VIEWPORT_PRIORITY = 5;
+
+/**
+ * Every reason an enqueue can be turned down: the product-wide ceilings, plus the caller's own
+ * allowance. Kept as a union of the two rather than one flat list, because they are refusals
+ * about different things — one is a statement about the estate, the other about the caller.
+ */
+export type QueueRefusal = IngestRefusal | RateRefusal;
 
 export interface CoverageResult {
   /** Every tile the bbox touches, whatever its state. */
@@ -40,11 +49,11 @@ export interface CoverageResult {
    */
   busy: boolean;
   /**
-   * Which refusal, when `busy`. Null otherwise. The two need different sentences: a deep queue
-   * clears on its own, a full database does not, and telling somebody to wait out the second
-   * prescribes an action that cannot work.
+   * Which refusal, when `busy`. Null otherwise. The three need different sentences: a deep queue
+   * clears on its own, a full database needs an operator, and a spent allowance is this caller's
+   * alone. Telling somebody to wait out the full database prescribes an action that cannot work.
    */
-  busyReason: IngestRefusal | null;
+  busyReason: QueueRefusal | null;
   /** True when the bbox needed more tiles than we will cover in one request. */
   tooLarge: boolean;
   requiredTiles: number;
@@ -57,6 +66,11 @@ export interface CoverageOptions {
   maxTiles?: number;
   /** Set false for a background sweep that should not jump the queue ahead of live viewports. */
   urgent?: boolean;
+  /**
+   * Who to charge new ground to. Null — the default — is for callers with no requester behind
+   * them, such as a cron or a script, and leaves only the product-wide ceilings applying.
+   */
+  principal?: IngestPrincipal | null;
 }
 
 /**
@@ -169,6 +183,8 @@ export async function ensureCoverage(
   const enqueued = await queueTiles(db, needsWork, {
     urgent: options.urgent ?? true,
     newGround,
+    principal: options.principal ?? null,
+    now,
   });
   const queued = enqueued.queued;
 
@@ -202,7 +218,7 @@ export interface QueueOutcome {
   /** The quadkeys now on the queue. Empty when admission refused. */
   queued: string[];
   /** The refusal, or `null` when nothing was refused. */
-  refused: IngestRefusal | null;
+  refused: QueueRefusal | null;
 }
 
 /**
@@ -225,6 +241,9 @@ export async function queueTiles(
     priority?: number;
     /** The subset of `quadkeys` with nothing already on the queue. Defaults to all of them. */
     newGround?: readonly string[];
+    /** Who to charge the new ground to. Null leaves only the product-wide ceilings applying. */
+    principal?: IngestPrincipal | null;
+    now?: Date;
   } = {},
 ): Promise<QueueOutcome> {
   if (quadkeys.length === 0) return { queued: [], refused: null };
@@ -232,11 +251,22 @@ export async function queueTiles(
   const newGround = options.newGround ?? quadkeys;
 
   // Nothing new to bound: the upserts below are all collisions, so they keep the priority
-  // bump without asking the guard about work it has already admitted once.
+  // bump without asking the guard about work it has already admitted once. This is also what
+  // keeps a reader panning over ground we already hold off the rate limiter entirely.
   if (newGround.length > 0) {
     // The one place every trail-ingest path crosses, and so where backpressure belongs.
     const refused = await admitIngest(db);
     if (refused !== null) return { queued: [], refused };
+
+    /*
+     * The caller's own share, taken only once the estate has said yes — charging for tiles the
+     * ceiling was about to refuse would bill somebody for work that never happened.
+     */
+    const principal = options.principal ?? null;
+    if (principal !== null) {
+      const budget = await spendIngestBudget(db, principal, newGround.length, options.now);
+      if (!budget.spent) return { queued: [], refused: 'rate-limit' };
+    }
   }
 
   // Explicit priority wins; `urgent` is the two-value shorthand the viewport path uses.
@@ -301,6 +331,8 @@ export interface AreaOptions {
   db?: PrismaClient;
   now?: Date;
   maxTiles?: number;
+  /** Who to charge new ground to. Null leaves only the product-wide ceilings applying. */
+  principal?: IngestPrincipal | null;
 }
 
 /**
@@ -369,8 +401,8 @@ export interface AreaRequest extends AreaCoverage {
   queued: string[];
   /** True when admission refused, so nothing was queued. */
   busy: boolean;
-  /** Which refusal, when `busy`. The two need different sentences on screen. */
-  busyReason: IngestRefusal | null;
+  /** Which refusal, when `busy`. The three need different sentences on screen. */
+  busyReason: QueueRefusal | null;
 }
 
 /**
@@ -393,6 +425,8 @@ export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promis
   const { queued, refused } = await queueTiles(db, area.outstanding, {
     priority: AREA_PRIORITY,
     newGround: area.outstanding.filter((quadkey) => !working.has(quadkey)),
+    principal: options.principal ?? null,
+    now: options.now,
   });
   if (queued.length === 0) return { ...area, queued: [], busy: true, busyReason: refused };
 

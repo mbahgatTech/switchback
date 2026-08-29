@@ -7,6 +7,8 @@
  */
 import type { PrismaClient, User } from '@switchback/db';
 import { prisma } from '@switchback/db';
+import type { IngestPrincipal } from '@switchback/ingest';
+import { ingestPrincipalFor } from './ingest-principal';
 import { verifyAccessToken } from './tokens';
 
 /** The subset of the Auth.js session this package relies on. */
@@ -35,8 +37,13 @@ export interface Context {
   db: PrismaClient;
   user: User | null;
   headers: Headers;
-  /** How the caller authenticated. Useful for logging and for rate limits later. */
+  /** How the caller authenticated. Useful for logging. */
   authMethod: 'session' | 'bearer' | null;
+  /**
+   * Whose allowance new ingest is charged against. Never null: a caller the platform could not
+   * place shares one bucket rather than escaping the limit.
+   */
+  ingestPrincipal: IngestPrincipal;
   /**
    * Runs work after the response is sent, when the platform supports it. Absent means "no
    * background work here" — every caller must still be correct without it, which is why the
@@ -48,6 +55,18 @@ export interface Context {
 export async function createContext(opts: CreateContextOptions): Promise<Context> {
   const db = opts.db ?? prisma;
   const base = { db, headers: opts.headers, waitUntil: opts.waitUntil };
+
+  /*
+   * The principal is decided here and only here, so no procedure can invent one and every
+   * ingest path is charged the same way. It follows the user, so a caller who signs in mid-
+   * session moves from an address bucket to their own.
+   */
+  const settled = (user: User | null, authMethod: Context['authMethod']): Context => ({
+    ...base,
+    user,
+    authMethod,
+    ingestPrincipal: ingestPrincipalFor(opts.headers, user),
+  });
 
   const bearer = opts.headers.get('authorization');
   if (bearer?.toLowerCase().startsWith('bearer ')) {
@@ -66,7 +85,7 @@ export async function createContext(opts: CreateContextOptions): Promise<Context
       if (user) {
         const revokedAt = user.sessionsRevokedAt;
         const staleToken = revokedAt !== null && claims.issuedAt * 1000 <= revokedAt.getTime();
-        if (!staleToken) return { ...base, user, authMethod: 'bearer' };
+        if (!staleToken) return settled(user, 'bearer');
       }
     }
     // A bad bearer token falls through to the cookie rather than short-circuiting: the
@@ -77,8 +96,8 @@ export async function createContext(opts: CreateContextOptions): Promise<Context
   const sessionUserId = session?.user?.id;
   if (typeof sessionUserId === 'string') {
     const user = await db.user.findUnique({ where: { id: sessionUserId } });
-    if (user) return { ...base, user, authMethod: 'session' };
+    if (user) return settled(user, 'session');
   }
 
-  return { ...base, user: null, authMethod: null };
+  return settled(null, null);
 }

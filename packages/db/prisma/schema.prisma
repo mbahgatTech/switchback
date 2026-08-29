@@ -819,6 +819,25 @@ model IngestJob {
   @@map("ingest_jobs")
 }
 
+/// One caller's remaining allowance to put *new* ground on the ingest queue, as a token bucket.
+///
+/// Refill is derived from `refilledAt` and the clock and from nothing else — no job decrements
+/// this and no sweep resets it — so a spent bucket recovers unaided. A missing row is a full
+/// bucket, which is what makes the rows disposable and `pruneIngestBuckets` retention rather
+/// than state.
+model IngestRateBucket {
+  /// `u:<userId>` for a signed-in caller, `a:<hmac>` for a network address, `x:shared` for one
+  /// the platform did not identify. Never a raw address — see `api/ingest-principal.ts`.
+  principal  String   @id
+  /// Tiles still spendable as of `refilledAt`. Fractional, because refill is continuous.
+  tokens     Float
+  /// When `tokens` was last settled. The only input to refill, and what retention reads.
+  refilledAt DateTime
+
+  @@index([refilledAt])
+  @@map("ingest_rate_buckets")
+}
+
 // ---------------------------------------------------------------------------
 // User-generated content
 // ---------------------------------------------------------------------------

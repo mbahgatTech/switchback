@@ -156,7 +156,9 @@ export function PlanReadout({
           about the terrain — they are ground we have not looked at.{' '}
           {plan.busyReason === 'storage'
             ? 'There is no room left to store new ground. Paths already mapped still work.'
-            : 'Try the route again later.'}
+            : plan.busyReason === 'rate-limit'
+              ? 'That is a lot of new ground at once — try this route again in a few minutes.'
+              : 'Try the route again later.'}
         </p>
       ) : null}
 
