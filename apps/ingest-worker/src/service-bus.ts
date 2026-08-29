@@ -133,7 +133,7 @@ export function deadLetterQueue(): DeadLetterQueue {
  * as work this queue had completed. Null only when neither carries a usable key: a fact about the
  * message rather than an error to raise, and the reconciler reports it as unreadable.
  */
-function readDedupeKey(message: ServiceBusReceivedMessage): string | null {
+export function readDedupeKey(message: ServiceBusReceivedMessage): string | null {
   try {
     return parseIngestSignal(message.body).dedupeKey;
   } catch {
