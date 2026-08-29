@@ -1,6 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Frame } from '@playwright/test';
 
@@ -13,15 +12,6 @@ import { chromium, type Frame } from '@playwright/test';
  */
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
-const SKIP_DIRS = new Set([
-  'node_modules',
-  '.git',
-  '.next',
-  '.claude',
-  'dist',
-  'build',
-  'coverage',
-]);
 
 /** GitHub mounts each block in an iframe on this host. */
 const VIEWSCREEN = 'viewscreen.githubusercontent.com';
@@ -29,28 +19,65 @@ const SETTLE_MS = 20_000;
 const POLL_MS = 500;
 
 function git(...args: string[]): string {
-  return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+  return execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' });
 }
 
-function markdownFiles(dir: string): string[] {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    if (entry.isDirectory()) {
-      return SKIP_DIRS.has(entry.name) ? [] : markdownFiles(join(dir, entry.name));
-    }
-    return entry.name.endsWith('.md') ? [join(dir, entry.name)] : [];
-  });
+/** A file to load, and the number of its blocks that have to have become diagrams. */
+export interface Target {
+  path: string;
+  expected: number;
 }
 
-function blockCount(file: string): number {
-  return readFileSync(file, 'utf8')
-    .split('\n')
-    .filter((line) => line.trim() === '```mermaid').length;
+/**
+ * The repository as one commit holds it. Injected so the enumeration can be exercised without a
+ * clone that happens to contain the right commits.
+ */
+export interface CommitTree {
+  paths: () => string[];
+  read: (path: string) => string;
+}
+
+export function countMermaidBlocks(source: string): number {
+  return source.split('\n').filter((line) => line.trim() === '```mermaid').length;
+}
+
+/**
+ * The markdown to check, read from the commit under test rather than from the working tree.
+ *
+ * The two are different trees on a pull request, and the difference is not cosmetic: the runner
+ * checks out a commit while the blob URL below names `ref`, so a branch that has not been rebased
+ * carries files on disk its head does not have, and a branch that *deletes* a diagram still has
+ * it on disk. Either way the run asks github.com for a blob that is not there, and a 404 renders
+ * nothing — which the settle loop cannot tell apart from a diagram that failed to parse. Three
+ * open pull requests went red on it while every diagram in them was fine.
+ */
+export function mermaidTargets(tree: CommitTree): Target[] {
+  return tree
+    .paths()
+    .filter((path) => path.endsWith('.md'))
+    .map((path) => ({ path, expected: countMermaidBlocks(tree.read(path)) }))
+    .filter((target) => target.expected > 0);
+}
+
+/**
+ * A commit in this clone. Absent objects make `git` throw, which ends the run loudly rather than
+ * finding nothing to check and calling that a pass.
+ */
+export function gitCommitTree(ref: string): CommitTree {
+  return {
+    // `-z`, because `ls-tree` otherwise quotes and backslash-escapes any path outside ASCII.
+    paths: () =>
+      git('ls-tree', '-r', '--name-only', '-z', ref)
+        .split('\0')
+        .filter((path) => path.length > 0),
+    read: (path) => git('show', `${ref}:${path}`),
+  };
 }
 
 /** `owner/repo` from the origin URL, however it is spelled. */
 function repoSlug(): string {
   const match = /github\.com[:/](?<slug>[^/]+\/[^/]+?)(?:\.git)?$/.exec(
-    git('remote', 'get-url', 'origin'),
+    git('remote', 'get-url', 'origin').trim(),
   );
   if (!match?.groups?.slug) throw new Error('origin is not a github.com remote');
   return match.groups.slug;
@@ -85,17 +112,12 @@ async function renderedBlocks(frames: Frame[]): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const ref = process.argv[2] ?? git('rev-parse', 'HEAD');
+  const ref = process.argv[2] ?? git('rev-parse', 'HEAD').trim();
   const slug = repoSlug();
 
-  const targets = markdownFiles(REPO_ROOT)
-    .map((file) => ({
-      path: file.slice(REPO_ROOT.length).replace(/\\/g, '/'),
-      expected: blockCount(file),
-    }))
-    .filter((target) => target.expected > 0);
+  const targets = mermaidTargets(gitCommitTree(ref));
 
-  if (targets.length === 0) throw new Error('no markdown file carries a Mermaid block');
+  if (targets.length === 0) throw new Error(`no markdown file at ${ref} carries a Mermaid block`);
 
   const browser = await chromium.launch();
   const failures: string[] = [];
@@ -132,7 +154,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
