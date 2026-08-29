@@ -300,6 +300,13 @@ describe('where the report is called from', () => {
      * reclaiming would strand every lease a killed invocation held. But reviving is the one part
      * of the sweep that puts work back on the queue, which is exactly what the brake means to
      * stop, so it is the one part the brake reaches.
+     *
+     * A source-text match, and therefore not the guard — it reds on a rename that changes no
+     * behaviour, and a maintainer who "fixes" the string would otherwise be left with nothing.
+     * The guard is behavioural and lives in `pump-handler.test.ts`: *stops revivals while the
+     * brake is on* and *leaves revivals running while the brake is off* assert the argument
+     * `sweepQueue` is actually called with, in both directions. Update this string freely; do not
+     * delete those.
      */
     expect(pump).toContain('{ revive: !braked() }');
   });

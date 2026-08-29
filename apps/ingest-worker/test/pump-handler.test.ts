@@ -82,6 +82,13 @@ async function bandPassedToPump(brake: string | undefined): Promise<number | und
   return call[5] as number | undefined;
 }
 
+/** The triage options `maintain` hands `sweepQueue` — the brake's reach into the sweep. */
+function triagePassedToSweep(): unknown {
+  const call = stub.sweepQueue.mock.calls.at(-1) as unknown[] | undefined;
+  if (!call) throw new Error('the handler did not sweep the queue');
+  return call[2];
+}
+
 describe('the ingestPump handler', () => {
   beforeEach(() => {
     stub.runPump.mockClear();
@@ -104,6 +111,28 @@ describe('the ingestPump handler', () => {
     // The sweep runs ahead of the brake: a stopped pump that also stopped reclaiming would leave
     // every lease a killed invocation held stuck for as long as the brake was on.
     expect(stub.sweepQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops revivals while the brake is on', async () => {
+    /*
+     * The brake's revive dimension, asserted on the argument rather than on the source text that
+     * spells it. Reviving is the one part of the sweep that puts work back on the queue, which is
+     * exactly what `INGEST_PUMP_ENABLED=false` means to stop — and a call site hard-wired to
+     * `true` disables that control completely while leaving every other assertion here green.
+     */
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump('false');
+
+    expect(triagePassedToSweep()).toEqual({ revive: false });
+  });
+
+  it('leaves revivals running while the brake is off', async () => {
+    // The other half, which is what makes the assertion above a statement about the brake rather
+    // than about a constant: the same call site must ask for revivals when nothing is stopping it.
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump('true');
+
+    expect(triagePassedToSweep()).toEqual({ revive: true });
   });
 
   it('drains the dead-letter queue whichever way the brake is set', async () => {
