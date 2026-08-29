@@ -339,7 +339,7 @@ function noCoverage(): CoverageResult {
  */
 async function coverageFor(ctx: Context, bbox: BBox): Promise<CoverageResult> {
   try {
-    return await ensureCoverage(bbox, { db: ctx.db });
+    return await ensureCoverage(bbox, { db: ctx.db, principal: ctx.ingestPrincipal });
   } catch (error) {
     console.warn('coverage failed', error);
     return noCoverage();
@@ -725,7 +725,11 @@ export const trailsRouter = router({
    */
   coverage: publicProcedure.input(z.object({ bbox: bboxSchema })).query(async ({ ctx, input }) => {
     // `urgent: false` — a poll must not re-prioritise work it is merely watching.
-    const coverage = await ensureCoverage(input.bbox, { db: ctx.db, urgent: false });
+    const coverage = await ensureCoverage(input.bbox, {
+      db: ctx.db,
+      urgent: false,
+      principal: ctx.ingestPrincipal,
+    });
     return toCoverage(coverage);
   }),
 
@@ -742,7 +746,7 @@ export const trailsRouter = router({
   fetchArea: publicProcedure
     .input(z.object({ bbox: bboxSchema }))
     .mutation(async ({ ctx, input }) => {
-      const area = await requestArea(input.bbox, { db: ctx.db });
+      const area = await requestArea(input.bbox, { db: ctx.db, principal: ctx.ingestPrincipal });
       kickIngest(ctx, area.queued);
       // `busyReason` rides along with `busy`: the refusal copy has to tell a deep queue,
       // which clears, apart from a full database, which does not.

@@ -115,10 +115,11 @@ export const routePlanSchema = z.object({
    */
   busy: z.boolean().default(false),
   /**
-   * Which refusal, when `busy`. A deep queue can be waited out and a full database cannot, so
-   * they must not share one "try again later". Defaulted, as `busy` is.
+   * Which refusal, when `busy`. A deep queue can be waited out, a full database cannot, and a
+   * spent allowance is this caller's own doing, so no two of them share one "try again later".
+   * Defaulted, as `busy` is.
    */
-  busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
+  busyReason: z.enum(['queue-depth', 'storage', 'rate-limit']).nullable().default(null),
   /** True when the anchors span more ground than one plan may cover. */
   tooLarge: z.boolean(),
 });

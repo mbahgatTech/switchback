@@ -107,7 +107,7 @@ function stale(quadkey: string): TileRow {
 describe('ensureCoverage partitioning', () => {
   it('treats an unknown tile as pending, with nothing to serve', async () => {
     const { db } = fakeDb();
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.quadkeys).toHaveLength(1);
     expect(result.pending).toEqual(result.quadkeys);
@@ -117,10 +117,11 @@ describe('ensureCoverage partitioning', () => {
   });
 
   it('serves a fresh tile and queues nothing', async () => {
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db, recorded } = fakeDb([fresh(quadkey)]);
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.ready).toEqual([quadkey]);
     expect(result.pending).toEqual([]);
@@ -130,10 +131,11 @@ describe('ensureCoverage partitioning', () => {
   });
 
   it('serves a stale tile while refreshing it, rather than blanking the map', async () => {
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db } = fakeDb([stale(quadkey)]);
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     // Both ready and refreshing: there are trails to draw, and a fetch behind them.
     expect(result.ready).toEqual([quadkey]);
@@ -143,10 +145,11 @@ describe('ensureCoverage partitioning', () => {
   });
 
   it('does not offer a failed tile as ready', async () => {
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db } = fakeDb([{ quadkey, status: TileStatus.failed, fetchedAt: null }]);
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.ready).toEqual([]);
     expect(result.pending).toEqual([quadkey]);
@@ -159,12 +162,13 @@ describe('ensureCoverage partitioning', () => {
      * `pending` is the set `explore.tsx` refetches on every 2.5 s, so classifying this as
      * pending both hides trails that are in the table and starts a poll for them.
      */
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db } = fakeDb([
       { quadkey, status: TileStatus.failed, fetchedAt: null, trailCount: 899 },
     ]);
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.ready).toEqual([quadkey]);
     expect(result.refreshing).toEqual([quadkey]);
@@ -179,12 +183,13 @@ describe('ensureCoverage partitioning', () => {
      * job restarts the ladder every 2.5 s and the tile re-runs for as long as the map is open.
      * Neither half may happen: no `pending` entry to poll on, no job upsert to revive it.
      */
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db, recorded } = fakeDb([{ quadkey, status: TileStatus.failed, fetchedAt: null }], {
       dead: [`ingest_tile:${quadkey}`],
     });
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.pending).toEqual([]);
     expect(result.queued).toEqual([]);
@@ -192,7 +197,8 @@ describe('ensureCoverage partitioning', () => {
   });
 
   it('still draws what a buried tile committed before it gave up', async () => {
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db } = fakeDb(
       [{ quadkey, status: TileStatus.failed, fetchedAt: null, trailCount: 899 }],
       {
@@ -200,7 +206,7 @@ describe('ensureCoverage partitioning', () => {
       },
     );
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.ready).toEqual([quadkey]);
     expect(result.pending).toEqual([]);
@@ -210,12 +216,13 @@ describe('ensureCoverage partitioning', () => {
   });
 
   it('counts an empty tile as covered — "no trails here" is an answer', async () => {
-    const quadkey = (await ensureCoverage(ONE_TILE, { db: fakeDb().db, now: NOW })).quadkeys[0]!;
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
     const { db } = fakeDb([
       { quadkey, status: TileStatus.empty, fetchedAt: new Date(NOW.getTime() - 1_000) },
     ]);
 
-    const result = await ensureCoverage(ONE_TILE, { db, now: NOW });
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
     expect(result.ready).toEqual([quadkey]);
     expect(result.queued).toEqual([]);
@@ -225,7 +232,7 @@ describe('ensureCoverage partitioning', () => {
 describe('ensureCoverage bounds', () => {
   it('refuses a bbox needing more tiles than the cap, and queues none of it', async () => {
     const { db, recorded } = fakeDb();
-    const result = await ensureCoverage(HUGE, { db, now: NOW });
+    const result = await ensureCoverage(HUGE, { principal: null, db, now: NOW });
 
     expect(result.tooLarge).toBe(true);
     expect(result.requiredTiles).toBeGreaterThan(result.maxTiles);
@@ -238,7 +245,12 @@ describe('ensureCoverage bounds', () => {
   });
 
   it('reports the cap it applied, so the client can say how far to zoom', async () => {
-    const result = await ensureCoverage(HUGE, { db: fakeDb().db, now: NOW, maxTiles: 4 });
+    const result = await ensureCoverage(HUGE, {
+      principal: null,
+      db: fakeDb().db,
+      now: NOW,
+      maxTiles: 4,
+    });
     expect(result.maxTiles).toBe(4);
   });
 });
@@ -310,7 +322,7 @@ describe('surveyArea', () => {
     const { db, recorded } = fakeDb();
 
     // The premise of the whole feature: `ensureCoverage` gives up here and reports nothing.
-    expect((await ensureCoverage(HUGE, { db, now: NOW })).quadkeys).toEqual([]);
+    expect((await ensureCoverage(HUGE, { principal: null, db, now: NOW })).quadkeys).toEqual([]);
 
     const area = await surveyArea(HUGE, { db, now: NOW });
 
@@ -386,7 +398,7 @@ describe('surveyArea', () => {
 describe('requestArea', () => {
   it('queues every outstanding tile below the viewport priority', async () => {
     const { db, recorded } = fakeDb();
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     expect(result.queued).toHaveLength(MAX_AREA_TILES);
     expect(recorded.jobUpserts).toHaveLength(MAX_AREA_TILES);
@@ -404,7 +416,7 @@ describe('requestArea', () => {
     const keys = (await surveyArea(HUGE, { db: probe, now: NOW })).quadkeys;
 
     const { db, recorded } = fakeDb(keys.map(fresh));
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     expect(result.outstanding).toEqual([]);
     expect(result.queued).toEqual([]);
@@ -416,7 +428,7 @@ describe('requestArea', () => {
     // The guard logs its refusal for an operator; this suite is not the audience.
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db, recorded } = fakeDb([], { queueDepth: MAX_TILE_QUEUE_DEPTH });
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     expect(result.busy).toBe(true);
     expect(result.queued).toEqual([]);
@@ -428,7 +440,7 @@ describe('requestArea', () => {
 
   it('lets a request through while the queue is one job short of the cap', async () => {
     const { db } = fakeDb([], { queueDepth: MAX_TILE_QUEUE_DEPTH - 1 });
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     expect(result.busy).toBe(false);
     expect(result.queued).toHaveLength(MAX_AREA_TILES);
@@ -436,7 +448,7 @@ describe('requestArea', () => {
 
   it('folds what it queued into `working`, so the caller can poll immediately', async () => {
     const { db } = fakeDb();
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     expect(result.working).toEqual(result.queued);
     expect(new Set(result.working).size).toBe(result.working.length);
@@ -444,7 +456,7 @@ describe('requestArea', () => {
 
   it('queues centre-first, so the middle of the view fills before the corners', async () => {
     const { db, recorded } = fakeDb();
-    const result = await requestArea(HUGE, { db, now: NOW });
+    const result = await requestArea(HUGE, { principal: null, db, now: NOW });
 
     // Equal-priority jobs come off the queue in the order they went on, so this ordering is
     // the reason the ground under the user's eye arrives first.

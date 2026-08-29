@@ -95,15 +95,18 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
       ) : null}
 
       {busy && working === 0 ? (
-        // Admission refused, said plainly. Which refusal decides the sentence: a queue drains
-        // and storage does not, so only one of them may end with "try again in a few minutes".
+        // Admission refused, said plainly. Which refusal decides the sentence: a queue drains,
+        // storage does not, and a spent allowance is this reader's own — three states that
+        // must not share one instruction.
         <p
           role="status"
           className="max-w-[240px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted"
         >
           {busyReason === 'storage'
             ? 'There is no room left to store new ground. Trails already mapped still work.'
-            : 'The fetch queue is full right now. Try again in a few minutes.'}
+            : busyReason === 'rate-limit'
+              ? 'You have fetched a lot of new ground recently. This area can be fetched again later on.'
+              : 'The fetch queue is full right now. Try again in a few minutes.'}
         </p>
       ) : null}
 

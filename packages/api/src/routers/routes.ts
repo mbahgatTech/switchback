@@ -62,7 +62,7 @@ import {
   publishIngestSignals,
   VERCEL_OIDC_HEADER,
 } from '@switchback/ingest';
-import type { IngestRefusal } from '@switchback/ingest';
+import type { QueueRefusal } from '@switchback/ingest';
 import { protectedProcedure, publicProcedure, router } from '../trpc';
 import type { Context } from '../context';
 
@@ -180,7 +180,7 @@ function emptyPlan(
   tooLarge: boolean,
   pendingTiles: number,
   busy = false,
-  busyReason: IngestRefusal | null = null,
+  busyReason: QueueRefusal | null = null,
 ): PlanOutcome {
   return {
     plan: {
@@ -302,10 +302,13 @@ async function planRoute(ctx: Context, input: RoutePlanInput): Promise<PlanOutco
   // inferring the leg reason from it reported a refused fetch as "no path near point 3" — a
   // claim about the ground rather than about us.
   let networkPaused = false;
-  let pausedReason: IngestRefusal | null = null;
+  let pausedReason: QueueRefusal | null = null;
 
   if (needsNetwork) {
-    const coverage = await ensureNetworkCoverage(padBBox(bboxOf(raw), PLAN_PAD_M), { db: ctx.db });
+    const coverage = await ensureNetworkCoverage(padBBox(bboxOf(raw), PLAN_PAD_M), {
+      db: ctx.db,
+      principal: ctx.ingestPrincipal,
+    });
     if (coverage.tooLarge) return emptyPlan(true, 0);
     kickNetwork(ctx, coverage.queued);
     pendingTiles = coverage.pending.length;
@@ -666,7 +669,10 @@ export const routesRouter = router({
    * rather than quadkeys — the client only needs "2 of 4 areas ready".
    */
   coverage: publicProcedure.input(z.object({ bbox: bboxSchema })).query(async ({ ctx, input }) => {
-    const coverage = await ensureNetworkCoverage(input.bbox, { db: ctx.db });
+    const coverage = await ensureNetworkCoverage(input.bbox, {
+      db: ctx.db,
+      principal: ctx.ingestPrincipal,
+    });
     kickNetwork(ctx, coverage.queued);
     return {
       ready: coverage.ready.length,

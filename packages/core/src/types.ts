@@ -211,8 +211,9 @@ export const tileCoverageSchema = z.object({
    */
   busy: z.boolean().default(false),
   /** Which refusal, when `busy`. A deep queue drains and "try again in a few minutes" is a real
-   * instruction; a full database needs an operator, so it must not say that. */
-  busyReason: z.enum(['queue-depth', 'storage']).nullable().default(null),
+   * instruction; a full database needs an operator, so it must not say that; and `rate-limit` is
+   * about this caller alone, so it must not describe the product as busy. */
+  busyReason: z.enum(['queue-depth', 'storage', 'rate-limit']).nullable().default(null),
   /** How many tiles the viewport spans, and the most we will cover at once. */
   requiredTiles: z.number().int().nonnegative().default(0),
   maxTiles: z.number().int().positive().default(12),

@@ -11,6 +11,7 @@ import {
   reportSubmitSchema,
 } from '@switchback/core';
 import type { User } from '@switchback/db';
+import { ingestPrincipalFor } from '../src/ingest-principal';
 import { profileUpdateData } from '../src/routers/me';
 import { ORDER_BY, toReview } from '../src/routers/reviews';
 import { appRouter } from '../src/root';
@@ -67,11 +68,14 @@ const NO_DATABASE = new Proxy(
 );
 
 function contextFor(role: UserRole | null): Context {
+  const caller = role === null ? null : user(role);
+  const headers = new Headers();
   return {
     db: NO_DATABASE as Context['db'],
-    user: role === null ? null : user(role),
-    headers: new Headers(),
+    user: caller,
+    headers,
     authMethod: role === null ? null : 'session',
+    ingestPrincipal: ingestPrincipalFor(headers, caller),
   };
 }
 

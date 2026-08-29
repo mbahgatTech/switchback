@@ -3,6 +3,7 @@ import { pruneExpiredRefreshTokens } from '@switchback/api/tokens';
 import { type OverdueSweep, sweepOverdueLifelines } from '@switchback/api/lifeline';
 import { type SweepResult, sweepOrphanedPhotos } from '@switchback/api/orphans';
 import { prisma } from '@switchback/db';
+import { pruneIngestBuckets } from '@switchback/ingest';
 import { env } from '@/env';
 
 /**
@@ -13,7 +14,9 @@ import { env } from '@/env';
  * collection moved to the Function App's `ingestPump`, which runs every two minutes beside the
  * only process that drains — `apps/web/vercel.json` asks for once a day, because Hobby fails the
  * deployment for any expression that would run more often, and a daily tick was never a schedule
- * for a twelve-minute lease.
+ * for a twelve-minute lease. The rate buckets below are not the queue: they hold no work, and a
+ * full bucket and a missing one are the same answer, so a daily tick is exactly the right
+ * schedule for them.
  */
 export const runtime = 'nodejs';
 
@@ -76,6 +79,19 @@ async function sweepLifelines(): Promise<OverdueSweep | null> {
   }
 }
 
+/**
+ * Drop ingest rate buckets that have refilled to full. Deleting one grants nothing — a caller
+ * with no row has the whole allowance either way — so this is disk, not policy.
+ */
+async function sweepRateBuckets(): Promise<number | null> {
+  try {
+    return await pruneIngestBuckets(prisma);
+  } catch (error) {
+    console.warn('ingest rate bucket sweep failed', error);
+    return null;
+  }
+}
+
 export async function GET(req: Request): Promise<Response> {
   if (!env.CRON_SECRET) {
     return Response.json({ error: 'CRON_SECRET is not configured' }, { status: 503 });
@@ -85,10 +101,11 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const started = Date.now();
-  const [swept, orphans, lifelines] = await Promise.all([
+  const [swept, orphans, lifelines, rateBuckets] = await Promise.all([
     sweepCredentials(),
     sweepOrphans(),
     sweepLifelines(),
+    sweepRateBuckets(),
   ]);
 
   // The one thing about the sweep worth a log line: it ran out of room.
@@ -98,5 +115,11 @@ export async function GET(req: Request): Promise<Response> {
     );
   }
 
-  return Response.json({ swept, orphans, lifelines, durationMs: Date.now() - started });
+  return Response.json({
+    swept,
+    orphans,
+    lifelines,
+    rateBuckets,
+    durationMs: Date.now() - started,
+  });
 }

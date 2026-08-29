@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TRPCError } from '@trpc/server';
 import { Difficulty, Prisma, RouteType, prisma } from '@switchback/db';
+import { ingestPrincipalFor } from '../src/ingest-principal';
 import { appRouter } from '../src/root';
 import { createCallerFactory } from '../src/trpc';
 
@@ -26,11 +27,13 @@ const LIVE_SLUG = 'zz-alias-winner';
 const RETIRED_SLUG = 'zz-alias-retired';
 
 function callerFor(db: typeof prisma) {
+  const headers = new Headers();
   return createCallerFactory(appRouter)({
     db,
     user: null,
-    headers: new Headers(),
+    headers,
     authMethod: null,
+    ingestPrincipal: ingestPrincipalFor(headers, null),
   });
 }
 
