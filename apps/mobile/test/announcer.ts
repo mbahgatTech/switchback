@@ -2,8 +2,8 @@ import type { Listener } from '../src/auth/session';
 
 /**
  * A stand-in for `session.ts`'s subscription, so the identity tests run with no Keychain and no
- * network. Shared rather than retyped in each file — the duplicate copy this replaced appeared
- * in the same change that created `test/sources.ts` to end a duplicated walker.
+ * network. One copy, imported by `identity-cache.test.ts` and `offline-seed.test.ts` — the same
+ * reason `test/sources.ts` exists, and it is only true of either file while nobody retypes it.
  */
 export function announcer() {
   const listeners = new Set<Listener>();

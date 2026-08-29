@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { expect, it } from 'vitest';
 import { appSources } from './sources';
+import { drawsOverHeldData, screenReplacingBranches } from './screen-branches';
+import { ungatedCallSites } from './query-gates';
 
 /**
  * The conventions the phone has to keep too — the mobile twin of
@@ -147,36 +149,6 @@ it('announces an identity change even when the Keychain refuses', () => {
   ).toHaveLength(2);
 });
 
-/**
- * Every branch that draws something *instead of* the screen's content: the early-return guards a
- * screen opens with, and the arm a render ternary falls to once its pending arm is done. Read off
- * the source rather than listed, so a screen written next month is covered the day it is written.
- */
-function screenReplacingBranches(): { at: string; test: string; shape: 'guard' | 'arm' }[] {
-  const branches: { at: string; test: string; shape: 'guard' | 'arm' }[] = [];
-
-  for (const [file, source] of FILES) {
-    const lines = source.split('\n');
-    lines.forEach((line, index) => {
-      const guard = /^\s*if \((.+)\) \{$/u.exec(line);
-      if (guard && lines[index + 1]?.trim() === 'return (') {
-        branches.push({ at: `${file}:${index + 1}`, test: guard[1] ?? '', shape: 'guard' });
-        return;
-      }
-
-      // A ternary that opens on pending: the arm chained onto it is the failure copy. One that
-      // closes `) : null}` instead — `saved.tsx` — adds a message beside the content rather than
-      // in place of it, and is right to read the error flag.
-      if (!/\.isPending \? \($/u.test(line)) return;
-      const closing = lines.findIndex((next, at) => at > index && /^\s*\) : /u.test(next));
-      if (closing === -1) return;
-      const arm = /^\s*\) : (.+) \? \($/u.exec(lines[closing] ?? '');
-      if (arm) branches.push({ at: `${file}:${closing + 1}`, test: arm[1] ?? '', shape: 'arm' });
-    });
-  }
-  return branches;
-}
-
 it('never draws a failure over content the phone is still holding', () => {
   /*
    * `isError` is true while `data` is still there. A refetch that fails does not take the answer
@@ -184,16 +156,18 @@ it('never draws a failure over content the phone is still holding', () => {
    * the screen on the error flag draws "Trail not found" over a trail held in full. That is the
    * defect this Work Order exists to fix, and it was in ten branches across ten files.
    *
-   * The two spellings that are safe both ask about the data rather than the flag: an absence
-   * test (`!trail`, `!me.data`), or `isLoadingError`, which is by definition an error with
-   * nothing behind it. `offline-seed.test.ts` proves the property on a real observer for one
-   * screen; this is what holds the other nine, and what will hold the screen nobody has written
-   * yet.
+   * The rule is about the *question*, not the spelling: `status === 'error'` is `isError` written
+   * out, and both are caught. The spellings that are safe ask about the data rather than the
+   * flag — an absence test (`!trail`, `!me.data`), or `isLoadingError`, which is by definition an
+   * error with nothing behind it.
+   *
+   * What this reads, and what it does not, is stated in `screen-branches.ts` and pinned by
+   * `screen-branches.test.ts`. It is the whole defence for nine of the ten sites: with the
+   * mutation applied at `trails/[slug].tsx:296`, `offline-seed.test.ts` still passes, because it
+   * transcribes that screen's predicate rather than importing it.
    */
-  const branches = screenReplacingBranches();
-  const onTheFlag = branches
-    .filter(({ test }) => /\.isError\b/u.test(test))
-    .map(({ at, test }) => `${at}  ${test}`);
+  const branches = screenReplacingBranches(FILES);
+  const onTheFlag = branches.filter(drawsOverHeldData).map(({ at, test }) => `${at}  ${test}`);
 
   expect(
     branches.length,
@@ -261,14 +235,12 @@ it('asks for the reader’s own record only while there is a reader', () => {
    */
   const queries = accountScopedQueries();
   /*
-   * A plain string test, not a regex: the gated spelling always opens `useQuery({` to spread the
-   * options, so `useQuery(trpc.` with no brace is exactly the ungated one.
+   * The `enabled` each call site was given, not the shape it was written in. Testing for the
+   * ungated string `useQuery(trpc.X.queryOptions(` caught a deleted gate but waved through a
+   * neutered one — `enabled: true` is the ungated call in the gated spelling, and the suite
+   * stayed green through it.
    */
-  const ungated = FILES.flatMap(([file, source]) =>
-    queries
-      .filter((query) => source.includes(`useQuery(trpc.${query}.queryOptions(`))
-      .map((query) => `${file}: ${query}`),
-  );
+  const ungated = ungatedCallSites(FILES, queries);
 
   expect(
     queries.length,

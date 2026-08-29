@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { forgetAnswersOnIdentityChange } from '../src/api/identity';
+import { announcer } from './announcer';
 import { seedFromDisk, type TrailKeys } from '../src/offline/seed';
 import type { OfflineTrail } from '../src/offline/store';
 
@@ -45,19 +46,6 @@ function storedCopy(): OfflineTrail {
   } as unknown as OfflineTrail;
 }
 
-function announcer() {
-  const listeners = new Set<(signedIn: boolean) => void>();
-  return {
-    subscribe: (listener: (signedIn: boolean) => void) => {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
-    announce: (signedIn: boolean) => {
-      for (const listener of listeners) listener(signedIn);
-    },
-  };
-}
-
 /**
  * `apps/mobile/src/api/trpc.tsx`, with the backoff compressed but its *shape* kept: the retries
  * must still outlast the re-seed, because that ordering is the whole defect. In production the
@@ -72,8 +60,17 @@ const APP_DEFAULTS = {
 /**
  * `app/trails/[slug].tsx` transcribed: `trail` is `query.data`, and the screen asks `!trail` —
  * falsiness, not `=== undefined`, which is where this helper used to disagree with it about a
- * stored `null`. A transcription is only as good as its last read of the screen, so
- * `conventions.test.ts` reads the real predicate — and the other nine — off disk.
+ * stored `null`.
+ *
+ * **A transcription, not the screen.** Put the defect back at `[slug].tsx:296` and this file
+ * still passes; `conventions.test.ts` is what fails. So the source gate is not a second opinion
+ * on this screen — it is the only opinion on all ten, and that is where the assurance sits.
+ *
+ * Importing the screen instead is not a small step: vitest cannot resolve `react-native` at all
+ * (no `index.js` — Metro resolves it), `expo-router` is Flow-typed and does not parse under
+ * esbuild, and neither a renderer nor a DOM environment is installed. It needs
+ * `babel-preset-expo`, `@testing-library/react-native`, and mocks for the native modules the
+ * screen pulls in — a test-harness change, not a test.
  */
 function screenOf(observer: QueryObserver): 'the trail' | 'spinner' | 'Trail not found' {
   const result = observer.getCurrentResult();
@@ -137,12 +134,15 @@ describe('the phone’s copy, seeded into the cache', () => {
     bus.subscribe(() => setTimeout(() => seedFromDisk(client, KEYS, copy), 5));
     bus.announce(true);
 
-    // Long enough for the forced refetch to exhaust `retry: 2`, which is when the old code
-    // flipped the screen to "Trail not found" — seconds after it had drawn the trail.
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    // Waited for, not slept through. The screen can only be asked once the forced refetch has
+    // exhausted `retry: 2` — which is when the old code flipped it to "Trail not found" — and a
+    // fixed delay that clears the backoff on this machine is a race on a loaded one.
+    await vi.waitFor(() => expect(screen.getCurrentResult().isError).toBe(true), {
+      timeout: 5_000,
+      interval: 10,
+    });
 
     expect(attempts, 'the reset really did force a refetch').toBeGreaterThan(1);
-    expect(screen.getCurrentResult().isError, 'and it really did fail').toBe(true);
     expect(screenOf(screen)).toBe('the trail');
 
     unsubscribe();
