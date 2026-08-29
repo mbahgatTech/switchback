@@ -21,7 +21,10 @@ import { appSources, sourcesUnder } from './sources';
  * path, `_layout` draws rather than routes, and `index` is its directory.
  */
 function routeOf(file: string): string | null {
-  const withoutExtension = file.replace(/\\/gu, '/').replace(/^app\//u, '').replace(/\.tsx?$/u, '');
+  const withoutExtension = file
+    .replace(/\\/gu, '/')
+    .replace(/^app\//u, '')
+    .replace(/\.tsx?$/u, '');
   const segments = withoutExtension
     .split('/')
     .filter((segment) => !/^\(.+\)$/u.test(segment))
