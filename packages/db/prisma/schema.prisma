@@ -832,7 +832,13 @@ model IngestRateBucket {
   /// Tiles still spendable as of `refilledAt`. Fractional, because refill is continuous.
   tokens     Float
   /// When `tokens` was last settled. The only input to refill, and what retention reads.
-  refilledAt DateTime
+  ///
+  /// `Timestamptz` where the rest of this schema leaves the default, because this is the only
+  /// column both compared against a `timestamptz` in raw SQL (`rate-limit.ts`) and filtered
+  /// through Prisma (`pruneIngestBuckets`). Without a zone Postgres converts on the way in and
+  /// out using each session's own, so two instances that disagree about it read a different
+  /// instant out of the same row — measured at seven hours of refill for one hour elapsed.
+  refilledAt DateTime @db.Timestamptz
 
   @@index([refilledAt])
   @@map("ingest_rate_buckets")
