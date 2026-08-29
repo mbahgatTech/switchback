@@ -89,8 +89,9 @@ function getDeadLetterReceiver(): ServiceBusReceiver {
  * call — so the link has issued no credit yet and a cold one can answer empty with a queue that is
  * not. A warm host recovers on the next tick; a host recycling between ticks would never drain the
  * queue at all, which is the failure this whole function exists to prevent. Five seconds a tick is
- * an hour of the pump's wall clock a day spent confirming an empty queue, and the pump makes no
- * Overpass request, so that hour costs nothing anybody is waiting on.
+ * an hour of the pump's wall clock a day spent confirming an empty queue — affordable only because
+ * `ingestPump` runs this after `refill`, so the hour is spent behind the publish rather than in
+ * front of a viewport tile already queued in Postgres.
  */
 const DEAD_LETTER_WAIT_MS = 5_000;
 

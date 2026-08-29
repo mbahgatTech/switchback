@@ -38,9 +38,10 @@ app.timer('ingestPump', {
     if (braked()) {
       context.warn('ingest pump: disabled by INGEST_PUMP_ENABLED — reclaimed leases only');
       await refill(context, RECLAIM_PRIORITY);
-      return;
+    } else {
+      await refill(context);
     }
-    await refill(context);
+    await drainDeadLetters(context);
   },
 });
 
@@ -67,16 +68,19 @@ async function refill(log: InvocationContext, minPriority?: number): Promise<voi
 }
 
 /**
- * Reclaim expired leases, clear orphaned split markers, decide what happens to buried jobs, drain
- * the dead-letter queue, collect finished jobs.
+ * Reclaim expired leases, clear orphaned split markers, decide what happens to buried jobs,
+ * collect finished jobs.
  *
  * Ahead of the brake deliberately: `INGEST_PUMP_ENABLED=false` stops *new* work reaching the
  * queue, and a stopped pump that also stopped reclaiming would leave every lease a killed
  * invocation held stuck for as long as the brake was on.
  *
- * The broker's queue gets a catch of its own rather than sharing the database's. The two fail for
- * unrelated reasons, and one shared catch would let an unreachable namespace skip
- * `pruneFinishedJobs`, which is the one part of this that keeps a table from growing.
+ * Ahead of `refill` for a narrower reason: `classifyDisposition` completes a Service Bus message
+ * on the strength of the reaper returning the row to `queued` and this tick republishing it, so
+ * the reclaim has to be on the queue before the publish reads it. That coupling is what keeps
+ * this work here and put `drainDeadLetters` after the publish instead — nothing in `refill`
+ * reads the broker's dead-letter sub-queue, so its blocking receive had no reason to be
+ * spending the publish's wall clock.
  */
 async function maintain(log: InvocationContext): Promise<void> {
   try {
@@ -121,7 +125,21 @@ async function maintain(log: InvocationContext): Promise<void> {
     // Maintenance must not be able to stop the pump it is hung off.
     log.error('ingest sweep: failed', error);
   }
+}
 
+/**
+ * Return anything the broker gave up on to `ingest_jobs`, after the publish rather than before it.
+ *
+ * `DEAD_LETTER_WAIT_MS` is a blocking receive that a healthy estate spends in full confirming an
+ * empty queue, and the timer is singleton — so ahead of `refill` it was five seconds of every
+ * tick charged to a viewport tile waiting in Postgres. Nothing here feeds the publish: a message
+ * this recovers is enqueued for a later tick either way.
+ *
+ * Its own catch rather than the sweep's. The two fail for unrelated reasons, and one shared catch
+ * would let an unreachable namespace skip `pruneFinishedJobs`, which is the one part of this that
+ * keeps a table from growing.
+ */
+async function drainDeadLetters(log: InvocationContext): Promise<void> {
   try {
     await reconcileDeadLetters(backgroundPrisma, deadLetterQueue(), log);
   } catch (error) {

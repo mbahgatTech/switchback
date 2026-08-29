@@ -132,6 +132,45 @@ describe('the ingestPump handler', () => {
     expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
   });
 
+  it('publishes the runnable head before it blocks on the broker', async () => {
+    /*
+     * `DEAD_LETTER_WAIT_MS` is a blocking receive a healthy estate spends in full, and the timer
+     * is singleton — ahead of the publish it was five seconds of every tick charged to a viewport
+     * tile already queued in Postgres. Nothing in `runPump` reads the dead-letter sub-queue.
+     */
+    stub.reconcileDeadLetters.mockClear();
+    await bandPassedToPump(undefined);
+
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? Infinity;
+    const drained = stub.reconcileDeadLetters.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(published).toBeLessThan(drained);
+  });
+
+  it('reclaims expired leases before it publishes, so a recovered lease goes out this tick', async () => {
+    // The coupling that keeps the sweep in front: `classifyDisposition` completes a Service Bus
+    // message on the strength of the reaper returning the row to `queued` and this tick
+    // republishing it, so the reclaim has to land before the publish reads the head.
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump(undefined);
+
+    const reclaimed = stub.sweepQueue.mock.invocationCallOrder[0] ?? Infinity;
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(reclaimed).toBeLessThan(published);
+  });
+
+  it('has already published by the time an unreachable broker fails the drain', async () => {
+    // The reorder's payoff: the dead-letter queue can be entirely unreachable and the tick still
+    // does the job it exists for.
+    stub.reconcileDeadLetters.mockClear();
+    stub.reconcileDeadLetters.mockRejectedValueOnce(new Error('namespace is gone'));
+
+    await expect(bandPassedToPump(undefined)).resolves.toBeUndefined();
+    expect(stub.runPump).toHaveBeenCalledTimes(1);
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? Infinity;
+    const attempted = stub.reconcileDeadLetters.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(published).toBeLessThan(attempted);
+  });
+
   it('drains the dead-letter queue even when the database sweep throws', async () => {
     // Separate catches: the broker and Postgres fail for unrelated reasons, and one shared catch
     // would let an unreachable database leave the queue filling.
