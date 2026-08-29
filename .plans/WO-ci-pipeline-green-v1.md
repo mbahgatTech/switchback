@@ -106,7 +106,8 @@ The chain, with its evidence:
 5. The first scheduled run after that merge
    ([31359383694](https://github.com/mbahgatTech/switchback/actions/runs/31359383694),
    2026-08-10) failed on exactly the three cases, and every scheduled run since has failed the
-   same way. The failure is deterministic, not flaky: same three cases, same message, 17 runs.
+   same way — eighteen of them, plus one cancelled. The failure is deterministic, not flaky:
+   same three cases, same message, every time.
 
 **The `slug` unique violation in the ingest step is a red herring.** It is a lost race between
 concurrent commits for the same name, `commitWithSlugRetry` retries it, and the last _green_

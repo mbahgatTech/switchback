@@ -11,8 +11,8 @@ import * as trails from '../e2e/trails';
  * sees for a day and nobody can reproduce from a pull request. One went unnoticed for a
  * fortnight: `e2e/review.spec.ts` filed its reports against an OSM trail 3 km south of the one
  * tile the workflow ingests, which reached the database only as a side effect of the web app
- * ingesting neighbouring tiles inline. That side effect was removed on purpose, and seventeen
- * consecutive nightly runs failed on the same three cases.
+ * ingesting neighbouring tiles inline. That side effect was removed on purpose, and every
+ * scheduled run from 2026-08-10 on failed the same three cases.
  *
  * So each trail declares where CI gets it, and both claims are checked here — in `gates`, which
  * runs on every push and every pull request. `e2e/trails.ts` holds nothing but those
