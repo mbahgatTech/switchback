@@ -1,5 +1,5 @@
 import { createContext, use, useEffect, useMemo, useState } from 'react';
-import { UNRESOLVED_SESSION, nextSession, type Session, type Status } from './session-state';
+import { UNRESOLVED_SESSION, nextSession, type Session } from './session-state';
 import { hasStoredSession, signOut as signOutSession, subscribe } from './session';
 
 /**
@@ -51,5 +51,3 @@ export function useAuth(): AuthValue {
   if (!value) throw new Error('useAuth must be used inside <AuthProvider>');
   return value;
 }
-
-export type { Status };
