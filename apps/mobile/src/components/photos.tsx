@@ -254,7 +254,7 @@ export function Photos({ trailId, trailName, units = 'metric' }: PhotosProps) {
 
       {list.isPending ? (
         <ActivityIndicator color={theme.color.inkMuted} style={styles.pending} />
-      ) : list.isError ? (
+      ) : list.isLoadingError ? (
         <Text style={styles.absent}>
           The photographs could not be loaded. Everything else on this screen is unaffected.
         </Text>

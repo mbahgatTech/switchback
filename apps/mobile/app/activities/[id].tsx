@@ -163,7 +163,7 @@ export default function ActivityScreen() {
     );
   }
 
-  if (activity.isError || !detail) {
+  if (!detail) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.title}>Hike not found</Text>

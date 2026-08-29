@@ -24,7 +24,19 @@ let accessToken: string | null = null;
 let accessExpiresAt = 0;
 let inFlight: Promise<string | null> | null = null;
 
-type Listener = (signedIn: boolean) => void;
+/**
+ * Set the moment a sign-out is decided, and cleared only by a new sign-in.
+ *
+ * Clearing the Keychain can fail, and the reset this device now performs on every announcement
+ * refetches immediately — so without this the first thing after "Sign out" is `rotate()` finding
+ * the token that survived, minting a fresh pair and silently signing the reader back in while
+ * the interface says they are out. The decision is not the delete; the delete is how the
+ * decision is *persisted*.
+ */
+let signedOut = false;
+
+/** Told on every transition, in both directions. Exported so a subscriber need not retype it. */
+export type Listener = (signedIn: boolean) => void;
 const listeners = new Set<Listener>();
 
 function announce(signedIn: boolean): void {
@@ -46,14 +58,28 @@ function forget(): void {
   accessExpiresAt = 0;
 }
 
-/** Adopt a freshly minted pair — called by the sign-in flow after a successful exchange. */
+/**
+ * Adopt a freshly minted pair — called by the sign-in flow after a successful exchange.
+ *
+ * `finally`, because by this point `remember` has already installed the new reader's access
+ * token: every request from here is made as them, so the announcement is not optional — it is
+ * what empties the previous reader's cached answers. A Keychain that refuses the write costs
+ * this session its survival across a restart, and must not also cost the identity change.
+ */
 export async function adopt(pair: TokenPair): Promise<void> {
   remember(pair);
-  await writeRefreshToken(pair.refreshToken);
-  announce(true);
+  signedOut = false;
+  try {
+    await writeRefreshToken(pair.refreshToken);
+  } finally {
+    announce(true);
+  }
 }
 
 async function rotate(): Promise<string | null> {
+  // A token that outlived a failed sign-out is still on disk. It is not a licence to come back.
+  if (signedOut) return null;
+
   const refreshToken = await readRefreshToken();
   if (!refreshToken) return null;
 
@@ -93,11 +119,32 @@ export async function getAccessToken(): Promise<string | null> {
   return inFlight;
 }
 
-/** Forget the credentials on this device without telling the server. */
+/**
+ * Give up the stored credential, and make sure it cannot be honoured if the delete fails.
+ *
+ * An empty string is the fallback rather than a second delete: it neutralises the credential
+ * even across a relaunch, where the in-memory `signedOut` guard no longer exists. That rests on
+ * every reader treating a falsy value as "not signed in" — `rotate` does, and `hasStoredSession`
+ * does since it stopped asking `!== null`; `session.test.ts` holds both.
+ */
+async function discardStoredToken(): Promise<void> {
+  try {
+    await clearRefreshToken();
+  } catch (error) {
+    await writeRefreshToken('').catch(() => undefined);
+    throw error;
+  }
+}
+
+/** Forget the credentials on this device without telling the server. `finally` as in `adopt`. */
 async function signOutLocally(): Promise<void> {
   forget();
-  await clearRefreshToken();
-  announce(false);
+  signedOut = true;
+  try {
+    await discardStoredToken();
+  } finally {
+    announce(false);
+  }
 }
 
 /**
@@ -116,7 +163,12 @@ export async function signOut(): Promise<void> {
   await signOutLocally();
 }
 
-/** Whether a credential exists at all — the launch check, before any request is made. */
+/**
+ * Whether a credential exists at all — the launch check, before any request is made.
+ *
+ * Falsiness, not `!== null`: a failed delete leaves `''` behind, and this is the reader that
+ * turns a stored value into `signedIn` — and so into every gated query on the screen firing.
+ */
 export async function hasStoredSession(): Promise<boolean> {
-  return (await readRefreshToken()) !== null;
+  return Boolean(await readRefreshToken());
 }

@@ -287,7 +287,13 @@ export default function TrailScreen() {
     );
   }
 
-  if (query.isError || !trail) {
+  /*
+   * `!trail`, not `query.isError`. A refetch that fails does not take the data with it —
+   * query-core keeps `data` and moves `status` to `error` — and this screen is often standing
+   * on a copy seeded from the phone, where a failed refetch is the *expected* case rather than
+   * a fault. Branching on the error flag put "Trail not found" over a trail held in full.
+   */
+  if (!trail) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.name}>Trail not found</Text>

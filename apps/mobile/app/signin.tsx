@@ -97,11 +97,17 @@ export default function SignInScreen() {
    * One exit for both ways of arriving here signed in — a sign-in that just completed, and a
    * stale link opened by somebody who already has a session. A sign-in screen with a live
    * session is a dead end that looks like a bug.
+   *
+   * `/you` and not `/profile`: that is the *website's* account route, and this app has no such
+   * screen. The replace branch is the cold-start path `resumeSignIn` serves — iOS reclaimed the
+   * app while the browser sheet was open, so the deep link launches straight into this screen
+   * with nothing beneath it — which is precisely where a target with no route behind it lands
+   * the reader on Unmatched Route, signed in, with no way off it but restarting.
    */
   useEffect(() => {
     if (status !== 'signedIn') return;
     if (router.canGoBack()) router.back();
-    else router.replace('/profile');
+    else router.replace('/you');
   }, [status]);
 
   const begin = useCallback(() => {

@@ -71,6 +71,12 @@ Three rules in `src/auth/session.ts` are correctness, not polish:
   product.
 - Only an HTTP 401 clears it, because only the server can say a token is dead.
 
+A fourth rule lives one layer up, in `src/api/identity.ts`: **every announced change of identity
+empties the query cache.** React Query keys an entry by procedure and input and never by who
+asked, so a sign-out followed by a sign-in — the ordinary way to correct a wrong account — would
+otherwise serve the new reader the previous one's profile, lists and stats for a whole
+`staleTime`.
+
 Sign-in does not talk to the provider directly. The app opens the _website's_ sign-in in a
 system browser, the server completes OIDC against its own registered `https://` redirect URI,
 and the browser deep-links back with a one-time code that is worthless without the verifier the
