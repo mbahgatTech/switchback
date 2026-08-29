@@ -9,7 +9,17 @@
  * one where the guard has never heard of the host either. A hostname is either on this list or
  * it needs the flag; there is no third answer for the list to be out of date about.
  */
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
+const LOCAL_HOSTS = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '[::1]',
+  '0.0.0.0',
+  // Docker names the machine hosting the container this way, and the eight IS_LOCAL regexes
+  // the test suite gates itself on already admit it. Leaving it out sent whoever develops in a
+  // container to the opt-out flag for a database that is genuinely theirs.
+  'host.docker.internal',
+]);
 
 /**
  * Is this connection string one that provably cannot be production? Unparseable, empty and
@@ -29,7 +39,10 @@ export function isLocalDatabase(url: string): boolean {
   const socket = parsed.searchParams.get('host');
   const host = parsed.hostname || socket || '';
   if (host.startsWith('/')) return true;
-  return LOCAL_HOSTS.has(host) || host.endsWith('.localhost');
+  // `postgresql:` is not a special scheme, so the WHATWG parser hands back whatever case it
+  // was given. DNS resolves these the same either way; only this comparison did not.
+  const name = host.toLowerCase();
+  return LOCAL_HOSTS.has(name) || name.endsWith('.localhost');
 }
 
 /**

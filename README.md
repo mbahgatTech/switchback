@@ -72,6 +72,17 @@ npm test             # vitest
 npm run format:check # prettier --check .
 ```
 
+`npm test` refuses a database that is not on this machine. `.env` is read from the repository
+root rather than the shell, so a checkout configured against a hosted server ran the whole suite
+against it — quietly, because every database test gates itself on its own hostname check and
+simply skips, leaving a green run that covered nothing. Start the local database with
+`npm run db:up`. To use a remote one deliberately set `SWITCHBACK_ALLOW_REMOTE_TEST_DB=1`, and the
+run says so on stderr rather than passing silently. Two limits are worth knowing: the check reads
+a hostname, so a tunnel presenting a remote database on `localhost` still looks local to it; and
+it is an allow-list, so a local host it has not heard of is refused rather than admitted —
+`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`, `*.localhost`, `host.docker.internal` and unix
+sockets are what it knows.
+
 `.github/workflows/ci.yml` runs all four on every push and every pull request, and `master` only
 deploys behind them. **The browser suite is not part of that tick.** `npm run test:e2e` — Playwright
 against a real browser, including axe WCAG 2.1 A/AA audits — runs nightly and on demand only, so a
