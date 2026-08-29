@@ -16,11 +16,15 @@
 # So the browser suite runs nightly and on demand: one z9 tile, once a day, which is well
 # inside any fair-use reading. Contributors run it locally, where the tile is already there.
 #
-# That one tile is also why `packages/db/scripts/seed-e2e.ts` exists. Two specs open trails
-# outside it and neither is about the pipeline — one is about what a browser draws when an
-# image file 404s, the other about SVG labels overprinting — so they take offline fixtures
-# rather than a second and third Overpass query. Everything that *is* about the pipeline
-# still reads the ingested tile, where a fixtured version would indeed have passed.
+# That one tile is also why `packages/db/scripts/seed-e2e.ts` exists. Three specs open trails
+# outside it and none is about the pipeline — one is about what a browser draws when an image
+# file 404s, one about SVG labels overprinting, one about filing a report — so they take offline
+# fixtures rather than a second, third and fourth Overpass query. Everything that *is* about the
+# pipeline still reads the ingested tile, where a fixtured version would indeed have passed.
+#
+# Which trail belongs to which of those two is a declaration, in `e2e/trails.ts`, and
+# `test/e2e-trail-sources.test.ts` holds it to this file — in `gates`, so a trail this workflow
+# cannot produce fails a pull request rather than the next nightly run.
 #
 # ---------------------------------------------------------------------------------------
 #
@@ -440,11 +444,12 @@ jobs:
       # Creates the probe account the signed-in specs use, and queues the starter tiles.
       - run: npm run db:seed
 
-      # Two trails the suite opens by slug that the one tile below does not contain — a gallery
-      # whose photographs 404 on purpose, and a long route whose high point comes early enough
-      # that the section's weather callouts fight for room. Both are offline fixtures under
-      # reserved `fixture-` slugs; the script explains why they are invented rather than ingested.
-      # Without this step three specs fail on every run regardless of the commit.
+      # Three trails the suite opens by slug that the one tile below does not contain — a gallery
+      # whose photographs 404 on purpose, a long route whose high point comes early enough that
+      # the section's weather callouts fight for room, and the trail the reports are filed
+      # against. All are offline fixtures under reserved `fixture-` slugs; the script explains
+      # why they are invented rather than ingested. Without this step six cases fail on every
+      # run regardless of the commit.
       - name: Seed the browser suite's fixtures
         run: npx tsx --env-file-if-exists=.env packages/db/scripts/seed-e2e.ts
 

@@ -1,6 +1,6 @@
 /**
- * Fixtures for the browser suite: the two trails `e2e/` opens by slug that no ingested tile holds.
- * Offline and deterministic, under reserved slugs — read the note below before adding to this file.
+ * Writes the browser suite's offline fixture trails. The shapes, and why they are invented, are
+ * in `e2e-fixtures.ts`; everything here derives a row from one of them.
  */
 import { classifyDifficulty } from '@switchback/core';
 import type { ElevationPoint, LngLat } from '@switchback/core';
@@ -15,23 +15,8 @@ import {
 } from '@switchback/geo';
 import type { Prisma } from '@switchback/db';
 import { ActivityType, PhotoSource, RouteType, prisma, writeTrailGeometry } from '@switchback/db';
+import { SHAPES, type Shape } from './e2e-fixtures';
 import { looksLikeHostedDatabase } from './local-database';
-
-/**
- * WHY THERE IS INVENTED GEOMETRY HERE, when `seed.ts` refuses to invent any.
- *
- * `seed.ts` is right for the development seed: a fake trail there would hide a broken pipeline,
- * because the pipeline is what the explore sheet is looking at. These two are different. CI makes
- * exactly one Overpass query — one z9 tile over Vesper Peak, for fair use, see the note at the
- * top of `.github/workflows/ci.yml` — and two specs open trails that tile does not contain, so
- * they failed on every run. Neither spec is about the pipeline: one is about what a browser draws
- * when an image file 404s, the other about SVG labels overprinting. Fixtures answer both, and
- * answer them identically on a runner and on a laptop, which is what those specs were not doing.
- *
- * The slugs are reserved — no OSM name slugifies to `fixture-…` — so nothing written here can
- * land on, or be landed on by, a trail the pipeline produced. The specs that *are* about the
- * pipeline still read the real ingested Vesper Peak sheet and are untouched.
- */
 
 /** Spacing rule copied from `pipeline.ts`, so a fixture profile is shaped like a real one. */
 const PROFILE_SPACING_M = 25;
@@ -39,79 +24,6 @@ const MAX_PROFILE_POINTS = 6_000;
 
 /** Vertices `geometryJson` may carry, as in `renderGeometry`. */
 const MAX_RENDER_VERTICES = 3_000;
-
-/**
- * A trail described by its ends and two curves: where the line goes, and where the ground does.
- * Everything stored is measured off the result rather than stated here, so the stats, the axis
- * and the section cannot disagree with the line they are drawn from.
- */
-interface Shape {
-  slug: string;
-  name: string;
-  description: string;
-  from: LngLat;
-  to: LngLat;
-  /** Serpentine across the straight run: amplitude in degrees, and cycles end to end. */
-  wobbleDeg: number;
-  wobbleCycles: number;
-  lowEleM: number;
-  peakEleM: number;
-  endEleM: number;
-  /** Where the high point falls, as a fraction of the length. */
-  highAt: number;
-  /** Undulation after the high point: metres trough to crest, and cycles over the remainder. */
-  rollM: number;
-  rollCycles: number;
-  /** Photographs to hang on it. */
-  photographs: number;
-}
-
-/**
- * New Zealand, deliberately: every other spec in the suite looks at Vesper Peak or Snowdon, and a
- * fixture inside one of those viewports would change what a map spec counts.
- */
-const SHAPES: readonly Shape[] = [
-  {
-    slug: 'fixture-photographed-trail',
-    name: 'Photographed trail fixture',
-    description:
-      'A browser-suite fixture. Its twelve photographs are rows with no files behind them, which is the state the gallery spec is about.',
-    from: [175.58, -39.16],
-    to: [175.68, -39.1],
-    wobbleDeg: 0.004,
-    wobbleCycles: 6,
-    lowEleM: 760,
-    peakEleM: 1_860,
-    endEleM: 1_820,
-    highAt: 0.85,
-    rollM: 40,
-    rollCycles: 3,
-    photographs: 12,
-  },
-  {
-    /**
-     * The collar spec's trail. Its high point is 7% along, and that fraction is the whole
-     * condition: `placeCallouts` works in viewBox x-units, so what crowds the two weather
-     * annotations is where the high point falls in the width, not how many kilometres in it is.
-     * Long enough that the arrival clocks are days apart, as they were in the original report.
-     */
-    slug: 'fixture-early-high-point',
-    name: 'Early high point fixture',
-    description:
-      'A browser-suite fixture. A long through-hike whose high point comes 7% in, where the section’s two weather callouts fight for room.',
-    from: [170.6, -43.3],
-    to: [172.0, -42.3],
-    wobbleDeg: 0.008,
-    wobbleCycles: 24,
-    lowEleM: 420,
-    peakEleM: 2_180,
-    endEleM: 640,
-    highAt: 0.07,
-    rollM: 200,
-    rollCycles: 24,
-    photographs: 0,
-  },
-];
 
 function assertNotProduction(): void {
   const url = process.env.DATABASE_URL ?? '';
@@ -354,7 +266,7 @@ async function main(): Promise<void> {
 
   for (const shape of SHAPES) await writeFixture(shape);
 
-  console.log('\nthe browser suite can now open both trails. Remove them again with --reset.');
+  console.log('\nthe browser suite can now open these trails. Remove them again with --reset.');
 }
 
 main()
