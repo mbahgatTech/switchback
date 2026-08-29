@@ -44,6 +44,9 @@ enough", so nothing can stop one caller from spending the whole allowance.
 - A third refusal reason (`rate-limit`) carried to the client alongside `queue-depth` and
   `storage`, with its own sentence on the web.
 - Pruning spent buckets from the daily maintenance cron.
+- The stored type of `IngestRateBucket.refilledAt`. Added after review round 1: the column is the
+  only one in this schema both compared against a `timestamptz` in raw SQL and filtered through
+  Prisma, and without a zone the two disagree by the session's UTC offset.
 
 **Out**
 
@@ -61,18 +64,22 @@ enough", so nothing can stop one caller from spending the whole allowance.
 
 ## 4. Definition of Done
 
-| id  | predicate                                                                                                                                                    | verification                                                                                                                                     |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| D1  | A principal that has spent its allowance is refused, and the refusal is `rate-limit`                                                                         | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "refuses the enqueue"` exits 0                                                     |
-| D2  | One abusive principal can no longer drive the request queue to the product-wide ceiling, and a second principal is still served after the first is throttled | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "shared failure domain"` exits 0, and the same test fails with the limiter removed |
-| D3  | A request that adds no new ground touches neither the bucket nor the ceiling                                                                                 | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "already-ingested"` exits 0                                                        |
-| D4  | A first-time anonymous visitor's cold viewport is admitted in full                                                                                           | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "first cold viewport"` exits 0                                                     |
-| D5  | A refused request spends nothing, so repeated refusals cannot hold a bucket empty                                                                            | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "cannot latch"` exits 0                                                            |
-| D6  | A spent bucket recovers on the clock alone, with no job, sweep or operator involved                                                                          | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "refills"` exits 0                                                                 |
-| D7  | The bucket key is never a raw network address, and a client-set header cannot become one                                                                     | `npx vitest run packages/api/test/ingest-principal.test.ts` exits 0                                                                              |
-| D8  | The burst allowance always covers one deliberate area fetch, whatever the queue ceiling is re-tuned to                                                       | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "area fetch"` exits 0                                                              |
-| D9  | The whole tree typechecks and lints                                                                                                                          | `npm run typecheck` exits 0; `npm run lint` exits 0                                                                                              |
-| D10 | The unit suite is no worse than it was before the change                                                                                                     | `npx vitest run` — the failing set matches the recorded pre-change baseline                                                                      |
+| id  | predicate                                                                                                                                                    | verification                                                                                                                                                                  |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | A principal that has spent its allowance is refused, and the refusal is `rate-limit`                                                                         | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "refuses the enqueue"` exits 0                                                                                  |
+| D2  | One abusive principal can no longer drive the request queue to the product-wide ceiling, and a second principal is still served after the first is throttled | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "shared failure domain"` exits 0, and the same test fails with the limiter removed                              |
+| D3  | A request that adds no new ground touches neither the bucket nor the ceiling                                                                                 | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "already-ingested"` exits 0                                                                                     |
+| D4  | A first-time anonymous visitor's cold viewport is admitted in full                                                                                           | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "first cold viewport"` exits 0                                                                                  |
+| D5  | A refused request spends nothing, so repeated refusals cannot hold a bucket empty                                                                            | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "cannot latch"` exits 0                                                                                         |
+| D6  | A spent bucket recovers on the clock alone, with no job, sweep or operator involved                                                                          | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "refills"` exits 0                                                                                              |
+| D7  | The bucket key is never a raw network address, and a client-set header cannot become one                                                                     | `npx vitest run packages/api/test/ingest-principal.test.ts` exits 0                                                                                                           |
+| D8  | The burst allowance always covers one deliberate area fetch, whatever the queue ceiling is re-tuned to                                                       | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "area fetch"` exits 0                                                                                           |
+| D9  | The whole tree typechecks and lints                                                                                                                          | `npm run typecheck` exits 0; `npm run lint` exits 0                                                                                                                           |
+| D11 | Two instances that share no memory cannot both spend one allowance, and no grant is lost between them                                                        | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "raced by instances"` exits 0, and both tests fail when the spend is split into a read and a write              |
+| D12 | `/plan` debits the caller's bucket, and says `rate-limit` when it is empty                                                                                   | `npx vitest run packages/api/test/ingest-wiring.db.test.ts -t "/plan"` exits 0, and both tests fail when the router passes `principal: null`                                  |
+| D13 | Every ingest-facing procedure charges a principal, so the limiter cannot be switched off unnoticed                                                           | `npx vitest run packages/api/test/ingest-wiring.db.test.ts` exits 0, and 5 of its 6 tests fail when the routers pass `principal: null`                                        |
+| D14 | Refill and retention measure elapsed time, whatever session zone an instance is in                                                                           | `npx vitest run packages/ingest/test/rate-limit.db.test.ts -t "different session time zone"` exits 0, and both tests fail while `refilledAt` is `timestamp without time zone` |
+| D10 | The unit suite is no worse than it was before the change                                                                                                     | `npx vitest run` — the failing set matches the recorded pre-change baseline                                                                                                   |
 
 ---
 
@@ -200,6 +207,10 @@ Three properties follow from that shape:
 | T-006 | Put the principal on `Context` and pass it from both routers                                       | `npm run typecheck` exits 0                                                                              | `done` |
 | T-007 | Carry `rate-limit` through `@switchback/core` and give it its own sentence on the web              | `npm run typecheck` exits 0; `npm run lint` exits 0                                                      | `done` |
 | T-008 | Prune spent buckets from the daily maintenance cron                                                | `npm run typecheck` exits 0                                                                              | `done` |
+| T-010 | Race the spend from instances that share nothing, in `rate-limit.db.test.ts`                       | both tests fail against a read-then-write spend and pass against the shipped one                         | `done` |
+| T-011 | `packages/api/test/ingest-wiring.db.test.ts`: `/plan`, `fetchArea` and the context charge a caller | 5 of 6 fail with `principal: null` in the routers                                                        | `done` |
+| T-012 | `refilledAt @db.Timestamptz`, pushed, with the two zone tests that hold it                         | both tests fail against the untyped column; `prisma db push` applies it with no `--accept-data-loss`     | `done` |
+| T-013 | Correct the record: the schema-convention premise, and the base this was measured against          | §9 seq 7 and seq 8                                                                                       | `done` |
 | T-009 | Update `docs/architecture.md` where it says the limiter does not exist                             | `npx vitest run test/mermaid-blocks.test.ts` exits 0                                                     | `done` |
 
 ---
@@ -316,4 +327,66 @@ Three properties follow from that shape:
     branches on a drain driver. origin/master is unmoved from that commit; no rebase was needed.
   decision: No change to the work; the record now says which commit it was built on.
   budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+```
+
+```yaml
+- seq: 6
+  at: 2026-08-29T10:35:00-04:00
+  state: IN_REVIEW -> IMPLEMENT
+  event: review_findings_reproduced
+  detail: >-
+    The board held the gate on three behaviours that had no test able to fail, and each was
+    reproduced here before anything was written. Rate limiting switched off at all five router
+    call sites (`principal: null`): 22/22 still green. The spend split into a read and a write:
+    11/11 still green, including the concurrency test, because `Promise.all` over one
+    PrismaClient runs down a single connection and serialises — the test could never race.
+  decision: >-
+    Test the atomicity through separate PrismaClients, which is what a second Vercel instance
+    actually is, and test the wiring through `appRouter` rather than through `queueTiles`. Eight
+    contending instances turn the read-then-write into 8 winners where 1 is allowed, five trials
+    out of five.
+  budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 2/8 }
+```
+
+```yaml
+- seq: 7
+  at: 2026-08-29T10:50:00-04:00
+  state: IMPLEMENT
+  event: correction
+  detail: >-
+    The timezone defect is real and is now fixed, but the reason given for it in the review brief
+    was not. The brief stated that "every other timestamp in this schema is `@db.Timestamptz`".
+    It is the reverse: `schema.prisma` has 60 `DateTime` fields and zero `@db.Timestamptz`, and
+    the only `@db.` attributes in the file are three `@db.Text` and one `@db.Char`. `refilledAt`
+    is now the single zoned column in the schema, not one of sixty. Recorded so no later reader
+    takes the convention claim as fact.
+  decision: >-
+    Fixed anyway, on its own merits rather than on the convention. Measured, not assumed: a row
+    written by the raw-SQL spend under one session zone and read under another reports 25200
+    seconds elapsed for 3600 seconds of real time — seven hours of allowance nobody waited for —
+    and `pruneIngestBuckets`, which reads the same column through Prisma, deletes a bucket that
+    is still spent. Those two paths must agree about what instant the row holds, and only a
+    zoned column makes them agree without a convention every future reader has to remember.
+  budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 2/8 }
+```
+
+```yaml
+- seq: 8
+  at: 2026-08-29T11:05:00-04:00
+  state: IMPLEMENT -> IN_REVIEW
+  event: correction
+  detail: >-
+    Corrects seq 5, which said "origin/master is unmoved from that commit". It has since moved
+    twice: `git ls-remote origin master` is d11b1cd, which carries #80 and #84 on top of the
+    1789198 this branch was cut from. The only file both sides touch is
+    `packages/ingest/src/index.ts`, where each appends one `export *` line. The branch has not
+    been rebased — this round was asked to push, not to merge.
+  decision: >-
+    Left unrebased and recorded. D10 is reported UNVERIFIED rather than met: the two files that
+    fail on this machine (`test/worker-deploy-path.test.ts`, `packages/db/test/entra-client.test.ts`)
+    are byte-identical to master, read nothing this branch changes, and fail a different subset
+    every run — 3, 2 and 5 failures across three consecutive runs of the unchanged file, which
+    `spawnSync`s bash against a 5-second timeout. A non-deterministic baseline cannot support a
+    "no worse than before" claim on this machine; CI's `gates` job is the authority.
+  budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 2/8 }
 ```
