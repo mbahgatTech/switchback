@@ -17,6 +17,7 @@ export * from './photo-subject';
 export * from './feature-index';
 export * from './geocode';
 export * from './jobs';
+export * from './dead-jobs';
 export * from './backpressure';
 export * from './pool';
 export * from './subdivide';

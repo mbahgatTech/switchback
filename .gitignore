@@ -109,3 +109,8 @@ yarn-error.log*
 # claude code
 # Agent worktrees land here, inside the repo root. Each is a whole extra copy of the monorepo.
 .claude
+
+# Harness Work Orders. These are a build record for the agents that produce a change — status
+# field, iteration log, cap budget — not documentation of the system, and the repository's docs
+# are reference for a reader who was not there. The decisions survive in the code and the PR.
+.plans

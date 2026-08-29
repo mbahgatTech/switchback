@@ -17,9 +17,17 @@ type Handler = (timer: unknown, context: unknown) => Promise<void>;
 const stub = vi.hoisted(() => ({
   registered: undefined as Handler | undefined,
   runPump: vi.fn(async () => ({ published: 0 })),
-  sweepQueue: vi.fn(async () => ({ requeued: 0, retired: 0, unsplit: [], unwedged: [] })),
+  sweepQueue: vi.fn(async () => ({
+    requeued: 0,
+    retired: 0,
+    unsplit: [],
+    unwedged: [],
+    revived: [],
+    abandoned: [],
+  })),
   pruneFinishedJobs: vi.fn(async () => 0),
   reportQueueHealth: vi.fn(async () => {}),
+  reconcileDeadLetters: vi.fn(async () => ({ runnable: [], terminal: [], unreadable: [] })),
 }));
 
 vi.mock('@azure/functions', () => ({
@@ -43,12 +51,17 @@ vi.mock('@switchback/ingest', async (importOriginal) => ({
 
 vi.mock('../src/health', () => ({ reportQueueHealth: stub.reportQueueHealth }));
 
+vi.mock('../src/dead-letter', () => ({ reconcileDeadLetters: stub.reconcileDeadLetters }));
+
 vi.mock('../src/pump', async (importOriginal) => ({
   ...(await importOriginal<typeof PumpModule>()),
   runPump: stub.runPump,
 }));
 
-vi.mock('../src/service-bus', () => ({ serviceBusQueue: () => ({}) }));
+vi.mock('../src/service-bus', () => ({
+  serviceBusQueue: () => ({}),
+  deadLetterQueue: () => ({}),
+}));
 
 // Importing registers the timer, which is how the handler under test is obtained.
 import '../src/functions/pump';
@@ -91,5 +104,42 @@ describe('the ingestPump handler', () => {
     // The sweep runs ahead of the brake: a stopped pump that also stopped reclaiming would leave
     // every lease a killed invocation held stuck for as long as the brake was on.
     expect(stub.sweepQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains the dead-letter queue whichever way the brake is set', async () => {
+    stub.reconcileDeadLetters.mockClear();
+    await bandPassedToPump('false');
+
+    // Same argument, and a stronger one: the brake is pulled when something is wrong, which is
+    // when the queue is likeliest to be holding messages nobody is going to look at.
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs both repairs with no request having reached the estate', async () => {
+    /*
+     * The point of the timer. Nothing in this test publishes a signal, opens a map or calls the
+     * API — the handler is invoked with a timer and a context, which is what the host does on a
+     * schedule — and both repairs still run.
+     */
+    stub.sweepQueue.mockClear();
+    stub.reconcileDeadLetters.mockClear();
+
+    const handler = stub.registered;
+    if (!handler) throw new Error('ingestPump registered no handler');
+    await handler({}, context);
+
+    expect(stub.sweepQueue).toHaveBeenCalledTimes(1);
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains the dead-letter queue even when the database sweep throws', async () => {
+    // Separate catches: the broker and Postgres fail for unrelated reasons, and one shared catch
+    // would let an unreachable database leave the queue filling.
+    stub.reconcileDeadLetters.mockClear();
+    stub.sweepQueue.mockRejectedValueOnce(new Error('postgres is gone'));
+
+    await bandPassedToPump(undefined);
+
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
   });
 });

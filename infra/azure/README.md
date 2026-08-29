@@ -1280,17 +1280,17 @@ reached over this window. `worker-silent` reads a 30-minute absence, so its 35 a
 524-minute gap of 2026-08-08/09 — 34 consecutive buckets from 23:15Z — plus one isolated bucket at
 2026-08-08T17:30Z, not 35 pages.
 
-| Rule                                 | Sev | Fires when                                                                                           | Clears when                           | 48 h |
-| ------------------------------------ | --- | ---------------------------------------------------------------------------------------------------- | ------------------------------------- | ---- |
-| `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                                               | A heartbeat lands                     | 35   |
-| `switchback-db-token-alarm`          | 1   | A Vercel token renewal failed, or a token is nearly expired                                          | The 15-min window comes back empty    | 1    |
-| `switchback-ingest-ground-lost`      | 2   | Trails uncommitted, a job buried, a subtree stuck, a signal stranded, a double commit, a tile wedged | 15 min pass with none of them         | 2    |
-| `switchback-ingest-pump-failing`     | 2   | 3 of the last 4 windows carried a rejected `ingestPump`                                              | Two consecutive clean windows         | 0    |
-| `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                                          | The trailing hour drops to 8 or fewer | 15   |
-| `switchback-ingest-deadletter`       | 2   | A message is sitting in the dead-letter queue                                                        | The queue is drained                  | 0    |
-| `switchback-ingest-drain-degraded`   | 3   | A job failed and was rescheduled, a lease expired, a drain was rejected                              | The 15-min window comes back empty    | 5    |
-| `switchback-ingest-queue-distress`   | 3   | Any distress gauge non-zero                                                                          | Every gauge returns to zero           | 61   |
-| `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                                           | The window falls back to 4 or fewer   | 4    |
+| Rule                                 | Sev | Fires when                                                                                                        | Clears when                           | 48 h |
+| ------------------------------------ | --- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------- | ---- |
+| `switchback-ingest-worker-silent`    | 2   | No `queue-health` heartbeat for 30 min                                                                            | A heartbeat lands                     | 35   |
+| `switchback-db-token-alarm`          | 1   | A Vercel token renewal failed, or a token is nearly expired                                                       | The 15-min window comes back empty    | 1    |
+| `switchback-ingest-ground-lost`      | 2   | Trails uncommitted, a job buried or abandoned, a subtree stuck, a signal stranded, a double commit, a tile wedged | 15 min pass with none of them         | 2    |
+| `switchback-ingest-pump-failing`     | 2   | 3 of the last 4 windows carried a rejected `ingestPump`                                                           | Two consecutive clean windows         | 0    |
+| `switchback-ingest-overpass-limited` | 2   | More than 8 Overpass 429s in a rolling hour                                                                       | The trailing hour drops to 8 or fewer | 15   |
+| `switchback-ingest-deadletter`       | 2   | A message is sitting in the dead-letter queue                                                                     | `ingestPump` drains it, within 2 min  | 0    |
+| `switchback-ingest-drain-degraded`   | 3   | A job failed and was rescheduled, a lease expired, a burial was revived, a drain was rejected                     | The 15-min window comes back empty    | 5    |
+| `switchback-ingest-queue-distress`   | 3   | Any distress gauge non-zero                                                                                       | Every gauge returns to zero           | 61   |
+| `switchback-ingest-overpass-skipped` | 3   | More than 4 refused side queries in 15 min                                                                        | The window falls back to 4 or fewer   | 4    |
 
 The two rules this template adds re-derive from the workspace, and substituting the arming predicate
 re-derives every other row but one:

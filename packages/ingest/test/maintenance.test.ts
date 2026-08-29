@@ -4,7 +4,13 @@ import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { reconcileOrphanedSplits } from '../src/subdivide';
-import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS } from '../src/jobs';
+import {
+  DEFAULT_MAX_ATTEMPTS,
+  HOST_FUNCTION_TIMEOUT_MS,
+  LEASE_EXPIRED_REASON_PREFIX,
+  LEASE_TIMEOUT_MS,
+} from '../src/jobs';
+import { JOB_ABANDONED_MARKER } from '../src/dead-jobs';
 import {
   LEASE_SWEEP_GRACE_MS,
   MIN_ENRICH_SAMPLE,
@@ -31,6 +37,16 @@ interface Recorded {
   enqueued: string[];
   /** Bind values of every `$queryRaw` — the reclaim's, in `[now, reason, cutoff]` order. */
   rawBinds: unknown[][];
+  /** Writes the dead-job triage made, keyed by id — `enqueue`'s updates go by `dedupeKey`. */
+  triaged: Array<{ id: string; data: Record<string, unknown> }>;
+}
+
+/** A buried job as `reconcileDeadJobs` selects it. */
+interface BuriedRow {
+  id: string;
+  dedupeKey: string;
+  maxAttempts: number;
+  lastError: string | null;
 }
 
 /** The subset of a Prisma `where` the sweep and `childTiles` actually build. */
@@ -52,8 +68,9 @@ interface TileWhere {
 function fakeDb(
   tiles: TileRow[],
   expired: ReadonlyArray<{ status: JobStatus }> = [],
+  buried: readonly BuriedRow[] = [],
 ): { db: PrismaClient; recorded: Recorded } {
-  const recorded: Recorded = { updates: [], enqueued: [], rawBinds: [] };
+  const recorded: Recorded = { updates: [], enqueued: [], rawBinds: [], triaged: [] };
 
   const db = {
     $queryRaw: async (_strings: TemplateStringsArray, ...binds: unknown[]) => {
@@ -86,7 +103,27 @@ function fakeDb(
       },
     },
     ingestJob: {
-      updateMany: async () => ({ count: 0 }),
+      /*
+       * The triage reads two windows — retirements whose ladder is spent, then the rungs — so this
+       * has to tell them apart or every fixture is decided twice. `maxAttempts` as a bare equality
+       * is the retirement window; `OR` is the ladder. These fixtures are all on rungs.
+       */
+      findMany: async ({ where }: { where: { maxAttempts?: number; OR?: unknown[] } }) =>
+        where.OR === undefined ? [] : [...buried],
+      // Its revival budget, read before it grants any attempt. Nothing revived is outstanding in
+      // these fixtures, so the whole budget is available and the sweep's wiring is what is on test.
+      count: async () => 0,
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: { id?: string };
+        data: Record<string, unknown>;
+      }) => {
+        if (where.id === undefined) return { count: 0 };
+        recorded.triaged.push({ id: where.id, data });
+        return { count: 1 };
+      },
       upsert: async ({ create }: { create: { dedupeKey: string } }) => {
         recorded.enqueued.push(create.dedupeKey);
         return create;
@@ -154,13 +191,13 @@ describe('a split marker on a parent that really was subdivided', () => {
 });
 
 /**
- * `sweepQueue` is the *only* production entry point for either repair — the cron route calls it
- * unconditionally, `trails.kickIngest` calls it ahead of its own early return, and nothing else
- * calls `reconcileOrphanedSplits` or `reclaimExpiredJobs` off a path that drains nothing. Testing
- * the two halves in isolation leaves the call that makes them real untested: unhook either one and
- * every other case here stays green while production silently re-wedges.
+ * `sweepQueue` is the *only* production entry point for any of these repairs: `ingestPump`'s
+ * two-minute timer calls it, and nothing else calls `reconcileOrphanedSplits`,
+ * `reclaimExpiredJobs` or `reconcileDeadJobs` off a path that drains nothing. Testing the parts in
+ * isolation leaves the call that makes them real untested: unhook any one and every other case
+ * here stays green while production silently re-wedges.
  */
-describe('the sweep both live entry points call', () => {
+describe('the sweep the timer calls', () => {
   const MARKER = 'split into 4 tiles at z10';
   const NOW = new Date('2026-08-07T10:44:00Z');
 
@@ -193,6 +230,54 @@ describe('the sweep both live entry points call', () => {
     expect(cutoff).toEqual(new Date(NOW.getTime() - LEASE_TIMEOUT_MS));
   });
 
+  it('gives a transient burial one more attempt', async () => {
+    const { db, recorded } = fakeDb(
+      [],
+      [],
+      [
+        {
+          id: 'job-1',
+          dedupeKey: 'ingest_tile:120230220',
+          maxAttempts: DEFAULT_MAX_ATTEMPTS,
+          lastError: `${LEASE_EXPIRED_REASON_PREFIX} 12 min with no outcome`,
+        },
+      ],
+    );
+
+    const result = await sweepQueue(db, NOW);
+
+    expect(result.revived).toEqual(['ingest_tile:120230220']);
+    expect(recorded.triaged[0]?.data).toMatchObject({ status: JobStatus.queued, maxAttempts: 6 });
+  });
+
+  it('reports a burial it will not retry rather than retrying it', async () => {
+    const { db, recorded } = fakeDb(
+      [],
+      [],
+      [
+        {
+          id: 'job-2',
+          dedupeKey: 'enrich_trail:t1',
+          maxAttempts: DEFAULT_MAX_ATTEMPTS,
+          // A permanent cause, so the sweep retires it rather than putting it on the ladder.
+          lastError: 'job payload missing "trailId"',
+        },
+      ],
+    );
+
+    const result = await sweepQueue(db, NOW);
+
+    expect(result.revived).toEqual([]);
+    expect(result.abandoned).toEqual([
+      {
+        dedupeKey: 'enrich_trail:t1',
+        cause: 'permanent',
+        reason: 'the job payload is incomplete',
+      },
+    ]);
+    expect(recorded.triaged[0]?.data.lastError).toContain(JOB_ABANDONED_MARKER);
+  });
+
   it('still does each half when the other throws, because neither is worth a failed tick', async () => {
     const { db, recorded } = fakeDb([parent('031313112', TileStatus.pending, MARKER)]);
     const broken = { ...db, $queryRaw: () => Promise.reject(new Error('lease sweep exploded')) };
@@ -203,6 +288,21 @@ describe('the sweep both live entry points call', () => {
     expect(result).toMatchObject({ requeued: 0, retired: 0 });
     expect(result.unsplit).toHaveLength(1);
     expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:031313112`]);
+  });
+
+  it('carries on when the dead-job triage throws', async () => {
+    const { db, recorded } = fakeDb([parent('031313113', TileStatus.pending, MARKER)]);
+    const broken = {
+      ...db,
+      ingestJob: { ...db.ingestJob, findMany: () => Promise.reject(new Error('triage exploded')) },
+    };
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await sweepQueue(broken as unknown as PrismaClient, NOW);
+
+    expect(result).toMatchObject({ revived: [], abandoned: [] });
+    expect(result.unsplit).toHaveLength(1);
+    expect(recorded.enqueued).toEqual([`${JobKind.ingest_tile}:031313113`]);
   });
 });
 

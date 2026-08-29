@@ -5,11 +5,15 @@
  *   npx tsx scripts/requeue-jobs.ts --kind enrich_trail
  *   npx tsx scripts/requeue-jobs.ts --kind enrich_trail --match "primaryPhotoId"
  *
- * Resets `attempts` and `runAfter` so a requeued job runs immediately with a full budget
- * rather than resuming a backoff earned under the old bug, and clears the `completedAt` the
- * drainer stamped when it gave up.
+ * Resets `attempts`, `maxAttempts` and `runAfter` so a requeued job runs immediately with a full
+ * budget rather than resuming a backoff earned under the old bug, and clears the `completedAt` the
+ * drainer stamped when it gave up. `maxAttempts` matters as much as `attempts`:
+ * `reconcileDeadJobs` raises it per revival and past its ceiling when it abandons a job, and these
+ * rows are exactly the ones it has abandoned — so without the reset a requeue hands out nine
+ * attempts and re-buries the job outside every rung of that reconciler.
  */
 import { JobKind, prisma } from '@switchback/db';
+import { DEFAULT_MAX_ATTEMPTS } from '@switchback/ingest';
 
 /**
  * Read from the enum, not listed by hand: the hand-written version went stale in the worst
@@ -64,6 +68,7 @@ async function main(): Promise<void> {
     data: {
       status: 'queued',
       attempts: 0,
+      maxAttempts: DEFAULT_MAX_ATTEMPTS,
       runAfter: new Date(),
       lastError: null,
       lockedAt: null,

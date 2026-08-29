@@ -16,7 +16,7 @@ import {
 import { DRAIN_ADMISSION_KEY } from './drain-slot';
 import { isTileFresh, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
-import { LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
+import { DEFAULT_MAX_ATTEMPTS, LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
 
 /** How many children a quadkey has. Four, always — that is what "quad" means. */
 export const CHILDREN_PER_TILE = 4;
@@ -58,12 +58,16 @@ export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
 /**
  * Runs of a single child tile after which `queueStaleChildren` stops reviving it.
  *
- * Two full retry ladders. `IngestTile.attempts` is the counter because it is the only durable
- * one: `processTile` increments it on every run and nothing resets it, while `enqueue` clears the
- * *job*'s `attempts` on each revival — which is precisely how a revived child restarts its
- * five-attempt ladder from zero and why an uncapped revival never terminates.
+ * Two full retry ladders, derived rather than written out, so raising the ladder raises this with
+ * it. `IngestTile.attempts` is the counter because it is the only durable one: `processTile`
+ * increments it on every run and nothing resets it, while `enqueue` clears the *job*'s `attempts`
+ * on each revival — which is precisely how a revived child restarts its five-attempt ladder from
+ * zero and why an uncapped revival never terminates.
+ *
+ * `reconcileDeadJobs` reads this cap rather than working around it: a child past it is skipped
+ * there too, so the two revival paths do not sum into an unbounded one.
  */
-export const SPLIT_CHILD_ATTEMPT_CAP = 10;
+export const SPLIT_CHILD_ATTEMPT_CAP = 2 * DEFAULT_MAX_ATTEMPTS;
 
 /**
  * The zoom past which a tile is failed rather than split. `INGEST_ZOOM` disables subdivision, and
@@ -252,8 +256,8 @@ export interface ChildQueueOutcome {
   exhausted: string[];
   /**
    * Children past `SPLIT_CHILD_ATTEMPT_CAP`, left off the queue. Disjoint from `queued`: this is
-   * the set no automatic path will run again, and the parent stays incomplete until an operator
-   * intervenes.
+   * the set no automatic path will run again — `reconcileDeadJobs` honours the same cap — and the
+   * parent stays incomplete until an operator intervenes.
    */
   abandoned: string[];
 }
@@ -267,9 +271,10 @@ export interface ChildQueueOutcome {
  * coming back, on every viewport poll. `failJob` writes `queued` with a future `runAfter` while
  * attempts remain and `dead` only when they are gone, which is the distinction this reads.
  *
- * **A `dead` child is revived, deliberately, but only up to `SPLIT_CHILD_ATTEMPT_CAP` runs.** The
- * revival is the only path back: `splitTile` enqueues each child exactly once, `ensureCoverage`
- * covers z9 alone, and `reclaimExpiredJobs` does not touch a dead row. The cap is what keeps that
+ * **A `dead` child is revived, deliberately, but only up to `SPLIT_CHILD_ATTEMPT_CAP` runs.** This
+ * is the path back for a child: `splitTile` enqueues each exactly once, `ensureCoverage` covers z9
+ * alone, `reclaimExpiredJobs` does not touch a dead row, and `reconcileDeadJobs` skips a child
+ * this cap has already stopped rather than granting it a second budget. The cap is what keeps that
  * from running forever — a revived child starts a fresh five-attempt ladder, so without a counter
  * the ladder restarts for as long as anyone leaves a map open over the parent. `attempts` on the
  * *tile* survives the revival where the job's does not.

@@ -2,14 +2,18 @@ import { app } from '@azure/functions';
 import type { InvocationContext, Timer } from '@azure/functions';
 import { backgroundPrisma } from '@switchback/db';
 import {
+  JOB_ABANDONED_MARKER,
+  JOB_REVIVED_MARKER,
   RECLAIM_PRIORITY,
   TILE_WEDGED_MARKER,
+  describeRevived,
   pruneFinishedJobs,
   sweepQueue,
 } from '@switchback/ingest';
+import { reconcileDeadLetters } from '../dead-letter';
 import { reportQueueHealth } from '../health';
 import { pumpBounds, runPump } from '../pump';
-import { serviceBusQueue } from '../service-bus';
+import { deadLetterQueue, serviceBusQueue } from '../service-bus';
 
 /** `INGEST_PUMP_ENABLED=false` — see `refill` for what the brake does and does not stop. */
 function braked(): boolean {
@@ -63,15 +67,27 @@ async function refill(log: InvocationContext, minPriority?: number): Promise<voi
 }
 
 /**
- * Reclaim expired leases, clear orphaned split markers, collect finished jobs.
+ * Reclaim expired leases, clear orphaned split markers, decide what happens to buried jobs, drain
+ * the dead-letter queue, collect finished jobs.
  *
  * Ahead of the brake deliberately: `INGEST_PUMP_ENABLED=false` stops *new* work reaching the
  * queue, and a stopped pump that also stopped reclaiming would leave every lease a killed
  * invocation held stuck for as long as the brake was on.
+ *
+ * The broker's queue gets a catch of its own rather than sharing the database's. The two fail for
+ * unrelated reasons, and one shared catch would let an unreachable namespace skip
+ * `pruneFinishedJobs`, which is the one part of this that keeps a table from growing.
  */
 async function maintain(log: InvocationContext): Promise<void> {
   try {
-    const sweep = await sweepQueue(backgroundPrisma);
+    /*
+     * The brake reaches the triage and nothing else in this sweep. Reviving is the only part that
+     * puts work back on the queue, which is what `INGEST_PUMP_ENABLED=false` means to stop; a
+     * braked tick still reclaims leases, repairs splits and wedged tiles, and still retires the
+     * burials it has finished with, none of which needs queue capacity. That last one is only true
+     * because the triage reads retirements in a window of their own — see `reconcileDeadJobs`.
+     */
+    const sweep = await sweepQueue(backgroundPrisma, new Date(), { revive: !braked() });
     if (sweep.requeued > 0 || sweep.retired > 0) {
       log.warn(
         `ingest sweep: reclaimed ${sweep.requeued} expired lease(s), retired ${sweep.retired}`,
@@ -89,9 +105,26 @@ async function maintain(log: InvocationContext): Promise<void> {
           `could finish them, now failed: ${sweep.unwedged.join(', ')}`,
       );
     }
+    if (sweep.revived.length > 0) {
+      log.warn(`${JOB_REVIVED_MARKER}: ${describeRevived(sweep.revived)}`);
+    }
+    for (const job of sweep.abandoned) {
+      // One line each, not one line for the batch: this is the end of every automatic path, and
+      // the rule that pages on it needs the reason beside the key rather than a count.
+      log.error(
+        `${JOB_ABANDONED_MARKER} ${job.dedupeKey}: ${job.cause} — ${job.reason}; ` +
+          'nothing automatic runs it again — fetchArea over the tile, or scripts/requeue-jobs.ts',
+      );
+    }
     await pruneFinishedJobs(backgroundPrisma);
   } catch (error) {
     // Maintenance must not be able to stop the pump it is hung off.
     log.error('ingest sweep: failed', error);
+  }
+
+  try {
+    await reconcileDeadLetters(backgroundPrisma, deadLetterQueue(), log);
+  } catch (error) {
+    log.error('ingest dead-letter sweep: failed', error);
   }
 }
