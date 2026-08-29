@@ -137,7 +137,9 @@ export async function ensureCoverage(
      * A job the ladder buried after five attempts is not coming back on a poll, and re-queueing
      * it would be worse than useless: `enqueue` revives `dead` with `attempts` reset to zero, so
      * a tile that fails every time would re-run for as long as one map stayed open, never
-     * reaching `dead` again. `fetchArea` is the way back and a person pressing it is the bound.
+     * reaching `dead` again. What does bring it back is `reconcileDeadJobs`, off the pump's timer
+     * and bounded by `REVIVAL_CEILING` rather than by traffic; `fetchArea` is the way back for a
+     * person who will not wait for it.
      */
     if (givenUp.has(tileJobKey(quadkey))) {
       if (holdsTrails) ready.push(quadkey);

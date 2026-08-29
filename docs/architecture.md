@@ -108,15 +108,75 @@ reads that job status rather than the tile row, because `IngestTile.status` read
 a tile thirty seconds from its next attempt and for one that has given up — and reviving a `dead`
 job resets `attempts` to zero, so a viewport poll that re-queued it would restart the ladder every
 2.5 s and the tile would re-run for as long as one map stayed open. A buried tile is therefore
-neither queued nor reported `pending`; `fetchArea` is the way back, and a person pressing it is the
-bound.
+neither queued nor reported `pending` by anything a request reaches.
+
+**The way back from a burial is a schedule, not a reader.** `reconcileDeadJobs` runs inside
+`sweepQueue` on `ingestPump`'s two-minute tick and decides each buried row on what killed it, read
+off `lastError`. A failure it can name as transient — the reaper's lease expiry, an Overpass 5xx or
+429, a clock that ran out, a database it could not reach — earns one further attempt, after a delay
+that lengthens with each revival. Everything else is abandoned: a malformed query, an incomplete
+payload, and every message no rule explains, on the position `scripts/requeue-jobs.ts` already
+takes, that an error nobody recognises is a reason to stop rather than to retry harder.
+
+The budget is `maxAttempts`, raised by one per revival and capped at `REVIVAL_CEILING`. It has to be
+that column rather than `attempts` for the same reason `SPLIT_CHILD_ATTEMPT_CAP` counts in
+`IngestTile.attempts`: `enqueue` clears `attempts` on every revival and never writes `maxAttempts`,
+so a budget kept in the former restarts. Raising it grants exactly one attempt, because `claimJobs`
+increments `attempts` to meet it and `isFinalAttempt` buries the row again if that attempt fails.
+An abandoned row is marked by setting `maxAttempts` past the ceiling — an integer rather than the
+`lastError` prose beside it, because `lastError` is nullable and a `NOT LIKE` over NULL drops
+exactly the unexplained burial the mark exists for. `fetchArea` and `scripts/requeue-jobs.ts` remain
+the operator's way back, and are now the second way rather than the only one.
+
+The additions are the two `dead` edges and the `abandoned` mark. `abandoned` is not a sixth
+`JobStatus`: it is a `dead` row whose `maxAttempts` has been pushed past `REVIVAL_CEILING`, which
+is an integer rather than the `lastError` prose beside it because `lastError` is nullable and a
+`NOT LIKE` over NULL drops exactly the unexplained burial the mark exists for.
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: enqueue
+    queued --> running: claimJobs (attempts + 1)
+    running --> done: completeJob
+    running --> queued: failJob, attempts remain (RETRY_DELAYS_MS)
+    running --> queued: reclaimExpiredJobs, lease expired (attempts + 1)
+    running --> dead: failJob on the last attempt
+    running --> dead: reclaimExpiredJobs, lease expired out of attempts
+    done --> queued: enqueue, a fresh request (attempts and budget reset)
+    dead --> queued: enqueue, a fresh request (attempts and budget reset)
+
+    dead --> queued: reconcileDeadJobs, cause not permanent (maxAttempts + 1)
+    dead --> abandoned: reconcileDeadJobs, enumerated permanent cause
+    dead --> abandoned: reconcileDeadJobs, revival budget spent
+    abandoned --> queued: fetchArea, or scripts/requeue-jobs.ts
+
+    note right of abandoned
+        added — not a status.
+        A dead row whose maxAttempts
+        is past the ceiling, carrying
+        JOB_ABANDONED_MARKER.
+    end note
+```
+
+Only `REQUEST_JOB_KINDS` take those three new edges. `revivalBudget` counts outstanding revivals
+of request kinds alone — the same population `admitIngest` weighs — so reviving a derived kind
+would spend a slot no later pass counts back. A dead `enrich_trail` or `ingest_route` stays buried
+and is collected at `FAILED_JOB_TTL_MS`, as it is today.
 
 **A split child is bounded by a second counter, because the job ladder alone does not reach it.**
-`queueStaleChildren` revives a `dead` child deliberately — it is the only path back, since
-`ensureCoverage` covers z9 alone and never sees a z10 row — and that revival bypasses the
-`ensureCoverage` guard above entirely. The ladder is therefore not the child's ceiling: each
-revival resets it. `SPLIT_CHILD_ATTEMPT_CAP` is, counted in `IngestTile.attempts`, which
-`processTile` increments per run and nothing resets.
+`queueStaleChildren` revives a `dead` child deliberately — `ensureCoverage` covers z9 alone and
+never sees a z10 row — and that revival bypasses the `ensureCoverage` guard above entirely.
+`reconcileDeadJobs` does not make a second path out of it: a child already past
+`SPLIT_CHILD_ATTEMPT_CAP` is **retired** there rather than granted a second budget, so the two
+revival routes do not sum into an unbounded one. Retiring rather than skipping is what closes the
+path, and it is also what reports it, at a price worth knowing: `ingestPump` logs one
+`JOB_ABANDONED_MARKER` per retired child, and that marker is an arm of the Sev-2
+`switchback-ingest-ground-lost` rule, so a fully-capped parent puts four lines in that rule's
+window on top of the `SUBTREE_STUCK_MARKER` on its own row. Sixteen of them is sixty-four — which
+is the population this triage was written for, so the noise arrives exactly when it is least
+welcome. The ladder is therefore not the child's ceiling: each revival resets it.
+`SPLIT_CHILD_ATTEMPT_CAP` is, counted in `IngestTile.attempts`, which `processTile` increments per
+run and nothing resets.
 
 Past the cap the child is abandoned and the parent is **held** — not promoted, not failed. `rollUp`
 needs all four children settled, so a parent short one child keeps whatever it committed and does
@@ -169,6 +229,44 @@ only writer and spends an attempt every time it writes, so a tile that reliably 
 retired rather than republished forever; and `enqueue` resets `priority` when it revives a finished
 row, so a request for a tile that was once reclaimed re-enters at its own band and the brake still
 holds it.
+
+Where each piece of that hangs off the one timer, and how far the brake reaches:
+
+```mermaid
+flowchart TB
+    timer["ingestPump — timer, every 2 min<br/>singleton: an overrunning tick publishes nothing"]
+    timer -->|1| health[reportQueueHealth]
+    timer -->|2| maintain["maintain()"]
+    timer -->|3| refill["refill() — runPump publishes the runnable head"]
+    timer -->|4| dlq["drainDeadLetters — added, after the publish"]
+
+    maintain --> sweep[sweepQueue]
+    maintain --> prune[pruneFinishedJobs]
+
+    sweep --> reclaim[reclaimExpiredJobs]
+    sweep --> splits[reconcileOrphanedSplits]
+    sweep --> wedged[repairWedgedTiles]
+    sweep --> deadjobs["reconcileDeadJobs — added"]
+
+    brake["INGEST_PUMP_ENABLED=false"] -.->|stops revivals only| deadjobs
+    dlq --> broker[("Service Bus $deadletterqueue")]
+    deadjobs --> pg[("ingest_jobs")]
+
+    request["trails.browse — request path"] -.->|publishes signals only| broker
+    request -.->|no maintenance| pg
+```
+
+The brake reaches the triage and nothing else in the sweep: reviving is the only part that puts
+work back on the queue, which is what an operator stopping new ingest means to stop, while reclaim
+and the two repairs have to keep running under a brake because that is when losing them is least
+affordable.
+
+The order is load-bearing in both directions. `sweepQueue` runs ahead of the publish because
+`classifyDisposition` settles a message on the strength of the reaper returning the row to `queued`
+and _this_ tick republishing it. `drainDeadLetters` runs after it because `DEAD_LETTER_WAIT_MS` is a
+blocking receive a healthy estate spends in full, the timer is singleton, and nothing in `runPump`
+reads the broker's dead-letter sub-queue — in front of the publish it was five seconds of every tick
+charged to a viewport tile already queued in Postgres.
 
 None loses a tile. `ingest_jobs` is the record and the pump re-derives the runnable head every two
 minutes, so a brake costs the queue its throughput and not its contents — though work queued while

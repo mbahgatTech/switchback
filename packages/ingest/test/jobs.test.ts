@@ -4,6 +4,7 @@ import { AREA_PRIORITY, VIEWPORT_PRIORITY } from '../src/coverage';
 import { NETWORK_PRIORITY } from '../src/network';
 import { SPLIT_PRIORITY } from '../src/subdivide';
 import {
+  DEFAULT_MAX_ATTEMPTS,
   LEASE_EXPIRED_MARKER,
   LEASE_TIMEOUT_MS,
   RECLAIM_PRIORITY,
@@ -236,6 +237,41 @@ describe('enqueue', () => {
     expect(args.create.priority).toBe(0);
   });
 
+  it('hands a revived job the whole budget back, not the one the reconciler raised', async () => {
+    /*
+     * **The invariant the revival ladder rests on, from the other end.** `reconcileDeadJobs` keeps
+     * its budget in `maxAttempts` — raising it one per revival and past `REVIVAL_CEILING` when it
+     * gives up — precisely because `enqueue` clears `attempts` and that column therefore cannot
+     * hold a durable count. A counter that only ever climbed would hand a fresh request nine
+     * attempts instead of five and, once re-buried above the ceiling, would leave the row matching
+     * no rung of that reconciler at all, with nothing reporting it. So the revive arm has to bring
+     * it down, and this is the assertion that says so.
+     */
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+    });
+
+    expect(recorded.updateManys[0]?.data.maxAttempts).toBe(DEFAULT_MAX_ATTEMPTS);
+  });
+
+  it('honours a caller that asks for a budget of its own on the revive arm', async () => {
+    const { db, recorded } = fakeDb();
+    await enqueue(db, {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey('0333'),
+      payload: {},
+      maxAttempts: 2,
+    });
+
+    // The reset is to what this request asks for, not to a constant — the two arms of the upsert
+    // must not disagree about the budget a new request gets.
+    expect(recorded.updateManys[0]?.data.maxAttempts).toBe(2);
+    expect((recorded.upserts[0] as { create: Record<string, unknown> }).create.maxAttempts).toBe(2);
+  });
+
   it('does not reset an existing job when the same work is requested again', async () => {
     const { db, recorded } = fakeDb();
     await enqueue(db, {
@@ -250,6 +286,13 @@ describe('enqueue', () => {
     // nothing at all on collision: priority moves only through the guarded raise below.
     expect(args.update).not.toHaveProperty('runAfter');
     expect(args.update).not.toHaveProperty('priority');
+    /*
+     * `maxAttempts` least of all, and it is the one worth naming: it is a public `EnqueueInput`
+     * field, so honouring it here reads like a courtesy. It would reset the revival budget of a
+     * live job on every viewport poll, which is an unbounded retry loop for a poison tile.
+     */
+    expect(args.update).not.toHaveProperty('maxAttempts');
+    expect(args.update).toEqual({});
   });
 
   it('raises priority only when the incoming band is higher', async () => {
@@ -295,6 +338,8 @@ describe('enqueue', () => {
     });
     expect(revive?.data.status).toBe(JobStatus.queued);
     expect(revive?.data.attempts).toBe(0);
+    // Reset with `attempts`, and for the same reason — see the budget test above.
+    expect(revive?.data.maxAttempts).toBe(DEFAULT_MAX_ATTEMPTS);
     expect(revive?.data.runAfter).toBe(runAfter);
     expect(revive?.data.completedAt).toBeNull();
     expect(revive?.data.lockedAt).toBeNull();

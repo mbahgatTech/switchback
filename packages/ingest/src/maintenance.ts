@@ -5,6 +5,8 @@
 
 import { JobKind, JobStatus, PhotoSource, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
+import { reconcileDeadJobs } from './dead-jobs';
+import type { AbandonedJob, TriageOptions } from './dead-jobs';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
 import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
@@ -18,19 +20,33 @@ export interface SweepResult {
   unsplit: OrphanedSplitRepair[];
   /** Tiles left `running` by a handler that never came back — see `repairWedgedTiles`. */
   unwedged: string[];
+  /** Buried jobs granted one more attempt — see `reconcileDeadJobs`. */
+  revived: string[];
+  /** Buried jobs no automatic path will run again — see `reconcileDeadJobs`. */
+  abandoned: AbandonedJob[];
 }
 
 /**
- * Take back expired leases, clear split markers left by a subdivision that produced nothing, and
- * correct tiles whose handler never came back.
+ * Take back expired leases, clear split markers left by a subdivision that produced nothing,
+ * correct tiles whose handler never came back, and decide what happens to the jobs the retry
+ * ladder buried.
  *
- * Each part is caught separately: these are bookkeeping, and none is worth failing a request or a
- * cron tick for. What they return is counted by the caller, which is the only place the result is
- * worth a log line.
+ * `triage` is how a caller withholds the last of those without withholding the rest — see
+ * `ingestPump`, which passes `revive: false` under the brake. Reviving is the one part of this
+ * that puts work back on the queue, so it is the one part an operator stopping new ingest means
+ * to stop; reclaim, split repair and wedged-tile repair all have to keep running under a brake,
+ * because a brake is pulled precisely when they are least affordable to lose. A braked tick still
+ * retires burials — `reconcileDeadJobs` reads its two windows separately so that a revival it may
+ * not perform cannot crowd out a retirement it may.
+ *
+ * Each part is caught separately: these are bookkeeping, and none is worth failing a cron tick
+ * for. What they return is counted by the caller, which is the only place the result is worth a
+ * log line.
  */
 export async function sweepQueue(
   db: PrismaClient = prisma,
   now: Date = new Date(),
+  triage: TriageOptions = {},
 ): Promise<SweepResult> {
   let requeued = 0;
   let retired = 0;
@@ -59,7 +75,21 @@ export async function sweepQueue(
     console.warn('[ingest] wedged tile repair failed', error);
   }
 
-  return { requeued, retired, unsplit, unwedged };
+  /*
+   * Last, and after the reclaim for the same reason `repairWedgedTiles` runs after it: a reclaim
+   * can bury a job this tick, and deciding its fate in the same pass would spend a revival on a
+   * burial that is seconds old. `REVIVAL_DELAYS_MS` is what actually enforces that, so the
+   * ordering is belt to its braces.
+   */
+  let revived: string[] = [];
+  let abandoned: AbandonedJob[] = [];
+  try {
+    ({ revived, abandoned } = await reconcileDeadJobs(db, now, triage));
+  } catch (error) {
+    console.warn('[ingest] dead-job reconciliation failed', error);
+  }
+
+  return { requeued, retired, unsplit, unwedged, revived, abandoned };
 }
 
 /**
@@ -86,7 +116,10 @@ export const QUEUE_HEALTH_MARKER = 'switchback-ingest-queue-health';
 
 /** Distress the queue can be in, all of it visible to any reader of the two ingest tables. */
 export interface QueueHealth {
-  /** Jobs buried within `DISTRESS_WINDOW_MS`. Nothing retries these. */
+  /**
+   * Jobs buried within `DISTRESS_WINDOW_MS` that `reconcileDeadJobs` has not since revived —
+   * a revival clears `completedAt`, which is what takes the row back out of this count.
+   */
   dead: number;
   /** Leases past `LEASE_TIMEOUT_MS` that survived a sweep — see `LEASE_SWEEP_GRACE_MS`. */
   staleLeases: number;

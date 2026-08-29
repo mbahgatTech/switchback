@@ -811,8 +811,11 @@ model IngestJob {
   /// What admission control counts. Leading with `kind` because the claim index above
   /// starts at `status`, and the planner will not use it for a query filtered on both —
   /// `admitIngest` planned as a sequential scan over every job ever recorded, on the hot
-  /// path behind `trails.browse`.
-  @@index([kind, status])
+  /// path behind `trails.browse`. `completedAt` trails the pair `admitIngest` needs, so
+  /// that query still reads it as a prefix, while `reconcileDeadJobs` — which filters on
+  /// the same two columns and then sorts the `dead` partition by `completedAt` — gets its
+  /// ordering from the index rather than from a sort over every burial ever recorded.
+  @@index([kind, status, completedAt])
   @@map("ingest_jobs")
 }
 

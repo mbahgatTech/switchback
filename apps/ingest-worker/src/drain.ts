@@ -368,8 +368,12 @@ export const JOB_FAILED_MARKER = 'ingest-job-failed';
  * Separate from `JOB_FAILED_MARKER` because the two need different severities and the row alone
  * cannot tell them apart after the fact: `failJob` writes `dead` on the last attempt and `queued`
  * on every other, and a rule reading `ingest-job-failed` sees both. A job below `maxAttempts`
- * re-runs on its own and is a Sev3 observation; a buried one is the retry budget exhausted and
- * nothing will pick it up.
+ * re-runs on its own and is a Sev3 observation; a buried one has spent the ladder.
+ *
+ * **A burial is no longer the end of the road, and the severity survives that.** `reconcileDeadJobs`
+ * grants a further attempt on the pump's timer, but only for a failure it can name as transient and
+ * only `REVIVAL_DELAYS_MS.length` times — so a burial still means five attempts have failed, still
+ * deserves a look, and is followed by `JOB_ABANDONED_MARKER` when the revivals run out.
  *
  * The token deliberately does not contain `ingest-job-failed`, so the recoverable rule's
  * `has "ingest-job-failed"` cannot match a burial.
@@ -428,7 +432,8 @@ function report(signal: IngestSignal, result: DrainResult, log: WorkerLog): void
 
   if (result.buried > 0) {
     log.error(
-      `${JOB_BURIED_MARKER} ${key}: handler failed with no attempt left — the row is "dead" and nothing will retry it`,
+      `${JOB_BURIED_MARKER} ${key}: handler failed with no attempt left — the row is "dead", and ` +
+        'only a transient cause earns it another attempt from the reconciler',
     );
   }
 

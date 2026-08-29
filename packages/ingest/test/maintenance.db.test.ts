@@ -25,6 +25,19 @@ const IS_LOCAL = /@(localhost|127\.0\.0\.1|host\.docker\.internal)[:/]/.test(
 const NS = '222';
 
 /**
+ * The triage window this file runs `sweepQueue` with, and it is zero deliberately.
+ *
+ * These tests assert on the lease sweep and the two tile repairs; `sweepQueue` also reaches
+ * `reconcileDeadJobs`, which is table-wide and *destructive to diagnostics* — it overwrites
+ * `lastError` with an abandonment note and pushes `maxAttempts` past the ceiling. `NOW` is pinned
+ * three weeks back, so against any populated database every buried row is past its rung and
+ * eligible. Nothing here covers that behaviour, so nothing here should be able to perform it: a
+ * zero window selects no rows and the triage returns before its first write. The in-memory suite
+ * in `dead-jobs.test.ts` is where that behaviour is proven.
+ */
+const NO_TRIAGE = { limit: 0 } as const;
+
+/**
  * Six parents shaped like the ones wedged in production on 2026-08-07 — three `running`, three
  * `pending`, each marked, each with a full ten-minute `fetchMs` and no descendants. Production's
  * own keys are `031313112`, `120221231`, `120230202`, `120230203`, `120230212` and `120230220`;
@@ -111,7 +124,7 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
   afterAll(cleanup);
 
   it('clears every wedged parent and re-queues it, without touching the tile’s own data', async () => {
-    const { unsplit } = await sweepQueue(prisma, NOW);
+    const { unsplit } = await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     expect(unsplit.filter((repair) => WEDGED_KEYS.includes(repair.quadkey))).toHaveLength(
       WEDGED.length,
@@ -133,10 +146,10 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
   });
 
   it('is a no-op the second time, so a cron that runs it daily cannot churn', async () => {
-    await sweepQueue(prisma, NOW);
+    await sweepQueue(prisma, NOW, NO_TRIAGE);
     const settled = await wedgedRows();
 
-    const { unsplit } = await sweepQueue(prisma, NOW);
+    const { unsplit } = await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     expect(unsplit.filter((repair) => WEDGED_KEYS.includes(repair.quadkey))).toEqual([]);
     expect((await wedgedRows()).map((tile) => tile.updatedAt)).toEqual(
@@ -148,7 +161,7 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
     await seedTile(INTACT, TileStatus.pending, { lastError: MARKER });
     for (const child of childQuadkeys(INTACT)) await seedTile(child, TileStatus.ready);
 
-    await sweepQueue(prisma, NOW);
+    await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     const parent = await prisma.ingestTile.findUniqueOrThrow({ where: { quadkey: INTACT } });
     expect(parent.lastError).toBe(MARKER);
@@ -167,7 +180,7 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
       },
     });
 
-    const { requeued } = await sweepQueue(prisma, NOW);
+    const { requeued } = await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     // The row, not only the count: `requeued` is a total over every expired lease in the table.
     // `lockedBy` survives on purpose — the status change is what releases the lease, and this is
@@ -193,7 +206,7 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
       },
     });
 
-    await sweepQueue(prisma, NOW);
+    await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
     expect(job.priority).toBe(RECLAIM_PRIORITY);
@@ -216,7 +229,7 @@ describe.runIf(IS_LOCAL).sequential('the queue sweep against a real database', (
       },
     });
 
-    await sweepQueue(prisma, NOW);
+    await sweepQueue(prisma, NOW, NO_TRIAGE);
 
     const job = await prisma.ingestJob.findUniqueOrThrow({ where: { dedupeKey: STALE_JOB } });
     expect(job).toMatchObject({ status: JobStatus.dead, priority: VIEWPORT_PRIORITY });

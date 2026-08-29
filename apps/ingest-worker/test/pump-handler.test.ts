@@ -17,9 +17,17 @@ type Handler = (timer: unknown, context: unknown) => Promise<void>;
 const stub = vi.hoisted(() => ({
   registered: undefined as Handler | undefined,
   runPump: vi.fn(async () => ({ published: 0 })),
-  sweepQueue: vi.fn(async () => ({ requeued: 0, retired: 0, unsplit: [], unwedged: [] })),
+  sweepQueue: vi.fn(async () => ({
+    requeued: 0,
+    retired: 0,
+    unsplit: [],
+    unwedged: [],
+    revived: [],
+    abandoned: [],
+  })),
   pruneFinishedJobs: vi.fn(async () => 0),
   reportQueueHealth: vi.fn(async () => {}),
+  reconcileDeadLetters: vi.fn(async () => ({ runnable: [], terminal: [], unreadable: [] })),
 }));
 
 vi.mock('@azure/functions', () => ({
@@ -43,12 +51,17 @@ vi.mock('@switchback/ingest', async (importOriginal) => ({
 
 vi.mock('../src/health', () => ({ reportQueueHealth: stub.reportQueueHealth }));
 
+vi.mock('../src/dead-letter', () => ({ reconcileDeadLetters: stub.reconcileDeadLetters }));
+
 vi.mock('../src/pump', async (importOriginal) => ({
   ...(await importOriginal<typeof PumpModule>()),
   runPump: stub.runPump,
 }));
 
-vi.mock('../src/service-bus', () => ({ serviceBusQueue: () => ({}) }));
+vi.mock('../src/service-bus', () => ({
+  serviceBusQueue: () => ({}),
+  deadLetterQueue: () => ({}),
+}));
 
 // Importing registers the timer, which is how the handler under test is obtained.
 import '../src/functions/pump';
@@ -67,6 +80,13 @@ async function bandPassedToPump(brake: string | undefined): Promise<number | und
   const call = stub.runPump.mock.calls.at(-1) as unknown[] | undefined;
   if (!call) throw new Error('the handler did not run the pump');
   return call[5] as number | undefined;
+}
+
+/** The triage options `maintain` hands `sweepQueue` — the brake's reach into the sweep. */
+function triagePassedToSweep(): unknown {
+  const call = stub.sweepQueue.mock.calls.at(-1) as unknown[] | undefined;
+  if (!call) throw new Error('the handler did not sweep the queue');
+  return call[2];
 }
 
 describe('the ingestPump handler', () => {
@@ -91,5 +111,103 @@ describe('the ingestPump handler', () => {
     // The sweep runs ahead of the brake: a stopped pump that also stopped reclaiming would leave
     // every lease a killed invocation held stuck for as long as the brake was on.
     expect(stub.sweepQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops revivals while the brake is on', async () => {
+    /*
+     * The brake's revive dimension, asserted on the argument rather than on the source text that
+     * spells it. Reviving is the one part of the sweep that puts work back on the queue, which is
+     * exactly what `INGEST_PUMP_ENABLED=false` means to stop — and a call site hard-wired to
+     * `true` disables that control completely while leaving every other assertion here green.
+     */
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump('false');
+
+    expect(triagePassedToSweep()).toEqual({ revive: false });
+  });
+
+  it('leaves revivals running while the brake is off', async () => {
+    // The other half, which is what makes the assertion above a statement about the brake rather
+    // than about a constant: the same call site must ask for revivals when nothing is stopping it.
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump('true');
+
+    expect(triagePassedToSweep()).toEqual({ revive: true });
+  });
+
+  it('drains the dead-letter queue whichever way the brake is set', async () => {
+    stub.reconcileDeadLetters.mockClear();
+    await bandPassedToPump('false');
+
+    // Same argument, and a stronger one: the brake is pulled when something is wrong, which is
+    // when the queue is likeliest to be holding messages nobody is going to look at.
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs both repairs with no request having reached the estate', async () => {
+    /*
+     * The point of the timer. Nothing in this test publishes a signal, opens a map or calls the
+     * API — the handler is invoked with a timer and a context, which is what the host does on a
+     * schedule — and both repairs still run.
+     */
+    stub.sweepQueue.mockClear();
+    stub.reconcileDeadLetters.mockClear();
+
+    const handler = stub.registered;
+    if (!handler) throw new Error('ingestPump registered no handler');
+    await handler({}, context);
+
+    expect(stub.sweepQueue).toHaveBeenCalledTimes(1);
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes the runnable head before it blocks on the broker', async () => {
+    /*
+     * `DEAD_LETTER_WAIT_MS` is a blocking receive a healthy estate spends in full, and the timer
+     * is singleton — ahead of the publish it was five seconds of every tick charged to a viewport
+     * tile already queued in Postgres. Nothing in `runPump` reads the dead-letter sub-queue.
+     */
+    stub.reconcileDeadLetters.mockClear();
+    await bandPassedToPump(undefined);
+
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? Infinity;
+    const drained = stub.reconcileDeadLetters.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(published).toBeLessThan(drained);
+  });
+
+  it('reclaims expired leases before it publishes, so a recovered lease goes out this tick', async () => {
+    // The coupling that keeps the sweep in front: `classifyDisposition` completes a Service Bus
+    // message on the strength of the reaper returning the row to `queued` and this tick
+    // republishing it, so the reclaim has to land before the publish reads the head.
+    stub.sweepQueue.mockClear();
+    await bandPassedToPump(undefined);
+
+    const reclaimed = stub.sweepQueue.mock.invocationCallOrder[0] ?? Infinity;
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(reclaimed).toBeLessThan(published);
+  });
+
+  it('has already published by the time an unreachable broker fails the drain', async () => {
+    // The reorder's payoff: the dead-letter queue can be entirely unreachable and the tick still
+    // does the job it exists for.
+    stub.reconcileDeadLetters.mockClear();
+    stub.reconcileDeadLetters.mockRejectedValueOnce(new Error('namespace is gone'));
+
+    await expect(bandPassedToPump(undefined)).resolves.toBeUndefined();
+    expect(stub.runPump).toHaveBeenCalledTimes(1);
+    const published = stub.runPump.mock.invocationCallOrder[0] ?? Infinity;
+    const attempted = stub.reconcileDeadLetters.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(published).toBeLessThan(attempted);
+  });
+
+  it('drains the dead-letter queue even when the database sweep throws', async () => {
+    // Separate catches: the broker and Postgres fail for unrelated reasons, and one shared catch
+    // would let an unreachable database leave the queue filling.
+    stub.reconcileDeadLetters.mockClear();
+    stub.sweepQueue.mockRejectedValueOnce(new Error('postgres is gone'));
+
+    await bandPassedToPump(undefined);
+
+    expect(stub.reconcileDeadLetters).toHaveBeenCalledTimes(1);
   });
 });

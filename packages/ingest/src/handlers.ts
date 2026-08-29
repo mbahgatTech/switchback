@@ -7,7 +7,7 @@ import { JobKind } from '@switchback/db';
 import { backgroundPrisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { drainSlotGate } from './drain-slot';
-import { drainJobs } from './jobs';
+import { PAYLOAD_INCOMPLETE, drainJobs } from './jobs';
 import type { ClaimGate, ClaimedJob, DrainResult, JobHandler } from './jobs';
 import { processNetworkTile } from './network';
 import { enrichTrailPhotos, processRoute, processTile } from './pipeline';
@@ -17,7 +17,7 @@ import { pipelineDeps } from './config';
 function requireString(payload: Record<string, unknown>, key: string): string {
   const value = payload[key];
   if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`job payload missing "${key}"`);
+    throw new Error(`${PAYLOAD_INCOMPLETE} "${key}"`);
   }
   return value;
 }
@@ -25,7 +25,7 @@ function requireString(payload: Record<string, unknown>, key: string): string {
 function requireNumber(payload: Record<string, unknown>, key: string): number {
   const value = payload[key];
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new Error(`job payload missing "${key}"`);
+    throw new Error(`${PAYLOAD_INCOMPLETE} "${key}"`);
   }
   return value;
 }
