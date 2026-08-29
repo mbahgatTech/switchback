@@ -1659,6 +1659,55 @@ application-settings write replaces the collection whole, so any default would r
 and both fall back to absent, which is what the app already holds, so leaving them unexported
 deploys the deployed value.
 
+### The shared terrarium tile cache
+
+Terrain fetching is what an ingest invocation spends its clock on, and the 256-tile LRU in
+`packages/ingest/src/elevate.ts` dies with the process — so a retry, a subdivided child tile, a
+30-day refresh and every cold start re-fetch terrain the fleet already had. A Cloudflare R2 bucket
+holds those tiles between invocations. It is a separate bucket from the one that serves user
+photographs, and a separate credential, so a token that can write terrain cannot reach uploads.
+
+Four more exports, all with an empty fallback:
+
+```bash
+export TERRAIN_CACHE_R2_ACCOUNT_ID="…"
+export TERRAIN_CACHE_R2_ACCESS_KEY_ID="…"
+export TERRAIN_CACHE_R2_SECRET_ACCESS_KEY="…"
+export TERRAIN_CACHE_R2_BUCKET=switchback-terrain
+```
+
+**All four or none.** `ingest.bicep` emits the group only when every one is non-empty, and
+`terrainCacheFromEnv` reads a partial set the same way, so a half-configured deploy turns the cache
+off rather than half on. Off means every tile comes from the origin, which is what the worker did
+before the cache existed — the same thing a slow bucket, a 403 or an outage degrades to, because
+`TerrainCache` answers `unavailable` and the caller reads that as a miss.
+
+R2 rather than Postgres or the worker's own storage account, and the reasons are in
+`.plans/WO-shared-terrain-cache-v1.md`. The short form: the server above has a 64 GiB disk at 240
+IOPS shared with every trail, and world coverage of z13 terrain is 250–500 GB; the worker's blob
+storage is reached by managed identity that Vercel does not hold, and Vercel elevates planned
+routes through the same `getTerrain()`. R2 is reachable from both over plain HTTPS and charges no
+egress in either direction.
+
+Vercel needs the same four names in its project environment for the route planner to share the
+cache. It works without them — that surface simply keeps fetching from the origin.
+
+Read the group back after a deploy, because an application-settings write replaces the collection
+whole:
+
+```bash
+az functionapp config appsettings list -g rg-switchback-prod-northcentralus \
+  -n func-switchback-ingest-37ywppu5p7fri \
+  --query "[?starts_with(name,'TERRAIN_CACHE_')].name" -o tsv
+# expect four names, or none at all
+```
+
+A laptop drain can point at a directory instead, which is the same tier with a different store:
+
+```bash
+TERRAIN_CACHE_DIR=.terrain-cache npm run ingest:tile -- --quadkey 021231030
+```
+
 Confirm the two flags landed rather than assuming it:
 
 ```bash

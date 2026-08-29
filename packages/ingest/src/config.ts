@@ -7,6 +7,7 @@
 
 import { OverpassClient } from './overpass';
 import { TerrainSource } from './elevate';
+import { terrainCacheFromEnv } from './terrain-cache';
 import { subdivideMaxZoom } from './subdivide';
 import { trailIdentityMode } from './identity';
 import type { PipelineDeps } from './pipeline';
@@ -82,7 +83,12 @@ function splitList(value: string | undefined): string[] {
 
 export function getTerrain(): TerrainSource {
   if (!terrainSource) {
-    terrainSource = new TerrainSource({ urlTemplate: process.env.TERRAIN_TILE_URL });
+    terrainSource = new TerrainSource({
+      urlTemplate: process.env.TERRAIN_TILE_URL,
+      // Unconfigured is `null`, which leaves the origin as the only source — the behaviour every
+      // deployment had before the shared tier existed, and the one a bad configuration falls to.
+      cache: terrainCacheFromEnv() ?? undefined,
+    });
   }
   return terrainSource;
 }

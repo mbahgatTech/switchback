@@ -94,6 +94,25 @@ param terrainTileUrl string = ''
 param mapillaryToken string = ''
 
 @description('''
+Cloudflare R2 holding the shared terrarium tile cache — the tier that survives an invocation, so a
+retry, a subdivided child tile and a cold start stop re-fetching terrain the fleet already has.
+
+All four go in together or none does. Any one empty omits the whole group, and the worker then
+fetches every tile from the origin, which is what it did before the cache existed. That is the
+failure mode by design: `packages/ingest/src/terrain-cache.ts` treats an unconfigured, slow or
+broken cache as a miss rather than an error.
+
+**Deliberately not the `R2_*` variables Vercel holds for photographs.** A token scoped to the
+terrain bucket alone cannot reach user uploads, and terrain written to the photo bucket would be
+served from the origin that fronts it.
+''')
+param terrainCacheAccountId string = ''
+param terrainCacheAccessKeyId string = ''
+@secure()
+param terrainCacheSecretAccessKey string = ''
+param terrainCacheBucket string = ''
+
+@description('''
 The package the Function App runs from, written to `WEBSITE_RUN_FROM_PACKAGE`.
 
 **Declared here because an application-settings write replaces the collection whole.** Linux
@@ -772,6 +791,12 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   }
 }
 
+// All four R2 variables or none. Three of four is a misconfiguration, and `terrainCacheFromEnv`
+// reads a partial set as no cache at all; emitting the group whole keeps the template and the
+// code agreeing on that rather than one relying on the other. One line because Bicep will not
+// parse a boolean expression across several.
+var terrainCacheConfigured = !empty(terrainCacheAccountId) && !empty(terrainCacheAccessKeyId) && !empty(terrainCacheSecretAccessKey) && !empty(terrainCacheBucket)
+
 var optionalWorkerSettings = concat(
   databaseAuth == 'password'
     ? []
@@ -796,7 +821,28 @@ var optionalWorkerSettings = concat(
           name: 'MAPILLARY_TOKEN'
           value: mapillaryToken
         }
+      ],
+  // All four or none — see `terrainCacheConfigured` above.
+  terrainCacheConfigured
+    ? [
+        {
+          name: 'TERRAIN_CACHE_R2_ACCOUNT_ID'
+          value: terrainCacheAccountId
+        }
+        {
+          name: 'TERRAIN_CACHE_R2_ACCESS_KEY_ID'
+          value: terrainCacheAccessKeyId
+        }
+        {
+          name: 'TERRAIN_CACHE_R2_SECRET_ACCESS_KEY'
+          value: terrainCacheSecretAccessKey
+        }
+        {
+          name: 'TERRAIN_CACHE_R2_BUCKET'
+          value: terrainCacheBucket
+        }
       ]
+    : []
 )
 
 @description('''
