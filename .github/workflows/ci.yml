@@ -206,7 +206,14 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
 
     steps:
+      # The head commit, not the default merge ref, because the script reads the checkout to
+      # decide which files to load and github.com to decide whether they rendered. Those two have
+      # to be the same commit or the run asks for blobs that are not there, and a 404 renders
+      # nothing — which the check reports as a diagram that failed. Standing on the head commit
+      # names it once, and `check-mermaid-github.ts` defaults to `HEAD`.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -221,9 +228,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
 
       - name: Every block became a diagram, on the site
-        env:
-          REF: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: npx tsx scripts/check-mermaid-github.ts "$REF"
+        run: npx tsx scripts/check-mermaid-github.ts
 
   worker:
     name: ingest worker bundle
