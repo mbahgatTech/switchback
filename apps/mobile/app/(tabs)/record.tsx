@@ -22,16 +22,20 @@ import {
   flush,
   forget,
   formatClock,
+  trackingNote,
   useRecording,
   useRecorderActions,
+  type RecorderSnapshot,
+  type TrackingNote,
 } from '@/record/store';
 
 /**
  * Record — the only screen in the product that is an instrument rather than a page: one figure
  * readable at arm's length, three supporting readings, and controls big enough for a glove.
  *
- * The state machine is `@/record/store`, at module scope; this file only draws it. Expo Go
- * records in the foreground only, so the screen is held awake and the caveat is printed.
+ * The state machine is `@/record/store`, at module scope; this file only draws it. Which of the
+ * two fix sources the host granted is a fact only the recorder knows, so the line about what the
+ * phone will do with the screen off is derived from `tracking` rather than written as a promise.
  */
 
 const theme = nativeTheme('field');
@@ -280,8 +284,13 @@ export default function RecordScreen() {
       {/* One line, always in the same place, saying whether the instrument is working. */}
       <Text style={styles.signal}>{signalLine(recording, units)}</Text>
 
+      {running ? <Text style={styles.caveat}>{trackingProse(recording)}</Text> : null}
+
       {recording.geoError ? <Text style={styles.problem}>{recording.geoError}</Text> : null}
       {recording.syncError ? <Text style={styles.problem}>{recording.syncError}</Text> : null}
+      {recording.journalDegraded ? (
+        <Text style={styles.problem}>{JOURNAL_DEGRADED_PROSE}</Text>
+      ) : null}
       {saveError ? <Text style={styles.problem}>{saveError}</Text> : null}
       {start.isError ? <Text style={styles.problem}>{start.error.message}</Text> : null}
 
@@ -324,9 +333,10 @@ export default function RecordScreen() {
           ) : null}
 
           <Text style={styles.caveat}>
-            Recording runs while Switchback is open, and the screen is held awake for it. Lock the
-            phone and the track stops until you come back — everything recorded up to that point is
-            already saved.
+            Where the phone allows it the track carries on with the screen off and Switchback in
+            your pocket, and the line under the clock says which you have got — while you are still
+            at the trailhead rather than after. Continuous GPS is the heaviest thing a phone does,
+            so a long day out wants a battery pack.
           </Text>
         </>
       ) : null}
@@ -442,6 +452,37 @@ function pace(stats: ActivityStats, units: UnitSystem): string {
   if (stats.distanceM < 50 || stats.movingTimeS <= 0) return '—';
   const perUnit = units === 'metric' ? 1000 : 1609.344;
   return formatPace((stats.movingTimeS / stats.distanceM) * perUnit, units);
+}
+
+/**
+ * What the phone will actually do with the screen off. The recorder decides *which* case this is;
+ * all this does is put words to a closed set.
+ *
+ * A total `Record` over the union rather than a chain of `if`s, because a chain is how a paused
+ * hike came to be told it was recording: three arms for a four-state domain, and the missing one
+ * fell through to the most reassuring sentence. Adding a state to `TrackingNote` is a compile
+ * error here until it has prose.
+ */
+const TRACKING_PROSE: Readonly<Record<TrackingNote, string>> = {
+  starting: 'Starting — finding you, and asking the phone for what it needs.',
+  'background-durable': 'Recording with the screen off. Nothing needs Switchback to stay open.',
+  'background-fragile':
+    'Recording with the screen off. Location is set to "While Using" — allow "Always" in Settings and iOS will restart the recording if it ever has to close the app.',
+  foreground:
+    'This build records only while Switchback is open, so the screen is being held awake. Lock the phone and the track pauses until you come back.',
+  'not-tracking': 'Not tracking. Nothing is being added to this hike until you resume it.',
+};
+
+/**
+ * Said where a hike is still saveable, because that is the only thing left to do about it. The
+ * recorder keeps the track in memory and keeps uploading it; what is gone is the copy that would
+ * survive the app being killed.
+ */
+const JOURNAL_DEGRADED_PROSE =
+  'The phone would not store part of this hike. Nothing is lost yet — save it rather than leaving the app.';
+
+function trackingProse(recording: RecorderSnapshot): string {
+  return TRACKING_PROSE[trackingNote(recording)];
 }
 
 function signalLine(

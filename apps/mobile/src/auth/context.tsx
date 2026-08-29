@@ -1,4 +1,5 @@
-import { createContext, use, useEffect, useState } from 'react';
+import { createContext, use, useEffect, useMemo, useState } from 'react';
+import { UNRESOLVED_SESSION, nextSession, type Session } from './session-state';
 import { hasStoredSession, signOut as signOutSession, subscribe } from './session';
 
 /**
@@ -9,31 +10,30 @@ import { hasStoredSession, signOut as signOutSession, subscribe } from './sessio
  * would close over a stale value. So the module is the source of truth and this only
  * mirrors it for rendering.
  */
-type Status = 'loading' | 'signedIn' | 'signedOut';
 
-interface AuthValue {
-  status: Status;
+interface AuthValue extends Session {
   signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [status, setStatus] = useState<Status>('loading');
+  const [session, setSession] = useState<Session>(UNRESOLVED_SESSION);
 
   useEffect(() => {
     let active = true;
+    // Both sources answer the same question, so both settle the session the same way — including
+    // the moment it began, which `@/record/bridge` measures a cached user id against.
+    const settle = (signedIn: boolean): void => {
+      if (active) setSession((current) => nextSession(current, signedIn, Date.now()));
+    };
 
     // Reading the Keychain is async, so there is a real moment at launch where the answer
     // is unknown. Rendering "signed out" during it would flash the sign-in screen at
     // someone who is already signed in — hence a third state rather than a boolean.
-    void hasStoredSession().then((present) => {
-      if (active) setStatus(present ? 'signedIn' : 'signedOut');
-    });
+    void hasStoredSession().then(settle);
 
-    const unsubscribe = subscribe((signedIn) => {
-      if (active) setStatus(signedIn ? 'signedIn' : 'signedOut');
-    });
+    const unsubscribe = subscribe(settle);
 
     return () => {
       active = false;
@@ -41,7 +41,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  return <AuthContext value={{ status, signOut: signOutSession }}>{children}</AuthContext>;
+  const value = useMemo<AuthValue>(() => ({ ...session, signOut: signOutSession }), [session]);
+
+  return <AuthContext value={value}>{children}</AuthContext>;
 }
 
 export function useAuth(): AuthValue {

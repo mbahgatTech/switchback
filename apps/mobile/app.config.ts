@@ -42,10 +42,16 @@ const config: ExpoConfig = {
       // Recording an activity is the whole point of Phase 4, and iOS shows these strings
       // verbatim in the permission dialog. Written now so the prompts are never the
       // placeholder text an Expo template ships with.
+      //
+      // The when-in-use string describes background recording because that is what when-in-use
+      // buys here: with `location` in `UIBackgroundModes`, this is the authorization the track
+      // actually runs on. Describing only the on-screen map would be asking for one thing and
+      // doing another, and leaving the honest sentence attached to the "Always" prompt most
+      // people decline.
       NSLocationWhenInUseUsageDescription:
-        'Switchback shows your position on the trail and records your hike.',
+        'Switchback records your hike — including with the screen off and the phone in your pocket — and shows your position on the trail.',
       NSLocationAlwaysAndWhenInUseUsageDescription:
-        'Switchback keeps recording your route and can alert you if you leave the trail, even with the screen off.',
+        'Switchback keeps recording your route and can alert you if you leave the trail, even with the screen off. Allowing this also lets iOS restart the recording if it ever has to close the app.',
       NSMotionUsageDescription:
         'Step and elevation data makes your recorded activity stats more accurate.',
       /**
@@ -68,7 +74,30 @@ const config: ExpoConfig = {
       NSAppTransportSecurity: { NSAllowsLocalNetworking: true },
     },
   },
-  plugins: ['expo-router', 'expo-secure-store'],
+  plugins: [
+    'expo-router',
+    'expo-secure-store',
+    /**
+     * Background location. `isIosBackgroundLocationEnabled` is what puts `location` into
+     * `UIBackgroundModes`, and without that key iOS suspends the app at the lock screen and
+     * `startLocationUpdatesAsync` throws rather than registering the task — which is exactly
+     * how `@/record/background` detects a host that cannot carry a hike.
+     *
+     * `locationAlwaysPermission: false` deletes `NSLocationAlwaysUsageDescription`. The plugin
+     * would otherwise write its own placeholder prose into it. It is the older of the two:
+     * `NSLocationAlwaysAndWhenInUseUsageDescription`, set above, replaced it in iOS 11 and is the
+     * one iOS 15 shows.
+     * The three strings this app does define are left alone: the plugin only fills a key that
+     * has no value yet.
+     */
+    [
+      'expo-location',
+      {
+        isIosBackgroundLocationEnabled: true,
+        locationAlwaysPermission: false,
+      },
+    ],
+  ],
   experiments: {
     typedRoutes: true,
   },

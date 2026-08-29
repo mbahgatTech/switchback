@@ -373,9 +373,10 @@ export function LifelinePanel({
        */}
       <Text style={styles.caveat}>
         The link shows your last position and your return time, and stops showing anything the
-        moment you finish this hike or tap “I&apos;m back”. Your position only goes up while
-        Switchback is on screen — lock the phone and the last one sent stands until you come back.
-        Nobody is alerted if you are late; the person you send it to is.
+        moment you finish this hike or tap “I&apos;m back”. While a hike is recording, your position
+        keeps going up with the screen off and the phone in your pocket. With no hike recording it
+        only goes up while Switchback is on screen — lock the phone and the last one sent stands
+        until you come back. Nobody is alerted if you are late; the person you send it to is.
       </Text>
     </View>
   );

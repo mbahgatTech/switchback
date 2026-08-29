@@ -13,5 +13,6 @@ export * from './section';
 export * from './sheet';
 export * from './tally';
 export * from './track';
+export * from './track-stats';
 export * from './fit';
 export * from './graph';

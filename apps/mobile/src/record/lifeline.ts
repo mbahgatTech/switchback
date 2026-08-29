@@ -3,7 +3,7 @@ import { AppState, type NativeEventSubscription } from 'react-native';
 import * as Battery from 'expo-battery';
 import * as Location from 'expo-location';
 import { LIFELINE_PING_INTERVAL_S } from '@switchback/core';
-import { latestFix, type RecordedFix } from '@/record/store';
+import { latestFix, type RecordedFix } from './store';
 
 /**
  * The Lifeline ping loop, at module scope like `@/record/store`: a loop in the Record screen's
@@ -14,9 +14,16 @@ import { latestFix, type RecordedFix } from '@/record/store';
  * (`LIFELINE_PING_INTERVAL_S`, slower than the recorder's upload tick) and takes the recorder's
  * fix only when a fresh one is going spare — never an old one; see `freshFix`.
  *
- * Timers do not run while the app is suspended, so pings stop when Switchback is off screen and
- * the panel says so. The `AppState` listener is the mitigation: returning to the app sends a
- * position immediately rather than waiting out the interval.
+ * **This loop now runs with the screen off.** `UIBackgroundModes: location`, declared for the
+ * recorder in `app.config.ts`, stops iOS suspending the JavaScript runtime while a hike is being
+ * recorded — and these timers with it. A Lifeline running alongside a recording therefore keeps
+ * sending position to a publicly shareable link from a locked phone, which it did not do when
+ * that link's own panel said pings stop when the app is off screen. The `AppState` listener
+ * below is no longer the mitigation it was written as; it is now only what makes a return to the
+ * app send a position immediately rather than waiting out the interval.
+ *
+ * Whether that egress should be bounded back to the foreground is an open product decision, not
+ * an oversight. Recorded here rather than left as a contract that is no longer true.
  */
 
 /** One position report. The shape `lifeline.ping` takes, minus the plumbing. */

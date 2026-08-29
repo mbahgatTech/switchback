@@ -4,6 +4,7 @@ import { defineConfig } from 'vitest/config';
 import { assertLocalTestDatabase } from './test/database-guard';
 
 const packagesDir = fileURLToPath(new URL('./packages', import.meta.url));
+const mobileSrc = fileURLToPath(new URL('./apps/mobile/src', import.meta.url));
 
 // The integration tests need DATABASE_URL, which lives in the root .env rather than the
 // shell. `loadEnv` with an empty prefix reads every key, not just VITE_-prefixed ones.
@@ -50,6 +51,17 @@ export default defineConfig({
       {
         find: /^@switchback\/(core|geo|db|api|ui|weather|busyness|ingest)\/(.*)$/,
         replacement: `${packagesDir}/$1/src/$2`,
+      },
+      /*
+       * `@/` is the mobile app's own prefix, and without it `apps/mobile/src/record/bridge.tsx`
+       * — the component wiring the recorder to auth and the API — cannot be imported by a test at
+       * all. Anchored to the directories that exist under `apps/mobile/src`, so it cannot swallow
+       * a `@/` that some other workspace introduces later; `apps/web` uses relative imports in
+       * everything its tests reach.
+       */
+      {
+        find: /^@\/(api|auth|components|config|offline|photos|record)(\/.*)?$/,
+        replacement: `${mobileSrc}/$1$2`,
       },
     ],
   },

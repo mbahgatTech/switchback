@@ -108,6 +108,134 @@ it from `app.config.ts`, so a committed copy would be a second source of truth t
 wins. Everything normally hand-edited in Xcode — bundle identifier, the `NSLocation*` and
 `NSMotion` permission strings iOS shows verbatim — lives in `app.config.ts` instead.
 
+## Recording with the screen off
+
+```mermaid
+flowchart TB
+    OS(["iOS CoreLocation<br/>UIBackgroundModes: location"]) --> BG["record/background.ts<br/>task + probe + failures"]
+    FG["watchPositionAsync<br/>fallback"] --> ST
+    BG -->|"readings, failures"| ST["record/store.ts<br/>state machine"]
+    AUTH(["auth status + me.get<br/>via record/bridge.tsx"]) -->|"confirmSignedInUser"| ST
+    ST -->|"one leg"| ACC["geo: advanceTrackStats<br/>(incremental)"]
+    ACC -->|"stats"| ST
+    ST -->|"append one batch"| JF["record/journal-files.ts<br/>JournalStore"]
+    ST -->|"stage then rename head"| JF
+    J["record/journal.ts<br/>pure codec, owner rule"] --- ST
+    J -.->|"interface"| JF
+    ST -->|"batch/minute"| API[["activities.append"]]
+```
+
+A hike is recorded by a CoreLocation task the OS owns, not by anything the app schedules.
+`Location.watchPositionAsync` is a foreground subscription: iOS suspends the JavaScript runtime
+when the screen locks, and a track recorded that way is a straight line between the two moments
+somebody looked at their phone. `src/record/background.ts` registers a `TaskManager` task
+instead, at module load rather than in a component, because iOS relaunches a terminated app
+_headless_ to hand it a position and a task defined in a `useEffect` does not exist yet at that
+moment.
+
+The capability is a build-time declaration, not a runtime request. `app.config.ts` enables
+`isIosBackgroundLocationEnabled` on the `expo-location` plugin, which is what puts `location`
+into `UIBackgroundModes`. Without that key `startLocationUpdatesAsync` throws
+`LocationUpdatesUnavailable` — and that throw is exactly how the app tells the two hosts apart.
+The probe is the attempt rather than a `Constants` check, because there is nothing there to
+check: a development build and Expo Go report the same execution environment, and only the
+`Info.plist` differs. (`src/config.ts` does read `Constants.expoGoConfig`, for the Metro host the
+API origin is derived from — a different question with a different answer.)
+
+| Host                               | What it does                                                                                                                                                                                      |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Expo Go**                        | No `location` background mode, so the task cannot register. The app falls back to `watchPositionAsync`, holds the screen awake, and the Record screen says the track pauses when the phone locks. |
+| **Development build / TestFlight** | The task registers. Recording continues with the screen off and the app behind others.                                                                                                            |
+
+Two permissions, doing different jobs:
+
+- **When In Use** is the one recording requires. With the background mode declared, it is enough
+  to keep the track running with the screen off, and iOS shows the location indicator while it
+  does — `showsBackgroundLocationIndicator` is set deliberately.
+- **Always** buys one further thing: iOS may relaunch the app after terminating it under memory
+  pressure and carry on feeding the recording. Refusing it is not a broken hike, so the app never
+  treats it as an error. It reports it — `mayNotSurviveTermination` on the recorder snapshot, and
+  a line on the Record screen naming the setting to change.
+
+`pausesUpdatesAutomatically` is set to `false`. `expo-location` defaults it to **true**
+(`ios/TaskConsumers/EXLocationTaskConsumer.m`), which lets CoreLocation stop updates when it
+decides the user has stopped moving — and with no `activityType` to judge by, it may not start
+them again. `activityType: Fitness` is set alongside it.
+
+Continuous GPS is the heaviest thing a phone does; a long day out wants a battery pack, and the
+Record screen says so before anybody sets off. The journal is the other half of that cost, which
+is why it appends rather than rewrites: `Documents/recording-v2/` holds a small `head.json` and an
+append-only `fixes.ndjson`, so a fix costs one line instead of re-serialising six hours of track
+once a second. CoreLocation delivers readings in batches and each batch is **one** append, not one
+per reading — an eight-hour hike costs roughly five hundred writes rather than twenty-eight
+thousand, and a kill loses the same readings either way, because the ones in a batch arrived
+together. The head is written to a staging name and renamed into place — `expo-file-system`'s
+string write is not atomic, and a head cut in half by a kill is a hike thrown away. A torn
+`fixes.ndjson` tail is dropped by `src/record/journal.ts` and the file repaired at restore, so the
+recording loses the last second, not the hike.
+
+A write the phone refuses — a full disk, most likely — does not stop the hike: the track stays in
+memory and keeps being uploaded on the same minute tick. It is no longer silent either.
+`JournalStore`'s writes report whether they landed, one that did not sets `journalDegraded` on the
+recorder snapshot, and the Record screen says so where the hike can still be saved. Carrying on
+quietly was the right call for the hiker mid-climb; carrying on with **nothing anywhere** recording
+that durability had gone was not.
+
+Running totals are folded one leg at a time (`advanceTrackStats` in `packages/geo`), not
+recomputed. `summariseTrack` walks the whole buffer, which is right for a finished recording and
+quadratic for a live one — at 1 Hz for eight hours it is roughly 575× the work it was when a
+recording could only run while the screen was on. `packages/geo/test/track-stats.test.ts` pins the
+fold to the full pass, because a recorder showing one distance while the server returns another
+would be worse than a slow one.
+
+### What the recording writes down, and how long it stays
+
+A journal is a per-second location history. Three rules follow, and each is enforced in
+`src/record/store.ts` rather than left to habit:
+
+- **It is keyed to the person who made it.** The head carries an `ownerId`, and a journal is
+  restored only for that identity. A different confirmed identity erases it rather than being
+  shown where somebody has been. Signing out seals it — nothing of it is presented and the OS
+  subscription stops — but does not destroy it, because a refresh token expiring mid-hike is an
+  ordinary event on a mountain and losing a hike to it would teach people not to sign out.
+- **An unsettled identity shows nothing.** `me.get` is a network call, and at a trailhead it may
+  not answer for the whole session — so "nobody is confirmed yet" is a state that lasts, not an
+  instant. A journal read back in that state is **withheld**: readings from the OS keep reaching
+  the disk, so a hike in progress loses nothing while the network is out, but no part of the track
+  reaches the screen, the tab bar or the Lifeline until an identity is confirmed, and it is handed
+  over whole or erased whole. Treating "unknown" as "the owner" is how one person's per-second
+  location history reaches the next person to pick the phone up.
+- **Nothing outlives its format.** Journals from every version below this one are deleted at
+  launch rather than ignored — the sweep is derived from `JOURNAL_VERSION`, the same constant the
+  live directory name is, so bumping the format cannot strand a trace behind a hardcoded list.
+- **Nothing outlives the hike by more than a day.** The directory is cleared on finish, on
+  discard, and on an identity that does not own it — and a journal whose hike began more than
+  48 hours ago is erased at the next launch, whether or not it was ever finished. That horizon is
+  `trackFixSchema`'s own: `t` is capped at 48 hours, so past it no further fix could legally join
+  the track and the journal is only a trace. A hike sealed by a sign-out is inside the same
+  horizon, so it is kept for the person who made it and erased once it is stale, not held forever.
+
+`Documents/` rather than `Caches/` because iOS empties Caches under storage pressure and this is
+the one file a recording cannot lose — the cost is that a track rides into iCloud backups, which
+is why the horizon above exists and is the only control standing between an all-day trace and a
+backup. Backup exclusion is not reachable from this stack's file API, and is not claimed. At rest the file takes the app's default
+protection class, unlocked after first authentication: `NSFileProtectionComplete` would make the
+writes fail while the phone is locked in a pocket, which is exactly when they matter.
+
+**The Lifeline now transmits from a locked phone.** `UIBackgroundModes: location` stops iOS
+suspending the JavaScript runtime during a recording, and the Lifeline's ping loop is a timer in
+that same runtime — so a Lifeline running alongside a hike keeps sending position to its publicly
+shareable link with the screen off, where before it went quiet. That is a change in egress, not
+just in scheduling, and whether it should be bounded back to the foreground is an open decision;
+`src/record/lifeline.ts` records it at the loop. Recording's own uploads are unchanged: the same
+`activities.append` batch, on the same minute tick.
+
+A restored recording comes back **paused** unless the OS still holds the task, which is the only
+evidence that distinguishes an app iOS relaunched — where the hike genuinely never stopped — from
+a crash or a force-quit, where the track has a hole in it and only the user can say whether to
+carry on. The reverse is reconciled too: a task still registered for a hike nobody is recording is
+stopped, rather than left running `BestForNavigation` GPS for readings nothing will read.
+
 ## Verifying a change
 
 **There is no iOS simulator on this machine — it runs Windows.** Mobile changes are verified by

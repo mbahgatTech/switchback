@@ -1,5 +1,4 @@
 import { useCallback, useSyncExternalStore } from 'react';
-import * as FileSystem from 'expo-file-system';
 import * as Haptics from 'expo-haptics';
 import * as KeepAwake from 'expo-keep-awake';
 import * as Location from 'expo-location';
@@ -12,33 +11,67 @@ import {
 } from '@switchback/core';
 import {
   DEFAULT_OFF_ROUTE_CONFIG,
+  accumulatedStats,
+  advanceTrackStats,
   initialOffRouteState,
+  initialTrackStats,
   remainingDistanceM,
-  summariseTrack,
   updateOffRoute,
   type OffRouteState,
+  type TrackStatsState,
 } from '@switchback/geo';
+import {
+  hasAlwaysAuthorization,
+  isTrackingInBackground,
+  setBackgroundHandlers,
+  startBackgroundUpdates,
+  stopBackgroundUpdates,
+} from './background';
+import { fileJournalStore } from './journal-files';
+import {
+  JOURNAL_VERSION,
+  decodeFixes,
+  decodeHead,
+  encodeFixes,
+  encodeHead,
+  ownerVerdict,
+  restoredPhase,
+  type JournalHead,
+  type JournalStore,
+} from './journal';
 
 /**
  * The recording engine, at module scope rather than in a hook: a recorder living in the Record
  * screen's state would end the hike the first time somebody switched tabs. React subscribes.
  *
- * The rules are the web recorder's, and deliberately identical — both call `summariseTrack` and
- * the same off-route watchdog out of `@switchback/geo`, so the two clients compute the same
- * numbers from the same fixes. See `apps/web/src/components/record/use-recorder.ts`.
+ * The rules are the web recorder's, and deliberately identical — both compute their numbers with
+ * `@switchback/geo` and the same off-route watchdog, so the two clients and the server agree.
+ * See `apps/web/src/components/record/use-recorder.ts`.
  *
  * 1. The buffer on the device is the truth while hiking; fixes are never removed once sent, so
  *    a failed upload is a retry and not a hole.
  * 2. Nothing waits for the end — a batch goes up about every minute.
- * 3. The journal survives a crash (a file, not `localStorage`) and the recording comes back
- *    **paused**, because the honest thing after an interruption is to ask.
+ * 3. Every fix reaches the journal as it arrives and the head is renamed into place, so a kill
+ *    costs the last second rather than the hike.
+ * 4. A journal is readable only by the identity that made it, erased for any other, and shown to
+ *    nobody at all until one of the two is settled.
  *
- * Expo Go carries no background-location task registration, so recording only runs in the
- * foreground and the screen is held awake for the duration. A development build lifts that
- * without changing anything here: `expo-task-manager` would feed the same `pushFix`.
+ * Fixes come from `@/record/background` where the host allows it, which is what keeps a hike
+ * running with the screen off. Where it does not — Expo Go has no `location` background mode —
+ * the foreground watcher below is the fallback, the screen is held awake, and the Record screen
+ * says which of the two is in force.
+ *
+ * Three things follow from fixes arriving from the OS rather than from a live screen, and each
+ * was a defect before it was a rule: readings arrive in **batches** and every one carries its own
+ * timestamp; `n` is bounded by the length of the hike rather than by screen-on time, so nothing
+ * per-fix may be O(n); and the process outlives the session, so the identity is checked rather
+ * than assumed.
  */
 
 export type RecorderPhase = 'idle' | 'locating' | 'recording' | 'paused' | 'saving';
+
+/** How fixes are arriving. `null` between hikes, and while a start is still being negotiated. */
+export type TrackingSource = 'background' | 'foreground' | null;
 
 export interface RecorderSnapshot {
   phase: RecorderPhase;
@@ -68,14 +101,47 @@ export interface RecorderSnapshot {
   offRouteDistanceM: number | null;
   remainingM: number | null;
   alert: 'left' | 'returned' | null;
+  tracking: TrackingSource;
+  /**
+   * Recording without the "Always" authorization iOS needs to relaunch a terminated app. The
+   * track keeps being written either way — this only means the OS reclaiming memory ends the hike.
+   */
+  mayNotSurviveTermination: boolean;
+  /**
+   * A write to the journal did not land, most likely a full disk. The hike is still being recorded
+   * and still being uploaded; what is gone is the promise that a kill costs only the last second.
+   */
+  journalDegraded: boolean;
+}
+
+/**
+ * What the recorder is actually doing, as a tag rather than as prose.
+ *
+ * A tag, and computed here, because the screen once told a paused hike it was recording: the
+ * mapping had three arms for a four-state domain and the missing one fell through to the most
+ * reassuring sentence. A closed union computed from the store's own state is what makes the
+ * fourth case impossible to leave out.
+ */
+export type TrackingNote =
+  'starting' | 'background-durable' | 'background-fragile' | 'foreground' | 'not-tracking';
+
+export function trackingNote(snapshot: RecorderSnapshot): TrackingNote {
+  if (snapshot.tracking === null) {
+    // `begin` sets `locating` and emits before it has asked the OS for anything, and two
+    // permission dialogs can stand between those two moments. Reading that as "not tracking" told
+    // somebody who had just tapped Start that nothing was being added to their hike.
+    return snapshot.phase === 'locating' ? 'starting' : 'not-tracking';
+  }
+  if (snapshot.tracking === 'foreground') return 'foreground';
+  return snapshot.mayNotSurviveTermination ? 'background-fragile' : 'background-durable';
 }
 
 /** Uploads one batch. Set once at the app root, where the tRPC client lives. */
 export type Uploader = (activityId: string, fixes: TrackFix[]) => Promise<unknown>;
 
-/** One reading, with the moment it arrived. See `latestFix`. */
+/** One reading, with the moment the phone was there. See `latestFix`. */
 export interface RecordedFix {
-  /** `Date.now()` when the watch reported it, not seconds-since-start like `TrackFix.t`. */
+  /** The reading's own timestamp, not seconds-since-start like `TrackFix.t`. */
   at: number;
   lng: number;
   lat: number;
@@ -84,24 +150,17 @@ export interface RecordedFix {
 
 export const FLUSH_INTERVAL_MS = 60_000;
 
-const JOURNAL_NAME = 'recording-v1.json';
-const JOURNAL_VERSION = 1;
 const KEEP_AWAKE_TAG = 'switchback-recording';
 
-interface Journal {
-  v: number;
-  id: string;
-  startedAt: number;
-  trailId: string | null;
-  /**
-   * Optional on read, always written. A journal from before planned routes existed restores as
-   * `null`, so no version bump is needed — and a bump would throw that hike away, which is the
-   * one thing a crash journal exists to prevent.
-   */
-  routeId: string | null;
-  fixes: TrackFix[];
-  sent: number;
-}
+/** A reading stamped this far ahead of now is a clock the device cannot be trusted about. */
+const MAX_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * How long an unfinished journal may sit on disk. `trackFixSchema` caps `t` at 48 hours, so past
+ * this no further fix could legally join the track: it is abandoned, and the only control keeping
+ * an all-day position history out of an iCloud backup is that it does not outlive its hike.
+ */
+const JOURNAL_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
 const listeners = new Set<() => void>();
 
@@ -110,10 +169,11 @@ let activityId: string | null = null;
 let startedAt: Date | null = null;
 let trailId: string | null = null;
 let routeId: string | null = null;
+let ownerId: string | null = null;
 let fixes: TrackFix[] = [];
 let sent = 0;
 let position: LngLat | null = null;
-/** When `position` arrived, and the elevation that came with it. Only `latestFix` reads them. */
+/** When `position` was true, and the elevation that came with it. Only `latestFix` reads them. */
 let positionAt: number | null = null;
 let positionEleM: number | null = null;
 let accuracyM: number | null = null;
@@ -135,16 +195,51 @@ let routeLengthM: number | null = null;
 
 let uploader: Uploader | null = null;
 let watch: Location.LocationSubscription | null = null;
+let tracking: TrackingSource = null;
+let survivesTermination = true;
+/**
+ * Whether the hike is meant to be running. Written into the journal head, and the only thing that
+ * lets a relaunch tell a hike somebody paused from one the OS interrupted.
+ */
+let live = false;
 let flushTimer: ReturnType<typeof setInterval> | null = null;
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let flushing = false;
+/** Set when the server has refused a batch in a way no retry can fix. Cleared only by a new hike. */
+let uploadHalted = false;
 let hydrated = false;
+/** Set by a journal write that did not land, and cleared only by the next hike. See `noteWrite`. */
+let journalDegraded = false;
+/** Who the app currently believes is at the phone. `null` until sign-in resolves. */
+let signedInUser: string | null = null;
 
 /**
- * `summariseTrack` walks the whole buffer, so it is computed once per emit rather than once per
- * reader — on a six-hour hike that is ~20,000 fixes times four subscribers, every second.
+ * A journal read back off disk but shown to nobody, because who is at the phone is not settled.
+ * Readings arriving meanwhile are appended to it, so the hike is not lost; none of it reaches the
+ * snapshot until `ownerVerdict` returns `restore` for a confirmed identity.
  */
-let statsCache: ActivityStats = summariseTrack([]);
+interface WithheldJournal {
+  head: JournalHead;
+  /** `t` of the last fix on disk, so a held append cannot land out of order or twice. */
+  lastT: number;
+}
+
+let withheld: WithheldJournal | null = null;
+
+let journal: JournalStore = fileJournalStore();
+
+/** Swaps the files for something a test can inspect. The seam `store.ts` had no way to offer. */
+export function setJournalStore(next: JournalStore): void {
+  journal = next;
+}
+
+/**
+ * Running totals, folded one leg at a time. `summariseTrack` walks the whole buffer, which is
+ * fine for a finished hike and quadratic for a live one — at 1 Hz for eight hours it was ~575×
+ * the work of the same call on a foreground-only recording, on a battery, in a pocket.
+ */
+let statsState: TrackStatsState = initialTrackStats();
+let statsCache: ActivityStats = accumulatedStats(statsState);
 let snapshot: RecorderSnapshot = build();
 
 function build(): RecorderSnapshot {
@@ -160,7 +255,7 @@ function build(): RecorderSnapshot {
     position,
     accuracyM,
     weakSignal,
-    pending: fixes.length - sent,
+    pending: Math.max(0, fixes.length - sent),
     lastSyncAt,
     syncing,
     geoError,
@@ -170,6 +265,9 @@ function build(): RecorderSnapshot {
     remainingM:
       routeLengthM == null || alongM == null ? null : remainingDistanceM(routeLengthM, alongM),
     alert,
+    tracking,
+    mayNotSurviveTermination: tracking === 'background' && !survivesTermination,
+    journalDegraded,
   };
 }
 
@@ -187,6 +285,14 @@ function subscribe(listener: () => void): () => void {
 function getSnapshot(): RecorderSnapshot {
   return snapshot;
 }
+
+/**
+ * The store's external-store contract, of which `useRecording` is only the React binding. Exported
+ * because anything that needs the recorder outside a render — the Lifeline, a test — should read
+ * the same snapshot the screen does rather than a second view assembled from module internals.
+ */
+export const recordingSnapshot = getSnapshot;
+export const subscribeToRecording = subscribe;
 
 /** The whole recorder. Re-renders once a second while a hike runs. */
 export function useRecording(): RecorderSnapshot {
@@ -235,150 +341,331 @@ export function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-function journalFile(): FileSystem.File {
-  return new FileSystem.File(FileSystem.Paths.document, JOURNAL_NAME);
-}
-
-function persist(): void {
-  if (!activityId || !startedAt) return;
-  try {
-    const journal: Journal = {
-      v: JOURNAL_VERSION,
-      id: activityId,
-      startedAt: startedAt.getTime(),
-      trailId,
-      routeId,
-      fixes,
-      sent,
-    };
-    const file = journalFile();
-    if (!file.exists) file.create({ intermediates: true });
-    file.write(JSON.stringify(journal));
-  } catch {
-    // A full disk, most likely. Only the ability to survive a crash is affected, and saying so
-    // mid-hike is worse than carrying on.
-  }
-}
-
-function clearJournal(): void {
-  try {
-    const file = journalFile();
-    if (file.exists) file.delete();
-  } catch {
-    /* Nothing to do about it, and nothing depends on it. */
-  }
-}
-
-function parseJournal(raw: string): Journal | null {
-  try {
-    const value: unknown = JSON.parse(raw);
-    if (typeof value !== 'object' || value === null) return null;
-    const record = value as Record<string, unknown>;
-    if (record.v !== JOURNAL_VERSION) return null;
-    if (typeof record.id !== 'string' || typeof record.startedAt !== 'number') return null;
-    if (!Array.isArray(record.fixes)) return null;
-    return {
-      v: JOURNAL_VERSION,
-      id: record.id,
-      startedAt: record.startedAt,
-      trailId: typeof record.trailId === 'string' ? record.trailId : null,
-      routeId: typeof record.routeId === 'string' ? record.routeId : null,
-      fixes: record.fixes as TrackFix[],
-      sent: typeof record.sent === 'number' ? record.sent : 0,
-    };
-  } catch {
-    // A corrupt journal is worse than none — its activity id may not exist on the server.
-    return null;
-  }
-}
-
 /**
- * Adopt whatever the last run left behind. Safe to call repeatedly — the app root calls it
- * on mount, and a remount after a fast refresh must not wipe a hike in progress.
+ * Fold a journal write's outcome in. Failures are not raised where they happen — a full disk is
+ * nothing a hiker can act on mid-climb — but the screen where the hike is saved has to be able to
+ * say so, and until this nothing anywhere recorded that durability had gone.
  */
-export function hydrate(): void {
-  if (hydrated) return;
-  hydrated = true;
-  let raw: string;
-  try {
-    const file = journalFile();
-    if (!file.exists) return;
-    raw = file.textSync();
-  } catch {
-    return;
-  }
-  const journal = parseJournal(raw);
-  if (!journal) {
-    clearJournal();
-    return;
-  }
-  fixes = journal.fixes;
-  sent = Math.min(journal.sent, journal.fixes.length);
-  activityId = journal.id;
-  startedAt = new Date(journal.startedAt);
-  trailId = journal.trailId;
-  routeId = journal.routeId;
-  statsCache = summariseTrack(fixes);
-  const last = fixes[fixes.length - 1];
-  if (last) position = [last.lng, last.lat];
-  elapsedS = Math.max(0, Math.round((Date.now() - journal.startedAt) / 1000));
-  // Paused, not recording. See the note at the top of the file.
-  phase = 'paused';
+function noteWrite(landed: boolean): void {
+  if (landed || journalDegraded) return;
+  journalDegraded = true;
   emit();
 }
 
-function pushFix(reading: Location.LocationObject): void {
-  if (!startedAt) return;
-  const { longitude, latitude, altitude, accuracy, speed } = reading.coords;
-  position = [longitude, latitude];
-  positionAt = Date.now();
-  positionEleM = altitude != null && Number.isFinite(altitude) ? altitude : null;
-  accuracyM = accuracy ?? null;
+function writeHead(): void {
+  if (!activityId || !startedAt) return;
+  const head: JournalHead = {
+    v: JOURNAL_VERSION,
+    id: activityId,
+    ownerId,
+    startedAt: startedAt.getTime(),
+    trailId,
+    routeId,
+    sent,
+    live,
+  };
+  noteWrite(journal.writeHead(encodeHead(head)));
+}
+
+/**
+ * Adopt whatever the last run left behind. Safe to call repeatedly — the app root calls it on
+ * mount, and a remount after a fast refresh must not wipe a hike in progress.
+ *
+ * Restores paused, then reconciles with the OS: promoted to recording if the location task is
+ * still registered, and the task stopped if it is registered for a hike that is no longer live.
+ * That order matters — the reconciliation is asynchronous, and a launch that claimed to be
+ * recording before it had asked would be claiming a fix it does not have.
+ *
+ * Runs before any identity is known, so a journal whose owner is unsettled is withheld rather than
+ * restored, and re-decided when `confirmSignedInUser` re-enters here.
+ */
+export function hydrate(): void {
+  // Before the latch, and before any identity is known. Readings from the OS must have somewhere
+  // to land on every launch — an app iOS relaunched in the backcountry has no network, so nothing
+  // that waits on a signed-in user can be what registers these.
+  setBackgroundHandlers({ onReadings, onFailure });
+  if (hydrated) return;
+  // A fresh decision against whoever is signed in now: anything held by the last pass is about to
+  // be published or erased on its own terms.
+  withheld = null;
+  // Journals written in a format this build cannot read are erased rather than left behind: an
+  // unreadable per-second location trace is still a location trace.
+  journal.clearLegacy();
+
+  const raw = journal.readHead();
+  if (raw === null) {
+    // No journal at all, which is the ordinary case. Only now is hydration settled, so a store
+    // that threw does not latch and leave `onReadings` treating a live hike as an orphan.
+    hydrated = true;
+    return;
+  }
+  const head = decodeHead(raw);
+  if (!head) {
+    // Undecodable means real corruption of a track that can no longer be attributed to a server
+    // activity, and leaving that on disk is the same disclosure as never deleting it.
+    discard();
+    return;
+  }
+  if (Date.now() - head.startedAt > JOURNAL_MAX_AGE_MS) {
+    // Older than a recording is allowed to be. `trackFixSchema` caps `t` at 48 hours, so no
+    // further fix could legally join this track — it is abandoned, and an abandoned all-day
+    // position history is the one thing that must not sit in Documents waiting for a backup.
+    discard();
+    return;
+  }
+
+  const verdict = ownerVerdict(head, signedInUser);
+  switch (verdict) {
+    case 'erase':
+      discard();
+      return;
+    case 'wait':
+      withhold(head);
+      return;
+    case 'restore':
+      break;
+    default: {
+      const unhandled: never = verdict;
+      throw new Error(`unhandled owner verdict: ${String(unhandled)}`);
+    }
+  }
+
+  const stored = readStoredFixes();
+  fixes = stored;
+  sent = Math.min(head.sent, stored.length);
+  activityId = head.id;
+  ownerId = head.ownerId;
+  startedAt = new Date(head.startedAt);
+  trailId = head.trailId;
+  routeId = head.routeId;
+  live = head.live;
+  statsState = foldAll(stored);
+  statsCache = accumulatedStats(statsState);
+  const last = fixes[fixes.length - 1];
+  if (last) position = [last.lng, last.lat];
+  elapsedS = Math.max(0, Math.round((Date.now() - head.startedAt) / 1000));
+  phase = 'paused';
+  hydrated = true;
+  emit();
+  void reconcileWithOs(head);
+}
+
+/** Every fix on disk, with a tail cut off mid-append repaired so the next one starts clean. */
+function readStoredFixes(): TrackFix[] {
+  const stored = decodeFixes(journal.readFixes() ?? '');
+  // A torn tail has no newline, so the next append would concatenate onto it and cost a second
+  // fix. Rewritten once here rather than guarded at every append.
+  if (stored.torn) noteWrite(journal.rewriteFixes(encodeFixes(stored.fixes)));
+  return stored.fixes;
+}
+
+/**
+ * Hold a journal whose owner is not settled. Nothing about it is published — a phone handed on
+ * while `me.get` is unanswered must not show the previous hike — but readings keep reaching the
+ * disk, so the identity resolving five minutes later costs no part of the track.
+ */
+function withhold(head: JournalHead): void {
+  const stored = readStoredFixes();
+  withheld = { head, lastT: stored[stored.length - 1]?.t ?? -1 };
+  hydrated = true;
+  // The battery half of the reconciliation, which does not depend on who is at the phone:
+  // `BestForNavigation` left running for a hike nobody is recording drains a phone regardless.
+  if (!head.live) void stopBackgroundUpdates();
+}
+
+/**
+ * Readings arriving for a withheld journal. They reach the disk and nothing else — no snapshot, no
+ * stats, no clock — so whoever is confirmed next takes the whole track or has all of it erased.
+ */
+function recordWithheld(readings: readonly Location.LocationObject[]): void {
+  if (!withheld) return;
+  const held = withheld;
+  const kept: TrackFix[] = [];
+  for (const reading of ordered(readings)) {
+    if (!accurateEnough(reading)) continue;
+    const fix = fixAt(reading, stampOf(reading), held.head.startedAt);
+    if (fix.t <= held.lastT) continue;
+    kept.push(fix);
+    held.lastT = fix.t;
+  }
+  if (kept.length > 0) noteWrite(journal.appendFixes(encodeFixes(kept)));
+}
+
+/** Erase the journal and stop anything the OS is still doing for it. */
+function discard(): void {
+  withheld = null;
+  journal.clear();
+  hydrated = true;
+  void stopBackgroundUpdates();
+}
+
+function foldAll(stored: readonly TrackFix[]): TrackStatsState {
+  let state = initialTrackStats();
+  for (const fix of stored) state = advanceTrackStats(state, fix);
+  return state;
+}
+
+/**
+ * Settle the difference between what the journal says and what the OS is doing.
+ *
+ * A hike iOS kept alive through a relaunch resumes without asking; `restoredPhase` is what
+ * separates that from a crash or a force-quit, after which the track has a hole in it and only
+ * the user can say whether to carry on. The other direction matters just as much and was missed:
+ * a task still registered for a hike nobody is recording is `BestForNavigation` GPS running
+ * indefinitely for readings that will be computed and thrown away.
+ */
+async function reconcileWithOs(head: JournalHead): Promise<void> {
+  const still = await isTrackingInBackground();
+  if (activityId !== head.id) return;
+  if (restoredPhase(head, still) === 'recording') {
+    survivesTermination = await hasAlwaysAuthorization();
+    if (phase === 'paused' && activityId === head.id) adoptBackgroundRecording();
+    return;
+  }
+  if (still) void stopBackgroundUpdates();
+}
+
+/**
+ * Take up a recording the OS is already feeding. Shared by the two ways that happens — a restore
+ * that finds the task registered, and a reading arriving before the restore has finished asking —
+ * because they had drifted apart while doing the same four things.
+ */
+function adoptBackgroundRecording(): void {
+  tracking = 'background';
+  // `locating`, not `recording`: the first fix good enough to trust is what promotes it, exactly
+  // as at the start of a hike, so a restored recording is not claimed before it has a position.
+  phase = 'locating';
+  startClock();
+  emit();
+}
+
+/**
+ * Readings from the OS. They arrive in the foreground, with the screen off, and in an app iOS
+ * relaunched headless with no screen mounted at all.
+ *
+ * Registered before any identity is known, because a relaunch in the backcountry has no network to
+ * resolve one and readings must have somewhere to land. So a reading can arrive for a journal whose
+ * owner is unsettled: `recordWithheld` puts those on disk and shows them to nobody.
+ */
+function onReadings(readings: readonly Location.LocationObject[]): void {
+  if (withheld) {
+    recordWithheld(readings);
+    return;
+  }
+  if (!activityId) {
+    // An orphaned task: the OS is tracking for a hike this device no longer holds. Stop it rather
+    // than keep taking positions nothing will ever use. `hydrated` is only ever set after the
+    // journal has actually been read, so a failed read cannot reach this.
+    if (hydrated) void stopBackgroundUpdates();
+    return;
+  }
+  if (live && phase === 'paused') adoptBackgroundRecording();
+  const recorded: TrackFix[] = [];
+  for (const reading of ordered(readings)) {
+    const fix = pushFix(reading);
+    if (fix) recorded.push(fix);
+  }
+  // One append for the batch that arrived as one. Per fix this was 28,800 open-write-close cycles
+  // over an eight-hour hike where about 500 do the same work — and durability is unchanged, since
+  // readings delivered together are lost together by a kill either way.
+  if (recorded.length > 0) noteWrite(journal.appendFixes(encodeFixes(recorded)));
+}
+
+/** The fallback watcher's sink. It is handed one reading at a time, so its append is its own. */
+function pushForegroundFix(reading: Location.LocationObject): void {
+  const fix = pushFix(reading);
+  if (fix) noteWrite(journal.appendFixes(encodeFixes([fix])));
+}
+
+/**
+ * Oldest first. A reading carries the moment the phone was somewhere, CoreLocation hands over
+ * everything it accumulated while the runtime slept, and nothing promises the order it hands them
+ * over in — while every consumer below drops anything not newer than the fix before it.
+ */
+function ordered(readings: readonly Location.LocationObject[]): Location.LocationObject[] {
+  return [...readings].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/** Whether a reading is worth recording. A fix this vague is a wrong answer, not a rough one. */
+function accurateEnough(reading: Location.LocationObject): boolean {
+  const { accuracy } = reading.coords;
+  return accuracy == null || accuracy <= MAX_FIX_ACCURACY_M;
+}
+
+/** The reading's own elevation, where the device supplied a usable one. */
+function elevationOf(reading: Location.LocationObject): number | null {
+  const { altitude } = reading.coords;
+  return altitude != null && Number.isFinite(altitude) ? altitude : null;
+}
+
+/**
+ * A reading as a fix. `t` counts from the moment the hike began, and `at` is the moment the phone
+ * was *there* — not the moment JavaScript woke up to hear about it. A batch of eight readings all
+ * stamped at delivery computes one `t`, and eight seconds of track collapse to a single point.
+ */
+function fixAt(reading: Location.LocationObject, at: number, startedAtMs: number): TrackFix {
+  const { longitude, latitude, accuracy, speed } = reading.coords;
+  return {
+    t: Math.max(0, Math.round((at - startedAtMs) / 1000)),
+    lng: longitude,
+    lat: latitude,
+    eleM: elevationOf(reading),
+    accuracyM: accuracy ?? null,
+    speedMps: speed != null && speed >= 0 ? speed : null,
+  };
+}
+
+function onFailure(reason: string): void {
+  geoError = reason;
+  emit();
+}
+
+/** The fix this reading was worth, or nothing where it did not become one. Never writes it. */
+function pushFix(reading: Location.LocationObject): TrackFix | null {
+  if (!startedAt) return null;
+  const { longitude, latitude, accuracy } = reading.coords;
+  const at = stampOf(reading);
+
+  // Newest wins. Every reading in a batch used to overwrite this, so the live readout showed the
+  // last reading of the batch while the single fix that survived was the first.
+  if (positionAt == null || at >= positionAt) {
+    position = [longitude, latitude];
+    positionAt = at;
+    positionEleM = elevationOf(reading);
+    accuracyM = accuracy ?? null;
+  }
   geoError = null;
 
-  const usable = accuracy == null || accuracy <= MAX_FIX_ACCURACY_M;
+  const usable = accurateEnough(reading);
   weakSignal = !usable;
   // The first fix good enough to trust is what turns "locating" into "recording".
   if (phase === 'locating' && usable) {
     phase = 'recording';
     startFlushLoop();
   }
-  if (phase !== 'recording') {
+  if (phase !== 'recording' || !usable) {
     emit();
-    return;
-  }
-  if (!usable) {
-    emit();
-    return;
+    return null;
   }
 
-  const t = Math.max(0, Math.round((Date.now() - startedAt.getTime()) / 1000));
+  const fix = fixAt(reading, at, startedAt.getTime());
   const previous = fixes[fixes.length - 1];
-  // One fix a second, at most. The server's `(activityId, t)` constraint would reject the
-  // duplicates anyway; not sending them is cheaper than being rejected.
-  if (previous && t <= previous.t) {
+  if (previous && fix.t <= previous.t) {
     emit();
-    return;
+    return null;
   }
 
-  fixes.push({
-    t,
-    lng: longitude,
-    lat: latitude,
-    eleM: altitude != null && Number.isFinite(altitude) ? altitude : null,
-    accuracyM: accuracy ?? null,
-    speedMps: speed != null && speed >= 0 ? speed : null,
-  });
-  statsCache = summariseTrack(fixes);
-  elapsedS = t;
-  persist();
+  fixes.push(fix);
+  statsState = advanceTrackStats(statsState, fix);
+  statsCache = accumulatedStats(statsState);
+  elapsedS = Math.max(elapsedS, fix.t);
 
   if (route && route.length >= 2) {
     // `updateOffRoute` measures its own timings in milliseconds, unlike `TrackFix.t` which is
     // seconds since the start. The wrong one fires the watchdog after 45 ms or 45,000 seconds.
     const update = updateOffRoute(
       offRouteState,
-      { t: Date.now(), lng: longitude, lat: latitude, accuracyM: accuracy ?? null },
+      { t: at, lng: longitude, lat: latitude, accuracyM: accuracy ?? null },
       route,
       DEFAULT_OFF_ROUTE_CONFIG,
     );
@@ -399,10 +686,19 @@ function pushFix(reading: Location.LocationObject): void {
   // A full batch does not wait for the timer. At 1 Hz the two coincide; on a device
   // reporting faster, this is what keeps the backlog from growing without bound.
   if (fixes.length - sent >= SAMPLE_BATCH) void flush().catch(() => undefined);
+  return fix;
 }
 
-async function startWatch(): Promise<void> {
-  if (watch) return;
+/** A reading's own moment, or now where the device's clock is not worth believing. */
+function stampOf(reading: Location.LocationObject): number {
+  const now = Date.now();
+  const stamp = reading.timestamp;
+  if (!Number.isFinite(stamp) || stamp <= 0) return now;
+  return stamp > now + MAX_CLOCK_SKEW_MS ? now : stamp;
+}
+
+async function startTracking(): Promise<void> {
+  if (tracking) return;
   try {
     const permission = await Location.requestForegroundPermissionsAsync();
     if (!permission.granted) {
@@ -410,18 +706,39 @@ async function startWatch(): Promise<void> {
         ? 'Location access is needed to record a hike.'
         : 'Location access is blocked. Allow it for Switchback in Settings.';
       phase = 'paused';
+      live = false;
+      writeHead();
       emit();
       return;
     }
   } catch {
     geoError = 'Could not ask for location access.';
     phase = 'paused';
+    live = false;
+    writeHead();
     emit();
     return;
   }
 
-  // The screen stays on for the duration. Without background location this is the only thing
-  // keeping the hike being recorded, and the Record screen says so.
+  // The OS first. This is the only source that keeps delivering once iOS suspends the runtime,
+  // and it makes the screen's own state irrelevant to whether a hike is being recorded.
+  const start = await startBackgroundUpdates();
+  if (start.started) {
+    tracking = 'background';
+    survivesTermination = start.survivesTermination;
+    emit();
+    return;
+  }
+  if (start.reason === 'failed') {
+    // Not a host without the capability — services switched off, or authorization withdrawn
+    // between the prompt and the start. Reported rather than mislabelled as a build limitation.
+    geoError = start.message;
+  }
+
+  tracking = 'foreground';
+  survivesTermination = false;
+  // Nothing else is keeping this hike alive now, so the screen cannot be allowed to sleep. Held
+  // only in the fallback: in background mode the point is that the phone may do as it likes.
   void KeepAwake.activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => undefined);
 
   try {
@@ -434,17 +751,20 @@ async function startWatch(): Promise<void> {
         distanceInterval: 0,
         mayShowUserSettingsDialog: true,
       },
-      pushFix,
+      pushForegroundFix,
     );
   } catch {
     geoError = 'No position yet. This usually means no clear view of the sky.';
-    emit();
   }
+  emit();
 }
 
-function stopWatch(): void {
+function stopTracking(): void {
   watch?.remove();
   watch = null;
+  void stopBackgroundUpdates();
+  tracking = null;
+  survivesTermination = true;
   void KeepAwake.deactivateKeepAwake(KEEP_AWAKE_TAG);
 }
 
@@ -479,27 +799,40 @@ export function setUploader(next: Uploader | null): void {
 }
 
 export async function flush(): Promise<void> {
-  if (!activityId || !uploader || flushing) return;
+  if (!activityId || !uploader || flushing || uploadHalted) return;
   if (fixes.length - sent <= 0) return;
 
+  // The hike this flush belongs to. A batch can be in flight when the user finishes and starts
+  // another, and `sent` written back into the new hike's head sends its first fixes nowhere.
+  const forActivity = activityId;
   flushing = true;
   syncing = true;
   emit();
   try {
-    // One batch per call, oldest first: draining the whole backlog in a loop would turn a
-    // reconnection after an hour of no signal into sixty simultaneous requests.
-    while (fixes.length - sent > 0) {
+    // Sequentially, oldest first: awaited rather than fired together, so a reconnection after an
+    // hour of no signal is eight requests in series and not eight at once.
+    while (activityId === forActivity && fixes.length - sent > 0) {
       const from = sent;
       const batch = fixes.slice(from, from + SAMPLE_BATCH);
-      await uploader(activityId, batch);
+      await uploader(forActivity, batch);
+      if (activityId !== forActivity) return;
       sent = from + batch.length;
-      persist();
+      writeHead();
     }
+    if (activityId !== forActivity) return;
     lastSyncAt = new Date();
     syncError = null;
   } catch (cause) {
     // Left in the buffer for the next flush. `sent` only ever advances past acknowledged fixes.
     syncError = cause instanceof Error ? cause.message : 'Could not save the last few minutes.';
+    if (isTerminalUploadError(cause)) {
+      // The server will not take this batch on any attempt — the recording has hit its stored
+      // sample ceiling, or the payload is malformed. Retrying it every minute for the rest of a
+      // hike keeps the radio awake on a battery and moves nothing, so the loop stops and the
+      // screen says what to do instead of failing quietly until the end.
+      stopFlushLoop();
+      uploadHalted = true;
+    }
     throw cause;
   } finally {
     flushing = false;
@@ -508,7 +841,22 @@ export async function flush(): Promise<void> {
   }
 }
 
+/**
+ * Whether a retry could ever succeed. A 4xx from `activities.append` is a statement about the
+ * request, not about the network: the same bytes will be refused again. Read structurally rather
+ * than through a tRPC import, because the uploader is injected and this module never sees the
+ * client.
+ */
+function isTerminalUploadError(cause: unknown): boolean {
+  if (typeof cause !== 'object' || cause === null) return false;
+  const data = (cause as { data?: { code?: unknown; httpStatus?: unknown } }).data;
+  if (!data) return false;
+  if (data.code === 'BAD_REQUEST' || data.code === 'PAYLOAD_TOO_LARGE') return true;
+  return typeof data.httpStatus === 'number' && data.httpStatus >= 400 && data.httpStatus < 500;
+}
+
 function startFlushLoop(): void {
+  if (uploadHalted) return;
   if (flushTimer) return;
   flushTimer = setInterval(() => {
     void flush().catch(() => undefined);
@@ -550,9 +898,13 @@ export function begin({
   trailId: trail,
   routeId: plan = null,
 }: BeginArgs): void {
+  // `journal.open()` below replaces whatever was being held, so the hold has to go with it.
+  withheld = null;
+  journalDegraded = false;
   fixes = [];
   sent = 0;
-  statsCache = summariseTrack(fixes);
+  statsState = initialTrackStats();
+  statsCache = accumulatedStats(statsState);
   offRouteState = initialOffRouteState();
   offRoute = false;
   offRouteDistanceM = null;
@@ -561,21 +913,31 @@ export function begin({
   startedAt = at;
   trailId = trail;
   routeId = plan;
+  // Taken from the store rather than from the caller: four screens start hikes, and an owner
+  // threaded through four call sites is an owner one of them will forget.
+  ownerId = signedInUser;
   syncError = null;
   geoError = null;
   alert = null;
   elapsedS = 0;
   phase = 'locating';
-  persist();
+  live = true;
+  uploadHalted = false;
+  noteWrite(journal.open());
+  writeHead();
   emit();
   startClock();
-  void startWatch();
+  void startTracking();
 }
 
 export function pause(): void {
   if (phase !== 'recording' && phase !== 'locating') return;
   phase = 'paused';
-  stopWatch();
+  // Before the OS subscription goes, so a launch after this one restores paused rather than
+  // resuming a hike the user had stopped.
+  live = false;
+  writeHead();
+  stopTracking();
   stopFlushLoop();
   stopClock();
   emit();
@@ -586,15 +948,19 @@ export function resume(): void {
   if (phase !== 'paused') return;
   phase = 'locating';
   geoError = null;
+  live = true;
+  writeHead();
   emit();
   startClock();
-  void startWatch();
+  void startTracking();
 }
 
 /** Moves to `saving`. The screen calls `activities.finish` and then `forget`. */
 export function stop(): void {
   phase = 'saving';
-  stopWatch();
+  live = false;
+  writeHead();
+  stopTracking();
   stopFlushLoop();
   stopClock();
   emit();
@@ -602,18 +968,29 @@ export function stop(): void {
 
 /** Wipe the local journal without touching the server. */
 export function forget(): void {
-  clearJournal();
-  stopWatch();
+  live = false;
+  journal.clear();
+  stopTracking();
   stopFlushLoop();
   stopClock();
+  reset();
+  emit();
+}
+
+/** Everything about a hike, out of memory. Does not touch the disk — callers decide that. */
+function reset(): void {
+  withheld = null;
+  journalDegraded = false;
   fixes = [];
   sent = 0;
-  statsCache = summariseTrack(fixes);
+  statsState = initialTrackStats();
+  statsCache = accumulatedStats(statsState);
   offRouteState = initialOffRouteState();
   activityId = null;
   startedAt = null;
   trailId = null;
   routeId = null;
+  ownerId = null;
   position = null;
   positionAt = null;
   positionEleM = null;
@@ -628,8 +1005,57 @@ export function forget(): void {
   elapsedS = 0;
   route = null;
   routeLengthM = null;
+  uploadHalted = false;
   phase = 'idle';
+}
+
+/**
+ * Who is at the phone, as the app currently understands it. Driven from `@/record/bridge`, off
+ * the same sign-in seam every other consumer uses.
+ *
+ * A recording is a per-second location history and the device it was made on can be handed to
+ * somebody else, so the journal is keyed to its owner rather than cleared on every sign-out —
+ * a token expiring mid-hike is an ordinary event on a mountain, and destroying a hike for it
+ * would teach people not to sign out, which is worse for privacy than the thing it fixed.
+ *
+ * Signing out seals the recording rather than erasing it: nothing of it is presented, the OS
+ * subscription stops, and it comes back if the same person signs in again. A *different*
+ * identity is the only moment the disclosure exists, and that erases.
+ */
+export function confirmSignedInUser(next: string): void {
+  if (next === signedInUser) return;
+  applyIdentity(next);
+}
+
+/**
+ * Nobody is signed in. The recording is sealed rather than erased — nothing of it is presented and
+ * the OS subscription stops — because a refresh token expiring mid-hike is an ordinary event on a
+ * mountain, and destroying a hike for it would teach people not to sign out.
+ */
+export function signOut(): void {
+  if (signedInUser === null) return;
+  applyIdentity(null);
+}
+
+function applyIdentity(next: string | null): void {
+  signedInUser = next;
+
+  // Only where there is something to take down. On a cold launch this runs before anything has
+  // been restored, and stopping the OS subscription there would end a hike iOS had kept alive.
+  if (activityId !== null) {
+    stopTracking();
+    stopFlushLoop();
+    stopClock();
+    reset();
+  }
+  // The journal is re-read against the new identity rather than trusted from a restore performed
+  // for somebody else. Clearing the state is not enough on its own: subscribers are told the
+  // recorder changed only if something announces it, and the tab bar would otherwise keep drawing
+  // the previous person's clock until an unrelated render happened to come along.
+  hydrated = false;
   emit();
+  if (next === null) return;
+  hydrate();
 }
 
 export function dismissAlert(): void {
