@@ -764,10 +764,10 @@ out tags;`;
 }
 
 /**
- * Waypoints and amenities in an assembled trail's buffer. Separate from the tile query so it
- * runs against a trail's bbox, and only after assembly has decided the trail is worth keeping.
- * Glaciers are areas rather than nodes; `out center` gives one the point every other feature
- * here already has, and the 150 m buffer drops the ones a trail merely skirts.
+ * Waypoints and amenities across one whole tile, against its bbox padded by `PARKING_BUFFER_M` —
+ * a trailhead car park is often up an access road beyond the edge. Glaciers are areas rather than
+ * nodes, so `out center` gives one the point every other feature here already has. Which trail
+ * each feature belongs to is decided locally, at `WAYPOINT_BUFFER_M`, in `attachWaypoints`.
  */
 export function buildFeatureQuery(bbox: BBox, options: { timeoutS?: number } = {}): string {
   const [w, s, e, n] = bbox;

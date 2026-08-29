@@ -4,10 +4,11 @@
  * once — a lookup that reads no part of the tile query's answer has no reason to wait for it, and
  * these two sit between the tile query and the first committed trail.
  *
- * The overlap lives inside the shared client's allowance rather than beside it. Both calls go
- * through the one `deps.overpass` queue, so `OVERPASS_MAX_CONCURRENT` still bounds this process
- * against the whole of Overpass. Filling a two-slot budget is the point; a third slot, or a second
- * client opened to get one, is what an instance blocks an IP for.
+ * The overlap lives inside the shared client's allowance, not beside it: both calls go through the
+ * one `deps.overpass` queue, so `OVERPASS_MAX_CONCURRENT` bounds this process against the whole of
+ * Overpass. Two is the documented-safe number of slots an instance allots one IP, and this fills
+ * that budget rather than widening it. Raising the cap, or opening a second client to get a third
+ * slot, earns an IP block — which takes ingest down for the product, not for one tile.
  */
 
 import type { BBox, LngLat } from '@switchback/core';
