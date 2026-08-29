@@ -381,6 +381,30 @@ nesting in place.
     — is unchanged. The mechanism given for it was wrong.
   decision: Reasoning corrected in §3 Out. No web code changes.
   budget: { implement: 1/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 7
+  at: 2026-08-29T09:05:00+00:00
+  state: IMPLEMENT -> IN_REVIEW
+  event: fix_round_verified
+  detail: >-
+    All six round-2 tasks (T-008..T-013) confirmed present in source rather than trusted from
+    the task table, after this agent was terminated mid-round by a platform API outage and
+    resumed. Working tree was coherent on resume — no truncated write — and is now committed.
+    Correctness returned PASS with a third Major, the `announce` bypass, which is T-011 and was
+    already implemented before the outage: `adopt` and `signOutLocally` now announce from a
+    `finally`. The ordering Correctness asked to have asserted is T-013, in
+    `conventions.test.ts`. Deterministic gates: lint, typecheck and format:check all exit 0.
+    Differential re-run on both sides against base `1789198f`, which `git ls-remote` confirms is
+    still `origin/master` — the base has not moved, so §1 stands unamended.
+  decision: >-
+    Two things declared rather than smoothed over. First, an earlier run this round was
+    contaminated by a `.env` I created in the worktree; it is deleted and no number from that
+    run survives into §10. Second, this host's suite is load-unstable — three runs of one tree
+    gave 38, 43 and 27 failures — so the differential rests on the set of failing files and the
+    arithmetic, not on a headline count. The one file that differs between the two runs,
+    `packages/db/test/entra-client.test.ts`, passes 4/4 alone on the branch and is untouched by
+    a diff confined to `apps/mobile`, `docs/` and this file.
+  budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 1/8 }
 ```
 
 ---
@@ -416,23 +440,64 @@ sweep exit=0
  Test Files  1 failed (1)   Tests  2 failed | 1 passed (3)   exit=1
 ```
 
-**D2, D3, D5 — after the fix.**
+**D2, D3, D5 — after the fix.** Superseded at v1r2; the run below replaces the one recorded at
+seq 3, which was taken with a stray `.env` in the tree (see the note on contamination after it).
 
 ```
- ✓ apps/mobile/test/navigation-targets.test.ts (3 tests)
- ✓ apps/mobile/test/identity-cache.test.ts (3 tests)
- Test Files  2 passed (2)   Tests  6 passed (6)   exit=0
+ ✓ apps/mobile/test/conventions.test.ts       (4 tests)
+ ✓ apps/mobile/test/navigation-targets.test.ts (4 tests)
+ ✓ apps/mobile/test/trail-title.test.ts        (2 tests)
+ ✓ apps/mobile/test/offline-seed.test.ts       (4 tests)
+ ✓ apps/mobile/test/identity-cache.test.ts     (5 tests)
+ Test Files  5 passed (5)   Tests  19 passed (19)   exit=0
 
-npm run test    base 1789198f: Test Files 2 failed | 120 passed (122)  Tests 24 failed | 2285 passed (2309)
-npm run test    this branch:   Test Files 2 failed | 122 passed (124)  Tests 24 failed | 2291 passed (2315)
 npm run lint          exit=0
 npm run typecheck     exit=0
 npm run format:check  exit=0
 ```
 
-The 24 failures are identical on both sides and pre-existing: `test/ci-steps-runnable.test.ts`
-(6) and `test/worker-deploy-path.test.ts` (18), both of which shell out to workflow scripts and
-neither of which touches authentication.
+**The differential, both sides run on this host within the hour, base `1789198f` (which is
+still `origin/master` — the base has not moved since §1 was written):**
+
+```
+base   1789198f: Test Files 2 failed | 115 passed | 5 skipped (122)
+                      Tests 24 failed | 2180 passed | 105 skipped (2309)
+branch e8a4496 : Test Files 3 failed | 117 passed | 5 skipped (125)
+                      Tests 27 failed | 2191 passed | 105 skipped (2323)
+```
+
+Read it as: **+14 tests, all of them passing.** The arithmetic closes exactly — total +14,
+passed +11, failed +3 — because one file that passed on the base run failed on the branch run.
+
+That file is `packages/db/test/entra-client.test.ts`, and it is **flake, not regression**. Run
+alone on the branch it passes 4/4, twice:
+
+```
+$ npx vitest run packages/db/test/entra-client.test.ts
+run1:  Tests  4 passed (4)
+run2:  Tests  4 passed (4)
+```
+
+The whole diff against the base is `apps/mobile/**`, `docs/mobile.md` and this file — nothing
+under `packages/db` — so there is no path by which this change reaches that test.
+
+The remaining failures are pre-existing and identical on both sides: `ci-steps-runnable` and
+`worker-deploy-path`, which shell out to workflow scripts through a `/bin/bash` this Windows
+host does not have (`execvpe(/bin/bash) failed: No such file or directory`). Neither touches
+authentication.
+
+**Two cautions on these numbers, both mine to declare.**
+
+_Contamination, corrected._ An earlier run in this round was taken after I created a `.env` in
+the worktree to get the database suites to connect. It did not connect them; it un-skipped them
+into failures, and the run read 43 failed / 2266 passed / 14 skipped. That file is deleted and
+both runs above were taken without it — which is why 105 tests skip on both sides rather than 14. No number from the contaminated run is used here.
+
+_The suite is not stable on this host under load._ Three full runs of the same tree produced 38,
+43 and 27 failures as the environment changed around them, with individual files taking 116s and
+184s. The host is at 99% disk. A single total from this machine is therefore not evidence on its
+own, and the claim above rests on the _set_ of failing files plus the arithmetic, not on a
+headline count matching.
 
 **UNVERIFIED.** No iOS device or simulator was driven — the host runs Windows and the app has no
 `react-native-web` target. The two defects are proven at source level and by unit test, which is
