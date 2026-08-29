@@ -149,11 +149,8 @@ it('announces an identity change even when the Keychain refuses', () => {
 
 /**
  * Every branch that draws something *instead of* the screen's content: the early-return guards a
- * screen opens with, and the arm a render ternary falls to once its pending arm is done.
- *
- * Both shapes are read off the source rather than listed, so a screen written next month is
- * covered the day it is written — and so that this rule cannot quietly stop reading the screens
- * it was built for.
+ * screen opens with, and the arm a render ternary falls to once its pending arm is done. Read off
+ * the source rather than listed, so a screen written next month is covered the day it is written.
  */
 function screenReplacingBranches(): { at: string; test: string; shape: 'guard' | 'arm' }[] {
   const branches: { at: string; test: string; shape: 'guard' | 'arm' }[] = [];

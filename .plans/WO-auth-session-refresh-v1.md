@@ -690,3 +690,77 @@ headline count matching.
 **UNVERIFIED.** No iOS device or simulator was driven — the host runs Windows and the app has no
 `react-native-web` target. The two defects are proven at source level and by unit test, which is
 the standard `docs/mobile.md` § "Verifying a change" already sets for this repository.
+
+---
+
+**Round 5, on `d11b1cd` — the merge-gate findings (T-014..T-017).** The mobile suite is 48 tests
+across 6 files:
+
+```
+ ✓ apps/mobile/test/session.test.ts           (14)
+ ✓ apps/mobile/test/identity-cache.test.ts    (10)
+ ✓ apps/mobile/test/conventions.test.ts        (8)
+ ✓ apps/mobile/test/navigation-targets.test.ts (7)
+ ✓ apps/mobile/test/offline-seed.test.ts       (7)
+ ✓ apps/mobile/test/trail-title.test.ts        (2)
+ Test Files 6 passed (6)   Tests 48 passed (48)   exit=0
+
+npm run lint                                      exit=0
+npm run typecheck --workspace=@switchback/mobile  exit=0
+npx prettier --check apps/mobile                  exit=0
+```
+
+Every mutation below was re-run against this head rather than carried forward from an earlier
+round, because a claim inherited is a claim unverified:
+
+| Mutation                                            | Result                                                                           |
+| --------------------------------------------------- | -------------------------------------------------------------------------------- |
+| all ten screen predicates put back to `isError`     | fails, naming all ten sites                                                      |
+| `query.isError` put back at `trails/[slug].tsx:296` | fails, naming that one site                                                      |
+| `me.get` un-gated in `settings.tsx`                 | `a query about the reader needs an enabled gate: [ 'app\settings.tsx: me.get' ]` |
+| `hasStoredSession` back to `!== null`               | `expected true to be false`                                                      |
+| single-flight refresh dropped                       | `expected "spy" to be called 1 times, but got 3 times`                           |
+| non-`ok` response handling dropped                  | `expected undefined to be null`, twice                                           |
+| `resetQueries()` replaced by `clear()`              | 4 fail — `expected 'ALICE-profile' to be 'BOB-profile'`                          |
+| dedupe on the boolean again                         | `a second sign-in must reset: expected 5 to be greater than 5`                   |
+| `generation` dropped from the hydrate deps          | `expected 'copy, queryClient, trpc' to contain 'generation'`                     |
+| both `finally` announcements reverted               | 3 fail — `expected [] to deeply equal [ true ]` and `[ false ]`                  |
+
+**The round-5 differential, against `d11b1cd`.** Both sides run back to back from worktrees that
+resolve the same `node_modules`, so the two runs differ only in the source under test:
+
+```
+base   d11b1cd: Test Files  5 failed | 114 passed | 5 skipped (124)
+                     Tests 15 failed | 2250 passed | 105 skipped (2370)
+branch 45d6a44: Test Files  4 failed | 119 passed | 5 skipped (128)
+                     Tests 16 failed | 2292 passed | 105 skipped (2413)
+```
+
++43 tests and +4 files, exactly the mobile suite's growth (48 from 5, over 6 files from 2). All 48
+mobile tests pass on the branch. Residuals per file:
+
+```
+                                            base   branch
+packages/ingest/test/config.test.ts            6        6
+packages/ingest/test/drain-slot.test.ts        3        3
+packages/ingest/test/terrain-cache.test.ts     2        0
+test/ci-steps-runnable.test.ts                 1        1
+test/worker-deploy-path.test.ts                3        6
+```
+
+`config.test.ts` fails identically on both sides because this host's `.env` carries an
+`OVERPASS_USER_AGENT` the config validator rejects — an environment fact, not a repository one.
+Every other failure on both sides is `Test timed out in 5000ms`.
+
+**Correcting the record on residuals.** §10 above, and the pull request, previously named
+`ci-steps-runnable` and `worker-deploy-path` as the residual set and asserted that the failing
+_file_ set was identical across runs. On this measurement it is not: `terrain-cache` failed on the
+base run and passed on the branch run, `worker-deploy-path` moved from three failures to six, and
+`config.test.ts` and `drain-slot.test.ts` fail on both sides and were never named. The stable
+claim is the arithmetic, not the file set.
+
+**UNVERIFIED, unchanged from round 4.** No iOS device or simulator was driven, and no CI job runs
+a browser on a pull request: the browser suite is gated on `schedule` or `workflow_dispatch` with
+no path filters anywhere in the workflow, so it skips on every PR — and on its nightly run it
+drives `apps/web` behind an injected session cookie, so it could not catch this change in any
+case.
