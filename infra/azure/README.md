@@ -1682,12 +1682,13 @@ off rather than half on. Off means every tile comes from the origin, which is wh
 before the cache existed — the same thing a slow bucket, a 403 or an outage degrades to, because
 `TerrainCache` answers `unavailable` and the caller reads that as a miss.
 
-R2 rather than Postgres or the worker's own storage account, and the reasons are in
-`.plans/WO-shared-terrain-cache-v1.md`. The short form: the server above has a 64 GiB disk at 240
-IOPS shared with every trail, and world coverage of z13 terrain is 250–500 GB; the worker's blob
-storage is reached by managed identity that Vercel does not hold, and Vercel elevates planned
-routes through the same `getTerrain()`. R2 is reachable from both over plain HTTPS and charges no
-egress in either direction.
+R2 rather than Postgres or the worker's own storage account. The server above has a 64 GiB disk at
+240 IOPS shared with every trail, and world coverage of z13 terrain is 250–500 GB, so the cache
+would outgrow the database it lived in and spend the IOPS the commit loop needs. The worker's blob
+storage is reached by a managed identity Vercel does not hold, and Vercel elevates planned routes
+through the same `getTerrain()`, so a blob cache would serve one surface and not the other. R2 is
+reachable from both over plain HTTPS and charges no egress in either direction — $0.015/GB-month,
+$7.50 at full world coverage.
 
 Vercel needs the same four names in its project environment for the route planner to share the
 cache. It works without them — that surface simply keeps fetching from the origin.

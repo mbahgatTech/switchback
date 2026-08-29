@@ -1,8 +1,8 @@
 /**
  * Terrarium tiles in a Cloudflare R2 bucket — the deployed half of the shared tier. Chosen over
- * Postgres and Azure Blob for a reason recorded in `.plans/WO-shared-terrain-cache-v1.md`: it is
- * the only store both the Functions worker and Vercel reach over plain HTTPS, and its egress is
- * free in both directions.
+ * Postgres and Azure Blob for a reason recorded in `infra/azure/README.md`: it is the only store
+ * both the Functions worker and Vercel reach over plain HTTPS, and its egress is free in both
+ * directions.
  *
  * **SigV4 is here rather than imported.** `packages/api/src/storage.ts` has a presigner, but
  * `@switchback/api` depends on `@switchback/ingest`, so importing it back is a cycle. This is the
