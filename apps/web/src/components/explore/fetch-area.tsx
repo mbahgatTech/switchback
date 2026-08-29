@@ -105,7 +105,7 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
           {busyReason === 'storage'
             ? 'There is no room left to store new ground. Trails already mapped still work.'
             : busyReason === 'rate-limit'
-              ? 'You have fetched a lot of new ground just now. Try this area again in a few minutes.'
+              ? 'You have fetched a lot of new ground recently. This area can be fetched again later on.'
               : 'The fetch queue is full right now. Try again in a few minutes.'}
         </p>
       ) : null}

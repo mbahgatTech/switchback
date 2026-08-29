@@ -96,7 +96,7 @@ function describe(
       coverage.busyReason === 'storage'
         ? 'fetching new ground is paused: there is no room left to store it. Everything already mapped still works.'
         : coverage.busyReason === 'rate-limit'
-          ? 'that is a lot of new ground at once, so fetching more is paused for a few minutes. Everything already mapped still works.'
+          ? 'that is a lot of new ground at once, so fetching more is paused for now. Everything already mapped still works.'
           : 'fetching new ground is paused while the queue clears. Try again in a few minutes.';
     return {
       text: shown > 0 ? `${count(shown, total)} · ${why}` : capitalise(why),

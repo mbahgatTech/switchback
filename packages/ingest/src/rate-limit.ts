@@ -41,22 +41,70 @@ export const BUCKET_CAPACITY = Math.max(
 );
 
 /**
- * How long an empty bucket takes to fill. Long enough that sustained hammering costs more than
- * the queue drains, short enough that a reader who tripped it is panning over new ground again
- * within a few minutes rather than being locked out of the map.
+ * What the estate actually drains, in tiles per hour: 28.5 at the mean, 6.7 at p90, measured on
+ * the deployed queue.
+ *
+ * This is the number an allowance has to respect. Granting one caller more than a share of it
+ * promises work the estate cannot do, and the queue that promise fills is the one every other
+ * reader waits behind. `MAX_TILE_QUEUE_DEPTH`'s docstring calls 600 jobs "roughly an hour of
+ * drain", which disagrees with this by about 21x; the two cannot both be right and the
+ * re-measurement of that ceiling is a separate stream. This one is measured, and is the only
+ * input to the refill below.
  */
-export const BUCKET_REFILL_MS = 30 * 60_000;
+export const ESTATE_DRAIN_TILES_PER_HOUR = 28.5;
+
+/** Tiles per hour one caller may sustain — their share of what the estate can actually drain. */
+export const PRINCIPAL_TILES_PER_HOUR = ESTATE_DRAIN_TILES_PER_HOUR * PRINCIPAL_QUEUE_SHARE;
+
+/**
+ * How long an empty bucket takes to refill: the allowance divided by the sustained rate, so the
+ * burst and the rate are tuned by two separate numbers rather than one.
+ *
+ * Derived rather than chosen. The window this replaced was 30 minutes, which refilled 120 tiles
+ * at 240/hour — 8.4x what the estate drains — so one caller could hold the product-wide ceiling
+ * indefinitely and every other reader saw `queue-depth` for as long as it cared to continue.
+ * `BUCKET_CAPACITY` still covers one deliberate area fetch in a burst; what changed is that a
+ * second burst is now paced by the drain rather than by a clock nobody measured against it.
+ */
+export const BUCKET_REFILL_MS = Math.ceil((BUCKET_CAPACITY / PRINCIPAL_TILES_PER_HOUR) * 3_600_000);
 
 /** How often one process may mention a rate-limited caller. This runs behind every viewport. */
 export const RATE_WARN_INTERVAL_MS = 60_000;
 
-const TOKENS_PER_SECOND = BUCKET_CAPACITY / (BUCKET_REFILL_MS / 1000);
+/**
+ * The measured rate is the primitive; `BUCKET_REFILL_MS` is a rounded consequence of it. Deriving
+ * this back out of that rounded window instead leaves the bucket a float-rounding hair short of
+ * full after exactly one window, so "wait the window out" did not refill it.
+ */
+const TOKENS_PER_SECOND = PRINCIPAL_TILES_PER_HOUR / 3600;
 
-let warnedAt = Number.NEGATIVE_INFINITY;
+/**
+ * When each principal's refusal was last logged. Per principal rather than one global mark: with
+ * a single mark whichever caller trips first owns the whole budget, so a sustained abuser
+ * silences the very line an operator is told to watch for everybody else.
+ */
+const warnedAt = new Map<string, number>();
+
+/** Past this many tracked principals, drop the ones whose interval has already elapsed. */
+const WARN_TRACKING_LIMIT = 1_000;
 
 /** Test seam: forget the once-per-interval log state. */
 export function resetIngestBudgetState(): void {
-  warnedAt = Number.NEGATIVE_INFINITY;
+  warnedAt.clear();
+}
+
+/** Whether this principal may be logged now, recording the mention when it may. */
+function mayWarn(key: string, at: number): boolean {
+  const last = warnedAt.get(key);
+  if (last !== undefined && at - last < RATE_WARN_INTERVAL_MS) return false;
+
+  if (warnedAt.size >= WARN_TRACKING_LIMIT) {
+    for (const [seen, when] of warnedAt) {
+      if (at - when >= RATE_WARN_INTERVAL_MS) warnedAt.delete(seen);
+    }
+  }
+  warnedAt.set(key, at);
+  return true;
 }
 
 /** What a spend attempt did. `remaining` is null when there was not enough to take. */
@@ -106,7 +154,10 @@ export async function spendIngestBudget(
     VALUES (${principal.key}, ${BUCKET_CAPACITY - cost}::float8, ${now}::timestamptz)
     ON CONFLICT (principal) DO UPDATE
        SET tokens = ${available} - ${cost}::float8,
-           "refilledAt" = ${now}::timestamptz
+           -- Never backwards. Elapsed time is already clamped at zero for a slow instance, but
+           -- writing its clock unclamped would rewind the row and hand the next normal-clock
+           -- reader the skew as free tokens: 15 minutes of skew was measured granting 60.
+           "refilledAt" = GREATEST(b."refilledAt", ${now}::timestamptz)
      WHERE ${available} >= ${cost}::float8
     RETURNING tokens
   `);
@@ -114,9 +165,7 @@ export async function spendIngestBudget(
   const granted = rows[0];
   if (granted !== undefined) return { spent: true, remaining: granted.tokens };
 
-  const at = now.getTime();
-  if (at - warnedAt >= RATE_WARN_INTERVAL_MS) {
-    warnedAt = at;
+  if (mayWarn(principal.key, now.getTime())) {
     console.warn(
       `ingest refused: ${principal.kind} ${principal.key} asked for ${cost} more tiles than its ${BUCKET_CAPACITY}-tile allowance holds`,
     );

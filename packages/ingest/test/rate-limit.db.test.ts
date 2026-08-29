@@ -6,8 +6,10 @@ import { MAX_AREA_TILES, queueTiles } from '../src/coverage';
 import {
   BUCKET_CAPACITY,
   BUCKET_REFILL_MS,
+  ESTATE_DRAIN_TILES_PER_HOUR,
   MIN_BUCKET_CAPACITY,
   PRINCIPAL_QUEUE_SHARE,
+  PRINCIPAL_TILES_PER_HOUR,
   pruneIngestBuckets,
   resetIngestBudgetState,
   spendIngestBudget,
@@ -63,6 +65,11 @@ async function clear(): Promise<void> {
   await prisma.ingestJob.deleteMany({ where: { dedupeKey: { contains: `:${NS}` } } });
   await prisma.ingestTile.deleteMany({ where: { quadkey: { startsWith: NS } } });
   await prisma.ingestRateBucket.deleteMany({ where: { principal: { in: KEYS } } });
+}
+
+/** How many of this file's buckets still exist. The sweep's own count is table-wide. */
+async function mine(): Promise<number> {
+  return prisma.ingestRateBucket.count({ where: { principal: { in: KEYS } } });
 }
 
 /** How many of this file's tiles are on the request queue right now. */
@@ -278,7 +285,10 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
         new Date(NOW.getTime() + BUCKET_REFILL_MS + 1),
       );
 
-      expect(swept).toBe(1);
+      // `pruneIngestBuckets` sweeps the whole table and `clear()` only owns `KEYS`, so the
+      // return value counts other people's rows too. What this file may assert is its own.
+      expect(swept).toBeGreaterThanOrEqual(1);
+      expect(await mine()).toBe(1);
       expect(
         await prisma.ingestRateBucket.findUnique({ where: { principal: ABUSER.key } }),
       ).toBeNull();
@@ -387,9 +397,10 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
         // `pruneIngestBuckets` reads the column through Prisma while the spend wrote it through
         // raw SQL. The two must agree about what instant the row holds, or retention deletes a
         // spent bucket and hands its owner a full allowance early.
-        const swept = await pruneIngestBuckets(prisma, new Date(NOW.getTime() + 60_000));
+        await pruneIngestBuckets(prisma, new Date(NOW.getTime() + 60_000));
 
-        expect(swept).toBe(0);
+        // This file's own rows, not the table-wide count the sweep returns.
+        expect(await mine()).toBe(1);
         expect(
           await prisma.ingestRateBucket.findUnique({ where: { principal: ABUSER.key } }),
         ).not.toBeNull();
@@ -397,4 +408,57 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
       TIMEOUT,
     );
   });
+  it(
+    'holds a sustained caller to what the estate can drain, not just to its first burst',
+    async () => {
+      // Six hours of one caller asking for a viewport every three minutes — the shape that pinned
+      // the product-wide queue while the allowance refilled at 240 tiles/hour against an estate
+      // that drains 28.5. Measured at 780 tiles granted over this run, against 171 drainable.
+      const step = 3 * 60_000;
+      const hours = 6;
+      let granted = 0;
+
+      for (let at = 0; at < hours * 3_600_000; at += step) {
+        const outcome = await spendIngestBudget(
+          prisma,
+          ABUSER,
+          VIEWPORT,
+          new Date(NOW.getTime() + at),
+        );
+        if (outcome.spent) granted += VIEWPORT;
+      }
+
+      // The burst, plus six hours of refill at the sustained rate, and nothing past it.
+      expect(granted).toBeLessThanOrEqual(
+        Math.ceil(BUCKET_CAPACITY + hours * PRINCIPAL_TILES_PER_HOUR),
+      );
+      // And under what the estate itself drains in those six hours, which is the property that
+      // stops one caller pinning the ceiling against every other reader.
+      expect(granted).toBeLessThan(hours * ESTATE_DRAIN_TILES_PER_HOUR);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'takes only the cost from an instance behind the clock: no phantom drain, no rewound clock',
+    async () => {
+      await spendIngestBudget(prisma, ABUSER, BUCKET_CAPACITY - 10, NOW);
+      const stored = await prisma.ingestRateBucket.findUnique({
+        where: { principal: ABUSER.key },
+      });
+
+      const slow = new Date(NOW.getTime() - 15 * 60_000);
+      const outcome = await spendIngestBudget(prisma, ABUSER, 1, slow);
+      const after = await prisma.ingestRateBucket.findUnique({ where: { principal: ABUSER.key } });
+
+      // Elapsed is clamped at zero, so the reading buys no refill — and costs nothing beyond the
+      // spend. Without `GREATEST(0, …)` this bucket is drained by tiles nobody asked for.
+      expect(outcome.spent).toBe(true);
+      expect(after?.tokens).toBeCloseTo(9, 6);
+      // And the row's clock never moves backwards. Writing the slow instance's `now` unclamped
+      // rewinds it, and the next reader on a normal clock is handed the skew as free tokens.
+      expect(after?.refilledAt.getTime()).toBe(stored?.refilledAt.getTime());
+    },
+    TIMEOUT,
+  );
 });
