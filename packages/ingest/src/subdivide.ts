@@ -64,8 +64,9 @@ export const SUBTREE_STUCK_MARKER = 'switchback-ingest-subtree-stuck';
  * on each revival — which is precisely how a revived child restarts its five-attempt ladder from
  * zero and why an uncapped revival never terminates.
  *
- * `reconcileDeadJobs` reads this cap rather than working around it: a child past it is skipped
- * there too, so the two revival paths do not sum into an unbounded one.
+ * `reconcileDeadJobs` reads this cap rather than working around it: a child past it is retired
+ * there rather than granted a second budget, so the two revival paths do not sum into an
+ * unbounded one.
  */
 export const SPLIT_CHILD_ATTEMPT_CAP = 2 * DEFAULT_MAX_ATTEMPTS;
 
@@ -273,7 +274,7 @@ export interface ChildQueueOutcome {
  *
  * **A `dead` child is revived, deliberately, but only up to `SPLIT_CHILD_ATTEMPT_CAP` runs.** This
  * is the path back for a child: `splitTile` enqueues each exactly once, `ensureCoverage` covers z9
- * alone, `reclaimExpiredJobs` does not touch a dead row, and `reconcileDeadJobs` skips a child
+ * alone, `reclaimExpiredJobs` does not touch a dead row, and `reconcileDeadJobs` retires a child
  * this cap has already stopped rather than granting it a second budget. The cap is what keeps that
  * from running forever — a revived child starts a fresh five-attempt ladder, so without a counter
  * the ladder restarts for as long as anyone leaves a map open over the parent. `attempts` on the

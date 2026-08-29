@@ -132,10 +132,16 @@ the operator's way back, and are now the second way rather than the only one.
 `queueStaleChildren` revives a `dead` child deliberately — `ensureCoverage` covers z9 alone and
 never sees a z10 row — and that revival bypasses the `ensureCoverage` guard above entirely.
 `reconcileDeadJobs` does not make a second path out of it: a child already past
-`SPLIT_CHILD_ATTEMPT_CAP` is skipped there, so the two revival routes do not sum into an unbounded
-one, and the parent's `SUBTREE_STUCK_MARKER` stays the single report of an abandoned subtree. The ladder is therefore not the child's ceiling: each
-revival resets it. `SPLIT_CHILD_ATTEMPT_CAP` is, counted in `IngestTile.attempts`, which
-`processTile` increments per run and nothing resets.
+`SPLIT_CHILD_ATTEMPT_CAP` is **retired** there rather than granted a second budget, so the two
+revival routes do not sum into an unbounded one. Retiring rather than skipping is what closes the
+path, and it is also what reports it, at a price worth knowing: `ingestPump` logs one
+`JOB_ABANDONED_MARKER` per retired child, and that marker is an arm of the Sev-2
+`switchback-ingest-ground-lost` rule, so a fully-capped parent puts four lines in that rule's
+window on top of the `SUBTREE_STUCK_MARKER` on its own row. Sixteen of them is sixty-four — which
+is the population this triage was written for, so the noise arrives exactly when it is least
+welcome. The ladder is therefore not the child's ceiling: each revival resets it.
+`SPLIT_CHILD_ATTEMPT_CAP` is, counted in `IngestTile.attempts`, which `processTile` increments per
+run and nothing resets.
 
 Past the cap the child is abandoned and the parent is **held** — not promoted, not failed. `rollUp`
 needs all four children settled, so a parent short one child keeps whatever it committed and does
