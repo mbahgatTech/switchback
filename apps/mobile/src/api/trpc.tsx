@@ -1,12 +1,13 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createTRPCClient, httpBatchLink, httpLink, splitLink } from '@trpc/client';
 import { createTRPCContext } from '@trpc/tanstack-react-query';
 import superjson from 'superjson';
 import { isUnbatched, MAX_BATCH_SIZE } from '@switchback/core';
 import type { AppRouter } from '@switchback/api';
-import { getAccessToken } from '@/auth/session';
+import { getAccessToken, subscribe } from '@/auth/session';
 import { trpcUrl } from '@/config';
+import { forgetAnswersOnIdentityChange } from './identity';
 
 /**
  * The API client.
@@ -73,6 +74,15 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
       ],
     });
   });
+
+  /*
+   * Subscribed here rather than in `AuthProvider`. React mounts a child's effects before its
+   * parent's, so this subscribes first and the cache is emptied before any screen re-renders on
+   * the new status — which makes the refetch that follows the first one rather than a second.
+   * That is a cost argument, not a correctness one: `resetQueries` notifies its observers, so a
+   * mounted screen is right either way. `test/conventions.test.ts` holds the nesting in place.
+   */
+  useEffect(() => forgetAnswersOnIdentityChange(queryClient, subscribe), [queryClient]);
 
   return (
     <QueryClientProvider client={queryClient}>

@@ -107,7 +107,7 @@ export default function YouScreen() {
     );
   }
 
-  if (me.isError || stats.isError || !me.data) {
+  if (!me.data || !stats.data) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.name}>Could not load your record</Text>

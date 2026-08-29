@@ -144,7 +144,7 @@ export default function RouteScreen() {
     );
   }
 
-  if (route.isError || !detail) {
+  if (!detail) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.title}>Route not found</Text>

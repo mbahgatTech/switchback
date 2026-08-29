@@ -11,6 +11,7 @@ import {
 import { CONTROL_HEIGHT, nativeTheme } from '@switchback/ui';
 import { askAgain } from '@/api/after-write';
 import { useTRPC } from '@/api/trpc';
+import { useAuth } from '@/auth/context';
 import { apiBaseUrl } from '@/config';
 import { useLifelinePings } from '@/record/lifeline';
 
@@ -58,7 +59,13 @@ export function LifelinePanel({
   const queryClient = useQueryClient();
   const pings = useLifelinePings();
 
-  const active = useQuery(trpc.lifeline.active.queryOptions());
+  const { status } = useAuth();
+  // Account-scoped: the active session belongs to a reader. Ungated it fires as nobody through
+  // the reset that follows every identity change, and 401s.
+  const active = useQuery({
+    ...trpc.lifeline.active.queryOptions(),
+    enabled: status === 'signedIn',
+  });
   const session = active.data ?? null;
 
   const [open, setOpen] = useState(false);
