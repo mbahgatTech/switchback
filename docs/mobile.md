@@ -149,16 +149,52 @@ Continuous GPS is the heaviest thing a phone does; a long day out wants a batter
 Record screen says so before anybody sets off. The journal is the other half of that cost, which
 is why it appends rather than rewrites: `Documents/recording-v2/` holds a small `head.json` and an
 append-only `fixes.ndjson`, so a fix costs one line instead of re-serialising six hours of track
-once a second. A kill mid-write leaves a half-line, which `src/record/journal.ts` drops — the
+once a second. The head is written to a staging name and renamed into place — `expo-file-system`'s
+string write is not atomic, and a head cut in half by a kill is a hike thrown away. A torn
+`fixes.ndjson` tail is dropped by `src/record/journal.ts` and the file repaired at restore, so the
 recording loses the last second, not the hike.
 
-Nothing leaves the phone that did not already: the same `activities.append` batch, on the same
-minute tick. Background location changes when fixes are collected, not where they go.
+Running totals are folded one leg at a time (`advanceTrackStats` in `packages/geo`), not
+recomputed. `summariseTrack` walks the whole buffer, which is right for a finished recording and
+quadratic for a live one — at 1 Hz for eight hours it is roughly 575× the work it was when a
+recording could only run while the screen was on. `packages/geo/test/track-stats.test.ts` pins the
+fold to the full pass, because a recorder showing one distance while the server returns another
+would be worse than a slow one.
+
+### What the recording writes down, and how long it stays
+
+A journal is a per-second location history. Three rules follow, and each is enforced in
+`src/record/store.ts` rather than left to habit:
+
+- **It is keyed to the person who made it.** The head carries an `ownerId`, and a journal is
+  restored only for that identity. A different confirmed identity erases it rather than being
+  shown where somebody has been. Signing out seals it — nothing of it is presented and the OS
+  subscription stops — but does not destroy it, because a refresh token expiring mid-hike is an
+  ordinary event on a mountain and losing a hike to it would teach people not to sign out.
+- **Nothing outlives its format.** `recording-v1.json`, written by builds before this, is deleted
+  at launch rather than ignored.
+- **Nothing outlives the hike.** The directory is cleared on finish, on discard, and on an
+  identity that does not own it.
+
+`Documents/` rather than `Caches/` because iOS empties Caches under storage pressure and this is
+the one file a recording cannot lose — the cost is that a track rides into iCloud backups, which
+is why nothing is kept beyond the hike in progress. At rest the file takes the app's default
+protection class, unlocked after first authentication: `NSFileProtectionComplete` would make the
+writes fail while the phone is locked in a pocket, which is exactly when they matter.
+
+**The Lifeline now transmits from a locked phone.** `UIBackgroundModes: location` stops iOS
+suspending the JavaScript runtime during a recording, and the Lifeline's ping loop is a timer in
+that same runtime — so a Lifeline running alongside a hike keeps sending position to its publicly
+shareable link with the screen off, where before it went quiet. That is a change in egress, not
+just in scheduling, and whether it should be bounded back to the foreground is an open decision;
+`src/record/lifeline.ts` records it at the loop. Recording's own uploads are unchanged: the same
+`activities.append` batch, on the same minute tick.
 
 A restored recording comes back **paused** unless the OS still holds the task, which is the only
 evidence that distinguishes an app iOS relaunched — where the hike genuinely never stopped — from
 a crash or a force-quit, where the track has a hole in it and only the user can say whether to
-carry on.
+carry on. The reverse is reconciled too: a task still registered for a hike nobody is recording is
+stopped, rather than left running `BestForNavigation` GPS for readings nothing will read.
 
 ## Verifying a change
 

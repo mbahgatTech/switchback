@@ -22,8 +22,11 @@ import {
   flush,
   forget,
   formatClock,
+  trackingNote,
   useRecording,
   useRecorderActions,
+  type RecorderSnapshot,
+  type TrackingNote,
 } from '@/record/store';
 
 /**
@@ -281,7 +284,7 @@ export default function RecordScreen() {
       {/* One line, always in the same place, saying whether the instrument is working. */}
       <Text style={styles.signal}>{signalLine(recording, units)}</Text>
 
-      {running ? <Text style={styles.caveat}>{trackingNote(recording)}</Text> : null}
+      {running ? <Text style={styles.caveat}>{trackingProse(recording)}</Text> : null}
 
       {recording.geoError ? <Text style={styles.problem}>{recording.geoError}</Text> : null}
       {recording.syncError ? <Text style={styles.problem}>{recording.syncError}</Text> : null}
@@ -327,9 +330,10 @@ export default function RecordScreen() {
           ) : null}
 
           <Text style={styles.caveat}>
-            Put the phone in your pocket and the track carries on — Switchback records with the
-            screen off. Continuous GPS is the heaviest thing a phone does, so a long day out wants a
-            battery pack.
+            Where the phone allows it the track carries on with the screen off and Switchback in
+            your pocket, and the line under the clock says which you have got — while you are still
+            at the trailhead rather than after. Continuous GPS is the heaviest thing a phone does,
+            so a long day out wants a battery pack.
           </Text>
         </>
       ) : null}
@@ -448,18 +452,25 @@ function pace(stats: ActivityStats, units: UnitSystem): string {
 }
 
 /**
- * What the phone will actually do with the screen off, which depends on what the host granted.
- * Never a promise the recorder cannot keep: a foreground-only build says so before somebody walks
- * away from a track that is no longer being written.
+ * What the phone will actually do with the screen off. The recorder decides *which* case this is;
+ * all this does is put words to a closed set.
+ *
+ * A total `Record` over the union rather than a chain of `if`s, because a chain is how a paused
+ * hike came to be told it was recording: three arms for a four-state domain, and the missing one
+ * fell through to the most reassuring sentence. Adding a state to `TrackingNote` is a compile
+ * error here until it has prose.
  */
-function trackingNote(recording: { tracking: string | null; mayNotSurviveTermination: boolean }) {
-  if (recording.tracking === 'foreground') {
-    return 'This build records only while Switchback is open, so the screen is being held awake. Lock the phone and the track pauses until you come back.';
-  }
-  if (recording.mayNotSurviveTermination) {
-    return 'Recording with the screen off. Location is set to "While Using" — allow "Always" in Settings and iOS will restart the recording if it ever has to close the app.';
-  }
-  return 'Recording with the screen off. Nothing needs Switchback to stay open.';
+const TRACKING_PROSE: Readonly<Record<TrackingNote, string>> = {
+  'background-durable': 'Recording with the screen off. Nothing needs Switchback to stay open.',
+  'background-fragile':
+    'Recording with the screen off. Location is set to "While Using" — allow "Always" in Settings and iOS will restart the recording if it ever has to close the app.',
+  foreground:
+    'This build records only while Switchback is open, so the screen is being held awake. Lock the phone and the track pauses until you come back.',
+  'not-tracking': 'Not tracking. Nothing is being added to this hike until you resume it.',
+};
+
+function trackingProse(recording: RecorderSnapshot): string {
+  return TRACKING_PROSE[trackingNote(recording)];
 }
 
 function signalLine(

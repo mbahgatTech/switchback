@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useTRPC, useTRPCClient } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { setPinger, watchLifeline } from '@/record/lifeline';
-import { flush, hydrate, setUploader } from '@/record/store';
+import { flush, setSignedInUser, setUploader } from '@/record/store';
 
 /**
  * The wire between the recorder and the API.
@@ -14,14 +14,15 @@ import { flush, hydrate, setUploader } from '@/record/store';
  * in from here: one component, mounted once at the root inside `ApiProvider`, where the tRPC
  * client actually exists.
  *
- * `hydrate` runs here too rather than on the Record screen. A hike interrupted by a crash has
- * to be adopted the moment the app opens, not the first time somebody happens to look at the
- * recorder — the tab bar shows a live hike's clock, and it can only do that if the hike is
- * already restored when the bar first paints.
+ * Identity arrives the same way, and for a stronger reason. A journal is a per-second location
+ * history, and a phone can be handed to somebody else — so the recorder restores a hike only for
+ * the person who made it. This is where the two halves meet: `useAuth` says whether anybody is
+ * signed in, off the session module every other consumer subscribes to, and `me.get` is the only
+ * place a user *id* exists on the device. The store adopts nothing until one arrives.
  *
- * The Lifeline is driven from here for the stronger version of the same reason: a loop that
- * sends somebody's position to a worried contact must not stop because they tapped another
- * tab. This component is mounted for the life of the app, so the loop is too.
+ * The Lifeline is driven from here for a related reason: a loop that sends somebody's position to
+ * a worried contact must not stop because they tapped another tab. This component is mounted for
+ * the life of the app, so the loop is too.
  *
  * Renders nothing.
  */
@@ -34,15 +35,27 @@ export function RecordBridge() {
   useEffect(() => {
     setUploader((activityId, fixes) => client.activities.append.mutate({ id: activityId, fixes }));
     setPinger((ping) => client.lifeline.ping.mutate(ping));
-    hydrate();
-    // A batch may have been recorded and journalled but never acknowledged before the last
-    // launch ended. Nothing else would send it until the next flush tick a minute from now.
-    void flush().catch(() => undefined);
     return () => {
       setUploader(null);
       setPinger(null);
     };
   }, [client]);
+
+  const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: signedIn });
+
+  /*
+   * Sign-out seals the recorder immediately rather than waiting for a user id to fail to arrive:
+   * `me.get` is disabled while signed out, so its data would simply go stale and the tab bar
+   * would keep the previous person's clock on screen.
+   */
+  useEffect(() => {
+    const user = signedIn ? (me.data?.id ?? null) : null;
+    setSignedInUser(user);
+    if (!user) return;
+    // A batch may have been recorded and journalled but never acknowledged before the last launch
+    // ended. Nothing else would send it until the next flush tick a minute from now.
+    void flush().catch(() => undefined);
+  }, [signedIn, me.data]);
 
   /*
    * Whether a Lifeline is running, asked once per launch and refreshed by whoever changes it.

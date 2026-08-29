@@ -20,6 +20,10 @@ import { nativeTheme } from '@switchback/ui';
 import { ApiProvider } from '@/api/trpc';
 import { AuthProvider } from '@/auth/context';
 import { RecordBridge } from '@/record/bridge';
+// Side effect only: registering the CoreLocation task at module load is what lets iOS relaunch
+// the app headless and hand it a position. Imported here rather than left to whichever component
+// happens to pull the recorder in, so a refactor cannot silently end background recording.
+import '@/record/background';
 
 /**
  * Root layout.

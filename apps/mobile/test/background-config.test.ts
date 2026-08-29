@@ -80,13 +80,26 @@ describe('what the Record screen promises', () => {
     expect(screen).not.toMatch(/the track stops until you come back/);
   });
 
-  it('derives what it says about the screen from the recorder, not from a fixed promise', () => {
-    expect(screen).toMatch(/trackingNote\(recording\)/);
-    expect(screen).toMatch(/recording\.tracking === 'foreground'|tracking === 'foreground'/);
+  /*
+   * The positive half of this gate used to assert that a function *name* appeared in the file,
+   * which is how a screen telling a paused hike it was recording passed it. What the screen says
+   * is now asserted against the recorder in `record-store.test.ts`; what is left here is the one
+   * thing a source scan is genuinely the right instrument for — that the prose is a total mapping
+   * over the union rather than a chain with a fall-through arm.
+   */
+  it('maps every tracking state to prose, rather than falling through to the reassuring one', () => {
+    expect(screen).toMatch(/Readonly<Record<TrackingNote, string>>/);
   });
+});
 
-  it('tells a hiker who allowed only "While Using" what that costs them', () => {
-    expect(screen).toMatch(/mayNotSurviveTermination/);
-    expect(screen).toMatch(/Always/);
+describe('the module that registers the background task', () => {
+  /*
+   * The task is registered by importing `@/record/background`, and before this the only path to
+   * that import ran through two React components. Removing one in a refactor would have ended
+   * background recording with every test still green.
+   */
+  it('is imported by the Expo entry layout for its side effect', () => {
+    const layout = readFileSync(path.join(mobileRoot, 'app', '_layout.tsx'), 'utf8');
+    expect(layout).toMatch(/import '@\/record\/background';/);
   });
 });

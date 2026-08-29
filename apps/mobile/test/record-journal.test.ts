@@ -6,19 +6,21 @@ import {
   decodeHead,
   encodeFixes,
   encodeHead,
+  ownerVerdict,
   restoredPhase,
   type JournalHead,
 } from '../src/record/journal';
 
 /**
  * The journal is the only thing standing between a six-hour hike and an app the OS decided to
- * reclaim. What is checked here is what survives that: a torn write, a stale format, and the
- * rule for whether a restored hike is still running.
+ * reclaim. What is checked here is what survives that: a torn write, a stale format, a line the
+ * server would refuse, and the rules for whether a restored hike is still running and whose it is.
  */
 
 const head: JournalHead = {
   v: JOURNAL_VERSION,
   id: 'act_1',
+  ownerId: 'usr_a',
   startedAt: 1_735_689_600_000,
   trailId: 'trail_1',
   routeId: null,
@@ -38,11 +40,11 @@ describe('a journal written and read back whole', () => {
   });
 
   it('round-trips every fix, in order', () => {
-    expect(decodeFixes(encodeFixes(fixes))).toEqual(fixes);
+    expect(decodeFixes(encodeFixes(fixes)).fixes).toEqual(fixes);
   });
 
   it('reads nothing from an empty file rather than throwing', () => {
-    expect(decodeFixes('')).toEqual([]);
+    expect(decodeFixes('')).toEqual({ fixes: [], torn: false });
   });
 });
 
@@ -54,16 +56,26 @@ describe('a journal the phone was killed in the middle of writing', () => {
   const torn = `${encodeFixes(fixes)}{"t":3,"lng":-121.487,"lat":4`;
 
   it('keeps every fix that finished being written', () => {
-    expect(decodeFixes(torn)).toEqual(fixes);
+    expect(decodeFixes(torn).fixes).toEqual(fixes);
   });
 
-  it('drops the half-written one instead of failing the whole hike', () => {
-    expect(decodeFixes(torn)).toHaveLength(fixes.length);
+  it('reports the tear, so the next append does not concatenate onto the fragment', () => {
+    // Without the repair this costs two fixes rather than one: the half-line has no terminator,
+    // so the following fix lands on the end of it and neither parses.
+    expect(decodeFixes(torn).torn).toBe(true);
+    expect(decodeFixes(encodeFixes(fixes)).torn).toBe(false);
   });
 
-  it('drops a line that parses but is not a fix', () => {
+  it('drops a line the server would reject rather than retrying it forever', () => {
+    // `flush` only advances `sent` once an upload resolves, so one line the schema refuses would
+    // make the same batch fail on every attempt for the rest of the hike.
+    const outOfRange = `${encodeFixes(fixes)}{"t":4,"lng":-400,"lat":48}\n`;
+    expect(decodeFixes(outOfRange).fixes).toEqual(fixes);
+  });
+
+  it('drops a line that parses as JSON but is not a fix', () => {
     const wrong = `${encodeFixes(fixes)}{"t":"three","lng":null,"lat":null}\n`;
-    expect(decodeFixes(wrong)).toEqual(fixes);
+    expect(decodeFixes(wrong).fixes).toEqual(fixes);
   });
 });
 
@@ -85,6 +97,12 @@ describe('a head that cannot be trusted', () => {
     delete older.live;
     expect(decodeHead(JSON.stringify(older))?.live).toBe(false);
   });
+
+  it('reads a missing owner as nobody, rather than as whoever is asking', () => {
+    const anonymous: Record<string, unknown> = { ...head };
+    delete anonymous.ownerId;
+    expect(decodeHead(JSON.stringify(anonymous))?.ownerId).toBeNull();
+  });
 });
 
 describe('what phase a restored recording takes', () => {
@@ -98,5 +116,23 @@ describe('what phase a restored recording takes', () => {
 
   it('comes back paused when the hike was already paused, task or no task', () => {
     expect(restoredPhase({ ...head, live: false }, true)).toBe('paused');
+  });
+});
+
+describe('whose track this is', () => {
+  it('restores it for the person who made it', () => {
+    expect(ownerVerdict(head, 'usr_a')).toBe('restore');
+  });
+
+  it('erases it for anybody else, rather than showing them where somebody has been', () => {
+    expect(ownerVerdict(head, 'usr_b')).toBe('erase');
+  });
+
+  it('waits while nobody is confirmed, because an offline launch cannot be a new user', () => {
+    expect(ownerVerdict(head, null)).toBe('wait');
+  });
+
+  it('erases an unattributable track rather than handing it to the first identity that appears', () => {
+    expect(ownerVerdict({ ...head, ownerId: null }, 'usr_a')).toBe('erase');
   });
 });

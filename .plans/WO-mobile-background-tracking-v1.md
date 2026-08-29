@@ -4,17 +4,17 @@
 
 ## 1. Metadata
 
-| Field           | Value                                             |
-| --------------- | ------------------------------------------------- |
-| id              | `WO-mobile-background-tracking`                   |
-| version         | `1`                                               |
-| status          | `In Review`                                       |
-| repo_target     | `switchback`                                      |
-| base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`        |
-| created_at      | `2026-08-28T00:00:00-04:00`                       |
-| harness_version | `3.1.0`                                           |
-| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in this repo |
-| supersedes      | N/A                                               |
+| Field           | Value                                                        |
+| --------------- | ------------------------------------------------------------ |
+| id              | `WO-mobile-background-tracking`                              |
+| version         | `1`                                                          |
+| status          | `Superseded` by `.plans/WO-mobile-background-tracking-v2.md` |
+| repo_target     | `switchback`                                                 |
+| base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`                   |
+| created_at      | `2026-08-28T00:00:00-04:00`                                  |
+| harness_version | `3.1.0`                                                      |
+| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in this repo            |
+| supersedes      | N/A                                                          |
 
 The brief named `7d593956b079704300666f22b0d6d8900012ef59` as the base. That commit is an
 ancestor of this worktree's `master` head, which is what the branch is cut from.

@@ -3,8 +3,8 @@ import type * as BackgroundModule from '../src/record/background';
 
 /**
  * The OS half of recording, with CoreLocation stood in for. What is checked is the behaviour that
- * only shows up on a mountain: a host that cannot run the task at all, and readings that arrive
- * while nothing is listening — the app backgrounded, or relaunched headless to be handed a fix.
+ * only shows up on a mountain: a host that cannot run the task at all, a failure the OS reports
+ * mid-hike, and readings arriving while nothing is listening.
  */
 
 type TaskBody = { data?: { locations: unknown[] }; error?: unknown };
@@ -48,6 +48,20 @@ function reading(lng: number, lat: number) {
   return { coords: { longitude: lng, latitude: lat, altitude: 600 }, timestamp: 1 };
 }
 
+/** Both handlers, with the readings collected for inspection. */
+function handlers() {
+  const readings: unknown[] = [];
+  const failures: string[] = [];
+  return {
+    readings,
+    failures,
+    sink: {
+      onReadings: (batch: readonly unknown[]) => readings.push(...batch),
+      onFailure: (reason: string) => failures.push(reason),
+    },
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   os.startLocationUpdatesAsync.mockResolvedValue(undefined);
@@ -78,21 +92,43 @@ describe('starting on a host that can track in the background', () => {
     os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: true });
     os.requestBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: false });
     const background = await load();
-    const start = await background.startBackgroundUpdates();
     // Still recording: the background mode carries the screen-off case on its own.
-    expect(start).toEqual({ started: true, survivesTermination: false });
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: true,
+      survivesTermination: false,
+    });
   });
 });
 
 describe('starting on a host that cannot', () => {
-  it('reports it rather than throwing, so the caller can fall back to the foreground watcher', async () => {
+  it('names it unsupported so the caller falls back to the foreground watcher', async () => {
     os.startLocationUpdatesAsync.mockRejectedValue(
       new Error("Background location has not been configured, make sure to add 'location'"),
     );
     const background = await load();
-    await expect(background.startBackgroundUpdates()).resolves.toEqual({
+    expect(await background.startBackgroundUpdates()).toEqual({
       started: false,
-      survivesTermination: false,
+      reason: 'unsupported',
+    });
+  });
+
+  it('never spends the "Always" prompt on a capability the host does not have', async () => {
+    os.startLocationUpdatesAsync.mockRejectedValue(
+      new Error("add 'location' to 'UIBackgroundModes'"),
+    );
+    const background = await load();
+    await background.startBackgroundUpdates();
+    expect(os.requestBackgroundPermissionsAsync).not.toHaveBeenCalled();
+    expect(os.getBackgroundPermissionsAsync).not.toHaveBeenCalled();
+  });
+
+  it('distinguishes location services being off from a build that cannot do this', async () => {
+    os.startLocationUpdatesAsync.mockRejectedValue(new Error('Location services are disabled'));
+    const background = await load();
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: false,
+      reason: 'failed',
+      message: 'Location services are disabled',
     });
   });
 });
@@ -100,36 +136,41 @@ describe('starting on a host that cannot', () => {
 describe('readings arriving from the OS', () => {
   it('hands a whole batch to the sink, not just the newest', async () => {
     const background = await load();
-    const got: unknown[] = [];
-    background.setFixSink((readings) => got.push(...readings));
+    const { readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
     os.task?.({ data: { locations: [reading(-121.4, 48.0), reading(-121.5, 48.1)] } });
-    expect(got).toHaveLength(2);
+    expect(readings).toHaveLength(2);
   });
 
   it('replays what arrived before anything was listening', async () => {
     const background = await load();
     os.task?.({ data: { locations: [reading(-121.4, 48.0)] } });
     os.task?.({ data: { locations: [reading(-121.5, 48.1)] } });
-    const got: unknown[] = [];
-    background.setFixSink((readings) => got.push(...readings));
-    expect(got).toHaveLength(2);
+    const { readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
+    expect(readings).toHaveLength(2);
   });
 
   it('replays them once', async () => {
     const background = await load();
     os.task?.({ data: { locations: [reading(-121.4, 48.0)] } });
-    background.setFixSink(() => undefined);
-    const second: unknown[] = [];
-    background.setFixSink((readings) => second.push(...readings));
-    expect(second).toHaveLength(0);
+    background.setBackgroundHandlers(handlers().sink);
+    const second = handlers();
+    background.setBackgroundHandlers(second.sink);
+    expect(second.readings).toHaveLength(0);
   });
+});
 
-  it('ignores a task execution that carries an error instead of a position', async () => {
+describe('failures the OS reports mid-hike', () => {
+  it('reaches the caller rather than being swallowed', async () => {
     const background = await load();
-    const got: unknown[] = [];
-    background.setFixSink((readings) => got.push(...readings));
-    os.task?.({ error: { message: 'kCLErrorDomain 1' } });
-    expect(got).toHaveLength(0);
+    const { failures, readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
+    os.task?.({
+      error: { message: 'The operation couldn’t be completed. (kCLErrorDomain error 1.)' },
+    });
+    expect(failures).toEqual(['The operation couldn’t be completed. (kCLErrorDomain error 1.)']);
+    expect(readings).toHaveLength(0);
   });
 });
 
@@ -145,5 +186,13 @@ describe('asking the OS whether it is still tracking', () => {
     const background = await load();
     await background.stopBackgroundUpdates();
     expect(os.stopLocationUpdatesAsync).not.toHaveBeenCalled();
+  });
+
+  it('reads "Always" from the OS every time it is asked', async () => {
+    const background = await load();
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: true });
+    await expect(background.hasAlwaysAuthorization()).resolves.toBe(false);
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: true, canAskAgain: true });
+    await expect(background.hasAlwaysAuthorization()).resolves.toBe(true);
   });
 });
