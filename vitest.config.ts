@@ -1,12 +1,18 @@
 import { fileURLToPath } from 'node:url';
 import { loadEnv } from 'vite';
 import { defineConfig } from 'vitest/config';
+import { assertLocalTestDatabase } from './test/database-guard';
 
 const packagesDir = fileURLToPath(new URL('./packages', import.meta.url));
 
 // The integration tests need DATABASE_URL, which lives in the root .env rather than the
 // shell. `loadEnv` with an empty prefix reads every key, not just VITE_-prefixed ones.
 const env = loadEnv('test', fileURLToPath(new URL('.', import.meta.url)), '');
+
+// Before anything can open a connection. That .env is read from the repository root rather
+// than the shell is exactly why this is needed: a clean checkout inherits whatever the file
+// names, and the suite creates and deletes rows in it.
+assertLocalTestDatabase(env);
 
 /**
  * Database connections one test file may hold. Not a tuning knob: `pool: 'forks'` gives each
