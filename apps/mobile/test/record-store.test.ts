@@ -76,6 +76,8 @@ interface MemoryJournal extends JournalStore {
   head: string | null;
   lines: string;
   headWrites: HeadWrite[];
+  appends: number;
+  rewrites: number;
   cleared: number;
   legacyCleared: number;
 }
@@ -85,6 +87,8 @@ function memoryJournal(): MemoryJournal {
     head: null,
     lines: '',
     headWrites: [],
+    appends: 0,
+    rewrites: 0,
     cleared: 0,
     legacyCleared: 0,
     readHead() {
@@ -100,9 +104,11 @@ function memoryJournal(): MemoryJournal {
       return this.lines;
     },
     appendFixes(raw) {
+      this.appends += 1;
       this.lines += raw;
     },
     rewriteFixes(raw) {
+      this.rewrites += 1;
       this.lines = raw;
     },
     open() {
@@ -476,5 +482,92 @@ describe('a host that cannot track in the background', () => {
     await vi.waitFor(() =>
       expect(store.recordingSnapshot().geoError).toBe('Location services are disabled'),
     );
+  });
+});
+
+describe('what the journal costs per fix', () => {
+  it('appends each fix and never rewrites the track while recording', async () => {
+    const journal = memoryJournal();
+    await recording(journal);
+    const rewritesBefore = journal.rewrites;
+    os.task?.({ data: { locations: [0, 1, 2, 3].map((s) => reading(s)) } });
+    // Four appends, no rewrite. Rewriting the whole track per fix is what the append-only format
+    // exists to avoid, and it is invisible to any assertion that only counts the lines on disk.
+    expect(journal.appends).toBe(4);
+    expect(journal.rewrites).toBe(rewritesBefore);
+  });
+});
+
+describe('a head that disagrees with the track beside it', () => {
+  it('never reports more sent than exist, which would send the rest nowhere', async () => {
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_1',
+      ownerId: 'usr_a',
+      startedAt: START.getTime(),
+      trailId: null,
+      routeId: null,
+      // A stale count: the head survived a write the fixes file did not.
+      sent: 99,
+      live: false,
+    });
+    journal.lines =
+      '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n' +
+      '{"t":1,"lng":-121.489,"lat":48.02,"eleM":611,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.setSignedInUser('usr_a');
+    expect(store.recordingSnapshot().fixes).toHaveLength(2);
+
+    // The harm of an unclamped count is not the readout, it is the upload: `flush` measures the
+    // backlog as `fixes.length - sent`, so a count of 99 against two fixes means nothing is ever
+    // sent again until ninety-eight more arrive — and the ones in between are skipped for good.
+    const uploaded: number[] = [];
+    store.setUploader(async (_id, batch) => {
+      uploaded.push(...batch.map((fix) => fix.t));
+    });
+    store.resume();
+    await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('background'));
+    os.task?.({ data: { locations: [2, 3, 4].map((sec) => reading(sec)) } });
+    await store.flush();
+    expect(uploaded).toContain(2);
+    expect(uploaded).toContain(4);
+  });
+});
+
+describe('a hiker who refuses location', () => {
+  it('does not leave the hike marked live, which would resume it on the next launch', async () => {
+    os.requestForegroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: true });
+    const journal = memoryJournal();
+    const store = await load(journal);
+    store.setSignedInUser('usr_a');
+    store.begin({ id: 'act_1', startedAt: START, trailId: null });
+    await vi.waitFor(() => expect(store.recordingSnapshot().phase).toBe('paused'));
+    expect(JSON.parse(journal.head ?? '{}')).toMatchObject({ live: false });
+    expect(store.recordingSnapshot().geoError).toMatch(/Location access/);
+  });
+});
+
+describe('a restored hike on a phone that never granted Always', () => {
+  it('says so, rather than claiming iOS will restart it', async () => {
+    os.hasStartedLocationUpdatesAsync.mockResolvedValue(true);
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: false });
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_1',
+      ownerId: 'usr_a',
+      startedAt: START.getTime(),
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: true,
+    });
+    journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.setSignedInUser('usr_a');
+    await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('background'));
+    expect(store.recordingSnapshot().mayNotSurviveTermination).toBe(true);
+    expect(store.trackingNote(store.recordingSnapshot())).toBe('background-fragile');
   });
 });

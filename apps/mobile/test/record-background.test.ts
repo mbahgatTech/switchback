@@ -196,3 +196,75 @@ describe('asking the OS whether it is still tracking', () => {
     await expect(background.hasAlwaysAuthorization()).resolves.toBe(true);
   });
 });
+
+describe('readings the buffer cannot hold', () => {
+  it('keeps the oldest, which are the ones bridging the gap', async () => {
+    const background = await load();
+    // Far beyond the cap, delivered before anything is listening.
+    for (let i = 0; i < 700; i++) os.task?.({ data: { locations: [reading(-121.4 - i, 48)] } });
+    const { readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
+    expect(readings.length).toBeLessThanOrEqual(600);
+    expect(readings.length).toBeGreaterThan(0);
+    // The first reading through is the first one the OS produced, not the newest to arrive.
+    expect((readings[0] as { coords: { longitude: number } }).coords.longitude).toBe(-121.4);
+  });
+});
+
+describe('a task execution carrying both an error and the last readings', () => {
+  it('reports the failure and does not silently drop the positions', async () => {
+    const background = await load();
+    const { failures, readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
+    os.task?.({
+      error: { message: 'kCLErrorDomain error 0' },
+      data: { locations: [reading(-121.4, 48)] },
+    });
+    expect(failures).toEqual(['kCLErrorDomain error 0']);
+    // Deliberate: a batch arriving alongside a failure is of unknown provenance, and the failure
+    // is the thing the hiker needs. If this ever changes, it changes here and on purpose.
+    expect(readings).toHaveLength(0);
+  });
+});
+
+describe('every way "Always" can go', () => {
+  it('already granted: never prompts again', async () => {
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: true, canAskAgain: false });
+    const background = await load();
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: true,
+      survivesTermination: true,
+    });
+    expect(os.requestBackgroundPermissionsAsync).not.toHaveBeenCalled();
+  });
+
+  it('not granted but askable: prompts, and takes the answer', async () => {
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: true });
+    os.requestBackgroundPermissionsAsync.mockResolvedValue({ granted: true, canAskAgain: false });
+    const background = await load();
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: true,
+      survivesTermination: true,
+    });
+    expect(os.requestBackgroundPermissionsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('refused for good: does not prompt into a wall', async () => {
+    os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: false });
+    const background = await load();
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: true,
+      survivesTermination: false,
+    });
+    expect(os.requestBackgroundPermissionsAsync).not.toHaveBeenCalled();
+  });
+
+  it('the query itself failing is not a reason to stop recording', async () => {
+    os.getBackgroundPermissionsAsync.mockRejectedValue(new Error('no permissions module'));
+    const background = await load();
+    expect(await background.startBackgroundUpdates()).toEqual({
+      started: true,
+      survivesTermination: false,
+    });
+  });
+});

@@ -2,6 +2,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import withLocation from 'expo-location/plugin/build/withLocation';
 import config from '../app.config';
 
 /**
@@ -81,15 +82,12 @@ describe('what the Record screen promises', () => {
   });
 
   /*
-   * The positive half of this gate used to assert that a function *name* appeared in the file,
-   * which is how a screen telling a paused hike it was recording passed it. What the screen says
-   * is now asserted against the recorder in `record-store.test.ts`; what is left here is the one
-   * thing a source scan is genuinely the right instrument for — that the prose is a total mapping
-   * over the union rather than a chain with a fall-through arm.
+   * There is deliberately no positive assertion on what this file *says*. The old one matched a
+   * function name and let a screen telling a paused hike it was recording straight through, and
+   * a spelling assertion turns a rename with no behaviour change into a red suite. What the
+   * screen says is asserted against the recorder in `record-store.test.ts`, and that every state
+   * has prose is enforced by the compiler: the mapping is a total `Record` over `TrackingNote`.
    */
-  it('maps every tracking state to prose, rather than falling through to the reassuring one', () => {
-    expect(screen).toMatch(/Readonly<Record<TrackingNote, string>>/);
-  });
 });
 
 describe('the module that registers the background task', () => {
@@ -101,5 +99,49 @@ describe('the module that registers the background task', () => {
   it('is imported by the Expo entry layout for its side effect', () => {
     const layout = readFileSync(path.join(mobileRoot, 'app', '_layout.tsx'), 'utf8');
     expect(layout).toMatch(/import '@\/record\/background';/);
+  });
+});
+
+/**
+ * The plist Expo will actually generate, rather than the options we hand the plugin.
+ *
+ * Asserting the options proves we asked; this proves what `expo prebuild` writes. It is the one
+ * step of the device checklist that needs no device — the config plugin is ordinary Node, so its
+ * `infoPlist` mod can be run here and the result read.
+ */
+describe('the Info.plist expo prebuild would write', () => {
+  async function generatedPlist(): Promise<Record<string, unknown>> {
+    const options = locationPluginOptions() ?? {};
+    const seeded = { ...config, _internal: { projectRoot: '.' } };
+    const applied = withLocation(seeded as never, options as never) as unknown as {
+      mods: {
+        ios: { infoPlist: (c: unknown) => Promise<{ modResults: Record<string, unknown> }> };
+      };
+    };
+    const out = await applied.mods.ios.infoPlist({
+      ...applied,
+      modResults: { ...(config.ios?.infoPlist ?? {}) },
+      modRequest: {
+        projectRoot: '.',
+        platformProjectRoot: '.',
+        modName: 'infoPlist',
+        platform: 'ios',
+      },
+    });
+    return out.modResults;
+  }
+
+  it('declares location in UIBackgroundModes, without which the task cannot register', async () => {
+    expect((await generatedPlist()).UIBackgroundModes).toContain('location');
+  });
+
+  it('carries our own permission strings rather than the plugin defaults', async () => {
+    const plist = await generatedPlist();
+    expect(String(plist.NSLocationWhenInUseUsageDescription)).toMatch(/screen off/i);
+    expect(String(plist.NSLocationAlwaysAndWhenInUseUsageDescription)).toMatch(/screen off/i);
+  });
+
+  it('omits the pre-iOS-11 always key rather than shipping placeholder prose', async () => {
+    expect((await generatedPlist()).NSLocationAlwaysUsageDescription).toBeUndefined();
   });
 });
