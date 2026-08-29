@@ -8,7 +8,7 @@
 | --------------- | --------------------------------------------------------- |
 | id              | `WO-ci-pipeline-green`                                    |
 | version         | `1`                                                       |
-| status          | `Active`                                                  |
+| status          | `In Review`                                               |
 | repo_target     | `switchback`                                              |
 | base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`                |
 | created_at      | `2026-08-29T00:00:00-07:00`                               |
@@ -57,8 +57,8 @@ repository can show an honest green tick.
 | id  | predicate                                                                                    | verification                                                                                     |
 | --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | D1  | The root cause is named with evidence from the logs, not inferred                            | § Root cause below cites run ids, log lines and the commit that removed the mechanism            |
-| D2  | `npm run test:e2e` passes locally, all 50 cases                                              | `npx playwright test` exits 0, `50 passed`                                                       |
-| D3  | The suite passes repeatedly, not once                                                        | two consecutive full runs, both `50 passed`, exit 0                                              |
+| D2  | The browser suite passes, all 50 cases                                                       | `npm run test:e2e` reports `50 passed` on a runner (see A5)                                      |
+| D3  | The suite passes repeatedly, not once                                                        | three dispatched CI runs, each `50 passed`, each `success`                                       |
 | D4  | The three reviews cases still exercise the real form, the real routers and the real database | `e2e/review.spec.ts` is unchanged apart from nothing — the specs are not touched at all          |
 | D5  | A trail the suite opens that CI cannot produce fails a unit test, not a nightly browser run  | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, and fails when the declaration is wrong |
 | D6  | Nothing else regressed                                                                       | `npm run format:check`, `npm run typecheck`, `npm run lint`, `npm test` each exit 0              |
@@ -168,12 +168,12 @@ slug sits inside the tile the workflow's own `--at` resolves to.
 
 | id    | task                                                                                                                                 | acceptance check                                                             | status |
 | ----- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | ------ |
-| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-fixtures.ts`; `seed-e2e.ts` imports them                                       | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `todo` |
-| T-002 | Add the `fixture-report-trail` shape                                                                                                 | the seed prints three lines, one per fixture, exit 0                         | `todo` |
-| T-003 | Lift the trail constants into `e2e/trails.ts`, add `SUITE_TRAILS`, re-export from `fixtures.ts`, point `REPORT_TRAIL` at the fixture | `npm run typecheck` exits 0                                                  | `todo` |
-| T-004 | Add `test/e2e-trail-sources.test.ts`, observed failing first for each of its three cases                                             | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 3 passed            | `todo` |
-| T-005 | Correct the fixture counts in the `ci.yml` comments                                                                                  | `npm run format:check` exits 0 and the comment names three trails            | `todo` |
-| T-006 | Full local verification: seed, ingest, browser suite twice, and every hermetic gate                                                  | see § Iteration log for pasted output                                        | `todo` |
+| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-fixtures.ts`; `seed-e2e.ts` imports them                                       | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `done` |
+| T-002 | Add the `fixture-report-trail` shape                                                                                                 | the seed prints three lines, one per fixture, exit 0                         | `done` |
+| T-003 | Lift the trail constants into `e2e/trails.ts`, add `SUITE_TRAILS`, re-export from `fixtures.ts`, point `REPORT_TRAIL` at the fixture | `npm run typecheck` exits 0                                                  | `done` |
+| T-004 | Add `test/e2e-trail-sources.test.ts`, observed failing first for each of its three cases                                             | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 3 passed            | `done` |
+| T-005 | Correct the fixture counts in the `ci.yml` comments                                                                                  | `npm run format:check` exits 0 and the comment names three trails            | `done` |
+| T-006 | Verification: seed, ingest, hermetic gates locally, browser suite on runners                                                         | see § Iteration log for pasted output                                        | `done` |
 
 ---
 
@@ -218,4 +218,69 @@ full browser runs, because a suite that passes once has not been shown to be det
   decision: test/infra defect. Seed the trail offline under a reserved `fixture-` slug, as
     seed-e2e.ts already does for the two other specs that open trails off the tile.
   budget: { implement: 0/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 2
+  at: 2026-08-29T00:45:00-07:00
+  state: IMPLEMENT -> SELF_VERIFY
+  event: failure_reproduced_before_change
+  detail: >-
+    Clean database (switchback_wo, template_postgis), db:push + spatial.sql, db:seed,
+    seed-e2e.ts, then `npm run ingest:tile -- --at 48.01213,-121.51188`:
+      processing 021230013…
+        assembled { quadkey: '021230013', elements: 439, trails: 213 }
+      prisma:error Unique constraint failed on the fields: (`slug`)
+      021230013: 213 trails in 80.2s   exit 0
+    `select count(*) from trails` -> 215. `select slug from trails where name ilike
+    '%greider%'` -> 0 rows. `npx playwright test e2e/review.spec.ts` -> 3 failed,
+    1 passed (27.3s), exit 1, all three `No trail "greider-lakes-trail" in this database`.
+  decision: proceed with the fixture, exactly as `seed-e2e.ts` already does for two specs.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 3
+  at: 2026-08-29T01:10:00-07:00
+  state: SELF_VERIFY
+  event: guard_observed_failing
+  detail: >-
+    Each case of test/e2e-trail-sources.test.ts watched failing for its own reason before
+    being trusted. (1) an extra exported trail constant with no source ->
+    "expected [ 'fixture-early-high-point', …(4) ] to deeply equal [ …(3) ]". (2) a seeded
+    slug seed-e2e.ts does not write -> the two-direction set comparison fails. (3) an
+    ingested trail outside the workflow's tile -> "vesper-peak-summit-trail: expected
+    '021230031' to be '021230013'" — the historical defect's own tile pair.
+  decision: guard is measuring the defect, not adjacent to it.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 4
+  at: 2026-08-29T01:30:00-07:00
+  state: SELF_VERIFY
+  event: local_gates_green_browser_suite_not_runnable_here
+  detail: >-
+    format:check, typecheck, lint all exit 0. `npm test` against a clean database: 123 files,
+    2312 tests passed, exit 0 — three more tests than master's baseline run (122 files, 2309),
+    which is this file. One earlier full `npm test` on this workstation timed out three
+    unrelated files (ci-steps-runnable, worker-deploy-path, entra-client); all three pass in
+    isolation, 38 passed, and the repeat run above is clean. The full browser suite could not
+    be completed here: ~350 MB free with another agent's Next server and npm install on the
+    box, the dev server was killed mid-run, and every case after 12 failed on a dead port.
+    Recorded as an environment limit, not as a pass.
+  decision: verify the fixed suite where CI runs it, per A5.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 5
+  at: 2026-08-29T02:05:00-07:00
+  state: SELF_VERIFY -> IN_REVIEW
+  event: ci_green
+  detail: >-
+    Three `workflow_dispatch` runs on fix/ci-pipeline-green, every job success, deploy jobs
+    correctly skipped (they gate on push to master):
+      33239757151  0f3d84b  browser suite `50 passed (6.2m)`  success
+      33240178652  0f3d84b  browser suite `50 passed (6.1m)`  success
+      33240608824  48d547e  browser suite `50 passed (6.3m)`  success
+    Run 33239757151 gates: `test/e2e-trail-sources.test.ts (3 tests) 60ms`, Test Files 123
+    passed, Tests 2312 passed. Reports cases 42/43/44 green. `grep -c "assembled { quadkey:
+    '021230031'"` over the browser job log -> 0, so the fix adds no Overpass query. The
+    `slug` unique violation is still present on the green run, which is the evidence that it
+    was never the defect.
+  decision: PR #80 opened against master. Review Board next.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
 ```
