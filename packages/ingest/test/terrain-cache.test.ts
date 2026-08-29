@@ -227,7 +227,7 @@ describe('the breaker', () => {
   });
 
   it('forgets earlier failures once a lookup succeeds', async () => {
-    let now = 1_000;
+    const now = 1_000;
     let failing = true;
     const store = scriptedStore({
       read: async () => {
@@ -344,7 +344,7 @@ describe('the R2 store', () => {
     const at = (status: number) =>
       r2TerrainStore({
         ...config,
-        fetchImpl: (async () => new Response('', { status })) as unknown as typeof fetch,
+        fetchImpl: async () => new Response('', { status }),
       });
 
     expect((await at(404).read(13, 1, 1, anySignal())).kind).toBe('miss');
@@ -354,8 +354,7 @@ describe('the R2 store', () => {
   it('reads a zero-length object as no tile there', async () => {
     const store = r2TerrainStore({
       ...config,
-      fetchImpl: (async () =>
-        new Response(new Uint8Array(0), { status: 200 })) as unknown as typeof fetch,
+      fetchImpl: async () => new Response(new Uint8Array(0), { status: 200 }),
     });
 
     expect((await store.read(13, 1, 1, anySignal())).kind).toBe('absent');
