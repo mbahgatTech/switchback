@@ -18,12 +18,24 @@ export interface GainLoss {
   lossM: number;
 }
 
-/** Total ascent and descent under the `GAIN_THRESHOLD_M` hysteresis filter. */
-export function computeGainLoss(
+/** Ascent and descent accrued from the first sample to each sample, as two parallel arrays. */
+export interface GainLossCurve {
+  gainM: number[];
+  lossM: number[];
+}
+
+/**
+ * The hysteresis filter read at every sample rather than only at the end, so a caller can ask
+ * what has been climbed by a point partway along. Both arrays are non-decreasing, and their
+ * last values are what `computeGainLoss` returns for the whole line.
+ */
+export function gainLossCurve(
   elevations: readonly number[],
   thresholdM = GAIN_THRESHOLD_M,
-): GainLoss {
-  if (elevations.length < 2) return { gainM: 0, lossM: 0 };
+): GainLossCurve {
+  const gain = new Array<number>(elevations.length).fill(0);
+  const loss = new Array<number>(elevations.length).fill(0);
+  if (elevations.length < 2) return { gainM: gain, lossM: loss };
 
   let gainM = 0;
   let lossM = 0;
@@ -35,7 +47,12 @@ export function computeGainLoss(
 
   for (let i = 1; i < elevations.length; i++) {
     const ele = elevations[i]!;
-    if (!Number.isFinite(ele)) continue;
+    if (!Number.isFinite(ele)) {
+      // Nothing is known about this sample, so nothing has been climbed at it either.
+      gain[i] = gain[i - 1]!;
+      loss[i] = loss[i - 1]!;
+      continue;
+    }
 
     if (direction === 0) {
       if (ele - reference >= thresholdM) {
@@ -45,10 +62,7 @@ export function computeGainLoss(
         direction = -1;
         extreme = ele;
       }
-      continue;
-    }
-
-    if (direction === 1) {
+    } else if (direction === 1) {
       if (ele > extreme) {
         extreme = ele;
       } else if (extreme - ele >= thresholdM) {
@@ -68,13 +82,25 @@ export function computeGainLoss(
         extreme = ele;
       }
     }
+
+    // The leg in progress counts towards the reading at this sample, exactly as the final leg
+    // is banked below — otherwise a single unreversed climb would read as zero all the way up.
+    gain[i] = round1(gainM + (direction === 1 ? extreme - reference : 0));
+    loss[i] = round1(lossM + (direction === -1 ? reference - extreme : 0));
   }
 
-  // Bank whatever the final leg accumulated.
-  if (direction === 1) gainM += extreme - reference;
-  else if (direction === -1) lossM += reference - extreme;
+  return { gainM: gain, lossM: loss };
+}
 
-  return { gainM: round1(gainM), lossM: round1(lossM) };
+/** Total ascent and descent under the `GAIN_THRESHOLD_M` hysteresis filter. */
+export function computeGainLoss(
+  elevations: readonly number[],
+  thresholdM = GAIN_THRESHOLD_M,
+): GainLoss {
+  const curve = gainLossCurve(elevations, thresholdM);
+  const last = elevations.length - 1;
+  if (last < 1) return { gainM: 0, lossM: 0 };
+  return { gainM: curve.gainM[last]!, lossM: curve.lossM[last]! };
 }
 
 /**

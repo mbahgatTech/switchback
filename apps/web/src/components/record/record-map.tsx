@@ -5,7 +5,7 @@ import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from 'maplibr
 import type { FeatureCollection } from 'geojson';
 import type { LineString } from '@switchback/core';
 import { SCHEMES } from '@switchback/ui';
-import { buildStyle } from '../map/basemap';
+import { CASING, buildStyle } from '../map/basemap';
 import { registerRTLText } from '../map/rtl';
 import { useScaleBar } from '../map/scale';
 import { useUnitsRef } from '../units';
@@ -15,8 +15,14 @@ import 'maplibre-gl/dist/maplibre-gl.css';
  * The map on the recording screen. Separate from the browse and trail maps because this one
  * follows a person: the camera is not the reader's by default and the subject moves.
  *
- * Two lines and a dot: the planned route is woodland underneath, the recorded track is
- * contour, and the position dot is survey.
+ * A ribbon and a thread: the trail is a wide woodland line and the recorded track a narrow
+ * contour one down the middle of it, so both stay legible where they coincide — which, on a
+ * hike that is going well, is everywhere. `map/track-layers.ts` reaches the opposite
+ * conclusion for a *finished* hike, where the two lines carry equal weight and a reader has
+ * no reason left to tell them apart.
+ *
+ * Survey is the dot: you, now. The woodland ring under it is where the trail says you are,
+ * which is the same place until you leave the trail, and the useful difference afterwards.
  */
 
 export interface RecordMapProps {
@@ -24,6 +30,8 @@ export interface RecordMapProps {
   track: ReadonlyArray<readonly [number, number]>;
   /** The trail being followed, if one was chosen. */
   route: LineString | null;
+  /** The position projected onto that trail, from the recorder's `progress`. */
+  progressAt: readonly [number, number] | null;
   position: readonly [number, number] | null;
   /** Metres. Drawn as a circle under the dot, so a poor fix looks like a poor fix. */
   accuracyM: number | null;
@@ -35,7 +43,17 @@ export interface RecordMapProps {
 
 const TRACK_SOURCE = 'rec-track';
 const ROUTE_SOURCE = 'rec-route';
+const PROGRESS_SOURCE = 'rec-progress';
 const POSITION_SOURCE = 'rec-position';
+
+/**
+ * The two line weights, in pixels, and the whole of the hierarchy between them. Ten against
+ * three, because what has to survive is the *green*: a fix good to seven metres sits about
+ * three pixels off the trail at z15, and once the track's own casing is subtracted the trail
+ * has three pixels a side left to read as a line rather than as a fringe.
+ */
+const ROUTE_WIDTH = 10;
+const TRACK_WIDTH = 3;
 
 /**
  * Ground metres per screen pixel at zoom 0, taken at 48° north. Web Mercator's scale depends
@@ -103,26 +121,29 @@ function lineCollection(coords: ReadonlyArray<readonly [number, number]>): Featu
   };
 }
 
-function positionCollection(
+/** One point, or none. `accuracyM` is read by the ring layer's radius expression. */
+function pointCollection(
   position: readonly [number, number] | null,
-  accuracyM: number | null,
+  accuracyM: number | null = null,
 ): FeatureCollection {
-  if (!position) return { type: 'FeatureCollection', features: [] };
   return {
     type: 'FeatureCollection',
-    features: [
-      {
-        type: 'Feature',
-        properties: { accuracyM: accuracyM ?? 0 },
-        geometry: { type: 'Point', coordinates: [position[0], position[1]] },
-      },
-    ],
+    features: position
+      ? [
+          {
+            type: 'Feature',
+            properties: { accuracyM: accuracyM ?? 0 },
+            geometry: { type: 'Point', coordinates: [position[0], position[1]] },
+          },
+        ]
+      : [],
   };
 }
 
 export function RecordMap({
   track,
   route,
+  progressAt,
   position,
   accuracyM,
   follow,
@@ -138,8 +159,8 @@ export function RecordMap({
   // The current data, kept where the `load` handler can reach it. `route` is passed once and
   // never changes identity, so its effect runs before the sources exist and the line would
   // otherwise never be added at all.
-  const latest = useRef({ track, route, position, accuracyM });
-  latest.current = { track, route, position, accuracyM };
+  const latest = useRef({ track, route, progressAt, position, accuracyM });
+  latest.current = { track, route, progressAt, position, accuracyM };
 
   const scaleBar = useScaleBar(110);
   const units = useUnitsRef();
@@ -183,10 +204,11 @@ export function RecordMap({
       instance
         .getSource<GeoJSONSource>(ROUTE_SOURCE)
         ?.setData(lineCollection(now.route?.coordinates ?? []));
+      instance.getSource<GeoJSONSource>(PROGRESS_SOURCE)?.setData(pointCollection(now.progressAt));
       if (now.position) {
         instance
           .getSource<GeoJSONSource>(POSITION_SOURCE)
-          ?.setData(positionCollection(now.position, now.accuracyM));
+          ?.setData(pointCollection(now.position, now.accuracyM));
       }
     });
 
@@ -215,10 +237,16 @@ export function RecordMap({
 
   useEffect(() => {
     const instance = map.current;
+    if (!instance || !ready.current) return;
+    instance.getSource<GeoJSONSource>(PROGRESS_SOURCE)?.setData(pointCollection(progressAt));
+  }, [progressAt]);
+
+  useEffect(() => {
+    const instance = map.current;
     if (!instance || !ready.current || !position) return;
     instance
       .getSource<GeoJSONSource>(POSITION_SOURCE)
-      ?.setData(positionCollection(position, accuracyM));
+      ?.setData(pointCollection(position, accuracyM));
     if (follow) {
       // `easeTo` rather than `jumpTo`: a dot that teleports every second is unreadable, and
       // a second of easing is shorter than the gap between fixes anyway.
@@ -249,10 +277,14 @@ export function RecordMap({
   );
 }
 
-function addRecordLayers(instance: MapLibreMap): void {
+/**
+ * Add the sources and the layers, in draw order. Idempotent, because a base-map change tears
+ * the style down and this runs again on the far side of it.
+ */
+export function addRecordLayers(instance: MapLibreMap): void {
   const field = SCHEMES.field;
 
-  for (const id of [ROUTE_SOURCE, TRACK_SOURCE, POSITION_SOURCE]) {
+  for (const id of [ROUTE_SOURCE, TRACK_SOURCE, PROGRESS_SOURCE, POSITION_SOURCE]) {
     if (!instance.getSource(id)) {
       instance.addSource(id, {
         type: 'geojson',
@@ -261,16 +293,15 @@ function addRecordLayers(instance: MapLibreMap): void {
     }
   }
 
-  // The route gets the same dark casing as the track: the relief basemap's ground tint is
-  // itself a green, so an unwashed woodland line over it is barely findable — and before the
-  // first fix it is the only thing on screen. Hierarchy is carried by hue and width instead.
+  // The relief basemap's ground tint is itself a green, so the woodland line is set against the
+  // dark casing every drawn line in the product is set against.
   if (!instance.getLayer('rec-route-casing')) {
     instance.addLayer({
       id: 'rec-route-casing',
       type: 'line',
       source: ROUTE_SOURCE,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': '#0B1214', 'line-opacity': 0.55, 'line-width': 8 },
+      paint: { 'line-color': CASING, 'line-opacity': 0.55, 'line-width': ROUTE_WIDTH + 3 },
     });
   }
 
@@ -280,11 +311,7 @@ function addRecordLayers(instance: MapLibreMap): void {
       type: 'line',
       source: ROUTE_SOURCE,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: {
-        'line-color': field.woodland,
-        'line-width': 5,
-        'line-opacity': 0.9,
-      },
+      paint: { 'line-color': field.woodland, 'line-width': ROUTE_WIDTH },
     });
   }
 
@@ -294,7 +321,7 @@ function addRecordLayers(instance: MapLibreMap): void {
       type: 'line',
       source: TRACK_SOURCE,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': '#0B1214', 'line-opacity': 0.7, 'line-width': 8 },
+      paint: { 'line-color': CASING, 'line-opacity': 0.7, 'line-width': TRACK_WIDTH + 2 },
     });
   }
 
@@ -304,7 +331,24 @@ function addRecordLayers(instance: MapLibreMap): void {
       type: 'line',
       source: TRACK_SOURCE,
       layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': field.contour, 'line-width': 4 },
+      paint: { 'line-color': field.contour, 'line-width': TRACK_WIDTH },
+    });
+  }
+
+  // Hollow, and narrower than the position dot that hides it while the hiker is on route: this
+  // is a reading off the trail, not a second claim about where they are.
+  if (!instance.getLayer('rec-progress')) {
+    instance.addLayer({
+      id: 'rec-progress',
+      type: 'circle',
+      source: PROGRESS_SOURCE,
+      paint: {
+        'circle-radius': 5,
+        'circle-color': CASING,
+        'circle-opacity': 0.5,
+        'circle-stroke-color': field.woodland,
+        'circle-stroke-width': 2,
+      },
     });
   }
 

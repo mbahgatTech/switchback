@@ -24,11 +24,13 @@ import {
   type UnitSystem,
   type Visibility,
 } from '@switchback/core';
+import type { HikePlan } from '@switchback/geo';
 import { useTRPC } from '../../trpc/react';
 import { isMissing, markFinished, newActivityId, type FinishWrite } from '../../offline/activities';
 import { isUnreachable } from '../../offline/queue';
 import { BUTTON, DANGER, HEIGHT, PRIMARY, SECONDARY } from '../controls';
 import { LifelinePanel } from './lifeline-panel';
+import { ProgressProfile } from './progress-profile';
 import { RecordMap } from './record-map';
 import { useRecorder, type RecorderOptions, type RecorderPhase } from './use-recorder';
 
@@ -50,6 +52,8 @@ export interface RecorderTrail {
   slug: string;
   geometry: LineString;
   lengthM: number;
+  /** The section and the ascent curve, thinned for the wire. Null on a zero-length trail. */
+  plan: HikePlan | null;
 }
 
 export interface RecorderProps {
@@ -120,7 +124,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
     // `RecorderOptions.onStart`. Held in a ref because `start` is declared below this call.
     onStart: (input) => startServerRef.current(input),
     route,
-    routeLengthM: trail?.lengthM ?? null,
+    plan: trail?.plan ?? null,
   });
 
   const start = useMutation(
@@ -370,6 +374,7 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
           className="absolute inset-0 h-full w-full"
           track={track}
           route={trail?.geometry ?? null}
+          progressAt={recorder.progress?.at ?? null}
           position={recorder.position}
           accuracyM={recorder.accuracyM}
           follow={follow}
@@ -473,9 +478,18 @@ export function Recorder({ units, defaultVisibility, trail, openRecording }: Rec
             movingS={recorder.stats.movingTimeS}
             gainM={recorder.stats.gainM}
             avgSpeedMps={recorder.stats.avgSpeedMps}
-            remainingM={recorder.remainingM}
+            remainingM={recorder.progress?.remainingM ?? null}
             idle={!live}
           />
+
+          {trail?.plan && trail.plan.profile.length >= 2 ? (
+            <ProgressProfile
+              plan={trail.plan}
+              progress={recorder.progress}
+              trailName={title ?? trail.name}
+              units={units}
+            />
+          ) : null}
 
           {live ? (
             <Status

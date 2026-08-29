@@ -94,19 +94,19 @@ const STATION_STEPS = [
 ] as const;
 
 /**
- * Thin the profile for drawing, pinning the first, last, highest and lowest samples: a plain
+ * Which samples survive thinning: an even stride, plus the ends and the two extremes. A plain
  * every-Nth stride drops the summit whenever it is off the stride, and a section whose high
  * point is 40 m below the stat block above it is worse than no section.
+ *
+ * Indices rather than points, so anything computed alongside the profile — an ascent curve,
+ * say — can be thinned through the same choice and stay paired with it.
  */
-export function toSectionPoints(
+export function sectionSampleIndices(
   profile: readonly ElevationPoint[],
-  opts: { maxPoints?: number } = {},
-): SectionPoint[] {
-  const maxPoints = Math.max(2, opts.maxPoints ?? SECTION_DISPLAY_POINTS);
-  if (profile.length === 0) return [];
-  if (profile.length <= maxPoints) {
-    return profile.map((p) => ({ distanceM: p.distM, elevationM: p.eleM }));
-  }
+  maxPoints = SECTION_DISPLAY_POINTS,
+): number[] {
+  const cap = Math.max(2, maxPoints);
+  if (profile.length <= cap) return profile.map((_, i) => i);
 
   let highest = 0;
   let lowest = 0;
@@ -115,13 +115,21 @@ export function toSectionPoints(
     if (profile[i]!.eleM < profile[lowest]!.eleM) lowest = i;
   }
 
-  const stride = Math.ceil(profile.length / maxPoints);
+  const stride = Math.ceil(profile.length / cap);
   const keep = new Set<number>([0, profile.length - 1, highest, lowest]);
   for (let i = 0; i < profile.length; i += stride) keep.add(i);
+  return [...keep].sort((a, b) => a - b);
+}
 
-  return [...keep]
-    .sort((a, b) => a - b)
-    .map((i) => ({ distanceM: profile[i]!.distM, elevationM: profile[i]!.eleM }));
+/** Thin the profile for drawing. */
+export function toSectionPoints(
+  profile: readonly ElevationPoint[],
+  opts: { maxPoints?: number } = {},
+): SectionPoint[] {
+  return sectionSampleIndices(profile, opts.maxPoints ?? SECTION_DISPLAY_POINTS).map((i) => ({
+    distanceM: profile[i]!.distM,
+    elevationM: profile[i]!.eleM,
+  }));
 }
 
 /**

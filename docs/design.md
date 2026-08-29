@@ -89,6 +89,19 @@ and elapsed-time axes in a third of the width.](screenshots/product/section-390.
 an arrival time, altitude, temperature, wind, rain chance and sky, with the high-point row picked
 out by a water-blue rule and wash.](screenshots/product/weather-1400.png)
 
+## Recording against a trail
+
+![The recording screen: a map filling the left with the trail drawn as a wide pale-green ribbon
+cased in near-black, the recorded track a narrow orange thread down the centre of it and a red
+survey dot at its head, and a readout column at the right carrying distance, elapsed and moving
+time, ascent, pace, distance to finish, and an AHEAD strip whose silhouette of the trail is filled
+woodland behind the hiker and a hairline in front, with a green marker on the
+join.](screenshots/product/record-1400.png)
+
+The two lines part on weight, not on hue. A finished hike draws no trail line at all — afterwards
+two coincident lines read as one thick one — but recording, they are the plan and the doing, and
+the reader needs to tell which is which everywhere they overlap.
+
 ## Near you, and offline
 
 ![Hikes near your location on the sheet surface: a mono distance-and-bearing column at the left,

@@ -378,6 +378,26 @@
   }
 
   /*
+   * A graphic that is dragged across rather than read as text.
+   *
+   * Touch-and-hold on the section put the cursor where a finger was *and* started a selection,
+   * and because a selection is not bounded by the element it began in, one press swept the
+   * caption, the stat block and the forecast table below it into a highlight. Safari needs the
+   * prefixed property, and the callout is separate again — it is what turns a long press into
+   * the system's Copy menu instead of the gesture the graphic wants.
+   *
+   * Narrow on purpose: the plot only. Every number these graphics report is set in HTML beside
+   * them, where it stays selectable, and the keyboard slider and the SVG's own summary are
+   * untouched. `touch-action` is deliberately not set — see the note in `trail/profile.tsx`
+   * on why this graphic must not capture the page's scroll.
+   */
+  .plot-surface {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  /*
    * The section plotting itself. The one long duration in the system, and the only motion
    * on the page — it happens once per trail, on first paint, and never on scroll.
    *

@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { redirect } from 'next/navigation';
 import { BRAND, trailTitle } from '@switchback/core';
+import { buildHikePlan } from '@switchback/geo';
 import { OsmCredit, OsmCreditBeside } from '@/components/map/osm-credit';
 import { Recorder, type RecorderTrail } from '@/components/record/recorder';
 import { SiteNav } from '@/components/site-nav';
@@ -20,10 +21,11 @@ import { caller } from '@/trpc/server';
  * trail — loads that trail's line. Everything after that needs a browser's geolocation and
  * lives in `<Recorder>`.
  *
- * **The trail is destructured rather than passed whole.** `trails.bySlug` returns the
- * elevation profile, which is several thousand points, and none of them are wanted here: a
- * recording draws the route as a line and measures distance along it, and both come from
- * the geometry. Sending the profile too would double the page's payload to draw nothing.
+ * **The trail is destructured rather than passed whole, and its profile is thinned on the way
+ * through.** `trails.bySlug` returns several thousand elevation samples; the progress strip
+ * draws a couple of hundred. `buildHikePlan` thins them here, where the full set is, because
+ * the ascent curve it carries has to be measured before thinning or it disagrees with the
+ * figure the trail publishes.
  */
 
 export const metadata: Metadata = {
@@ -58,6 +60,10 @@ export default async function RecordPage({
           slug: found.slug,
           geometry: found.geometry,
           lengthM: found.stats.lengthM,
+          plan: buildHikePlan(found.profile, {
+            routeType: found.routeType,
+            lengthM: found.stats.lengthM,
+          }),
         }
       : null;
 

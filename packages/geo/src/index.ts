@@ -9,6 +9,7 @@ export * from './tobler';
 export * from './flyover';
 export * from './route-type';
 export * from './offroute';
+export * from './progress';
 export * from './section';
 export * from './sheet';
 export * from './tally';
