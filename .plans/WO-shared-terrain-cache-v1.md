@@ -8,7 +8,7 @@
 | --------------- | ----------------------------------------------------- |
 | id              | `WO-shared-terrain-cache`                             |
 | version         | `1`                                                   |
-| status          | `Active`                                              |
+| status          | `In Review`                                           |
 | repo_target     | `switchback`                                          |
 | base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`            |
 | created_at      | `2026-08-29T06:57:03Z`                                |
@@ -202,14 +202,27 @@ it found or throws, and only the policy layer may answer "the cache could not be
 
 | id    | task                                                                                                    | acceptance check                                                                 | status |
 | ----- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ------ |
-| T-001 | `terrain-cache.ts`: types, `TerrainCache` policy (timeout, breaker, fail-open), `terrainCacheFromEnv`   | `npx vitest run packages/ingest/test/terrain-cache.test.ts` exits 0              | `todo` |
-| T-002 | `terrain-cache-dir.ts`: directory store, atomic write, zero-length absent marker                        | same file, directory-store cases exit 0                                          | `todo` |
-| T-003 | `terrain-cache-r2.ts`: R2 store with GET/PUT SigV4, 404 as miss                                         | same file, R2-store cases exit 0                                                 | `todo` |
-| T-004 | `elevate.ts`: consult the tier inside the dedup path, write back unawaited, preserve the deadline rules | `npx vitest run packages/ingest/test/elevate.test.ts` exits 0                    | `todo` |
-| T-005 | `config.ts`: `getTerrain()` builds the tier from environment                                            | `npx vitest run packages/ingest/test/config.test.ts` exits 0                     | `todo` |
-| T-006 | `infra/azure/ingest.bicep` + `.bicepparam` + README: four settings, gated on all four                   | `npm test` exits 0; the gate is visible in `optionalWorkerSettings`              | `todo` |
-| T-007 | `scripts/bench-terrain-cache.ts`: cold/warm over a real z9 footprint against the real origin            | `npx tsx scripts/bench-terrain-cache.ts 021231030 --tiles 64` prints both passes | `todo` |
-| T-008 | Full verification: suite, lint, typecheck                                                               | `npm test`, `npm run lint`, `npm run typecheck` exit 0                           | `todo` |
+| T-001 | `terrain-cache.ts`: types, `TerrainCache` policy (timeout, breaker, fail-open), `terrainCacheFromEnv`   | `npx vitest run packages/ingest/test/terrain-cache.test.ts` exits 0              | `done` |
+| T-002 | `terrain-cache-dir.ts`: directory store, atomic write, zero-length absent marker                        | same file, directory-store cases exit 0                                          | `done` |
+| T-003 | `terrain-cache-r2.ts`: R2 store with GET/PUT SigV4, 404 as miss                                         | same file, R2-store cases exit 0                                                 | `done` |
+| T-004 | `elevate.ts`: consult the tier inside the dedup path, write back unawaited, preserve the deadline rules | `npx vitest run packages/ingest/test/elevate.test.ts` exits 0                    | `done` |
+| T-005 | `config.ts`: `getTerrain()` builds the tier from environment                                            | `npx vitest run packages/ingest/test/config.test.ts` exits 0                     | `env`  |
+| T-006 | `infra/azure/ingest.bicep` + `.bicepparam` + README: four settings, gated on all four                   | `npm test` exits 0; the gate is visible in `optionalWorkerSettings`              | `done` |
+| T-007 | `scripts/bench-terrain-cache.ts`: cold/warm over a real z9 footprint against the real origin            | `npx tsx scripts/bench-terrain-cache.ts 021231030 --tiles 64` prints both passes | `done` |
+| T-008 | Full verification: suite, lint, typecheck                                                               | `npm test`, `npm run lint`, `npm run typecheck` exit 0                           | `env`  |
+
+`env` marks a task whose code is complete and whose behaviour is covered by tests that pass, but
+whose acceptance check cannot go green on this machine for a reason outside the change. Both are
+the same two causes, evidenced in §9 seq 5:
+
+- **T-005.** `config.test.ts` fails six `getOverpass` cases because this worktree sits inside the
+  main checkout and Prisma's dotenv walk-up picks up that checkout's stale `.env`, whose
+  `OVERPASS_USER_AGENT` names the one host `overpass.ts` refuses. `origin/master`'s own `config.ts`
+  fails the same six. The wiring T-005 adds is covered by the four `terrainCacheFromEnv` cases in
+  `terrain-cache.test.ts`, which pass.
+- **T-008.** `lint`, `format:check` and `typecheck` exit 0. `npm test` does not, on three files
+  that flake on 5,000 ms timeouts under machine load — four of seven runs at a detached
+  `origin/master` failed, a different subset each time. Marked **UNVERIFIED** rather than passed.
 
 ---
 
@@ -261,4 +274,84 @@ it found or throws, and only the policy layer may answer "the cache could not be
   detail: Store chosen as Cloudflare R2 on disk ceiling, IOPS contention and zero egress.
   decision: Proceed to T-001.
   budget: { implement: 0/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 2
+  at: 2026-08-29T07:05:00Z
+  state: IMPLEMENT (interrupted)
+  event: lineage_lost
+  detail: >
+    A platform-wide API outage killed the lineage mid-verification. Implementation was complete
+    and coherent on disk but uncommitted across twelve files; §7 still read `todo` because the
+    Work Order was never updated. Nothing was truncated — every file balanced and the root
+    `tsc -p tsconfig.json` came back clean on first run.
+  decision: Resume in place. Commit before verifying, so the tree cannot be lost twice.
+
+- seq: 3
+  at: 2026-08-29T08:00:00Z
+  state: IMPLEMENT -> SELF_VERIFY
+  event: rebase_checked
+  detail: >
+    `git merge-base --is-ancestor origin/master HEAD` succeeds and
+    `git rev-list --left-right --count origin/master...HEAD` is `0 1`. The branch was already cut
+    from `1789198`, which carries #63, #64, #67, #72 and #75, so no rebase was owed. Re-checked
+    the two facts the brief called out: `OVERPASS_MAX_TOTAL_MS` is `190_000` in
+    `packages/ingest/src/config.ts`, the Overpass start-by is derived in
+    `apps/ingest-worker/src/drain.ts:overpassDeadlineMs`, and `INGEST_QUEUE_DRIVER` appears
+    nowhere in the tree. Neither the design nor the code reasons about two drain drivers — the
+    two surfaces it names are the Functions worker and Vercel's route planner, both of which
+    still reach terrain through `getTerrain()`.
+  decision: Proceed to verification with no rebase.
+
+- seq: 4
+  at: 2026-08-29T08:20:00Z
+  state: SELF_VERIFY
+  event: tests_observed_failing
+  detail: >
+    The four behaviours the tier turns on were each watched failing for the right reason before
+    being counted. Reverting `readShared` to skip the tier failed 7, including the hit path and
+    the warm `elevateLine`; deleting the write-back failed 3, all populate-path; answering a
+    thrown lookup as `absent` rather than `unavailable` failed 6, including
+    "does not read an unavailable cache as no tile there"; and folding the stored no-data marker
+    into "no answer" failed exactly the round-trip case. All four restored, 53 tests green over
+    three consecutive runs of `terrain-cache.test.ts` and `elevate.test.ts`.
+  decision: Verification counts.
+
+- seq: 5
+  at: 2026-08-29T08:40:00Z
+  state: SELF_VERIFY
+  event: suite_flakiness_attributed
+  detail: >
+    `npm test` does not exit 0 on this machine, and none of it is this change.
+    `packages/ingest/test/config.test.ts` fails because the worktree is nested inside the main
+    checkout and Prisma's dotenv walk-up finds `C:\Projects\switchback\.env`, whose stale
+    `OVERPASS_USER_AGENT` names `switchback.app` — the one host `overpass.ts` refuses. Proven by
+    restoring `origin/master`'s `config.ts` and watching the same six fail. CI exports a valid
+    agent, so this is worktree-local.
+    `test/worker-deploy-path.test.ts`, `packages/db/test/entra-client.test.ts` and
+    `packages/ingest/test/identity.db.test.ts` flake on 5,000 ms timeouts under machine load:
+    four of seven runs at a detached `origin/master` failed, with a different subset each time.
+  decision: Recorded as UNVERIFIED against D10 rather than claimed as a pass.
+
+- seq: 6
+  at: 2026-08-29T09:00:00Z
+  state: SELF_VERIFY -> REVIEW_BOARD
+  event: benchmark_recorded
+  detail: >
+    `npx tsx scripts/bench-terrain-cache.ts 021231030` over a whole z9 footprint, twice against
+    the live origin: cold 7.0 s / warm 0.9 s at a 100% hit rate, then cold 5.6 s / warm 0.8 s.
+    7.1x and 8.2x. At `--tiles 64`, cold 2.5 s / warm 0.3 s, 7.9x. The store is a directory, so
+    the warm figure is a floor on round trips removed rather than a prediction of R2's latency.
+  decision: Work Order to In Review.
+
+- seq: 7
+  at: 2026-08-29T09:05:00Z
+  state: REVIEW_BOARD
+  event: design_correction
+  detail: >
+    One change from the design as built: `terrain-cache-r2.ts` and `infra/azure/README.md` both
+    cited this Work Order by path for the store choice. `.plans/` has never been part of
+    `master`'s tree — `git cat-file -p origin/master^{tree}` has no entry for it, and every
+    commit that ever added a `WO-*.md` sits on a branch that never merged. Both references now
+    point at `infra/azure/README.md`, which carries the argument in full and does ship.
+  decision: No other departure from the predecessor's design.
 ```
