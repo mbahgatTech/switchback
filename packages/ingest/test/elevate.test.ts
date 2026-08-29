@@ -2,20 +2,28 @@ import { describe, expect, it } from 'vitest';
 import { NO_DATA_ELEVATION, lineLengthM, resampleLine } from '@switchback/geo';
 import { TerrainSource, decodeTerrarium, elevateLine, fillGaps } from '../src/elevate';
 import { IngestDeadlineError } from '../src/deadline';
+import { TERRARIUM_TILE_SIZE } from '@switchback/geo';
 import { flatTile, pngResponse } from './fixtures/terrarium';
 
 describe('decodeTerrarium', () => {
   it('round-trips a known elevation through the RGB encoding', () => {
-    const tile = decodeTerrarium(flatTile(1000, 8), 13, 4000, 2600);
-    expect(tile.width).toBe(8);
+    const tile = decodeTerrarium(flatTile(1000), 13, 4000, 2600);
+    expect(tile.width).toBe(TERRARIUM_TILE_SIZE);
     expect(tile.channels).toBe(4);
     // First pixel, decoded by hand the way `@switchback/geo` does it.
     const elev = tile.data[0]! * 256 + tile.data[1]! + tile.data[2]! / 256 - 32768;
     expect(elev).toBeCloseTo(1000, 6);
   });
 
+  it('refuses a well-formed PNG that is not a tile, rather than stamping one out of it', () => {
+    // The coordinates are stamped from the arguments and never read from the body, so without
+    // this a 1x1 PNG becomes a tile whose every sample clamps to pixel (0,0).
+    expect(() => decodeTerrarium(flatTile(1000, 1), 13, 4000, 2600)).toThrow(/not a 256px/u);
+    expect(() => decodeTerrarium(flatTile(1000, 128), 13, 4000, 2600)).toThrow(/128x128/u);
+  });
+
   it('handles a fractional elevation, which is what the blue channel is for', () => {
-    const tile = decodeTerrarium(flatTile(1325.5, 8), 13, 0, 0);
+    const tile = decodeTerrarium(flatTile(1325.5), 13, 0, 0);
     const elev = tile.data[0]! * 256 + tile.data[1]! + tile.data[2]! / 256 - 32768;
     expect(elev).toBeCloseTo(1325.5, 2);
   });
@@ -30,7 +38,7 @@ describe('TerrainSource', () => {
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
       fetchImpl: (async () => {
         requests += 1;
-        return pngResponse(flatTile(500, 8));
+        return pngResponse(flatTile(500));
       }) as unknown as typeof fetch,
     });
 
@@ -46,7 +54,7 @@ describe('TerrainSource', () => {
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
       fetchImpl: (async () => {
         requests += 1;
-        return pngResponse(flatTile(500, 8));
+        return pngResponse(flatTile(500));
       }) as unknown as typeof fetch,
     });
 
@@ -87,7 +95,7 @@ describe('TerrainSource', () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
       cacheSize: 2,
-      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(500))) as unknown as typeof fetch,
     });
 
     await source.tile(13, 1, 1);
@@ -107,7 +115,7 @@ describe('TerrainSource', () => {
         peak = Math.max(peak, inFlight);
         await new Promise((r) => setTimeout(r, 2));
         inFlight -= 1;
-        return pngResponse(flatTile(500, 8));
+        return pngResponse(flatTile(500));
       }) as unknown as typeof fetch,
     });
 
@@ -122,7 +130,7 @@ describe('TerrainSource', () => {
       requestTimeoutMs: 50,
       fetchImpl: ((_url: string, init: RequestInit) => {
         signal = init.signal ?? undefined;
-        return Promise.resolve(pngResponse(flatTile(500, 8)));
+        return Promise.resolve(pngResponse(flatTile(500)));
       }) as unknown as typeof fetch,
     });
 
@@ -138,7 +146,7 @@ describe('TerrainSource', () => {
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
       fetchImpl: (async () => {
         requests += 1;
-        return pngResponse(flatTile(500, 8));
+        return pngResponse(flatTile(500));
       }) as unknown as typeof fetch,
     });
 
@@ -150,7 +158,7 @@ describe('TerrainSource', () => {
   it('still answers from cache once the deadline has passed', async () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
-      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(500))) as unknown as typeof fetch,
     });
 
     await source.tile(13, 1, 1);
@@ -164,7 +172,7 @@ describe('TerrainSource', () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
       maxConcurrent: 1,
-      fetchImpl: (async () => pngResponse(flatTile(500, 8))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(500))) as unknown as typeof fetch,
     });
 
     await expect(source.tile(13, 9, 9, Date.now() - 1)).rejects.toBeInstanceOf(IngestDeadlineError);
@@ -211,7 +219,7 @@ describe('elevateLine', () => {
   it('produces one point per coordinate with cumulative distance', async () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
-      fetchImpl: (async () => pngResponse(flatTile(1000, 64))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(1000))) as unknown as typeof fetch,
     });
 
     const coords: Array<[number, number]> = [
@@ -263,7 +271,7 @@ describe('elevateLine', () => {
   it('measures along the line, not chord to chord, when the true length is given', async () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
-      fetchImpl: (async () => pngResponse(flatTile(1000, 64))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(1000))) as unknown as typeof fetch,
     });
 
     // A sawtooth: it advances north in small steps while swinging east and west, so hiking
@@ -316,7 +324,7 @@ describe('elevateLine', () => {
   it('falls back to chord distances when no along-line length is known', async () => {
     const source = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
-      fetchImpl: (async () => pngResponse(flatTile(1000, 64))) as unknown as typeof fetch,
+      fetchImpl: (async () => pngResponse(flatTile(1000))) as unknown as typeof fetch,
     });
 
     const coords: Array<[number, number]> = [

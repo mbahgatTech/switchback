@@ -11,7 +11,7 @@ import { r2TerrainStore } from '../src/terrain-cache-r2';
 import { IngestDeadlineError } from '../src/deadline';
 import { flatTile, pngResponse } from './fixtures/terrarium';
 
-const TILE = flatTile(1000, 8);
+const TILE = flatTile(1000);
 
 interface ScriptedStore extends TerrainCacheStore {
   readonly writes: Array<Buffer | null>;
@@ -281,7 +281,7 @@ describe('the directory store', () => {
     // perfectly. `decodeTerrarium` stamps z/x/y from its arguments and never checks them against
     // the body, so a mis-keyed entry decodes cleanly into plausible, wrong elevations.
     const store = directoryTerrainStore(root);
-    const other = flatTile(2000, 8);
+    const other = flatTile(2000);
     await store.write(13, 4000, 2600, TILE, anySignal());
     await store.write(13, 2600, 4000, other, anySignal());
 
@@ -480,7 +480,7 @@ describe('elevateLine over a warm tier', () => {
       [-4.0, 56.8],
       [-4.0, 56.801],
     ];
-    const origin = flatTile(1000, 64);
+    const origin = flatTile(1000);
 
     const cold = new TerrainSource({
       urlTemplate: 'https://terrain.test/{z}/{x}/{y}.png',
@@ -538,6 +538,83 @@ describe('what reaches the store', () => {
     await source.flushWrites();
 
     expect(store.writes).toEqual([]);
+  });
+
+  it('does not store a well-formed PNG that is not a tile', async () => {
+    // `PNG.sync.read` succeeding says the bytes are a PNG, not that they are terrain, and
+    // `decodeTerrarium` stamps z/x/y from its arguments rather than reading them. A 1x1 PNG
+    // decodes into a tile whose every sample `elevationAtPixel` clamps to pixel (0,0) — one bad
+    // invocation in the LRU, but that elevation for the whole estate once it is stored.
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store), () => pngResponse(flatTile(1000, 1)));
+
+    await expect(source.tile(13, 4000, 2600)).rejects.toThrow(/1x1 is not a 256px/u);
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([]);
+  });
+
+  it('re-fetches a stored tile of the wrong size rather than serving it', async () => {
+    // The guard runs on the read side too, so a key poisoned before it existed heals itself:
+    // counted corrupt, fetched from the origin, and overwritten with what the origin sent.
+    const store = scriptedStore({
+      read: async () => ({ kind: 'tile', body: flatTile(1000, 1) }),
+    });
+    const source = sourceOver(new TerrainCache(store), () => pngResponse(TILE));
+
+    await expect(source.tile(13, 4000, 2600)).resolves.not.toBeNull();
+    await source.flushWrites();
+
+    expect(source.originRequests()).toBe(1);
+    expect(source.sharedCacheStats.corrupt).toBe(1);
+    expect(store.writes).toEqual([TILE]);
+  });
+
+  it('retries a body that would not decode, and stores the attempt that did', async () => {
+    // Decoding happens inside the fetch attempt, not after the retry ladder. A truncated body is
+    // transient and retrying it is the right answer — moving the decode after the loop would
+    // turn one bad read into a failed tile, and would hand the store bytes nobody had checked.
+    const store = scriptedStore({});
+    let attempt = 0;
+    const source = sourceOver(new TerrainCache(store), () => {
+      attempt += 1;
+      return attempt === 1 ? pngResponse(Buffer.from('truncated')) : pngResponse(TILE);
+    });
+
+    await expect(source.tile(13, 4000, 2600)).resolves.not.toBeNull();
+    await source.flushWrites();
+
+    expect(source.originRequests()).toBe(2);
+    expect(store.writes).toEqual([TILE]);
+  });
+
+  it('issues no write at all when the token cannot write', async () => {
+    // A read-only surface — Vercel reads the cache the worker fills — would otherwise send one
+    // doomed PUT per miss, swallowed with nothing logged and nothing counted.
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store, { readOnly: true }), () => pngResponse(TILE));
+
+    await expect(source.tile(13, 4000, 2600)).resolves.not.toBeNull();
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([]);
+  });
+
+  it('says so once when writes are failing, rather than swallowing them in silence', async () => {
+    const lines: string[] = [];
+    const cache = new TerrainCache(
+      scriptedStore({ write: () => Promise.reject(new Error('403')) }),
+      {
+        logImpl: (line) => lines.push(line),
+      },
+    );
+
+    await cache.write(13, 1, 1, TILE);
+    await cache.write(13, 2, 2, TILE);
+
+    expect(lines).toEqual([
+      expect.stringContaining('[ingest] terrain-cache directory writes failing'),
+    ]);
   });
 
   it('does not store bytes that will not decode', async () => {

@@ -1,10 +1,11 @@
 import { PNG } from 'pngjs';
+import { TERRARIUM_TILE_SIZE } from '@switchback/geo';
 
 /**
  * A terrarium tile where every pixel encodes the same elevation.
  * `elev = R*256 + G + B/256 - 32768`, so 1000 m is R=131, G=232, B=0.
  */
-export function flatTile(elevationM: number, size = 64): Buffer {
+export function flatTile(elevationM: number, size = TERRARIUM_TILE_SIZE): Buffer {
   const encoded = elevationM + 32768;
   const r = Math.floor(encoded / 256);
   const g = Math.floor(encoded - r * 256);

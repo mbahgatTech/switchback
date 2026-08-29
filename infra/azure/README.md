@@ -1702,6 +1702,10 @@ worker walks whole z9 footprints and is where a cold tile is first wanted, and a
 is frozen at response time — an unawaited write-back there is not guaranteed to land anyway. So
 Vercel gets the warm cache without being trusted to fill it.
 
+Set `TERRAIN_CACHE_READ_ONLY=1` alongside the four on Vercel. The token already refuses writes, so
+this changes no outcome — it stops the attempt. Without it every miss sends a PUT that cannot
+succeed and is swallowed, which is a request per uncached tile and a failure nothing reports.
+
 Read the group back after a deploy, because an application-settings write replaces the collection
 whole:
 

@@ -9,6 +9,7 @@ import { IngestDeadlineError, assertBefore, requestBudgetMs } from './deadline';
 import type { TerrainCache } from './terrain-cache';
 import {
   NO_DATA_ELEVATION,
+  TERRARIUM_TILE_SIZE,
   TERRARIUM_ZOOM,
   cumulativeDistancesM,
   requiredTiles,
@@ -334,9 +335,22 @@ export class TerrainSource {
   }
 }
 
-/** Decode a terrarium PNG into the raster shape `@switchback/geo` samples. */
+/**
+ * Decode a terrarium PNG into the raster shape `@switchback/geo` samples.
+ *
+ * The size is checked, not trusted. `PNG.sync.read` succeeding says the bytes are a PNG, not that
+ * they are a tile, and the coordinates are stamped from the arguments rather than read from the
+ * body — so a well-formed 1x1 PNG decodes into a plausible tile whose every sample
+ * `elevationAtPixel` clamps to pixel (0,0). In the LRU alone that was one bad invocation; stored,
+ * it is that elevation for the whole estate until somebody finds the key by hand.
+ */
 export function decodeTerrarium(buffer: Buffer, z: number, x: number, y: number): TerrariumTile {
   const png = PNG.sync.read(buffer);
+  if (png.width !== TERRARIUM_TILE_SIZE || png.height !== TERRARIUM_TILE_SIZE) {
+    throw new Error(
+      `terrain tile ${z}/${x}/${y}: ${png.width}x${png.height} is not a ${TERRARIUM_TILE_SIZE}px terrarium tile`,
+    );
+  }
   return {
     z,
     x,

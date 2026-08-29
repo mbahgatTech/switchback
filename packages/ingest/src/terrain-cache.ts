@@ -88,6 +88,11 @@ export interface TerrainCacheOptions {
   failureLimit?: number;
   retryAfterMs?: number;
   nowImpl?: () => number;
+  /**
+   * Skip writes entirely. For a surface holding a read-only token — Vercel reads the cache the
+   * worker populates — where every write is a request that cannot succeed.
+   */
+  readOnly?: boolean;
   /** Where degradation is reported. Injected in tests; `console.warn` everywhere else. */
   logImpl?: (line: string) => void;
 }
@@ -105,7 +110,9 @@ export class TerrainCache {
   private readonly failureLimit: number;
   private readonly retryAfterMs: number;
   private readonly nowImpl: () => number;
+  private readonly readOnly: boolean;
   private readonly logImpl: (line: string) => void;
+  private writeFailures = 0;
 
   private consecutiveFailures = 0;
   /** When the breaker lets a lookup through again. Zero while it is closed. */
@@ -121,6 +128,7 @@ export class TerrainCache {
     this.failureLimit = Math.max(1, options.failureLimit ?? DEFAULT_FAILURE_LIMIT);
     this.retryAfterMs = options.retryAfterMs ?? DEFAULT_RETRY_AFTER_MS;
     this.nowImpl = options.nowImpl ?? Date.now;
+    this.readOnly = options.readOnly ?? false;
     this.logImpl = options.logImpl ?? ((line) => console.warn(line));
   }
 
@@ -160,6 +168,8 @@ export class TerrainCache {
    * arm the breaker: a bucket that rejects writes but serves reads is still worth reading.
    */
   async write(z: number, x: number, y: number, body: Buffer | null): Promise<void> {
+    if (this.readOnly) return;
+
     // Zero bytes is the marker for "no tile here", and nothing deletes, expires or versions a
     // key. An empty body that did not come from an origin 404 — a 200 with nothing in it, a
     // truncated read — would convert a real tile into permanent ocean for the whole estate.
@@ -169,8 +179,17 @@ export class TerrainCache {
     }
     try {
       await this.store.write(z, x, y, body, AbortSignal.timeout(this.writeTimeoutMs));
-    } catch {
-      // A cache write is not part of anyone's answer.
+    } catch (error) {
+      // A cache write is not part of anyone's answer, so it is swallowed — but swallowed is not
+      // the same as unreported. Said once, because a bucket that refuses writes refuses all of
+      // them and 256 identical lines a tile would bury the one that matters.
+      this.writeFailures += 1;
+      if (this.writeFailures === 1) {
+        this.logImpl(
+          `${TERRAIN_CACHE_MARKER} ${this.store.kind} writes failing, the tier will not populate ` +
+            `— first was ${z}/${x}/${y}: ${String(error)}`,
+        );
+      }
     }
   }
 
@@ -223,7 +242,8 @@ export function terrainCacheFromEnv(
   options: TerrainCacheOptions = {},
 ): TerrainCache | null {
   const store = terrainStoreFromEnv(env);
-  return store ? new TerrainCache(store, options) : null;
+  if (!store) return null;
+  return new TerrainCache(store, { readOnly: readOnlyFromEnv(env), ...options });
 }
 
 function terrainStoreFromEnv(env: Record<string, string | undefined>): TerrainCacheStore | null {
@@ -238,4 +258,10 @@ function terrainStoreFromEnv(env: Record<string, string | undefined>): TerrainCa
 
   const dir = env.TERRAIN_CACHE_DIR?.trim();
   return dir ? directoryTerrainStore(dir) : null;
+}
+
+/** `TERRAIN_CACHE_READ_ONLY` for a surface whose token cannot write — see `TerrainCacheOptions`. */
+function readOnlyFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.TERRAIN_CACHE_READ_ONLY?.trim().toLowerCase();
+  return value === '1' || value === 'true';
 }
