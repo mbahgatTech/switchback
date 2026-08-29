@@ -409,4 +409,55 @@ the same two causes, evidenced in §9 seq 5:
     `infra/azure/README.md` carries the argument in full and is where an operator looks — but it
     was reached by an argument that did not hold.
   decision: Reference stays repointed. The reasoning is corrected here rather than edited away.
+
+- seq: 12
+  at: 2026-08-29T14:00:00Z
+  state: REVIEW_BOARD -> IMPLEMENT
+  event: merge_gate_condition
+  detail: >
+    Merge gate passed, with one Major held back. A well-formed PNG of the wrong size still reached
+    the store: `decodeTerrarium` validated only that `PNG.sync.read` did not throw, and stamps
+    z/x/y from its arguments, so a 1x1 PNG became a tile whose every sample `elevationAtPixel`
+    clamps to pixel (0,0). Pre-existing in `decodeTerrarium`, but this Work Order amplifies it from
+    one invocation to permanent and estate-wide — a fourth route into the failure the write path
+    already guarded three ways.
+  decision: Guard the dimensions against `TERRARIUM_TILE_SIZE`, on both sides of the tier.
+
+- seq: 13
+  at: 2026-08-29T14:30:00Z
+  state: IMPLEMENT
+  event: correction
+  detail: >
+    Correcting the claim in seq 8 and in the pull request that silent failure paths had been ended.
+    They had not. `TerrainCache.write` still swallowed every failure into a bare catch, and because
+    `writeBack` fires whenever a cache is configured, a read-only surface issued one doomed PUT per
+    miss with nothing logged and nothing counted. Also correcting the argument that Vercel holding a
+    read-only token made the write path moot: the security half is sound, but nothing in the code
+    knew the credential was read-only. `TERRAIN_CACHE_READ_ONLY` now skips the write, and a write
+    that does fail is reported once.
+  decision: The position stands; the word "moot" does not.
+
+- seq: 14
+  at: 2026-08-29T14:45:00Z
+  state: IMPLEMENT
+  event: correction
+  detail: >
+    Correcting the pull request's mutation table, which labelled one row "write-back before
+    validating (the shipped bug)" against a single failing test. That mutation was the 403 collapse
+    and fails 1; true write-before-validate fails 2. Both are caught, so the conclusion held, but
+    the label described a different mutation from the one the count came from.
+  decision: Table relabelled with the mutation actually run against each count.
+
+- seq: 15
+  at: 2026-08-29T15:00:00Z
+  state: IMPLEMENT -> REVIEW_BOARD
+  event: rebased_and_verified
+  detail: >
+    Rebased onto `d7c2fad` (#80), which is the first master since 2026-08-10 whose browser suite
+    genuinely passes, so a green tick now means something. Six commits replayed with no conflicts.
+    Mutation evidence for this round: removing the dimension guard fails 3, moving the decode after
+    the retry ladder fails 1 (it passed 69/69 before), ignoring `readOnly` fails 1, silencing the
+    write-failure report fails 1, and transposing the R2 key — the twin of the directory case —
+    fails 2. Full suite 2,339 passed / 29 skipped, 2 failed, both in the flaky pair.
+  decision: Condition met. Back to the gate.
 ```
