@@ -138,7 +138,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    C1[ci: seed-e2e.ts] -->|fixture-photographed-trail<br/>fixture-early-high-point<br/>fixture-report-trail| C2[(database)]
+    C1[ci: npm run db:seed:e2e] -->|fixture-photographed-trail<br/>fixture-early-high-point<br/>fixture-report-trail| C2[(database)]
     C3[ci: ingest tile 021230013] -->|Overpass, once a day| C2
     C4[e2e/trails.ts<br/>SUITE_TRAILS] -.->|held by<br/>test/e2e-trail-sources.test.ts| C1
     C4 -.-> C3
@@ -146,7 +146,7 @@ flowchart LR
 
 ### What changes
 
-`packages/db/scripts/e2e-fixtures.ts` — the `Shape` type and the shapes, lifted out of
+`packages/db/scripts/e2e-shapes.ts` — the `Shape` type and the shapes, lifted out of
 `seed-e2e.ts` so that the seeding script and the guard read one list rather than two. A third
 shape joins them: `fixture-report-trail`, a short day hike with no photographs, which is all
 the reviews specs need from a trail.
@@ -174,7 +174,7 @@ slug sits inside the tile the workflow's own `--at` resolves to.
 
 | id    | task                                                                                                                                                                                                                    | acceptance check                                                             | status |
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------ |
-| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-fixtures.ts`; `seed-e2e.ts` imports them                                                                                                                          | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `done` |
+| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-shapes.ts`; `seed-e2e.ts` imports them                                                                                                                          | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `done` |
 | T-002 | Add the `fixture-report-trail` shape                                                                                                                                                                                    | the seed prints three lines, one per fixture, exit 0                         | `done` |
 | T-003 | Lift the trail constants into `e2e/trails.ts`, add `SUITE_TRAILS`, re-export from `fixtures.ts`, point `REPORT_TRAIL` at the fixture                                                                                    | `npm run typecheck` exits 0                                                  | `done` |
 | T-004 | Add `test/e2e-trail-sources.test.ts`, observed failing first for each of its three cases                                                                                                                                | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 3 passed            | `done` |
