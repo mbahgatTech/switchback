@@ -67,18 +67,20 @@ page highlighted from one gesture over a chart.
 
 ## 4. Definition of Done
 
-| id  | predicate                                                                                                                                    | verification                                                                                                                                                               |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | The trail line stays visible along ground already recorded — the recorded track is narrower than the trail beneath it and both read at once. | screenshot of the recording map after ~30 fixes walked along the trail, showing green either side of the recorded track                                                    |
-| D2  | The recording screen shows the trail's section with a marker at the hiker's position on it.                                                  | screenshot of the recording screen mid-hike                                                                                                                                |
-| D3  | Remaining distance and remaining ascent are both readable on the recording screen.                                                           | the same screenshot shows a "to go" and a "to climb" figure                                                                                                                |
-| D4  | Remaining ascent at the trailhead equals the trail's published ascent, so the screen never reports two climbs for one trail.                 | `npx vitest run packages/geo/test/progress.test.ts` exits 0 with the `spends the whole published ascent` case passing                                                      |
-| D5  | The map's progress mark and the section's marker are the same value, not two computations that can disagree.                                 | `apps/web/test/record-progress.test.ts` asserts one `RouteProgress` reaches both components; `npx vitest run apps/web/test/record-progress.test.ts` exits 0                |
-| D6  | A press-and-drag beginning on either elevation graphic selects nothing.                                                                      | `window.getSelection().toString()` is `''` after the drag — before/after screenshots, and `npx vitest run apps/web/test/conventions.test.ts` covering the class's presence |
-| D7  | Selection elsewhere on the trail page is unaffected.                                                                                         | screenshot of a drag over the caption below the graphic, still highlighting                                                                                                |
-| D8  | The section marker is reachable and readable without sight or a pointer.                                                                     | `apps/web/test/record-progress.test.ts` asserts the summary string; screenshot of the readout text                                                                         |
-| D10 | The line hierarchy D1 rests on is asserted, not only photographed — the track's casing is narrower than the trail line beneath it.           | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                                                                                                           |
-| D9  | Nothing already green goes red.                                                                                                              | `npx vitest run` exits 0; `npm run typecheck` exits 0; `npm run lint` exits 0; `npm run format:check` exits 0                                                              |
+| id  | predicate                                                                                                                                    | verification                                                                                                                                                                                                                                         |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | The trail line stays visible along ground already recorded — the recorded track is narrower than the trail beneath it and both read at once. | screenshot of the recording map after ~30 fixes walked along the trail, showing green either side of the recorded track                                                                                                                              |
+| D2  | The recording screen shows the trail's section with a marker at the hiker's position on it.                                                  | screenshot of the recording screen mid-hike                                                                                                                                                                                                          |
+| D3  | Remaining distance and remaining ascent are both readable on the recording screen.                                                           | the same screenshot shows a "to go" and a "to climb" figure                                                                                                                                                                                          |
+| D4  | Remaining ascent at the trailhead equals the trail's published ascent, so the screen never reports two climbs for one trail.                 | `npx vitest run packages/geo/test/progress.test.ts` exits 0 with the `spends the whole published ascent` case passing                                                                                                                                |
+| D5  | The map's progress mark and the section's marker are the same value, not two computations that can disagree.                                 | `apps/web/test/record-progress.test.ts` asserts one `RouteProgress` reaches both components; `npx vitest run apps/web/test/record-progress.test.ts` exits 0                                                                                          |
+| D6  | A press-and-drag beginning on either elevation graphic selects nothing.                                                                      | `window.getSelection().toString()` is `''` after the drag — before/after screenshots, and `npx vitest run apps/web/test/conventions.test.ts` covering the class's presence                                                                           |
+| D7  | Selection elsewhere on the trail page is unaffected.                                                                                         | screenshot of a drag over the caption below the graphic, still highlighting                                                                                                                                                                          |
+| D8  | The section marker is reachable and readable without sight or a pointer.                                                                     | `apps/web/test/record-progress.test.ts` asserts the summary string; screenshot of the readout text                                                                                                                                                   |
+| D10 | The line hierarchy D1 rests on is asserted, not only photographed — the track's casing is narrower than the trail line beneath it.           | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                                                                                                                                                                                     |
+| D9  | Nothing already green goes red.                                                                                                              | `npx vitest run` exits 0; `npm run typecheck` exits 0; `npm run lint` exits 0; `npm run format:check` exits 0                                                                                                                                        |
+| D11 | The section marker and the map mark cannot come to name different places on the hike — a regression in either is caught.                     | `npx vitest run apps/web/test/record-progress.test.ts` exits 0, **and** the invariant was observed red under two injected regressions: the marker drawn from `alongM`, and the outward leg drawn under round-trip figures. Both pasted at log seq 5. |
+| D12 | Weakening or removing the selection suppression fails the suite, rather than passing on the spelling of a class name.                        | `npx vitest run apps/web/test/plot-selection.test.ts` exits 0, **and** observed red under `user-select: text` and under the class removed from either plot. Pasted at log seq 5.                                                                     |
 
 ---
 
@@ -177,17 +179,20 @@ selectable, announced, and set in the real type ladder.
 
 ## 7. Task breakdown
 
-| id    | task                                                                                                                      | acceptance check                                                                  | status |
-| ----- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------ |
-| T-001 | `cumulativeGainM` and `buildHikePlan` in `@switchback/geo`, with the thinning that keeps the curve paired to its samples. | `npx vitest run packages/geo/test/progress.test.ts` exits 0                       | `done` |
-| T-002 | `advanceProgress` and the turnaround latch.                                                                               | same file, exits 0                                                                | `done` |
-| T-003 | `updateOffRoute` returns the projected point, so progress costs no second pass over the route.                            | `npx vitest run packages/geo/test/offroute.test.ts` exits 0                       | `done` |
-| T-004 | `useRecorder` exposes one `progress: RouteProgress \| null`; the record page builds and passes the plan.                  | `npm run typecheck` exits 0                                                       | `done` |
-| T-005 | The recording map's line hierarchy and the progress mark.                                                                 | `npx vitest run apps/web/test/record-progress.test.ts` exits 0; screenshot        | `done` |
-| T-006 | `<ProgressProfile>` — silhouette, marker, and the two figures in HTML.                                                    | same file, exits 0; screenshot                                                    | `done` |
-| T-007 | `.plot-surface` on both graphics' interaction surfaces.                                                                   | `npx vitest run apps/web/test/conventions.test.ts` exits 0; selection screenshots | `done` |
-| T-009 | `addRecordLayers` exported and the hierarchy asserted, so D1 does not rest on a screenshot alone.                         | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                  | `done` |
-| T-008 | Full suite, lint, typecheck, format.                                                                                      | each exits 0                                                                      | `done` |
+| id    | task                                                                                                                                                                         | acceptance check                                                                         | status       |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------ |
+| T-001 | `cumulativeGainM` and `buildHikePlan` in `@switchback/geo`, with the thinning that keeps the curve paired to its samples.                                                    | `npx vitest run packages/geo/test/progress.test.ts` exits 0                              | `done`       |
+| T-002 | `advanceProgress` and the turnaround latch.                                                                                                                                  | same file, exits 0                                                                       | `done`       |
+| T-003 | `updateOffRoute` returns the projected point, so progress costs no second pass over the route.                                                                               | `npx vitest run packages/geo/test/offroute.test.ts` exits 0                              | `done`       |
+| T-004 | `useRecorder` exposes one `progress: RouteProgress \| null`; the record page builds and passes the plan.                                                                     | `npm run typecheck` exits 0                                                              | `done`       |
+| T-005 | The recording map's line hierarchy and the progress mark.                                                                                                                    | `npx vitest run apps/web/test/record-progress.test.ts` exits 0; screenshot               | `done`       |
+| T-006 | `<ProgressProfile>` — silhouette, marker, and the two figures in HTML.                                                                                                       | same file, exits 0; screenshot                                                           | `done`       |
+| T-007 | `.plot-surface` on both graphics' interaction surfaces.                                                                                                                      | `npx vitest run apps/web/test/conventions.test.ts` exits 0; selection screenshots        | `done`       |
+| T-009 | `addRecordLayers` exported and the hierarchy asserted, so D1 does not rest on a screenshot alone.                                                                            | `npx vitest run apps/web/test/record-map-layers.test.ts` exits 0                         | `done`       |
+| T-008 | Full suite, lint, typecheck, format.                                                                                                                                         | each exits 0                                                                             | `done`       |
+| T-010 | Selection suppression asserted through the declarations the plot resolves to in `globals.css`, reached from the class the rendered element actually wears.                   | `npx vitest run apps/web/test/plot-selection.test.ts` exits 0 and is red under mutation  | `done`       |
+| T-011 | The one-value invariant asserted by reading the rendered marker back off the SVG and comparing both the ground under it and the distance it stands for against the map mark. | `npx vitest run apps/web/test/record-progress.test.ts` exits 0 and is red under mutation | `done`       |
+| T-012 | The gesture itself asserted on the real trail page, for the nightly browser suite.                                                                                           | `npx playwright test e2e/selection.spec.ts`                                              | `unverified` |
 
 ---
 
@@ -275,4 +280,58 @@ selectable, announced, and set in the real type ladder.
     and D10 added, and `addRecordLayers` exported to carry them.
   decision: Amendment before implementation, per the Architect's scope rule.
   budget: { implement: 2/3, review: 0/3, replan: 0/2, total: 2/8 }
+
+- seq: 5
+  at: 2026-08-29T10:50:00-07:00
+  state: REVIEW_BOARD -> IMPLEMENT
+  event: blockers_returned
+  detail: >
+    The Review Board held the gate on two findings of the same shape: two behaviours had no
+    test that could fail. Correcting the record for D5 and D6, which seq 2 recorded as MET on
+    evidence that could not have failed:
+
+    D6 was asserted by `conventions.test.ts` looking for the string `plot-surface` in the
+    sources. Rewriting the rule it names to `user-select: text` — deleting the whole of ask #5 —
+    left `24 passed` across `conventions` and `record-progress`. Reproduced before fixing.
+
+    D5 was asserted by `record-progress.test.ts` looking for the literal prop expressions in
+    `recorder.tsx`. Drawing the strip's marker from `progress.alongM` instead of `hikedM` — which
+    on an out-and-back runs the marker backwards down the plot while the figures beside it count
+    down to zero — left `25 passed`. Reproduced before fixing.
+
+    Neither D5 nor D6 was met on the evidence recorded for it. D11 and D12 carry the real
+    verifications; the original rows are left standing rather than edited, per the append-only rule.
+  decision: >
+    T-010 and T-011 added, each written against the mechanism rather than the spelling, and each
+    observed red before green. D12's check is red under two mutations (the rule weakened; the class
+    dropped from either plot) and D11's under two (the marker drawn from `alongM`, which the second
+    assertion catches; the outward leg drawn under round-trip figures, which the ground assertion
+    catches at 786 m of drift).
+  budget: { implement: 3/3, review: 1/3, replan: 0/2, total: 6/8 }
+
+- seq: 6
+  at: 2026-08-29T10:55:00-07:00
+  state: SELF_VERIFY
+  event: verification_gap_declared
+  detail: >
+    T-012 is UNVERIFIED. `e2e/selection.spec.ts` is written and typechecks, but the browser suite
+    needs a seeded database and the local Postgres container holds no schema at all — `Trail` does
+    not exist — so the trail page 500s and the spec fails on page load rather than on selection.
+    Seeding needs an Overpass query and a DEM pass against a volume at 99%. Not attempted.
+
+    Separately: the repository-root `.env` this worktree would have to borrow points `DATABASE_URL`
+    at the production Azure instance, not at the local container. It was copied in for one dev-server
+    start, the trail page failed to load, and the file was deleted. No spec in this change writes,
+    and the two that ran never got past page load. Flagged because any browser run started from a
+    worktree will reach for that same file.
+
+    What is verified instead, in a real Chromium: the component's own markup under the real
+    `globals.css`, dragged with a 700 ms hold. Nothing selected on the plot; the identical drag
+    beginning on the prose below it selected 119 characters. With `user-select` weakened the same
+    drag on the plot selected the graphic's axis labels — the defect ask #5 reports. Pasted in the PR.
+  decision: >
+    Ship the spec for the nightly suite, claim nothing from it, and close D12 on the vitest check
+    that runs on every PR. `implement` is now at its cap of 3: a further Blocker escalates rather
+    than being retried.
+  budget: { implement: 3/3, review: 1/3, replan: 0/2, total: 6/8 }
 ```
