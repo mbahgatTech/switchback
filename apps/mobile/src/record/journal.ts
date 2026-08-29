@@ -42,17 +42,22 @@ export interface JournalHead {
  * The files, behind an interface. `store.ts` constructing `expo-file-system` objects inline is
  * what made it untestable, and untested is how a batch of eight readings came to collapse into
  * one fix without anything noticing.
+ *
+ * Writes report whether they landed. Carrying on through a failed write is deliberate — a full
+ * disk halfway up a mountain is not something the hiker can act on there — but durability being
+ * entirely gone with nothing anywhere recording it is not. The deletions return nothing: a failed
+ * erase has no recovery the caller could pick.
  */
 export interface JournalStore {
   readHead(): string | null;
   /** Staged and renamed into place: a reader never observes a partially written head. */
-  writeHead(raw: string): void;
+  writeHead(raw: string): boolean;
   readFixes(): string | null;
-  appendFixes(raw: string): void;
+  appendFixes(raw: string): boolean;
   /** Rewrites the fixes file whole. Used once at restore, to repair a torn tail. */
-  rewriteFixes(raw: string): void;
+  rewriteFixes(raw: string): boolean;
   /** Replaces whatever the last hike left with an empty journal. */
-  open(): void;
+  open(): boolean;
   clear(): void;
   /** Erases journals written in formats this build no longer reads. */
   clearLegacy(): void;
@@ -158,10 +163,12 @@ export type OwnerVerdict = 'restore' | 'erase' | 'wait';
 /**
  * Whether this journal may be shown to the person at the phone.
  *
- * `wait` when nobody is confirmed signed in: absence of an identity is never treated as a
- * mismatch, because changing identity requires a network sign-in through our own server, so an
- * offline launch cannot be a different user than the launch before it. Refusing to restore
- * offline would lose a hike to a hazard that cannot occur offline.
+ * `wait` is neither `restore` nor `erase`, and the caller must treat it as neither. An earlier
+ * version of this argued that absence of an identity is safe because changing identity needs a
+ * network sign-in — but the erase is gated on `me.get`, a separate call that can fail while the
+ * sign-in succeeded, so "nobody is confirmed" and "the same person as last time" are not the same
+ * claim. `@/record/store` withholds a waiting journal instead: it keeps recording to disk and
+ * presents nothing, which loses no hike and shows no stranger a track.
  *
  * A head with no owner is erased rather than adopted. It can only come from a hike begun before
  * the signed-in user was known, and handing an unattributable location trace to the first

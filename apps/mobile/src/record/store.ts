@@ -53,7 +53,8 @@ import {
  * 2. Nothing waits for the end — a batch goes up about every minute.
  * 3. Every fix reaches the journal as it arrives and the head is renamed into place, so a kill
  *    costs the last second rather than the hike.
- * 4. A journal is readable only by the identity that made it, and erased for any other.
+ * 4. A journal is readable only by the identity that made it, erased for any other, and shown to
+ *    nobody at all until one of the two is settled.
  *
  * Fixes come from `@/record/background` where the host allows it, which is what keeps a hike
  * running with the screen off. Where it does not — Expo Go has no `location` background mode —
@@ -106,6 +107,11 @@ export interface RecorderSnapshot {
    * track keeps being written either way — this only means the OS reclaiming memory ends the hike.
    */
   mayNotSurviveTermination: boolean;
+  /**
+   * A write to the journal did not land, most likely a full disk. The hike is still being recorded
+   * and still being uploaded; what is gone is the promise that a kill costs only the last second.
+   */
+  journalDegraded: boolean;
 }
 
 /**
@@ -202,8 +208,23 @@ let flushing = false;
 /** Set when the server has refused a batch in a way no retry can fix. Cleared only by a new hike. */
 let uploadHalted = false;
 let hydrated = false;
+/** Set by a journal write that did not land, and cleared only by the next hike. See `noteWrite`. */
+let journalDegraded = false;
 /** Who the app currently believes is at the phone. `null` until sign-in resolves. */
 let signedInUser: string | null = null;
+
+/**
+ * A journal read back off disk but shown to nobody, because who is at the phone is not settled.
+ * Readings arriving meanwhile are appended to it, so the hike is not lost; none of it reaches the
+ * snapshot until `ownerVerdict` returns `restore` for a confirmed identity.
+ */
+interface WithheldJournal {
+  head: JournalHead;
+  /** `t` of the last fix on disk, so a held append cannot land out of order or twice. */
+  lastT: number;
+}
+
+let withheld: WithheldJournal | null = null;
 
 let journal: JournalStore = fileJournalStore();
 
@@ -246,6 +267,7 @@ function build(): RecorderSnapshot {
     alert,
     tracking,
     mayNotSurviveTermination: tracking === 'background' && !survivesTermination,
+    journalDegraded,
   };
 }
 
@@ -319,6 +341,17 @@ export function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/**
+ * Fold a journal write's outcome in. Failures are not raised where they happen — a full disk is
+ * nothing a hiker can act on mid-climb — but the screen where the hike is saved has to be able to
+ * say so, and until this nothing anywhere recorded that durability had gone.
+ */
+function noteWrite(landed: boolean): void {
+  if (landed || journalDegraded) return;
+  journalDegraded = true;
+  emit();
+}
+
 function writeHead(): void {
   if (!activityId || !startedAt) return;
   const head: JournalHead = {
@@ -331,7 +364,7 @@ function writeHead(): void {
     sent,
     live,
   };
-  journal.writeHead(encodeHead(head));
+  noteWrite(journal.writeHead(encodeHead(head)));
 }
 
 /**
@@ -342,6 +375,9 @@ function writeHead(): void {
  * still registered, and the task stopped if it is registered for a hike that is no longer live.
  * That order matters — the reconciliation is asynchronous, and a launch that claimed to be
  * recording before it had asked would be claiming a fix it does not have.
+ *
+ * Runs before any identity is known, so a journal whose owner is unsettled is withheld rather than
+ * restored, and re-decided when `confirmSignedInUser` re-enters here.
  */
 export function hydrate(): void {
   // Before the latch, and before any identity is known. Readings from the OS must have somewhere
@@ -349,6 +385,9 @@ export function hydrate(): void {
   // that waits on a signed-in user can be what registers these.
   setBackgroundHandlers({ onReadings, onFailure });
   if (hydrated) return;
+  // A fresh decision against whoever is signed in now: anything held by the last pass is about to
+  // be published or erased on its own terms.
+  withheld = null;
   // Journals written in a format this build cannot read are erased rather than left behind: an
   // unreadable per-second location trace is still a location trace.
   journal.clearLegacy();
@@ -380,12 +419,10 @@ export function hydrate(): void {
     case 'erase':
       discard();
       return;
-    case 'restore':
     case 'wait':
-      // `wait` is the offline launch: nobody is confirmed, and nobody can have *become* confirmed
-      // without a network sign-in through our own server, so this cannot be a new user. Refusing
-      // to restore here would lose the rest of a hike for a hazard that cannot occur offline —
-      // which is exactly what happens if this arm is folded into `erase`.
+      withhold(head);
+      return;
+    case 'restore':
       break;
     default: {
       const unhandled: never = verdict;
@@ -393,20 +430,16 @@ export function hydrate(): void {
     }
   }
 
-  const stored = decodeFixes(journal.readFixes() ?? '');
-  // A tail cut off mid-append has no newline, so the next append would concatenate onto it and
-  // cost a second fix. Rewritten once here rather than guarded at every append.
-  if (stored.torn) journal.rewriteFixes(encodeFixes(stored.fixes));
-
-  fixes = stored.fixes;
-  sent = Math.min(head.sent, stored.fixes.length);
+  const stored = readStoredFixes();
+  fixes = stored;
+  sent = Math.min(head.sent, stored.length);
   activityId = head.id;
   ownerId = head.ownerId;
   startedAt = new Date(head.startedAt);
   trailId = head.trailId;
   routeId = head.routeId;
   live = head.live;
-  statsState = foldAll(stored.fixes);
+  statsState = foldAll(stored);
   statsCache = accumulatedStats(statsState);
   const last = fixes[fixes.length - 1];
   if (last) position = [last.lng, last.lat];
@@ -417,8 +450,50 @@ export function hydrate(): void {
   void reconcileWithOs(head);
 }
 
+/** Every fix on disk, with a tail cut off mid-append repaired so the next one starts clean. */
+function readStoredFixes(): TrackFix[] {
+  const stored = decodeFixes(journal.readFixes() ?? '');
+  // A torn tail has no newline, so the next append would concatenate onto it and cost a second
+  // fix. Rewritten once here rather than guarded at every append.
+  if (stored.torn) noteWrite(journal.rewriteFixes(encodeFixes(stored.fixes)));
+  return stored.fixes;
+}
+
+/**
+ * Hold a journal whose owner is not settled. Nothing about it is published — a phone handed on
+ * while `me.get` is unanswered must not show the previous hike — but readings keep reaching the
+ * disk, so the identity resolving five minutes later costs no part of the track.
+ */
+function withhold(head: JournalHead): void {
+  const stored = readStoredFixes();
+  withheld = { head, lastT: stored[stored.length - 1]?.t ?? -1 };
+  hydrated = true;
+  // The battery half of the reconciliation, which does not depend on who is at the phone:
+  // `BestForNavigation` left running for a hike nobody is recording drains a phone regardless.
+  if (!head.live) void stopBackgroundUpdates();
+}
+
+/**
+ * Readings arriving for a withheld journal. They reach the disk and nothing else — no snapshot, no
+ * stats, no clock — so whoever is confirmed next takes the whole track or has all of it erased.
+ */
+function recordWithheld(readings: readonly Location.LocationObject[]): void {
+  if (!withheld) return;
+  const held = withheld;
+  const kept: TrackFix[] = [];
+  for (const reading of ordered(readings)) {
+    if (!accurateEnough(reading)) continue;
+    const fix = fixAt(reading, stampOf(reading), held.head.startedAt);
+    if (fix.t <= held.lastT) continue;
+    kept.push(fix);
+    held.lastT = fix.t;
+  }
+  if (kept.length > 0) noteWrite(journal.appendFixes(encodeFixes(kept)));
+}
+
 /** Erase the journal and stop anything the OS is still doing for it. */
 function discard(): void {
+  withheld = null;
   journal.clear();
   hydrated = true;
   void stopBackgroundUpdates();
@@ -468,10 +543,15 @@ function adoptBackgroundRecording(): void {
  * Readings from the OS. They arrive in the foreground, with the screen off, and in an app iOS
  * relaunched headless with no screen mounted at all.
  *
- * Handlers are registered only once an identity is known, so anything arriving before that waits
- * in `@/record/background`'s buffer rather than being adopted by whoever happens to be signed in.
+ * Registered before any identity is known, because a relaunch in the backcountry has no network to
+ * resolve one and readings must have somewhere to land. So a reading can arrive for a journal whose
+ * owner is unsettled: `recordWithheld` puts those on disk and shows them to nobody.
  */
 function onReadings(readings: readonly Location.LocationObject[]): void {
+  if (withheld) {
+    recordWithheld(readings);
+    return;
+  }
   if (!activityId) {
     // An orphaned task: the OS is tracking for a hike this device no longer holds. Stop it rather
     // than keep taking positions nothing will ever use. `hydrated` is only ever set after the
@@ -480,12 +560,59 @@ function onReadings(readings: readonly Location.LocationObject[]): void {
     return;
   }
   if (live && phase === 'paused') adoptBackgroundRecording();
-  // A reading carries the moment the phone was somewhere, and CoreLocation hands over everything
-  // it accumulated while the runtime slept. Ordered rather than assumed ordered: `pushFix` keeps
-  // the newest position and drops anything not newer than the last fix, so an out-of-order batch
-  // would silently discard most of itself.
-  const ordered = [...readings].sort((a, b) => a.timestamp - b.timestamp);
-  for (const reading of ordered) pushFix(reading);
+  const recorded: TrackFix[] = [];
+  for (const reading of ordered(readings)) {
+    const fix = pushFix(reading);
+    if (fix) recorded.push(fix);
+  }
+  // One append for the batch that arrived as one. Per fix this was 28,800 open-write-close cycles
+  // over an eight-hour hike where about 500 do the same work — and durability is unchanged, since
+  // readings delivered together are lost together by a kill either way.
+  if (recorded.length > 0) noteWrite(journal.appendFixes(encodeFixes(recorded)));
+}
+
+/** The fallback watcher's sink. It is handed one reading at a time, so its append is its own. */
+function pushForegroundFix(reading: Location.LocationObject): void {
+  const fix = pushFix(reading);
+  if (fix) noteWrite(journal.appendFixes(encodeFixes([fix])));
+}
+
+/**
+ * Oldest first. A reading carries the moment the phone was somewhere, CoreLocation hands over
+ * everything it accumulated while the runtime slept, and nothing promises the order it hands them
+ * over in — while every consumer below drops anything not newer than the fix before it.
+ */
+function ordered(readings: readonly Location.LocationObject[]): Location.LocationObject[] {
+  return [...readings].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+/** Whether a reading is worth recording. A fix this vague is a wrong answer, not a rough one. */
+function accurateEnough(reading: Location.LocationObject): boolean {
+  const { accuracy } = reading.coords;
+  return accuracy == null || accuracy <= MAX_FIX_ACCURACY_M;
+}
+
+/** The reading's own elevation, where the device supplied a usable one. */
+function elevationOf(reading: Location.LocationObject): number | null {
+  const { altitude } = reading.coords;
+  return altitude != null && Number.isFinite(altitude) ? altitude : null;
+}
+
+/**
+ * A reading as a fix. `t` counts from the moment the hike began, and `at` is the moment the phone
+ * was *there* — not the moment JavaScript woke up to hear about it. A batch of eight readings all
+ * stamped at delivery computes one `t`, and eight seconds of track collapse to a single point.
+ */
+function fixAt(reading: Location.LocationObject, at: number, startedAtMs: number): TrackFix {
+  const { longitude, latitude, accuracy, speed } = reading.coords;
+  return {
+    t: Math.max(0, Math.round((at - startedAtMs) / 1000)),
+    lng: longitude,
+    lat: latitude,
+    eleM: elevationOf(reading),
+    accuracyM: accuracy ?? null,
+    speedMps: speed != null && speed >= 0 ? speed : null,
+  };
 }
 
 function onFailure(reason: string): void {
@@ -493,23 +620,23 @@ function onFailure(reason: string): void {
   emit();
 }
 
-function pushFix(reading: Location.LocationObject): void {
-  if (!startedAt) return;
-  const { longitude, latitude, altitude, accuracy, speed } = reading.coords;
+/** The fix this reading was worth, or nothing where it did not become one. Never writes it. */
+function pushFix(reading: Location.LocationObject): TrackFix | null {
+  if (!startedAt) return null;
+  const { longitude, latitude, accuracy } = reading.coords;
   const at = stampOf(reading);
-  const eleM = altitude != null && Number.isFinite(altitude) ? altitude : null;
 
   // Newest wins. Every reading in a batch used to overwrite this, so the live readout showed the
   // last reading of the batch while the single fix that survived was the first.
   if (positionAt == null || at >= positionAt) {
     position = [longitude, latitude];
     positionAt = at;
-    positionEleM = eleM;
+    positionEleM = elevationOf(reading);
     accuracyM = accuracy ?? null;
   }
   geoError = null;
 
-  const usable = accuracy == null || accuracy <= MAX_FIX_ACCURACY_M;
+  const usable = accurateEnough(reading);
   weakSignal = !usable;
   // The first fix good enough to trust is what turns "locating" into "recording".
   if (phase === 'locating' && usable) {
@@ -518,32 +645,20 @@ function pushFix(reading: Location.LocationObject): void {
   }
   if (phase !== 'recording' || !usable) {
     emit();
-    return;
+    return null;
   }
 
-  // `t` is the moment the phone was *there*, not the moment JavaScript woke up to hear about it.
-  // A batch of eight accumulated readings all stamped at delivery computes one `t`, and the guard
-  // below then rejects seven of them — eight seconds of track collapsing to a single point.
-  const t = Math.max(0, Math.round((at - startedAt.getTime()) / 1000));
+  const fix = fixAt(reading, at, startedAt.getTime());
   const previous = fixes[fixes.length - 1];
-  if (previous && t <= previous.t) {
+  if (previous && fix.t <= previous.t) {
     emit();
-    return;
+    return null;
   }
 
-  const fix: TrackFix = {
-    t,
-    lng: longitude,
-    lat: latitude,
-    eleM,
-    accuracyM: accuracy ?? null,
-    speedMps: speed != null && speed >= 0 ? speed : null,
-  };
   fixes.push(fix);
   statsState = advanceTrackStats(statsState, fix);
   statsCache = accumulatedStats(statsState);
-  elapsedS = Math.max(elapsedS, t);
-  journal.appendFixes(encodeFixes([fix]));
+  elapsedS = Math.max(elapsedS, fix.t);
 
   if (route && route.length >= 2) {
     // `updateOffRoute` measures its own timings in milliseconds, unlike `TrackFix.t` which is
@@ -571,6 +686,7 @@ function pushFix(reading: Location.LocationObject): void {
   // A full batch does not wait for the timer. At 1 Hz the two coincide; on a device
   // reporting faster, this is what keeps the backlog from growing without bound.
   if (fixes.length - sent >= SAMPLE_BATCH) void flush().catch(() => undefined);
+  return fix;
 }
 
 /** A reading's own moment, or now where the device's clock is not worth believing. */
@@ -635,7 +751,7 @@ async function startTracking(): Promise<void> {
         distanceInterval: 0,
         mayShowUserSettingsDialog: true,
       },
-      pushFix,
+      pushForegroundFix,
     );
   } catch {
     geoError = 'No position yet. This usually means no clear view of the sky.';
@@ -693,8 +809,8 @@ export async function flush(): Promise<void> {
   syncing = true;
   emit();
   try {
-    // One batch per call, oldest first: draining the whole backlog in a loop would turn a
-    // reconnection after an hour of no signal into sixty simultaneous requests.
+    // Sequentially, oldest first: awaited rather than fired together, so a reconnection after an
+    // hour of no signal is eight requests in series and not eight at once.
     while (activityId === forActivity && fixes.length - sent > 0) {
       const from = sent;
       const batch = fixes.slice(from, from + SAMPLE_BATCH);
@@ -782,6 +898,9 @@ export function begin({
   trailId: trail,
   routeId: plan = null,
 }: BeginArgs): void {
+  // `journal.open()` below replaces whatever was being held, so the hold has to go with it.
+  withheld = null;
+  journalDegraded = false;
   fixes = [];
   sent = 0;
   statsState = initialTrackStats();
@@ -804,7 +923,7 @@ export function begin({
   phase = 'locating';
   live = true;
   uploadHalted = false;
-  journal.open();
+  noteWrite(journal.open());
   writeHead();
   emit();
   startClock();
@@ -860,6 +979,8 @@ export function forget(): void {
 
 /** Everything about a hike, out of memory. Does not touch the disk — callers decide that. */
 function reset(): void {
+  withheld = null;
+  journalDegraded = false;
   fixes = [];
   sent = 0;
   statsState = initialTrackStats();

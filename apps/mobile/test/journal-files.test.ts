@@ -14,6 +14,8 @@ const disk = vi.hoisted(() => ({
   dirs: new Set<string>(),
   /** Fails the second half of a move, the way a kill between remove and rename would. */
   breakMoveAfterRemove: false,
+  /** A full disk. */
+  refuseWrites: false,
   writes: [] as string[],
   moves: [] as string[],
 }));
@@ -64,6 +66,7 @@ vi.mock('expo-file-system', () => {
       return node.text;
     }
     write(raw: string, options?: { append?: boolean }) {
+      if (disk.refuseWrites) throw new Error('no space left on device');
       disk.writes.push(this.path);
       const previous = options?.append ? (disk.files.get(this.path)?.text ?? '') : '';
       disk.files.set(this.path, { text: previous + raw });
@@ -82,6 +85,7 @@ vi.mock('expo-file-system', () => {
 });
 
 const { fileJournalStore } = await import('../src/record/journal-files');
+const { JOURNAL_VERSION } = await import('../src/record/journal');
 
 beforeEach(() => {
   disk.files.clear();
@@ -89,6 +93,7 @@ beforeEach(() => {
   disk.writes = [];
   disk.moves = [];
   disk.breakMoveAfterRemove = false;
+  disk.refuseWrites = false;
 });
 
 describe('writing the head', () => {
@@ -137,6 +142,34 @@ describe('the fixes file', () => {
   });
 });
 
+describe('a write the filesystem refuses', () => {
+  /*
+   * A full disk, most likely. The hike carrying on is deliberate — telling somebody their storage
+   * is full halfway up a mountain helps nobody — but durability being entirely gone with nothing
+   * anywhere recording it is a different thing, and the caller has to be able to see it.
+   */
+
+  it('says so, rather than reporting a fix that never reached the disk', () => {
+    const store = fileJournalStore();
+    store.open();
+    disk.refuseWrites = true;
+    expect(store.appendFixes('{"t":0}\n')).toBe(false);
+  });
+
+  it('says so for the head as well', () => {
+    const store = fileJournalStore();
+    disk.refuseWrites = true;
+    expect(store.writeHead('{"v":2}')).toBe(false);
+  });
+
+  it('reports a write that did land', () => {
+    const store = fileJournalStore();
+    store.open();
+    expect(store.appendFixes('{"t":0}\n')).toBe(true);
+    expect(store.writeHead('{"v":2}')).toBe(true);
+  });
+});
+
 describe('erasure', () => {
   it('takes the whole journal directory, staged head included', () => {
     const store = fileJournalStore();
@@ -152,5 +185,32 @@ describe('erasure', () => {
     disk.files.set('Documents/recording-v1.json', { text: '{"v":1}' });
     fileJournalStore().clearLegacy();
     expect(disk.files.has('Documents/recording-v1.json')).toBe(false);
+  });
+
+  it('sweeps every format below this one, whatever this one is', () => {
+    // Derived from `JOURNAL_VERSION` rather than listed, for the same reason the live directory
+    // is: a hardcoded list strands a full GPS trace at the next bump, with no sweep and no age
+    // horizon to catch it. v1 was a flat file; every version since has been a directory.
+    disk.files.set('Documents/recording-v1.json', { text: '{"v":1}' });
+    for (let v = 1; v < JOURNAL_VERSION; v += 1) {
+      disk.dirs.add(`Documents/recording-v${v}`);
+      disk.files.set(`Documents/recording-v${v}/fixes.ndjson`, { text: '{"t":0}' });
+    }
+
+    fileJournalStore().clearLegacy();
+
+    expect(disk.files.has('Documents/recording-v1.json')).toBe(false);
+    for (let v = 1; v < JOURNAL_VERSION; v += 1) {
+      expect(disk.dirs.has(`Documents/recording-v${v}`)).toBe(false);
+      expect(disk.files.has(`Documents/recording-v${v}/fixes.ndjson`)).toBe(false);
+    }
+  });
+
+  it('leaves the format this build actually reads alone', () => {
+    const store = fileJournalStore();
+    store.open();
+    store.appendFixes('{"t":0}\n');
+    store.clearLegacy();
+    expect(store.readFixes()).toBe('{"t":0}\n');
   });
 });

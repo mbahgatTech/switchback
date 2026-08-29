@@ -288,6 +288,9 @@ export default function RecordScreen() {
 
       {recording.geoError ? <Text style={styles.problem}>{recording.geoError}</Text> : null}
       {recording.syncError ? <Text style={styles.problem}>{recording.syncError}</Text> : null}
+      {recording.journalDegraded ? (
+        <Text style={styles.problem}>{JOURNAL_DEGRADED_PROSE}</Text>
+      ) : null}
       {saveError ? <Text style={styles.problem}>{saveError}</Text> : null}
       {start.isError ? <Text style={styles.problem}>{start.error.message}</Text> : null}
 
@@ -469,6 +472,14 @@ const TRACKING_PROSE: Readonly<Record<TrackingNote, string>> = {
     'This build records only while Switchback is open, so the screen is being held awake. Lock the phone and the track pauses until you come back.',
   'not-tracking': 'Not tracking. Nothing is being added to this hike until you resume it.',
 };
+
+/**
+ * Said where a hike is still saveable, because that is the only thing left to do about it. The
+ * recorder keeps the track in memory and keeps uploading it; what is gone is the copy that would
+ * survive the app being killed.
+ */
+const JOURNAL_DEGRADED_PROSE =
+  'The phone would not store part of this hike. Nothing is lost yet — save it rather than leaving the app.';
 
 function trackingProse(recording: RecorderSnapshot): string {
   return TRACKING_PROSE[trackingNote(recording)];

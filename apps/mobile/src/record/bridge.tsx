@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTRPC, useTRPCClient } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
@@ -29,7 +29,7 @@ import { confirmSignedInUser, flush, hydrate, setUploader, signOut } from '@/rec
 export function RecordBridge() {
   const client = useTRPCClient();
   const trpc = useTRPC();
-  const { status } = useAuth();
+  const { status, signedInAt } = useAuth();
   const signedIn = status === 'signedIn';
 
   useEffect(() => {
@@ -55,29 +55,28 @@ export function RecordBridge() {
   const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: signedIn });
 
   /*
-   * When this device last became signed in. A `QueryClient` built once per launch keeps `me.get`
-   * for a minute after it is read, and nothing clears it on sign-out — so without this, signing in
-   * as somebody else inside that window is answered with the previous user's id, and the previous
-   * user's track is handed to them. An id older than the sign-in that is asking for it is refused.
+   * A `QueryClient` built once per launch keeps `me.get` for a minute after it is read, and
+   * nothing clears it on sign-out — so signing in as somebody else inside that window is answered
+   * with the previous user's id, and the previous user's track is handed to them. An id not
+   * fetched *after* the sign-in asking for it is refused, and a tie is not after.
+   *
+   * `signedInAt` comes from `AuthProvider`, which is where the transition it stamps actually
+   * happens. Deriving it here meant writing a ref during render: React may discard a render and
+   * keep the mutation, which is exactly how a stale id gets past a check meant to refuse it.
    */
-  const signedInAt = useRef<number | null>(null);
-  if (signedIn && signedInAt.current === null) signedInAt.current = Date.now();
-  if (!signedIn && signedInAt.current !== null) signedInAt.current = null;
-
   useEffect(() => {
     if (status === 'loading') return;
     if (!signedIn) {
       signOut();
       return;
     }
-    const since = signedInAt.current;
     const id = me.data?.id;
-    if (!id || since === null || me.dataUpdatedAt < since) return;
+    if (!id || signedInAt === null || me.dataUpdatedAt <= signedInAt) return;
     confirmSignedInUser(id);
     // A batch may have been recorded and journalled but never acknowledged before the last launch
     // ended. Nothing else would send it until the next flush tick a minute from now.
     void flush().catch(() => undefined);
-  }, [status, signedIn, me.data, me.dataUpdatedAt]);
+  }, [status, signedIn, signedInAt, me.data, me.dataUpdatedAt]);
 
   /*
    * Whether a Lifeline is running, asked once per launch and refreshed by whoever changes it.

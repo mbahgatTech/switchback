@@ -23,8 +23,30 @@ const HEAD_NAME = 'head.json';
 const STAGED_HEAD_NAME = 'head.json.staged';
 const FIXES_NAME = 'fixes.ndjson';
 
-/** Journals from formats this build no longer reads. Deleted, not ignored — see `clearLegacy`. */
-const LEGACY_NAMES = ['recording-v1.json'];
+/** The single file v1 wrote. Every format since has been a directory, so it is named apart. */
+const V1_FILE_NAME = 'recording-v1.json';
+
+/**
+ * The directories of formats this build no longer reads, derived for the same reason
+ * `JOURNAL_DIR` is. A hardcoded list strands a whole GPS trace at the next version bump, with no
+ * sweep to take it and no age horizon behind it — `docs/mobile.md` promises the opposite.
+ */
+function legacyDirNames(): string[] {
+  const names: string[] = [];
+  for (let version = 1; version < JOURNAL_VERSION; version += 1) {
+    names.push(`recording-v${version}`);
+  }
+  return names;
+}
+
+/** Deletes an entry if it is there. A failure here is not actionable and nothing depends on it. */
+function remove(entry: { exists: boolean; delete(): void }): void {
+  try {
+    if (entry.exists) entry.delete();
+  } catch {
+    /* Nothing to do about it. */
+  }
+}
 
 export function fileJournalStore(): JournalStore {
   const dir = (): FileSystem.Directory =>
@@ -63,9 +85,11 @@ export function fileJournalStore(): JournalStore {
         // follows is not atomic either, so `readHead` falls back to the staged copy for the window
         // in which neither file exists.
         staged.moveSync(file(HEAD_NAME), { overwrite: true });
+        return true;
       } catch {
-        // A full disk, most likely. Durability degrades; the hike carries on, because saying so
-        // mid-hike is worse than carrying on.
+        // A full disk, most likely. The hike carries on — saying so mid-climb helps nobody — but
+        // the caller is told, so somewhere it can be acted on says it.
+        return false;
       }
     },
 
@@ -74,16 +98,18 @@ export function fileJournalStore(): JournalStore {
     appendFixes(raw) {
       try {
         file(FIXES_NAME).write(raw, { append: true });
+        return true;
       } catch {
-        /* As above. */
+        return false;
       }
     },
 
     rewriteFixes(raw) {
       try {
         file(FIXES_NAME).write(raw);
+        return true;
       } catch {
-        /* As above. */
+        return false;
       }
     },
 
@@ -92,8 +118,9 @@ export function fileJournalStore(): JournalStore {
         this.clear();
         dir().create({ intermediates: true });
         file(FIXES_NAME).create();
+        return true;
       } catch {
-        /* As above. */
+        return false;
       }
     },
 
@@ -107,13 +134,9 @@ export function fileJournalStore(): JournalStore {
     },
 
     clearLegacy() {
-      for (const name of LEGACY_NAMES) {
-        try {
-          const stale = new FileSystem.File(FileSystem.Paths.document, name);
-          if (stale.exists) stale.delete();
-        } catch {
-          /* As above. */
-        }
+      remove(new FileSystem.File(FileSystem.Paths.document, V1_FILE_NAME));
+      for (const name of legacyDirNames()) {
+        remove(new FileSystem.Directory(FileSystem.Paths.document, name));
       }
     },
   };

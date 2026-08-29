@@ -3,6 +3,7 @@ import type { JournalStore } from '../src/record/journal';
 import type { TrackFix } from '@switchback/core';
 import type * as GeoModule from '@switchback/geo';
 import type * as StoreModule from '../src/record/store';
+import { summariseTrack } from '@switchback/geo';
 
 /**
  * The recorder itself, which had no tests at all — and that is where every blocker of the first
@@ -103,6 +104,8 @@ interface MemoryJournal extends JournalStore {
   rewrites: number;
   cleared: number;
   legacyCleared: number;
+  /** A full disk: every write is refused, exactly as the file store reports one. */
+  refuseWrites: boolean;
 }
 
 function memoryJournal(): MemoryJournal {
@@ -114,29 +117,38 @@ function memoryJournal(): MemoryJournal {
     rewrites: 0,
     cleared: 0,
     legacyCleared: 0,
+    refuseWrites: false,
     readHead() {
       return this.head;
     },
     writeHead(raw) {
+      if (this.refuseWrites) return false;
       // The file store stages under another name and renames, so a reader never sees half a head.
       this.headWrites.push({ kind: 'stage', raw });
       this.head = raw;
       this.headWrites.push({ kind: 'commit', raw });
+      return true;
     },
     readFixes() {
       return this.lines;
     },
     appendFixes(raw) {
+      if (this.refuseWrites) return false;
       this.appends += 1;
       this.lines += raw;
+      return true;
     },
     rewriteFixes(raw) {
+      if (this.refuseWrites) return false;
       this.rewrites += 1;
       this.lines = raw;
+      return true;
     },
     open() {
+      if (this.refuseWrites) return false;
       this.head = null;
       this.lines = '';
+      return true;
     },
     clear() {
       this.cleared += 1;
@@ -406,6 +418,101 @@ describe('a phone handed to somebody else', () => {
   });
 });
 
+describe('a journal whose owner has not been confirmed yet', () => {
+  /**
+   * A live journal, exactly as an app iOS relaunched in the backcountry finds one: `me.get` has
+   * not answered, so `signedInUser` is still null and `ownerVerdict` returns `wait`.
+   */
+  function unconfirmed(): MemoryJournal {
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_1',
+      ownerId: 'usr_a',
+      startedAt: START.getTime(),
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: true,
+    });
+    journal.lines =
+      '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n' +
+      '{"t":1,"lng":-121.489,"lat":48.02,"eleM":611,"accuracyM":6}\n';
+    return journal;
+  }
+
+  it('shows the person at the phone nothing of it', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    // The whole finding: `wait` used to reach the same restore block as `restore`, so somebody who
+    // picked up the phone saw the previous user's track until `me.get` answered — which on a
+    // trailhead with no signal is never.
+    const snapshot = store.recordingSnapshot();
+    expect(snapshot.activityId).toBeNull();
+    expect(snapshot.fixes).toEqual([]);
+    expect(snapshot.position).toBeNull();
+    expect(snapshot.phase).toBe('idle');
+  });
+
+  it('does not offer its last position to the Lifeline', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    // A guard rather than a repair: `latestFix` withholds a position it has no stamp for, so this
+    // held even while the snapshot leaked. It is asserted because the Lifeline sends whatever this
+    // returns to a publicly shareable link, and the leak next door proves the reasoning is fragile.
+    expect(store.latestFix()).toBeNull();
+  });
+
+  it('keeps writing the hike to disk, so a wait costs no readings', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    os.task?.({ data: { locations: [2, 3].map((s) => reading(s)) } });
+    expect(journal.lines.trimEnd().split('\n')).toHaveLength(4);
+    expect(store.recordingSnapshot().fixes).toEqual([]);
+  });
+
+  it('leaves a subscription the OS is feeding alone', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    os.task?.({ data: { locations: [2].map((s) => reading(s)) } });
+    expect(os.stopLocationUpdatesAsync).not.toHaveBeenCalled();
+  });
+
+  it('hands over everything, including what arrived while it waited, to the owner', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    os.task?.({ data: { locations: [2, 3].map((s) => reading(s)) } });
+    store.confirmSignedInUser('usr_a');
+    expect(store.recordingSnapshot().fixes.map((fix) => fix.t)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('erases everything, including what arrived while it waited, for anybody else', async () => {
+    const journal = unconfirmed();
+    const store = await load(journal);
+    store.hydrate();
+    os.task?.({ data: { locations: [2, 3].map((s) => reading(s)) } });
+    store.confirmSignedInUser('usr_b');
+    expect(store.recordingSnapshot().activityId).toBeNull();
+    expect(journal.cleared).toBeGreaterThan(0);
+  });
+
+  it('stops a task still registered for a hike that was already paused', async () => {
+    os.hasStartedLocationUpdatesAsync.mockResolvedValue(true);
+    const journal = unconfirmed();
+    journal.head = JSON.stringify({ ...JSON.parse(journal.head ?? '{}'), live: false });
+    const store = await load(journal);
+    store.hydrate();
+    // Withholding must not cost the battery fix: `BestForNavigation` left running for a hike
+    // nobody is recording burns a phone whether or not an identity has resolved.
+    await vi.waitFor(() => expect(os.stopLocationUpdatesAsync).toHaveBeenCalled());
+  });
+});
+
 describe('an upload still in flight when the next hike starts', () => {
   it('cannot write its progress into the new hike', async () => {
     const journal = memoryJournal();
@@ -511,16 +618,178 @@ describe('a host that cannot track in the background', () => {
   });
 });
 
-describe('what the journal costs per fix', () => {
-  it('appends each fix and never rewrites the track while recording', async () => {
+describe('the numbers on the screen', () => {
+  /**
+   * Five readouts on the Record screen come off `snapshot.stats`, and until this block nothing
+   * asserted a single one of them. The accumulator's arithmetic is proven in `packages/geo`; what
+   * is proven here is that the recorder publishes it — a mutation replacing the snapshot's stats
+   * with a permanently empty object left the whole suite green while every tile read zero.
+   */
+
+  it('has walked a distance and climbed after a batch of readings', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1, 2, 3, 4, 5, 6, 7].map((s) => reading(s)) } });
+    const { stats } = store.recordingSnapshot();
+    // Eight readings, 20 m apart: a distance on the order of 140 m, not zero and not a kilometre.
+    expect(stats.distanceM).toBeGreaterThan(100);
+    expect(stats.distanceM).toBeLessThan(200);
+    expect(stats.movingTimeS).toBeGreaterThan(0);
+  });
+
+  it('agrees with the full pass over the same buffer', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1, 2, 3, 4, 5, 6, 7].map((s) => reading(s)) } });
+    const snapshot = store.recordingSnapshot();
+    // The fold and `summariseTrack` are pinned to each other in `packages/geo`. This is the other
+    // half: that the recorder's published figures are that fold over the recorder's own buffer.
+    expect(snapshot.stats).toEqual(summariseTrack(snapshot.fixes));
+  });
+
+  it('climbs when the hike climbs, rather than reporting a flat day', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    const climbing = [0, 1, 2, 3, 4, 5, 6, 7].map((s) => {
+      const base = reading(s);
+      return { ...base, coords: { ...base.coords, altitude: 610 + s * 8 } };
+    });
+    os.task?.({ data: { locations: climbing } });
+    expect(store.recordingSnapshot().stats.gainM).toBeGreaterThan(0);
+  });
+
+  it('starts a new hike at zero rather than on the end of the last one', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1, 2, 3].map((s) => reading(s)) } });
+    expect(store.recordingSnapshot().stats.distanceM).toBeGreaterThan(0);
+    store.begin({ id: 'act_2', startedAt: START, trailId: null });
+    expect(store.recordingSnapshot().stats.distanceM).toBe(0);
+    expect(store.recordingSnapshot().stats.gainM).toBe(0);
+  });
+
+  it('re-derives them from the journal when a hike is restored', async () => {
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_1',
+      ownerId: 'usr_a',
+      startedAt: START.getTime(),
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: false,
+    });
+    journal.lines =
+      [0, 1, 2, 3, 4]
+        .map((t) =>
+          JSON.stringify({
+            t,
+            lng: -121.49 + t * 0.000_24,
+            lat: 48.02,
+            eleM: 610 + t * 8,
+            accuracyM: 6,
+          }),
+        )
+        .join('\n') + '\n';
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    const snapshot = store.recordingSnapshot();
+    // An eight-hour hike coming back reading 0 km is what a missing re-fold looks like.
+    expect(snapshot.fixes).toHaveLength(5);
+    expect(snapshot.stats).toEqual(summariseTrack(snapshot.fixes));
+    expect(snapshot.stats.distanceM).toBeGreaterThan(0);
+  });
+
+  it('is emptied when a journal is discarded', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1, 2, 3].map((s) => reading(s)) } });
+    store.forget();
+    expect(store.recordingSnapshot().stats.distanceM).toBe(0);
+  });
+});
+
+describe('a phone that will not take the writes', () => {
+  /**
+   * Every write path swallows its failure on purpose: a full disk halfway up a mountain is not
+   * something the hiker can do anything about there, and stopping the hike over it is worse. What
+   * was missing is any record that it happened — durability could be entirely gone with nothing
+   * anywhere saying so, including on the screen where the hike is saved and could still be acted on.
+   */
+
+  it('says so on the snapshot when a fix does not reach the disk', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    expect(store.recordingSnapshot().journalDegraded).toBe(false);
+    journal.refuseWrites = true;
+    os.task?.({ data: { locations: [0, 1].map((s) => reading(s)) } });
+    expect(store.recordingSnapshot().journalDegraded).toBe(true);
+  });
+
+  it('keeps recording the hike in memory regardless', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    journal.refuseWrites = true;
+    os.task?.({ data: { locations: [0, 1].map((s) => reading(s)) } });
+    // The point of swallowing the failure in the first place. Losing the durability guarantee
+    // must not cost the fixes that are already in hand.
+    expect(store.recordingSnapshot().fixes.map((fix) => fix.t)).toEqual([0, 1]);
+  });
+
+  it('tells mounted subscribers the moment it turns true', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    let announced = 0;
+    const stop = store.subscribeToRecording(() => {
+      announced += 1;
+    });
+    journal.refuseWrites = true;
+    os.task?.({ data: { locations: [0].map((s) => reading(s)) } });
+    stop();
+    expect(announced).toBeGreaterThan(0);
+  });
+
+  it('starts the next hike clean, rather than accusing the phone forever', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    journal.refuseWrites = true;
+    os.task?.({ data: { locations: [0].map((s) => reading(s)) } });
+    expect(store.recordingSnapshot().journalDegraded).toBe(true);
+    journal.refuseWrites = false;
+    store.begin({ id: 'act_2', startedAt: START, trailId: null });
+    expect(store.recordingSnapshot().journalDegraded).toBe(false);
+  });
+});
+
+describe('what the journal costs per batch', () => {
+  it('writes the batch the OS delivered as one append, and never rewrites the track', async () => {
     const journal = memoryJournal();
     await recording(journal);
     const rewritesBefore = journal.rewrites;
     os.task?.({ data: { locations: [0, 1, 2, 3].map((s) => reading(s)) } });
-    // Four appends, no rewrite. Rewriting the whole track per fix is what the append-only format
-    // exists to avoid, and it is invisible to any assertion that only counts the lines on disk.
-    expect(journal.appends).toBe(4);
+    // One open-write-close for the four readings that arrived together. Per fix, an eight-hour
+    // hike costs 28,800 of them for the ~500 the batches are worth. No rewrite either: rewriting
+    // the whole track is what the append-only format exists to avoid, and it is invisible to any
+    // assertion that only counts the lines on disk.
+    expect(journal.appends).toBe(1);
     expect(journal.rewrites).toBe(rewritesBefore);
+    expect(journal.lines.trimEnd().split('\n')).toHaveLength(4);
+  });
+
+  it('still writes a foreground reading of its own, which arrives alone', async () => {
+    os.startLocationUpdatesAsync.mockRejectedValue(new Error('UIBackgroundModes'));
+    const journal = memoryJournal();
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    store.begin({ id: 'act_1', startedAt: START, trailId: null });
+    await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('foreground'));
+    const [, watcher] = os.watchPositionAsync.mock.calls[0] ?? [];
+    (watcher as (r: unknown) => void)(reading(0));
+    (watcher as (r: unknown) => void)(reading(1));
+    // The fallback watcher hands over one reading at a time, so batching it would mean holding a
+    // fix out of the journal until the next one arrived.
+    expect(journal.appends).toBe(2);
   });
 });
 

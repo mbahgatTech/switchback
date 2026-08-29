@@ -19,7 +19,10 @@ const store = vi.hoisted(() => ({
 }));
 
 type Status = 'loading' | 'signedIn' | 'signedOut';
-const auth = vi.hoisted((): { status: Status } => ({ status: 'loading' }));
+const auth = vi.hoisted((): { status: Status; signedInAt: number | null } => ({
+  status: 'loading',
+  signedInAt: null,
+}));
 const query = vi.hoisted(() => ({
   me: { data: undefined as { id: string } | undefined, dataUpdatedAt: 0 },
 }));
@@ -34,7 +37,9 @@ vi.mock('@/record/store', () => ({
 
 vi.mock('@/record/lifeline', () => ({ setPinger: vi.fn(), watchLifeline: vi.fn() }));
 
-vi.mock('@/auth/context', () => ({ useAuth: () => ({ status: auth.status }) }));
+vi.mock('@/auth/context', () => ({
+  useAuth: () => ({ status: auth.status, signedInAt: auth.signedInAt }),
+}));
 
 vi.mock('@/api/trpc', () => ({
   useTRPC: () => ({
@@ -57,13 +62,16 @@ vi.mock('@tanstack/react-query', () => ({
 
 /**
  * React's hooks, played by hand across renders. `useEffect` fires when its dependencies change,
- * `useRef` keeps its box — which is all this component uses and all that has to be faithful.
+ * which is all this component uses and all that has to be faithful.
+ *
+ * `useRef` is deliberately absent. This component used to derive the sign-in moment by mutating a
+ * ref during render — unsupported in React, because a discarded render's mutation survives — and
+ * the moment now comes from `AuthProvider`, which is where the transition happens. Leaving the
+ * hook unimplemented is what makes bringing that back a failure rather than a subtlety.
  */
 const hooks = vi.hoisted(() => ({
   effects: [] as { deps: unknown[] | undefined; ran: boolean }[],
-  refs: [] as { current: unknown }[],
   slot: 0,
-  refSlot: 0,
 }));
 
 vi.mock('react', () => ({
@@ -79,11 +87,6 @@ vi.mock('react', () => ({
     hooks.effects[index] = { deps, ran: true };
     if (changed) fn();
   },
-  useRef: <T>(initial: T) => {
-    const index = hooks.refSlot++;
-    hooks.refs[index] ??= { current: initial };
-    return hooks.refs[index] as { current: T };
-  },
 }));
 
 const { RecordBridge } = await import('@/record/bridge');
@@ -91,15 +94,14 @@ const { RecordBridge } = await import('@/record/bridge');
 /** One render. */
 function render(): void {
   hooks.slot = 0;
-  hooks.refSlot = 0;
   RecordBridge();
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
   hooks.effects = [];
-  hooks.refs = [];
   auth.status = 'loading';
+  auth.signedInAt = null;
   query.me = { data: undefined, dataUpdatedAt: 0 };
 });
 
@@ -135,18 +137,39 @@ describe('a user id from before this sign-in', () => {
   it('is refused, so the previous person’s track is not handed to the next one', () => {
     const signInMoment = Date.now();
     auth.status = 'signedIn';
+    auth.signedInAt = signInMoment;
     // Served from a cache filled a minute ago, under the previous account, and never cleared.
     query.me = { data: { id: 'usr_a' }, dataUpdatedAt: signInMoment - 60_000 };
     render();
     expect(store.confirmSignedInUser).not.toHaveBeenCalled();
   });
 
+  it('is refused when it was fetched in the very millisecond of the sign-in', () => {
+    const signInMoment = Date.now();
+    auth.status = 'signedIn';
+    auth.signedInAt = signInMoment;
+    // A tie says nothing about which side of the sign-in the answer came from, and the direction
+    // that is wrong hands one person another person's track.
+    query.me = { data: { id: 'usr_a' }, dataUpdatedAt: signInMoment };
+    render();
+    expect(store.confirmSignedInUser).not.toHaveBeenCalled();
+  });
+
   it('is accepted once it was fetched after the sign-in that is asking', () => {
     auth.status = 'signedIn';
+    auth.signedInAt = Date.now();
     render();
     query.me = { data: { id: 'usr_b' }, dataUpdatedAt: Date.now() + 1_000 };
     render();
     expect(store.confirmSignedInUser).toHaveBeenCalledWith('usr_b');
+  });
+
+  it('is refused while the provider has stamped no sign-in at all', () => {
+    auth.status = 'signedIn';
+    auth.signedInAt = null;
+    query.me = { data: { id: 'usr_a' }, dataUpdatedAt: Date.now() };
+    render();
+    expect(store.confirmSignedInUser).not.toHaveBeenCalled();
   });
 });
 
@@ -160,6 +183,7 @@ describe('signing out', () => {
 
   it('does not seal a live hike when a token refresh flickers the session', () => {
     auth.status = 'signedIn';
+    auth.signedInAt = Date.now();
     query.me = { data: { id: 'usr_a' }, dataUpdatedAt: Date.now() + 1_000 };
     render();
     expect(store.confirmSignedInUser).toHaveBeenCalledWith('usr_a');

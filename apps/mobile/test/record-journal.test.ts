@@ -130,7 +130,10 @@ describe('whose track this is', () => {
     expect(ownerVerdict(head, 'usr_b')).toBe('erase');
   });
 
-  it('waits while nobody is confirmed, because an offline launch cannot be a new user', () => {
+  it('waits while nobody is confirmed, rather than guessing either way', () => {
+    // Only the name of the verdict. What the recorder does with it — withhold the journal, show
+    // none of it, keep recording to disk — is asserted in `record-store.test.ts`, because pinning
+    // the name here and nothing else is how `wait` came to be handled exactly like `restore`.
     expect(ownerVerdict(head, null)).toBe('wait');
   });
 

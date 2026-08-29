@@ -43,12 +43,13 @@ export type StartOutcome =
   | { started: false; reason: 'failed'; message: string };
 
 /**
- * Readings held for handlers that have not registered yet. The recorder registers only once it
- * knows who is signed in, because a location history must not be presented to the wrong person,
- * and identity is resolved asynchronously at launch — so this buffer is what stops those first
- * seconds of a relaunched hike being dropped on the floor. Ten minutes at 1 Hz; a buffer this
- * full means nothing is coming to drain it, so the excess is dropped rather than the oldest,
- * which are the ones bridging the gap.
+ * Readings held until a sink registers. iOS can relaunch this app headless and hand it a position
+ * before React has mounted anything at all, so `@/record/store` cannot yet have registered — this
+ * buffer is what stops those first seconds of a relaunched hike being dropped on the floor. It is
+ * not an identity gate: registration happens on every launch, before anybody is signed in, and
+ * `@/record/store` is what withholds a journal whose owner is unsettled. Ten minutes at 1 Hz; a
+ * buffer this full means nothing is coming to drain it, so the excess is dropped rather than the
+ * oldest, which are the ones bridging the gap.
  */
 const MAX_BUFFERED = 600;
 
