@@ -39,6 +39,13 @@ repository can show an honest green tick.
 - A regression guard that fails in `gates` — on every pull request — when the browser suite
   names a trail CI does not produce.
 - The `ci.yml` comments that count the fixtures and the specs depending on them.
+- How that guard reads the suite: `e2e/` source rather than only the declarations, since a
+  slug reaches a `page.goto` through a constant or typed in place, and only one of those is
+  a declaration. With it, a bounded opt-out for the one spec whose subject is a trail the
+  database must not hold.
+- Atomicity of each fixture write, which the seed did not have and this guard's usefulness
+  depends on: a half-written row satisfies `trails.bySlug` and defeats the message.
+- `README.md`'s account of what a local browser run needs, which named one seed of two.
 
 **Out**
 
@@ -59,27 +66,27 @@ fixed. Out of scope here, where it is only the evidence that the retry works.
 
 ## 4. Definition of Done
 
-| id  | predicate                                                                                    | verification                                                                                     |
-| --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| D1  | The root cause is named with evidence from the logs, not inferred                            | § Root cause below cites run ids, log lines and the commit that removed the mechanism            |
-| D2  | The browser suite passes, all 50 cases                                                       | `npm run test:e2e` reports `50 passed` on a runner (see A5)                                      |
-| D3  | The suite passes repeatedly, not once                                                        | three dispatched CI runs, each `50 passed`, each `success`                                       |
-| D4  | The three reviews cases still exercise the real form, the real routers and the real database | `e2e/review.spec.ts` is unchanged apart from nothing — the specs are not touched at all          |
-| D5  | A trail the suite opens that CI cannot produce fails a unit test, not a nightly browser run  | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, and fails when the declaration is wrong |
-| D6  | Nothing else regressed                                                                       | `npm run format:check`, `npm run typecheck`, `npm run lint`, `npm test` each exit 0              |
-| D7  | CI is green on the pull request                                                              | run URL with conclusion `success`, browser suite included via `workflow_dispatch`                |
+| id  | predicate                                                                                    | verification                                                                                                                   |
+| --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| D1  | The root cause is named with evidence from the logs, not inferred                            | § Root cause below cites run ids, log lines and the commit that removed the mechanism                                          |
+| D2  | The browser suite passes, all 50 cases                                                       | `npm run test:e2e` reports `50 passed` on a runner (see A5)                                                                    |
+| D3  | The suite passes repeatedly, not once                                                        | three dispatched CI runs, each `50 passed`, each `success`                                                                     |
+| D4  | The three reviews cases still exercise the real form, the real routers and the real database | no spec logic changes: `e2e/review.spec.ts` is untouched, and `e2e/offline.spec.ts` gains three comment lines and nothing else |
+| D5  | A trail the suite opens that CI cannot produce fails a unit test, not a nightly browser run  | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, and fails when the declaration is wrong                               |
+| D6  | Nothing else regressed                                                                       | `npm run format:check`, `npm run typecheck`, `npm run lint`, `npm test` each exit 0                                            |
+| D7  | CI is green on the pull request                                                              | run URL with conclusion `success`, browser suite included via `workflow_dispatch`                                              |
 
 ---
 
 ## 5. Assumptions & defaults
 
-| #   | Ambiguity                                                                                               | Default chosen                                    | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| --- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A1  | Fix by seeding the trail offline, or by pointing the spec at a different real trail on the Vesper sheet | Seed it offline, under a reserved `fixture-` slug | `seed-e2e.ts` already states the rule and applies it to two other specs: a spec that is not about the pipeline, opening a trail the one tile does not hold, takes a fixture. `review.spec.ts` is the third such spec. Naming another OSM trail would re-create the same fragility — an upstream rename would red the pipeline again, silently, and only at 04:11 UTC.                                                                                                                             |
-| A2  | Where the third fixture lives geographically                                                            | New Zealand, beside the other two                 | The existing comment gives the reason: a fixture inside the Vesper or Snowdon viewport changes what a map spec counts.                                                                                                                                                                                                                                                                                                                                                                            |
-| A3  | Whether to reuse `fixture-photographed-trail` for the reports                                           | No — a third shape                                | `photographs.spec.ts` asserts that no image anywhere on its trail page is broken. That is a whole-page assertion, so a report left behind by a run that died mid-test lands inside it — and `review.spec.ts`'s own teardown comment says leftovers happen. Confining the writes to a trail no read-only spec opens keeps that blast radius to the spec that caused it. Corrected in seq 6: the first version of this row cited `rating`/`reviewCount`, which `photographs.spec.ts` does not read. |
-| A4  | Whether the guard belongs in `e2e/` or in the unit suite                                                | The unit suite, `test/`                           | `test/` is where this repository already keeps invariants about the CI workflow itself. A guard that only runs inside the browser suite is a guard that only reports at 04:11 UTC, which is the failure mode being fixed.                                                                                                                                                                                                                                                                         |
-| A5  | Where to run the fixed browser suite, after the workstation could not hold it                           | On runners, `workflow_dispatch`                   | The failing state was reproduced locally and is recorded in seq 2. The fixed suite was not: this workstation had ~350 MB free with other work on it, the Next dev server was killed mid-run, and thirty cases then failed on a dead port. A clean 16 GB runner is the environment CI actually uses, and several runs there beat one contended local pass. Added in seq 6 — seq 4 and D2 cited this row before it existed.                                                                         |
+| #   | Ambiguity                                                                                               | Default chosen                                    | Why                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A1  | Fix by seeding the trail offline, or by pointing the spec at a different real trail on the Vesper sheet | Seed it offline, under a reserved `fixture-` slug | `seed-e2e.ts` already states the rule and applies it to two other specs: a spec that is not about the pipeline, opening a trail the one tile does not hold, takes a fixture. `review.spec.ts` is the third such spec. Naming another OSM trail would re-create the same fragility — an upstream rename would red the pipeline again, silently, and only at 04:11 UTC.                                                             |
+| A2  | Where the third fixture lives geographically                                                            | New Zealand, beside the other two                 | The existing comment gives the reason: a fixture inside the Vesper or Snowdon viewport changes what a map spec counts.                                                                                                                                                                                                                                                                                                            |
+| A3  | Whether to reuse `fixture-photographed-trail` for the reports                                           | No — a third shape                                | The reports specs time a hydration window — they re-click a button until its handler arrives — and neither existing fixture is a quiet page to time anything on: one carries twelve photographs with no file behind them, the other a few thousand profile samples. Two earlier versions of this row argued from write isolation instead; both were checked against `photographs.spec.ts` and neither held. See seq 6 and seq 10. |
+| A4  | Whether the guard belongs in `e2e/` or in the unit suite                                                | The unit suite, `test/`                           | `test/` is where this repository already keeps invariants about the CI workflow itself. A guard that only runs inside the browser suite is a guard that only reports at 04:11 UTC, which is the failure mode being fixed.                                                                                                                                                                                                         |
+| A5  | Where to run the fixed browser suite, after the workstation could not hold it                           | On runners, `workflow_dispatch`                   | The failing state was reproduced locally and is recorded in seq 2. The fixed suite was not: this workstation had ~350 MB free with other work on it, the Next dev server was killed mid-run, and thirty cases then failed on a dead port. A clean 16 GB runner is the environment CI actually uses, and several runs there beat one contended local pass.                                                                         |
 
 ---
 
@@ -142,6 +149,7 @@ flowchart LR
     C3[ci: ingest tile 021230013] -->|Overpass, once a day| C2
     C4[e2e/trails.ts<br/>SUITE_TRAILS] -.->|held by<br/>test/e2e-trail-sources.test.ts| C1
     C4 -.-> C3
+    C5[e2e/*.spec.ts<br/>slugs written in place] -.->|same gate,<br/>source scan| C4
 ```
 
 ### What changes
@@ -172,40 +180,58 @@ slug sits inside the tile the workflow's own `--at` resolves to.
 
 ## 7. Task breakdown
 
-| id    | task                                                                                                                                                                                                                    | acceptance check                                                             | status |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------ |
-| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-shapes.ts`; `seed-e2e.ts` imports them                                                                                                                            | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `done` |
-| T-002 | Add the `fixture-report-trail` shape                                                                                                                                                                                    | the seed prints three lines, one per fixture, exit 0                         | `done` |
-| T-003 | Lift the trail constants into `e2e/trails.ts`, add `SUITE_TRAILS`, re-export from `fixtures.ts`, point `REPORT_TRAIL` at the fixture                                                                                    | `npm run typecheck` exits 0                                                  | `done` |
-| T-004 | Add `test/e2e-trail-sources.test.ts`, observed failing first for each of its three cases                                                                                                                                | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 3 passed            | `done` |
-| T-005 | Correct the fixture counts in the `ci.yml` comments                                                                                                                                                                     | `npm run format:check` exits 0 and the comment names three trails            | `done` |
-| T-006 | Verification: seed, ingest, hermetic gates locally, browser suite on runners                                                                                                                                            | see § Iteration log for pasted output                                        | `done` |
-| T-007 | Review round 1: correct A3's reason, carry `cause` through `trailBySlug`, harden the gate onto spec source and onto exactly one ingest step, add `db:seed:e2e`, rename the shapes module, fix the `warm.setup.ts` count | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 4 passed            | `done` |
+| id    | task                                                                                                                                                                                 | acceptance check                                                             | status |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | ------ |
+| T-001 | Lift the fixture shapes into `packages/db/scripts/e2e-shapes.ts`; `seed-e2e.ts` imports them                                                                                         | `npx tsx packages/db/scripts/seed-e2e.ts` writes the same two trails, exit 0 | `done` |
+| T-002 | Add the `fixture-report-trail` shape                                                                                                                                                 | the seed prints three lines, one per fixture, exit 0                         | `done` |
+| T-003 | Lift the trail constants into `e2e/trails.ts`, add `SUITE_TRAILS`, re-export from `fixtures.ts`, point `REPORT_TRAIL` at the fixture                                                 | `npm run typecheck` exits 0                                                  | `done` |
+| T-004 | Add `test/e2e-trail-sources.test.ts`, observed failing first for each of its three cases                                                                                             | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 3 passed            | `done` |
+| T-005 | Correct the fixture counts in the `ci.yml` comments                                                                                                                                  | `npm run format:check` exits 0 and the comment names three trails            | `done` |
+| T-006 | Verification: seed, ingest, hermetic gates locally, browser suite on runners                                                                                                         | see § Iteration log for pasted output                                        | `done` |
+| T-007 | Carry `cause` through `trailBySlug`, count the ingest steps, add `db:seed:e2e`, name the shapes module for what it holds                                                             | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 4 passed            | `done` |
+| T-008 | Review round 2: scan `e2e/` recursively for both slug shapes, pin the opt-out, count `--at` per occurrence, make each fixture write atomic, fix `--reset`, correct A3 and the README | `npx vitest run test/e2e-trail-sources.test.ts` exits 0, 8 passed            | `done` |
 
 ---
 
 ## 8. Test plan
 
-**Unit** — `test/e2e-trail-sources.test.ts`, three cases against the declaration that broke:
+**Unit** — `test/e2e-trail-sources.test.ts`, five cases on where trails come from:
 
-- _names every trail the suite opens_ — happy path. Every exported constant carrying a `slug`
+- _each say where a CI run gets them_ — happy path. Every exported constant carrying a `slug`
   appears in `SUITE_TRAILS`; a new trail added without a source fails here.
-- _seeds every trail the ingested tile does not hold_ — the failure case. `seeded` slugs and
-  `seed-e2e.ts`'s shapes are the same set, in both directions.
-- _ingests the tile every other trail sits in_ — the edge case, and the one that would have
-  caught this defect. Each `ingested` trail's coordinate resolves to the quadkey the
-  workflow's own `--at` resolves to, both read rather than restated.
+- _are seeded when the ingested tile does not hold them_ — `seeded` slugs and `e2e-shapes.ts`'s
+  shapes are the same set, in both directions.
+- _keep the ingested one on the tile ci.yml still queries_ — a tripwire on the workflow's `--at`
+  moving away from the trail declared against it. Not proof the trail is inside the tile; only
+  OSM could say that, and this suite makes no query. It also requires the workflow to ingest
+  exactly one tile, counted per occurrence so two inside one `run: |` block are two.
+- _include every slug the specs name, however it is written_ — the case that measures the suite
+  rather than its declarations. Reads `e2e/` recursively for both routes a slug takes: a
+  `/trails/` path segment, and the string a `slug:` property is given.
+- _are exempted only where the exemption is already argued for_ — the opt-out is pinned by
+  equality. An unbounded one is a gate that discriminates on nothing, which is what the first
+  version of this file was.
+
+Three more on the remedy those specs print, in the same file: a seeded trail is sent to
+`db:seed:e2e`, an ingested one to `ingest:tile`, and an unknown slug to `ingest:tile`, because
+the seed writes three known rows and could not produce it.
 
 **Integration** — `e2e/review.spec.ts`, unchanged. Filing a report through the rendered form,
 reading it back off the trail page, filing one into a held tRPC batch, and withdrawing one:
 all still against the real Next server, the real routers and the real Postgres.
 
-**Edge cases** — the guard reads `ci.yml` and `e2e/trails.ts` rather than restating either, so
-a workflow edited to ingest a different tile, a constant renamed, or a fixture deleted each
-fail it. A vacuous harvest — no trails found, no `--at` found — fails rather than passes.
+**Edge cases** — the guard reads `ci.yml` and `e2e/` rather than restating either, so a workflow
+edited to ingest a different tile, a constant renamed, or a fixture deleted each fail it. The
+evasion shapes it was built against, all verified failing: a slug in a subdirectory spec, a
+`/trails/<slug>/print` sub-route, a constant declared in `e2e/fixtures.ts` and reached through a
+template literal, a bogus opt-out comment, and two ingests inside one `run: |` block with one of
+them using `--at=`. A vacuous scan fails rather than passes, and its floor counts only unexempt
+sites — the first version's floor was satisfied by the exempt one.
 
-**Regression** — the other 47 browser cases, and the four hermetic gates. Two consecutive
-full browser runs, because a suite that passes once has not been shown to be deterministic.
+**Regression** — the other 47 browser cases, and the four hermetic gates. Repeated full browser
+runs, because a suite that passes once has not been shown to be deterministic. Master's last
+scheduled run reports `Running 50 tests` and `47 passed`; this branch reports `Running 50 tests`
+and `50 passed`, which is the same 50 cases and three more of them passing.
 
 ---
 
@@ -364,4 +390,59 @@ full browser runs, because a suite that passes once has not been shown to be det
     and the tip is the only commit whose green is asserted.
   decision: dispatch a fresh CI run on 81bcfaf; the run on b3be0c9 no longer describes the head.
   budget: { implement: 2/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 10
+  at: 2026-08-29T12:20:00-07:00
+  state: IN_REVIEW -> IMPLEMENT
+  event: review_round_2_corrections
+  detail: >-
+    Seven reviewers, zero Blockers, all seven Pass on the gate rule. Four holes in the gate and
+    three documentation defects, every one reproduced here before being fixed.
+    The gate discriminated on nothing: one /trails/ literal existed under e2e/ and it was the
+    exempt one, so the floor was satisfied by the exempt hit and the undeclared set ran over an
+    empty population. It also read one non-recursive directory, required a closing quote right
+    after the slug, matched only whole-quoted-string literals, and counted --at once per step
+    rather than per occurrence. Five evasion shapes were planted and all five now fail:
+    e2e/regression/nested.spec.ts, '/trails/x/print', a constant declared in e2e/fixtures.ts and
+    reached by template literal, a bogus not-in-suite: comment, and two ingests in one `run: |`
+    block with one written --at=. The opt-out is now pinned by equality against EXEMPTED.
+    `npm run db:seed:e2e -- --reset` re-seeded instead of removing: npm does not forward args
+    through a nested `npm run`, so seed-e2e.ts saw no argv and exited 0 having written the three
+    fixtures again. Reproduced, then fixed by ending the root script with `--`; the flag now
+    reaches the script and removes three rows. That indirection was introduced by round 1's own
+    Minor, and the PR then documented the broken form.
+    writeFixture was four sequential writes; a Ctrl-C between the upsert and writeTrailGeometry
+    left a row that satisfies trails.bySlug with no geom and no searchVector — the friendly
+    message never fires and the specs fail inside the page render. Now one transaction per
+    fixture.
+  decision: fix all of 1-7 plus the Majors; nothing deferred to a fourth round.
+  budget: { implement: 3/3, review: 2/3, replan: 0/2, total: 1/8 }
+
+- seq: 11
+  at: 2026-08-29T12:30:00-07:00
+  state: IMPLEMENT
+  event: reason_of_record_corrected_by_deletion
+  detail: >-
+    A3's stated reason has now been wrong three times, and the correction is a deletion rather
+    than a fourth attempt. seq 6 recorded the first: rating/reviewCount, which photographs.spec.ts
+    does not read. Its replacement claimed a leftover report lands inside brokenImages(page)'s
+    whole-page assertion; it cannot, because a review renders an <img> only through review.photos,
+    guarded on length, and review.spec.ts posts conditions: [] and no photographs — zero <img>
+    contributed. The reason that survives was already in the same comment: the reports specs time
+    a hydration window, and neither existing fixture is a quiet page to time on. Everything else
+    is struck from both the comment and A3 rather than restated in weaker form.
+  decision: state only what was checked against the spec it describes.
+  budget: { implement: 3/3, review: 2/3, replan: 0/2, total: 1/8 }
+
+- seq: 12
+  at: 2026-08-29T12:35:00-07:00
+  state: IMPLEMENT
+  event: coordinator_claim_corrected
+  detail: >-
+    The round-1 report said no e2e/*.spec.ts file was touched. True when written, not true at
+    9d5bd00: e2e/offline.spec.ts is in the diff, +3 lines, all comments — the marked opt-out. No
+    spec logic changed, which is the substance, but D4 now says the accurate thing rather than
+    "the specs are not touched at all".
+  decision: correct the record here and in D4 and the PR body.
+  budget: { implement: 3/3, review: 2/3, replan: 0/2, total: 1/8 }
 ```
