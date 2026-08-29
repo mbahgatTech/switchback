@@ -108,6 +108,58 @@ it from `app.config.ts`, so a committed copy would be a second source of truth t
 wins. Everything normally hand-edited in Xcode — bundle identifier, the `NSLocation*` and
 `NSMotion` permission strings iOS shows verbatim — lives in `app.config.ts` instead.
 
+## Recording with the screen off
+
+A hike is recorded by a CoreLocation task the OS owns, not by anything the app schedules.
+`Location.watchPositionAsync` is a foreground subscription: iOS suspends the JavaScript runtime
+when the screen locks, and a track recorded that way is a straight line between the two moments
+somebody looked at their phone. `src/record/background.ts` registers a `TaskManager` task
+instead, at module load rather than in a component, because iOS relaunches a terminated app
+_headless_ to hand it a position and a task defined in a `useEffect` does not exist yet at that
+moment.
+
+The capability is a build-time declaration, not a runtime request. `app.config.ts` enables
+`isIosBackgroundLocationEnabled` on the `expo-location` plugin, which is what puts `location`
+into `UIBackgroundModes`. Without that key `startLocationUpdatesAsync` throws
+`LocationUpdatesUnavailable` — and that throw is exactly how the app tells the two hosts apart.
+There is no `Constants` check anywhere, because there is nothing to check: a development build
+and Expo Go report the same execution environment, and only the `Info.plist` differs.
+
+| Host                               | What it does                                                                                                                                                                                      |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Expo Go**                        | No `location` background mode, so the task cannot register. The app falls back to `watchPositionAsync`, holds the screen awake, and the Record screen says the track pauses when the phone locks. |
+| **Development build / TestFlight** | The task registers. Recording continues with the screen off and the app behind others.                                                                                                            |
+
+Two permissions, doing different jobs:
+
+- **When In Use** is the one recording requires. With the background mode declared, it is enough
+  to keep the track running with the screen off, and iOS shows the location indicator while it
+  does — `showsBackgroundLocationIndicator` is set deliberately.
+- **Always** buys one further thing: iOS may relaunch the app after terminating it under memory
+  pressure and carry on feeding the recording. Refusing it is not a broken hike, so the app never
+  treats it as an error. It reports it — `mayNotSurviveTermination` on the recorder snapshot, and
+  a line on the Record screen naming the setting to change.
+
+`pausesUpdatesAutomatically` is set to `false`. `expo-location` defaults it to **true**
+(`ios/TaskConsumers/EXLocationTaskConsumer.m`), which lets CoreLocation stop updates when it
+decides the user has stopped moving — and with no `activityType` to judge by, it may not start
+them again. `activityType: Fitness` is set alongside it.
+
+Continuous GPS is the heaviest thing a phone does; a long day out wants a battery pack, and the
+Record screen says so before anybody sets off. The journal is the other half of that cost, which
+is why it appends rather than rewrites: `Documents/recording-v2/` holds a small `head.json` and an
+append-only `fixes.ndjson`, so a fix costs one line instead of re-serialising six hours of track
+once a second. A kill mid-write leaves a half-line, which `src/record/journal.ts` drops — the
+recording loses the last second, not the hike.
+
+Nothing leaves the phone that did not already: the same `activities.append` batch, on the same
+minute tick. Background location changes when fixes are collected, not where they go.
+
+A restored recording comes back **paused** unless the OS still holds the task, which is the only
+evidence that distinguishes an app iOS relaunched — where the hike genuinely never stopped — from
+a crash or a force-quit, where the track has a hole in it and only the user can say whether to
+carry on.
+
 ## Verifying a change
 
 **There is no iOS simulator on this machine — it runs Windows.** Mobile changes are verified by

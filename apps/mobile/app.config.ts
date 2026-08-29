@@ -68,7 +68,29 @@ const config: ExpoConfig = {
       NSAppTransportSecurity: { NSAllowsLocalNetworking: true },
     },
   },
-  plugins: ['expo-router', 'expo-secure-store'],
+  plugins: [
+    'expo-router',
+    'expo-secure-store',
+    /**
+     * Background location. `isIosBackgroundLocationEnabled` is what puts `location` into
+     * `UIBackgroundModes`, and without that key iOS suspends the app at the lock screen and
+     * `startLocationUpdatesAsync` throws rather than registering the task — which is exactly
+     * how `@/record/background` detects a host that cannot carry a hike.
+     *
+     * `locationAlwaysPermission: false` deletes `NSLocationAlwaysUsageDescription`. The plugin
+     * would otherwise write its own placeholder prose into it, and the key it replaced in iOS 11
+     * — `NSLocationAlwaysAndWhenInUseUsageDescription`, set above — is the one iOS 15 shows.
+     * The three strings this app does define are left alone: the plugin only fills a key that
+     * has no value yet.
+     */
+    [
+      'expo-location',
+      {
+        isIosBackgroundLocationEnabled: true,
+        locationAlwaysPermission: false,
+      },
+    ],
+  ],
   experiments: {
     typedRoutes: true,
   },

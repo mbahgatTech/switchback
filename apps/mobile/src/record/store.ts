@@ -18,6 +18,21 @@ import {
   updateOffRoute,
   type OffRouteState,
 } from '@switchback/geo';
+import {
+  isTrackingInBackground,
+  setFixSink,
+  startBackgroundUpdates,
+  stopBackgroundUpdates,
+} from '@/record/background';
+import {
+  JOURNAL_VERSION,
+  decodeFixes,
+  decodeHead,
+  encodeFixes,
+  encodeHead,
+  restoredPhase,
+  type JournalHead,
+} from '@/record/journal';
 
 /**
  * The recording engine, at module scope rather than in a hook: a recorder living in the Record
@@ -30,12 +45,13 @@ import {
  * 1. The buffer on the device is the truth while hiking; fixes are never removed once sent, so
  *    a failed upload is a retry and not a hole.
  * 2. Nothing waits for the end — a batch goes up about every minute.
- * 3. The journal survives a crash (a file, not `localStorage`) and the recording comes back
- *    **paused**, because the honest thing after an interruption is to ask.
+ * 3. The journal survives a crash (files, not `localStorage`) and every fix reaches it as it
+ *    arrives, so a kill costs the last second rather than the hike.
  *
- * Expo Go carries no background-location task registration, so recording only runs in the
- * foreground and the screen is held awake for the duration. A development build lifts that
- * without changing anything here: `expo-task-manager` would feed the same `pushFix`.
+ * Fixes come from `@/record/background` where the host allows it, which is what keeps a hike
+ * running with the screen off and the phone in a pocket. Where it does not — Expo Go has no
+ * `location` background mode — the foreground watcher below is the fallback, the screen is held
+ * awake, and the Record screen says which of the two is in force.
  */
 
 export type RecorderPhase = 'idle' | 'locating' | 'recording' | 'paused' | 'saving';
@@ -68,6 +84,16 @@ export interface RecorderSnapshot {
   offRouteDistanceM: number | null;
   remainingM: number | null;
   alert: 'left' | 'returned' | null;
+  /**
+   * Where fixes are coming from. `background` survives the screen going off; `foreground` is the
+   * fallback for a host with no background location capability and stops when the app does.
+   */
+  tracking: 'background' | 'foreground' | null;
+  /**
+   * Recording without the "Always" authorization iOS needs to relaunch a terminated app. The
+   * screen keeps running either way — this only means the OS reclaiming memory ends the hike.
+   */
+  mayNotSurviveTermination: boolean;
 }
 
 /** Uploads one batch. Set once at the app root, where the tRPC client lives. */
@@ -84,24 +110,10 @@ export interface RecordedFix {
 
 export const FLUSH_INTERVAL_MS = 60_000;
 
-const JOURNAL_NAME = 'recording-v1.json';
-const JOURNAL_VERSION = 1;
+const JOURNAL_DIR = 'recording-v2';
+const HEAD_NAME = 'head.json';
+const FIXES_NAME = 'fixes.ndjson';
 const KEEP_AWAKE_TAG = 'switchback-recording';
-
-interface Journal {
-  v: number;
-  id: string;
-  startedAt: number;
-  trailId: string | null;
-  /**
-   * Optional on read, always written. A journal from before planned routes existed restores as
-   * `null`, so no version bump is needed — and a bump would throw that hike away, which is the
-   * one thing a crash journal exists to prevent.
-   */
-  routeId: string | null;
-  fixes: TrackFix[];
-  sent: number;
-}
 
 const listeners = new Set<() => void>();
 
@@ -135,6 +147,14 @@ let routeLengthM: number | null = null;
 
 let uploader: Uploader | null = null;
 let watch: Location.LocationSubscription | null = null;
+let tracking: 'background' | 'foreground' | null = null;
+/** Whether iOS may relaunch this app to keep feeding the recording. See `BackgroundStart`. */
+let survivesTermination = false;
+/**
+ * Whether the hike is meant to be running. Written into the journal head, and the only thing that
+ * lets a relaunch tell a hike somebody paused from one the OS interrupted.
+ */
+let live = false;
 let flushTimer: ReturnType<typeof setInterval> | null = null;
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let flushing = false;
@@ -170,6 +190,8 @@ function build(): RecorderSnapshot {
     remainingM:
       routeLengthM == null || alongM == null ? null : remainingDistanceM(routeLengthM, alongM),
     alert,
+    tracking,
+    mayNotSurviveTermination: tracking === 'background' && !survivesTermination,
   };
 }
 
@@ -235,97 +257,152 @@ export function formatClock(seconds: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
-function journalFile(): FileSystem.File {
-  return new FileSystem.File(FileSystem.Paths.document, JOURNAL_NAME);
+function journalDir(): FileSystem.Directory {
+  return new FileSystem.Directory(FileSystem.Paths.document, JOURNAL_DIR);
 }
 
-function persist(): void {
+function headFile(): FileSystem.File {
+  return new FileSystem.File(journalDir(), HEAD_NAME);
+}
+
+function fixesFile(): FileSystem.File {
+  return new FileSystem.File(journalDir(), FIXES_NAME);
+}
+
+/**
+ * Everything about the recording except its fixes. Rewritten whenever one of those things
+ * changes, which is a few times a hike rather than once a second.
+ */
+function writeHead(): void {
   if (!activityId || !startedAt) return;
+  const head: JournalHead = {
+    v: JOURNAL_VERSION,
+    id: activityId,
+    startedAt: startedAt.getTime(),
+    trailId,
+    routeId,
+    sent,
+    live,
+  };
   try {
-    const journal: Journal = {
-      v: JOURNAL_VERSION,
-      id: activityId,
-      startedAt: startedAt.getTime(),
-      trailId,
-      routeId,
-      fixes,
-      sent,
-    };
-    const file = journalFile();
-    if (!file.exists) file.create({ intermediates: true });
-    file.write(JSON.stringify(journal));
+    headFile().write(encodeHead(head));
   } catch {
     // A full disk, most likely. Only the ability to survive a crash is affected, and saying so
     // mid-hike is worse than carrying on.
   }
 }
 
-function clearJournal(): void {
+/** One line on the end of the track. Costs the same on the last fix of a hike as on the first. */
+function appendFix(fix: TrackFix): void {
   try {
-    const file = journalFile();
-    if (file.exists) file.delete();
+    fixesFile().write(encodeFixes([fix]), { append: true });
   } catch {
-    /* Nothing to do about it, and nothing depends on it. */
+    /* As above: durability degrades, the hike does not stop. */
   }
 }
 
-function parseJournal(raw: string): Journal | null {
+/** A directory with an empty track in it, replacing whatever the last hike left. */
+function openJournal(): void {
   try {
-    const value: unknown = JSON.parse(raw);
-    if (typeof value !== 'object' || value === null) return null;
-    const record = value as Record<string, unknown>;
-    if (record.v !== JOURNAL_VERSION) return null;
-    if (typeof record.id !== 'string' || typeof record.startedAt !== 'number') return null;
-    if (!Array.isArray(record.fixes)) return null;
-    return {
-      v: JOURNAL_VERSION,
-      id: record.id,
-      startedAt: record.startedAt,
-      trailId: typeof record.trailId === 'string' ? record.trailId : null,
-      routeId: typeof record.routeId === 'string' ? record.routeId : null,
-      fixes: record.fixes as TrackFix[],
-      sent: typeof record.sent === 'number' ? record.sent : 0,
-    };
+    clearJournal();
+    journalDir().create({ intermediates: true });
+    fixesFile().create();
   } catch {
-    // A corrupt journal is worse than none — its activity id may not exist on the server.
-    return null;
+    /* As above. */
+  }
+  writeHead();
+}
+
+function clearJournal(): void {
+  try {
+    const dir = journalDir();
+    if (dir.exists) dir.delete();
+  } catch {
+    /* Nothing to do about it, and nothing depends on it. */
   }
 }
 
 /**
  * Adopt whatever the last run left behind. Safe to call repeatedly — the app root calls it
  * on mount, and a remount after a fast refresh must not wipe a hike in progress.
+ *
+ * Restores paused, then promotes to recording if the OS turns out to still hold the location
+ * task. That order matters: the promotion is asynchronous, and a launch that claimed to be
+ * recording before it had asked would be claiming a fix it does not have.
  */
 export function hydrate(): void {
   if (hydrated) return;
   hydrated = true;
-  let raw: string;
+  let head: JournalHead | null = null;
+  let stored: TrackFix[] = [];
   try {
-    const file = journalFile();
+    const file = headFile();
     if (!file.exists) return;
-    raw = file.textSync();
+    head = decodeHead(file.textSync());
+    const trackFile = fixesFile();
+    if (head && trackFile.exists) stored = decodeFixes(trackFile.textSync());
   } catch {
     return;
   }
-  const journal = parseJournal(raw);
-  if (!journal) {
+  if (!head) {
+    // A corrupt head is worse than none — its activity id may not exist on the server.
     clearJournal();
     return;
   }
-  fixes = journal.fixes;
-  sent = Math.min(journal.sent, journal.fixes.length);
-  activityId = journal.id;
-  startedAt = new Date(journal.startedAt);
-  trailId = journal.trailId;
-  routeId = journal.routeId;
+  fixes = stored;
+  sent = Math.min(head.sent, stored.length);
+  activityId = head.id;
+  startedAt = new Date(head.startedAt);
+  trailId = head.trailId;
+  routeId = head.routeId;
+  live = head.live;
   statsCache = summariseTrack(fixes);
   const last = fixes[fixes.length - 1];
   if (last) position = [last.lng, last.lat];
-  elapsedS = Math.max(0, Math.round((Date.now() - journal.startedAt) / 1000));
-  // Paused, not recording. See the note at the top of the file.
+  elapsedS = Math.max(0, Math.round((Date.now() - head.startedAt) / 1000));
   phase = 'paused';
   emit();
+  void promoteIfStillTracking(head);
 }
+
+/**
+ * A hike iOS kept alive through a relaunch, resumed without asking. `restoredPhase` is what
+ * separates that from a crash or a force-quit, after which the honest thing is to come back
+ * paused — the track has a hole in it either way, and only the user can say whether to carry on.
+ */
+async function promoteIfStillTracking(head: JournalHead): Promise<void> {
+  const still = await isTrackingInBackground();
+  if (restoredPhase(head, still) !== 'recording') return;
+  if (phase !== 'paused' || activityId !== head.id) return;
+  tracking = 'background';
+  phase = 'locating';
+  startClock();
+  emit();
+}
+
+/**
+ * Readings from the OS. They arrive in the foreground, with the screen off, and in an app iOS
+ * relaunched headless with no screen mounted at all — so the journal is adopted here rather than
+ * assumed, and a reading is taken as proof the task is alive, which is what makes the promotion
+ * above a nicety rather than something correctness depends on.
+ */
+function onReadings(readings: readonly Location.LocationObject[]): void {
+  hydrate();
+  if (!activityId) {
+    // An orphaned task: the OS is tracking for a hike this device no longer holds. Stop it
+    // rather than keep taking positions nothing will ever use.
+    void stopBackgroundUpdates();
+    return;
+  }
+  if (live && phase === 'paused') {
+    tracking = 'background';
+    phase = 'locating';
+    startClock();
+  }
+  for (const reading of readings) pushFix(reading);
+}
+
+setFixSink(onReadings);
 
 function pushFix(reading: Location.LocationObject): void {
   if (!startedAt) return;
@@ -371,7 +448,8 @@ function pushFix(reading: Location.LocationObject): void {
   });
   statsCache = summariseTrack(fixes);
   elapsedS = t;
-  persist();
+  const written = fixes[fixes.length - 1];
+  if (written) appendFix(written);
 
   if (route && route.length >= 2) {
     // `updateOffRoute` measures its own timings in milliseconds, unlike `TrackFix.t` which is
@@ -402,7 +480,7 @@ function pushFix(reading: Location.LocationObject): void {
 }
 
 async function startWatch(): Promise<void> {
-  if (watch) return;
+  if (tracking) return;
   try {
     const permission = await Location.requestForegroundPermissionsAsync();
     if (!permission.granted) {
@@ -410,18 +488,34 @@ async function startWatch(): Promise<void> {
         ? 'Location access is needed to record a hike.'
         : 'Location access is blocked. Allow it for Switchback in Settings.';
       phase = 'paused';
+      live = false;
+      writeHead();
       emit();
       return;
     }
   } catch {
     geoError = 'Could not ask for location access.';
     phase = 'paused';
+    live = false;
+    writeHead();
     emit();
     return;
   }
 
-  // The screen stays on for the duration. Without background location this is the only thing
-  // keeping the hike being recorded, and the Record screen says so.
+  // The OS first. This is the only source that keeps delivering once iOS suspends the runtime,
+  // and it makes the screen's own state irrelevant to whether a hike is being recorded.
+  const start = await startBackgroundUpdates();
+  if (start.started) {
+    tracking = 'background';
+    survivesTermination = start.survivesTermination;
+    emit();
+    return;
+  }
+
+  tracking = 'foreground';
+  survivesTermination = false;
+  // Nothing else is keeping this hike alive now, so the screen cannot be allowed to sleep. Held
+  // only in the fallback: in background mode the point is that the phone may do as it likes.
   void KeepAwake.activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => undefined);
 
   try {
@@ -438,13 +532,16 @@ async function startWatch(): Promise<void> {
     );
   } catch {
     geoError = 'No position yet. This usually means no clear view of the sky.';
-    emit();
   }
+  emit();
 }
 
 function stopWatch(): void {
   watch?.remove();
   watch = null;
+  void stopBackgroundUpdates();
+  tracking = null;
+  survivesTermination = false;
   void KeepAwake.deactivateKeepAwake(KEEP_AWAKE_TAG);
 }
 
@@ -493,7 +590,7 @@ export async function flush(): Promise<void> {
       const batch = fixes.slice(from, from + SAMPLE_BATCH);
       await uploader(activityId, batch);
       sent = from + batch.length;
-      persist();
+      writeHead();
     }
     lastSyncAt = new Date();
     syncError = null;
@@ -566,7 +663,8 @@ export function begin({
   alert = null;
   elapsedS = 0;
   phase = 'locating';
-  persist();
+  live = true;
+  openJournal();
   emit();
   startClock();
   void startWatch();
@@ -575,6 +673,10 @@ export function begin({
 export function pause(): void {
   if (phase !== 'recording' && phase !== 'locating') return;
   phase = 'paused';
+  // Before the OS subscription goes, so a launch after this one restores paused rather than
+  // resuming a hike the user had stopped.
+  live = false;
+  writeHead();
   stopWatch();
   stopFlushLoop();
   stopClock();
@@ -586,6 +688,8 @@ export function resume(): void {
   if (phase !== 'paused') return;
   phase = 'locating';
   geoError = null;
+  live = true;
+  writeHead();
   emit();
   startClock();
   void startWatch();
@@ -594,6 +698,8 @@ export function resume(): void {
 /** Moves to `saving`. The screen calls `activities.finish` and then `forget`. */
 export function stop(): void {
   phase = 'saving';
+  live = false;
+  writeHead();
   stopWatch();
   stopFlushLoop();
   stopClock();
@@ -602,6 +708,7 @@ export function stop(): void {
 
 /** Wipe the local journal without touching the server. */
 export function forget(): void {
+  live = false;
   clearJournal();
   stopWatch();
   stopFlushLoop();
