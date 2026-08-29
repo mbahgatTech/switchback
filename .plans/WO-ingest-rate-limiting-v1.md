@@ -287,3 +287,33 @@ Three properties follow from that shape:
   decision: Self-verify, then raise the pull request.
   budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
 ```
+
+```yaml
+- seq: 4
+  at: 2026-08-29T03:20:00-04:00
+  state: SELF_VERIFY -> IN_REVIEW
+  event: verification_complete
+  detail: >-
+    lint exit 0, typecheck exit 0, format:check exit 0. Both new files green: 11 tests each.
+    Full suite 2324 passed / 7 failed across 3 files — every one of them in the pre-change
+    baseline of 10 files / 53 tests, and every one reproducing in isolation as a five-second
+    timeout on a loaded machine (worker-deploy-path, entra-client) or the known race between
+    database test files (identity.db, which passes alone). Both regressions were watched failing
+    first: with the spend removed, one caller queued 132 tiles where the guard holds it to 120.
+  decision: Raised as pull request 82 against master. Not merged.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+```
+
+```yaml
+- seq: 5
+  at: 2026-08-29T03:25:00-04:00
+  state: IN_REVIEW
+  event: correction
+  detail: >-
+    Corrects the base recorded at seq 1, which repeated the commit the brief named. The worktree
+    was cut from master at 1789198, which already carries #63, #64, #67, #72 and #75 — so
+    INGEST_QUEUE_DRIVER is absent from the tree this was written against and nothing here
+    branches on a drain driver. origin/master is unmoved from that commit; no rebase was needed.
+  decision: No change to the work; the record now says which commit it was built on.
+  budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+```
