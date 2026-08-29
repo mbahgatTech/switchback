@@ -379,6 +379,13 @@ function sourceFiles(): string[] {
  * *new* caller fail this rather than only a caller in a place somebody thought to look.
  */
 describe('what the repairs are reachable from', () => {
+  /*
+   * Both tests below read every `.ts`/`.tsx` in the repository from disk. Observed between 251 ms
+   * and 7.2 s depending on what else is running, which straddles vitest's 5 s default — and this
+   * guard failing for the machine's load rather than for a real call is how a guard gets disabled.
+   */
+  const WALKS_THE_REPO = { timeout: 30_000 };
+
   // Calls, not mentions: half the ingest package refers to these by name in prose about them.
   const REPAIRS = /(sweepQueue|reconcileDeadJobs|reconcileDeadLetters)\(/;
 
@@ -391,7 +398,7 @@ describe('what the repairs are reachable from', () => {
     'apps/ingest-worker/src/functions/pump.ts',
   ]);
 
-  it('reaches the tree the deleted Vercel drainer lived in', () => {
+  it('reaches the tree the deleted Vercel drainer lived in', WALKS_THE_REPO, () => {
     /*
      * The guard is only worth what it scans, and the walk it replaces rooted at `<workspace>/src`
      * — which does not contain `apps/web/app`, where `api/cron/drain/route.ts` used to be. A call
@@ -403,7 +410,7 @@ describe('what the repairs are reachable from', () => {
     expect(scanned.some((file) => file.startsWith('scripts/'))).toBe(true);
   });
 
-  it('is the timer, and nothing a request can reach', () => {
+  it('is the timer, and nothing a request can reach', WALKS_THE_REPO, () => {
     const root = resolve(here, '../../..');
     const mentions = sourceFiles().filter((file) =>
       REPAIRS.test(readFileSync(`${root}/${file}`, 'utf8')),

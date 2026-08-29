@@ -43,6 +43,23 @@ function fakeLog() {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 }
 
+/**
+ * A message that records the order it was settled in, against a shared counter the log shares —
+ * which is the only way to observe that the report is written before anything is completed.
+ */
+function ordered(dedupeKey: string, tick: { n: number }) {
+  const entry = {
+    dedupeKey,
+    reason: 'MaxDeliveryCountExceeded',
+    completedAt: 0,
+    complete: async () => {
+      tick.n += 1;
+      entry.completedAt = tick.n;
+    },
+  };
+  return entry;
+}
+
 describe('draining the dead-letter queue', () => {
   it('drops a message whose job row is still runnable, because the pump republishes it', async () => {
     // `running` counts as runnable too: a lease is held or the reaper will take it back, and
@@ -111,6 +128,26 @@ describe('draining the dead-letter queue', () => {
 
     expect(report).toEqual({ runnable: [], terminal: [], unreadable: [] });
     expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('writes the report before it settles anything', async () => {
+    /*
+     * The ordering is a deliberate trade, not an accident of layout: a process that dies between
+     * the two leaves the messages locked, and the next tick reports them again — a duplicate line
+     * rather than the loss of the only record that a fault happened. Settling first would make the
+     * crash silent.
+     */
+    const tick = { n: 0 };
+    const messages = [ordered('ingest_tile:a', tick), ordered('ingest_tile:b', tick)];
+    const log = fakeLog();
+    log.warn.mockImplementation(() => {
+      tick.n += 1;
+    });
+
+    await reconcileDeadLetters(fakeDb([]), queueOf(...messages), log, 10);
+
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(messages.map((entry) => entry.completedAt)).toEqual([2, 3]);
   });
 
   it('bounds the batch it takes off the queue', async () => {

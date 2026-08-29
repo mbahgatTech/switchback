@@ -490,6 +490,26 @@ describe('reconciling buried jobs', () => {
     expect(row.maxAttempts).toBe(DEFAULT_MAX_ATTEMPTS + 1);
   });
 
+  it('writes nothing at all on a zero window', async () => {
+    /*
+     * Load-bearing beyond arithmetic: `maintenance.db.test.ts` runs `sweepQueue` unscoped against a
+     * real database to exercise the lease sweep, and passes a zero window so this triage — which
+     * overwrites `lastError` and pushes `maxAttempts` past the ceiling, table-wide — cannot reach
+     * rows that file does not own.
+     */
+    const rows = [
+      job({ id: 'a', dedupeKey: tileJobKey('021301203') }),
+      job({ id: 'b', dedupeKey: tileJobKey('021301204'), lastError: 'query is malformed' }),
+      job({ id: 'c', dedupeKey: tileJobKey('021301205'), maxAttempts: REVIVAL_CEILING }),
+    ];
+    const before = rows.map((row) => ({ ...row }));
+
+    const triage = await reconcileDeadJobs(fakeDb(rows), NOW, { limit: 0 });
+
+    expect(triage).toEqual({ revived: [], abandoned: [] });
+    expect(rows).toEqual(before);
+  });
+
   it('bounds one pass, so a backlog of burials cannot fill a tick', async () => {
     const rows = Array.from({ length: 5 }, (_, index) =>
       job({ id: `job-${index}`, dedupeKey: tileJobKey(`02130120${index}`) }),
