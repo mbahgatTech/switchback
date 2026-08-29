@@ -11,11 +11,13 @@ import {
 } from '@switchback/core';
 import {
   DEFAULT_OFF_ROUTE_CONFIG,
+  advanceProgress,
   initialOffRouteState,
-  remainingDistanceM,
   summariseTrack,
   updateOffRoute,
+  type HikePlan,
   type OffRouteState,
+  type RouteProgress,
 } from '@switchback/geo';
 import { isUnreachable } from '@/offline/queue';
 import { stillActingAs, writingReader } from '@/offline/identity';
@@ -185,8 +187,11 @@ export interface RecorderApi {
   offRoute: boolean;
   /** Metres from the route line, when a route is being followed. */
   offRouteDistanceM: number | null;
-  /** Metres still to hike on the route, when a route is being followed. */
-  remainingM: number | null;
+  /**
+   * Where on the trail the last usable fix put the hiker, and what is left of the hike from
+   * there. The one value everything that draws progress reads — see `@switchback/geo`.
+   */
+  progress: RouteProgress | null;
   /** Set when an off-route crossing has just happened and has not been acknowledged. */
   alert: 'left' | 'returned' | null;
   dismissAlert: () => void;
@@ -249,16 +254,11 @@ export interface RecorderOptions {
   }) => Promise<unknown>;
   /** The route being followed, if any. Enables the off-route watchdog. */
   route: readonly LngLat[] | null;
-  /** Total route length, for the distance-to-finish readout. */
-  routeLengthM: number | null;
+  /** The hike that route describes, for the progress readings. Null when there is no trail. */
+  plan: HikePlan | null;
 }
 
-export function useRecorder({
-  onFlush,
-  onStart,
-  route,
-  routeLengthM,
-}: RecorderOptions): RecorderApi {
+export function useRecorder({ onFlush, onStart, route, plan }: RecorderOptions): RecorderApi {
   const [phase, setPhase] = useState<RecorderPhase>('idle');
   const [activityId, setActivityId] = useState<string | null>(null);
   const [startedAt, setStartedAt] = useState<Date | null>(null);
@@ -273,7 +273,7 @@ export function useRecorder({
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
   const [offRoute, setOffRoute] = useState(false);
   const [offRouteDistanceM, setOffRouteDistanceM] = useState<number | null>(null);
-  const [alongM, setAlongM] = useState<number | null>(null);
+  const [progress, setProgress] = useState<RouteProgress | null>(null);
   const [alert, setAlert] = useState<'left' | 'returned' | null>(null);
 
   // The buffer lives in a ref and its size is mirrored into state: twenty thousand fixes must
@@ -302,7 +302,12 @@ export function useRecorder({
   onStartRef.current = onStart;
   const routeRef = useRef<readonly LngLat[] | null>(route);
   routeRef.current = route;
+  const planRef = useRef<HikePlan | null>(plan);
+  planRef.current = plan;
   const offRouteRef = useRef<OffRouteState>(initialOffRouteState());
+  // Read inside the fix handler, which is memoised on nothing that changes per fix.
+  const progressRef = useRef<RouteProgress | null>(null);
+  progressRef.current = progress;
 
   /**
    * The queue row as it stands, and the chunk currently being filled. The header is held whole
@@ -527,7 +532,12 @@ export function useRecorder({
         offRouteRef.current = update.state;
         setOffRoute(update.state.isOffRoute);
         setOffRouteDistanceM(update.distanceM);
-        setAlongM(update.alongM);
+        // No projection means the fix was too vague to trust, so progress holds where it was
+        // rather than jumping to a reading the off-route watchdog has already refused.
+        const hike = planRef.current;
+        if (hike && update.nearest) {
+          setProgress(advanceProgress(hike, progressRef.current, update.nearest));
+        }
         if (update.shouldAlert) {
           setAlert('left');
           buzz([200, 100, 200, 100, 400]);
@@ -797,6 +807,7 @@ export function useRecorder({
         sentRef.current = 0;
       }
       offRouteRef.current = initialOffRouteState();
+      setProgress(null);
       setActivityId(id);
       setStartedAt(at);
       setTrailId(trail);
@@ -879,7 +890,7 @@ export function useRecorder({
     setAccuracyM(null);
     setOffRoute(false);
     setOffRouteDistanceM(null);
-    setAlongM(null);
+    setProgress(null);
     setAlert(null);
     setSyncError(null);
     setSyncOffline(false);
@@ -918,11 +929,6 @@ export function useRecorder({
   // manager needs a distance for a hike it can no longer ask the server about.
   distanceRef.current = stats.distanceM;
 
-  const remainingM = useMemo(() => {
-    if (routeLengthM == null || alongM == null) return null;
-    return remainingDistanceM(routeLengthM, alongM);
-  }, [routeLengthM, alongM]);
-
   return {
     phase,
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -940,7 +946,7 @@ export function useRecorder({
     syncOffline,
     offRoute,
     offRouteDistanceM,
-    remainingM,
+    progress,
     alert,
     dismissAlert: useCallback(() => setAlert(null), []),
     activityId,

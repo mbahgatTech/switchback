@@ -175,7 +175,7 @@ export function TrailProfile({
         onKeyDown={onKeyDown}
         // The aspect ratio matches the viewBox exactly, so `xMidYMid meet` letterboxes
         // nothing and a pointer at 40% across the box is at 40% across the plot.
-        className="mt-sm aspect-[1000/380] w-full cursor-crosshair rounded-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
+        className="plot-surface mt-sm aspect-[1000/380] w-full cursor-crosshair rounded-hair focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink"
       >
         <Section
           points={points}

@@ -1,5 +1,5 @@
 import type { LngLat } from '@switchback/core';
-import { nearestPointOnLine } from './distance';
+import { nearestPointOnLine, type NearestOnLine } from './distance';
 
 /**
  * Wrong-turn detection. A bare cross-track threshold is unusable in the field — GPS under canopy
@@ -72,6 +72,11 @@ export interface OffRouteUpdate {
   didReturn: boolean;
   distanceM: number | null;
   alongM: number | null;
+  /**
+   * The fix projected onto the route, or null when the fix was not usable. Returned because
+   * the projection has already been paid for here, and progress is read from the same one.
+   */
+  nearest: NearestOnLine | null;
 }
 
 /** Fold one GPS fix into the detector. Pure state-in/state-out, so web and native agree. */
@@ -84,10 +89,24 @@ export function updateOffRoute(
   // A fix we cannot trust is worse than no fix: acting on it produces the false alarm this
   // detector exists to avoid.
   if (fix.accuracyM != null && fix.accuracyM > config.maxAccuracyM) {
-    return { state, shouldAlert: false, didReturn: false, distanceM: null, alongM: null };
+    return {
+      state,
+      shouldAlert: false,
+      didReturn: false,
+      distanceM: null,
+      alongM: null,
+      nearest: null,
+    };
   }
   if (route.length < 2) {
-    return { state, shouldAlert: false, didReturn: false, distanceM: null, alongM: null };
+    return {
+      state,
+      shouldAlert: false,
+      didReturn: false,
+      distanceM: null,
+      alongM: null,
+      nearest: null,
+    };
   }
 
   const nearest = nearestPointOnLine([fix.lng, fix.lat], route);
@@ -117,11 +136,11 @@ export function updateOffRoute(
     if (persistent && cooledDown) {
       next.isOffRoute = true;
       next.lastAlertT = fix.t;
-      return { state: next, shouldAlert: true, didReturn: false, distanceM, alongM };
+      return { state: next, shouldAlert: true, didReturn: false, distanceM, alongM, nearest };
     }
 
     next.isOffRoute = next.isOffRoute || persistent;
-    return { state: next, shouldAlert: false, didReturn: false, distanceM, alongM };
+    return { state: next, shouldAlert: false, didReturn: false, distanceM, alongM, nearest };
   }
 
   const didReturn = state.isOffRoute;
@@ -130,7 +149,7 @@ export function updateOffRoute(
   next.offRouteSinceT = null;
   if (didReturn) next.lastAlertT = null;
 
-  return { state: next, shouldAlert: false, didReturn, distanceM, alongM };
+  return { state: next, shouldAlert: false, didReturn, distanceM, alongM, nearest };
 }
 
 /**

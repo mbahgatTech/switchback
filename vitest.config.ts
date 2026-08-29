@@ -37,6 +37,10 @@ if (env.DATABASE_URL) {
 }
 
 export default defineConfig({
+  // esbuild defaults to the classic runtime, which needs `React` in scope; the apps compile
+  // against Next's automatic one and import no React at all. Without this a test that renders
+  // a component fails inside the component with `React is not defined`.
+  esbuild: { jsx: 'automatic' },
   resolve: {
     // Explicit aliases rather than the workspace symlinks, so the run is identical whether or
     // not `npm install` has linked the packages. Both patterns are anchored: a bare string

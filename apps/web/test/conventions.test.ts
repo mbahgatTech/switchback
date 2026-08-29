@@ -221,3 +221,30 @@ describe('the collar is painted, not coloured', () => {
     expect(stray, 'SVG text takes `fill`, not `color` — see .collar in globals.css').toEqual([]);
   });
 });
+
+describe('the plots are a selection-free zone, and only the plots', () => {
+  const GLOBALS = path.join('app', 'globals.css');
+
+  /**
+   * A press-and-hold on the elevation graphic put the cursor where the finger was and started a
+   * selection with the same gesture, and a selection does not stop at the element it began in:
+   * one press swept the caption, the stat block and the forecast table below it into a
+   * highlight. The suppression belongs on the plot and on nothing above it, because everything
+   * these graphics report is HTML beside them that has to stay copyable.
+   */
+  it('suppresses selection through one named class, worn only by the two plots', () => {
+    const wearing = FILES.filter(([, source]) => /\bplot-surface\b/.test(source))
+      .map(([file]) => file)
+      .sort();
+    expect(wearing).toEqual([
+      GLOBALS,
+      path.join('src', 'components', 'record', 'progress-profile.tsx'),
+      path.join('src', 'components', 'trail', 'profile.tsx'),
+    ]);
+  });
+
+  it('turns selection off nowhere else', () => {
+    const stray = offenders(/\bselect-none\b|user-select|touch-callout/g, (f) => f === GLOBALS);
+    expect(stray, 'a page is not a plot — put `.plot-surface` on the graphic').toEqual([]);
+  });
+});
