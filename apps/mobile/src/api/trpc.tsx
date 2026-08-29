@@ -76,9 +76,11 @@ export function ApiProvider({ children }: { children: React.ReactNode }) {
   });
 
   /*
-   * Subscribed here rather than in `AuthProvider`, and that placement is load-bearing: React
-   * runs a child's effects before its parent's, so this cache is empty before any screen
-   * re-renders on the new status and the fetch that follows is the first one, not a second.
+   * Subscribed here rather than in `AuthProvider`. React mounts a child's effects before its
+   * parent's, so this subscribes first and the cache is emptied before any screen re-renders on
+   * the new status — which makes the refetch that follows the first one rather than a second.
+   * That is a cost argument, not a correctness one: `resetQueries` notifies its observers, so a
+   * mounted screen is right either way. `test/conventions.test.ts` holds the nesting in place.
    */
   useEffect(() => forgetAnswersOnIdentityChange(queryClient, subscribe), [queryClient]);
 

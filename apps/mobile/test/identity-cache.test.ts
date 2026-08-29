@@ -1,12 +1,17 @@
-import { describe, expect, it } from 'vitest';
-import { QueryClient } from '@tanstack/react-query';
-import { forgetAnswersOnIdentityChange } from '../src/api/identity';
+import { describe, expect, it, vi } from 'vitest';
+import { QueryCache, QueryClient, QueryObserver } from '@tanstack/react-query';
+import { cacheGeneration, forgetAnswersOnIdentityChange } from '../src/api/identity';
 
 /**
  * The cache does not know who asked. React Query keys an entry by procedure and input, so an
  * answer given to one reader is handed to the next one unless something empties it — which on a
  * phone means signing in and being shown the account you just signed out of, for a full stale
  * window or until the app is restarted.
+ *
+ * **Emptying is not enough, and asserting on `getQueryCache().getAll()` alone would not catch
+ * that.** `clear()` empties without notifying, so a mounted `useQuery` goes on serving the old
+ * value off its observer and never refetches. Every case below therefore asks what a subscribed
+ * observer serves, which is what a screen actually draws.
  */
 
 /** A stand-in for `session.ts`'s subscription, so this runs with no Keychain and no network. */
@@ -23,40 +28,83 @@ function announcer() {
   };
 }
 
-function populated(): QueryClient {
-  const client = new QueryClient();
-  client.setQueryData([['me', 'get'], { type: 'query' }], { id: 'the-previous-reader' });
-  return client;
+const PROFILE = [['me', 'get'], { type: 'query' }];
+
+/** A client holding one reader's profile, with a mounted observer serving it — as a screen has. */
+function withAliceOnScreen() {
+  const client = new QueryClient({
+    queryCache: new QueryCache(),
+    // What a screen's `useQuery` does next. The point of a reset is that this happens at all.
+    defaultOptions: { queries: { queryFn: () => Promise.resolve('BOB-profile'), retry: false } },
+  });
+  client.setQueryData(PROFILE, 'ALICE-profile');
+
+  const observer = new QueryObserver(client, { queryKey: PROFILE });
+  const unsubscribe = observer.subscribe(() => undefined);
+  return { client, observer, unsubscribe };
 }
 
 describe('a change of signed-in identity', () => {
-  it('leaves nothing behind when somebody signs in', () => {
-    const client = populated();
+  it('stops a mounted screen serving the reader who left', async () => {
+    const { client, observer, unsubscribe } = withAliceOnScreen();
+    expect(observer.getCurrentResult().data).toBe('ALICE-profile');
+
     const bus = announcer();
     forgetAnswersOnIdentityChange(client, bus.subscribe);
-
     bus.announce(true);
+    await vi.waitFor(() => {
+      expect(observer.getCurrentResult().data).toBe('BOB-profile');
+    });
 
-    expect(client.getQueryCache().getAll()).toEqual([]);
+    unsubscribe();
   });
 
-  it('leaves nothing behind when somebody signs out', () => {
-    const client = populated();
+  it('does the same on the way out, which is the shared-phone case', async () => {
+    const { client, observer, unsubscribe } = withAliceOnScreen();
+
     const bus = announcer();
     forgetAnswersOnIdentityChange(client, bus.subscribe);
+    bus.announce(false);
+    await vi.waitFor(() => {
+      expect(observer.getCurrentResult().data).not.toBe('ALICE-profile');
+    });
 
+    unsubscribe();
+  });
+
+  it('wakes whatever seeds the cache by hand, because a reset leaves it nothing to refetch', () => {
+    const { client, unsubscribe } = withAliceOnScreen();
+    const before = cacheGeneration();
+
+    const bus = announcer();
+    forgetAnswersOnIdentityChange(client, bus.subscribe);
+    bus.announce(true);
+
+    expect(cacheGeneration()).toBeGreaterThan(before);
+    unsubscribe();
+  });
+
+  it('ignores a repeat, so a 401 and then a Sign out costs one reset and not two', () => {
+    const { client, unsubscribe } = withAliceOnScreen();
+
+    const bus = announcer();
+    forgetAnswersOnIdentityChange(client, bus.subscribe);
+    bus.announce(false);
+    const afterFirst = cacheGeneration();
     bus.announce(false);
 
-    expect(client.getQueryCache().getAll()).toEqual([]);
+    expect(cacheGeneration()).toBe(afterFirst);
+    unsubscribe();
   });
 
   it('stops mattering once the subscription is dropped', () => {
-    const client = populated();
+    const { client, observer, unsubscribe } = withAliceOnScreen();
     const bus = announcer();
 
     forgetAnswersOnIdentityChange(client, bus.subscribe)();
     bus.announce(true);
 
-    expect(client.getQueryCache().getAll()).toHaveLength(1);
+    expect(observer.getCurrentResult().data).toBe('ALICE-profile');
+    unsubscribe();
   });
 });

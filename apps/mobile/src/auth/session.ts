@@ -24,7 +24,8 @@ let accessToken: string | null = null;
 let accessExpiresAt = 0;
 let inFlight: Promise<string | null> | null = null;
 
-type Listener = (signedIn: boolean) => void;
+/** Told on every transition, in both directions. Exported so a subscriber need not retype it. */
+export type Listener = (signedIn: boolean) => void;
 const listeners = new Set<Listener>();
 
 function announce(signedIn: boolean): void {
@@ -46,11 +47,21 @@ function forget(): void {
   accessExpiresAt = 0;
 }
 
-/** Adopt a freshly minted pair — called by the sign-in flow after a successful exchange. */
+/**
+ * Adopt a freshly minted pair — called by the sign-in flow after a successful exchange.
+ *
+ * `finally`, because by this point `remember` has already installed the new reader's access
+ * token: every request from here is made as them, so the announcement is not optional — it is
+ * what empties the previous reader's cached answers. A Keychain that refuses the write costs
+ * this session its survival across a restart, and must not also cost the identity change.
+ */
 export async function adopt(pair: TokenPair): Promise<void> {
   remember(pair);
-  await writeRefreshToken(pair.refreshToken);
-  announce(true);
+  try {
+    await writeRefreshToken(pair.refreshToken);
+  } finally {
+    announce(true);
+  }
 }
 
 async function rotate(): Promise<string | null> {
@@ -93,11 +104,14 @@ export async function getAccessToken(): Promise<string | null> {
   return inFlight;
 }
 
-/** Forget the credentials on this device without telling the server. */
+/** Forget the credentials on this device without telling the server. `finally` as in `adopt`. */
 async function signOutLocally(): Promise<void> {
   forget();
-  await clearRefreshToken();
-  announce(false);
+  try {
+    await clearRefreshToken();
+  } finally {
+    announce(false);
+  }
 }
 
 /**

@@ -42,7 +42,13 @@ reader outlive the sign-in that replaced them.
 
 - `apps/mobile/app/signin.tsx` — where a completed sign-in sends the reader.
 - `apps/mobile/src/api/` — discarding cached answers when the signed-in identity changes.
-- Mobile tests covering both.
+- `apps/mobile/src/offline/` — laying the phone's copy of a trail down again afterwards. Added
+  at v1r2; see A6 and the log entry at seq 4.
+- `apps/mobile/src/auth/session.ts` — making the announcement that drives all of the above
+  unskippable. Added at v1r2; see A7.
+- `apps/mobile/app/lists/[key].tsx` — the one account query in the app not gated on being
+  signed in. Added at v1r2.
+- Mobile tests covering all of it.
 - `docs/mobile.md` — the sessions section, which describes this seam.
 
 **Out**
@@ -51,9 +57,20 @@ reader outlive the sign-in that replaced them.
   changes.
 - The Auth.js configuration, the CSRF helper, the mobile handshake, and the token lifecycle.
   All were read; none is implicated.
-- The website's own React Query cache surviving a sign-out. Real, but a different surface and a
-  different code path, and sign-_in_ on the web is always a document load. Recorded under
-  "Observed, not addressed" in the final report rather than fixed here.
+- The website's own React Query cache surviving a sign-out. Real, and the mechanism first
+  recorded here was wrong: `enabled: viewerId !== null` gates the *fetch*, not the cached read,
+  and `useSaved` returns `saved.data ?? EMPTY_SAVED_IDS` to a `TrailCard` that calls it
+  unconditionally — so a reader who has just signed out keeps seeing their own favourite rings
+  on the anonymous explore index for the life of the tab. The conclusion survives, because web
+  sign-_in_ is always a document load and no cross-account exposure follows; the reasoning did
+  not. Still out of scope: a different surface and a different code path.
+- The recorder journal (`apps/mobile/src/record/store.ts`), which survives an identity change
+  holding the previous reader's GPS trace. Same class of defect as the query cache and a real
+  one, but that file is being rewritten by `feat/mobile-background-tracking` and the requirement
+  has gone to that stream.
+- Generating expo-router's typed-route declarations in CI. `typedRoutes` is already set in
+  `app.config.ts` and is inert, so the compiler would name this bug outright — see the log entry
+  at seq 4. Repo-wide, and spun out separately.
 - `e2e/` and `playwright.config.ts`. A sign-in end-to-end spec belongs there and the harness to
   write one now exists (§4 D1), but that tree is owned by a sibling stream in flight.
 
@@ -63,11 +80,11 @@ reader outlive the sign-in that replaced them.
 
 | id  | predicate                                                                                                                                                            | verification                                                                                                                                                                                                       |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| D1  | The website reflects a completed sign-in with no reload, on every route that offers one, in both `next dev` and a production build with the service worker installed | `scratch-drive.mjs` drives the real OIDC round trip against a stub issuer for `/`, `/lists`, `/settings`, `/record`, `/plan`, `/downloads`; each prints the same signed-in chrome before and after a manual reload |
+| D1  | The website reflects a completed sign-in with no reload, on every route that offers one, in a production build with the service worker installed | A driver script walks the real OIDC round trip against a stub issuer for `/`, `/lists`, `/settings`, `/record`, `/plan`, `/downloads`; each prints the same signed-in chrome before and after a manual reload. **The driver is not in the tree** — see A5 — so this is reproducible only from the transcript in §10, not by running a command in this repo. An earlier `next dev` sweep agreed, and is not evidenced: the production sweep is the stricter of the two and is the one recorded |
 | D2  | Every literal navigation target in the iOS app resolves to a route the app actually has                                                                              | `npx vitest run apps/mobile/test/navigation-targets.test.ts` exits 0                                                                                                                                               |
 | D3  | A change of signed-in identity empties the query cache, in both directions                                                                                           | `npx vitest run apps/mobile/test/identity-cache.test.ts` exits 0                                                                                                                                                   |
 | D4  | Both new tests fail against the unfixed source, naming the defect rather than crashing                                                                               | run each on the pre-fix tree; D2 names `/profile`, D3 finds the cache still populated                                                                                                                              |
-| D5  | Nothing else regressed                                                                                                                                               | `npm run test`, `npm run lint`, `npm run typecheck` each exit 0                                                                                                                                                    |
+| D5  | Nothing else regressed — the suite gains the new tests and loses nothing                                                                                            | `npm run lint`, `npm run typecheck` and `npm run format:check` each exit 0. `npm run test` does **not** exit 0 on this host: it is run against the base commit and again against the branch, and the same pre-existing failures must appear on both sides with the new tests added to the passing count                                                                                                                                                    |
 
 ---
 
@@ -80,6 +97,8 @@ reader outlive the sign-in that replaced them.
 | A3  | How much of the query cache to discard on an identity change | All of it                                              | Which procedures are account-scoped is not knowable from the cache seam without a list that will drift out of date silently. A list that is wrong leaks one reader's answers to the next; a blunt clear costs one refetch at a moment the app is already navigating |
 | A4  | iOS could not be run here                                    | Prove the defects at source level and state the gap    | Windows host, no simulator, and the app has no `react-native-web` target. Recorded as **UNVERIFIED** in the report: no device recording exists                                                                                                                      |
 | A5  | Whether to add an end-to-end sign-in spec                    | No                                                     | `e2e/` and `playwright.config.ts` are the write set of a sibling stream. The reproduction harness is described in the final report so it can be landed after that stream                                                                                            |
+| A6  | What to do about the ownership flags on a re-seeded copy      | Seed them false, on every seed and not only the re-seed | `isMine` on a stored photo or report is a fact about whoever downloaded the trail. It sits on disk and outlives both the session that wrote it and the account that owned it, so it is never a claim about the reader now. False is the only value that claims nothing; the true answer arrives with the live fetch. One behaviour rather than two, because a seed that means different things on different paths is the next defect |
+| A7  | Whether a Keychain failure should still propagate to callers | Yes                                                    | `try/finally` makes the announcement unskippable, which is the part this Work Order created by making it the sole cache-clearing trigger. The unhandled rejection above it is older than this change and belongs to the sign-in screen's error handling, not here |
 
 ---
 
@@ -145,19 +164,60 @@ entry can also be filled by nobody at all.
 The seam already exists: `session.ts` announces every transition to its subscribers, and it is
 the only thing that does. The new unit hangs off it.
 
-Key interface:
+**The seed that is not a fetch.** Emptying the cache is only half an answer, because not every
+entry in it came from the network. `offline/hydrate.ts` writes a downloaded trail into four live
+query keys with `setQueryData`, so the gallery, the reports and the detail all render from the
+phone without knowing a download exists. A reset destroys those entries; an active query
+refetches itself, but nothing refetches a seed, and in a valley there is nothing to refetch
+from. Its effect cannot notice on its own — every dependency it has is referentially stable —
+so it would stay destroyed for the life of that mounted screen, and the trail screen would
+report "Trail not found" over a trail the phone is holding in full.
+
+That is on the path this Work Order fixes: open a downloaded trail, press Save, sign in, and the
+sign-in screen pops back to the still-mounted trail screen. It also happens unattended, when a
+401 signs the device out wherever the reader is standing.
+
+So the reset publishes a generation, and the hydration effect depends on it. One subscriber does
+both, in one synchronous step, so the order is a property of the code rather than of React:
+
+```
+announce(signedIn)
+  └─ forgetAnswersOnIdentityChange
+       ├─ resetQueries()      the answers go, and every observer is told
+       └─ generation += 1     the seeds are laid again by the effects that own them
+```
+
+Key interfaces:
 
 ```ts
 /** Discard every cached answer whenever the signed-in identity changes. Returns an unsubscribe. */
 export function forgetAnswersOnIdentityChange(
-  queryClient: Pick<QueryClient, 'clear'>,
-  subscribe: (listener: (signedIn: boolean) => void) => () => void,
+  queryClient: Pick<QueryClient, 'resetQueries'>,
+  subscribe: (listener: Listener) => () => void,
 ): () => void;
+
+/** How many identity changes this process has seen, for a component that must re-lay a seed. */
+export function useCacheGeneration(): number;
+
+/** Write the phone's copy under the keys the live queries use. Never over live data. */
+export function seedFromDisk(
+  queryClient: Pick<QueryClient, 'setQueryData'>,
+  keys: TrailKeys,
+  copy: OfflineTrail,
+): void;
 ```
 
+**`resetQueries`, not `clear`.** `clear` empties the cache without notifying anybody, so a
+mounted `useQuery` goes on serving the previous reader's data and never refetches on its own —
+the leak would close only when some other re-render happened to reach that screen, which is an
+unstated invariant ("every screen showing account data calls `useAuth()`") that the app already
+violates. `resetQueries` notifies its observers and refetches the active ones.
+
 `ApiProvider` is mounted inside `AuthProvider`, so its effect subscribes first and the cache is
-emptied before any screen re-renders on the new status — the refetch that follows is the first
-one, not a second.
+emptied before any screen re-renders on the new status — which makes the refetch that follows
+the first one rather than a second. With `resetQueries` that is a cost argument and no longer a
+correctness one, but it is invisible from either file, so `test/conventions.test.ts` holds the
+nesting in place.
 
 ---
 
@@ -171,7 +231,13 @@ one, not a second.
 | T-004 | Test that an identity change empties the query cache, both directions, and stops on unsubscribe; observe it fail                                                                                   | `npx vitest run apps/mobile/test/identity-cache.test.ts` fails, then passes after T-005     | `done` |
 | T-005 | Add `forgetAnswersOnIdentityChange` and wire it into `ApiProvider`                                                                                                                                 | as T-004                                                                                    | `done` |
 | T-006 | Record the rule in `docs/mobile.md`'s sessions section                                                                                                                                             | the section names the cache reset                                                           | `done` |
-| T-007 | Full verification                                                                                                                                                                                  | `npm run test`, `npm run lint`, `npm run typecheck` exit 0                                  | `done` |
+| T-007 | Full verification                                                                                                                                                                                  | `lint`, `typecheck`, `format:check` exit 0; `npm run test` differs from base only by the added tests | `done` |
+| T-008 | Reset with `resetQueries` rather than `clear`, so observers are told; assert what a mounted observer serves rather than what the cache holds | `identity-cache.test.ts` fails against `clear` with the observer still serving the departed reader, and passes against `resetQueries` | `done` |
+| T-009 | Publish a generation on every reset and split the seed out of the hook so both are testable; re-lay the phone's copy when it moves | `offline-seed.test.ts` fails with nothing re-seeding and passes with it | `done` |
+| T-010 | Strip the stored ownership flags on every seed | `offline-seed.test.ts` › claims nothing on behalf of whoever downloaded it | `done` |
+| T-011 | Make the announcement unskippable when the Keychain refuses a write | `adopt` and `signOutLocally` announce from a `finally` | `done` |
+| T-012 | Widen the navigation gate to the object and `href` spellings, and gate the one ungated account query | the gate catches `router.push({ pathname: '/profile' })`; `lists/[key].tsx` reads `useAuth()` | `done` |
+| T-013 | Lift the source walker into `test/sources.ts` and hold the provider nesting the ordering rests on | `conventions.test.ts` exits 0 with four rules | `done` |
 
 ---
 
@@ -257,6 +323,64 @@ one, not a second.
     react-native-web target, which is the verification standard `docs/mobile.md` already sets
     for this repo.
   budget: { implement: 1/3, review: 0/3, replan: 0/2, total: 1/8 }
+
+- seq: 4
+  at: 2026-08-29T07:45:00+00:00
+  state: IN_REVIEW -> IMPLEMENT
+  event: review_board_returned_fail
+  detail: >-
+    One Blocker, four Majors. The Blocker is mine and was not in the design at all: the reset
+    destroys the `setQueryData` seed that `offline/hydrate.ts` lays for a downloaded trail, and
+    that effect's dependencies are all referentially stable, so it never re-runs and the seed is
+    gone for the life of the mounted screen. Reachable on the very path this Work Order fixes —
+    sign in from a downloaded trail, `canGoBack()` pops back to the still-mounted trail screen —
+    and offline the screen then says "Trail not found" over a trail the phone holds in full,
+    which is verbatim what `hydrate.ts` documents itself as existing to prevent. The Majors:
+    `clear()` empties without notifying observers, so the fix was incomplete; an uncaught
+    Keychain throw can skip `announce` entirely, which this Work Order promoted from a stranded
+    UI to a live cache; the navigation gate matched only the short spelling and missed all nine
+    object-form calls, so the original bug could walk back in through
+    `router.push({ pathname: '/profile' })`; and `typedRoutes` is already set in `app.config.ts`
+    but inert, because `tsconfig.json` excludes the `.expo` directory its declarations are
+    generated into — the compiler would name this bug outright if that were wired up.
+  decision: >-
+    Fix all five in place; no re-plan. Scope amended in writing first — §3 In gains
+    `src/offline/`, `src/auth/session.ts` and `app/lists/[key].tsx`, and A6/A7 record the two
+    judgement calls. Typed-route generation in CI is repo-wide and stays out, recorded in §3 Out.
+  budget: { implement: 1/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 5
+  at: 2026-08-29T08:10:00+00:00
+  state: IMPLEMENT -> IN_REVIEW
+  event: record_corrected
+  detail: >-
+    Correcting seq 3, which recorded two things it should not have. **D1 was marked MET on half
+    its predicate**: it claimed both `next dev` and a production build, and every artefact under
+    §10 is the production sweep. The dev sweep was run and agreed, but it was not captured, so
+    the claim outran the evidence. D1's predicate now says production only, and names at the
+    point of the claim that the driver is not in the tree. **D5 and T-007 both read "each exit
+    0" for `npm run test`** while the evidence directly beneath them showed 24 failures on both
+    sides. The differential run against the base commit is what was actually performed and is
+    sufficient for "nothing else regressed"; the predicate now says that instead.
+  decision: >-
+    Predicates corrected to match what was measured. Nothing was deleted; this entry is the
+    record of what the earlier one got wrong.
+  budget: { implement: 1/3, review: 1/3, replan: 0/2, total: 1/8 }
+
+- seq: 6
+  at: 2026-08-29T08:15:00+00:00
+  state: IN_REVIEW
+  event: reasoning_corrected
+  detail: >-
+    Correcting the web sign-out note in §3 Out at seq 1. It said no leak followed because every
+    account-scoped client query is gated on a `viewerId` from the re-rendered server tree. That
+    gate is on the *fetch*, not on the cached read: `useSaved` returns `saved.data ?? EMPTY` to a
+    `TrailCard` that calls it unconditionally, so a reader who has just signed out keeps seeing
+    their own favourite rings on the anonymous explore index for the life of the tab. The
+    conclusion — out of scope, no cross-account exposure, because web sign-in is a document load
+    — is unchanged. The mechanism given for it was wrong.
+  decision: Reasoning corrected in §3 Out. No web code changes.
+  budget: { implement: 1/3, review: 1/3, replan: 0/2, total: 1/8 }
 ```
 
 ---

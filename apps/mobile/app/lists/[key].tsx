@@ -15,6 +15,7 @@ import {
 } from '@switchback/core';
 import { DIFFICULTY_PLATE, nativeTheme } from '@switchback/ui';
 import { useTRPC } from '@/api/trpc';
+import { useAuth } from '@/auth/context';
 import { TallyRule } from '@/components/tally';
 
 /**
@@ -46,9 +47,10 @@ export default function ListScreen() {
   const params = useLocalSearchParams<{ key: string }>();
   const key = params.key ?? '';
   const trpc = useTRPC();
+  const { status } = useAuth();
 
   const list = useQuery({ ...trpc.lists.detail.queryOptions({ key }), enabled: key.length > 0 });
-  const me = useQuery(trpc.me.get.queryOptions());
+  const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: status === 'signedIn' });
   const units: UnitSystem = me.data?.units ?? 'metric';
 
   if (list.isPending) {

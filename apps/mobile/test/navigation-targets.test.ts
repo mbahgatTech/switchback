@@ -1,7 +1,5 @@
-import { readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { appSources, sourcesUnder } from './sources';
 
 /**
  * Every place this app sends itself has to exist. expo-router resolves a route from the
@@ -11,35 +9,19 @@ import { describe, expect, it } from 'vitest';
  *
  * The rule earns its place: a completed sign-in sent the reader to `/profile`, which is the
  * *website's* account route. This app's is `/you`.
+ *
+ * The compiler is the better answer and is one line from working — `typedRoutes` is set in
+ * `app.config.ts`, and `tsconfig.json` excludes the `.expo` directory its declarations are
+ * generated into, so they never enter the program. Wiring that generation into CI is repo-wide
+ * and is being done separately; this gate needs no build step and holds in the meantime.
  */
-
-const mobileRoot = fileURLToPath(new URL('..', import.meta.url));
-
-/** Every `.ts`/`.tsx` under a directory, as `[repo-relative path, contents]`. */
-function sourcesUnder(dir: string): [string, string][] {
-  const out: [string, string][] = [];
-  const walk = (current: string) => {
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (/\.tsx?$/u.test(entry.name)) {
-        out.push([path.relative(mobileRoot, full), readFileSync(full, 'utf8')]);
-      }
-    }
-  };
-  walk(path.join(mobileRoot, dir));
-  return out;
-}
 
 /**
  * The URL a route file answers to. Route groups are parentheses on disk and absent from the
  * path, `_layout` draws rather than routes, and `index` is its directory.
  */
 function routeOf(file: string): string | null {
-  const withoutExtension = file
-    .replace(/\\/gu, '/')
-    .replace(/^app\//u, '')
-    .replace(/\.tsx?$/u, '');
+  const withoutExtension = file.replace(/\\/gu, '/').replace(/^app\//u, '').replace(/\.tsx?$/u, '');
   const segments = withoutExtension
     .split('/')
     .filter((segment) => !/^\(.+\)$/u.test(segment))
@@ -63,21 +45,40 @@ function resolves(target: string): boolean {
   });
 }
 
-/** Literal `router.push('/x')` and friends. A computed target is beyond a source-level rule. */
-const NAVIGATION = /router\.(?:push|replace|navigate)\(\s*'(\/[^']*)'/gu;
+/**
+ * The three literal spellings of a destination this app uses.
+ *
+ * `router.push('/x')` is the short form; `router.push({ pathname: '/x', params })` is how every
+ * dynamic route is navigated, and the pathname in it is every bit as literal as the short form;
+ * `href` is the tab bar's. Missing the object form is not academic — the bug this file exists
+ * for would walk straight back in through it.
+ *
+ * What is genuinely beyond a source-level rule is a target assembled from a variable. Nothing
+ * here does that today, and a gate cannot follow it if something starts.
+ */
+const DESTINATIONS = [
+  /router\.(?:push|replace|navigate)\(\s*'(\/[^']*)'/gu,
+  /pathname:\s*'(\/[^']*)'/gu,
+  /href:\s*'(\/[^']*)'/gu,
+  /href=\{?'(\/[^']*)'/gu,
+];
 
-function targets(): { where: string; target: string }[] {
+function destinations(): { where: string; target: string }[] {
   const found: { where: string; target: string }[] = [];
-  for (const [file, source] of [...sourcesUnder('app'), ...sourcesUnder('src')]) {
+  for (const [file, source] of appSources()) {
     source.split('\n').forEach((line, index) => {
-      for (const match of line.matchAll(NAVIGATION)) {
-        const target = match[1];
-        if (target) found.push({ where: `${file}:${index + 1}`, target });
+      for (const pattern of DESTINATIONS) {
+        for (const match of line.matchAll(pattern)) {
+          const target = match[1];
+          if (target) found.push({ where: `${file}:${index + 1}`, target });
+        }
       }
     });
   }
   return found;
 }
+
+const FOUND = destinations();
 
 describe('the routes this app has', () => {
   /* A resolver that matched nothing would pass the rule below by reading nothing. */
@@ -93,11 +94,22 @@ describe('the routes this app has', () => {
   });
 });
 
-it('is never sent somewhere it cannot go', () => {
-  const found = targets();
-  // Same floor as `conventions.test.ts`: a scan that found nothing must not read as clean.
-  expect(found.length).toBeGreaterThan(8);
+describe('every destination in the app', () => {
+  /*
+   * A floor per spelling, not one across all of them. A single total passes with the short form
+   * alone, which is the hole the first version of this file shipped with: 37 matched, 9 missed,
+   * and every dynamic route among the missing.
+   */
+  it('is scanned in all three spellings it is written in', () => {
+    expect(FOUND.filter(({ target }) => target.includes('['))).not.toEqual([]);
+    expect(FOUND.length).toBeGreaterThan(20);
+    expect(FOUND.map(({ target }) => target)).toEqual(
+      expect.arrayContaining(['/you', '/trails/[slug]', '/saved']),
+    );
+  });
 
-  const missing = found.filter(({ target }) => !resolves(target));
-  expect(missing, 'a target with no route behind it is the Unmatched Route screen').toEqual([]);
+  it('names a route this app can go to', () => {
+    const missing = FOUND.filter(({ target }) => !resolves(target));
+    expect(missing, 'a target with no route behind it is the Unmatched Route screen').toEqual([]);
+  });
 });

@@ -1,42 +1,22 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { expect, it } from 'vitest';
+import { appSources } from './sources';
 
 /**
  * The conventions the phone has to keep too — the mobile twin of
  * `apps/web/test/conventions.test.ts`. Two clients sharing `packages/ui` are one product only
  * while something checks they still agree, and a token set can offer but not enforce.
  *
- * Same bar as the web file: **a rule earns its place by having been broken.** Both below are
- * counts of real drift, not preferences.
+ * Same bar as the web file: **a rule earns its place by having been broken.** All three below
+ * are counts of real drift, not preferences.
  */
 
-const mobileRoot = fileURLToPath(new URL('..', import.meta.url));
-
-/** Every source file the app actually ships, as `[repo-relative path, contents]`. */
-function sources(): [string, string][] {
-  const out: [string, string][] = [];
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (/\.tsx?$/.test(entry.name)) {
-        out.push([path.relative(mobileRoot, full), readFileSync(full, 'utf8')]);
-      }
-    }
-  };
-  // `app` is the router and `src` is everything it draws with. Route groups like `(tabs)`
-  // are ordinary directories on disk, so nothing special is needed to walk into them.
-  walk(path.join(mobileRoot, 'app'));
-  walk(path.join(mobileRoot, 'src'));
-  return out;
-}
-
-const FILES = sources();
+const FILES = appSources();
 
 /**
- * A gate that scans nothing passes everything. Both rules below assert an empty list, so a walk
+ * A gate that scans nothing passes everything. The rules below assert an empty list, so a walk
  * that returned no files would report a clean app while reading none of it. The floor is not a
  * target; it only has to be high enough that an empty tree cannot clear it.
  */
@@ -83,4 +63,26 @@ it('takes every colour from the theme', () => {
    */
   const stray = offenders(/['"]#[0-9a-fA-F]{3,8}['"]/g);
   expect(stray, 'colour comes from the theme, so it can change with the scheme').toEqual([]);
+});
+
+it('empties the query cache before it tells anybody the reader changed', () => {
+  /*
+   * `api/identity.ts` and `auth/context.tsx` both subscribe to `auth/session.ts`, which calls
+   * its listeners in the order they were added. React mounts a child's effects before its
+   * parent's, so `ApiProvider` *inside* `AuthProvider` is what puts the reset first and makes
+   * the refetch that follows it the first one rather than a second.
+   *
+   * Correctness no longer rests on this — `resetQueries` notifies its observers, so a screen is
+   * right either way — but the cost does, and the nesting is invisible from either of the two
+   * files that depend on it. This is the only thing that would notice them being swapped.
+   */
+  const layout = readFileSync(
+    fileURLToPath(new URL('../app/_layout.tsx', import.meta.url)),
+    'utf8',
+  );
+  const auth = layout.indexOf('<AuthProvider>');
+  const api = layout.indexOf('<ApiProvider>');
+
+  expect(auth, 'AuthProvider is the outer of the two').toBeGreaterThanOrEqual(0);
+  expect(api, 'ApiProvider subscribes first, so it must be the inner').toBeGreaterThan(auth);
 });
