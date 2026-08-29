@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { User } from '@switchback/db';
 import { ingestPrincipalFor, resetIngestPrincipalWarnings } from '../src/ingest-principal';
@@ -145,5 +146,15 @@ describe('ingestPrincipalFor', () => {
     const chosen = ingestPrincipalFor(headers({ 'x-forwarded-for': '198.51.100.9' }), null);
 
     expect(chosen.key).toBe(victim.key);
+  });
+  it('separates its digest from anything else AUTH_SECRET signs', () => {
+    // The same secret signs sessions. Without a domain tag the bucket key is a bare HMAC of the
+    // address under that secret, so it is the same value any other use of it would produce.
+    const digest = (message: string) =>
+      createHmac('sha256', SECRET).update(message).digest('hex').slice(0, 32);
+    const key = ingestPrincipalFor(headers({ 'x-forwarded-for': '203.0.113.4' }), null).key;
+
+    expect(key).toBe(`a:${digest('ingest-principal|203.0.113.4')}`);
+    expect(key).not.toBe(`a:${digest('203.0.113.4')}`);
   });
 });

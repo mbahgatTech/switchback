@@ -22,8 +22,14 @@ export type RateRefusal = 'rate-limit';
 
 /**
  * The share of the product-wide request-queue ceiling one caller may hold. Derived rather than
- * written down, so re-measuring `MAX_TILE_QUEUE_DEPTH` re-tunes this with it. At a fifth it
- * takes five simultaneous abusers to fill the queue for everybody, where it took one.
+ * written down, so re-measuring `MAX_TILE_QUEUE_DEPTH` re-tunes this with it.
+ *
+ * At a fifth it takes five *buckets* to fill the queue for everybody where it took one — which is
+ * not the same as five people, and this line previously said "abusers" as though it were. An
+ * anonymous caller is keyed by IPv6 `/64`, and one residential customer with a routed `/56` holds
+ * 256 of those. Five buckets can be one household, and what a fresh key is worth is the full
+ * burst, which nothing here paces. Tune against that, not against a headcount. Signed-in callers
+ * are keyed by account, where none of this applies.
  */
 export const PRINCIPAL_QUEUE_SHARE = 0.2;
 

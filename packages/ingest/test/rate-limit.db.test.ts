@@ -461,4 +461,26 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
     },
     TIMEOUT,
   );
+  it(
+    'gives each caller its own log budget, so one cannot silence the warning for the rest',
+    async () => {
+      const warn = vi.mocked(console.warn);
+      await spendIngestBudget(prisma, ABUSER, BUCKET_CAPACITY, NOW);
+      await spendIngestBudget(prisma, BYSTANDER, BUCKET_CAPACITY, NOW);
+      warn.mockClear();
+
+      // Two callers refused inside the same minute. Held on one process-wide mark, whichever
+      // trips first owns the budget and the second never appears — so a sustained abuser hides
+      // itself and everybody else from the operator told to watch for this line.
+      await spendIngestBudget(prisma, ABUSER, VIEWPORT, NOW);
+      await spendIngestBudget(prisma, BYSTANDER, VIEWPORT, NOW);
+      // ...and the interval still holds per caller, or the line becomes the flood it guards against.
+      await spendIngestBudget(prisma, ABUSER, VIEWPORT, new Date(NOW.getTime() + 1_000));
+
+      const lines = warn.mock.calls.map((call) => String(call[0]));
+      expect(lines.filter((line) => line.includes(ABUSER.key))).toHaveLength(1);
+      expect(lines.filter((line) => line.includes(BYSTANDER.key))).toHaveLength(1);
+    },
+    TIMEOUT,
+  );
 });

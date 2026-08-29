@@ -329,12 +329,20 @@ export interface AreaCoverage {
   capped: boolean;
 }
 
-export interface AreaOptions {
+/**
+ * What reading the area needs. No principal, because a survey queues nothing and so charges
+ * nobody — asking a read-only path to name a payer would be a field it could only ever ignore.
+ */
+export interface SurveyOptions {
   db?: PrismaClient;
   now?: Date;
   maxTiles?: number;
-  /** Who to charge new ground to. Null leaves only the product-wide ceilings applying. */
-  principal?: IngestPrincipal | null;
+}
+
+/** What *fetching* the area needs: everything a survey needs, plus who the new ground is on. */
+export interface AreaOptions extends SurveyOptions {
+  /** Who to charge new ground to. Required; `null` says "no requester behind this". */
+  principal: IngestPrincipal | null;
 }
 
 /**
@@ -342,7 +350,7 @@ export interface AreaOptions {
  * cannot answer this: it refuses outright past twelve tiles, which is right for a map that
  * panned and useless for a UI offering "fetch this area".
  */
-export async function surveyArea(bbox: BBox, options: AreaOptions = {}): Promise<AreaCoverage> {
+export async function surveyArea(bbox: BBox, options: SurveyOptions = {}): Promise<AreaCoverage> {
   const db = options.db ?? prisma;
   const now = options.now ?? new Date();
   const maxTiles = options.maxTiles ?? MAX_AREA_TILES;
