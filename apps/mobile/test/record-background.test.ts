@@ -142,6 +142,19 @@ describe('readings arriving from the OS', () => {
     expect(readings).toHaveLength(2);
   });
 
+  it('replays a whole batch that arrived before anything was listening', async () => {
+    // The premise of the feature: CoreLocation hands over everything it accumulated while the
+    // runtime slept, in one execution. Truncating that to its first reading loses the gap the
+    // buffer exists to bridge, and two separate one-reading batches cannot see the difference.
+    const background = await load();
+    os.task?.({
+      data: { locations: [reading(-121.4, 48.0), reading(-121.5, 48.1), reading(-121.6, 48.2)] },
+    });
+    const { readings, sink } = handlers();
+    background.setBackgroundHandlers(sink);
+    expect(readings).toHaveLength(3);
+  });
+
   it('replays what arrived before anything was listening', async () => {
     const background = await load();
     os.task?.({ data: { locations: [reading(-121.4, 48.0)] } });

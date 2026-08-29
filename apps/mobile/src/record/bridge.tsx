@@ -1,9 +1,9 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTRPC, useTRPCClient } from '@/api/trpc';
 import { useAuth } from '@/auth/context';
 import { setPinger, watchLifeline } from '@/record/lifeline';
-import { flush, setSignedInUser, setUploader } from '@/record/store';
+import { confirmSignedInUser, flush, hydrate, setUploader, signOut } from '@/record/store';
 
 /**
  * The wire between the recorder and the API.
@@ -41,21 +41,43 @@ export function RecordBridge() {
     };
   }, [client]);
 
+  /*
+   * Unconditionally, and before anything about identity is known. `me.get` is a network query with
+   * no persister, so on a relaunch with no signal it never resolves — and a recorder that waited
+   * for it would adopt no journal, register no handler for the readings iOS is already delivering,
+   * and drop the rest of the hike on the floor. Restoring here is safe offline for the reason in
+   * `ownerVerdict`: becoming a different user requires a sign-in through our own server.
+   */
+  useEffect(() => {
+    hydrate();
+  }, []);
+
   const me = useQuery({ ...trpc.me.get.queryOptions(), enabled: signedIn });
 
   /*
-   * Sign-out seals the recorder immediately rather than waiting for a user id to fail to arrive:
-   * `me.get` is disabled while signed out, so its data would simply go stale and the tab bar
-   * would keep the previous person's clock on screen.
+   * When this device last became signed in. A `QueryClient` built once per launch keeps `me.get`
+   * for a minute after it is read, and nothing clears it on sign-out — so without this, signing in
+   * as somebody else inside that window is answered with the previous user's id, and the previous
+   * user's track is handed to them. An id older than the sign-in that is asking for it is refused.
    */
+  const signedInAt = useRef<number | null>(null);
+  if (signedIn && signedInAt.current === null) signedInAt.current = Date.now();
+  if (!signedIn && signedInAt.current !== null) signedInAt.current = null;
+
   useEffect(() => {
-    const user = signedIn ? (me.data?.id ?? null) : null;
-    setSignedInUser(user);
-    if (!user) return;
+    if (status === 'loading') return;
+    if (!signedIn) {
+      signOut();
+      return;
+    }
+    const since = signedInAt.current;
+    const id = me.data?.id;
+    if (!id || since === null || me.dataUpdatedAt < since) return;
+    confirmSignedInUser(id);
     // A batch may have been recorded and journalled but never acknowledged before the last launch
     // ended. Nothing else would send it until the next flush tick a minute from now.
     void flush().catch(() => undefined);
-  }, [signedIn, me.data]);
+  }, [status, signedIn, me.data, me.dataUpdatedAt]);
 
   /*
    * Whether a Lifeline is running, asked once per launch and refreshed by whoever changes it.

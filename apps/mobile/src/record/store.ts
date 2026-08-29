@@ -117,10 +117,15 @@ export interface RecorderSnapshot {
  * fourth case impossible to leave out.
  */
 export type TrackingNote =
-  'background-durable' | 'background-fragile' | 'foreground' | 'not-tracking';
+  'starting' | 'background-durable' | 'background-fragile' | 'foreground' | 'not-tracking';
 
 export function trackingNote(snapshot: RecorderSnapshot): TrackingNote {
-  if (snapshot.tracking === null) return 'not-tracking';
+  if (snapshot.tracking === null) {
+    // `begin` sets `locating` and emits before it has asked the OS for anything, and two
+    // permission dialogs can stand between those two moments. Reading that as "not tracking" told
+    // somebody who had just tapped Start that nothing was being added to their hike.
+    return snapshot.phase === 'locating' ? 'starting' : 'not-tracking';
+  }
   if (snapshot.tracking === 'foreground') return 'foreground';
   return snapshot.mayNotSurviveTermination ? 'background-fragile' : 'background-durable';
 }
@@ -143,6 +148,13 @@ const KEEP_AWAKE_TAG = 'switchback-recording';
 
 /** A reading stamped this far ahead of now is a clock the device cannot be trusted about. */
 const MAX_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * How long an unfinished journal may sit on disk. `trackFixSchema` caps `t` at 48 hours, so past
+ * this no further fix could legally join the track: it is abandoned, and the only control keeping
+ * an all-day position history out of an iCloud backup is that it does not outlive its hike.
+ */
+const JOURNAL_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
 const listeners = new Set<() => void>();
 
@@ -187,6 +199,8 @@ let live = false;
 let flushTimer: ReturnType<typeof setInterval> | null = null;
 let clockTimer: ReturnType<typeof setInterval> | null = null;
 let flushing = false;
+/** Set when the server has refused a batch in a way no retry can fix. Cleared only by a new hike. */
+let uploadHalted = false;
 let hydrated = false;
 /** Who the app currently believes is at the phone. `null` until sign-in resolves. */
 let signedInUser: string | null = null;
@@ -330,6 +344,10 @@ function writeHead(): void {
  * recording before it had asked would be claiming a fix it does not have.
  */
 export function hydrate(): void {
+  // Before the latch, and before any identity is known. Readings from the OS must have somewhere
+  // to land on every launch — an app iOS relaunched in the backcountry has no network, so nothing
+  // that waits on a signed-in user can be what registers these.
+  setBackgroundHandlers({ onReadings, onFailure });
   if (hydrated) return;
   // Journals written in a format this build cannot read are erased rather than left behind: an
   // unreadable per-second location trace is still a location trace.
@@ -344,18 +362,35 @@ export function hydrate(): void {
   }
   const head = decodeHead(raw);
   if (!head) {
-    // The head is staged and renamed, so it is never observed half-written. Undecodable therefore
-    // means real corruption of a track that can no longer be attributed to a server activity —
-    // and leaving that on disk is the same disclosure as never deleting it.
-    journal.clear();
-    hydrated = true;
+    // Undecodable means real corruption of a track that can no longer be attributed to a server
+    // activity, and leaving that on disk is the same disclosure as never deleting it.
+    discard();
     return;
   }
-  if (ownerVerdict(head, signedInUser) === 'erase') {
-    journal.clear();
-    hydrated = true;
-    void stopBackgroundUpdates();
+  if (Date.now() - head.startedAt > JOURNAL_MAX_AGE_MS) {
+    // Older than a recording is allowed to be. `trackFixSchema` caps `t` at 48 hours, so no
+    // further fix could legally join this track — it is abandoned, and an abandoned all-day
+    // position history is the one thing that must not sit in Documents waiting for a backup.
+    discard();
     return;
+  }
+
+  const verdict = ownerVerdict(head, signedInUser);
+  switch (verdict) {
+    case 'erase':
+      discard();
+      return;
+    case 'restore':
+    case 'wait':
+      // `wait` is the offline launch: nobody is confirmed, and nobody can have *become* confirmed
+      // without a network sign-in through our own server, so this cannot be a new user. Refusing
+      // to restore here would lose the rest of a hike for a hazard that cannot occur offline —
+      // which is exactly what happens if this arm is folded into `erase`.
+      break;
+    default: {
+      const unhandled: never = verdict;
+      throw new Error(`unhandled owner verdict: ${String(unhandled)}`);
+    }
   }
 
   const stored = decodeFixes(journal.readFixes() ?? '');
@@ -380,6 +415,13 @@ export function hydrate(): void {
   hydrated = true;
   emit();
   void reconcileWithOs(head);
+}
+
+/** Erase the journal and stop anything the OS is still doing for it. */
+function discard(): void {
+  journal.clear();
+  hydrated = true;
+  void stopBackgroundUpdates();
 }
 
 function foldAll(stored: readonly TrackFix[]): TrackStatsState {
@@ -641,7 +683,7 @@ export function setUploader(next: Uploader | null): void {
 }
 
 export async function flush(): Promise<void> {
-  if (!activityId || !uploader || flushing) return;
+  if (!activityId || !uploader || flushing || uploadHalted) return;
   if (fixes.length - sent <= 0) return;
 
   // The hike this flush belongs to. A batch can be in flight when the user finishes and starts
@@ -667,6 +709,14 @@ export async function flush(): Promise<void> {
   } catch (cause) {
     // Left in the buffer for the next flush. `sent` only ever advances past acknowledged fixes.
     syncError = cause instanceof Error ? cause.message : 'Could not save the last few minutes.';
+    if (isTerminalUploadError(cause)) {
+      // The server will not take this batch on any attempt — the recording has hit its stored
+      // sample ceiling, or the payload is malformed. Retrying it every minute for the rest of a
+      // hike keeps the radio awake on a battery and moves nothing, so the loop stops and the
+      // screen says what to do instead of failing quietly until the end.
+      stopFlushLoop();
+      uploadHalted = true;
+    }
     throw cause;
   } finally {
     flushing = false;
@@ -675,7 +725,22 @@ export async function flush(): Promise<void> {
   }
 }
 
+/**
+ * Whether a retry could ever succeed. A 4xx from `activities.append` is a statement about the
+ * request, not about the network: the same bytes will be refused again. Read structurally rather
+ * than through a tRPC import, because the uploader is injected and this module never sees the
+ * client.
+ */
+function isTerminalUploadError(cause: unknown): boolean {
+  if (typeof cause !== 'object' || cause === null) return false;
+  const data = (cause as { data?: { code?: unknown; httpStatus?: unknown } }).data;
+  if (!data) return false;
+  if (data.code === 'BAD_REQUEST' || data.code === 'PAYLOAD_TOO_LARGE') return true;
+  return typeof data.httpStatus === 'number' && data.httpStatus >= 400 && data.httpStatus < 500;
+}
+
 function startFlushLoop(): void {
+  if (uploadHalted) return;
   if (flushTimer) return;
   flushTimer = setInterval(() => {
     void flush().catch(() => undefined);
@@ -738,6 +803,7 @@ export function begin({
   elapsedS = 0;
   phase = 'locating';
   live = true;
+  uploadHalted = false;
   journal.open();
   writeHead();
   emit();
@@ -818,6 +884,7 @@ function reset(): void {
   elapsedS = 0;
   route = null;
   routeLengthM = null;
+  uploadHalted = false;
   phase = 'idle';
 }
 
@@ -834,14 +901,27 @@ function reset(): void {
  * subscription stops, and it comes back if the same person signs in again. A *different*
  * identity is the only moment the disclosure exists, and that erases.
  */
-export function setSignedInUser(next: string | null): void {
+export function confirmSignedInUser(next: string): void {
   if (next === signedInUser) return;
+  applyIdentity(next);
+}
+
+/**
+ * Nobody is signed in. The recording is sealed rather than erased — nothing of it is presented and
+ * the OS subscription stops — because a refresh token expiring mid-hike is an ordinary event on a
+ * mountain, and destroying a hike for it would teach people not to sign out.
+ */
+export function signOut(): void {
+  if (signedInUser === null) return;
+  applyIdentity(null);
+}
+
+function applyIdentity(next: string | null): void {
   signedInUser = next;
 
   // Only where there is something to take down. On a cold launch this runs before anything has
   // been restored, and stopping the OS subscription there would end a hike iOS had kept alive.
   if (activityId !== null) {
-    setBackgroundHandlers(null);
     stopTracking();
     stopFlushLoop();
     stopClock();
@@ -854,9 +934,7 @@ export function setSignedInUser(next: string | null): void {
   hydrated = false;
   emit();
   if (next === null) return;
-
   hydrate();
-  setBackgroundHandlers({ onReadings, onFailure });
 }
 
 export function dismissAlert(): void {

@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { JournalStore } from '../src/record/journal';
+import type { TrackFix } from '@switchback/core';
+import type * as GeoModule from '@switchback/geo';
 import type * as StoreModule from '../src/record/store';
 
 /**
@@ -60,6 +62,27 @@ vi.mock('expo-keep-awake', () => ({
   activateKeepAwakeAsync: async () => undefined,
   deactivateKeepAwake: () => undefined,
 }));
+
+/**
+ * The real geo, with one counter around it. Folding incrementally and re-deriving from the whole
+ * buffer produce identical numbers — that is what the property test in `packages/geo` proves — so
+ * the call count is the only thing that can tell an O(1) step from an O(n) one.
+ */
+const geo = vi.hoisted(() => {
+  let advances = 0;
+  return { bump: () => (advances += 1), advanceCalls: () => advances, reset: () => (advances = 0) };
+});
+
+vi.mock('@switchback/geo', async () => {
+  const real = await vi.importActual<typeof GeoModule>('@switchback/geo');
+  return {
+    ...real,
+    advanceTrackStats: (state: GeoModule.TrackStatsState, fix: TrackFix) => {
+      geo.bump();
+      return real.advanceTrackStats(state, fix);
+    },
+  };
+});
 
 /** `store.ts` picks a file-backed store at module load; nothing here may reach the filesystem. */
 vi.mock('../src/record/journal-files', () => ({
@@ -157,7 +180,7 @@ function reading(seconds: number, metres = 20) {
 /** A hike under way, fed by the OS task, with the identity already settled. */
 async function recording(journal: MemoryJournal, user = 'usr_a'): Promise<Store> {
   const store = await load(journal);
-  store.setSignedInUser(user);
+  store.confirmSignedInUser(user);
   store.begin({ id: 'act_1', startedAt: START, trailId: null });
   await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('background'));
   return store;
@@ -165,6 +188,7 @@ async function recording(journal: MemoryJournal, user = 'usr_a'): Promise<Store>
 
 beforeEach(() => {
   vi.clearAllMocks();
+  geo.reset();
   os.startLocationUpdatesAsync.mockResolvedValue(undefined);
   os.hasStartedLocationUpdatesAsync.mockResolvedValue(false);
   os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: true, canAskAgain: true });
@@ -209,20 +233,21 @@ describe('a batch of readings the OS accumulated while the runtime slept', () =>
     const skewed = { ...reading(0), timestamp: Date.now() + 86_400_000 };
     os.task?.({ data: { locations: [skewed] } });
     const [first] = store.recordingSnapshot().fixes;
-    // Stamped from the clock rather than from a reading claiming to be from tomorrow.
-    expect(first?.t).toBeLessThan(60 * 60 * 48);
+    // Stamped from the clock, so `t` is the hour since this hike began — not the twenty-five
+    // hours a reading from tomorrow would imply. The gap between the two is the whole assertion,
+    // and a ceiling of 48 h would have been satisfied by either.
+    expect(first?.t).toBeGreaterThan(3_500);
+    expect(first?.t).toBeLessThan(7_200);
   });
 });
 
 describe('the head on disk', () => {
-  it('is staged before it is committed, so a kill cannot leave half of one', async () => {
-    const journal = memoryJournal();
-    await recording(journal);
-    expect(journal.headWrites.length).toBeGreaterThan(0);
-    expect(journal.headWrites.map((write) => write.kind)).toEqual(
-      journal.headWrites.map((_, i) => (i % 2 === 0 ? 'stage' : 'commit')),
-    );
-  });
+  /*
+   * There is deliberately no staging assertion here. The one that used to be here asserted that
+   * the in-memory double pushed `stage` then `commit` — which it does unconditionally, for any
+   * production code at all. Staging is a property of the files, and it is asserted against the
+   * real `expo-file-system` calls in `journal-files.test.ts`, where removing the rename fails.
+   */
 
   it('carries the owner, so the track can be refused to anybody else', async () => {
     const journal = memoryJournal();
@@ -262,13 +287,13 @@ describe('restoring a hike the phone was killed during', () => {
   it('comes back with every fix that finished being written', async () => {
     const journal = killedMidHike();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     expect(store.recordingSnapshot().fixes.map((fix) => fix.t)).toEqual([0, 1]);
   });
 
   it('repairs the torn tail, so the next fix does not land on the fragment', async () => {
     const journal = killedMidHike();
-    await load(journal).then((store) => store.setSignedInUser('usr_a'));
+    await load(journal).then((store) => store.confirmSignedInUser('usr_a'));
     expect(journal.lines.endsWith('\n')).toBe(true);
   });
 
@@ -276,7 +301,7 @@ describe('restoring a hike the phone was killed during', () => {
     os.hasStartedLocationUpdatesAsync.mockResolvedValue(false);
     const journal = killedMidHike();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     expect(store.recordingSnapshot().phase).toBe('paused');
   });
 
@@ -284,7 +309,7 @@ describe('restoring a hike the phone was killed during', () => {
     os.hasStartedLocationUpdatesAsync.mockResolvedValue(true);
     const journal = killedMidHike();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     await vi.waitFor(() => expect(store.recordingSnapshot().phase).toBe('locating'));
     expect(store.recordingSnapshot().tracking).toBe('background');
   });
@@ -294,7 +319,7 @@ describe('restoring a hike the phone was killed during', () => {
     os.getBackgroundPermissionsAsync.mockResolvedValue({ granted: true, canAskAgain: false });
     const journal = killedMidHike();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('background'));
     expect(store.recordingSnapshot().mayNotSurviveTermination).toBe(false);
   });
@@ -304,14 +329,14 @@ describe('restoring a hike the phone was killed during', () => {
     const journal = killedMidHike();
     journal.head = JSON.stringify({ ...JSON.parse(journal.head ?? '{}'), live: false });
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     await vi.waitFor(() => expect(os.stopLocationUpdatesAsync).toHaveBeenCalled());
   });
 
   it('erases the journal of a format this build no longer reads', async () => {
     const journal = memoryJournal();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     expect(journal.legacyCleared).toBeGreaterThan(0);
   });
 
@@ -321,7 +346,7 @@ describe('restoring a hike the phone was killed during', () => {
       throw new Error('disk');
     };
     const store = await load(journal);
-    expect(() => store.setSignedInUser('usr_a')).toThrow();
+    expect(() => store.confirmSignedInUser('usr_a')).toThrow();
     expect(os.stopLocationUpdatesAsync).not.toHaveBeenCalled();
   });
 });
@@ -346,14 +371,14 @@ describe('a phone handed to somebody else', () => {
   it('shows a hike back to the person who recorded it', async () => {
     const journal = pausedHikeOf('usr_a');
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     expect(store.recordingSnapshot().activityId).toBe('act_1');
   });
 
   it('shows nobody else where they have been, and erases it', async () => {
     const journal = pausedHikeOf('usr_a');
     const store = await load(journal);
-    store.setSignedInUser('usr_b');
+    store.confirmSignedInUser('usr_b');
     expect(store.recordingSnapshot().activityId).toBeNull();
     expect(journal.cleared).toBeGreaterThan(0);
   });
@@ -361,8 +386,8 @@ describe('a phone handed to somebody else', () => {
   it('keeps a signed-out hike rather than destroying it, because tokens expire on mountains', async () => {
     const journal = pausedHikeOf('usr_a');
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
-    store.setSignedInUser(null);
+    store.confirmSignedInUser('usr_a');
+    store.signOut();
     expect(store.recordingSnapshot().activityId).toBeNull();
     expect(journal.cleared).toBe(0);
   });
@@ -370,12 +395,12 @@ describe('a phone handed to somebody else', () => {
   it('tells mounted subscribers, rather than leaving the clock on screen until a re-render', async () => {
     const journal = pausedHikeOf('usr_a');
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     let announced = 0;
     const stop = store.subscribeToRecording(() => {
       announced += 1;
     });
-    store.setSignedInUser(null);
+    store.signOut();
     stop();
     expect(announced).toBeGreaterThan(0);
   });
@@ -407,7 +432,8 @@ describe('an upload still in flight when the next hike starts', () => {
 
     const snapshot = store.recordingSnapshot();
     expect(snapshot.activityId).toBe('act_2');
-    expect(snapshot.pending).toBeGreaterThanOrEqual(0);
+    // Not `pending >= 0`: `build` clamps that with `Math.max`, so it holds however wrong `sent`
+    // is. The head is where the damage would be visible, and it is what is checked.
     expect(JSON.parse(journal.head ?? '{}')).toMatchObject({ id: 'act_2', sent: 0 });
   });
 });
@@ -466,7 +492,7 @@ describe('a host that cannot track in the background', () => {
     );
     const journal = memoryJournal();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     store.begin({ id: 'act_1', startedAt: START, trailId: null });
     await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('foreground'));
     expect(os.watchPositionAsync).toHaveBeenCalled();
@@ -477,7 +503,7 @@ describe('a host that cannot track in the background', () => {
     os.startLocationUpdatesAsync.mockRejectedValue(new Error('Location services are disabled'));
     const journal = memoryJournal();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     store.begin({ id: 'act_1', startedAt: START, trailId: null });
     await vi.waitFor(() =>
       expect(store.recordingSnapshot().geoError).toBe('Location services are disabled'),
@@ -516,7 +542,7 @@ describe('a head that disagrees with the track beside it', () => {
       '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n' +
       '{"t":1,"lng":-121.489,"lat":48.02,"eleM":611,"accuracyM":6}\n';
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     expect(store.recordingSnapshot().fixes).toHaveLength(2);
 
     // The harm of an unclamped count is not the readout, it is the upload: `flush` measures the
@@ -540,7 +566,7 @@ describe('a hiker who refuses location', () => {
     os.requestForegroundPermissionsAsync.mockResolvedValue({ granted: false, canAskAgain: true });
     const journal = memoryJournal();
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     store.begin({ id: 'act_1', startedAt: START, trailId: null });
     await vi.waitFor(() => expect(store.recordingSnapshot().phase).toBe('paused'));
     expect(JSON.parse(journal.head ?? '{}')).toMatchObject({ live: false });
@@ -565,9 +591,189 @@ describe('a restored hike on a phone that never granted Always', () => {
     });
     journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
     const store = await load(journal);
-    store.setSignedInUser('usr_a');
+    store.confirmSignedInUser('usr_a');
     await vi.waitFor(() => expect(store.recordingSnapshot().tracking).toBe('background'));
     expect(store.recordingSnapshot().mayNotSurviveTermination).toBe(true);
     expect(store.trackingNote(store.recordingSnapshot())).toBe('background-fragile');
+  });
+});
+
+describe('behaviours a mutation could quietly remove', () => {
+  /** A live hike, then whatever the caller does to it. */
+  async function live(journal: MemoryJournal) {
+    return recording(journal);
+  }
+
+  it('stops the OS subscription on sign-out, rather than leaving GPS running for nobody', async () => {
+    const journal = memoryJournal();
+    const store = await live(journal);
+    // The OS now holds the task, which is what `stopBackgroundUpdates` checks before stopping.
+    os.hasStartedLocationUpdatesAsync.mockResolvedValue(true);
+    store.signOut();
+    await vi.waitFor(() => expect(os.stopLocationUpdatesAsync).toHaveBeenCalled());
+  });
+
+  it('erases the journal when a hike is discarded', async () => {
+    const journal = memoryJournal();
+    const store = await live(journal);
+    os.task?.({ data: { locations: [reading(0)] } });
+    store.forget();
+    expect(journal.head).toBeNull();
+    expect(journal.lines).toBe('');
+    expect(journal.cleared).toBeGreaterThan(0);
+  });
+
+  it('erases a corrupt journal rather than leaving an unattributable trace on disk', async () => {
+    const journal = memoryJournal();
+    journal.head = '{"v":2,"id":';
+    journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    expect(journal.cleared).toBeGreaterThan(0);
+    expect(store.recordingSnapshot().activityId).toBeNull();
+  });
+
+  it('starts a new hike on an empty track, not on the end of the last one', async () => {
+    const journal = memoryJournal();
+    const store = await live(journal);
+    os.task?.({ data: { locations: [reading(0), reading(1)] } });
+    expect(journal.lines.trimEnd().split('\n')).toHaveLength(2);
+    store.begin({ id: 'act_2', startedAt: new Date(), trailId: null });
+    expect(journal.lines).toBe('');
+  });
+
+  it('marks a finished hike as no longer live, so the next launch does not resume it', async () => {
+    const journal = memoryJournal();
+    const store = await live(journal);
+    store.stop();
+    expect(JSON.parse(journal.head ?? '{}')).toMatchObject({ live: false });
+  });
+
+  it('adopts a live journal from a reading alone, without waiting to be told the task is up', async () => {
+    // The second of the two documented adoption paths: iOS relaunches the app and hands over a
+    // position before `reconcileWithOs` has finished asking whether the task is registered.
+    os.hasStartedLocationUpdatesAsync.mockImplementation(
+      () => new Promise<boolean>(() => undefined),
+    );
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_1',
+      ownerId: 'usr_a',
+      startedAt: START.getTime(),
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: true,
+    });
+    journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    expect(store.recordingSnapshot().phase).toBe('paused');
+    os.task?.({ data: { locations: [reading(30)] } });
+    expect(store.recordingSnapshot().tracking).toBe('background');
+    expect(store.recordingSnapshot().fixes.map((fix) => fix.t)).toContain(30);
+  });
+
+  it('registers for readings before anything can fail, so a bad journal costs no fixes', async () => {
+    const journal = memoryJournal();
+    journal.readHead = () => {
+      throw new Error('disk');
+    };
+    const store = await load(journal);
+    expect(() => store.confirmSignedInUser('usr_a')).toThrow();
+    // Handlers are attached ahead of the latch and ahead of the first read, so a reading arriving
+    // now reaches the store. With no hike restored there is nothing to append it to — but the
+    // orphan-stop must not fire either, because the journal was never actually read.
+    os.task?.({ data: { locations: [reading(0)] } });
+    expect(os.stopLocationUpdatesAsync).not.toHaveBeenCalled();
+  });
+
+  it('folds one leg per fix rather than re-walking the track', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1, 2, 3, 4, 5].map((s) => reading(s)) } });
+    // Six fixes, six folds. Re-deriving from the whole buffer gives the same numbers — which is
+    // what the geo property test proves — so only the call count can tell the two apart.
+    expect(geo.advanceCalls()).toBe(6);
+    expect(store.recordingSnapshot().fixes).toHaveLength(6);
+  });
+});
+
+describe('a journal older than a recording is allowed to be', () => {
+  it('is erased rather than left in Documents waiting for a backup', async () => {
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_old',
+      ownerId: 'usr_a',
+      startedAt: Date.now() - 72 * 60 * 60 * 1000,
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: false,
+    });
+    journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    expect(journal.cleared).toBeGreaterThan(0);
+    expect(store.recordingSnapshot().activityId).toBeNull();
+  });
+
+  it('keeps one still inside the window', async () => {
+    const journal = memoryJournal();
+    journal.head = JSON.stringify({
+      v: 2,
+      id: 'act_recent',
+      ownerId: 'usr_a',
+      startedAt: Date.now() - 6 * 60 * 60 * 1000,
+      trailId: null,
+      routeId: null,
+      sent: 0,
+      live: false,
+    });
+    journal.lines = '{"t":0,"lng":-121.49,"lat":48.02,"eleM":610,"accuracyM":6}\n';
+    const store = await load(journal);
+    store.confirmSignedInUser('usr_a');
+    expect(store.recordingSnapshot().activityId).toBe('act_recent');
+  });
+});
+
+describe('an upload the server will never accept', () => {
+  it('stops the retry loop instead of burning the radio for the rest of the hike', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1].map((s) => reading(s)) } });
+
+    let attempts = 0;
+    store.setUploader(() => {
+      attempts += 1;
+      // What `activities.append` throws once a recording has reached MAX_SAMPLES.
+      return Promise.reject(
+        Object.assign(new Error('This recording has reached its maximum length.'), {
+          data: { code: 'BAD_REQUEST', httpStatus: 400 },
+        }),
+      );
+    });
+    await expect(store.flush()).rejects.toThrow(/maximum length/);
+    await store.flush();
+    await store.flush();
+    expect(attempts).toBe(1);
+    expect(store.recordingSnapshot().syncError).toMatch(/maximum length/);
+  });
+
+  it('keeps retrying one that is only a lost signal', async () => {
+    const journal = memoryJournal();
+    const store = await recording(journal);
+    os.task?.({ data: { locations: [0, 1].map((s) => reading(s)) } });
+
+    let attempts = 0;
+    store.setUploader(() => {
+      attempts += 1;
+      return Promise.reject(new Error('Network request failed'));
+    });
+    await expect(store.flush()).rejects.toThrow();
+    await expect(store.flush()).rejects.toThrow();
+    expect(attempts).toBe(2);
   });
 });

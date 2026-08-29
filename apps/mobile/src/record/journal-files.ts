@@ -41,7 +41,15 @@ export function fileJournalStore(): JournalStore {
   };
 
   return {
-    readHead: () => readText(HEAD_NAME),
+    /**
+     * The live head, or the staged one when the live head is missing.
+     *
+     * `moveSync(..., { overwrite: true })` is `removeItem` then `moveItem` on iOS, not an atomic
+     * rename — there is a window in which neither file is in place, and a kill inside it would
+     * otherwise throw a whole hike away. The staged copy is only ever a complete write, and
+     * `decodeHead` is what decides whether to believe it.
+     */
+    readHead: () => readText(HEAD_NAME) ?? readText(STAGED_HEAD_NAME),
 
     writeHead(raw) {
       try {
@@ -50,10 +58,10 @@ export function fileJournalStore(): JournalStore {
         if (staged.exists) staged.delete();
         staged.create();
         staged.write(raw);
-        // The rename is what makes the head atomic. `expo-file-system`'s string write is not —
-        // it writes non-atomically, so a kill mid-write leaves a head that will not parse, and a
-        // head that will not parse is a hike thrown away. A reader sees the old head or the new
-        // one, never half of either.
+        // Staging is what keeps a half-written head off the live path: `expo-file-system`'s string
+        // write is not atomic, and a head that will not parse is a hike thrown away. The move that
+        // follows is not atomic either, so `readHead` falls back to the staged copy for the window
+        // in which neither file exists.
         staged.moveSync(file(HEAD_NAME), { overwrite: true });
       } catch {
         // A full disk, most likely. Durability degrades; the hike carries on, because saying so

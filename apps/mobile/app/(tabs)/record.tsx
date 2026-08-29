@@ -461,6 +461,7 @@ function pace(stats: ActivityStats, units: UnitSystem): string {
  * error here until it has prose.
  */
 const TRACKING_PROSE: Readonly<Record<TrackingNote, string>> = {
+  starting: 'Starting — finding you, and asking the phone for what it needs.',
   'background-durable': 'Recording with the screen off. Nothing needs Switchback to stay open.',
   'background-fragile':
     'Recording with the screen off. Location is set to "While Using" — allow "Always" in Settings and iOS will restart the recording if it ever has to close the app.',
