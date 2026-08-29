@@ -238,6 +238,10 @@ nesting in place.
 | T-011 | Make the announcement unskippable when the Keychain refuses a write                                                                                                                                | `adopt` and `signOutLocally` announce from a `finally`                                                                                | `done` |
 | T-012 | Widen the navigation gate to the object and `href` spellings, and gate the one ungated account query                                                                                               | the gate catches `router.push({ pathname: '/profile' })`; `lists/[key].tsx` reads `useAuth()`                                         | `done` |
 | T-013 | Lift the source walker into `test/sources.ts` and hold the provider nesting the ordering rests on                                                                                                  | `conventions.test.ts` exits 0 with four rules                                                                                         | `done` |
+| T-014 | Gate all ten changed screen predicates structurally, reading both spellings off disk, so reinstating `isError` anywhere fails                                                                      | reverting all ten to their pre-PR spelling names all ten sites; reverting one names one                                               | `done` |
+| T-015 | Widen the derived query rule to the reader's own record, so `me.get` is visible to it despite being `publicProcedure`                                                                              | un-gating `me.get` in `settings.tsx` fails the rule                                                                                   | `done` |
+| T-016 | Stop a blanked credential reading as a live session, and cover the `''` case                                                                                                                       | `hasStoredSession` on `''` is `false`; reverting to `!== null` fails the new case                                                     | `done` |
+| T-017 | Make two mutants fail on their assertion rather than on mock plumbing                                                                                                                              | M9 reports the fetch count, M11 reports `expected undefined to be null`                                                               | `done` |
 
 ---
 
@@ -498,14 +502,62 @@ nesting in place.
     router shapes. Named behaviours now covered: a partial stored copy seeds only what it has,
     and a second identical announcement costs no second reset.
   budget: { implement: 4, review: 2, replan: 0, total: 2 }
+
+- seq: 12
+  at: 2026-08-29T15:05:00+00:00
+  state: IMPLEMENT
+  event: record_corrected
+  detail: >-
+    Commit `8a719f2` rebased this branch a second time — onto `d11b1cd`, PR #84 — and edited §1's
+    metadata to say so without writing anything here: 11 insertions, 11 deletions, no entry. A
+    metadata-only edit with no log entry is the one shape an append-only record forbids, because
+    it moves the base every other claim is measured against and leaves no trace of when or why.
+    Recording it now. The base has moved twice: `1789198f` to `d7c2fad` (#80, seq 11) to
+    `d11b1cd` (#84, this entry).
+  decision: >-
+    §10's parenthetical that the base "has not moved since §1 was written" was false from the
+    first of those rebases and contradicted §1 on the same page. It is corrected in place rather
+    than left standing, and §10's round-4 heading, which still named `d7c2fad`, now names the
+    commit this branch actually sits on.
+  budget: { implement: 4, review: 3, replan: 0, total: 2 }
+
+- seq: 13
+  at: 2026-08-29T15:40:00+00:00
+  state: IMPLEMENT
+  event: merge_gate_findings_closed
+  detail: >-
+    Two independent merge-gate reviewers would merge the code and failed the PR on what defends
+    and describes it. **Ten screen predicates, one defended.** The `isError` to data-absence
+    change landed in ten branches across ten files; only `[slug].tsx` had a test, and that test
+    transcribed the predicate by hand rather than reading it, so reinstating `query.isError` left
+    46/46 green. There is now a structural rule over both spellings the app uses — the
+    early-return guards a screen opens with, and the arm a render ternary falls to after its
+    pending arm — read off disk. Reverting all ten to their pre-PR spelling names all ten sites.
+    **`me.get` was invisible to the derived rule.** It is `publicProcedure`, so the rule's
+    `protectedProcedure` scan excluded it, while it has twelve hand-gated call sites including
+    `lists/[key].tsx` — the first bug the rule was written for. The rule now reads the `me` router
+    whole, on the ground that its whole contract is the current reader; the derivation the
+    reviewers credited with finding `lifeline.active` is kept, only its scope corrected.
+  decision: >-
+    Also closed a Major this branch amplified: `hasStoredSession` asked `!== null`, so the `''`
+    that `discardStoredToken` writes when the Keychain refuses a delete read back as a live
+    session, `AuthProvider` mapped it to `signedIn`, and because this Work Order newly gates every
+    protected query on that status, a failed sign-out became a screenful of 401s. Now `Boolean`,
+    with the `''` case covered; the comment asserting every reader already tested falsiness was
+    false where it was written and now names what enforces it. Two mutants that were killed by
+    mock plumbing rather than by their assertion were repaired. **SEC-01 — a sign-out racing an
+    in-flight refresh — is left alone deliberately:** it predates this branch, which strictly
+    narrows it, and closing it is a separate Work Order.
+  budget: { implement: 5, review: 3, replan: 0, total: 2 }
 ```
 
 ---
 
 ## 10. Evidence
 
-**Round 4, rebased onto `d7c2fad`.** The mobile suite is 46 tests across 6 files, up from 5
-tests across 2 on the base:
+**Round 4, rebased onto `d7c2fad` (#80), then onto `d11b1cd` (#84), where this branch now
+sits.** The mobile suite was 46 tests across 6 files at that point, up from 5 across 2 on the
+base. Round 5 takes it to 48 and is recorded at the end of this section:
 
 ```
  ✓ apps/mobile/test/navigation-targets.test.ts (7)
@@ -574,8 +626,10 @@ npm run typecheck     exit=0
 npm run format:check  exit=0
 ```
 
-**The differential, both sides run on this host within the hour, base `1789198f` (which is
-still `origin/master` — the base has not moved since §1 was written):**
+**The differential, both sides run on this host within the hour, against what was then the base,
+`1789198f`.** That base has since moved twice — to `d7c2fad` (#80) and then to `d11b1cd` (#84) —
+recorded at seq 11 and seq 12. The run below is kept because it is what was measured at the time;
+it is superseded by the round-5 differential at the end of this section, taken against `d11b1cd`:
 
 ```
 base   1789198f: Test Files 2 failed | 115 passed | 5 skipped (122)

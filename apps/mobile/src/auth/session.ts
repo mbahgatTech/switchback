@@ -122,9 +122,10 @@ export async function getAccessToken(): Promise<string | null> {
 /**
  * Give up the stored credential, and make sure it cannot be honoured if the delete fails.
  *
- * An empty string is the fallback rather than a second delete: every reader of this value
- * already treats a falsy result as "not signed in", so overwriting neutralises the credential
- * even across a relaunch, where the in-memory `signedOut` guard no longer exists.
+ * An empty string is the fallback rather than a second delete: it neutralises the credential
+ * even across a relaunch, where the in-memory `signedOut` guard no longer exists. That rests on
+ * every reader treating a falsy value as "not signed in" — `rotate` does, and `hasStoredSession`
+ * does since it stopped asking `!== null`; `session.test.ts` holds both.
  */
 async function discardStoredToken(): Promise<void> {
   try {
@@ -162,7 +163,12 @@ export async function signOut(): Promise<void> {
   await signOutLocally();
 }
 
-/** Whether a credential exists at all — the launch check, before any request is made. */
+/**
+ * Whether a credential exists at all — the launch check, before any request is made.
+ *
+ * Falsiness, not `!== null`: a failed delete leaves `''` behind, and this is the reader that
+ * turns a stored value into `signedIn` — and so into every gated query on the screen firing.
+ */
 export async function hasStoredSession(): Promise<boolean> {
-  return (await readRefreshToken()) !== null;
+  return Boolean(await readRefreshToken());
 }

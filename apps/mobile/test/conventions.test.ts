@@ -99,11 +99,15 @@ it('empties the query cache before it tells anybody the reader changed', () => {
 });
 
 /*
- * The three rules below are *structural*, and that is a compromise worth naming. Each pins a
+ * The four rules below are *structural*, and that is a compromise worth naming. Each pins a
  * property that belongs in a behavioural test, but `useOfflineHydration` and `useCacheGeneration`
  * are hooks, `vitest.config.ts` sets `environment: 'node'`, and this workspace has no
  * `react-test-renderer` or `@testing-library/react-native`. Reading the source is what is
  * available today. Each was written by making the mutation it describes and watching it fail.
+ *
+ * Two of them are no longer alone: `session.test.ts` runs both `finally` blocks, and the screen
+ * rule below is doubled by `offline-seed.test.ts` driving a real observer. Structural is the
+ * floor here, not the whole story.
  */
 
 it('re-lays the phone’s copy when the cache generation moves', () => {
@@ -144,14 +148,86 @@ it('announces an identity change even when the Keychain refuses', () => {
 });
 
 /**
- * Every protected *query* the server declares, as `router.procedure`.
+ * Every branch that draws something *instead of* the screen's content: the early-return guards a
+ * screen opens with, and the arm a render ternary falls to once its pending arm is done.
  *
- * Read from `packages/api/src/routers/`, not listed here: a hand-kept list is a list that goes
- * stale the first time somebody adds a procedure, and the rule below is only worth having if it
- * knows about procedures nobody thought to tell it about. Mutations are excluded — they fire on
- * a press, not on mount, so they need no `enabled`.
+ * Both shapes are read off the source rather than listed, so a screen written next month is
+ * covered the day it is written — and so that this rule cannot quietly stop reading the screens
+ * it was built for.
  */
-function protectedQueries(): string[] {
+function screenReplacingBranches(): { at: string; test: string; shape: 'guard' | 'arm' }[] {
+  const branches: { at: string; test: string; shape: 'guard' | 'arm' }[] = [];
+
+  for (const [file, source] of FILES) {
+    const lines = source.split('\n');
+    lines.forEach((line, index) => {
+      const guard = /^\s*if \((.+)\) \{$/u.exec(line);
+      if (guard && lines[index + 1]?.trim() === 'return (') {
+        branches.push({ at: `${file}:${index + 1}`, test: guard[1] ?? '', shape: 'guard' });
+        return;
+      }
+
+      // A ternary that opens on pending: the arm chained onto it is the failure copy. One that
+      // closes `) : null}` instead — `saved.tsx` — adds a message beside the content rather than
+      // in place of it, and is right to read the error flag.
+      if (!/\.isPending \? \($/u.test(line)) return;
+      const closing = lines.findIndex((next, at) => at > index && /^\s*\) : /u.test(next));
+      if (closing === -1) return;
+      const arm = /^\s*\) : (.+) \? \($/u.exec(lines[closing] ?? '');
+      if (arm) branches.push({ at: `${file}:${closing + 1}`, test: arm[1] ?? '', shape: 'arm' });
+    });
+  }
+  return branches;
+}
+
+it('never draws a failure over content the phone is still holding', () => {
+  /*
+   * `isError` is true while `data` is still there. A refetch that fails does not take the answer
+   * with it — query-core keeps `data` and moves `status` to `error` — so a branch that replaces
+   * the screen on the error flag draws "Trail not found" over a trail held in full. That is the
+   * defect this Work Order exists to fix, and it was in ten branches across ten files.
+   *
+   * The two spellings that are safe both ask about the data rather than the flag: an absence
+   * test (`!trail`, `!me.data`), or `isLoadingError`, which is by definition an error with
+   * nothing behind it. `offline-seed.test.ts` proves the property on a real observer for one
+   * screen; this is what holds the other nine, and what will hold the screen nobody has written
+   * yet.
+   */
+  const branches = screenReplacingBranches();
+  const onTheFlag = branches
+    .filter(({ test }) => /\.isError\b/u.test(test))
+    .map(({ at, test }) => `${at}  ${test}`);
+
+  expect(
+    branches.length,
+    'the scan found no screen branches, so this rule read nothing',
+  ).toBeGreaterThan(30);
+  expect(
+    new Set(branches.map(({ shape }) => shape)),
+    'both spellings must still be found — a regex that matches neither passes everything',
+  ).toEqual(new Set(['guard', 'arm']));
+  expect(onTheFlag, 'a screen branches on the data it holds, never on the error flag').toEqual([]);
+});
+
+/**
+ * Every *query* whose answer is about the reader — the ones a screen must not ask as nobody.
+ *
+ * Two clauses, both read from `packages/api/src/routers/` rather than listed here: every
+ * `protectedProcedure` query, and every query in `me.ts`. A hand-kept list goes stale the first
+ * time somebody adds a procedure, and this rule is only worth having if it knows about the ones
+ * nobody thought to tell it about.
+ *
+ * The second clause is not a special case wearing a general name. `me.get` is `publicProcedure`
+ * on purpose — it answers `null` rather than 401 for a signed-out visitor, so the error logs
+ * stay worth reading — but the record it returns is still the reader's own, and asking for it as
+ * nobody through the reset that follows an identity change is the same defect the protected ones
+ * have. The `me` router is the reader's record by construction, so it is read whole rather than
+ * named procedure by procedure.
+ *
+ * Mutations are excluded either way: they fire on a press, not on mount, so they need no
+ * `enabled`.
+ */
+function accountScopedQueries(): string[] {
   const routerDir = fileURLToPath(new URL('../../../packages/api/src/routers', import.meta.url));
   const names: string[] = [];
 
@@ -163,7 +239,7 @@ function protectedQueries(): string[] {
     ];
 
     declarations.forEach((declaration, index) => {
-      if (declaration[2] !== 'protectedProcedure') return;
+      if (declaration[2] !== 'protectedProcedure' && entry !== 'me.ts') return;
       const from = declaration.index ?? 0;
       const to = declarations[index + 1]?.index ?? source.length;
       // `.query(` before the next declaration means this one answers rather than writes.
@@ -181,10 +257,12 @@ it('asks for the reader’s own record only while there is a reader', () => {
    * It also fires again through the reset that follows every identity change, before React has
    * re-rendered — so `enabled` computed from the last signed-in render is still `true`.
    *
-   * Three call sites shipped ungated: `lists/[key].tsx`, then `settings.tsx` and
-   * `lifeline-panel.tsx`, both found by this rule after the first was fixed by hand.
+   * `lists/[key].tsx` shipped ungated and was fixed by hand; the rule then found two more
+   * nobody had thought to look for — `me.devices` in `settings.tsx`, and `lifeline.active` in
+   * `lifeline-panel.tsx`. `me.get` itself stayed invisible to it until the `me.ts` clause above,
+   * though it is the procedure that first bug was about and it has twelve call sites.
    */
-  const queries = protectedQueries();
+  const queries = accountScopedQueries();
   /*
    * A plain string test, not a regex: the gated spelling always opens `useQuery({` to spread the
    * options, so `useQuery(trpc.` with no brace is exactly the ungated one.
@@ -198,6 +276,7 @@ it('asks for the reader’s own record only while there is a reader', () => {
   expect(
     queries.length,
     'the router scan found nothing, so this rule read nothing',
-  ).toBeGreaterThan(5);
-  expect(ungated, 'a protected query needs an `enabled` gate').toEqual([]);
+  ).toBeGreaterThan(10);
+  expect(queries, 'the `me.ts` clause is what makes `me.get` visible here').toContain('me.get');
+  expect(ungated, 'a query about the reader needs an `enabled` gate').toEqual([]);
 });

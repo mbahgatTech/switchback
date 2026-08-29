@@ -120,8 +120,9 @@ describe('signing out', () => {
 
     /*
      * The delete failed, so the credential is still on disk and would be honoured after a
-     * relaunch, where the in-memory guard no longer exists. An empty string reads back falsy,
-     * which every caller already treats as "not signed in".
+     * relaunch, where the in-memory guard no longer exists. An empty string reads back falsy —
+     * which only closes anything because every caller tests falsiness, and one of them did not
+     * until this Work Order. The launch check at the bottom of this file is what pins that.
      */
     expect(storage.writeRefreshToken).toHaveBeenCalledWith('');
   });
@@ -155,7 +156,7 @@ describe('refreshing an access token', () => {
     const heard: boolean[] = [];
     session.subscribe((signedIn) => heard.push(signedIn));
     storage.readRefreshToken.mockResolvedValue('refresh-alice');
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 401 }));
+    vi.mocked(fetch).mockResolvedValue(Response.json({ error: 'invalid_grant' }, { status: 401 }));
 
     const token = await session.getAccessToken();
 
@@ -170,7 +171,7 @@ describe('refreshing an access token', () => {
     const heard: boolean[] = [];
     session.subscribe((signedIn) => heard.push(signedIn));
     storage.readRefreshToken.mockResolvedValue('refresh-alice');
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 503 }));
+    vi.mocked(fetch).mockResolvedValue(Response.json({ error: 'unavailable' }, { status: 503 }));
 
     expect(await session.getAccessToken()).toBeNull();
     expect(heard, 'a 503 is not the server revoking anything').toEqual([]);
@@ -192,7 +193,10 @@ describe('refreshing an access token', () => {
   it('presents a rotated token once, however many callers ask at once', async () => {
     const session = await freshSession();
     storage.readRefreshToken.mockResolvedValue('refresh-alice');
-    vi.mocked(fetch).mockResolvedValue(Response.json(PAIR));
+    // A fresh `Response` per call, not one shared: a body can only be read once, so a mutant
+    // that drops the single flight would fail on "Body has already been read" rather than on
+    // the count below, which is the thing actually being asserted.
+    vi.mocked(fetch).mockImplementation(() => Promise.resolve(Response.json(PAIR)));
 
     const [a, b, c] = await Promise.all([
       session.getAccessToken(),
@@ -230,5 +234,19 @@ describe('the launch check', () => {
 
     storage.readRefreshToken.mockResolvedValue('refresh-alice');
     expect(await session.hasStoredSession()).toBe(true);
+  });
+
+  it('does not count the blank a failed sign-out leaves behind', async () => {
+    const session = await freshSession();
+
+    storage.readRefreshToken.mockResolvedValue('');
+
+    /*
+     * `discardStoredToken` writes `''` when the Keychain refuses the delete, and this check ran
+     * on `!== null`, so it reported a session. `AuthProvider` maps that to `signedIn`, and this
+     * Work Order newly gates every protected query on that status — so a sign-out that could not
+     * reach the Keychain came back as a screenful of 401s issued on behalf of nobody.
+     */
+    expect(await session.hasStoredSession()).toBe(false);
   });
 });

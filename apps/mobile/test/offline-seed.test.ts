@@ -69,11 +69,16 @@ const APP_DEFAULTS = {
   retryDelay: (attempt: number) => 30 * 2 ** attempt,
 };
 
-/** `app/trails/[slug].tsx`: what the screen puts on the display. */
+/**
+ * `app/trails/[slug].tsx` transcribed: `trail` is `query.data`, and the screen asks `!trail` —
+ * falsiness, not `=== undefined`, which is where this helper used to disagree with it about a
+ * stored `null`. A transcription is only as good as its last read of the screen, so
+ * `conventions.test.ts` reads the real predicate — and the other nine — off disk.
+ */
 function screenOf(observer: QueryObserver): 'the trail' | 'spinner' | 'Trail not found' {
   const result = observer.getCurrentResult();
   if (result.isPending) return 'spinner';
-  return result.data === undefined ? 'Trail not found' : 'the trail';
+  return result.data ? 'the trail' : 'Trail not found';
 }
 
 describe('the phone’s copy, seeded into the cache', () => {
