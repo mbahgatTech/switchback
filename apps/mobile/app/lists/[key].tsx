@@ -61,7 +61,7 @@ export default function ListScreen() {
     );
   }
 
-  if (list.isError || !list.data) {
+  if (!list.data) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.name}>Could not open that list</Text>

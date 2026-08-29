@@ -35,7 +35,14 @@ function readGeneration(): number {
   return generation;
 }
 
-function watchGeneration(watcher: () => void): () => void {
+/**
+ * Subscribe to identity changes the way `useCacheGeneration` does.
+ *
+ * Exported for the same reason `seedFromDisk` is: the notification is the load-bearing half of
+ * the re-seed, and a counter that can only be *read* lets a test pass while nothing is ever
+ * told. `useSyncExternalStore` is this function; a test that calls it exercises the real path.
+ */
+export function watchGeneration(watcher: () => void): () => void {
   watchers.add(watcher);
   return () => watchers.delete(watcher);
 }
@@ -59,21 +66,28 @@ export function useCacheGeneration(): number {
  * rather than "one refetch" — a reset takes the phone's downloaded trails out of the cache with
  * it, and offline there is no refetch to be had, which is exactly what the generation is for.
  *
- * The announced state is compared with the last one acted on, because a repeat is reachable: a
- * 401 signs the device out locally, and the reader then presses Sign out on a screen that never
- * noticed. Acting twice would reset a cache that is already right and cost every mounted screen
- * a second round trip. `null` to begin with, because a process that has heard no announcement
- * cannot assume it knows which reader the cache belongs to.
+ * **Only a repeated sign-*out* is skipped.** The repeat this guard exists for is one-directional:
+ * a 401 signs the device out locally, and the reader then presses Sign out on a screen that
+ * never noticed. Acting twice there would reset a cache that is already right and cost every
+ * mounted screen a second round trip.
+ *
+ * A repeated sign-*in* is the opposite, and treating it as a duplicate was a hole in this file.
+ * `announce(true)` is fired by `adopt`, which runs only when a fresh token pair has been
+ * installed — so a second one means a *different reader*, not the same one twice. It is
+ * reachable: `app/signin.tsx`'s cold-start effect gates `resumeSignIn` on a ref and not on
+ * `status`, so an exchange can complete while a session is already live. Swallowing that left
+ * the previous reader's answers in the cache under the new reader's requests — one person's
+ * record shown to another, which is the whole harm this module exists to prevent.
  */
 export function forgetAnswersOnIdentityChange(
   queryClient: Pick<QueryClient, 'resetQueries'>,
   subscribe: (listener: Listener) => () => void,
 ): () => void {
-  let actedOn: boolean | null = null;
+  let signedOutAlready = false;
 
   return subscribe((signedIn) => {
-    if (actedOn === signedIn) return;
-    actedOn = signedIn;
+    if (!signedIn && signedOutAlready) return;
+    signedOutAlready = !signedIn;
 
     void forgetEverything(queryClient);
     generation += 1;

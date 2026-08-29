@@ -81,7 +81,7 @@ export default function SettingsScreen() {
     );
   }
 
-  if (me.isError || !me.data) {
+  if (!me.data) {
     return (
       <Chrome insets={insets}>
         <View style={styles.head}>
@@ -442,8 +442,13 @@ function Home({ me }: { me: SelfProfile }) {
  */
 function Devices() {
   const trpc = useTRPC();
-  const { signOut } = useAuth();
-  const devices = useQuery(trpc.me.devices.queryOptions());
+  const { signOut, status } = useAuth();
+  // Account-scoped, so it waits for a reader. The screen above gates its own `me.get` the same
+  // way; an ungated one here fires as nobody through the reset that follows a sign-out.
+  const devices = useQuery({
+    ...trpc.me.devices.queryOptions(),
+    enabled: status === 'signedIn',
+  });
   const [confirming, setConfirming] = useState(false);
 
   const revoke = useMutation(

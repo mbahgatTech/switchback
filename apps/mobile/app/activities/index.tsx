@@ -86,7 +86,7 @@ export default function ActivitiesScreen() {
     );
   }
 
-  if (list.isError) {
+  if (list.isLoadingError) {
     return (
       <Chrome insets={insets}>
         <Text style={styles.title}>Could not load your hikes</Text>

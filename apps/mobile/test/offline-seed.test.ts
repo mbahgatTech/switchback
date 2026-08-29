@@ -12,6 +12,17 @@ import type { OfflineTrail } from '../src/offline/store';
  *
  * That is not hypothetical: it is on the path this Work Order fixes. Open a downloaded trail,
  * press Save, sign in, and the sign-in screen pops back to the still-mounted trail screen.
+ *
+ * **These cases assert what a subscribed observer serves, and what the trail screen's own
+ * predicate makes of it — never `getQueryData`.** A screen draws from an observer, and the first
+ * version of this file asked the cache instead and so passed while the screen was broken.
+ *
+ * **They also do not model React's scheduling, deliberately.** An earlier version re-seeded
+ * inline in the announcement loop, which is not what ships: production goes
+ * `useSyncExternalStore` → re-render → `useEffect`, strictly later. Rather than approximate that
+ * timing — a test that guesses scheduling cannot police a scheduling bug — the re-seed below is
+ * delivered on a timer, arbitrarily *late*. That is a weaker assumption than React's, so a
+ * property that survives it survives any real schedule.
  */
 
 const KEYS: TrailKeys = {
@@ -47,6 +58,24 @@ function announcer() {
   };
 }
 
+/**
+ * `apps/mobile/src/api/trpc.tsx`, with the backoff compressed but its *shape* kept: the retries
+ * must still outlast the re-seed, because that ordering is the whole defect. In production the
+ * effect re-seeds within a frame and `retry: 2` on real backoff fails seconds later.
+ */
+const APP_DEFAULTS = {
+  staleTime: 60_000,
+  retry: 2,
+  retryDelay: (attempt: number) => 30 * 2 ** attempt,
+};
+
+/** `app/trails/[slug].tsx`: what the screen puts on the display. */
+function screenOf(observer: QueryObserver): 'the trail' | 'spinner' | 'Trail not found' {
+  const result = observer.getCurrentResult();
+  if (result.isPending) return 'spinner';
+  return result.data === undefined ? 'Trail not found' : 'the trail';
+}
+
 describe('the phone’s copy, seeded into the cache', () => {
   it('is what the trail screen reads when there is no network answer', () => {
     const client = new QueryClient();
@@ -77,11 +106,17 @@ describe('the phone’s copy, seeded into the cache', () => {
     expect(page?.pages[0]?.reviews[0]?.isMine).toBe(false);
   });
 
-  it('survives the sign-in that empties the cache underneath it', async () => {
+  it('is still on the screen after a sign-in whose refetch fails in a valley', async () => {
+    let attempts = 0;
     const client = new QueryClient({
       defaultOptions: {
-        // A valley: the refetch a reset kicks off cannot land.
-        queries: { queryFn: () => Promise.reject(new Error('offline')), retry: false },
+        queries: {
+          ...APP_DEFAULTS,
+          queryFn: () => {
+            attempts += 1;
+            return Promise.reject(new Error('offline'));
+          },
+        },
       },
     });
     const copy = storedCopy();
@@ -89,15 +124,47 @@ describe('the phone’s copy, seeded into the cache', () => {
 
     const screen = new QueryObserver(client, { queryKey: KEYS.detail });
     const unsubscribe = screen.subscribe(() => undefined);
+    expect(screenOf(screen)).toBe('the trail');
 
     const bus = announcer();
-    // What the trail screen's effect does when the generation moves.
     forgetAnswersOnIdentityChange(client, bus.subscribe);
-    bus.subscribe(() => seedFromDisk(client, KEYS, copy));
+    // Late on purpose — see the header. React's effect would land sooner than this.
+    bus.subscribe(() => setTimeout(() => seedFromDisk(client, KEYS, copy), 5));
     bus.announce(true);
 
-    await Promise.resolve();
-    expect(client.getQueryData(KEYS.detail)).toMatchObject({ name: 'Vesper Peak' });
+    // Long enough for the forced refetch to exhaust `retry: 2`, which is when the old code
+    // flipped the screen to "Trail not found" — seconds after it had drawn the trail.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    expect(attempts, 'the reset really did force a refetch').toBeGreaterThan(1);
+    expect(screen.getCurrentResult().isError, 'and it really did fail').toBe(true);
+    expect(screenOf(screen)).toBe('the trail');
+
+    unsubscribe();
+  });
+
+  it('pins the query-core behaviour the screen now depends on', async () => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, queryFn: () => Promise.reject(new Error('offline')) },
+      },
+    });
+    client.setQueryData(KEYS.detail, { name: 'Vesper Peak' });
+    const screen = new QueryObserver(client, { queryKey: KEYS.detail });
+    const unsubscribe = screen.subscribe(() => undefined);
+
+    await client.refetchQueries({ type: 'active' });
+
+    /*
+     * The belief this Work Order shipped on was that a failed refetch leaves `status: 'success'`.
+     * It does not. It goes to `error` and keeps `data` — which is why a screen must branch on
+     * the data and not on the flag. If a future upgrade changes either half, this fails and the
+     * rule in `offline/hydrate.ts` needs rereading.
+     */
+    expect(screen.getCurrentResult().status).toBe('error');
+    expect(screen.getCurrentResult().data).toMatchObject({ name: 'Vesper Peak' });
+    expect(screen.getCurrentResult().isLoadingError).toBe(false);
+
     unsubscribe();
   });
 });

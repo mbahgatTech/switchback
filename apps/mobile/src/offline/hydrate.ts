@@ -18,10 +18,15 @@ import type { OfflineTrail } from '@/offline/store';
  * procedures and the same arguments the screens use, so writing it under the same keys
  * makes every one of them render from the phone without knowing anything has changed.
  *
- * It also buys the right behaviour when a fetch fails. React Query keeps `status: 'success'`
- * on a query that has data and a failed refetch, so a trail opened in a valley shows the
- * saved copy with a note saying so — rather than the "Trail not found" a bare error would
- * put under the name of a trail the phone is holding in full.
+ * It also buys the right behaviour when a fetch fails — but not on its own, and the earlier
+ * version of this note had the mechanism backwards. It claimed query-core keeps
+ * `status: 'success'` on a query that has data and a failed refetch. Measured on 5.101.4 it
+ * does not: the reducer sets `status: 'error'` unconditionally and *retains* `data`. A screen
+ * that branches on the error flag therefore puts "Trail not found" over a trail the phone is
+ * holding in full — which is what shipped, and what `app/trails/[slug].tsx` now avoids by
+ * asking whether it has data rather than whether the last fetch failed.
+ *
+ * So the rule for anything rendering a seeded key: **branch on data, never on `isError`.**
  *
  * **A seed is not a fetch, so it has to be laid again.** `api/identity.ts` empties the cache on
  * every change of signed-in identity, which destroys these entries; an active query refetches

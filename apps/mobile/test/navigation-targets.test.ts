@@ -59,21 +59,24 @@ function resolves(target: string): boolean {
  * What is genuinely beyond a source-level rule is a target assembled from a variable. Nothing
  * here does that today, and a gate cannot follow it if something starts.
  */
-const DESTINATIONS = [
-  /router\.(?:push|replace|navigate)\(\s*'(\/[^']*)'/gu,
-  /pathname:\s*'(\/[^']*)'/gu,
-  /href:\s*'(\/[^']*)'/gu,
-  /href=\{?'(\/[^']*)'/gu,
+const DESTINATIONS: { spelling: Spelling; pattern: RegExp }[] = [
+  { spelling: 'call', pattern: /router\.(?:push|replace|navigate)\(\s*'(\/[^']*)'/gu },
+  { spelling: 'pathname', pattern: /pathname:\s*'(\/[^']*)'/gu },
+  { spelling: 'href', pattern: /href:\s*'(\/[^']*)'/gu },
+  { spelling: 'href', pattern: /href=\{?'(\/[^']*)'/gu },
 ];
 
-function destinations(): { where: string; target: string }[] {
-  const found: { where: string; target: string }[] = [];
+type Spelling = 'call' | 'pathname' | 'href';
+const SPELLINGS: Spelling[] = ['call', 'pathname', 'href'];
+
+function destinations(): { where: string; target: string; spelling: Spelling }[] {
+  const found: { where: string; target: string; spelling: Spelling }[] = [];
   for (const [file, source] of appSources()) {
     source.split('\n').forEach((line, index) => {
-      for (const pattern of DESTINATIONS) {
+      for (const { spelling, pattern } of DESTINATIONS) {
         for (const match of line.matchAll(pattern)) {
           const target = match[1];
-          if (target) found.push({ where: `${file}:${index + 1}`, target });
+          if (target) found.push({ where: `${file}:${index + 1}`, target, spelling });
         }
       }
     });
@@ -99,16 +102,18 @@ describe('the routes this app has', () => {
 
 describe('every destination in the app', () => {
   /*
-   * A floor per spelling, not one across all of them. A single total passes with the short form
-   * alone, which is the hole the first version of this file shipped with: 37 matched, 9 missed,
-   * and every dynamic route among the missing.
+   * A floor per spelling, and it has to be per spelling to mean anything: `/you` and `/saved`
+   * are written in more than one of them, so a single total plus a list of expected targets
+   * stays green with a whole pattern deleted. That is the hole the first version of this file
+   * shipped with — 37 matched, 9 missed, every dynamic route among the missing — and asserting
+   * the total again would have reintroduced it in the file that fixed it.
    */
-  it('is scanned in all three spellings it is written in', () => {
+  it.each(SPELLINGS)('is scanned where it is written as %s', (spelling) => {
+    expect(FOUND.filter((found) => found.spelling === spelling)).not.toEqual([]);
+  });
+
+  it('includes the dynamic routes, which only the object form reaches', () => {
     expect(FOUND.filter(({ target }) => target.includes('['))).not.toEqual([]);
-    expect(FOUND.length).toBeGreaterThan(20);
-    expect(FOUND.map(({ target }) => target)).toEqual(
-      expect.arrayContaining(['/you', '/trails/[slug]', '/saved']),
-    );
   });
 
   it('names a route this app can go to', () => {

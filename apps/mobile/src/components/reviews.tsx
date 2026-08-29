@@ -86,7 +86,7 @@ export function Reviews({ trailId }: { trailId: string }) {
 
       {list.isPending ? (
         <Text style={styles.absent}>Reading the reports…</Text>
-      ) : list.isError ? (
+      ) : list.isLoadingError ? (
         <Text style={styles.absent}>
           The reports could not be loaded. Everything else on this screen is unaffected.
         </Text>

@@ -86,3 +86,61 @@ it('empties the query cache before it tells anybody the reader changed', () => {
   expect(auth, 'AuthProvider is the outer of the two').toBeGreaterThanOrEqual(0);
   expect(api, 'ApiProvider subscribes first, so it must be the inner').toBeGreaterThan(auth);
 });
+
+/*
+ * The three rules below are *structural*, and that is a compromise worth naming. Each pins a
+ * property that belongs in a behavioural test, but `useOfflineHydration` and `useCacheGeneration`
+ * are hooks, `vitest.config.ts` sets `environment: 'node'`, and this workspace has no
+ * `react-test-renderer` or `@testing-library/react-native`. Reading the source is what is
+ * available today. Each was written by making the mutation it describes and watching it fail.
+ */
+
+it('re-lays the phone’s copy when the cache generation moves', () => {
+  /*
+   * The dependency IS the fix. `hydrate.ts` seeds with `setQueryData`, which no refetch
+   * restores, and every other dependency it has is referentially stable — so without
+   * `generation` in this array the effect never re-runs, the seed stays destroyed for the life
+   * of the mounted screen, and a downloaded trail reads "Trail not found" in a valley.
+   */
+  const hydrate = readFileSync(
+    fileURLToPath(new URL('../src/offline/hydrate.ts', import.meta.url)),
+    'utf8',
+  );
+  const deps = /\}, \[([^\]]*)\]\);/u.exec(hydrate)?.[1] ?? '';
+
+  expect(hydrate).toContain('useCacheGeneration()');
+  expect(deps, 'the effect cannot re-seed on a change it does not depend on').toContain(
+    'generation',
+  );
+});
+
+it('announces an identity change even when the Keychain refuses', () => {
+  /*
+   * `announce` is the only thing that empties the query cache, so it cannot sit behind an
+   * `await` that may throw: in `adopt` the new reader's token is already installed by then, and
+   * skipping the announcement would leave the previous reader's answers under their requests.
+   */
+  const session = readFileSync(
+    fileURLToPath(new URL('../src/auth/session.ts', import.meta.url)),
+    'utf8',
+  );
+  const finallyAnnounces = session.match(/\}\s*finally\s*\{\s*announce\(/gu) ?? [];
+
+  expect(
+    finallyAnnounces,
+    'adopt and signOutLocally must both announce from a finally',
+  ).toHaveLength(2);
+});
+
+it('asks for the reader’s own record only while there is a reader', () => {
+  /*
+   * `me.*` is account-scoped, so an ungated one fires as nobody the moment a screen mounts
+   * signed out, and 401s. Screens gate it with `enabled`; a new call site that forgets is the
+   * defect this catches — `app/lists/[key].tsx` shipped that way.
+   */
+  const ungated = FILES.filter(([, source]) =>
+    /useQuery\(\s*trpc\.me\.[a-zA-Z]+\.queryOptions\(\)\s*\)/u.test(source),
+  ).map(([file]) => file);
+
+  expect(ungated, 'a me.* query needs an `enabled` gate').toEqual([]);
+});

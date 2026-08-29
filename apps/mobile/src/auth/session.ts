@@ -24,6 +24,17 @@ let accessToken: string | null = null;
 let accessExpiresAt = 0;
 let inFlight: Promise<string | null> | null = null;
 
+/**
+ * Set the moment a sign-out is decided, and cleared only by a new sign-in.
+ *
+ * Clearing the Keychain can fail, and the reset this device now performs on every announcement
+ * refetches immediately — so without this the first thing after "Sign out" is `rotate()` finding
+ * the token that survived, minting a fresh pair and silently signing the reader back in while
+ * the interface says they are out. The decision is not the delete; the delete is how the
+ * decision is *persisted*.
+ */
+let signedOut = false;
+
 /** Told on every transition, in both directions. Exported so a subscriber need not retype it. */
 export type Listener = (signedIn: boolean) => void;
 const listeners = new Set<Listener>();
@@ -57,6 +68,7 @@ function forget(): void {
  */
 export async function adopt(pair: TokenPair): Promise<void> {
   remember(pair);
+  signedOut = false;
   try {
     await writeRefreshToken(pair.refreshToken);
   } finally {
@@ -65,6 +77,9 @@ export async function adopt(pair: TokenPair): Promise<void> {
 }
 
 async function rotate(): Promise<string | null> {
+  // A token that outlived a failed sign-out is still on disk. It is not a licence to come back.
+  if (signedOut) return null;
+
   const refreshToken = await readRefreshToken();
   if (!refreshToken) return null;
 
@@ -104,11 +119,28 @@ export async function getAccessToken(): Promise<string | null> {
   return inFlight;
 }
 
+/**
+ * Give up the stored credential, and make sure it cannot be honoured if the delete fails.
+ *
+ * An empty string is the fallback rather than a second delete: every reader of this value
+ * already treats a falsy result as "not signed in", so overwriting neutralises the credential
+ * even across a relaunch, where the in-memory `signedOut` guard no longer exists.
+ */
+async function discardStoredToken(): Promise<void> {
+  try {
+    await clearRefreshToken();
+  } catch (error) {
+    await writeRefreshToken('').catch(() => undefined);
+    throw error;
+  }
+}
+
 /** Forget the credentials on this device without telling the server. `finally` as in `adopt`. */
 async function signOutLocally(): Promise<void> {
   forget();
+  signedOut = true;
   try {
-    await clearRefreshToken();
+    await discardStoredToken();
   } finally {
     announce(false);
   }
