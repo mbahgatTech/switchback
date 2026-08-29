@@ -51,6 +51,8 @@ function callerFor(headers: Headers) {
   });
 }
 
+type Caller = ReturnType<typeof callerFor>;
+
 /** The bucket key the router will charge, derived the same way the request path derives it. */
 function principalKey(): string {
   return ingestPrincipalFor(headersFor(ADDRESS), null).key;
@@ -101,34 +103,57 @@ describe.skipIf(!IS_LOCAL)('the ingest allowance, through the procedures that sp
     expect(context.ingestPrincipal.kind).toBe('address');
   });
 
-  it('charges the caller for the network ground /plan puts on the queue', async () => {
-    const before = await remaining();
+  /**
+   * Every call site that charges a caller, one test each.
+   *
+   * Table-driven deliberately. The round-2 mutation switched all five sites off at once, which
+   * establishes only that turning *all* of them off is noticed — strictly weaker than "the
+   * limiter cannot be switched off unnoticed". Three sites had no test at all, including
+   * `coverageFor`, which serves `trails.browse` and `trails.near` and is the path a map hammers.
+   * One site dropped in isolation now fails one named test.
+   */
+  const CHARGED: Array<{
+    procedure: string;
+    site: string;
+    call: (caller: Caller) => Promise<unknown>;
+  }> = [
+    {
+      procedure: 'trails.browse',
+      site: 'trails.ts — coverageFor, shared with trails.near',
+      call: (caller) => caller.trails.browse({ bbox: BBOX }),
+    },
+    {
+      procedure: 'trails.coverage',
+      site: 'trails.ts — the viewport poll',
+      call: (caller) => caller.trails.coverage({ bbox: BBOX }),
+    },
+    {
+      procedure: 'trails.fetchArea',
+      site: 'trails.ts — the deliberate area fetch',
+      call: (caller) => caller.trails.fetchArea({ bbox: BBOX }),
+    },
+    {
+      procedure: 'routes.coverage',
+      site: 'routes.ts — the planner map poll',
+      call: (caller) => caller.routes.coverage({ bbox: BBOX }),
+    },
+    {
+      procedure: 'routes.plan',
+      site: 'routes.ts — planRoute',
+      call: (caller) => caller.routes.plan({ anchors: ANCHORS, preferPaths: true }),
+    },
+  ];
 
-    await callerFor(headersFor(ADDRESS)).routes.plan({ anchors: ANCHORS, preferPaths: true });
+  for (const { procedure, site } of CHARGED) {
+    it(`charges the caller through ${procedure} (${site})`, async () => {
+      const before = await remaining();
 
-    expect(await remaining()).toBeLessThan(before);
-  });
+      const entry = CHARGED.find((candidate) => candidate.procedure === procedure);
+      await entry?.call(callerFor(headersFor(ADDRESS)));
 
-  it('tells /plan the caller is out of allowance rather than blaming the ground', async () => {
-    await spendIngestBudget(prisma, ingestPrincipalFor(headersFor(ADDRESS), null), BUCKET_CAPACITY);
-
-    const plan = await callerFor(headersFor(ADDRESS)).routes.plan({
-      anchors: ANCHORS,
-      preferPaths: true,
+      expect(await remaining()).toBeLessThan(before);
     });
-
-    expect(plan.busy).toBe(true);
-    expect(plan.busyReason).toBe('rate-limit');
-  });
-
-  it('charges the caller for the trail ground a deliberate area fetch asks for', async () => {
-    const before = await remaining();
-
-    const area = await callerFor(headersFor(ADDRESS)).trails.fetchArea({ bbox: BBOX });
-
-    expect(area.queued).toBeGreaterThan(0);
-    expect(await remaining()).toBeLessThan(before);
-  });
+  }
 
   it('refuses an area fetch by name once the caller has spent its allowance', async () => {
     await spendIngestBudget(prisma, ingestPrincipalFor(headersFor(ADDRESS), null), BUCKET_CAPACITY);

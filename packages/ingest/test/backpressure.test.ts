@@ -360,7 +360,7 @@ describe('what the reader is told', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH });
 
-    const coverage = await ensureCoverage(ONE_TILE, { db });
+    const coverage = await ensureCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(true);
     expect(coverage.queued).toEqual([]);
@@ -373,7 +373,7 @@ describe('what the reader is told', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH, inFlight: [ONE_TILE_KEY] });
 
-    const coverage = await ensureCoverage(ONE_TILE, { db });
+    const coverage = await ensureCoverage(ONE_TILE, { principal: null, db });
 
     // The one tile this bbox covers is already queued, so there is no new ground to refuse.
     expect(coverage.busy).toBe(false);
@@ -385,7 +385,7 @@ describe('what the reader is told', () => {
     // background refresh's priority when somebody starts looking at it.
     const { db, recorded } = fakeDb({ inFlight: [ONE_TILE_KEY] });
 
-    const coverage = await ensureCoverage(ONE_TILE, { db });
+    const coverage = await ensureCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(false);
     expect(coverage.queued).toEqual([ONE_TILE_KEY]);
@@ -398,7 +398,7 @@ describe('what the reader is told', () => {
     process.env.DATABASE_SIZE_LIMIT_BYTES = String(LIMIT);
     const { db } = fakeDb({ databaseBytes: Math.ceil(LIMIT * 0.95) });
 
-    const coverage = await ensureCoverage(ONE_TILE, { db });
+    const coverage = await ensureCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(true);
     expect(coverage.busyReason).toBe('storage');
@@ -408,7 +408,7 @@ describe('what the reader is told', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH });
 
-    const coverage = await ensureNetworkCoverage(ONE_TILE, { db });
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(true);
     // Unlike the trail side, `pending` stays: the planner uses it as the only tiebreaker
@@ -423,7 +423,7 @@ describe('what the reader is told', () => {
       networkInFlight: ROUTING_KEYS,
     });
 
-    const coverage = await ensureNetworkCoverage(ONE_TILE, { db });
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(false);
     expect(coverage.busyReason).toBeNull();
@@ -440,7 +440,7 @@ describe('what the reader is told', () => {
       networkInFlight: [ROUTING_KEYS[0]!],
     });
 
-    const coverage = await ensureNetworkCoverage(ONE_TILE, { db });
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { principal: null, db });
 
     expect(coverage.busy).toBe(true);
     expect(coverage.busyReason).toBe('queue-depth');
@@ -451,7 +451,7 @@ describe('what the reader is told', () => {
   it('is not busy when there was simply nothing to do', async () => {
     const { db } = fakeDb();
     // A survey-only call queues nothing by request, which must not read as a refusal.
-    const coverage = await ensureNetworkCoverage(ONE_TILE, { db, queue: false });
+    const coverage = await ensureNetworkCoverage(ONE_TILE, { principal: null, db, queue: false });
 
     expect(coverage.busy).toBe(false);
   });

@@ -67,10 +67,12 @@ export interface CoverageOptions {
   /** Set false for a background sweep that should not jump the queue ahead of live viewports. */
   urgent?: boolean;
   /**
-   * Who to charge new ground to. Null — the default — is for callers with no requester behind
-   * them, such as a cron or a script, and leaves only the product-wide ceilings applying.
+   * Who to charge new ground to. Required, with `null` the explicit way to say "no requester
+   * behind this" — a cron or a script. An abuse control that a forgotten option switches off is
+   * one whose bypass is a forgotten option, so the omission is not spelled the same as the
+   * decision.
    */
-  principal?: IngestPrincipal | null;
+  principal: IngestPrincipal | null;
 }
 
 /**
@@ -80,7 +82,7 @@ export interface CoverageOptions {
  */
 export async function ensureCoverage(
   bbox: BBox,
-  options: CoverageOptions = {},
+  options: CoverageOptions,
 ): Promise<CoverageResult> {
   const db = options.db ?? prisma;
   const now = options.now ?? new Date();
@@ -183,7 +185,7 @@ export async function ensureCoverage(
   const enqueued = await queueTiles(db, needsWork, {
     urgent: options.urgent ?? true,
     newGround,
-    principal: options.principal ?? null,
+    principal: options.principal,
     now,
   });
   const queued = enqueued.queued;
@@ -409,7 +411,7 @@ export interface AreaRequest extends AreaCoverage {
  * Queue every outstanding tile in an area, because somebody asked for it. Pressing twice is
  * free: fresh tiles are skipped and the rest dedupe onto the first press's jobs.
  */
-export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promise<AreaRequest> {
+export async function requestArea(bbox: BBox, options: AreaOptions): Promise<AreaRequest> {
   const db = options.db ?? prisma;
   const area = await surveyArea(bbox, options);
 
@@ -425,7 +427,7 @@ export async function requestArea(bbox: BBox, options: AreaOptions = {}): Promis
   const { queued, refused } = await queueTiles(db, area.outstanding, {
     priority: AREA_PRIORITY,
     newGround: area.outstanding.filter((quadkey) => !working.has(quadkey)),
-    principal: options.principal ?? null,
+    principal: options.principal,
     now: options.now,
   });
   if (queued.length === 0) return { ...area, queued: [], busy: true, busyReason: refused };

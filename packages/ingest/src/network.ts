@@ -518,8 +518,8 @@ export interface NetworkCoverageOptions {
   maxTiles?: number;
   /** Set false to survey without queueing — the read half, for a "what do we hold" probe. */
   queue?: boolean;
-  /** Who to charge new ground to. Null leaves only the product-wide ceilings applying. */
-  principal?: IngestPrincipal | null;
+  /** Who to charge new ground to. Required; `null` says "no requester behind this". */
+  principal: IngestPrincipal | null;
 }
 
 /**
@@ -529,7 +529,7 @@ export interface NetworkCoverageOptions {
  */
 export async function ensureNetworkCoverage(
   bbox: BBox,
-  options: NetworkCoverageOptions = {},
+  options: NetworkCoverageOptions,
 ): Promise<NetworkCoverage> {
   const db = options.db ?? prisma;
   const now = options.now ?? new Date();
@@ -596,7 +596,7 @@ export async function ensureNetworkCoverage(
       ? { queued: [] as string[], refused: null }
       : await queueNetworkTiles(db, needsWork, {
           newGround,
-          principal: options.principal ?? null,
+          principal: options.principal,
           now,
         });
   const queued = enqueued.queued;
