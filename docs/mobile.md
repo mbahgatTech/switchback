@@ -122,8 +122,10 @@ The capability is a build-time declaration, not a runtime request. `app.config.t
 `isIosBackgroundLocationEnabled` on the `expo-location` plugin, which is what puts `location`
 into `UIBackgroundModes`. Without that key `startLocationUpdatesAsync` throws
 `LocationUpdatesUnavailable` — and that throw is exactly how the app tells the two hosts apart.
-There is no `Constants` check anywhere, because there is nothing to check: a development build
-and Expo Go report the same execution environment, and only the `Info.plist` differs.
+The probe is the attempt rather than a `Constants` check, because there is nothing there to
+check: a development build and Expo Go report the same execution environment, and only the
+`Info.plist` differs. (`src/config.ts` does read `Constants.expoGoConfig`, for the Metro host the
+API origin is derived from — a different question with a different answer.)
 
 | Host                               | What it does                                                                                                                                                                                      |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -173,12 +175,17 @@ A journal is a per-second location history. Three rules follow, and each is enfo
   ordinary event on a mountain and losing a hike to it would teach people not to sign out.
 - **Nothing outlives its format.** `recording-v1.json`, written by builds before this, is deleted
   at launch rather than ignored.
-- **Nothing outlives the hike.** The directory is cleared on finish, on discard, and on an
-  identity that does not own it.
+- **Nothing outlives the hike by more than a day.** The directory is cleared on finish, on
+  discard, and on an identity that does not own it — and a journal whose hike began more than
+  48 hours ago is erased at the next launch, whether or not it was ever finished. That horizon is
+  `trackFixSchema`'s own: `t` is capped at 48 hours, so past it no further fix could legally join
+  the track and the journal is only a trace. A hike sealed by a sign-out is inside the same
+  horizon, so it is kept for the person who made it and erased once it is stale, not held forever.
 
 `Documents/` rather than `Caches/` because iOS empties Caches under storage pressure and this is
 the one file a recording cannot lose — the cost is that a track rides into iCloud backups, which
-is why nothing is kept beyond the hike in progress. At rest the file takes the app's default
+is why the horizon above exists and is the only control standing between an all-day trace and a
+backup. Backup exclusion is not reachable from this stack's file API, and is not claimed. At rest the file takes the app's default
 protection class, unlocked after first authentication: `NSFileProtectionComplete` would make the
 writes fail while the phone is locked in a pocket, which is exactly when they matter.
 

@@ -84,8 +84,9 @@ const config: ExpoConfig = {
      * how `@/record/background` detects a host that cannot carry a hike.
      *
      * `locationAlwaysPermission: false` deletes `NSLocationAlwaysUsageDescription`. The plugin
-     * would otherwise write its own placeholder prose into it, and the key it replaced in iOS 11
-     * — `NSLocationAlwaysAndWhenInUseUsageDescription`, set above — is the one iOS 15 shows.
+     * would otherwise write its own placeholder prose into it. It is the older of the two:
+     * `NSLocationAlwaysAndWhenInUseUsageDescription`, set above, replaced it in iOS 11 and is the
+     * one iOS 15 shows.
      * The three strings this app does define are left alone: the plugin only fills a key that
      * has no value yet.
      */

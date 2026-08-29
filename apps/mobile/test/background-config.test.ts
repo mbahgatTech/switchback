@@ -47,16 +47,38 @@ describe('the iOS capability a recording needs to outlive the lock screen', () =
   });
 });
 
-/** Every recorder source file, as `[repo-relative path, contents]`. */
+/** Every recorder source file, at any depth, as `[repo-relative path, contents]`. */
 function recorderSources(): [string, string][] {
-  const dir = path.join(mobileRoot, 'src', 'record');
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && /\.tsx?$/.test(entry.name))
-    .map((entry) => [
-      path.join('src', 'record', entry.name),
-      readFileSync(path.join(dir, entry.name), 'utf8'),
-    ]);
+  const root = path.join(mobileRoot, 'src', 'record');
+  const out: [string, string][] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      // Recursive: this directory grew from three files to six during the change these rules
+      // guard, and a non-recursive walk would let a subdirectory empty the gate in silence.
+      if (entry.isDirectory()) walk(full);
+      else if (/\.tsx?$/.test(entry.name)) {
+        out.push([path.relative(mobileRoot, full), readFileSync(full, 'utf8')]);
+      }
+    }
+  };
+  walk(root);
+  return out;
 }
+
+describe('the scan that the rules below depend on', () => {
+  /*
+   * A gate that reads nothing passes everything. Both rules under it assert an empty list, so a
+   * walk that found no files would report a clean recorder while reading none of it. The floor is
+   * not a target — it only has to be high enough that an empty or moved tree cannot clear it.
+   */
+  it('reads the recorder', () => {
+    const files = recorderSources().map(([file]) => file);
+    expect(files.length).toBeGreaterThanOrEqual(5);
+    expect(files).toContain(path.join('src', 'record', 'store.ts'));
+    expect(files).toContain(path.join('src', 'record', 'background.ts'));
+  });
+});
 
 describe('nothing in the recorder reacts to the app going away', () => {
   /*

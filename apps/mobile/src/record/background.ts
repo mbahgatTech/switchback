@@ -59,9 +59,13 @@ type LocationTaskBody = { locations: Location.LocationObject[] };
 
 /**
  * `expo-location`'s iOS module raises this from `startLocationUpdatesAsync` when the host's
- * `Info.plist` carries no `location` in `UIBackgroundModes` — Expo Go, and nothing else we ship.
- * Matching the text rather than catching everything is what keeps "location services are off
- * system-wide" from being reported to the user as "this build cannot record in the background".
+ * `Info.plist` carries no `location` in `UIBackgroundModes`. Matching the text rather than
+ * catching everything is what keeps "location services are off system-wide" out of the fall-back
+ * path.
+ *
+ * It cannot be narrowed further: `LocationModule.swift` throws the same exception with the same
+ * message when significant-change monitoring is unavailable — an MDM-restricted device, say. So
+ * the prose the user sees says what will happen, never why, and never blames the build.
  */
 const UNSUPPORTED_SIGNATURE = /UIBackgroundModes|Background location has not been configured/i;
 

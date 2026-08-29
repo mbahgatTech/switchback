@@ -93,28 +93,28 @@ rules. v1's **D3 and D5 were marked MET on `record-journal.test.ts`, which never
 marked MET on a source-spelling assertion that B4 walked straight past.** Neither predicate is
 carried forward as met; both are re-verified below against the module under test.
 
-| id  | predicate                                                                                                           | verification                                                                                                                      |
-| --- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| E1  | A batch of `k` readings delivered in one task execution yields `k` fixes, stamped from each reading's own timestamp | `record-store.test.ts` — batch of 8 across 8 seconds produces 8 fixes with `t` 0..7                                               |
-| E2  | The live position reflects the newest reading in a batch, never the oldest                                          | `record-store.test.ts` — snapshot `position` equals the last reading's coordinates after a batch                                  |
-| E3  | The head is never observed partially written: it is staged and renamed into place                                   | `record-store.test.ts` — the journal store records `stage` then `commit`, never a direct write to the live head                   |
-| E4  | Stats are accumulated incrementally and agree exactly with `summariseTrack`                                         | `packages/geo/test/track.test.ts` — fold equals `summariseTrack` over 500 randomised ascending-`t` tracks                         |
-| E5  | Per-fix cost does not grow with the length of the hike                                                              | `packages/geo/test/track.test.ts` — 20k-fix fold completes within a fixed budget; no `summariseTrack` call in `pushFix`           |
-| E6  | Every recorder state maps to a distinct, true sentence, and the mapping is exhaustive over the union                | `record-store.test.ts` — every `(phase, tracking)` pair the store can produce yields a note, none claiming recording while paused |
-| E7  | A CoreLocation failure reaches the user rather than being swallowed                                                 | `record-background.test.ts` + `record-store.test.ts` — task error sets `geoError`                                                 |
-| E8  | An unsupported host is distinguished from every other start failure                                                 | `record-background.test.ts` — the unavailable code falls back; any other error is reported                                        |
-| E9  | "Always" is asked for only after the capability probe succeeds                                                      | `record-background.test.ts` — no permission request when the start throws                                                         |
-| E10 | `mayNotSurviveTermination` is read from the OS, not from a module variable, on every restore path                   | `record-store.test.ts` — restored session with Always granted reports `false`                                                     |
-| E11 | An upload that resolves after a new hike began cannot write its `sent` into the new hike's head                     | `record-store.test.ts` — interleaved `begin` during an in-flight upload leaves `pending` non-negative                             |
-| E12 | A failed hydrate never stops a live OS subscription                                                                 | `record-store.test.ts` — throwing store leaves `stopBackgroundUpdates` uncalled                                                   |
-| E13 | A journal that is not live while the OS still tracks is reconciled by stopping the OS                               | `record-store.test.ts` — restore of a paused journal with the task running calls `stopBackgroundUpdates`                          |
-| E14 | No location trace outlives the identity that created it                                                             | `record-store.test.ts` — a journal owned by A is erased, not presented, when B is confirmed signed in                             |
-| E15 | Clearing a session notifies mounted subscribers rather than waiting for a re-render                                 | `record-store.test.ts` — a subscriber is called during the identity change                                                        |
-| E16 | The legacy `recording-v1.json` is deleted, not ignored                                                              | `record-store.test.ts` — the store's `clearLegacy` is invoked at hydrate                                                          |
-| E17 | Fix lines are validated by `trackFixSchema`, the canonical contract, not a hand-rolled twin                         | `record-journal.test.ts` — a line the schema rejects is dropped                                                                   |
-| E18 | A torn tail costs one fix, not two: the next append starts on a clean line                                          | `record-journal.test.ts` + `record-store.test.ts` — a fixes file with no trailing newline is repaired at restore                  |
-| E19 | Background registration has a structural guarantee, not an incidental import path                                   | `background-config.test.ts` — the Expo entry layout imports the task module for its side effect                                   |
-| E20 | Existing suites pass; types, lint and format clean                                                                  | `npm run test`, `npm run typecheck`, `npm run lint`, `npx prettier --check .` each exit 0                                         |
+| id  | predicate                                                                                                           | verification                                                                                                                           |
+| --- | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| E1  | A batch of `k` readings delivered in one task execution yields `k` fixes, stamped from each reading's own timestamp | `record-store.test.ts` — batch of 8 across 8 seconds produces 8 fixes with `t` 0..7                                                    |
+| E2  | The live position reflects the newest reading in a batch, never the oldest                                          | `record-store.test.ts` — snapshot `position` equals the last reading's coordinates after a batch                                       |
+| E3  | The head is never observed partially written: it is staged and renamed into place                                   | `journal-files.test.ts` — asserted against the real `expo-file-system` calls, including a kill inside the move                         |
+| E4  | Stats are accumulated incrementally and agree exactly with `summariseTrack`                                         | `packages/geo/test/track-stats.test.ts` — fold equals `summariseTrack` over 500 randomised ascending-`t` tracks                        |
+| E5  | Per-fix cost does not grow with the length of the hike                                                              | `packages/geo/test/track-stats.test.ts` — 20k-fix fold completes within a fixed budget; `record-store.test.ts` counts one fold per fix |
+| E6  | Every recorder state maps to a distinct, true sentence, and the mapping is exhaustive over the union                | `record-store.test.ts` — every `(phase, tracking)` pair the store can produce yields a note, none claiming recording while paused      |
+| E7  | A CoreLocation failure reaches the user rather than being swallowed                                                 | `record-background.test.ts` + `record-store.test.ts` — task error sets `geoError`                                                      |
+| E8  | An unsupported host is distinguished from every other start failure                                                 | `record-background.test.ts` — the unavailable code falls back; any other error is reported                                             |
+| E9  | "Always" is asked for only after the capability probe succeeds                                                      | `record-background.test.ts` — no permission request when the start throws                                                              |
+| E10 | `mayNotSurviveTermination` is read from the OS, not from a module variable, on every restore path                   | `record-store.test.ts` — restored session with Always granted reports `false`                                                          |
+| E11 | An upload that resolves after a new hike began cannot write its `sent` into the new hike's head                     | `record-store.test.ts` — interleaved `begin` during an in-flight upload leaves `pending` non-negative                                  |
+| E12 | A failed hydrate never stops a live OS subscription                                                                 | `record-store.test.ts` — throwing store leaves `stopBackgroundUpdates` uncalled                                                        |
+| E13 | A journal that is not live while the OS still tracks is reconciled by stopping the OS                               | `record-store.test.ts` — restore of a paused journal with the task running calls `stopBackgroundUpdates`                               |
+| E14 | No location trace outlives the identity that created it                                                             | `record-store.test.ts` — a journal owned by A is erased, not presented, when B is confirmed signed in                                  |
+| E15 | Clearing a session notifies mounted subscribers rather than waiting for a re-render                                 | `record-store.test.ts` — a subscriber is called during the identity change                                                             |
+| E16 | The legacy `recording-v1.json` is deleted, not ignored                                                              | `record-store.test.ts` — the store's `clearLegacy` is invoked at hydrate                                                               |
+| E17 | Fix lines are validated by `trackFixSchema`, the canonical contract, not a hand-rolled twin                         | `record-journal.test.ts` — a line the schema rejects is dropped                                                                        |
+| E18 | A torn tail costs one fix, not two: the next append starts on a clean line                                          | `record-journal.test.ts` + `record-store.test.ts` — a fixes file with no trailing newline is repaired at restore                       |
+| E19 | Background registration has a structural guarantee, not an incidental import path                                   | `background-config.test.ts` — the Expo entry layout imports the task module for its side effect                                        |
+| E20 | Existing suites pass; types, lint and format clean                                                                  | `npm run test`, `npm run typecheck`, `npm run lint`, `npx prettier --check .` each exit 0                                              |
 
 ---
 
@@ -223,7 +223,7 @@ impossible to forget.
 
 ## 8. Test plan
 
-**`packages/geo/test/track.test.ts`** — the fold equals `summariseTrack` over randomised
+**`packages/geo/test/track-stats.test.ts`** — the fold equals `summariseTrack` over randomised
 ascending-`t` tracks including teleports, duplicate `t`, out-of-range accuracy, absent elevation,
 single-fix and empty tracks; and a 20k-fix fold inside a fixed time budget.
 
@@ -322,4 +322,50 @@ or edited here.
     The Hermes argument-count ceiling is recorded as UNVERIFIED with a one-line device repro
     rather than guessed at.
   budget: { implement: 2/3, review: 1/3, replan: 1/2, total: 1/8 }
+
+- seq: 9
+  at: 2026-08-29T04:00:00-04:00
+  state: REVIEW_BOARD -> IMPLEMENT
+  event: round_two_findings
+  detail: >-
+    Eight of eight reviewers reported - five FAIL, two PASS, one FAIL from the Tests reviewer,
+    which applied 65 mutations and found 26 survivors. Closed this round - the Lifeline panel's
+    hiker-facing copy (a third statement of the old behaviour, and the only one a hiker reads);
+    hydrate() unreachable on an offline launch, which dropped the rest of a hike and is a
+    regression against master; the server's 20,000-sample ceiling retrying the same batch every
+    60 s for the rest of a hike; journal-files.ts having no tests at all, where five of five
+    mutations survived; E3 asserting only its own test double; bridge.tsx being untestable; an
+    age horizon so the retention claim is true; a `starting` arm for the note the screen shows
+    between Start and the permission dialogs; the decode regression; and the sweep of false or
+    stale statements in the docs, the config comment and the config gate.
+  decision: >-
+    The `@/` alias was added to vitest.config.ts after all. Relative imports unlocked store.ts
+    but could not reach bridge.tsx, which imports `@/api/trpc` and `@/auth/context` - and that is
+    the file wiring the whole feature to the app. Anchored to the directories under
+    apps/mobile/src, and the full suite is the evidence that apps/web is unaffected.
+  budget: { implement: 3/3, review: 2/3, replan: 1/2, total: 1/8 }
+
+- seq: 10
+  at: 2026-08-29T04:30:00-04:00
+  state: IMPLEMENT -> SELF_VERIFY
+  event: correction_and_deferral
+  detail: >-
+    Correcting seq 6, which recorded "31 tests" against a pasted suite total of 552. Two
+    reviewers independently measured 564 on the tree; the block had been assembled from more
+    than one run rather than pasted from one. It is replaced in the PR body with a verbatim
+    per-file listing from a single command, and no number in this file is carried over from it.
+    Also correcting the E3, E4 and E5 citations - E3 cited a test of the in-memory double rather
+    than of the files, and E4/E5 cited packages/geo/test/track.test.ts, which this change never
+    touched; the tests are in track-stats.test.ts. That is the same shape of error this Work
+    Order's section 4 says it is correcting from v1.
+  decision: >-
+    Deferred at the cap, with reasons. (a) Re-expressing `summariseTrack` as the fold - a
+    reviewer proved the equivalence total over 4000 tracks, so the finding is upheld, but it
+    changes the function the server computes every stored activity with, and doing that in the
+    last hours of the last implement round is the wrong trade. The concrete divergence it named
+    is real and is recorded as UNFIXED - `computeGainLoss` takes `thresholdM` as a parameter
+    while `foldElevation` hard-codes the constant, so the two agree only at the default and the
+    property test cannot see it. (b) Stripping the round-by-round narration from the PR body.
+    Both are listed in the PR under what is deferred, and neither is claimed as done.
+  budget: { implement: 3/3, review: 2/3, replan: 1/2, total: 1/8 }
 ```

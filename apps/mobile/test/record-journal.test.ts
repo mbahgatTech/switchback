@@ -66,11 +66,13 @@ describe('a journal the phone was killed in the middle of writing', () => {
     expect(decodeFixes(encodeFixes(fixes)).torn).toBe(false);
   });
 
-  it('drops a line the server would reject rather than retrying it forever', () => {
-    // `flush` only advances `sent` once an upload resolves, so one line the schema refuses would
-    // make the same batch fail on every attempt for the rest of the hike.
-    const outOfRange = `${encodeFixes(fixes)}{"t":4,"lng":-400,"lat":48}\n`;
-    expect(decodeFixes(outOfRange).fixes).toEqual(fixes);
+  it('refuses a fix the server would reject, on the way in rather than on the way back', () => {
+    // `flush` only advances `sent` once an upload resolves, so one line `trackFixSchema` refuses
+    // would make the same batch fail on every attempt for the rest of the hike. Checked here,
+    // once per fix on the append path, rather than over twenty thousand lines at every launch.
+    const outOfRange = { t: 4, lng: -400, lat: 48 } as unknown as TrackFix;
+    expect(encodeFixes([outOfRange])).toBe('');
+    expect(encodeFixes([...fixes, outOfRange])).toBe(encodeFixes(fixes));
   });
 
   it('drops a line that parses as JSON but is not a fix', () => {

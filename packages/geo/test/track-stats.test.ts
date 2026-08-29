@@ -131,10 +131,11 @@ describe('what the accumulator buys', () => {
     expect(accumulatedStats(state)).toEqual(summariseTrack(day));
   });
 
-  it('never spreads the elevation array, which has an argument-count ceiling', () => {
-    const source = new URL('../src/track-stats.ts', import.meta.url);
-    expect(source.pathname).toMatch(/track-stats/);
-    // `Math.min(...elevations)` is what `summariseTrack` does and what a long hike overflows.
+  it('reports no extent for an empty fold rather than spreading an empty array', () => {
+    // `summariseTrack` reaches its extent with `Math.min(...elevations)`, which has an argument
+    // ceiling a long hike can pass. The fold never spreads; the claim that carries weight is the
+    // equivalence above, not an assertion about this file's own path.
     expect(accumulatedStats(initialTrackStats()).minEleM).toBeNull();
+    expect(accumulatedStats(initialTrackStats()).maxEleM).toBeNull();
   });
 });
