@@ -1,7 +1,7 @@
 /**
- * Keeps `npm test` off any database that is not on this machine. The suite creates and deletes
- * rows, and a checkout whose `.env` names a hosted server turns a routine test run into a write
- * against it — so the run is refused before a client is ever constructed.
+ * Keeps `npm test` off any database that is not on this machine. Every database-backed test gates
+ * itself on its own hostname check, so a run pointed elsewhere skips them and still reports green —
+ * a silent loss of coverage, and a per-file control the next database test can forget to copy.
  */
 
 import { isLocalDatabase } from '../packages/db/scripts/local-database';
@@ -35,17 +35,28 @@ function hostOf(url: string): string | undefined {
  * CI log or screenshot that captured the failure.
  */
 export function assertLocalTestDatabase(env: Record<string, string | undefined>): void {
-  if (optedIn(env[ALLOW_REMOTE_TEST_DB])) return;
+  if (optedIn(env[ALLOW_REMOTE_TEST_DB])) {
+    // `loadEnv` reads the repository-root `.env`, so the opt-in can sit in the same file that
+    // names the remote host. Announced rather than silent, or a bypassed run looks like a clean one.
+    const url = env.DATABASE_URL;
+    const host = url ? hostOf(url) : undefined;
+    console.warn(
+      `${ALLOW_REMOTE_TEST_DB} is set: the database guard is off for this run, which may reach ` +
+        `${host ?? 'a database that was never checked'}.`,
+    );
+    return;
+  }
 
   for (const key of GUARDED) {
     const url = env[key];
     if (!url || isLocalDatabase(url)) continue;
 
     throw new Error(
-      `${key} names ${hostOf(url) ?? 'a host that cannot be parsed out of the value'}, not a ` +
-        `database on this machine, and the test suite writes: it creates and deletes rows in ` +
-        `whatever it is pointed at. Start the local database with \`npm run db:up\`, or set ` +
-        `${ALLOW_REMOTE_TEST_DB}=1 to run against it anyway.`,
+      `${key} names ${hostOf(url) ?? 'a host that cannot be parsed out of the value'}, which is ` +
+        `not a database on this machine. Point it at the local one — \`npm run db:up\` starts ` +
+        `it. Against anything else the database tests skip themselves, so the run stays green ` +
+        `while covering nothing. To use a remote database deliberately, set ` +
+        `${ALLOW_REMOTE_TEST_DB}=1.`,
     );
   }
 }
