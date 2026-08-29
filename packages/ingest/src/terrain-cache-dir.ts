@@ -6,10 +6,8 @@
 
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { NO_TILE_BYTES, storedFromBody } from './terrain-cache';
 import type { StoredTerrain, TerrainCacheStore } from './terrain-cache';
-
-/** Zero bytes records a tile the origin does not have; a terrarium PNG is never empty. */
-const NO_TILE = Buffer.alloc(0);
 
 export function directoryTerrainStore(root: string): TerrainCacheStore {
   const base = resolve(root);
@@ -19,8 +17,7 @@ export function directoryTerrainStore(root: string): TerrainCacheStore {
 
     async read(z, x, y, signal): Promise<StoredTerrain> {
       try {
-        const body = await readFile(tilePath(base, z, x, y), { signal });
-        return body.length === 0 ? { kind: 'absent' } : { kind: 'tile', body };
+        return storedFromBody(await readFile(tilePath(base, z, x, y), { signal }));
       } catch (error) {
         if (isMissingFile(error)) return { kind: 'miss' };
         throw error;
@@ -34,7 +31,7 @@ export function directoryTerrainStore(root: string): TerrainCacheStore {
       // the normal case: a reader must never see a half-written PNG that then fails to decode.
       const staging = `${path}.${process.pid}.${Date.now()}.tmp`;
       try {
-        await writeFile(staging, body ?? NO_TILE, { signal });
+        await writeFile(staging, body ?? NO_TILE_BYTES, { signal });
         await rename(staging, path);
       } catch (error) {
         await rm(staging, { force: true });

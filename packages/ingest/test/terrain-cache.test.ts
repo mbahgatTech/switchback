@@ -1,3 +1,4 @@
+import { createHash, createHmac } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -75,7 +76,7 @@ describe('the shared terrain tier', () => {
 
     expect(tile).not.toBeNull();
     expect(source.originRequests()).toBe(0);
-    expect(source.sharedCacheStats).toEqual({ hits: 1, misses: 0, unavailable: 0 });
+    expect(source.sharedCacheStats).toEqual({ hits: 1, misses: 0, unavailable: 0, corrupt: 0 });
   });
 
   it('falls through to the origin on a miss, and stores what it fetched', async () => {
@@ -89,7 +90,7 @@ describe('the shared terrain tier', () => {
     expect(source.originRequests()).toBe(1);
     // The origin's own bytes, so a warm read decodes to exactly what a cold one did.
     expect(store.writes).toEqual([TILE]);
-    expect(source.sharedCacheStats).toEqual({ hits: 0, misses: 1, unavailable: 0 });
+    expect(source.sharedCacheStats).toEqual({ hits: 0, misses: 1, unavailable: 0, corrupt: 0 });
   });
 
   it('makes one shared lookup for forty callers of one tile', async () => {
@@ -125,7 +126,7 @@ describe('the shared terrain tier', () => {
     );
     await expect(warm.tile(13, 1, 1)).resolves.toBeNull();
     expect(warm.originRequests()).toBe(0);
-    expect(warm.sharedCacheStats).toEqual({ hits: 1, misses: 0, unavailable: 0 });
+    expect(warm.sharedCacheStats).toEqual({ hits: 1, misses: 0, unavailable: 0, corrupt: 0 });
   });
 
   it('does not read an unavailable cache as no tile there', async () => {
@@ -135,7 +136,7 @@ describe('the shared terrain tier', () => {
     const source = sourceOver(new TerrainCache(store), () => pngResponse(TILE));
 
     await expect(source.tile(13, 1, 1)).resolves.not.toBeNull();
-    expect(source.sharedCacheStats).toEqual({ hits: 0, misses: 0, unavailable: 1 });
+    expect(source.sharedCacheStats).toEqual({ hits: 0, misses: 0, unavailable: 1, corrupt: 0 });
   });
 
   it('re-fetches a stored object that will not decode', async () => {
@@ -146,6 +147,9 @@ describe('the shared terrain tier', () => {
 
     await expect(source.tile(13, 1, 1)).resolves.not.toBeNull();
     expect(source.originRequests()).toBe(1);
+    // Counted apart from a miss: a miss is a key nobody has written, and this is one somebody
+    // wrote wrongly. Only the second is worth waking an operator for.
+    expect(source.sharedCacheStats).toEqual({ hits: 0, misses: 0, unavailable: 0, corrupt: 1 });
   });
 
   it('swallows a write that fails', async () => {
@@ -270,6 +274,23 @@ describe('the directory store', () => {
 
     expect(found.kind).toBe('tile');
     expect(found.kind === 'tile' && found.body.equals(TILE)).toBe(true);
+  });
+
+  it('keys x and y apart, so two tiles never become one', async () => {
+    // Every other case here is a symmetric round-trip, which a transposed path satisfies
+    // perfectly. `decodeTerrarium` stamps z/x/y from its arguments and never checks them against
+    // the body, so a mis-keyed entry decodes cleanly into plausible, wrong elevations.
+    const store = directoryTerrainStore(root);
+    const other = flatTile(2000, 8);
+    await store.write(13, 4000, 2600, TILE, anySignal());
+    await store.write(13, 2600, 4000, other, anySignal());
+
+    const at4000 = await store.read(13, 4000, 2600, anySignal());
+    const at2600 = await store.read(13, 2600, 4000, anySignal());
+
+    expect(at4000.kind === 'tile' && at4000.body.equals(TILE)).toBe(true);
+    expect(at2600.kind === 'tile' && at2600.body.equals(other)).toBe(true);
+    expect(await readFile(join(root, '13', '4000', '2600.png'))).toEqual(TILE);
   });
 
   it('reports a file that is not there as a miss', async () => {
@@ -481,5 +502,287 @@ describe('elevateLine over a warm tier', () => {
     expect(second.gapCount).toBe(0);
     expect(second.points).toEqual(first.points);
     expect(warm.sharedCacheStats.misses).toBe(0);
+  });
+});
+
+describe('what reaches the store', () => {
+  // Zero bytes is the marker for "the origin has no tile here", and nothing deletes, expires or
+  // versions a key. So an empty body stored by mistake is not a stale entry that heals on the
+  // next pass — it is a real tile turned into ocean, permanently, for every process that reads
+  // the bucket afterwards. Non-empty garbage self-heals: it fails to decode and is re-fetched.
+  it('does not store an origin 403, which says nothing about terrain', async () => {
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store), () => new Response('', { status: 403 }));
+
+    await expect(source.tile(13, 4000, 2600)).resolves.toBeNull();
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([]);
+  });
+
+  it('still stores an origin 404, which does', async () => {
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store), () => new Response('', { status: 404 }));
+
+    await expect(source.tile(13, 4000, 2600)).resolves.toBeNull();
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([null]);
+  });
+
+  it('does not store an empty 200, whose body is truthy and is not a tile', async () => {
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store), () => pngResponse(Buffer.alloc(0)));
+
+    await expect(source.tile(13, 4000, 2600)).rejects.toThrow();
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([]);
+  });
+
+  it('does not store bytes that will not decode', async () => {
+    const store = scriptedStore({});
+    const source = sourceOver(new TerrainCache(store), () => pngResponse(Buffer.from('nope')));
+
+    await expect(source.tile(13, 4000, 2600)).rejects.toThrow();
+    await source.flushWrites();
+
+    expect(store.writes).toEqual([]);
+  });
+
+  it('refuses an empty body at the policy layer too, whatever the caller believes', async () => {
+    const store = scriptedStore({});
+    const lines: string[] = [];
+
+    await new TerrainCache(store, { logImpl: (line) => lines.push(line) }).write(
+      13,
+      4000,
+      2600,
+      Buffer.alloc(0),
+    );
+
+    expect(store.writes).toEqual([]);
+    expect(lines).toEqual([expect.stringContaining('empty body for 13/4000/2600')]);
+  });
+});
+
+describe('the stores and their abort signal', () => {
+  // The timeout cases above drive hand-written doubles, which prove the double honours a signal.
+  // These prove the shipped stores forward it — a store that dropped it would hang here on
+  // undici's ~300 s default, which is the worst case the whole tier exists to avoid.
+  const hangsUnlessAborted = (async (_url: string, init: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(init.signal?.reason as Error));
+    })) as unknown as typeof fetch;
+
+  const r2Config = {
+    accountId: 'acct',
+    accessKeyId: 'key',
+    secretAccessKey: 'secret',
+    bucket: 'terrain',
+  };
+
+  it('R2 aborts a read that outruns the signal', async () => {
+    const store = r2TerrainStore({ ...r2Config, fetchImpl: hangsUnlessAborted });
+
+    await expect(store.read(13, 1, 2, AbortSignal.timeout(40))).rejects.toThrow();
+  });
+
+  it('R2 aborts a write that outruns the signal', async () => {
+    const store = r2TerrainStore({ ...r2Config, fetchImpl: hangsUnlessAborted });
+
+    await expect(store.write(13, 1, 2, TILE, AbortSignal.timeout(40))).rejects.toThrow();
+  });
+
+  it('the directory store refuses a read on an already-aborted signal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sb-terrain-abort-'));
+    try {
+      const store = directoryTerrainStore(root);
+      await store.write(13, 1, 2, TILE, AbortSignal.timeout(5_000));
+
+      await expect(store.read(13, 1, 2, AbortSignal.abort())).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('the directory store refuses a write on an already-aborted signal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sb-terrain-abort-'));
+    try {
+      const store = directoryTerrainStore(root);
+
+      await expect(store.write(13, 1, 2, TILE, AbortSignal.abort())).rejects.toThrow();
+      expect((await store.read(13, 1, 2, AbortSignal.timeout(5_000))).kind).toBe('miss');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the shared lookup, under fan-out', () => {
+  it('bounds how many lookups are in flight, whatever the caller asks for', async () => {
+    // `tilesFor` fans out over up to 256 tiles at once. Unbounded, that is 256 sockets to one
+    // host, and `AbortSignal.timeout` runs from creation — so the queued ones would spend their
+    // budget waiting and abort spuriously, arming the breaker on the cold-start burst.
+    let inFlight = 0;
+    let peak = 0;
+    const store: TerrainCacheStore = {
+      kind: 'directory',
+      async read() {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        inFlight -= 1;
+        return { kind: 'miss' };
+      },
+      async write() {},
+    };
+    const cache = new TerrainCache(store, { maxConcurrent: 4 });
+
+    await Promise.all(Array.from({ length: 40 }, (_, i) => cache.read(13, i, 0)));
+
+    expect(peak).toBe(4);
+  });
+
+  it('does not arm the breaker on a lookup the deadline cut short', async () => {
+    // The abort lands in the same catch as a real failure, and `getTerrain()` memoises at module
+    // scope in a worker that outlives one message — so a deadline artefact would otherwise skip
+    // the tier for a minute of somebody else's invocation.
+    const store = stalledStore();
+    const cache = new TerrainCache(store, { lookupTimeoutMs: 5_000, failureLimit: 2 });
+
+    for (let i = 0; i < 4; i++) {
+      expect((await cache.read(13, i, 0, Date.now() + 30)).kind).toBe('unavailable');
+    }
+
+    // Four clamped aborts, and the store was still consulted every time.
+    expect(store.reads).toBe(4);
+  });
+
+  it('says so once, when it stops consulting a failing store', async () => {
+    const lines: string[] = [];
+    const cache = new TerrainCache(scriptedStore({ read: () => Promise.reject(new Error('down')) }), {
+      failureLimit: 2,
+      logImpl: (line) => lines.push(line),
+    });
+
+    for (let i = 0; i < 5; i++) await cache.read(13, i, 0);
+
+    expect(lines).toEqual([expect.stringContaining('[ingest] terrain-cache directory lookups failing')]);
+  });
+});
+
+describe('the R2 signature', () => {
+  /**
+   * SigV4 recomputed from the specification with `node:crypto`, so the assertion below is an
+   * independent answer rather than the implementation agreeing with itself. The algorithm itself
+   * is held to AWS's published vectors in `packages/api/test/storage.test.ts`; what this checks
+   * is that the terrain store feeds it the right canonical request.
+   */
+  function expectedSignature(options: {
+    secretAccessKey: string;
+    accessKeyId: string;
+    host: string;
+    canonicalUri: string;
+    method: string;
+    stamp: string;
+  }): string {
+    const dateStamp = options.stamp.slice(0, 8);
+    const scope = `${dateStamp}/auto/s3/aws4_request`;
+    const query = [
+      `X-Amz-Algorithm=AWS4-HMAC-SHA256`,
+      `X-Amz-Credential=${encodeURIComponent(`${options.accessKeyId}/${scope}`)}`,
+      `X-Amz-Date=${options.stamp}`,
+      `X-Amz-Expires=60`,
+      `X-Amz-SignedHeaders=host`,
+    ].join('&');
+
+    const canonicalRequest = [
+      options.method,
+      options.canonicalUri,
+      query,
+      `host:${options.host}\n`,
+      'host',
+      'UNSIGNED-PAYLOAD',
+    ].join('\n');
+
+    const stringToSign = [
+      'AWS4-HMAC-SHA256',
+      options.stamp,
+      scope,
+      createHash('sha256').update(canonicalRequest).digest('hex'),
+    ].join('\n');
+
+    let key = createHmac('sha256', `AWS4${options.secretAccessKey}`).update(dateStamp).digest();
+    for (const part of ['auto', 's3', 'aws4_request']) {
+      key = createHmac('sha256', key).update(part).digest();
+    }
+    return createHmac('sha256', key).update(stringToSign).digest('hex');
+  }
+
+  it('signs the canonical request the specification asks for, byte for byte', async () => {
+    const at = new Date('2026-08-29T09:15:30.000Z');
+    let seen = '';
+    const store = r2TerrainStore({
+      accountId: 'acct',
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      bucket: 'terrain',
+      nowImpl: () => at,
+      fetchImpl: (async (url: string) => {
+        seen = url;
+        return pngResponse(TILE);
+      }) as unknown as typeof fetch,
+    });
+
+    await store.read(13, 4000, 2600, AbortSignal.timeout(5_000));
+
+    const signature = expectedSignature({
+      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
+      host: 'acct.r2.cloudflarestorage.com',
+      canonicalUri: '/terrain/terrarium/13/4000/2600.png',
+      method: 'GET',
+      stamp: '20260829T091530Z',
+    });
+    expect(seen).toContain(`X-Amz-Signature=${signature}`);
+  });
+
+  it('signs GET and PUT differently, so a read ticket cannot write', async () => {
+    const at = new Date('2026-08-29T09:15:30.000Z');
+    const seen: string[] = [];
+    const store = r2TerrainStore({
+      accountId: 'acct',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+      bucket: 'terrain',
+      nowImpl: () => at,
+      fetchImpl: (async (url: string) => {
+        seen.push(url);
+        return pngResponse(TILE);
+      }) as unknown as typeof fetch,
+    });
+
+    await store.read(13, 1, 2, AbortSignal.timeout(5_000));
+    await store.write(13, 1, 2, TILE, AbortSignal.timeout(5_000));
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).not.toBe(seen[1]);
+  });
+
+  it('refuses a body far too large to be a tile', async () => {
+    const store = r2TerrainStore({
+      accountId: 'acct',
+      accessKeyId: 'key',
+      secretAccessKey: 'secret',
+      bucket: 'terrain',
+      fetchImpl: (async () =>
+        new Response(new Uint8Array(8), {
+          status: 200,
+          headers: { 'content-length': String(64 * 1024 * 1024) },
+        })) as unknown as typeof fetch,
+    });
+
+    await expect(store.read(13, 1, 2, AbortSignal.timeout(5_000))).rejects.toThrow(/not a tile/u);
   });
 });
