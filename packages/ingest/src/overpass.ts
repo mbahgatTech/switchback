@@ -132,6 +132,16 @@ export interface OverpassOptions {
 export const OVERPASS_STRAIN_MARKER = 'switchback-ingest-overpass-strain';
 
 /**
+ * The literal `switchback-ingest-overpass-skipped` greps for.
+ *
+ * Three of a tile's four Overpass queries fail soft — region, waypoints, parent routes — so a
+ * budget that refuses them costs metadata silently: the tile still reaches `ready`, the request row
+ * still reads success, and no job row records anything. This token is what makes the loss
+ * countable, and it is why `lookupRegion` logs at all.
+ */
+export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
+
+/**
  * Public instances, tried in this order. Two rules govern the list. A mirror must serve the
  * planet: a regional extract answers an out-of-area query `200 OK` with no elements, which is
  * indistinguishable from "no trails here" and caches a tile empty for thirty days

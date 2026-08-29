@@ -77,7 +77,7 @@ sequenceDiagram
   W->>SB: queue trigger, one message at a time
   W->>P: drainIngest limit 1, scoped to that dedupeKey
 
-  P->>O: one tile query, plus one tile-wide waypoint query
+  P->>O: tile query, then region and waypoints together in the two slots
   O-->>P: ways and relations
   P->>DB: one transaction per trail, then tile status
   C->>B: re-ask every 2.5 s while anything is pending
@@ -88,11 +88,25 @@ Inside `processTile`, per tile:
 ```mermaid
 flowchart LR
   A["Overpass<br/>tile query"] --> B["assemble<br/>members into ordered lines"]
-  B --> C["elevate<br/>resample 25 m, terrarium z13"]
+  B --> X{"any trails<br/>assembled?"}
+  X -- no --> Z["tile empty<br/>no further queries"]
+  X -- yes --> T
+  subgraph T["tile context — one window, both Overpass slots"]
+    direction TB
+    T1["region<br/>is_in at the tile centre"]
+    T2["waypoints<br/>one query for the whole tile"]
+  end
+  T --> C["elevate<br/>resample 25 m, terrarium z13"]
   C --> D["derive<br/>length, gain, grade, route type,<br/>difficulty, Tobler time"]
   D --> E["commit<br/>one transaction per trail"]
   E --> F["enqueue: enrich_trail for photographs,<br/>ingest_route for any parent superroute"]
 ```
+
+Neither tile-wide lookup reads the tile query's answer, so the two share one window rather than
+taking a slot each in turn; both block the first commit, and the pair is the last thing standing
+between a viewer and their first trail. They follow the tile query rather than racing it so that a
+tile over ocean still costs exactly one query — the branch above is what keeps the overlap a
+scheduling change and not an increase in what this client asks of a donated instance.
 
 Three properties make this safe to run unattended. Every trail is keyed by `(osmType, osmId)` and
 every write is an upsert, so an at-least-once queue is harmless. Each trail commits in its own
