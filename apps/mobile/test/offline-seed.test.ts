@@ -168,3 +168,34 @@ describe('the phone’s copy, seeded into the cache', () => {
     unsubscribe();
   });
 });
+
+describe('a stored copy with pieces missing', () => {
+  /*
+   * `readTrail` parses whatever the download wrote, and a trail with no reports has no summary
+   * and no first page. Seeding `undefined` under those keys would put a query into `success`
+   * with nothing in it, which reads as "no reports" rather than "not asked yet" — so the keys
+   * are left alone and the live fetch fills them.
+   */
+  it('seeds only the pieces it has', () => {
+    const client = new QueryClient();
+    const sparse = { ...storedCopy(), reviewSummary: null, reviewPage: null } as OfflineTrail;
+
+    seedFromDisk(client, KEYS, sparse);
+
+    expect(client.getQueryData(KEYS.detail)).toMatchObject({ name: 'Vesper Peak' });
+    expect(client.getQueryState(KEYS.reviewSummary)).toBeUndefined();
+    expect(client.getQueryState(KEYS.reviewPage)).toBeUndefined();
+  });
+
+  it('is safe to lay down twice, because that is what a re-seed is', () => {
+    const client = new QueryClient();
+    const copy = storedCopy();
+
+    seedFromDisk(client, KEYS, copy);
+    seedFromDisk(client, KEYS, copy);
+
+    const photos = client.getQueryData<{ isMine: boolean }[]>(KEYS.photos);
+    expect(photos).toHaveLength(1);
+    expect(photos?.[0]?.isMine).toBe(false);
+  });
+});

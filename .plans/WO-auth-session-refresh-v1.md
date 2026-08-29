@@ -4,17 +4,17 @@
 
 ## 1. Metadata
 
-| Field           | Value                                                |
-| --------------- | ---------------------------------------------------- |
-| id              | `WO-auth-session-refresh`                            |
-| version         | `1`                                                  |
-| status          | `In Review`                                          |
-| repo_target     | `switchback`                                         |
-| base_sha        | `1789198ff095cbe84a442e163b7dd2ac28a96341`           |
-| created_at      | `2026-08-29T06:40:00+00:00`                          |
-| harness_version | `3.1.0`                                              |
-| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in `switchback` |
-| supersedes      | N/A                                                  |
+| Field           | Value                                                                        |
+| --------------- | ---------------------------------------------------------------------------- |
+| id              | `WO-auth-session-refresh`                                                    |
+| version         | `1`                                                                          |
+| status          | `In Review`                                                                  |
+| repo_target     | `switchback`                                                                 |
+| base_sha        | `d7c2fad3f260ecc2add7c95f588e9a8a6aa144e0` (rebased at v1r4; was `1789198f`) |
+| created_at      | `2026-08-29T06:40:00+00:00`                                                  |
+| harness_version | `3.1.0`                                                                      |
+| overrides       | none — no `AGENTS.md` or `CLAUDE.md` in `switchback`                         |
+| supersedes      | N/A                                                                          |
 
 The dispatch brief named `7d593956` as the base. This worktree branched from `origin/master`,
 which had moved on to `1789198f`; `7d593956` is an ancestor of it. The later SHA is recorded
@@ -454,11 +454,80 @@ nesting in place.
     unchanged and was independently reproduced on a reviewer's host — base 10 failed / 2194
     passed, branch 10 failed / 2208 passed, +14 exactly and only the new mobile tests.
   budget: { implement: 3/3, review: 2/3, replan: 0/2, total: 1/8 }
+
+- seq: 10
+  at: 2026-08-29T14:10:00+00:00
+  state: IMPLEMENT
+  event: rebased_and_scope_reopened
+  detail: >-
+    Rebased onto `d7c2fad` (PR #80, the CI fix) — seven commits, no conflicts, and no overlap:
+    #80 touched `e2e/`, `packages/db/scripts/` and a new root test, nothing under `apps/mobile`.
+    §1 `base_sha` updated; the base has genuinely moved this time and the record says so. Caps
+    were then lifted, reopening the six items escalated at 3/3. Took four of them.
+  decision: >-
+    **Declined the test-renderer dependency.** It was offered, and the top-priority item turned
+    out not to need it: `session.ts` is a plain module, so `vi.mock` on `expo-secure-store` and a
+    stubbed `fetch` reach every branch with no DOM and no renderer. Declining also avoids an
+    install on a 99% volume. `test/session.test.ts` is new — 13 cases over the two `try/finally`
+    announcements, the 401 sign-out, the single-flight refresh, the offline and 503 paths that
+    must *not* sign anybody out, and the guard that stops a failed Keychain delete resurrecting
+    a session. Reverting both `finally` blocks now fails 2 of them; a reviewer had shown that
+    same mutation leaving the whole suite green.
+  budget: { implement: 4, review: 2, replan: 0, total: 2 }
+
+- seq: 11
+  at: 2026-08-29T14:20:00+00:00
+  state: IMPLEMENT
+  event: weak_gates_replaced
+  detail: >-
+    Three gates strengthened after reviewers demonstrated each passing against the mutation it
+    was supposed to catch. **The ordering rule compared two string indices**, which siblings
+    satisfy as well as a parent and child — it now reads what sits between `<AuthProvider>` and
+    its closing tag, and rewriting the providers as siblings fails it. **The protected-query rule
+    hardcoded `me.*`**; it now derives the list from `protectedProcedure` declarations in
+    `packages/api/src/routers/`, excluding mutations, and so knows about procedures nobody
+    thought to tell it about. That rule immediately found `lifeline.active`, the second ungated
+    query, which is now gated — the third such call site this Work Order has closed, and the
+    second found by the rule rather than by hand.
+  decision: >-
+    Also folded in the two remaining Minors. `unowned`/`unclaimed` are one generic `disown`. The
+    `isMine: false` decision now records the one affordance it *adds* rather than removes —
+    `reviews.tsx` offers the Report control on a report that is not yours, so a seeded page
+    offers it on your own — and accepts it: pointless rather than dangerous, corrected by the
+    first live fetch, and cheaper than carrying a third "unknown" ownership state through the
+    router shapes. Named behaviours now covered: a partial stored copy seeds only what it has,
+    and a second identical announcement costs no second reset.
+  budget: { implement: 4, review: 2, replan: 0, total: 2 }
 ```
 
 ---
 
 ## 10. Evidence
+
+**Round 4, rebased onto `d7c2fad`.** The mobile suite is 46 tests across 6 files, up from 5
+tests across 2 on the base:
+
+```
+ ✓ apps/mobile/test/navigation-targets.test.ts (7)
+ ✓ apps/mobile/test/conventions.test.ts        (7)
+ ✓ apps/mobile/test/session.test.ts           (13)
+ ✓ apps/mobile/test/identity-cache.test.ts    (10)
+ ✓ apps/mobile/test/trail-title.test.ts        (2)
+ ✓ apps/mobile/test/offline-seed.test.ts       (7)
+ Test Files 6 passed (6)   Tests 46 passed (46)   exit=0
+
+npm run lint          exit=0
+npm run typecheck     exit=0
+npm run format:check  exit=0
+```
+
+Each gate strengthened this round was verified by making the mutation it exists to catch:
+
+| Mutation                                  | Before       | After                                                          |
+| ----------------------------------------- | ------------ | -------------------------------------------------------------- |
+| Both `try/finally` announcements reverted | suite green  | 2 fail — `expected [] to deeply equal [ true ]` / `[ false ]`  |
+| Providers rewritten as siblings           | 4/4 green    | fails — `expected '<AuthProvider>' to contain '<ApiProvider>'` |
+| `lifeline.active` left ungated            | not detected | fails — `a protected query needs an \`enabled\` gate`          |
 
 **D1 — the website reflects a sign-in with no reload.** Production build (`next build`, all 41
 routes `ƒ`), `next start`, service worker installed and controlling, real authorization-code

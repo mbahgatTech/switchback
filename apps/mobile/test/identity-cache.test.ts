@@ -174,3 +174,36 @@ describe('the generation seam the re-seed hangs off', () => {
     expect(calls).toBe(0);
   });
 });
+
+describe('two identity changes in a row', () => {
+  /*
+   * A 401 signs the device out wherever the reader is standing, and they may then press Sign
+   * out on a screen that never noticed. The second announcement must cost nothing: a reset of
+   * an already-empty cache still notifies every observer and refetches every active query, so
+   * "harmless" would be a round trip per mounted screen.
+   */
+  it('costs one reset when the second says the same thing', () => {
+    const client = new QueryClient({ queryCache: new QueryCache() });
+    const bus = announcer();
+    forgetAnswersOnIdentityChange(client, bus.subscribe);
+
+    bus.announce(false);
+    const afterFirst = cacheGeneration();
+    bus.announce(false);
+    bus.announce(false);
+
+    expect(cacheGeneration()).toBe(afterFirst);
+  });
+
+  it('acts again once the reader has actually changed', () => {
+    const client = new QueryClient({ queryCache: new QueryCache() });
+    const bus = announcer();
+    forgetAnswersOnIdentityChange(client, bus.subscribe);
+
+    bus.announce(false);
+    const afterOut = cacheGeneration();
+    bus.announce(true);
+
+    expect(cacheGeneration()).toBeGreaterThan(afterOut);
+  });
+});

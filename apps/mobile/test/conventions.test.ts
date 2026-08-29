@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { expect, it } from 'vitest';
@@ -80,11 +80,22 @@ it('empties the query cache before it tells anybody the reader changed', () => {
     fileURLToPath(new URL('../app/_layout.tsx', import.meta.url)),
     'utf8',
   );
-  const auth = layout.indexOf('<AuthProvider>');
-  const api = layout.indexOf('<ApiProvider>');
 
-  expect(auth, 'AuthProvider is the outer of the two').toBeGreaterThanOrEqual(0);
-  expect(api, 'ApiProvider subscribes first, so it must be the inner').toBeGreaterThan(auth);
+  /*
+   * Nesting, not two positions in the file. Comparing indices only asks which tag is written
+   * first, which siblings satisfy just as well as a parent and child — and siblings destroy the
+   * ordering this rule exists to protect. Reading what sits *between* the opening and closing
+   * tags is what tells the two shapes apart.
+   */
+  const opened = layout.indexOf('<AuthProvider>');
+  const closed = layout.indexOf('</AuthProvider>');
+
+  expect(opened, 'AuthProvider is the outer of the two').toBeGreaterThanOrEqual(0);
+  expect(closed, 'AuthProvider must wrap something').toBeGreaterThan(opened);
+  expect(
+    layout.slice(opened, closed),
+    'ApiProvider subscribes first, so it must be nested inside AuthProvider',
+  ).toContain('<ApiProvider>');
 });
 
 /*
@@ -132,15 +143,61 @@ it('announces an identity change even when the Keychain refuses', () => {
   ).toHaveLength(2);
 });
 
+/**
+ * Every protected *query* the server declares, as `router.procedure`.
+ *
+ * Read from `packages/api/src/routers/`, not listed here: a hand-kept list is a list that goes
+ * stale the first time somebody adds a procedure, and the rule below is only worth having if it
+ * knows about procedures nobody thought to tell it about. Mutations are excluded — they fire on
+ * a press, not on mount, so they need no `enabled`.
+ */
+function protectedQueries(): string[] {
+  const routerDir = fileURLToPath(new URL('../../../packages/api/src/routers', import.meta.url));
+  const names: string[] = [];
+
+  for (const entry of readdirSync(routerDir)) {
+    if (!entry.endsWith('.ts')) continue;
+    const source = readFileSync(path.join(routerDir, entry), 'utf8');
+    const declarations = [
+      ...source.matchAll(/^ {2}(\w+): (protectedProcedure|publicProcedure)/gmu),
+    ];
+
+    declarations.forEach((declaration, index) => {
+      if (declaration[2] !== 'protectedProcedure') return;
+      const from = declaration.index ?? 0;
+      const to = declarations[index + 1]?.index ?? source.length;
+      // `.query(` before the next declaration means this one answers rather than writes.
+      if (source.slice(from, to).includes('.query(')) {
+        names.push(`${entry.replace(/\.ts$/u, '')}.${declaration[1]}`);
+      }
+    });
+  }
+  return names;
+}
+
 it('asks for the reader’s own record only while there is a reader', () => {
   /*
-   * `me.*` is account-scoped, so an ungated one fires as nobody the moment a screen mounts
-   * signed out, and 401s. Screens gate it with `enabled`; a new call site that forgets is the
-   * defect this catches — `app/lists/[key].tsx` shipped that way.
+   * An ungated protected query fires as nobody the moment a screen mounts signed out, and 401s.
+   * It also fires again through the reset that follows every identity change, before React has
+   * re-rendered — so `enabled` computed from the last signed-in render is still `true`.
+   *
+   * Three call sites shipped ungated: `lists/[key].tsx`, then `settings.tsx` and
+   * `lifeline-panel.tsx`, both found by this rule after the first was fixed by hand.
    */
-  const ungated = FILES.filter(([, source]) =>
-    /useQuery\(\s*trpc\.me\.[a-zA-Z]+\.queryOptions\(\)\s*\)/u.test(source),
-  ).map(([file]) => file);
+  const queries = protectedQueries();
+  /*
+   * A plain string test, not a regex: the gated spelling always opens `useQuery({` to spread the
+   * options, so `useQuery(trpc.` with no brace is exactly the ungated one.
+   */
+  const ungated = FILES.flatMap(([file, source]) =>
+    queries
+      .filter((query) => source.includes(`useQuery(trpc.${query}.queryOptions(`))
+      .map((query) => `${file}: ${query}`),
+  );
 
-  expect(ungated, 'a me.* query needs an `enabled` gate').toEqual([]);
+  expect(
+    queries.length,
+    'the router scan found nothing, so this rule read nothing',
+  ).toBeGreaterThan(5);
+  expect(ungated, 'a protected query needs an `enabled` gate').toEqual([]);
 });
