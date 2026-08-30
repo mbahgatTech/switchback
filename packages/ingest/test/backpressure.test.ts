@@ -9,13 +9,17 @@ import type { PrismaClient } from '@switchback/db';
 import {
   DERIVED_JOB_KINDS,
   DERIVED_QUEUE_WARN_DEPTH,
+  MAX_QUEUE_WAIT_HOURS,
   MAX_STORAGE_FRACTION,
   MAX_TILE_QUEUE_DEPTH,
   REQUEST_JOB_KINDS,
   admitIngest,
   resetStorageCache,
 } from '../src/backpressure';
-import { ensureCoverage, queueTiles } from '../src/coverage';
+import { MAX_AREA_TILES, ensureCoverage, queueTiles } from '../src/coverage';
+import { REVIVAL_OUTSTANDING_MAX } from '../src/dead-jobs';
+import { REQUEST_DRAIN_TILES_PER_HOUR, hoursToDrain, queueDepthForHours } from '../src/drain-rate';
+import { BUCKET_CAPACITY, PRINCIPAL_QUEUE_SHARE } from '../src/rate-limit';
 import { ensureNetworkCoverage, queueNetworkTiles } from '../src/network';
 
 /** A bbox small enough to need exactly one tile at either zoom. */
@@ -464,5 +468,109 @@ describe('what the reader is told', () => {
 
     // The number it tripped on, not just the fact that it tripped.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(String(MAX_TILE_QUEUE_DEPTH + 5)));
+  });
+
+  it('tells that operator what the depth costs, not only what it is', async () => {
+    /*
+     * This line is the only place the ceiling is visible in production — nothing is persisted on a
+     * refusal and no alert covers it, so `scripts/ingest-metrics/README.md` sends operators here
+     * with a grep. A bare count is the reading that was misjudged for 21 hours in the first place.
+     */
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const depth = MAX_TILE_QUEUE_DEPTH + 5;
+    const { db } = fakeDb({ depth });
+
+    await queueTiles(db, ['0213012']);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(`${hoursToDrain(depth).toFixed(1)} h of drain`),
+    );
+  });
+});
+
+/** The other wall on `MAX_QUEUE_WAIT_HOURS`: past this a fetch is for the next visitor. */
+const HOURS_IN_A_DAY = 24;
+
+/** `MAX_AREA_TILES` distinct z9 quadkeys — one press of "fetch this area". */
+function areaFetchKeys(): string[] {
+  return Array.from(
+    { length: MAX_AREA_TILES },
+    (_, index) => `02${index.toString(4).padStart(7, '0')}`,
+  );
+}
+
+describe('what the ceiling is worth in hours', () => {
+  it('refuses at the depth the wait horizon buys, and not one job sooner', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Recomputed from the two inputs rather than read off the constant: this is the assertion that
+    // goes red if the rate is re-measured and the ceiling is left where it was, which is the drift
+    // that let a 21-hour backlog be documented as an hour.
+    const atHorizon = Math.floor(REQUEST_DRAIN_TILES_PER_HOUR * MAX_QUEUE_WAIT_HOURS);
+
+    expect(await admitIngest(fakeDb({ depth: atHorizon }).db)).toBe('queue-depth');
+    expect(await admitIngest(fakeDb({ depth: atHorizon - 1 }).db)).toBeNull();
+  });
+
+  it('admits no tile into a longer wait than the horizon promises', async () => {
+    const { db } = fakeDb({ depth: MAX_TILE_QUEUE_DEPTH - 1 });
+
+    const { queued } = await queueTiles(db, ['0213012']);
+
+    // The last tile the ceiling lets through is the one that waits longest, so its wait is the
+    // whole promise. Asserted on the depth admission actually produced, not on the constant.
+    expect(queued).toHaveLength(1);
+    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH - 1 + queued.length)).toBeLessThanOrEqual(
+      MAX_QUEUE_WAIT_HOURS,
+    );
+  });
+
+  it('stays deep enough that a caller share still covers one deliberate area fetch', () => {
+    // Below this the allowance in `rate-limit.ts` is `MIN_BUCKET_CAPACITY` clamping *above* its own
+    // share of this ceiling, and one press of "fetch this area" would pin the product-wide ceiling
+    // for everybody. A shorter horizon needs a smaller `MAX_AREA_TILES` first.
+    expect(MAX_TILE_QUEUE_DEPTH * PRINCIPAL_QUEUE_SHARE).toBeGreaterThanOrEqual(MAX_AREA_TILES);
+  });
+
+  it('never refuses a viewport on revived work alone, whatever the ceiling is retuned to', async () => {
+    // Revival at its whole bound, with a full area fetch arriving on top of it.
+    const { db } = fakeDb({ depth: REVIVAL_OUTSTANDING_MAX });
+
+    const { queued, refused } = await queueTiles(db, areaFetchKeys());
+
+    expect(refused).toBeNull();
+    expect(queued).toHaveLength(MAX_AREA_TILES);
+  });
+
+  it('keeps recovery smaller than a single ordinary caller may hold', () => {
+    /*
+     * The assertion above passes for any share below 1.0 — revival at half the ceiling still
+     * admits one more tile — so it cannot see a share raised tenfold. This can: revival is
+     * recovery, not a tenant, and a burial that may take more of the queue than one ordinary
+     * caller is allowed to hold is an outage wearing another name. See `REVIVAL_QUEUE_SHARE`.
+     */
+    expect(REVIVAL_OUTSTANDING_MAX).toBeLessThanOrEqual(BUCKET_CAPACITY);
+  });
+
+  it('promises no wait longer than a day, whatever the horizon is set to', () => {
+    // The floor is `MAX_AREA_TILES`; this is the other wall. Past a day the fetch is certainly for
+    // the next visitor rather than the one who asked, and nothing here can tell them it arrived —
+    // so admitting it is the lie the ceiling exists to avoid, just slower.
+    expect(MAX_QUEUE_WAIT_HOURS).toBeLessThanOrEqual(HOURS_IN_A_DAY);
+    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH)).toBeLessThanOrEqual(HOURS_IN_A_DAY);
+  });
+
+  it('takes the longest horizon the floor and the day both allow', () => {
+    /*
+     * More than one whole hour clears both walls, so which one this is cannot be derived — but the
+     * *rule* can be, and this is it. Pinning the rule rather than the number keeps it true through
+     * a re-measurement: change the drain rate and the admissible set moves, and the constant has to
+     * move to the top of it. Recomputed here from the same two bounds the code argues from.
+     */
+    const admissible = Array.from({ length: HOURS_IN_A_DAY }, (_, index) => index + 1).filter(
+      (hours) => queueDepthForHours(hours) >= MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE,
+    );
+
+    expect(admissible.length).toBeGreaterThan(1);
+    expect(Math.max(...admissible)).toBe(MAX_QUEUE_WAIT_HOURS);
   });
 });

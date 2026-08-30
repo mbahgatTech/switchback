@@ -7,6 +7,7 @@
 import { Prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { MAX_TILE_QUEUE_DEPTH } from './backpressure';
+import { REQUEST_DRAIN_TILES_PER_HOUR } from './drain-rate';
 
 /**
  * Who an enqueue is charged to. `key` is what the bucket is keyed on and is never a raw network
@@ -47,30 +48,25 @@ export const BUCKET_CAPACITY = Math.max(
 );
 
 /**
- * What the estate actually drains, in tiles per hour: 28.5 at the mean, 6.7 at p90, measured on
- * the deployed queue.
+ * Tiles per hour one caller may sustain: their share of what the estate measurably drains.
  *
- * This is the number an allowance has to respect. Granting one caller more than a share of it
- * promises work the estate cannot do, and the queue that promise fills is the one every other
- * reader waits behind. `MAX_TILE_QUEUE_DEPTH`'s docstring calls 600 jobs "roughly an hour of
- * drain", which disagrees with this by about 21x; the two cannot both be right and the
- * re-measurement of that ceiling is a separate stream. This one is measured, and is the only
- * input to the refill below.
+ * The number an allowance has to respect. Granting one caller more than a share of it promises work
+ * the estate cannot do, and the queue that promise fills is the one every other reader waits behind.
+ * Request kinds only, because that is what a bucket prices, and `MAX_TILE_QUEUE_DEPTH` is sized
+ * from the same figure — so the allowance and the ceiling it is a share of move together.
  */
-export const ESTATE_DRAIN_TILES_PER_HOUR = 28.5;
-
-/** Tiles per hour one caller may sustain — their share of what the estate can actually drain. */
-export const PRINCIPAL_TILES_PER_HOUR = ESTATE_DRAIN_TILES_PER_HOUR * PRINCIPAL_QUEUE_SHARE;
+export const PRINCIPAL_TILES_PER_HOUR = REQUEST_DRAIN_TILES_PER_HOUR * PRINCIPAL_QUEUE_SHARE;
 
 /**
  * How long an empty bucket takes to refill: the allowance divided by the sustained rate, so the
  * burst and the rate are tuned by two separate numbers rather than one.
  *
- * Derived rather than chosen. The window this replaced was 30 minutes, which refilled 120 tiles
- * at 240/hour — 8.4x what the estate drains — so one caller could hold the product-wide ceiling
- * indefinitely and every other reader saw `queue-depth` for as long as it cared to continue.
- * `BUCKET_CAPACITY` still covers one deliberate area fetch in a burst; what changed is that a
- * second burst is now paced by the drain rather than by a clock nobody measured against it.
+ * Derived rather than chosen, and the derivation is what holds the property. A fixed 30-minute
+ * window refills a whole `BUCKET_CAPACITY` at many times `REQUEST_DRAIN_TILES_PER_HOUR`, which lets
+ * one caller hold the product-wide ceiling indefinitely while every other reader sees
+ * `queue-depth`. Pacing the refill by the drain instead makes that impossible at any allowance:
+ * the burst is `BUCKET_CAPACITY`, the sustained rate is `PRINCIPAL_TILES_PER_HOUR`, and re-tuning
+ * the ceiling moves the burst without touching the rate.
  */
 export const BUCKET_REFILL_MS = Math.ceil((BUCKET_CAPACITY / PRINCIPAL_TILES_PER_HOUR) * 3_600_000);
 

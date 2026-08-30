@@ -3,10 +3,10 @@ import { PrismaClient } from '@prisma/client';
 import { JobKind, JobStatus, prisma } from '@switchback/db';
 import { MAX_TILE_QUEUE_DEPTH, admitIngest } from '../src/backpressure';
 import { MAX_AREA_TILES, queueTiles } from '../src/coverage';
+import { REQUEST_DRAIN_TILES_PER_HOUR } from '../src/drain-rate';
 import {
   BUCKET_CAPACITY,
   BUCKET_REFILL_MS,
-  ESTATE_DRAIN_TILES_PER_HOUR,
   MIN_BUCKET_CAPACITY,
   PRINCIPAL_QUEUE_SHARE,
   PRINCIPAL_TILES_PER_HOUR,
@@ -413,7 +413,7 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
     async () => {
       // Six hours of one caller asking for a viewport every three minutes — the shape that pinned
       // the product-wide queue while the allowance refilled at 240 tiles/hour against an estate
-      // that drains 28.5. Measured at 780 tiles granted over this run, against 171 drainable.
+      // that drains a fraction of that. Measured at 780 tiles granted over this run.
       const step = 3 * 60_000;
       const hours = 6;
       let granted = 0;
@@ -432,9 +432,13 @@ describe.skipIf(!IS_LOCAL)('the per-caller ingest allowance', () => {
       expect(granted).toBeLessThanOrEqual(
         Math.ceil(BUCKET_CAPACITY + hours * PRINCIPAL_TILES_PER_HOUR),
       );
-      // And under what the estate itself drains in those six hours, which is the property that
-      // stops one caller pinning the ceiling against every other reader.
-      expect(granted).toBeLessThan(hours * ESTATE_DRAIN_TILES_PER_HOUR);
+      /*
+       * And under what the estate drains *of this kind* in those six hours, which is the property
+       * that stops one caller pinning the ceiling against every other reader. Request kinds, not
+       * all kinds: a bucket prices new ground, and comparing it to the all-kinds rate both flatters
+       * the caller and leaves the assertion dead — the cap above is already below that number.
+       */
+      expect(granted).toBeLessThan(hours * REQUEST_DRAIN_TILES_PER_HOUR);
     },
     TIMEOUT,
   );

@@ -236,6 +236,48 @@ keyed on the signed-in account or, failing that, on an HMAC of the address Verce
 fifth of the queue ceiling and is _derived_ from it, so re-measuring the ceiling re-tunes the share.
 Only new ground is priced, so a reader panning over tiles we already hold never touches it.
 
+**The queue ceiling is a wait, not a job count.** `MAX_TILE_QUEUE_DEPTH` is
+`MAX_QUEUE_WAIT_HOURS` × `REQUEST_DRAIN_TILES_PER_HOUR` (`ingest/drain-rate.ts`) — 24 hours at
+21.375 request tiles an hour — so the promise the ceiling makes is stated in the unit it is judged
+in, and one re-measurement retunes the ceiling, the per-caller allowance and the revival bound
+together. A job count states no promise a reader can check against the drain; an hours figure does.
+
+```mermaid
+flowchart TD
+  pump["ingest-worker/src/pump.ts<br/>50 ingestDrain invocations, 2026-08-08<br/>mean 126.2 s, serial, one job per message"]
+  all["ESTATE_DRAIN_TILES_PER_HOUR = 28.5<br/>all kinds"]
+  req["REQUEST_DRAIN_TILES_PER_HOUR = 21.375<br/>lower bound, request kinds only"]
+  bp["MAX_QUEUE_WAIT_HOURS = 24<br/>MAX_TILE_QUEUE_DEPTH = 513"]
+  rl["BUCKET_CAPACITY = 102<br/>PRINCIPAL_TILES_PER_HOUR = 4.275"]
+  dj["REVIVAL_OUTSTANDING_MAX = 25"]
+  area["MAX_AREA_TILES = 96 = 4.5 h<br/>the floor under the horizon"]
+
+  pump -->|measured| all
+  all -->|"x 6 of 8 messages"| req
+  req -->|x MAX_QUEUE_WAIT_HOURS| bp
+  req -->|x PRINCIPAL_QUEUE_SHARE| rl
+  bp -->|x PRINCIPAL_QUEUE_SHARE| rl
+  bp -->|x REVIVAL_QUEUE_SHARE| dj
+  area -.->|bounds from below| bp
+```
+
+**The divisor is request kinds only, and is a bound rather than an observation.** The pump reserves
+`PUMP_DERIVED_SHARE` of `PUMP_QUEUE_DEPTH` messages for `enrich_trail`/`ingest_route`, and the
+worker takes one job per message, so six of every eight invocations carry a request tile. Charging
+the other two a full tile's wall clock is the worst case — they are a lookup and an image fetch — so
+the true rate lies between 21.375 and 28.5. Sizing against the low end means the ceiling may deliver
+a shorter wait than it advertises and never a longer one. Q6 of `scripts/ingest-metrics/` measures
+the rate directly and is what should replace the bound.
+
+**Twenty-four hours is near a floor, not a preference.** One press of "fetch this area" is
+`MAX_AREA_TILES` = 96 tiles, which at a serial drain is 4.5 hours on its own; below
+`MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs, or 22.5 hours, the per-caller allowance stops
+being a share of the ceiling and becomes a clamp above it, so one area fetch would pin the
+product-wide ceiling. Shortening the wait meaningfully means shrinking the area fetch first, or
+draining faster; it is not reachable from this constant.
+`packages/ingest/test/backpressure.test.ts` holds that floor, and
+`test/queue-ceiling-restatements.test.ts` holds every number in this section against the code.
+
 State lives in Postgres because Vercel runs many instances: an in-process counter would hand each
 instance a full allowance and forget it on the next cold start. The spend is one
 `INSERT … ON CONFLICT … WHERE`, which makes the check and the decrement the same operation without
