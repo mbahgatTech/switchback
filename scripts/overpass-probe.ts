@@ -83,9 +83,6 @@ async function measure(
   rounds: number,
   userAgent: string,
 ): Promise<Sample[]> {
-  const clients = new Map(
-    endpoints.map((endpoint) => [endpoint, probeClient(endpoint, userAgent)]),
-  );
   const samples: Sample[] = [];
   let first = true;
 
@@ -94,9 +91,7 @@ async function measure(
       if (!first) await sleep(PAUSE_MS);
       first = false;
 
-      const client = clients.get(endpoint);
-      if (!client) continue;
-      const sample = await probe(client, endpoint, round);
+      const sample = await probe(probeClient(endpoint, userAgent), endpoint, round);
       samples.push(sample);
       console.log(
         `sample endpoint=${endpoint} round=${String(round)} ms=${String(sample.ms)} ` +
@@ -112,6 +107,11 @@ async function measure(
  * One attempt, one endpoint, no failover. `maxAttempts: 1` is what makes the number a measurement:
  * on the deployed settings a 504 would be retried against the next mirror and the elapsed time
  * would describe the ladder rather than this host.
+ *
+ * A client per *sample*, not per endpoint, so the breaker never carries state between rounds. Held
+ * across rounds it opens on the fifth consecutive failure and every later round of a mirror that is
+ * simply down reports `circuit breaker open` in microseconds — a run that says the endpoint failed
+ * for a reason the endpoint never gave.
  */
 function probeClient(endpoint: string, userAgent: string): OverpassClient {
   return new OverpassClient({
