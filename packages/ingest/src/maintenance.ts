@@ -5,6 +5,7 @@
 
 import { JobKind, JobStatus, PhotoSource, TileStatus, prisma } from '@switchback/db';
 import type { PrismaClient, TileSource } from '@switchback/db';
+import { childQuadkeys } from '@switchback/geo';
 import { reconcileDeadJobs } from './dead-jobs';
 import type { AbandonedJob, TriageOptions } from './dead-jobs';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
@@ -222,11 +223,19 @@ export const EMPTY_WRITE_MARKER = 'switchback-ingest-empty-tile-writes';
  */
 export const EMPTY_WRITE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * The suffixes that turn a quadkey into its children, from the function that defines them.
+ *
+ * Written out again in SQL this would be a second copy of the subdivision maths, free to drift
+ * from the first and stop recognising a split tile without saying so.
+ */
+const CHILD_SUFFIXES = childQuadkeys('');
+
 /** One source's tile writes inside the window, and how many of them landed empty. */
 export interface EmptyWriteRate {
   /** Null on rows a fetch wrote before provenance was recorded. */
   source: TileSource | null;
-  /** Tiles this source filled or emptied. A failed attempt writes no `fetchedAt` and is in neither. */
+  /** Tiles this source answered about. A failed attempt writes no `fetchedAt` and is in neither. */
   written: number;
   empty: number;
 }
@@ -244,10 +253,26 @@ export interface EmptyWriteRate {
  * What identifies the hazard is one source's share against another's over comparable ground, so
  * until a second source exists this reading is accruing the baseline that comparison will need.
  *
+ * **A tile with children is not one of its own writes, and is excluded.** `promoteFrom` composes
+ * a parent row out of its four children after every tile a fetch finishes, and it is the only path
+ * outside `processTile` that moves `fetchedAt` on this table — so one query answered about a z11
+ * was otherwise counted again at z10 and again at z9, attributed to whichever source last answered
+ * about the ancestor itself. The predicate is the roll-up's own precondition read off the child
+ * rows, not a flag a writer has to remember to set: `promoteFrom` writes nothing `childTiles` did
+ * not return four rows for. A tile subdivided *since* its own last answer goes with them, which is
+ * the same fact taken conservatively — a box that has been split no longer stands for ground one
+ * answer covers.
+ *
+ * **Four primary-key probes rather than `LIKE quadkey || '_'`.** A `LIKE` whose pattern is a column
+ * cannot use an index, so that anti-join degrades to the cross product: on this schema at 5,000
+ * rows inside the window it discarded 25,000,000 join-filter rows in 3.2 s, against 47.9 ms for the
+ * probes below. This runs on the two-minute pump tick.
+ *
  * `status` and `fetchedAt` are read together because one statement writes both. A later failed
  * attempt moves `status` without moving `fetchedAt`, which would drop that tile from the empty
  * count while leaving it in the total; an `empty` tile is not re-fetched for thirty days, so
- * inside one window that is a rounding error rather than a bias.
+ * inside one window that is a rounding error rather than a bias. A roll-up cannot widen that gap:
+ * the only rows it writes are the ones the exclusion above has already taken out.
  */
 export async function readEmptyWriteRates(
   db: PrismaClient = prisma,
@@ -261,6 +286,9 @@ export async function readEmptyWriteRates(
            count(*) FILTER (WHERE tile.status = 'empty')::int AS empty
       FROM ingest_tiles tile
      WHERE tile."fetchedAt" >= ${since}
+       AND NOT EXISTS (SELECT 1
+                         FROM unnest(${CHILD_SUFFIXES}::text[]) AS suffix
+                         JOIN ingest_tiles child ON child.quadkey = tile.quadkey || suffix)
      GROUP BY tile."sourceKind"
      ORDER BY tile."sourceKind"
   `;

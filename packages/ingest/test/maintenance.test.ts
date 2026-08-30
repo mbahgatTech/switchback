@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { JobKind, JobStatus, TileSource, TileStatus } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { SUBTREE_STUCK_MARKER, reconcileOrphanedSplits } from '../src/subdivide';
 import {
@@ -17,11 +17,9 @@ import {
   TILE_WEDGED_MARKER,
   WEDGE_GRACE_MS,
   countWedgedTiles,
-  formatEmptyWriteRate,
   isDistressed,
   photoSeedBlackout,
   queueHealth,
-  readEmptyWriteRates,
   repairWedgedTiles,
   sweepQueue,
 } from '../src/maintenance';
@@ -659,6 +657,10 @@ describe('repairWedgedTiles', () => {
  * ocean. A ninth count reading them would hold the distress alert on for as long as there is water,
  * which takes the other eight gauges with it — the failure `DISTRESS_WINDOW_MS` and `stalledDrain`
  * were both reshaped to avoid, arriving through a new field instead.
+ *
+ * That the same tiles *are* counted, by `readEmptyWriteRates`, is asserted against a real Postgres
+ * in `provenance.db.test.ts`. It cannot be asserted here: the reading is one `count(*) FILTER`
+ * grouped by an enum, and a fake standing in for it would be answering with the number under test.
  */
 describe('a queue whose tiles are mostly empty', () => {
   const NOW = new Date('2026-08-07T10:00:00Z');
@@ -669,10 +671,42 @@ describe('a queue whose tiles are mostly empty', () => {
     lastError: string | null;
   }
 
-  function matches(tile: EmptyTileRow, where: TileWhere): boolean {
-    if (where.status !== undefined && (where.status as unknown) !== tile.status) return false;
-    const contains = where.lastError?.contains;
-    return contains === undefined ? true : (tile.lastError ?? '').includes(contains);
+  /** What this fake refuses, named as the statement that would have to change to satisfy it. */
+  function unmodelled(what: string): Error {
+    return new Error(`queueHealth counted ingest_tiles on ${what}, which this fake does not model`);
+  }
+
+  /** The one operator this fake reads on `lastError`, or null for any other shape. */
+  function onlyContains(filter: unknown): string | null {
+    if (typeof filter !== 'object' || filter === null) return null;
+    const { contains } = filter as { contains?: unknown };
+    return Object.keys(filter).length === 1 && typeof contains === 'string' ? contains : null;
+  }
+
+  /**
+   * Whether one tile satisfies `where`, refusing any filter shape this fake does not model.
+   *
+   * **The refusal is the guard.** A ninth arm written `{ status: { in: [...] } }` against a reader
+   * that compared `where.status` as a scalar would match no row, count zero, and leave the verdict
+   * below green while the field it denies had already shipped — the reading is checked here, so a
+   * fake that answers `false` to a question it did not understand is answering for the code under
+   * test. An unknown column, or a known one under an unknown operator, therefore throws for the
+   * same reason an unknown statement throws in `$queryRaw`.
+   */
+  function matches(tile: EmptyTileRow, where: Record<string, unknown>): boolean {
+    for (const [column, filter] of Object.entries(where)) {
+      if (column === 'status') {
+        if (typeof filter !== 'string') throw unmodelled(`status ${JSON.stringify(filter)}`);
+        if (filter !== tile.status) return false;
+      } else if (column === 'lastError') {
+        const contains = onlyContains(filter);
+        if (contains === null) throw unmodelled(`lastError ${JSON.stringify(filter)}`);
+        if (!(tile.lastError ?? '').includes(contains)) return false;
+      } else {
+        throw unmodelled(column);
+      }
+    }
+    return true;
   }
 
   /**
@@ -692,8 +726,11 @@ describe('a queue whose tiles are mostly empty', () => {
         aggregate: async () => ({ _max: { completedAt: null } }),
       },
       ingestTile: {
-        count: async ({ where }: { where: TileWhere }) =>
-          tiles.filter((tile) => matches(tile, where)).length,
+        count: async (args?: { where?: Record<string, unknown> }) => {
+          const where = args?.where;
+          if (where === undefined) throw unmodelled('no filter at all');
+          return tiles.filter((tile) => matches(tile, where)).length;
+        },
       },
       $queryRaw: async (strings: TemplateStringsArray) => {
         const sql = strings.join('');
@@ -723,16 +760,5 @@ describe('a queue whose tiles are mostly empty', () => {
     const wedged = [...ocean, { status: TileStatus.pending, lastError: SUBTREE_STUCK_MARKER }];
 
     expect(isDistressed(await queueHealth(tableDb(wedged), NOW))).toBe(true);
-  });
-
-  it('counts the same tiles as an empty-write share, which is where they do belong', async () => {
-    const rates = await readEmptyWriteRates(
-      {
-        $queryRaw: async () => [{ source: TileSource.overpass, written: 40, empty: 40 }],
-      } as unknown as PrismaClient,
-      NOW,
-    );
-
-    expect(rates.map(formatEmptyWriteRate)).toEqual(['source=overpass written=40 empty=40']);
   });
 });

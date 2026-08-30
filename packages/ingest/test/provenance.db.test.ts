@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { TileSource, TileStatus, prisma } from '@switchback/db';
-import { quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
+import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
 import { TerrainSource } from '../src/elevate';
 import { processTile } from '../src/pipeline';
 import type { PipelineDeps } from '../src/pipeline';
@@ -47,7 +47,24 @@ const EMPTIED = `${NS}000001`;
 const UNSTAMPED = `${NS}000002`;
 const REFUSED = `${NS}000003`;
 const SEEDED = [`${NS}000010`, `${NS}000011`, `${NS}000012`, `${NS}000013`];
-const FIXTURE_TILES = [FILLED, EMPTIED, UNSTAMPED, REFUSED, ...SEEDED];
+
+/**
+ * A z9 parent and its four z10 children, for the roll-up write.
+ *
+ * The only fixtures in this file below the zoom the others use, deliberately: `rollUpAncestors`
+ * stops at `INGEST_ZOOM`, so nothing written at z9 can promote anything.
+ */
+const ROLLED_UP = `${NS}000020`;
+const ROLLED_UP_CHILDREN = childQuadkeys(ROLLED_UP);
+const FIXTURE_TILES = [
+  FILLED,
+  EMPTIED,
+  UNSTAMPED,
+  REFUSED,
+  ...SEEDED,
+  ROLLED_UP,
+  ...ROLLED_UP_CHILDREN,
+];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
 const PREFIX = 'ZZ Provenance';
@@ -279,6 +296,39 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       source: TileSource.overpass,
       written: SEEDED.length,
       empty: SEEDED.length,
+    });
+  });
+
+  /**
+   * A row a roll-up filled, which no source ever answered about.
+   *
+   * `promoteFrom` composes a parent from its children and is the only path outside `processTile`
+   * that moves `fetchedAt` on `ingest_tiles`. It runs after every tile a fetch finishes, so a
+   * reading windowed on that column alone counted one derived row per ancestor on top of the
+   * answers underneath it — inflating the denominator everywhere, and over ground whose children
+   * all come back empty the numerator with it.
+   */
+  it('leaves out a parent a roll-up filled, which no source answered about', async () => {
+    const [first, second, third, fetched] = ROLLED_UP_CHILDREN;
+    await seedWrite(ROLLED_UP, TileStatus.ready, BEFORE_WINDOW);
+    await seedWrite(first, TileStatus.empty, INSIDE_WINDOW);
+    await seedWrite(second, TileStatus.empty, INSIDE_WINDOW);
+    await seedWrite(third, TileStatus.ready, INSIDE_WINDOW);
+
+    await processTile(fetched, deps({ elements: [] }));
+
+    // The roll-up landed, and it moved the parent into the window. Without this the count below
+    // would also be right on a run that promoted nothing, which is the same green for the wrong
+    // reason.
+    const parent = await tileRow(ROLLED_UP);
+    expect(parent.status).toBe(TileStatus.ready);
+    expect(parent.fetchedAt).toEqual(INSIDE_WINDOW);
+
+    // Four answers — three seeded, one fetched — and not the fifth row the roll-up wrote.
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 4,
+      empty: 3,
     });
   });
 });

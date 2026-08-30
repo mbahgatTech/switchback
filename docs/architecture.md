@@ -837,8 +837,10 @@ a list an operator keeps by hand, because nothing in the estate could see the fa
 
 `readEmptyWriteRates` in `packages/ingest/src/maintenance.ts` is what makes it countable: one day of
 tile writes, grouped by the source that answered, with the share of them that landed empty. A write
-is a row whose `fetchedAt` moved, so a fetch that failed is in neither the numerator nor the
-denominator. `reportEmptyWriteRates` publishes one line per source on the two-minute pump tick,
+is a row whose `fetchedAt` a fetch wrote: a failed fetch moves that column for nothing and is in
+neither total, and a parent `promoteFrom` composed out of its four children is no source's answer at
+all — so a tile with children is excluded, rather than counted a second and a third time on the way
+up the pyramid. `reportEmptyWriteRates` publishes one line per source on the two-minute pump tick,
 which is what puts it somewhere a rule can query.
 
 **It is deliberately not a `QueueHealth` field, and that is why it is a second reading rather than a
@@ -848,8 +850,10 @@ permanently and take the other eight gauges with it. `formatQueueHealth` is also
 rules parse, so widening it breaks the rules already reading it.
 `packages/ingest/test/maintenance.test.ts` holds the separation by effect rather than by shape: a
 queue whose tiles are forty empties reads no distress, over a fake that answers by predicate and
-refuses any statement it does not already model — so a ninth arm shows up as a changed verdict or a
-thrown error rather than as a green test.
+refuses any statement — or any filter on `ingest_tiles` — it does not already model. A ninth arm
+counting empties therefore shows up as a changed verdict if it is written in a shape the fake reads
+and as a thrown error if it is not, rather than as a fake quietly answering `0` to a question it
+never understood.
 
 **What makes the share mean anything is the split, and a split needs two sources.** Ocean is real, so
 no absolute number of empty writes is a fault and no single source's share can be judged against
