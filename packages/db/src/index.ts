@@ -53,6 +53,7 @@ export {
   PhotoSource,
   RouteType,
   SacScale,
+  TileSource,
   TileStatus,
   TrailCondition,
   UnitSystem,

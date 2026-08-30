@@ -10,6 +10,7 @@ import {
   JobKind,
   OsmElementType,
   PhotoSource,
+  TileSource,
   TileStatus,
   backgroundPrisma,
   mergeTrailGeometry,
@@ -51,6 +52,7 @@ import {
   buildRouteQuery,
   buildTileQuery,
   buildWayGeometryQuery,
+  sourceSnapshotOf,
 } from './overpass';
 import { startParentRouteDiscovery } from './parent-routes';
 import { fetchTileContext, lookupRegion } from './tile-context';
@@ -281,9 +283,11 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   });
 
   let elements: OverpassElement[];
+  let sourceSnapshotAt: Date | null = null;
   try {
     const response = await deps.overpass.query(buildTileQuery(bbox));
     elements = response.elements ?? [];
+    sourceSnapshotAt = sourceSnapshotOf(response);
   } catch (error) {
     /*
      * Running out of clock on the tile query is the same verdict as running out of it in the
@@ -326,6 +330,13 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
   const assembled = assembleTrails(elements);
   log('assembled', { quadkey, elements: elements.length, trails: assembled.length });
 
+  /*
+   * Stamped by both exits that write `fetchedAt`, and by neither that does not. That pairing is
+   * what the empty-write signal reads: it weighs one source's empty tiles against the tiles that
+   * same source filled, and a failure — which fetched nothing — belongs in neither count.
+   */
+  const provenance = { sourceSnapshotAt, sourceKind: TileSource.overpass };
+
   if (assembled.length === 0) {
     await db.ingestTile.update({
       where: { quadkey },
@@ -337,6 +348,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
         trailCount: 0,
         lastError: null,
         fetchMs: Date.now() - startedAt,
+        ...provenance,
       },
     });
     await rollUpAncestors(db, quadkey);
@@ -551,6 +563,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
       trailCount: committed,
       lastError: null,
       fetchMs,
+      ...provenance,
     },
   });
 

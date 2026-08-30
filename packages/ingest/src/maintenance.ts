@@ -4,7 +4,7 @@
  */
 
 import { JobKind, JobStatus, PhotoSource, TileStatus, prisma } from '@switchback/db';
-import type { PrismaClient } from '@switchback/db';
+import type { PrismaClient, TileSource } from '@switchback/db';
 import { reconcileDeadJobs } from './dead-jobs';
 import type { AbandonedJob, TriageOptions } from './dead-jobs';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
@@ -200,6 +200,81 @@ export function formatQueueHealth(health: QueueHealth): string {
     `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain} ` +
     `photoSeedBlackout=${health.photoSeedBlackout}`
   );
+}
+
+/**
+ * The literal an operator greps for, and the token `switchback-ingest-empty-tile-writes` alerts on.
+ *
+ * **Deliberately not a `QueueHealth` field, and this is the reason.** `isDistressed` is
+ * `some((count) => count > 0)`; empty tiles exist wherever a viewport reaches ocean, so a count of
+ * them in that interface would report distress on every tick for ever and drown every other gauge
+ * in it. `formatQueueHealth` is also a field list KQL rules parse, so widening it breaks the rules
+ * already reading it. This reading is its own line for both reasons.
+ */
+export const EMPTY_WRITE_MARKER = 'switchback-ingest-empty-tile-writes';
+
+/**
+ * How much history the share is read over.
+ *
+ * A day, not the distress window's hour, because this is a proportion and an hour is not a sample.
+ * Six hours is roughly forty tiles at the nine-minute handler bound, so an hourly denominator is
+ * single digits and its share swings the whole way from 0 to 1 on one ocean tile.
+ */
+export const EMPTY_WRITE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** One source's tile writes inside the window, and how many of them landed empty. */
+export interface EmptyWriteRate {
+  /** Null on rows a fetch wrote before provenance was recorded. */
+  source: TileSource | null;
+  /** Tiles this source filled or emptied. A failed attempt writes no `fetchedAt` and is in neither. */
+  written: number;
+  empty: number;
+}
+
+/**
+ * What share of each source's tile writes said "no trails here".
+ *
+ * The one in-band signal for a source that answers an out-of-area query `200 OK` with zero
+ * elements. That response is indistinguishable from ocean on the tile it lands on, `processTile`
+ * caches it `empty` for a month, and nothing else in the estate records it — the request reads
+ * success and no job row is written. See the note above `DEFAULT_ENDPOINTS`.
+ *
+ * **Split by source and reported as a proportion, because neither an absolute count of empties nor
+ * one source's share means anything alone.** Ocean is real and its tiles are legitimately empty.
+ * What identifies the hazard is one source's share against another's over comparable ground, so
+ * until a second source exists this reading is accruing the baseline that comparison will need.
+ *
+ * `status` and `fetchedAt` are read together because one statement writes both. A later failed
+ * attempt moves `status` without moving `fetchedAt`, which would drop that tile from the empty
+ * count while leaving it in the total; an `empty` tile is not re-fetched for thirty days, so
+ * inside one window that is a rounding error rather than a bias.
+ */
+export async function readEmptyWriteRates(
+  db: PrismaClient = prisma,
+  now: Date = new Date(),
+  windowMs: number = EMPTY_WRITE_WINDOW_MS,
+): Promise<EmptyWriteRate[]> {
+  const since = new Date(now.getTime() - windowMs);
+  return db.$queryRaw<EmptyWriteRate[]>`
+    SELECT tile."sourceKind" AS source,
+           count(*)::int AS written,
+           count(*) FILTER (WHERE tile.status = 'empty')::int AS empty
+      FROM ingest_tiles tile
+     WHERE tile."fetchedAt" >= ${since}
+     GROUP BY tile."sourceKind"
+     ORDER BY tile."sourceKind"
+  `;
+}
+
+/**
+ * One source's reading as a field list, one line per source.
+ *
+ * Both counts rather than the quotient they imply: a rule has to weigh the share against the
+ * sample behind it, and `share=1.0` off two tiles is noise no threshold can tell from a mirror
+ * that has stopped serving the planet.
+ */
+export function formatEmptyWriteRate(rate: EmptyWriteRate): string {
+  return `source=${rate.source ?? 'unknown'} written=${rate.written} empty=${rate.empty}`;
 }
 
 /**

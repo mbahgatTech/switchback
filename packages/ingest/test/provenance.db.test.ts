@@ -1,0 +1,284 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { TileSource, TileStatus, prisma } from '@switchback/db';
+import { quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
+import { TerrainSource } from '../src/elevate';
+import { processTile } from '../src/pipeline';
+import type { PipelineDeps } from '../src/pipeline';
+import type { OverpassElement, OverpassQuerier, OverpassResponse } from '../src/overpass';
+import { EMPTY_WRITE_WINDOW_MS, readEmptyWriteRates } from '../src/maintenance';
+import { tileJobKey, trailEnrichJobKey } from '../src/jobs';
+import { flatTile, pngResponse } from './fixtures/terrarium';
+
+/**
+ * Tile provenance and the empty-write share, against a real Postgres.
+ *
+ * Both are about what a column holds after a write, and a fake client returns whatever the test
+ * handed it — which is the whole failure mode here, since the defect this guards against is a
+ * column that reads plausible and says something false. The share is one `count(*) FILTER`
+ * grouped by an enum; no fake shows whether that SQL groups or filters anything. Skipped unless
+ * `DATABASE_URL` is local, as CI's `gates` job makes it.
+ */
+const IS_LOCAL = /@(localhost|127\.0\.0\.1|host\.docker\.internal)[:/]/.test(
+  process.env.DATABASE_URL ?? '',
+);
+
+/**
+ * A quadkey namespace this file owns, and a clock ahead of every other suite's.
+ *
+ * `222` and `333` are taken, and `rate-limit.db.test.ts` deletes its whole prefix rather than its
+ * own keys — so a namespace here is a claim on the prefix, not on the keys inside it.
+ *
+ * `readEmptyWriteRates` has a lower bound and no upper one — a window that ends is not a thing
+ * production ever wants — so a window anchored in the past would also count every tile the
+ * suites running beside this one write at the real clock. Anchoring it ahead of them inverts
+ * that: their writes fall before `NOW - EMPTY_WRITE_WINDOW_MS` and these fixtures are the only
+ * rows the reading can see.
+ */
+const NS = '321';
+const NOW = new Date('2027-01-08T12:00:00Z');
+const INSIDE_WINDOW = new Date(NOW.getTime() - EMPTY_WRITE_WINDOW_MS / 2);
+const BEFORE_WINDOW = new Date(NOW.getTime() - EMPTY_WRITE_WINDOW_MS - 60_000);
+
+/** What the source says its own copy of OSM was current to — days behind the fetch, deliberately. */
+const SNAPSHOT = new Date('2027-01-05T04:31:07Z');
+
+const FILLED = `${NS}000000`;
+const EMPTIED = `${NS}000001`;
+const UNSTAMPED = `${NS}000002`;
+const REFUSED = `${NS}000003`;
+const SEEDED = [`${NS}000010`, `${NS}000011`, `${NS}000012`, `${NS}000013`];
+const FIXTURE_TILES = [FILLED, EMPTIED, UNSTAMPED, REFUSED, ...SEEDED];
+
+/** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
+const PREFIX = 'ZZ Provenance';
+
+/** A named way down the middle of `quadkey`, long enough to survive `MIN_TRAIL_LENGTH_M`. */
+function wayIn(quadkey: string, id: number): OverpassElement {
+  const [west, south, east, north] = quadkeyToBBox(quadkey);
+  const lat = (south + north) / 2;
+  return {
+    type: 'way',
+    id,
+    tags: { name: `${PREFIX} Ridge`, highway: 'path', surface: 'dirt' },
+    geometry: [
+      { lat, lon: west + (east - west) * 0.4 },
+      { lat, lon: west + (east - west) * 0.6 },
+    ],
+  };
+}
+
+/** Answers the tile query with `response` and every `is_in` region query with nothing. */
+function overpassOf(response: OverpassResponse): OverpassQuerier {
+  return {
+    query: (ql: string) =>
+      Promise.resolve(ql.includes('is_in(') ? { elements: [] } : { ...response }),
+  };
+}
+
+const terrain = new TerrainSource({
+  fetchImpl: () => Promise.resolve(pngResponse(flatTile(1000))),
+});
+
+function deps(response: OverpassResponse): PipelineDeps {
+  return {
+    db: prisma,
+    overpass: overpassOf(response),
+    terrain,
+    enrichWaypoints: false,
+    now: () => NOW,
+  } satisfies PipelineDeps;
+}
+
+function tileRow(quadkey: string) {
+  return prisma.ingestTile.findUniqueOrThrow({
+    where: { quadkey },
+    select: { status: true, fetchedAt: true, sourceSnapshotAt: true, sourceKind: true },
+  });
+}
+
+/** A tile written by a fetch that landed at `fetchedAt`, without running the pipeline for it. */
+async function seedWrite(
+  quadkey: string,
+  status: TileStatus,
+  fetchedAt: Date | null,
+  sourceKind: TileSource | null = TileSource.overpass,
+): Promise<void> {
+  const { x, y, z } = quadkeyToTile(quadkey);
+  const [bboxW, bboxS, bboxE, bboxN] = quadkeyToBBox(quadkey);
+  await prisma.ingestTile.create({
+    data: { quadkey, x, y, z, status, bboxW, bboxS, bboxE, bboxN, fetchedAt, sourceKind },
+  });
+}
+
+/** The window's reading for one source, or zeroes when it wrote nothing inside it. */
+async function shareFor(source: TileSource | null) {
+  const rates = await readEmptyWriteRates(prisma, NOW);
+  return rates.find((rate) => rate.source === source) ?? { source, written: 0, empty: 0 };
+}
+
+async function cleanup(): Promise<void> {
+  const doomed = await prisma.trail.findMany({
+    where: { name: { startsWith: PREFIX } },
+    select: { id: true },
+  });
+  const ids = doomed.map((row) => row.id);
+  await prisma.ingestJob.deleteMany({
+    where: { dedupeKey: { in: [...ids.map(trailEnrichJobKey), ...FIXTURE_TILES.map(tileJobKey)] } },
+  });
+  await prisma.trail.deleteMany({ where: { id: { in: ids } } });
+  await prisma.ingestTile.deleteMany({ where: { quadkey: { in: FIXTURE_TILES } } });
+}
+
+/**
+ * What the tile row says about the answer that filled it.
+ *
+ * The product tells a reader "Reconciled with OSM on ..." off a stamp, so a stamp taken from the
+ * local clock is a claim about OSM made out of nothing. `osm3s.timestamp_osm_base` is the only
+ * value in the response that answers the question actually being asked.
+ */
+describe.runIf(IS_LOCAL).sequential('the provenance a tile fetch records', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it('stamps the source’s own snapshot, not the moment we asked', async () => {
+    await processTile(
+      FILLED,
+      deps({
+        elements: [wayIn(FILLED, 930_001)],
+        osm3s: { timestamp_osm_base: SNAPSHOT.toISOString() },
+      }),
+    );
+
+    const row = await tileRow(FILLED);
+    expect(row.status).toBe(TileStatus.ready);
+    expect(row.sourceSnapshotAt).toEqual(SNAPSHOT);
+    expect(row.sourceKind).toBe(TileSource.overpass);
+    // The distinction the column exists for: the fetch and the data behind it are days apart.
+    expect(row.fetchedAt).toEqual(NOW);
+    expect(row.sourceSnapshotAt).not.toEqual(row.fetchedAt);
+  });
+
+  it('stamps a tile it wrote empty too, so an empty write can be attributed', async () => {
+    await processTile(
+      EMPTIED,
+      deps({ elements: [], osm3s: { timestamp_osm_base: SNAPSHOT.toISOString() } }),
+    );
+
+    const row = await tileRow(EMPTIED);
+    expect(row.status).toBe(TileStatus.empty);
+    expect(row.sourceKind).toBe(TileSource.overpass);
+    expect(row.sourceSnapshotAt).toEqual(SNAPSHOT);
+  });
+
+  it('leaves the snapshot null on an answer that carried none, and still names the source', async () => {
+    await processTile(UNSTAMPED, deps({ elements: [] }));
+
+    const row = await tileRow(UNSTAMPED);
+    expect(row.sourceSnapshotAt).toBeNull();
+    expect(row.sourceKind).toBe(TileSource.overpass);
+  });
+});
+
+/**
+ * The empty-write share against a real database.
+ *
+ * The detector for a source that answers an out-of-area query `200 OK` with zero elements: that
+ * response is indistinguishable from ocean on the tile it lands on and is cached `empty` for
+ * thirty days. Nothing else in the estate records it.
+ */
+describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
+  beforeEach(cleanup);
+  afterAll(async () => {
+    await cleanup();
+    await prisma.$disconnect();
+  });
+
+  it('weighs the tiles a source emptied against the tiles it filled', async () => {
+    await processTile(
+      FILLED,
+      deps({
+        elements: [wayIn(FILLED, 930_002)],
+        osm3s: { timestamp_osm_base: SNAPSHOT.toISOString() },
+      }),
+    );
+    await processTile(EMPTIED, deps({ elements: [] }));
+    await processTile(UNSTAMPED, deps({ elements: [] }));
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 3,
+      empty: 2,
+    });
+  });
+
+  it('counts each source on its own, so one cannot hide inside another’s total', async () => {
+    // The comparison the whole signal is for. Until a second source exists the split is
+    // degenerate, and a reading that collapsed the groups would look identical to this one.
+    await seedWrite(SEEDED[0]!, TileStatus.empty, INSIDE_WINDOW, TileSource.overpass);
+    await seedWrite(SEEDED[1]!, TileStatus.ready, INSIDE_WINDOW, TileSource.overpass);
+    await seedWrite(SEEDED[2]!, TileStatus.empty, INSIDE_WINDOW, null);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 2,
+      empty: 1,
+    });
+    expect(await shareFor(null)).toEqual({ source: null, written: 1, empty: 1 });
+  });
+
+  it('leaves a write older than the window out of both counts', async () => {
+    // Without this the denominator is every tile ever written and the share can no longer move.
+    await seedWrite(SEEDED[0]!, TileStatus.empty, BEFORE_WINDOW);
+    await seedWrite(SEEDED[1]!, TileStatus.empty, INSIDE_WINDOW);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 1,
+      empty: 1,
+    });
+  });
+
+  it('counts a fetch that failed in neither total, having written no data either way', async () => {
+    const refused = {
+      ...deps({ elements: [] }),
+      overpass: { query: () => Promise.reject(new Error('overpass 504 gateway timeout')) },
+    } satisfies PipelineDeps;
+
+    await expect(processTile(REFUSED, refused)).rejects.toThrow(/504/);
+
+    /*
+     * Moved into the window on purpose. `updatedAt` is the row's own clock and a failed attempt
+     * bumps it, so without this the tile would fall outside the reading for a reason that has
+     * nothing to do with the claim — and a share counting attempts rather than writes would pass
+     * this test unchanged.
+     */
+    await prisma.$executeRaw`
+      UPDATE ingest_tiles SET "updatedAt" = ${INSIDE_WINDOW} WHERE quadkey = ${REFUSED}
+    `;
+
+    const row = await tileRow(REFUSED);
+    expect(row.status).toBe(TileStatus.failed);
+    expect(row.fetchedAt).toBeNull();
+    // The whole reading, not one source's row: the failure wrote no `sourceKind` either, so
+    // asking for the Overpass group alone would answer zero whether or not the tile was counted.
+    expect(await readEmptyWriteRates(prisma, NOW)).toEqual([]);
+  });
+
+  /**
+   * The half of the separation that needs a real table: the tiles are there, inside the window,
+   * attributed to a source, and countable.
+   *
+   * That they stay out of `QueueHealth` is asserted in `maintenance.test.ts`, where the reading is
+   * decided by fixtures alone — `queueHealth` reads whole tables, so a delta taken here would be
+   * measuring whatever the suites running beside this one happen to be writing.
+   */
+  it('counts a window of tiles a source wrote empty', async () => {
+    for (const quadkey of SEEDED) await seedWrite(quadkey, TileStatus.empty, INSIDE_WINDOW);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: SEEDED.length,
+      empty: SEEDED.length,
+    });
+  });
+});

@@ -828,6 +828,49 @@ not configured. Until it is, the part of this signal that survives is the `lastE
 exhausted its retries, which is what `queueHealth`'s `rateLimited` counts and
 `switchback-ingest-queue-distress` alerts on.
 
+**A source that answers about ground it does not hold is invisible to every rule above.** A mirror
+serving a regional extract rather than the planet answers an out-of-area query `200 OK` with zero
+elements. `processTile` cannot tell that from ocean: it writes `empty`, and `isTileFresh` sells that
+answer for `TILE_TTL_MS`. The request reads success, no job row is written, and no field of
+`queueHealth` moves. `overpass.osm.ch` is absent from `DEFAULT_ENDPOINTS` for exactly this reason —
+a list an operator keeps by hand, because nothing in the estate could see the failure it prevents.
+
+`readEmptyWriteRates` in `packages/ingest/src/maintenance.ts` is what makes it countable: one day of
+tile writes, grouped by the source that answered, with the share of them that landed empty. A write
+is a row whose `fetchedAt` moved, so a fetch that failed is in neither the numerator nor the
+denominator. `reportEmptyWriteRates` publishes one line per source on the two-minute pump tick,
+which is what puts it somewhere a rule can query.
+
+**It is deliberately not a `QueueHealth` field, and that is why it is a second reading rather than a
+ninth count.** `isDistressed` is `some((count) => count > 0)` and empty tiles exist wherever a
+viewport reaches ocean, so a field counting them would hold `switchback-ingest-queue-distress` on
+permanently and take the other eight gauges with it. `formatQueueHealth` is also a field list the KQL
+rules parse, so widening it breaks the rules already reading it.
+`packages/ingest/test/maintenance.test.ts` holds the separation by effect rather than by shape: a
+queue whose tiles are forty empties reads no distress, over a fake that answers by predicate and
+refuses any statement it does not already model — so a ninth arm shows up as a changed verdict or a
+thrown error rather than as a green test.
+
+**What makes the share mean anything is the split, and a split needs two sources.** Ocean is real, so
+no absolute number of empty writes is a fault and no single source's share can be judged against
+anything — what identifies a regional extract is one source's share against another's over
+comparable ground. `IngestTile.sourceKind` records which upstream answered. Until a second one
+exists this reading is accruing the baseline that comparison will need, which is the reason the
+signal ships ahead of the exposure it exists to catch rather than beside it.
+
+`IngestTile.sourceSnapshotAt` is the other half of that row's provenance: `osm3s.timestamp_osm_base`
+from the answer that filled the tile, which is how current the source's own copy of OSM was and not
+when it was asked. **It is a different fact from `Trail.sourceUpdatedAt`**, which `commitTrail`
+stamps from the ingest clock and which the trail page renders as "Reconciled with OpenStreetMap
+&lt;date&gt;". The two are days apart on any real answer, and the sentence on the page is about the
+first while the column behind it holds the second.
+
+`switchback-ingest-empty-tile-writes` in `infra/azure/ingest.bicep` reads the published line and is
+declared **disarmed**. Its threshold is a placeholder rather than a measurement: with one source
+there is nothing to compare a share against, so arming it would page on the geography of whatever
+people happened to pan over. It is armed, with a threshold taken from the accrued baseline, when a
+second source starts answering.
+
 **What the deadline does not do is make a dense tile ingestable, and the second flag-on run says so
 plainly.** 2026-08-04T00:14Z-01:23Z, ten `ingestDrain` invocations, none killed — the longest was
 543,653.9 ms against a 600,000 ms `functionTimeout`, where the previous run's longest was

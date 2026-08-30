@@ -83,6 +83,20 @@ export interface OverpassResponse {
   remark?: string;
 }
 
+/**
+ * When the source's own copy of OSM was last current, out of `osm3s.timestamp_osm_base`.
+ *
+ * Null rather than the clock for a missing or unparseable stamp. A caller wants this to say how
+ * stale the data behind an answer is, and substituting the moment the question was asked answers
+ * a different question in the same column.
+ */
+export function sourceSnapshotOf(response: OverpassResponse): Date | null {
+  const stamp = response.osm3s?.timestamp_osm_base;
+  if (!stamp) return null;
+  const parsed = new Date(stamp);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 export interface OverpassOptions {
   /**
    * One endpoint, or several tried in order. Empty entries are dropped, so a half-filled

@@ -7,6 +7,7 @@ import {
   buildFeatureQuery,
   buildRegionQuery,
   buildTileQuery,
+  sourceSnapshotOf,
 } from '../src/overpass';
 import type { OverpassOptions } from '../src/overpass';
 
@@ -581,5 +582,32 @@ describe('query builders', () => {
 
   it('builds an is_in region query in lat,lng order', () => {
     expect(buildRegionQuery([-4.5, 56.8])).toContain('is_in(56.8,-4.5)');
+  });
+});
+
+/**
+ * `osm3s.timestamp_osm_base` is how current the source's own copy of OSM was when it answered,
+ * which is a different fact from when it was asked. `IngestTile.sourceSnapshotAt` stores it, and
+ * a caller that substituted the clock for a missing one would fill that column with the very
+ * falsehood it exists to remove.
+ */
+describe('the snapshot behind an answer', () => {
+  it('reads the moment the source’s copy of OSM was last current', () => {
+    const response = { elements: [], osm3s: { timestamp_osm_base: '2026-08-27T20:14:02Z' } };
+    expect(sourceSnapshotOf(response)).toEqual(new Date('2026-08-27T20:14:02Z'));
+  });
+
+  it('says nothing rather than the clock when the answer carried no stamp', () => {
+    expect(sourceSnapshotOf({ elements: [] })).toBeNull();
+    expect(sourceSnapshotOf({ elements: [], osm3s: {} })).toBeNull();
+    expect(sourceSnapshotOf({ elements: [], osm3s: { timestamp_osm_base: '' } })).toBeNull();
+  });
+
+  it('says nothing rather than an Invalid Date on a stamp it cannot read', () => {
+    // A column holding `Invalid Date` reaches Postgres as a rejected write, which fails the whole
+    // tile over a field nothing depends on.
+    expect(
+      sourceSnapshotOf({ elements: [], osm3s: { timestamp_osm_base: 'last Tuesday' } }),
+    ).toBeNull();
   });
 });

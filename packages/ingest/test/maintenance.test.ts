@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { JobKind, JobStatus, TileStatus } from '@switchback/db';
+import { JobKind, JobStatus, TileSource, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { reconcileOrphanedSplits } from '../src/subdivide';
+import { SUBTREE_STUCK_MARKER, reconcileOrphanedSplits } from '../src/subdivide';
 import {
   DEFAULT_MAX_ATTEMPTS,
   HOST_FUNCTION_TIMEOUT_MS,
@@ -17,9 +17,11 @@ import {
   TILE_WEDGED_MARKER,
   WEDGE_GRACE_MS,
   countWedgedTiles,
+  formatEmptyWriteRate,
   isDistressed,
   photoSeedBlackout,
   queueHealth,
+  readEmptyWriteRates,
   repairWedgedTiles,
   sweepQueue,
 } from '../src/maintenance';
@@ -646,5 +648,91 @@ describe('repairWedgedTiles', () => {
     const repair = source.indexOf('repairWedgedTiles(db, now)');
     expect(reclaim).toBeGreaterThan(-1);
     expect(repair).toBeGreaterThan(reclaim);
+  });
+});
+
+/**
+ * The empty-write signal is not a member of `QueueHealth`, and this is the assertion that keeps it
+ * out.
+ *
+ * `isDistressed` is `some((count) => count > 0)`, and empty tiles exist wherever a viewport reaches
+ * ocean. A ninth count reading them would hold the distress alert on for as long as there is water,
+ * which takes the other eight gauges with it — the failure `DISTRESS_WINDOW_MS` and `stalledDrain`
+ * were both reshaped to avoid, arriving through a new field instead.
+ */
+describe('a queue whose tiles are mostly empty', () => {
+  const NOW = new Date('2026-08-07T10:00:00Z');
+
+  /** Every tile row this fake holds, in the columns `queueHealth` filters on. */
+  interface EmptyTileRow {
+    status: TileStatus;
+    lastError: string | null;
+  }
+
+  function matches(tile: EmptyTileRow, where: TileWhere): boolean {
+    if (where.status !== undefined && (where.status as unknown) !== tile.status) return false;
+    const contains = where.lastError?.contains;
+    return contains === undefined ? true : (tile.lastError ?? '').includes(contains);
+  }
+
+  /**
+   * A queue holding `tiles` and no jobs, answering by predicate rather than by call order.
+   *
+   * Order-indexed fakes cannot see a *new* reader — a ninth arm would take whichever answer the
+   * eighth left behind — so this one evaluates the `where` it is handed and refuses any statement
+   * it does not already model. Both halves matter: a new Prisma count over `ingest_tiles` shows up
+   * as a changed verdict, and a new raw statement shows up as a thrown error, neither of which a
+   * fixed script of answers would show at all.
+   */
+  function tableDb(tiles: readonly EmptyTileRow[]): PrismaClient {
+    return {
+      ingestJob: {
+        count: async () => 0,
+        findFirst: async () => null,
+        aggregate: async () => ({ _max: { completedAt: null } }),
+      },
+      ingestTile: {
+        count: async ({ where }: { where: TileWhere }) =>
+          tiles.filter((tile) => matches(tile, where)).length,
+      },
+      $queryRaw: async (strings: TemplateStringsArray) => {
+        const sql = strings.join('');
+        if (sql.includes('photos photo')) return [{ completed: 0, seeded: 0 }];
+        if (sql.includes('ingest_tiles child')) return [{ count: 0 }];
+        if (sql.includes("tile.status = 'running'")) return [{ count: 0 }];
+        throw new Error(`queueHealth ran a statement this fake does not model: ${sql}`);
+      },
+    } as unknown as PrismaClient;
+  }
+
+  const ocean: EmptyTileRow[] = Array.from({ length: 40 }, () => ({
+    status: TileStatus.empty,
+    lastError: null,
+  }));
+
+  it('reads no distress at all, however many of them there are', async () => {
+    const health = await queueHealth(tableDb(ocean), NOW);
+
+    expect(isDistressed(health)).toBe(false);
+    // Not one field, and not by name: an empty tile is not evidence of anything the queue can do
+    // about it, so no arm of the reading may move on one.
+    expect(Object.values(health).every((count) => count === 0)).toBe(true);
+  });
+
+  it('still reads the distress that is really there, so the verdict above is not a dead fake', async () => {
+    const wedged = [...ocean, { status: TileStatus.pending, lastError: SUBTREE_STUCK_MARKER }];
+
+    expect(isDistressed(await queueHealth(tableDb(wedged), NOW))).toBe(true);
+  });
+
+  it('counts the same tiles as an empty-write share, which is where they do belong', async () => {
+    const rates = await readEmptyWriteRates(
+      {
+        $queryRaw: async () => [{ source: TileSource.overpass, written: 40, empty: 40 }],
+      } as unknown as PrismaClient,
+      NOW,
+    );
+
+    expect(rates.map(formatEmptyWriteRate)).toEqual(['source=overpass written=40 empty=40']);
   });
 });
