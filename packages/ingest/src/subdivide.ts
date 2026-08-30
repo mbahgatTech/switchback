@@ -18,8 +18,13 @@ import { isTileFresh, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
 import { DEFAULT_MAX_ATTEMPTS, LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
 
-/** How many children a quadkey has. Four, always — that is what "quad" means. */
-export const CHILDREN_PER_TILE = 4;
+/**
+ * How many children a quadkey has. Four, always — that is what "quad" means.
+ *
+ * Counted off `childQuadkeys` rather than written out, because the predicates that decide whether
+ * a subtree is complete compare this number against rows that function's output produced.
+ */
+export const CHILDREN_PER_TILE = childQuadkeys('').length;
 
 /**
  * The `lastError` a split leaves on the parent, and the predicate `reconcileOrphanedSplits`

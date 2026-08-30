@@ -9,7 +9,12 @@ import { childQuadkeys } from '@switchback/geo';
 import { reconcileDeadJobs } from './dead-jobs';
 import type { AbandonedJob, TriageOptions } from './dead-jobs';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
-import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
+import {
+  CHILDREN_PER_TILE,
+  SUBTREE_STUCK_MARKER,
+  countOrphanedSplits,
+  reconcileOrphanedSplits,
+} from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
 
 export interface SweepResult {
@@ -253,20 +258,34 @@ export interface EmptyWriteRate {
  * What identifies the hazard is one source's share against another's over comparable ground, so
  * until a second source exists this reading is accruing the baseline that comparison will need.
  *
- * **A tile with children is not one of its own writes, and is excluded.** `promoteFrom` composes
- * a parent row out of its four children after every tile a fetch finishes, and it is the only path
- * outside `processTile` that moves `fetchedAt` on this table — so one query answered about a z11
- * was otherwise counted again at z10 and again at z9, attributed to whichever source last answered
- * about the ancestor itself. The predicate is the roll-up's own precondition read off the child
- * rows, not a flag a writer has to remember to set: `promoteFrom` writes nothing `childTiles` did
- * not return four rows for. A tile subdivided *since* its own last answer goes with them, which is
- * the same fact taken conservatively — a box that has been split no longer stands for ground one
+ * **A tile with a full set of children is not one of its own writes, and is excluded.**
+ * `promoteFrom` composes a parent row out of its four children after every tile a fetch finishes,
+ * and it is the only path outside `processTile` that moves `fetchedAt` on this table — so one
+ * query answered about a z11 would otherwise be counted again at z10 and again at z9, attributed
+ * to whichever source last answered about the ancestor itself. The predicate is the roll-up's own
+ * precondition read off the child rows rather than a flag a writer has to remember to set:
+ * `rollUp` returns null below `CHILDREN_PER_TILE`, so `promoteFrom` writes nothing `childTiles`
+ * returned a full set for. A tile subdivided *since* its own last answer goes with them, which is
+ * the same fact taken conservatively — a box split into four no longer stands for ground one
  * answer covers.
+ *
+ * **Fewer than four children is not that fact, and keeps the parent in.** `splitTile` upserts its
+ * children one at a time outside a transaction and writes the parent's split marker last, so a
+ * host kill part-way through leaves 1–3 children and no marker — a state nothing repairs, since
+ * `reconcileOrphanedSplits` keys on the marker and `processTile` promotes only at four. That
+ * parent is re-fetched on the ordinary path, and the row it writes is one source's own answer.
+ * `< CHILDREN_PER_TILE` is therefore the predicate rather than `NOT EXISTS`, which would discard
+ * that answer for as long as the stray children live.
  *
  * **Four primary-key probes rather than `LIKE quadkey || '_'`.** A `LIKE` whose pattern is a column
  * cannot use an index, so that anti-join degrades to the cross product: on this schema at 5,000
  * rows inside the window it discarded 25,000,000 join-filter rows in 3.2 s, against 47.9 ms for the
- * probes below. This runs on the two-minute pump tick.
+ * probes below. Counting the probes rather than stopping at the first is the same plan over the
+ * same index and costs nothing measurable: 61.3/57.1/50.0 ms against `NOT EXISTS`'s 52.5/57.2/46.0
+ * ms, three runs each at that row count on `postgis/postgis:17-3.5`. It does raise the planner's
+ * estimate about fourfold, which is what can carry the statement over `jit_above_cost` — those
+ * readings are taken with `jit` off so the two forms are compared on the same terms. This runs on
+ * the two-minute pump tick.
  *
  * `status` and `fetchedAt` are read together because one statement writes both. A later failed
  * attempt moves `status` without moving `fetchedAt`, which would drop that tile from the empty
@@ -286,9 +305,9 @@ export async function readEmptyWriteRates(
            count(*) FILTER (WHERE tile.status = 'empty')::int AS empty
       FROM ingest_tiles tile
      WHERE tile."fetchedAt" >= ${since}
-       AND NOT EXISTS (SELECT 1
-                         FROM unnest(${CHILD_SUFFIXES}::text[]) AS suffix
-                         JOIN ingest_tiles child ON child.quadkey = tile.quadkey || suffix)
+       AND (SELECT count(*)
+              FROM unnest(${CHILD_SUFFIXES}::text[]) AS suffix
+              JOIN ingest_tiles child ON child.quadkey = tile.quadkey || suffix) < ${CHILDREN_PER_TILE}
      GROUP BY tile."sourceKind"
      ORDER BY tile."sourceKind"
   `;

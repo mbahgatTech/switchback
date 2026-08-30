@@ -839,9 +839,12 @@ a list an operator keeps by hand, because nothing in the estate could see the fa
 tile writes, grouped by the source that answered, with the share of them that landed empty. A write
 is a row whose `fetchedAt` a fetch wrote: a failed fetch moves that column for nothing and is in
 neither total, and a parent `promoteFrom` composed out of its four children is no source's answer at
-all — so a tile with children is excluded, rather than counted a second and a third time on the way
-up the pyramid. `reportEmptyWriteRates` publishes one line per source on the two-minute pump tick,
-which is what puts it somewhere a rule can query.
+all — so a tile holding a full set of four is excluded, rather than counted a second and a third
+time on the way up the pyramid. The predicate is that count rather than the existence of any child:
+`rollUp` returns null below `CHILDREN_PER_TILE`, so a parent left holding one to three of them by an
+interrupted `splitTile` is re-fetched on the ordinary path and the row it writes is its own answer.
+`reportEmptyWriteRates` publishes one line per source on the two-minute pump tick, which is what
+puts it somewhere a rule can query.
 
 **It is deliberately not a `QueueHealth` field, and that is why it is a second reading rather than a
 ninth count.** `isDistressed` is `some((count) => count > 0)` and empty tiles exist wherever a

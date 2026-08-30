@@ -56,6 +56,10 @@ const SEEDED = [`${NS}000010`, `${NS}000011`, `${NS}000012`, `${NS}000013`];
  */
 const ROLLED_UP = `${NS}000020`;
 const ROLLED_UP_CHILDREN = childQuadkeys(ROLLED_UP);
+
+/** A z9 parent holding one child, which is all an interrupted `splitTile` leaves behind. */
+const INTERRUPTED = `${NS}000030`;
+const STRAY_CHILD = `${INTERRUPTED}0`;
 const FIXTURE_TILES = [
   FILLED,
   EMPTIED,
@@ -64,6 +68,8 @@ const FIXTURE_TILES = [
   ...SEEDED,
   ROLLED_UP,
   ...ROLLED_UP_CHILDREN,
+  INTERRUPTED,
+  STRAY_CHILD,
 ];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
@@ -329,6 +335,34 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       source: TileSource.overpass,
       written: 4,
       empty: 3,
+    });
+  });
+
+  /**
+   * A parent that answered for itself while one child of a stalled subdivision sits beside it.
+   *
+   * `splitTile` upserts its four children one at a time outside a transaction and writes the
+   * parent's marker last, so a host kill part-way through leaves 1–3 children and no marker —
+   * a state nothing repairs, since `reconcileOrphanedSplits` keys on the marker and `processTile`
+   * promotes only at four. The parent is re-fetched on the ordinary path and the row is its own
+   * answer, which is exactly the hazard this reading exists to see. An exclusion keyed on *any*
+   * child would drop it from both counts for as long as the stray row lives.
+   */
+  it('counts a tile that answered for itself, beside a child a stalled split left', async () => {
+    await seedWrite(STRAY_CHILD, TileStatus.pending, null, null);
+
+    await processTile(INTERRUPTED, deps({ elements: [] }));
+
+    // The parent's own write, from the ordinary fetch path rather than from a roll-up.
+    const parent = await tileRow(INTERRUPTED);
+    expect(parent.status).toBe(TileStatus.empty);
+    expect(parent.fetchedAt).toEqual(NOW);
+    expect(parent.sourceKind).toBe(TileSource.overpass);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 1,
+      empty: 1,
     });
   });
 });

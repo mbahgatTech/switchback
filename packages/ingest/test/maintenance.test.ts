@@ -3,7 +3,11 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { SUBTREE_STUCK_MARKER, reconcileOrphanedSplits } from '../src/subdivide';
+import {
+  SUBTREE_STUCK_MARKER,
+  countOrphanedSplits,
+  reconcileOrphanedSplits,
+} from '../src/subdivide';
 import {
   DEFAULT_MAX_ATTEMPTS,
   HOST_FUNCTION_TIMEOUT_MS,
@@ -20,6 +24,8 @@ import {
   isDistressed,
   photoSeedBlackout,
   queueHealth,
+  readEmptyWriteRates,
+  readEnrichWindow,
   repairWedgedTiles,
   sweepQueue,
 } from '../src/maintenance';
@@ -306,6 +312,54 @@ describe('the sweep the timer calls', () => {
   });
 });
 
+/** The raw readings `queueHealth` composes, named by the field each one feeds. */
+type RawReading = 'orphanedSplits' | 'wedgedTiles' | 'enrichWindow';
+
+/**
+ * The statement one reader emits, read off the reader rather than transcribed from it.
+ *
+ * No rows is an answer all three already handle: each destructures one row and falls back to zero.
+ */
+async function statementOf(read: (db: PrismaClient) => Promise<unknown>): Promise<string> {
+  let statement: string | null = null;
+  const recorder = {
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      statement = strings.join('');
+      return [];
+    },
+  } as unknown as PrismaClient;
+
+  await read(recorder);
+  if (statement === null) throw new Error('a reading queueHealth composes ran no raw statement');
+  return statement;
+}
+
+/** Captured once: the statements are static text, and `queueHealth` asks for all three at once. */
+let statements: Promise<Record<RawReading, string>> | null = null;
+
+/**
+ * Which reading a statement is, or a throw naming it as one the fakes below do not model.
+ *
+ * **Matched whole, never on a fragment of the SQL.** `ingest_tiles child` reads as
+ * `countOrphanedSplits` and is equally a fragment of `readEmptyWriteRates`, so a discriminator
+ * short enough to write by hand can name a statement it does not mean — and a fake answering the
+ * wrong statement is answering for the code under test, which is what these fakes exist to make
+ * impossible. Text taken from the emitters cannot drift from them, and a statement no emitter
+ * emits is unmodelled by construction rather than by a judgement call.
+ */
+async function readingOf(sql: string): Promise<RawReading> {
+  statements ??= (async () => ({
+    orphanedSplits: await statementOf((db) => countOrphanedSplits(db)),
+    wedgedTiles: await statementOf((db) => countWedgedTiles(db)),
+    enrichWindow: await statementOf((db) => readEnrichWindow(db, new Date(0))),
+  }))();
+
+  const known = await statements;
+  const reading = (Object.keys(known) as RawReading[]).find((key) => known[key] === sql);
+  if (reading === undefined) throw new Error(`a statement this fake does not model: ${sql}`);
+  return reading;
+}
+
 describe('the queue health report', () => {
   const NOW = new Date('2026-08-07T10:00:00Z');
 
@@ -320,15 +374,16 @@ describe('the queue health report', () => {
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
       ingestTile: { count: async () => reading.stuckSubtrees },
-      // Three correlated reads share this seam; each is named by a table only its query mentions.
+      // Three correlated reads share this seam, told apart by the statement each one emits.
       $queryRaw: async (strings: TemplateStringsArray) => {
-        const sql = strings.join('');
-        if (sql.includes('photos photo')) {
-          return [{ completed: MIN_ENRICH_SAMPLE, seeded: reading.photoSeedBlackout ? 0 : 1 }];
+        switch (await readingOf(strings.join(''))) {
+          case 'enrichWindow':
+            return [{ completed: MIN_ENRICH_SAMPLE, seeded: reading.photoSeedBlackout ? 0 : 1 }];
+          case 'orphanedSplits':
+            return [{ count: reading.orphanedSplits }];
+          case 'wedgedTiles':
+            return [{ count: reading.wedgedTiles }];
         }
-        return sql.includes('ingest_tiles child')
-          ? [{ count: reading.orphanedSplits }]
-          : [{ count: reading.wedgedTiles }];
       },
     } as unknown as PrismaClient;
   }
@@ -716,7 +771,9 @@ describe('a queue whose tiles are mostly empty', () => {
    * eighth left behind — so this one evaluates the `where` it is handed and refuses any statement
    * it does not already model. Both halves matter: a new Prisma count over `ingest_tiles` shows up
    * as a changed verdict, and a new raw statement shows up as a thrown error, neither of which a
-   * fixed script of answers would show at all.
+   * fixed script of answers would show at all. `readingOf` is what holds the second half: it
+   * matches the whole statement each modelled reader emits, so a reader this fake has never seen
+   * cannot be taken for one it has.
    */
   function tableDb(tiles: readonly EmptyTileRow[]): PrismaClient {
     return {
@@ -733,11 +790,13 @@ describe('a queue whose tiles are mostly empty', () => {
         },
       },
       $queryRaw: async (strings: TemplateStringsArray) => {
-        const sql = strings.join('');
-        if (sql.includes('photos photo')) return [{ completed: 0, seeded: 0 }];
-        if (sql.includes('ingest_tiles child')) return [{ count: 0 }];
-        if (sql.includes("tile.status = 'running'")) return [{ count: 0 }];
-        throw new Error(`queueHealth ran a statement this fake does not model: ${sql}`);
+        switch (await readingOf(strings.join(''))) {
+          case 'enrichWindow':
+            return [{ completed: 0, seeded: 0 }];
+          case 'orphanedSplits':
+          case 'wedgedTiles':
+            return [{ count: 0 }];
+        }
       },
     } as unknown as PrismaClient;
   }
@@ -760,5 +819,17 @@ describe('a queue whose tiles are mostly empty', () => {
     const wedged = [...ocean, { status: TileStatus.pending, lastError: SUBTREE_STUCK_MARKER }];
 
     expect(isDistressed(await queueHealth(tableDb(wedged), NOW))).toBe(true);
+  });
+
+  /**
+   * The refusal exercised rather than asserted about.
+   *
+   * `readEmptyWriteRates` is the reading a ninth field would most naturally be wired to: it is
+   * exported from the module `queueHealth` lives in, and it joins `ingest_tiles child` exactly as
+   * `countOrphanedSplits` does. Running its real statement through this fake is what shows the two
+   * verdicts above cannot be satisfied by a fake answering a question it never understood.
+   */
+  it('refuses the empty-write reading rather than answering it a zero of its own', async () => {
+    await expect(readEmptyWriteRates(tableDb(ocean), NOW)).rejects.toThrow(/does not model/);
   });
 });
