@@ -6,6 +6,7 @@ import {
   countMermaidBlocks,
   gitCommitTree,
   mermaidTargets,
+  resolveRef,
   type CommitTree,
 } from '../scripts/check-mermaid-github';
 
@@ -81,6 +82,33 @@ describe('choosing which files to check', () => {
  * excludes a file that is only on disk, and would silently restore the half where a diagram the
  * commit carries is never loaded at all.
  */
+describe('naming the commit a blob URL asks for', () => {
+  /*
+   * github.com resolves a symbolic ref in a blob path against the default branch, so `HEAD` in
+   * the URL renders the base of a pull request while the expected block counts come from its
+   * head. Both trees usually carry the same number of blocks, so the run is green and about the
+   * wrong commit — the failure this whole script exists to prevent, one level up.
+   */
+  const head = git(['rev-parse', 'HEAD']);
+
+  it('resolves the default to the commit checked out, as a SHA', () => {
+    expect(resolveRef(undefined)).toBe(head);
+    expect(resolveRef(undefined)).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('resolves a symbolic ref rather than passing it through', () => {
+    expect(resolveRef('HEAD')).toBe(head);
+  });
+
+  it('leaves a full SHA alone', () => {
+    expect(resolveRef(head)).toBe(head);
+  });
+
+  it('fails loudly on a ref this clone does not have', () => {
+    expect(() => resolveRef('no-such-ref-9f3a2b')).toThrow();
+  });
+});
+
 describe('reading a commit out of the clone', () => {
   const probeDir = `${REPO_ROOT}tmp`;
   const onDiskOnly = `${probeDir}/mermaid-target-probe.md`;

@@ -1,14 +1,6 @@
 /**
- * The tile-wide Overpass lookups every trail in a tile needs: which region the ground is in, and
- * which waypoints sit on it. Both are functions of the tile bbox alone, so both are in flight at
- * once — a lookup that reads no part of the tile query's answer has no reason to wait for it, and
- * these two sit between the tile query and the first committed trail.
- *
- * The overlap lives inside the shared client's allowance, not beside it: both calls go through the
- * one `deps.overpass` queue, so `OVERPASS_MAX_CONCURRENT` bounds this process against the whole of
- * Overpass. Two is the documented-safe number of slots an instance allots one IP, and this fills
- * that budget rather than widening it. Raising the cap, or opening a second client to get a third
- * slot, earns an IP block — which takes ingest down for the product, not for one tile.
+ * The tile-wide Overpass lookups every trail needs — which region the ground is in, and which
+ * waypoints sit on it. Both take the tile bbox and nothing from the tile query's answer.
  */
 
 import type { BBox, LngLat } from '@switchback/core';
@@ -48,6 +40,18 @@ export async function fetchTileContext(
   bbox: BBox,
   deps: TileContextDeps,
 ): Promise<TileContext> {
+  /*
+   * Two slots is what an instance allots one IP, and this fills that budget rather than widening
+   * it: both calls go through the one `deps.overpass` queue, so `OVERPASS_MAX_CONCURRENT` bounds
+   * the process however many callers overlap. `test/tile-context.test.ts` is what holds that.
+   *
+   * **A deadline cannot separate the two.** `withDeadline` refuses synchronously at call time, so
+   * a serial pair refuses the second lookup when the budget expires during the first, and this
+   * pair refuses neither — one request more than serial, on that path alone, and not separable
+   * from the overlap. Whether the estate sends more in aggregate is UNVERIFIED: a tile that
+   * finishes sooner is a tile less likely to reach a deadline at all. Settling it needs the
+   * population of tiles whose budget expires inside that window, which no counter records today.
+   */
   const [region, features] = await Promise.all([
     lookupRegion(bbox, deps),
     lookupFeatures(quadkey, bbox, deps),

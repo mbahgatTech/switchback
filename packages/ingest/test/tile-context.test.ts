@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { OverpassClient, OverpassDeadlineError, withDeadline } from '../src/overpass';
-import type { OverpassElement, OverpassResponse } from '../src/overpass';
+import {
+  OverpassClient,
+  OverpassDeadlineError,
+  buildFeatureQuery,
+  buildRegionQuery,
+  withDeadline,
+} from '../src/overpass';
+import type { OverpassElement, OverpassQuerier, OverpassResponse } from '../src/overpass';
 import { fetchTileContext, pickRegion } from '../src/tile-context';
 import type { BBox } from '@switchback/core';
 
@@ -193,6 +199,45 @@ describe('fetchTileContext', () => {
     expect(
       logged.filter((line) => line.includes('switchback-ingest-overpass-skipped')),
     ).toHaveLength(2);
+  });
+
+  it('sends both lookups when the budget expires during the first, where a serial pair sends one', async () => {
+    /*
+     * The one path where overlapping asks Overpass for more than taking turns does.
+     * `withDeadline` refuses synchronously at call time, so a serial pair never sends the second
+     * lookup once the first has spent the budget, and a pair committed in the same tick sends
+     * both. Pinned rather than fixed: the two cannot be had at once, and a future change must be
+     * able to see which one it is trading away.
+     */
+    const clock = { now: 1_000 };
+    const deadlineAt = 1_500;
+
+    /** A view whose first query spends the whole remaining budget. */
+    function spendsTheBudget(): { overpass: OverpassQuerier; sent: string[] } {
+      const sent: string[] = [];
+      const inner: OverpassQuerier = {
+        query: (ql: string) => {
+          sent.push(kindOf(ql));
+          return Promise.resolve().then(() => {
+            clock.now = 2_000;
+            return { elements: [] };
+          });
+        },
+      };
+      return { overpass: withDeadline(inner, deadlineAt, () => clock.now), sent };
+    }
+
+    clock.now = 1_000;
+    const overlapped = spendsTheBudget();
+    await fetchTileContext(QUADKEY, BBOX, { overpass: overlapped.overpass });
+
+    clock.now = 1_000;
+    const serial = spendsTheBudget();
+    await serial.overpass.query(buildRegionQuery([-4.15, 56.85])).catch(() => undefined);
+    await serial.overpass.query(buildFeatureQuery(BBOX)).catch(() => undefined);
+
+    expect(overlapped.sent).toEqual(['region', 'features']);
+    expect(serial.sent).toEqual(['region']);
   });
 
   it('survives a deadline that expires while both lookups are already in flight', async () => {

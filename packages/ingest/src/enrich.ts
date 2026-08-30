@@ -450,7 +450,8 @@ export async function fetchSeedPhotos(
   return [...commons, ...mapillary];
 }
 
-/** The bbox to search for features around a trail, padded by the waypoint buffer. */
+/** A tile's bbox grown by `PARKING_BUFFER_M`, so a car park up an access road past the edge is
+ * still in the answer. */
 export function featureSearchBBox(bbox: BBox): BBox {
   return padBBox(bbox, PARKING_BUFFER_M);
 }

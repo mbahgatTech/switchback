@@ -63,6 +63,15 @@ export function mermaidTargets(tree: CommitTree): Target[] {
  * A commit in this clone. Absent objects make `git` throw, which ends the run loudly rather than
  * finding nothing to check and calling that a pass.
  */
+/**
+ * The commit to name in every blob URL, always as a SHA. github.com resolves a symbolic ref in a
+ * blob path against the *default branch*, so passing `HEAD` through renders master while the
+ * expected block counts are read from the head commit — a green run about the wrong tree.
+ */
+export function resolveRef(ref: string | undefined): string {
+  return git('rev-parse', ref ?? 'HEAD').trim();
+}
+
 export function gitCommitTree(ref: string): CommitTree {
   return {
     // `-z`, because `ls-tree` otherwise quotes and backslash-escapes any path outside ASCII.
@@ -112,7 +121,7 @@ async function renderedBlocks(frames: Frame[]): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const ref = process.argv[2] ?? git('rev-parse', 'HEAD').trim();
+  const ref = resolveRef(process.argv[2]);
   const slug = repoSlug();
 
   const targets = mermaidTargets(gitCommitTree(ref));
