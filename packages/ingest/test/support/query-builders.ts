@@ -1,12 +1,13 @@
 /**
- * The Overpass answers this repository asks for, found by reading its source rather than by
- * listing them, so a builder added anywhere is one a fixture guard can notice is unrecorded.
+ * The Overpass answers this repository asks for, read off the syntax of every non-test `.ts` and
+ * `.tsx` under it, so a query written in any of them is one a fixture guard can notice.
  */
 
 import { readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 
@@ -27,9 +28,6 @@ const SKIP_DIRS = new Set([
 /** Every Overpass query opens with this, and only a builder writes one. */
 const QL_HEADER = '[out:json';
 
-/** A top-level declaration, so an indented `const box = …` inside a builder cannot claim its QL. */
-const DECLARATION = /^(?:export )?(?:async )?(?:function|const) (\w+)/u;
-
 /** Tests quote Overpass QL as an expectation; only production source builds one. */
 function isTestSource(path: string): boolean {
   return (
@@ -47,13 +45,55 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-/** The nearest top-level declaration at or above a line — the builder the QL belongs to. */
-function declarationAbove(lines: readonly string[], at: number): string | null {
-  for (let i = at; i >= 0; i -= 1) {
-    const match = DECLARATION.exec(lines[i]!);
-    if (match) return match[1]!;
+/** The literal kinds QL can be written as, template pieces included. */
+const LITERAL_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.StringLiteral,
+  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+  ts.SyntaxKind.TemplateHead,
+  ts.SyntaxKind.TemplateMiddle,
+  ts.SyntaxKind.TemplateTail,
+]);
+
+/** The name a declaration introduces, whichever kind of declaration it is. */
+function declaredName(node: ts.Node, source: ts.SourceFile): string | null {
+  const name =
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isClassDeclaration(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertyAssignment(node)
+      ? node.name
+      : undefined;
+  if (!name) return null;
+  return ts.isIdentifier(name) ? name.text : name.getText(source);
+}
+
+function enclosingFunction(node: ts.Node): ts.Node | null {
+  for (let at = node.parent as ts.Node | undefined; at && !ts.isSourceFile(at); at = at.parent) {
+    if (ts.isFunctionLike(at)) return at;
   }
   return null;
+}
+
+function nameAtOrAbove(node: ts.Node, source: ts.SourceFile): string | null {
+  for (let at: ts.Node | undefined = node; at && !ts.isSourceFile(at); at = at.parent) {
+    const name = declaredName(at, source);
+    if (name) return name;
+  }
+  return null;
+}
+
+/**
+ * The builder a QL literal belongs to: the innermost function around it, or — when that function
+ * is anonymous — the name it is bound to. Taken from the syntax tree because a method, a
+ * `class`, an `export default function` and an indented `const` are all places a query can be
+ * written, and reading the nearest declaration *line* instead credits every one of them to
+ * whatever unrelated top-level name happens to sit above.
+ */
+function ownerOf(literal: ts.Node, source: ts.SourceFile): string | null {
+  return nameAtOrAbove(enclosingFunction(literal) ?? literal, source);
 }
 
 /**
@@ -75,24 +115,36 @@ function shapeOf(builder: string, where: string): string {
     .toLowerCase();
 }
 
-function shapesIn(text: string, file: string): string[] {
-  const lines = text.split('\n');
+/** The answer shapes one source file asks for. Exported so the attribution is testable directly. */
+export function overpassShapesIn(text: string, file: string): string[] {
+  const source = ts.createSourceFile(
+    file,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
   const shapes: string[] = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!lines[i]!.includes(QL_HEADER)) continue;
-    const where = `${relative(REPO_ROOT, file).split(sep).join('/')}:${i + 1}`;
-    const owner = declarationAbove(lines, i);
-    // Unattributable QL would silently shrink the set, which is the one failure a guard built
-    // on this cannot survive.
-    if (!owner) throw new Error(`${where}: Overpass QL outside any top-level declaration`);
-    shapes.push(shapeOf(owner, where));
-  }
+
+  const visit = (node: ts.Node): void => {
+    if (LITERAL_KINDS.has(node.kind) && (node as ts.LiteralLikeNode).text.includes(QL_HEADER)) {
+      const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+      const where = `${relative(REPO_ROOT, file).split(sep).join('/') || file}:${line}`;
+      const owner = ownerOf(node, source);
+      // Unattributable QL would silently shrink the set, which is the one failure a guard built
+      // on this cannot survive.
+      if (!owner) throw new Error(`${where}: Overpass QL under no named declaration`);
+      shapes.push(shapeOf(owner, where));
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(source, visit);
   return shapes;
 }
 
 /**
- * How many source files are read at once. Six hundred sequential opens is seconds of latency on
- * Windows and none of it is CPU; the threadpool turns that into a fraction of a second.
+ * Source files read at once. Over this repository's 405 non-test sources the opens measured
+ * 5.9–7.0 s sequentially against 0.93–1.08 s at 64 in flight: latency, not CPU.
  */
 const READ_CONCURRENCY = 64;
 
@@ -103,12 +155,12 @@ export async function overpassShapesInSource(): Promise<string[]> {
 
   for (let at = 0; at < files.length; at += READ_CONCURRENCY) {
     const batch = files.slice(at, at + READ_CONCURRENCY);
-    const contents = await Promise.all(batch.map((file) => readFile(file)));
-    for (const [index, raw] of contents.entries()) {
-      // Matched as bytes and decoded only on a hit: three files in some six hundred build QL,
-      // and decoding the rest to UTF-16 is most of the walk's cost.
-      if (!raw.includes(QL_HEADER)) continue;
-      for (const shape of shapesIn(raw.toString('utf8'), batch[index]!)) shapes.add(shape);
+    const contents = await Promise.all(batch.map((file) => readFile(file, 'utf8')));
+    for (const [index, text] of contents.entries()) {
+      // The substring test keeps parsing to the three files that carry QL: parsing all 405
+      // measured 0.22–0.55 s against 4–37 ms.
+      if (!text.includes(QL_HEADER)) continue;
+      for (const shape of overpassShapesIn(text, batch[index]!)) shapes.add(shape);
     }
   }
 

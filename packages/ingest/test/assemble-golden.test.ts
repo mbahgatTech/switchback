@@ -13,6 +13,7 @@ import {
   assembleSummary,
   loadAssembleGolden,
   loadRawFixture,
+  summariseTrails,
 } from './support/raw-fixture';
 
 /** Trail A: 9,081.9 m over three chained ways, of seven the relation declares. */
@@ -41,6 +42,36 @@ describe.each([sparse, dense])('the $density tile', ({ trails, golden, count }) 
     // The count first: an empty recording and an empty golden compare equal.
     expect(trails).toHaveLength(count);
     expect(trails).toEqual(golden.trails);
+  });
+});
+
+describe('the order ways arrive in', () => {
+  const reversed = [...(loadRawFixture('tile', SPARSE_TILE).response.elements ?? [])].reverse();
+  const identity = (trail: { osmType: string; osmId: number }) => `${trail.osmType}/${trail.osmId}`;
+
+  /**
+   * Why a trail count is no evidence of parity. `chainWays` seeds greedily in iteration order, so
+   * listing the same ways backwards assembles the golden's 145 trails with one of them under a
+   * different identity built from different member ways — the shape a Postgres source serving
+   * osm2pgsql's geometry-cluster order would produce.
+   */
+  it('decides which trails exist, not merely how many', () => {
+    const scrambled = summariseTrails(assembleTrails(reversed));
+    const gained = scrambled
+      .map(identity)
+      .filter((id) => !sparse.golden.trails.some((t) => identity(t) === id));
+    const lost = sparse.golden.trails
+      .map(identity)
+      .filter((id) => !scrambled.some((t) => identity(t) === id));
+
+    expect(scrambled).toHaveLength(sparse.count);
+    expect(gained).toEqual(['way/722501778']);
+    expect(lost).toEqual(['way/722483990']);
+  });
+
+  /** Sorting the input instead would let a source pass parity in an order production never gives it. */
+  it('is a precondition of the seam, refused rather than absorbed', () => {
+    expect(() => assembleSummary(reversed)).toThrow(/ordered by way id ascending/u);
   });
 });
 

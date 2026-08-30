@@ -25,9 +25,10 @@ what `out body geom` returns. `assemble-golden.test.ts` holds it to that.
 
 Every recording is held to what its own consumer makes of it, not to its element count:
 `assemble-golden.test.ts` for the answers assembly reads, `raw-recordings.test.ts` for the rest —
-`pickRegion`, `waysToSegments`, `classifyWaypoint` and `parseEleM` over the answer each was
-recorded for. `raw-recordings.test.ts` also derives the shape list from the query builders in
-source, so a builder added anywhere is one it reports as unrecorded.
+`pickRegion`, `classifyWay`, `classifyWaypoint` and `parseEleM` over the answer each was recorded
+for. `query-builders.test.ts` derives the shape list from the syntax of every non-test source, so
+a query written under a `class` or an `export default` is reported as unrecorded just as a
+top-level builder is.
 
 ## Dates
 
@@ -39,6 +40,12 @@ source, so a builder added anywhere is one it reports as unrecorded.
 What `assembleTrails` makes of a recording, one line per trail, coordinates digested rather than
 stored. `assembleSummary` in `../../support/raw-fixture.ts` produces it and is the seam a
 replacement trail source is diffed through. Both tiles and the whole `route` answer have one.
+
+Ways must reach it ordered by way id ascending, which is how Overpass serves them and how every
+recording here is stored. Assembly seeds `chainWays` in iteration order, so a source serving
+osm2pgsql's geometry-cluster order instead produces the golden's trail *count* out of different
+ways; `assembleSummary` refuses unordered elements rather than diffing trails that are silently
+not the golden's.
 
 Re-derive from what is already committed, with no network:
 

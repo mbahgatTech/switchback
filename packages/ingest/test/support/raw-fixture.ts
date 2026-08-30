@@ -142,15 +142,12 @@ export function digestCoords(coords: readonly LngLat[]): CoordDigest {
 }
 
 /**
- * The parity contract: elements in, comparable trails out. A source that replaces Overpass is
- * correct exactly when this returns the committed golden for the same ground.
- *
- * Sorted by identity because element order is a property of the source, not of assembly — a
- * different backend will not reproduce Overpass's ordering, and that difference is not a
- * divergence. Direction is deliberately *not* normalised: a reversed line is a real difference.
+ * Assembled trails in the comparable form, sorted by identity so that a reordering of otherwise
+ * identical trails is not a divergence. Direction is deliberately *not* normalised: a reversed
+ * line is a real difference.
  */
-export function assembleSummary(elements: readonly OverpassElement[]): AssembledTrailSummary[] {
-  return assembleTrails(elements)
+export function summariseTrails(trails: readonly AssembledTrail[]): AssembledTrailSummary[] {
+  return trails
     .map(({ coords, ...rest }) => ({ ...rest, coords: digestCoords(coords) }))
     .sort(
       (a, b) =>
@@ -159,6 +156,39 @@ export function assembleSummary(elements: readonly OverpassElement[]): Assembled
         a.name.localeCompare(b.name) ||
         a.coords.sha256.localeCompare(b.coords.sha256),
     );
+}
+
+/**
+ * Ways ordered by id ascending, which is what every recorded answer carries and what assembly
+ * silently depends on. Checked here rather than sorted, because sorting would let a source pass
+ * parity in an order production would not give it.
+ */
+function assertWaysAscending(elements: readonly OverpassElement[]): void {
+  let previous = -Infinity;
+  for (const element of elements) {
+    if (element.type !== 'way') continue;
+    if (element.id < previous) {
+      throw new Error(
+        `way ${element.id} arrives after way ${previous}: \`chainWays\` seeds greedily in ` +
+          `iteration order and \`mergeTags\` votes in it, so ways must reach \`assembleTrails\` ` +
+          `ordered by way id ascending. Sort the elements before comparing.`,
+      );
+    }
+    previous = element.id;
+  }
+}
+
+/**
+ * The parity contract: elements in, comparable trails out. A source that replaces Overpass is
+ * correct exactly when this returns the committed golden for the same ground.
+ *
+ * Element order is part of the contract, not a property of the source to be absorbed. Assembly
+ * seeds on it, so a backend serving osm2pgsql's geometry-cluster order yields the right trail
+ * *count* built from different ways — which is why unordered input is refused rather than diffed.
+ */
+export function assembleSummary(elements: readonly OverpassElement[]): AssembledTrailSummary[] {
+  assertWaysAscending(elements);
+  return summariseTrails(assembleTrails(elements));
 }
 
 export function goldenFile(shape: RawShape, subject: string): string {

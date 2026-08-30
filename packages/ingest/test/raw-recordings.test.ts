@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { osmKey } from '../../db/scripts/peak-elevations';
 import { classifyWaypoint, parseEleM } from '../src/enrich';
 import { countNodes, waysToSegments } from '../src/network';
-import type { OverpassElement, OverpassRelation } from '../src/overpass';
+import type { OverpassElement, OverpassRelation, OverpassWay } from '../src/overpass';
 import { pickRegion } from '../src/tile-context';
 import { overpassShapesInSource } from './support/query-builders';
 import {
@@ -23,6 +23,16 @@ import {
 
 function elementsOf(shape: RawShape, subject: string): OverpassElement[] {
   return loadRawFixture(shape, subject).response.elements ?? [];
+}
+
+/** A distribution rather than a total, so a reclassification is a diff and not a coincidence. */
+function countBy<T>(items: readonly T[], of: (item: T) => string | null): Record<string, number> {
+  const counted: Record<string, number> = {};
+  for (const item of items) {
+    const key = of(item);
+    if (key !== null) counted[key] = (counted[key] ?? 0) + 1;
+  }
+  return counted;
 }
 
 describe('the recording index', () => {
@@ -48,8 +58,9 @@ describe('the recording index', () => {
   });
 
   /**
-   * Read off the query builders in source rather than listed here, so a builder added anywhere is
-   * one this notices has no recording — including a `RAW_SHAPES` that has stopped keeping up.
+   * Read off the query builders in source rather than listed here, so a query written in any
+   * non-test file — under a `class` or an `export default` as much as a top-level `const` — is
+   * one this notices has no recording, including a `RAW_SHAPES` that has stopped keeping up.
    */
   it('covers every Overpass answer the repository asks for', async () => {
     const asked = await overpassShapesInSource();
@@ -70,11 +81,47 @@ describe('the region answer', () => {
 });
 
 describe('the network answer', () => {
-  it('parses to the segments and nodes a routing tile is stored as', () => {
-    const segments = waysToSegments(elementsOf('network', '021231030323'));
+  const elements = elementsOf('network', '021231030323');
+  const ways = elements.filter((element): element is OverpassWay => element.type === 'way');
+  const segments = waysToSegments(elements);
 
-    // Every element classifies: `waysToSegments` drops nothing from this answer.
-    expect(segments).toHaveLength(282);
+  /**
+   * Read off the recording rather than counted from it: `buildNetworkQuery`'s server-side
+   * filters and `classifyWay` agree about this box, and no way in it has a hole, so each way
+   * becomes exactly one segment and arrives in the order the answer listed it.
+   */
+  it('keeps every way in the answer, unsplit and in order', () => {
+    expect(segments.map((segment) => segment.wayId)).toEqual(ways.map((way) => way.id));
+  });
+
+  /**
+   * The cost model the router prices paths with, and the only reason this recording carries
+   * tags. A `HIGHWAY_KIND` entry retargeted or a `surface` dropped re-prices every route and
+   * leaves the segment count untouched. Nothing in this box carries `sac_scale`, so grade is
+   * covered by the synthetic cases in `network.test.ts` alone.
+   */
+  it('classifies into the kinds, surfaces and names routing reads', () => {
+    expect(countBy(segments, (segment) => segment.kind)).toEqual({
+      cycleway: 12,
+      footway: 3,
+      path: 9,
+      road: 245,
+      track: 13,
+    });
+    expect(countBy(segments, (segment) => segment.surface)).toEqual({
+      asphalt: 20,
+      gravel: 4,
+      paved: 6,
+      wood: 1,
+    });
+
+    const named = segments.filter((segment) => segment.name !== null);
+    expect(named).toHaveLength(158);
+    expect(new Set(named.map((segment) => segment.name)).size).toBe(123);
+  });
+
+  /** `countNodes` fuses the coordinate two ways share, which is what makes a junction one. */
+  it('fuses coordinates shared between ways into one graph vertex', () => {
     expect(countNodes(segments)).toBe(6_089);
   });
 });
@@ -143,12 +190,7 @@ describe('the parent-route answer', () => {
 
 /** The waypoint kinds `attachWaypoints` would pull out of an answer, counted by kind. */
 function waypointKinds(elements: readonly OverpassElement[]): Record<string, number> {
-  const counted: Record<string, number> = {};
-  for (const element of elements) {
-    const kind = classifyWaypoint(element.tags ?? {});
-    if (kind) counted[kind] = (counted[kind] ?? 0) + 1;
-  }
-  return counted;
+  return countBy(elements, (element) => classifyWaypoint(element.tags ?? {}));
 }
 
 const featureCases = [
