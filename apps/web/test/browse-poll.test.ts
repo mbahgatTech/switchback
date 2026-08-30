@@ -32,6 +32,8 @@ const SURVEY: AreaSummary = {
   working: 0,
   requiredTiles: 40,
   capped: true,
+  // Read by the fetch-area panel, not by the poll: carried only to satisfy `AreaSummary`.
+  outstandingHours: 1.5,
 };
 
 function progress(
