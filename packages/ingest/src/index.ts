@@ -26,6 +26,7 @@ export * from './subdivide';
 export * from './coverage';
 export * from './drain-slot';
 export * from './maintenance';
+export * from './parent-routes';
 export * from './tile-context';
 export * from './pipeline';
 export * from './publish';

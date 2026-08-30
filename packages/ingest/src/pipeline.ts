@@ -45,19 +45,18 @@ import { buildFeatureIndex, type FeatureIndex } from './feature-index';
 import { TerrainSource, elevateLine } from './elevate';
 import { IngestDeadlineError, assertBefore } from './deadline';
 import {
-  OVERPASS_SKIPPED_MARKER,
   OverpassDeadlineError,
   OverpassUnavailableError,
-  buildParentRouteQuery,
   buildRelationSkeletonQuery,
   buildRouteQuery,
   buildTileQuery,
   buildWayGeometryQuery,
 } from './overpass';
+import { startParentRouteDiscovery } from './parent-routes';
 import { fetchTileContext, lookupRegion } from './tile-context';
 import type { RegionInfo } from './tile-context';
 import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
-import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
+import { enqueue, trailEnrichJobKey } from './jobs';
 import {
   ClaimConflictError,
   canMergeTrails,
@@ -169,12 +168,13 @@ export interface PipelineDeps {
   /** The shared client, or a `withDeadline` view of it — never a second client. */
   overpass: OverpassQuerier;
   /**
-   * The same client for the phases that run *after* the commit loop, bounded only by
-   * `deadlineAt`. `overpass` gives up early to leave the commit loop its reserve; a query that
-   * runs once the commits are done has nothing left to reserve for, and gating it on that
-   * deadline refuses work the invocation still has minutes to do. Defaults to `overpass`.
+   * The same client bounded by `deadlineAt` alone, for a query that outlives the commit loop
+   * rather than blocking it. `overpass` gives up early to leave the loop its reserve, which is
+   * clock this query does not take: on the deployed budget the ordinary deadline refused all five
+   * parent-route lookups that reached it on 2026-08-08 between 22:34 and 22:48 UTC, at 181, 207,
+   * 214, 249 and 253 s into a handler bounded at 540 s. Defaults to `overpass`.
    */
-  overpassAfterCommits?: OverpassQuerier;
+  overpassToHandlerDeadline?: OverpassQuerier;
   terrain?: TerrainSource;
   /**
    * Epoch milliseconds after which this handler stops doing work. Overpass has its own budget
@@ -377,6 +377,13 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   const identityOutcomes = new Map<IdentityOutcome, number>();
 
+  /*
+   * Handed over before the loop rather than after it. It needs nothing the loop produces, and the
+   * loop needs neither of Overpass's two slots, so the round trip costs the tile only whatever it
+   * outruns the commits by. `startParentRouteDiscovery` carries what sending it early costs.
+   */
+  const parentRoutes = startParentRouteDiscovery(db, assembled, deps);
+
   // The try lives here in the body rather than inside `forEachConcurrent`: a trail that
   // throws must cost its tile one row, not the rest of the tile.
   await forEachConcurrent(assembled, COMMIT_CONCURRENCY, async (trail) => {
@@ -547,7 +554,7 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     },
   });
 
-  await discoverParentRoutes(db, assembled, deps);
+  await parentRoutes.settle();
   await rollUpAncestors(db, quadkey);
 
   return {
@@ -653,53 +660,6 @@ async function rollUpSplitTile(
     fetchMs: Date.now() - context.startedAt,
     children: children.map((child) => child.quadkey),
   };
-}
-
-/**
- * Queue the long-distance routes this tile's trails turn out to be pieces of. Runs after the
- * tile is marked ready and swallows its own failures: it is strictly additive, and marking
- * the tile failed would re-run the expensive half to retry the cheap half.
- *
- * Uses `overpassAfterCommits` because it runs past the commit loop the ordinary Overpass deadline
- * reserves clock for. Measured on the deployed budget: five of five invocations that reached here
- * on 2026-08-08 between 22:34 and 22:48 UTC were refused, at 181, 207, 214, 249 and 253 s into a
- * handler bounded at 540 s.
- */
-async function discoverParentRoutes(
-  db: PrismaClient,
-  assembled: readonly AssembledTrail[],
-  deps: PipelineDeps,
-): Promise<void> {
-  const log = deps.logger ?? (() => {});
-  const relationIds = assembled.filter((t) => t.osmType === 'relation').map((t) => t.osmId);
-  if (relationIds.length === 0) return;
-
-  const overpass = deps.overpassAfterCommits ?? deps.overpass;
-  try {
-    const response = await overpass.query(buildParentRouteQuery(relationIds));
-    const parents = (response.elements ?? []).filter(
-      (element): element is OverpassRelation => element.type === 'relation',
-    );
-
-    for (const parent of parents) {
-      // `type=superroute` means "this relation's members are routes". A plain `type=route`
-      // parent is a section container tiles already ingest by bbox.
-      if (parent.tags?.type !== 'superroute') continue;
-      if (!(parent.tags.name ?? parent.tags['name:en'])) continue;
-
-      await enqueue(db, {
-        kind: JobKind.ingest_route,
-        dedupeKey: routeIngestJobKey(parent.id),
-        payload: { osmId: parent.id },
-        // Below tile work: somebody is waiting on the tile under their cursor, nobody is
-        // waiting on a continental route, and it is the most expensive job we run.
-        priority: -10,
-      });
-      log('queued route', { osmId: parent.id, name: parent.tags.name });
-    }
-  } catch (error) {
-    log(`${OVERPASS_SKIPPED_MARKER} parent route lookup failed`, { error: String(error) });
-  }
 }
 
 /** How deep a superroute hierarchy is followed before we stop expanding member relations. */

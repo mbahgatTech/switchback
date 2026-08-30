@@ -122,9 +122,9 @@ export function handlerDeadlineMs(source: NodeJS.ProcessEnv = process.env): numb
  * arithmetic above being false again. `INGEST_OVERPASS_DEADLINE_MS` may still lower it — an
  * operator tightening the clamp is always safe — but never raise it past the reserve.
  *
- * Only the pre-commit queries. `discoverParentRoutes` runs after the tile is `ready` and after the
- * commit loop has finished, so refusing it reserves nothing for anybody; it gets the handler
- * deadline instead, through `PipelineDeps.overpassAfterCommits`.
+ * Only the pre-commit queries. The parent-route lookup runs alongside the commit loop and may
+ * outlast it, so refusing it reserves nothing for anybody; it gets the handler deadline instead,
+ * through `PipelineDeps.overpassToHandlerDeadline`.
  *
  * `dedupeKey` selects the reserve — see `commitReserveMs`. Omitted means the tile reserve, which
  * is the conservative one.
@@ -281,7 +281,7 @@ export async function runIngestSignal(
     client,
     startedAt + overpassDeadlineMs(process.env, signal.dedupeKey),
   );
-  const overpassAfterCommits = withDeadline(client, handlerDeadline);
+  const overpassToHandlerDeadline = withDeadline(client, handlerDeadline);
 
   let result: DrainResult;
   try {
@@ -292,7 +292,7 @@ export async function runIngestSignal(
       workerId: options.workerId,
       deps: {
         overpass,
-        overpassAfterCommits,
+        overpassToHandlerDeadline,
         deadlineAt: handlerDeadline,
         logger: pipelineLogger(log),
       },

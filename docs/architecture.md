@@ -79,6 +79,7 @@ sequenceDiagram
 
   P->>O: tile query, then region and waypoints together in the two slots
   O-->>P: ways and relations
+  P->>O: parent-route lookup, in flight while the trails commit
   P->>DB: one transaction per trail, then tile status
   C->>B: re-ask every 2.5 s while anything is pending
 ```
@@ -93,6 +94,7 @@ flowchart LR
       T1["region is_in"]
       T2["tile waypoints"]
     end
+    P["parent routes<br/>relation(br), one slot"]
   end
   A --> B["assemble<br/>members into ordered lines"]
   B --> X{"any trails<br/>assembled?"}
@@ -102,28 +104,46 @@ flowchart LR
   F --> T2
   T1 --> J(( ))
   T2 --> J(( ))
-  J --> C["elevate<br/>resample 25 m, terrarium z13"]
+  J --> K(( ))
+  K --> P
+  K --> C["elevate<br/>resample 25 m, terrarium z13"]
   C --> D["derive<br/>length, gain, grade, route type,<br/>difficulty, Tobler time"]
   D --> E["commit<br/>one transaction per trail"]
   E --> G["enqueue: enrich_trail for photographs,<br/>ingest_route for any parent superroute"]
+  P --> G
 ```
 
-Every edge crossing the outer box is a request to hardware somebody donated. `W` is the only place
-a tile holds both of its slots, and the fork into it is the whole of the concurrency this pipeline
-asks for.
+Every edge crossing the outer box is a request to hardware somebody donated, and a tile makes at
+most four. `W` is the only place a tile holds both of its slots; `P` holds one while the commit
+chain holds none, so the ceiling of two is never approached from more than one direction at a time.
 
 Neither tile-wide lookup reads the tile query's answer, so the two share one window rather than
-taking a slot each in turn. Both block the commit loop, and they are the last Overpass work before
-it — everything after the join is local arithmetic and Postgres. They follow the tile query rather
-than racing it, which is what keeps a tile over ocean at exactly one Overpass request: the empty
-branch above settles the tile before either lookup is sent.
+taking a slot each in turn. Both block the commit loop, and they are the last Overpass work the
+first trail waits behind. They follow the tile query rather than racing it, which is what keeps a
+tile over ocean at exactly one Overpass request: the empty branch above settles the tile before
+either lookup is sent.
 
-One request is the exception. `withDeadline` refuses a query synchronously, at the moment it is
-handed over rather than when it would return, so a budget that expires while the region lookup is
-out refuses a waypoint lookup that had not yet been sent — and refuses neither of a pair already
-committed in the same tick. On that path this shape sends one request a serial one would not. The
-aggregate direction is UNVERIFIED: a tile that finishes sooner is a tile less likely to reach its
-deadline at all, and no counter records how many land inside that window.
+The parent-route lookup is the opposite case. It reads the tile query's answer — the relation ids
+assembly produced — so it cannot start any earlier than the fork at `K`; but nothing in the commit
+chain reads _its_ answer, so it does not have to wait for the chain either. Run beside the commits
+rather than after them, it costs the tile only what it outruns them by: the whole round trip
+disappears wherever the commit loop is the longer of the two. The lookup itself is 3.0 to 54.5 s per
+tile, measured off a workstation against the live mirrors — its distribution on the deployed worker
+is UNVERIFIED, and `scripts/ingest-metrics/03-throughput.sql` is what would settle it.
+**It shortens no reader's wait for a first trail** — the join at `G` is past
+every trail this tile will draw. What it buys is throughput, and throughput is what shortens the
+queue behind it.
+
+Both overlaps are paid for in requests, on the paths where a tile does not finish. `withDeadline`
+refuses a query synchronously, at the moment it is handed over rather than when it would return, so
+a budget that expires while the region lookup is out refuses a waypoint lookup that had not yet been
+sent, and refuses neither of a pair already committed in the same tick. The same rule prices the
+fork at `K`: a parent-route lookup handed over before the commit loop is already in flight on every
+tile that abandons that loop — a deadline split, a deadline failure at the zoom floor, or a trail
+lost on its own account — where one handed over after the loop is never reached. Each overlap sends
+one request a serial shape would not, and neither can send more than one. The aggregate direction is UNVERIFIED: a tile that finishes
+sooner is a tile less likely to reach its deadline at all, and no counter records how many land
+inside that window.
 
 Three properties make this safe to run unattended. Every trail is keyed by `(osmType, osmId)` and
 every write is an upsert, so an at-least-once queue is harmless. Each trail commits in its own

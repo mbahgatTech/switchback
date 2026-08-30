@@ -14,11 +14,13 @@
  * **Not a request-kind rate on its own** — see `REQUEST_DRAIN_TILES_PER_HOUR`, which is what a
  * request-kind queue depth must be divided by.
  *
- * **Two things date this number, both pushing the true rate up.** It predates the shared terrain
+ * **Three things date this number, all pushing the true rate up.** It predates the shared terrain
  * cache (`terrain-cache-r2.ts`, 2026-08-29), which removes a per-invocation terrarium fetch from
- * exactly the phase being timed; and the p90 of 540.1 s is 6.7 an hour, so the distribution behind
- * this mean is wide. Re-measuring is `03-throughput.sql`; treat a ceiling built on it as a floor on
- * capacity rather than a forecast.
+ * exactly the phase being timed; it predates the parent-route lookup moving alongside the commit
+ * loop (`parent-routes.ts`), which takes off a tile's wall clock whatever of an Overpass round trip
+ * that loop covers, up to the whole of it; and
+ * the p90 of 540.1 s is 6.7 an hour, so the distribution behind this mean is wide. Re-measuring is
+ * `03-throughput.sql`; treat a ceiling built on it as a floor on capacity rather than a forecast.
  */
 export const ESTATE_DRAIN_TILES_PER_HOUR = 28.5;
 
