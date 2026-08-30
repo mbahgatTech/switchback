@@ -2,7 +2,7 @@
 # point that settles the question `DEFAULT_ENDPOINTS` is ordered on. A workstation measurement is
 # not evidence about the order: production runs in a data centre, and the list is ordered by
 # reachability from one — `overpass-api.de` publishes an A record that is unreachable from some
-# networks, which is why the reference instance is not first.
+# consumer networks, which is a fact about those networks rather than about a runner.
 #
 # Dispatch-only, and it stays that way. The gates in ci.yml never reach Overpass, deliberately (see
 # the note at the top of that file): a probe on every push would make this repository the kind of
