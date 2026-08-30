@@ -3,9 +3,9 @@
  * asks for gets one committed recording, so no test and no benchmark queries Overpass.
  */
 
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { gzipSync } from 'node:zlib';
 import type { LngLat } from '@switchback/core';
 import { quadkeyToBBox } from '@switchback/geo';
 import { tagsByIdQuery, type OsmType } from '../packages/db/scripts/peak-elevations';
@@ -33,11 +33,11 @@ import {
 import {
   RAW_FIXTURE_DIR,
   assembleSummary,
+  buildRawIndex,
   goldenFile,
   loadRawFixture,
   rawFixtureFile,
   type AssembleGolden,
-  type RawIndexEntry,
   type RawRecording,
   type RawShape,
 } from '../packages/ingest/test/support/raw-fixture';
@@ -200,25 +200,11 @@ async function writeGolden(shape: RawShape, subjects: readonly string[]): Promis
 
 /**
  * The index every recording appears in, sorted so a re-record is a one-line diff. Rebuilt from
- * the files on disk rather than appended to, so a deleted recording leaves no phantom row.
+ * the files on disk rather than appended to, so a deleted recording leaves no phantom row — and
+ * rebuilt by the function a test re-runs, so a stale index cannot pass for a current one.
  */
 async function writeIndex(): Promise<void> {
-  const entries: RawIndexEntry[] = [];
-  for (const file of (await readdir(RAW_FIXTURE_DIR)).filter((f) => f.endsWith('.json.gz'))) {
-    const path = join(RAW_FIXTURE_DIR, file);
-    const recording = JSON.parse(gunzipSync(await readFile(path)).toString('utf8')) as RawRecording;
-    entries.push({
-      shape: recording.shape,
-      subject: recording.subject,
-      file,
-      recordedAt: recording.recordedAt,
-      timestampOsmBase: recording.timestampOsmBase,
-      elements: recording.response.elements?.length ?? 0,
-      gzippedBytes: (await stat(path)).size,
-    });
-  }
-
-  entries.sort((a, b) => a.shape.localeCompare(b.shape) || a.subject.localeCompare(b.subject));
+  const entries = buildRawIndex();
   await writeFile(join(RAW_FIXTURE_DIR, 'index.json'), `${JSON.stringify(entries, null, 2)}\n`);
   console.log(`index: ${entries.length} recordings`);
 }

@@ -4,7 +4,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -19,7 +19,11 @@ export const RAW_FIXTURE_DIR = join(
   'raw',
 );
 
-/** The nine Overpass answers this repository reads. Every one has a recording. */
+/**
+ * The recorded answer shapes, as a type. Not the authority on what this repository asks Overpass
+ * for — `overpassShapesInSource()` reads that off the query builders, and a test holds this list
+ * to it.
+ */
 export const RAW_SHAPES = [
   'tile',
   'route',
@@ -33,6 +37,10 @@ export const RAW_SHAPES = [
 ] as const;
 
 export type RawShape = (typeof RAW_SHAPES)[number];
+
+/** The two z9 tiles recorded end to end — tile, feature answer, and an assembly golden. */
+export const SPARSE_TILE = '021231030';
+export const DENSE_TILE = '023010230';
 
 export interface RawRecording {
   shape: RawShape;
@@ -72,6 +80,36 @@ export function loadRawFixture(shape: RawShape, subject: string): RawRecording {
 
 export function loadRawIndex(): RawIndexEntry[] {
   return JSON.parse(readFileSync(join(RAW_FIXTURE_DIR, 'index.json'), 'utf8')) as RawIndexEntry[];
+}
+
+/** The recordings the directory actually holds, whatever the index claims about them. */
+export function recordedFiles(): string[] {
+  return readdirSync(RAW_FIXTURE_DIR)
+    .filter((file) => file.endsWith('.json.gz'))
+    .sort();
+}
+
+/**
+ * The index as rebuilt from the recordings on disk. `index.json` is committed as exactly this,
+ * so a recording added, re-recorded or deleted without rebuilding leaves a difference rather
+ * than a stale row that agrees with itself.
+ */
+export function buildRawIndex(): RawIndexEntry[] {
+  return recordedFiles()
+    .map((file): RawIndexEntry => {
+      const path = join(RAW_FIXTURE_DIR, file);
+      const recording = JSON.parse(gunzipSync(readFileSync(path)).toString('utf8')) as RawRecording;
+      return {
+        shape: recording.shape,
+        subject: recording.subject,
+        file,
+        recordedAt: recording.recordedAt,
+        timestampOsmBase: recording.timestampOsmBase,
+        elements: recording.response.elements?.length ?? 0,
+        gzippedBytes: statSync(path).size,
+      };
+    })
+    .sort((a, b) => a.shape.localeCompare(b.shape) || a.subject.localeCompare(b.subject));
 }
 
 /** A trail's geometry reduced to something a diff can show. */

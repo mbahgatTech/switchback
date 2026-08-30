@@ -23,6 +23,12 @@ queries a live mirror. `index.json` lists them; each recording carries the query
 three ways because `fetchRelationInParts` claims a skeleton plus way geometry splices back into
 what `out body geom` returns. `assemble-golden.test.ts` holds it to that.
 
+Every recording is held to what its own consumer makes of it, not to its element count:
+`assemble-golden.test.ts` for the answers assembly reads, `raw-recordings.test.ts` for the rest —
+`pickRegion`, `waysToSegments`, `classifyWaypoint` and `parseEleM` over the answer each was
+recorded for. `raw-recordings.test.ts` also derives the shape list from the query builders in
+source, so a builder added anywhere is one it reports as unrecorded.
+
 ## Dates
 
 `timestampOsmBase` is the instant of the planet an answer describes, and is the date that matters.
@@ -32,12 +38,13 @@ what `out body geom` returns. `assemble-golden.test.ts` holds it to that.
 
 What `assembleTrails` makes of a recording, one line per trail, coordinates digested rather than
 stored. `assembleSummary` in `../../support/raw-fixture.ts` produces it and is the seam a
-replacement trail source is diffed through.
+replacement trail source is diffed through. Both tiles and the whole `route` answer have one.
 
 Re-derive from what is already committed, with no network:
 
 ```sh
 npx tsx scripts/enrich-fixture.ts golden tile 021231030 023010230
+npx tsx scripts/enrich-fixture.ts golden route 7470475
 ```
 
 ## Re-recording
