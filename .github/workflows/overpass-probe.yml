@@ -13,6 +13,10 @@
 name: Overpass endpoint probe
 
 on:
+  # TEMPORARY, removed before this branch merges: GitHub only offers `workflow_dispatch` for
+  # workflows present on the default branch, so the first measurement cannot be dispatched.
+  push:
+    branches: [fix/refresh-poll-and-endpoint-probe]
   workflow_dispatch:
     inputs:
       rounds:
@@ -59,5 +63,5 @@ jobs:
           if [ -n "$ENDPOINTS" ]; then args+=(--endpoints "$ENDPOINTS"); fi
           npx tsx scripts/overpass-probe.ts "${args[@]}"
         env:
-          ROUNDS: ${{ inputs.rounds }}
+          ROUNDS: ${{ inputs.rounds || '3' }}
           ENDPOINTS: ${{ inputs.endpoints }}
