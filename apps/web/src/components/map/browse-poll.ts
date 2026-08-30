@@ -19,12 +19,23 @@ export interface BrowseProgress {
 }
 
 /**
- * `area.working` is read separately from `pendingTiles` because a wide viewport is `tooLarge` —
- * `ensureCoverage` queues nothing and `pendingTiles` is empty by construction, however much work
- * the button just started.
+ * Every list a tile can be outstanding in, and there are three. A tile past its TTL lands in
+ * `refreshingTiles` rather than `pendingTiles`, and a `tooLarge` viewport queues nothing at all —
+ * so a poll gated on `pendingTiles` alone leaves both to the next reload.
+ *
+ * `busy` excludes the refresh because backpressure refuses new ground without emptying
+ * `refreshingTiles`: those quadkeys have no job, and polling for them would aim a request every
+ * `BROWSE_POLL_MS` from every open map at a database that just said it had no room. It is the
+ * reason refused tiles are kept out of `pendingTiles` upstream. The cost is that a refresh already
+ * in flight when the ceiling closes is not polled for either — `ensureCoverage` narrows only
+ * `pendingTiles` to what is still coming, so the client cannot tell the two apart.
  */
 export function browsePollInterval(data: BrowseProgress | undefined): number | false {
   if (!data) return false;
-  const moving = data.coverage.pendingTiles.length > 0 || (data.area?.working ?? 0) > 0;
+  const { coverage } = data;
+  const moving =
+    coverage.pendingTiles.length > 0 ||
+    (!coverage.busy && coverage.refreshingTiles.length > 0) ||
+    (data.area?.working ?? 0) > 0;
   return moving ? BROWSE_POLL_MS : false;
 }

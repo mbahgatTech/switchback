@@ -70,3 +70,33 @@ describe('polling a viewport too wide to cover automatically', () => {
     expect(browsePollInterval(progress({ tooLarge: true }, SURVEY))).toBe(false);
   });
 });
+
+/*
+ * A tile past its TTL is `ready` *and* `refreshing` — it keeps serving last month's trails while
+ * the refetch runs, and `ensureCoverage` deliberately keeps it out of `pendingTiles` so the map is
+ * not blanked. Nothing else on the client re-asks, so a poll blind to `refreshingTiles` leaves the
+ * refreshed trails sitting in Postgres until the reader reloads the page.
+ */
+describe('polling while cached ground is refreshed behind the reader', () => {
+  const STALE = { readyTiles: ['021231030'], pendingTiles: [], refreshingTiles: ['021231030'] };
+
+  it('re-asks while a stale tile is refetched behind the trails it is still serving', () => {
+    expect(browsePollInterval(progress(STALE))).toBe(BROWSE_POLL_MS);
+  });
+
+  it('re-asks when new ground and a refresh are outstanding together', () => {
+    const both = { ...STALE, pendingTiles: ['021231031'] };
+    expect(browsePollInterval(progress(both))).toBe(BROWSE_POLL_MS);
+  });
+
+  /*
+   * Backpressure refuses new ground without emptying `refreshingTiles`, so under `busy` those
+   * quadkeys have no job and are not coming. Polling for them would aim a request every 2.5 s from
+   * every open map at the database that just said it had no room — which is what keeping refused
+   * tiles out of `pendingTiles` exists to prevent.
+   */
+  it('does not poll for a refresh that backpressure refused', () => {
+    const refused = { ...STALE, busy: true, busyReason: 'storage' as const };
+    expect(browsePollInterval(progress(refused))).toBe(false);
+  });
+});

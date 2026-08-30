@@ -174,8 +174,9 @@ export async function ensureCoverage(
   /*
    * The depth ceiling judges only *new ground*, which is the thing it exists to bound.
    * `enqueue` upserts on `dedupeKey`, so refusing a quadkey already queued protects nothing —
-   * while the refusal clears `pending`, and `explore.tsx` gates `refetchInterval` on
-   * `pendingTiles.length`, so the reader whose tiles were about to land stops polling for them.
+   * while the refusal clears `pending`, and the client's poll gate
+   * (`apps/web/src/components/map/browse-poll.ts`) reads `pendingTiles`, so the reader whose tiles
+   * were about to land stops polling for them.
    */
   const newGround = needsWork.filter((quadkey) => !inFlight.has(tileJobKey(quadkey)));
 
