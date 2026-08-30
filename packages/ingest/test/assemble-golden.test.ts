@@ -10,9 +10,11 @@ import { fetchRelationInParts } from '../src/pipeline';
 import {
   DENSE_TILE,
   SPARSE_TILE,
-  assembleSummary,
+  assembleAsRecorded,
   loadAssembleGolden,
   loadRawFixture,
+  memberWaySequences,
+  summariseRecording,
   summariseTrails,
 } from './support/raw-fixture';
 
@@ -21,10 +23,12 @@ const TRAIL_A = 7470475;
 
 /** A recorded tile, what assembly makes of it now, and what it is held to. */
 function tileCase(density: string, quadkey: string, count: number) {
+  const recording = loadRawFixture('tile', quadkey);
   return {
     density,
     count,
-    trails: assembleSummary(loadRawFixture('tile', quadkey).response.elements ?? []),
+    elements: recording.response.elements ?? [],
+    trails: summariseRecording(recording),
     golden: loadAssembleGolden('tile', quadkey),
   };
 }
@@ -45,15 +49,23 @@ describe.each([sparse, dense])('the $density tile', ({ trails, golden, count }) 
   });
 });
 
-describe('the order ways arrive in', () => {
-  const reversed = [...(loadRawFixture('tile', SPARSE_TILE).response.elements ?? [])].reverse();
+describe('the order elements arrive in', () => {
   const identity = (trail: { osmType: string; osmId: number }) => `${trail.osmType}/${trail.osmId}`;
+  const ascending = (ids: readonly number[]) => ids.every((id, i) => i === 0 || ids[i - 1]! <= id);
+
+  /** Top-level ways backwards: osm2pgsql's geometry-cluster order, in the shape it was caught in. */
+  const reversed = [...sparse.elements].reverse();
+
+  /** Every relation's members by way id — what a member join without `WITH ORDINALITY` returns. */
+  const membersSorted = structuredClone(sparse.elements);
+  for (const element of membersSorted) {
+    if (element.type === 'relation') element.members?.sort((a, b) => a.ref - b.ref);
+  }
 
   /**
    * Why a trail count is no evidence of parity. `chainWays` seeds greedily in iteration order, so
    * listing the same ways backwards assembles the golden's 145 trails with one of them under a
-   * different identity built from different member ways — the shape a Postgres source serving
-   * osm2pgsql's geometry-cluster order would produce.
+   * different identity built from different member ways.
    */
   it('decides which trails exist, not merely how many', () => {
     const scrambled = summariseTrails(assembleTrails(reversed));
@@ -69,9 +81,53 @@ describe('the order ways arrive in', () => {
     expect(lost).toEqual(['way/722483990']);
   });
 
+  /**
+   * The same argument one level down, and sharper: `chainWays` seeds on a relation's member list
+   * too. Sorting those leaves the sparse tile's trail count, every identity, and the changed
+   * trail's vertex count and length — equal to the nanometre, differing only in the order the
+   * segments are summed — and reverses the line it draws. A reader scanning counts and lengths
+   * passes over it.
+   */
+  it('decides how a relation is traversed, not merely which trails exist', () => {
+    const scrambled = summariseTrails(assembleTrails(membersSorted));
+    const differing = scrambled.filter(
+      (trail, index) => JSON.stringify(trail) !== JSON.stringify(sparse.golden.trails[index]),
+    );
+    const [changed] = differing;
+    const before = sparse.golden.trails.find((t) => identity(t) === identity(changed!))!;
+
+    expect(scrambled.map(identity)).toEqual(sparse.golden.trails.map(identity));
+    expect(differing).toHaveLength(1);
+    expect(changed!.lengthM).toBeCloseTo(before.lengthM, 9);
+    expect(changed!.coords.vertices).toBe(before.coords.vertices);
+    expect(changed!.memberWayIds).toEqual([...before.memberWayIds].reverse());
+    expect(changed!.coords.sha256).not.toBe(before.coords.sha256);
+  });
+
   /** Sorting the input instead would let a source pass parity in an order production never gives it. */
   it('is a precondition of the seam, refused rather than absorbed', () => {
-    expect(() => assembleSummary(reversed)).toThrow(/ordered by way id ascending/u);
+    // Positive control: the recording is the order the contract is stated against, so it passes.
+    expect(assembleAsRecorded(sparse.elements, sparse.elements)).toEqual(sparse.golden.trails);
+
+    expect(() => assembleAsRecorded(reversed, sparse.elements)).toThrow(
+      /ordered by way id ascending/u,
+    );
+    expect(() => assembleAsRecorded(membersSorted, sparse.elements)).toThrow(/WITH ORDINALITY/u);
+  });
+
+  /**
+   * The two halves of the contract are different rules, which is why one guard cannot serve both:
+   * Overpass sorts top-level ways by id, while a relation declares its ways in route order, which
+   * sorting silently rewrites rather than normalises.
+   */
+  it('is ascending at the top level and route order inside a relation', () => {
+    const topLevelWayIds = dense.elements.filter((e) => e.type === 'way').map((e) => e.id);
+    const declared = [...memberWaySequences(dense.elements).values()].filter(
+      (ids) => ids.length > 1,
+    );
+
+    expect(ascending(topLevelWayIds)).toBe(true);
+    expect(declared.filter((ids) => !ascending(ids)).length).toBeGreaterThan(0);
   });
 });
 
@@ -106,7 +162,8 @@ describe('a relation rebuilt from its parts', () => {
   /**
    * `fetchRelationInParts` claims its splice is structurally identical to what `out body geom`
    * would have returned. Both answers are recorded, so the claim is checked through assembly,
-   * which is what the claim is *for*.
+   * which is what the claim is *for* — and through the seam, so a splice that reordered the
+   * members it stitched back together is refused rather than compared.
    */
   it('assembles identically to the same relation fetched whole', async () => {
     const rebuilt = await fetchRelationInParts(
@@ -116,13 +173,16 @@ describe('a relation rebuilt from its parts', () => {
       0,
       new Error('mirror refused the relation whole'),
     );
-    const whole = loadRawFixture('route', String(TRAIL_A)).response.elements ?? [];
+    const recording = loadRawFixture('route', String(TRAIL_A));
+    const whole = recording.response.elements ?? [];
 
-    expect(assembleSummary([rebuilt])).toEqual(assembleSummary(whole));
-    expect(assembleSummary(whole)).toEqual(loadAssembleGolden('route', String(TRAIL_A)).trails);
+    expect(assembleAsRecorded([rebuilt], whole)).toEqual(summariseRecording(recording));
+    expect(summariseRecording(recording)).toEqual(
+      loadAssembleGolden('route', String(TRAIL_A)).trails,
+    );
     // The one length this file's prose and the fixture README both quote, so neither goes stale
     // quietly behind a golden nobody reads line by line.
-    expect(assembleSummary(whole)[0]!.lengthM).toBeCloseTo(9_081.9, 1);
+    expect(summariseRecording(recording)[0]!.lengthM).toBeCloseTo(9_081.9, 1);
   });
 });
 

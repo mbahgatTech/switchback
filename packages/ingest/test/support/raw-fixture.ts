@@ -159,19 +159,39 @@ export function summariseTrails(trails: readonly AssembledTrail[]): AssembledTra
 }
 
 /**
- * Ways ordered by id ascending, which is what every recorded answer carries and what assembly
- * silently depends on. Checked here rather than sorted, because sorting would let a source pass
- * parity in an order production would not give it.
+ * The way-member refs each relation declares, keyed by relation id, in the sequence served.
+ * `assembleTrails` seeds `chainWays` on exactly this list.
  */
-function assertWaysAscending(elements: readonly OverpassElement[]): void {
+export function memberWaySequences(
+  elements: readonly OverpassElement[],
+): Map<number, readonly number[]> {
+  const sequences = new Map<number, readonly number[]>();
+  for (const element of elements) {
+    if (element.type !== 'relation') continue;
+    const wayRefs = (element.members ?? [])
+      .filter((member) => member.type === 'way')
+      .map((member) => member.ref);
+    sequences.set(element.id, wayRefs);
+  }
+  return sequences;
+}
+
+/**
+ * Top-level ways ordered by id ascending, which is what every recorded answer carries and what
+ * assembly silently depends on. Checked rather than sorted, because sorting would let a source
+ * pass parity in an order production would not give it.
+ */
+function assertTopLevelWaysAscending(elements: readonly OverpassElement[]): void {
   let previous = -Infinity;
   for (const element of elements) {
     if (element.type !== 'way') continue;
     if (element.id < previous) {
       throw new Error(
         `way ${element.id} arrives after way ${previous}: \`chainWays\` seeds greedily in ` +
-          `iteration order and \`mergeTags\` votes in it, so ways must reach \`assembleTrails\` ` +
-          `ordered by way id ascending. Sort the elements before comparing.`,
+          `iteration order and \`mergeTags\` votes in it, so top-level ways must reach ` +
+          `\`assembleTrails\` ordered by way id ascending, as Overpass serves them. A relation's ` +
+          `members are the other half of the contract and are not sorted — see ` +
+          `\`assertMembersAsRecorded\`.`,
       );
     }
     previous = element.id;
@@ -179,15 +199,57 @@ function assertWaysAscending(elements: readonly OverpassElement[]): void {
 }
 
 /**
- * The parity contract: elements in, comparable trails out. A source that replaces Overpass is
- * correct exactly when this returns the committed golden for the same ground.
- *
- * Element order is part of the contract, not a property of the source to be absorbed. Assembly
- * seeds on it, so a backend serving osm2pgsql's geometry-cluster order yields the right trail
- * *count* built from different ways — which is why unordered input is refused rather than diffed.
+ * Each relation's member sequence, held to the recording rather than to any sort. OSM stores
+ * members in route order, so ascending is one of the ways to get this wrong and not the contract;
+ * relations the recording does not carry are a content difference the diff shows, not an order one.
  */
-export function assembleSummary(elements: readonly OverpassElement[]): AssembledTrailSummary[] {
-  assertWaysAscending(elements);
+function assertMembersAsRecorded(
+  elements: readonly OverpassElement[],
+  recorded: readonly OverpassElement[],
+): void {
+  const expected = memberWaySequences(recorded);
+  for (const [id, served] of memberWaySequences(elements)) {
+    const wanted = expected.get(id);
+    if (!wanted || (served.length === wanted.length && served.every((r, i) => r === wanted[i]))) {
+      continue;
+    }
+    throw new Error(
+      `relation ${id} serves member ways [${served.join(', ')}] where the recording declares ` +
+        `[${wanted.join(', ')}]: \`chainWays\` seeds greedily over a relation's members and ` +
+        `\`mergeTags\` votes in that order, so the sequence must be preserved, not sorted. ` +
+        `Rebuilding a relation from a member join needs \`ORDER BY ... WITH ORDINALITY\`.`,
+    );
+  }
+}
+
+/**
+ * The parity contract: a candidate source's elements against the recording a golden was derived
+ * from, comparable trails out. A source that replaces Overpass is correct exactly when this
+ * returns the committed golden for the same ground.
+ *
+ * Order is part of the contract, not a property of the source to be absorbed, and its two halves
+ * differ: top-level ways arrive by id ascending, a relation's members in the sequence OSM stores.
+ * Assembly seeds on both, so a backend serving osm2pgsql's geometry-cluster order, or joining
+ * member ways without `WITH ORDINALITY`, yields the right trail *count* built from different ways
+ * — which is why either is refused rather than diffed.
+ */
+export function assembleAsRecorded(
+  elements: readonly OverpassElement[],
+  recorded: readonly OverpassElement[],
+): AssembledTrailSummary[] {
+  assertTopLevelWaysAscending(elements);
+  assertMembersAsRecorded(elements, recorded);
+  return summariseTrails(assembleTrails(elements));
+}
+
+/**
+ * What assembly makes of a recording — the derivation a golden is written from. A recording is
+ * the authority on member order, so there is nothing to hold it to; diff a candidate source
+ * through `assembleAsRecorded`, which takes that authority as an argument.
+ */
+export function summariseRecording(recording: RawRecording): AssembledTrailSummary[] {
+  const elements = recording.response.elements ?? [];
+  assertTopLevelWaysAscending(elements);
   return summariseTrails(assembleTrails(elements));
 }
 

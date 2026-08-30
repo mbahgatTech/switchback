@@ -32,11 +32,11 @@ import {
 } from '../packages/ingest/test/support/enrich-fixture';
 import {
   RAW_FIXTURE_DIR,
-  assembleSummary,
   buildRawIndex,
   goldenFile,
   loadRawFixture,
   rawFixtureFile,
+  summariseRecording,
   type AssembleGolden,
   type RawRecording,
   type RawShape,
@@ -174,7 +174,7 @@ async function deriveGolden(recording: RawRecording): Promise<void> {
     shape: recording.shape,
     subject: recording.subject,
     timestampOsmBase: recording.timestampOsmBase,
-    trails: assembleSummary(recording.response.elements ?? []),
+    trails: summariseRecording(recording),
   };
   await mkdir(join(RAW_FIXTURE_DIR, 'golden'), { recursive: true });
   await writeFile(goldenFile(recording.shape, recording.subject), serialiseGolden(golden));

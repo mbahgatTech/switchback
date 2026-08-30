@@ -38,14 +38,18 @@ top-level builder is.
 ## golden/
 
 What `assembleTrails` makes of a recording, one line per trail, coordinates digested rather than
-stored. `assembleSummary` in `../../support/raw-fixture.ts` produces it and is the seam a
-replacement trail source is diffed through. Both tiles and the whole `route` answer have one.
+stored. `summariseRecording` in `../../support/raw-fixture.ts` derives one; `assembleAsRecorded`
+is the seam a replacement trail source is diffed through. Both tiles and the whole `route` answer
+have a golden.
 
-Ways must reach it ordered by way id ascending, which is how Overpass serves them and how every
-recording here is stored. Assembly seeds `chainWays` in iteration order, so a source serving
-osm2pgsql's geometry-cluster order instead produces the golden's trail *count* out of different
-ways; `assembleSummary` refuses unordered elements rather than diffing trails that are silently
-not the golden's.
+Order is part of that contract, and it is two different rules. Top-level ways arrive by way id
+ascending, which is how Overpass serves them. A relation's members arrive in the sequence the
+relation declares — route order, which is not sorted and which no sort reproduces. Assembly seeds
+`chainWays` on both lists, so a source serving osm2pgsql's geometry-cluster order, or rebuilding a
+relation from a member join without `ORDER BY ... WITH ORDINALITY`, returns the golden's trail
+count, identities and lengths built from different ways. `assembleAsRecorded` takes the recording
+as the authority on both and refuses either, rather than diffing trails that are silently not the
+golden's.
 
 Re-derive from what is already committed, with no network:
 

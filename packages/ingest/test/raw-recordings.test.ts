@@ -14,10 +14,10 @@ import {
   DENSE_TILE,
   RAW_SHAPES,
   SPARSE_TILE,
-  assembleSummary,
   buildRawIndex,
   loadRawFixture,
   loadRawIndex,
+  summariseRecording,
   type RawShape,
 } from './support/raw-fixture';
 
@@ -159,8 +159,8 @@ describe('the Pacific Crest Trail superroute', () => {
    * assembly makes nothing of it. That is the whole reason `parent-route` is a separate query.
    */
   it('assembles to nothing, because its members are relations', () => {
-    const elements = elementsOf('route', '1225378');
-    const superroute = elements.find(
+    const recording = loadRawFixture('route', '1225378');
+    const superroute = (recording.response.elements ?? []).find(
       (element): element is OverpassRelation => element.type === 'relation',
     )!;
     const members = superroute.members ?? [];
@@ -168,7 +168,7 @@ describe('the Pacific Crest Trail superroute', () => {
     expect(superroute.tags?.type).toBe('superroute');
     expect(members.filter((member) => member.type === 'relation')).toHaveLength(29);
     expect(members.some((member) => member.geometry)).toBe(false);
-    expect(assembleSummary(elements)).toEqual([]);
+    expect(summariseRecording(recording)).toEqual([]);
   });
 });
 
