@@ -16,6 +16,7 @@ import type {
 import { encodeMapOut, parseMapIn } from '@switchback/core';
 import { useTRPC } from '@/trpc/react';
 import { type BasemapId, buildStyle, pmtilesUrl } from './basemap';
+import { browsePollInterval } from './browse-poll';
 import { registerRTLText } from './rtl';
 import { registerSlopeProtocol } from './slope-protocol';
 import {
@@ -65,9 +66,6 @@ const SETTLE_MS = 320;
 
 /** Trails per viewport. `browse` caps at 300; a phone screen cannot use half of that. */
 const LIMIT = 120;
-
-/** How often to re-ask while tiles are still being fetched from OSM. */
-const POLL_MS = 2_500;
 
 const DEFAULT_QUERY: MapQuery = { sort: 'popularity' };
 
@@ -136,12 +134,7 @@ export function EmbedMap(props: EmbedMapProps) {
       // Hold the last viewport's trails on screen through the next fetch, so a pan does not
       // blank the map and repaint it.
       placeholderData: (previous) => previous,
-      refetchInterval: (active) => {
-        const data = active.state.data;
-        if (!data) return false;
-        const moving = data.coverage.pendingTiles.length > 0 || (data.area?.working ?? 0) > 0;
-        return moving ? POLL_MS : false;
-      },
+      refetchInterval: (active) => browsePollInterval(active.state.data),
     }),
   );
 

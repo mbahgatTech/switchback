@@ -7,6 +7,7 @@ import type { BBox } from '@switchback/core';
 import { rememberPlace } from '@/lib/place-action';
 import { useTRPC } from '@/trpc/react';
 import { type BasemapId } from '../map/basemap';
+import { browsePollInterval } from '../map/browse-poll';
 import { LAYER_COLUMN_PX, LayerSwitch } from '../map/layer-switch';
 import type { MapFrame } from '../map/trail-map';
 import { CoverageNote } from './coverage-note';
@@ -35,13 +36,6 @@ const TrailMap = dynamic(() => import('../map/trail-map').then((mod) => mod.Trai
 
 /** How long the search box waits after the last keystroke. */
 const TYPING_MS = 300;
-
-/**
- * How often to re-ask while tiles are still being fetched. A poll, not the SSE stream the plan
- * sketches: with a cap of twelve tiles per viewport, a stream would cost a long-lived
- * connection and a held-open serverless function per open map to carry a handful of messages.
- */
-const POLL_MS = 2_500;
 
 /** Gap between the fetch-area control and the layer column, plus the switcher's own inset. */
 const LAYER_COLUMN_CLEARANCE_PX = 32;
@@ -193,17 +187,7 @@ export function Explore({
       // Keep the previous viewport's trails on screen while the next one loads, so a pan
       // does not blank the map and then repaint it.
       placeholderData: (previous) => previous,
-      /*
-       * Poll while anything upstream is still moving. `area.working` is read separately from
-       * `pendingTiles` because a wide viewport is `tooLarge` — `ensureCoverage` queues nothing
-       * and `pendingTiles` is empty by construction, however much work the button just started.
-       */
-      refetchInterval: (active) => {
-        const data = active.state.data;
-        if (!data) return false;
-        const moving = data.coverage.pendingTiles.length > 0 || (data.area?.working ?? 0) > 0;
-        return moving ? POLL_MS : false;
-      },
+      refetchInterval: (active) => browsePollInterval(active.state.data),
     }),
   );
 
