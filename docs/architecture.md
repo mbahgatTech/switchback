@@ -127,18 +127,21 @@ The parent-route lookup is the opposite case. It reads the tile query's answer �
 assembly produced — so it cannot start any earlier than the fork at `K`; but nothing in the commit
 chain reads _its_ answer, so it does not have to wait for the chain either. Run beside the commits
 rather than after them, it costs the tile only what it outruns them by: the whole round trip
-disappears wherever the commit loop is the longer of the two, and the lookup is 5.1 to 58.9 s per
-tile in production. **It shortens no reader's wait for a first trail** — the join at `G` is past
+disappears wherever the commit loop is the longer of the two. The lookup itself is 3.0 to 54.5 s per
+tile, measured off a workstation against the live mirrors — its distribution on the deployed worker
+is UNVERIFIED, and `scripts/ingest-metrics/03-throughput.sql` is what would settle it.
+**It shortens no reader's wait for a first trail** — the join at `G` is past
 every trail this tile will draw. What it buys is throughput, and throughput is what shortens the
 queue behind it.
 
-Two paths pay a request for the overlap. `withDeadline` refuses a query synchronously, at the moment
-it is handed over rather than when it would return, so a budget that expires while the region lookup
-is out refuses a waypoint lookup that had not yet been sent, and refuses neither of a pair already
-committed in the same tick. The same rule prices the fork at `K`: a parent-route lookup handed over
-before the commit loop is in flight on a tile that runs out of clock and splits, where one handed
-over after the loop is refused or never reached. Each path sends one request a serial shape would
-not, and neither can send more than one. The aggregate direction is UNVERIFIED: a tile that finishes
+Both overlaps are paid for in requests, on the paths where a tile does not finish. `withDeadline`
+refuses a query synchronously, at the moment it is handed over rather than when it would return, so
+a budget that expires while the region lookup is out refuses a waypoint lookup that had not yet been
+sent, and refuses neither of a pair already committed in the same tick. The same rule prices the
+fork at `K`: a parent-route lookup handed over before the commit loop is already in flight on every
+tile that abandons that loop — a deadline split, a deadline failure at the zoom floor, or a trail
+lost on its own account — where one handed over after the loop is never reached. Each overlap sends
+one request a serial shape would not, and neither can send more than one. The aggregate direction is UNVERIFIED: a tile that finishes
 sooner is a tile less likely to reach its deadline at all, and no counter records how many land
 inside that window.
 

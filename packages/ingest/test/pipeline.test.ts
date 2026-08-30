@@ -921,9 +921,13 @@ describe('processTile, Overpass etiquette', () => {
     await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
 
     expect(sent).toHaveLength(4);
+    // The tile query stays first because `relation(br)` takes its ids from that answer. It is the
+    // data dependency the whole shape rests on, and order is the only place it is observable.
+    expect(sent[0]).toBe('tile');
     expect([...sent].sort()).toEqual(['features', 'parents', 'region', 'tile']);
     expect(peak()).toBeLessThanOrEqual(2);
     expect(client.inFlight).toBe(0);
+    expect(client.queueDepth).toBe(0);
   });
 
   it('hands the parent-route lookup over before the commit loop rather than after it', async () => {

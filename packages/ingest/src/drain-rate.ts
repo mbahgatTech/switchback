@@ -17,7 +17,8 @@
  * **Three things date this number, all pushing the true rate up.** It predates the shared terrain
  * cache (`terrain-cache-r2.ts`, 2026-08-29), which removes a per-invocation terrarium fetch from
  * exactly the phase being timed; it predates the parent-route lookup moving alongside the commit
- * loop (`parent-routes.ts`), which took a whole Overpass round trip out of a tile's wall clock; and
+ * loop (`parent-routes.ts`), which takes off a tile's wall clock whatever of an Overpass round trip
+ * that loop covers, up to the whole of it; and
  * the p90 of 540.1 s is 6.7 an hour, so the distribution behind this mean is wide. Re-measuring is
  * `03-throughput.sql`; treat a ceiling built on it as a floor on capacity rather than a forecast.
  */

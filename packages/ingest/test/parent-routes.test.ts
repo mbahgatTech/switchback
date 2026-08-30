@@ -167,9 +167,12 @@ describe('startParentRouteDiscovery', () => {
      * flight. Pinned rather than fixed: the two cannot be had at once, and a future change must be
      * able to see which one it is trading away.
      *
-     * The clock advances inside the awaited loop, never inside `query`. A synchronous advance
-     * there makes the overlapped shape behave exactly like the serial one and passes for the
-     * wrong reason.
+     * What discriminates the two shapes is the clock at hand-over and nothing else: `withDeadline`
+     * reads `now()` before delegating, so an advance inside the inner querier can never reach the
+     * refusal decision. The loop below is an awaited step because that is the shape it models, not
+     * because a synchronous one would pass for the wrong reason — against this `withDeadline` it
+     * would not. Moving the deadline check to completion time is the change that invalidates this
+     * test, and it would have to rewrite it rather than quietly green it.
      */
     const deadlineAt = 1_500;
 

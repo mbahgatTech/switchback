@@ -39,15 +39,17 @@ export interface ParentRouteDiscovery {
 /**
  * Ask which routes contain the relations this tile assembled, without waiting for the answer.
  *
- * Handed to the client before the commit loop rather than after it, so the round trip — 5.1 to
- * 58.9 s on the measured tiles — spends the loop's wall clock instead of the tile's own. It takes
+ * Handed to the client before the commit loop rather than after it, so the round trip — 3.0 to
+ * 54.5 s per tile, measured off a workstation against the live mirrors — spends the loop's wall
+ * clock instead of the tile's own. It takes
  * one of the two slots an instance allots an IP while the loop holds none, and it is the only
  * Overpass request a tile makes past its context lookups.
  *
  * **Sending it early is what costs a request.** `withDeadline` refuses synchronously at hand-over,
- * so a query handed over after the loop is refused on every tile that ran out of clock, while this
- * one is already in flight. A tile that goes on to split or fail therefore sends one request the
- * serial shape sent none of, and it can never send more than one.
+ * so a query handed over after the loop is never reached on a tile that abandons it — a deadline
+ * split, a deadline failure at the zoom floor, a trail lost on its own account — while this one is
+ * already in flight. Those three paths each send one request the serial shape sent none of, and no
+ * path can send more than one.
  */
 export function startParentRouteDiscovery(
   db: PrismaClient,
