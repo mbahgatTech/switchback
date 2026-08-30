@@ -733,7 +733,7 @@ const WAY_GEOMETRY_BATCH_SIZE = 250;
  * renders and lies about its length; throwing leaves the previous data alone and the job
  * retryable.
  */
-async function fetchRelationInParts(
+export async function fetchRelationInParts(
   id: number,
   deps: PipelineDeps,
   log: (message: string, fields?: Record<string, unknown>) => void,
