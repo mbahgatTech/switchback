@@ -15,7 +15,13 @@
  * Three endpoints over three rounds is nine requests.
  */
 
-import { OverpassClient } from '../packages/ingest/src/overpass';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  OverpassClient,
+  type OverpassQuerier,
+  type OverpassResponse,
+} from '../packages/ingest/src/overpass';
 
 /**
  * A handful of paths in a tenth of a degree of Seattle. Deliberately trivial: what separates these
@@ -30,14 +36,15 @@ const REQUEST_TIMEOUT_MS = 30_000;
 /** Between samples. Sequential requests are already inside the concurrency ceiling; this is manners. */
 const PAUSE_MS = 2_000;
 
-interface Sample {
+/** One endpoint, one round. `error` is null only for an answer that carried ground. */
+export interface Sample {
   endpoint: string;
   round: number;
   ms: number;
   error: string | null;
 }
 
-interface Summary {
+export interface Summary {
   endpoint: string;
   ok: number;
   rounds: number;
@@ -48,8 +55,8 @@ interface Summary {
 
 async function main(): Promise<void> {
   const userAgent = process.env.OVERPASS_USER_AGENT ?? '';
-  const rounds = intArg('--rounds') ?? 3;
-  const endpoints = listArg('--endpoints') ?? configuredEndpoints(userAgent);
+  const rounds = intArg('--rounds', process.argv) ?? 3;
+  const endpoints = listArg('--endpoints', process.argv) ?? configuredEndpoints(userAgent);
 
   console.log(`rounds ${String(rounds)}`);
   console.log(`query  ${PROBE_QL}`);
@@ -124,11 +131,22 @@ function probeClient(endpoint: string, userAgent: string): OverpassClient {
   });
 }
 
-async function probe(client: OverpassClient, endpoint: string, round: number): Promise<Sample> {
+/**
+ * An answer carrying no elements is recorded as a failure rather than as the fastest sample in the
+ * run. `assertUsable` accepts any JSON body without a failure remark, so a mirror serving a
+ * regional extract that excludes the probe bbox answers `{elements: []}` in milliseconds — which
+ * would otherwise read as the best mirror measured, from the one that cannot serve the query.
+ */
+export async function probe(
+  client: OverpassQuerier,
+  endpoint: string,
+  round: number,
+): Promise<Sample> {
   const startedAt = Date.now();
   try {
-    await client.query(PROBE_QL);
-    return { endpoint, round, ms: Date.now() - startedAt, error: null };
+    const body = await client.query(PROBE_QL);
+    const ms = Date.now() - startedAt;
+    return { endpoint, round, ms, error: carriedGround(body) ? null : EMPTY_ANSWER };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -140,9 +158,17 @@ async function probe(client: OverpassClient, endpoint: string, round: number): P
   }
 }
 
+/** Recorded against a mirror that answered but carried nothing for the probe bbox. */
+export const EMPTY_ANSWER = 'answered with no elements';
+
+/** `elements` is cast from the wire rather than parsed, so an absent array is reachable here. */
+function carriedGround(body: OverpassResponse): boolean {
+  return Array.isArray(body.elements) && body.elements.length > 0;
+}
+
 /** Medians over the rounds that answered. A failed round has no latency to average in — it is
  * counted in `ok` instead, where it belongs. */
-function summarise(endpoint: string, samples: readonly Sample[], rounds: number): Summary {
+export function summarise(endpoint: string, samples: readonly Sample[], rounds: number): Summary {
   const good = samples
     .filter((sample) => sample.endpoint === endpoint && sample.error === null)
     .map((sample) => sample.ms)
@@ -172,7 +198,7 @@ function median(sorted: readonly number[]): number | null {
  * a fast median over one lucky sample out of three is the failure this is meant to catch, not
  * evidence — and the incumbent keeps its place on a tie.
  */
-function verdict(endpoints: readonly string[], summaries: readonly Summary[]): string {
+export function verdict(endpoints: readonly string[], summaries: readonly Summary[]): string {
   const incumbent = endpoints[0];
   if (incumbent === undefined) return 'nothing to probe — no endpoints given.';
 
@@ -198,16 +224,16 @@ function configuredEndpoints(userAgent: string): readonly string[] {
   return new OverpassClient({ userAgent }).mirrors;
 }
 
-function intArg(flag: string): number | null {
-  const value = argValue(flag);
+export function intArg(flag: string, argv: readonly string[]): number | null {
+  const value = argValue(flag, argv);
   if (value === null) return null;
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${flag} takes a positive integer`);
   return parsed;
 }
 
-function listArg(flag: string): readonly string[] | null {
-  const value = argValue(flag);
+export function listArg(flag: string, argv: readonly string[]): readonly string[] | null {
+  const value = argValue(flag, argv);
   if (value === null) return null;
   const entries = value
     .split(',')
@@ -216,9 +242,9 @@ function listArg(flag: string): readonly string[] | null {
   return entries.length > 0 ? entries : null;
 }
 
-function argValue(flag: string): string | null {
-  const index = process.argv.indexOf(flag);
-  return index === -1 ? null : (process.argv[index + 1] ?? null);
+function argValue(flag: string, argv: readonly string[]): string | null {
+  const index = argv.indexOf(flag);
+  return index === -1 ? null : (argv[index + 1] ?? null);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -227,7 +253,9 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error: unknown) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
