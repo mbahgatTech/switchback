@@ -240,7 +240,7 @@ describe.skipIf(!IS_LOCAL)('the ingest allowance, through the procedures that sp
      * running database test see a full queue.
      */
     class Rollback extends Error {}
-    let depthRefusal: { busyReason: string | null; queueWaitHours: number | null } | null = null;
+    let refusalChecked = false;
 
     await prisma
       .$transaction(async (tx) => {
@@ -256,16 +256,19 @@ describe.skipIf(!IS_LOCAL)('the ingest allowance, through the procedures that sp
         const refused = await callerFor(headersFor(ADDRESS), tx as PrismaClient).trails.fetchArea({
           bbox: WIDE_BBOX,
         });
-        depthRefusal = { busyReason: refused.busyReason, queueWaitHours: refused.queueWaitHours };
+
+        expect(refused.busyReason).toBe('queue-depth');
+        expect(refused.queueWaitHours).toBe(MAX_QUEUE_WAIT_HOURS);
+        refusalChecked = true;
+
         throw new Rollback();
       })
       .catch((error: unknown) => {
         if (!(error instanceof Rollback)) throw error;
       });
 
-    expect(depthRefusal).not.toBeNull();
-    expect(depthRefusal?.busyReason).toBe('queue-depth');
-    expect(depthRefusal?.queueWaitHours).toBe(MAX_QUEUE_WAIT_HOURS);
+    // Without this the block above would pass by never running.
+    expect(refusalChecked).toBe(true);
   });
 
   it('keeps two callers apart across the procedures, not just inside the bucket', async () => {
