@@ -230,8 +230,9 @@ function assertMembersAsRecorded(
  * Order is part of the contract, not a property of the source to be absorbed, and its two halves
  * differ: top-level ways arrive by id ascending, a relation's members in the sequence OSM stores.
  * Assembly seeds on both, so a backend serving osm2pgsql's geometry-cluster order, or joining
- * member ways without `WITH ORDINALITY`, yields the right trail *count* built from different ways
- * — which is why either is refused rather than diffed.
+ * member ways without `WITH ORDINALITY`, draws different lines from the same ways — sometimes
+ * under the golden's own trail count and identities, which is why either is refused rather than
+ * diffed. `fixtures/raw/README.md` tabulates what each costs on each tile.
  */
 export function assembleAsRecorded(
   elements: readonly OverpassElement[],

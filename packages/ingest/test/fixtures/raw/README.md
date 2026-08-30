@@ -46,10 +46,22 @@ Order is part of that contract, and it is two different rules. Top-level ways ar
 ascending, which is how Overpass serves them. A relation's members arrive in the sequence the
 relation declares — route order, which is not sorted and which no sort reproduces. Assembly seeds
 `chainWays` on both lists, so a source serving osm2pgsql's geometry-cluster order, or rebuilding a
-relation from a member join without `ORDER BY ... WITH ORDINALITY`, returns the golden's trail
-count, identities and lengths built from different ways. `assembleAsRecorded` takes the recording
-as the authority on both and refuses either, rather than diffing trails that are silently not the
-golden's.
+relation from a member join without `ORDER BY ... WITH ORDINALITY`, draws different lines from the
+same ways.
+
+How far that carries depends on the tile, so no summary figure detects it:
+
+| fault                          | tile   | trails        | identities | geometry |
+| ------------------------------ | ------ | ------------- | ---------- | -------- |
+| top-level ways out of id order | sparse | 145 → 145     | changed    | changed  |
+| top-level ways out of id order | dense  | 1,517 → 1,521 | changed    | changed  |
+| relation members sorted by ref | sparse | 145 → 145     | all held   | changed  |
+| relation members sorted by ref | dense  | 1,517 → 1,513 | changed    | changed  |
+
+A trail count that survives is therefore evidence of nothing, and one that moves does not rule
+ordering out; only the geometry moves in every case. `assembleAsRecorded` takes the recording as
+the authority on both lists and refuses either fault, rather than diffing trails that are silently
+not the golden's. `assemble-golden.test.ts` holds this table.
 
 Re-derive from what is already committed, with no network:
 

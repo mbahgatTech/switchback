@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { assembleTrails } from '../src/assemble';
-import type { OverpassQuerier, OverpassRelation } from '../src/overpass';
+import type { OverpassElement, OverpassQuerier, OverpassRelation } from '../src/overpass';
 import { fetchRelationInParts } from '../src/pipeline';
 import {
   DENSE_TILE,
@@ -63,6 +63,26 @@ describe('the order elements arrive in', () => {
   }
 
   /**
+   * Each relation's member ways sorted between its first and its last, both of which stay where the
+   * recording put them — what a rebuild that walks the members outward from a declared endpoint
+   * returns, and the shape an endpoint comparison cannot see.
+   */
+  function interiorReordered(elements: readonly OverpassElement[]): OverpassElement[] {
+    const clone = structuredClone(elements) as OverpassElement[];
+    for (const element of clone) {
+      if (element.type !== 'relation') continue;
+      const ways = element.members.filter((member) => member.type === 'way');
+      if (ways.length < 4) continue;
+      const held = [ways[0]!, ...ways.slice(1, -1).sort((a, b) => a.ref - b.ref), ways.at(-1)!];
+      let next = 0;
+      element.members = element.members.map((member) =>
+        member.type === 'way' ? held[next++]! : member,
+      );
+    }
+    return clone;
+  }
+
+  /**
    * Why a trail count is no evidence of parity. `chainWays` seeds greedily in iteration order, so
    * listing the same ways backwards assembles the golden's 145 trails with one of them under a
    * different identity built from different member ways.
@@ -113,6 +133,113 @@ describe('the order elements arrive in', () => {
       /ordered by way id ascending/u,
     );
     expect(() => assembleAsRecorded(membersSorted, sparse.elements)).toThrow(/WITH ORDINALITY/u);
+  });
+
+  /**
+   * The interior of a member list, which is where an endpoint comparison sees nothing: every
+   * relation here keeps the first and last way the recording gave it. Refusing that is not
+   * pedantry — assembled, the dense tile comes back 1,513 trails against the golden's 1,517,
+   * six of the golden's gone.
+   */
+  it('holds a member list at every position, not at its ends', () => {
+    const candidate = interiorReordered(dense.elements);
+    const recorded = memberWaySequences(dense.elements);
+    const rows = [...memberWaySequences(candidate)].map(([id, seq]) => ({
+      id,
+      seq,
+      was: recorded.get(id)!,
+    }));
+    const asMultiset = (ids: readonly number[]) => [...ids].sort((a, b) => a - b).join();
+    const ends = (ids: readonly number[]) => `${ids[0]}..${ids.at(-1)}`;
+
+    // A reordering and nothing else, both ends left alone: otherwise the divergence below would be
+    // evidence of ways lost, not of the order they arrive in.
+    expect(rows.filter((r) => asMultiset(r.seq) !== asMultiset(r.was)).map((r) => r.id)).toEqual(
+      [],
+    );
+    expect(rows.filter((r) => ends(r.seq) !== ends(r.was)).map((r) => r.id)).toEqual([]);
+    expect(rows.filter((r) => r.seq.join() !== r.was.join()).length).toBeGreaterThan(0);
+
+    expect(() => assembleAsRecorded(candidate, dense.elements)).toThrow(/WITH ORDINALITY/u);
+
+    const accepted = new Set(summariseTrails(assembleTrails(candidate)).map(identity));
+    const lost = dense.golden.trails.map(identity).filter((id) => !accepted.has(id));
+
+    expect(accepted.size).toBe(1_513);
+    expect(lost).toHaveLength(6);
+  });
+
+  /** A prefix is not a match: compared ref by ref alone, a truncated member list passes. */
+  it('holds how many members a relation declares', () => {
+    const candidate = structuredClone(sparse.elements);
+    const truncated = candidate.find(
+      (element): element is OverpassRelation => element.type === 'relation',
+    )!;
+    truncated.members.pop();
+
+    expect(() => assembleAsRecorded(candidate, sparse.elements)).toThrow(/WITH ORDINALITY/u);
+  });
+
+  /**
+   * Which sequence is the candidate's and which the recording's. Named the wrong way round, the
+   * refusal reads as an instruction to sort the side that was already right.
+   */
+  it('names the served sequence and the recorded one the right way round', () => {
+    const candidate = structuredClone(sparse.elements);
+    const relation = candidate.find(
+      (element): element is OverpassRelation => element.type === 'relation',
+    )!;
+    relation.members.reverse();
+    const served = memberWaySequences(candidate).get(relation.id)!;
+    const declared = memberWaySequences(sparse.elements).get(relation.id)!;
+
+    expect(() => assembleAsRecorded(candidate, sparse.elements)).toThrow(
+      `serves member ways [${served.join(', ')}] where the recording declares ` +
+        `[${declared.join(', ')}]`,
+    );
+  });
+
+  /**
+   * What each fault actually costs, which is the table `fixtures/raw/README.md` states and what a
+   * reader uses to judge whether a diff is an ordering problem at all. The lines drawn move in
+   * every combination; the trail count survives two and the identity set one, so neither settles
+   * the question in either direction.
+   */
+  it('costs the geometry every time and the trail count only sometimes', () => {
+    const membersByRef = (elements: readonly OverpassElement[]) => {
+      const clone = structuredClone(elements) as OverpassElement[];
+      for (const element of clone) {
+        if (element.type === 'relation') element.members.sort((a, b) => a.ref - b.ref);
+      }
+      return clone;
+    };
+    const cost = (tile: typeof sparse, candidate: readonly OverpassElement[]) => {
+      const golden = new Map(tile.golden.trails.map((trail) => [identity(trail), trail]));
+      const after = summariseTrails(assembleTrails(candidate));
+      const ids = new Set(after.map(identity));
+      return {
+        trails: after.length,
+        identitiesHeld: ids.size === golden.size && [...ids].every((id) => golden.has(id)),
+        // Only trails the golden also carries: a gained identity is a count difference, already
+        // reported above, and counting it here would let that stand in for a line that moved.
+        geometryMoved: after.some((trail) => {
+          const before = golden.get(identity(trail));
+          return before !== undefined && before.coords.sha256 !== trail.coords.sha256;
+        }),
+      };
+    };
+
+    expect([
+      cost(sparse, reversed),
+      cost(dense, [...dense.elements].reverse()),
+      cost(sparse, membersSorted),
+      cost(dense, membersByRef(dense.elements)),
+    ]).toEqual([
+      { trails: 145, identitiesHeld: false, geometryMoved: true },
+      { trails: 1_521, identitiesHeld: false, geometryMoved: true },
+      { trails: 145, identitiesHeld: true, geometryMoved: true },
+      { trails: 1_513, identitiesHeld: false, geometryMoved: true },
+    ]);
   });
 
   /**
