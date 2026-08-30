@@ -87,14 +87,17 @@ Inside `processTile`, per tile:
 
 ```mermaid
 flowchart LR
-  A["Overpass<br/>tile query"] --> B["assemble<br/>members into ordered lines"]
+  subgraph OSM["donated public Overpass instance — two slots per client IP"]
+    A["tile query"]
+    subgraph W["one window, both slots held"]
+      T1["region is_in"]
+      T2["tile waypoints"]
+    end
+  end
+  A --> B["assemble<br/>members into ordered lines"]
   B --> X{"any trails<br/>assembled?"}
   X -- no --> Z["tile empty<br/>no further queries"]
   X -- yes --> F(( ))
-  subgraph W["one window, both slots"]
-    T1["Overpass<br/>region is_in"]
-    T2["Overpass<br/>tile waypoints"]
-  end
   F --> T1
   F --> T2
   T1 --> J(( ))
@@ -103,12 +106,11 @@ flowchart LR
   C --> D["derive<br/>length, gain, grade, route type,<br/>difficulty, Tobler time"]
   D --> E["commit<br/>one transaction per trail"]
   E --> G["enqueue: enrich_trail for photographs,<br/>ingest_route for any parent superroute"]
-  classDef donated stroke-dasharray: 5 4
-  class A,T1,T2 donated
 ```
 
-Dashed nodes leave this estate: each is a request to a donated public Overpass instance, which
-allots two slots per client IP. The fork is the only place a tile holds both at once.
+Every edge crossing the outer box is a request to hardware somebody donated. `W` is the only place
+a tile holds both of its slots, and the fork into it is the whole of the concurrency this pipeline
+asks for.
 
 Neither tile-wide lookup reads the tile query's answer, so the two share one window rather than
 taking a slot each in turn. Both block the commit loop, and they are the last Overpass work before

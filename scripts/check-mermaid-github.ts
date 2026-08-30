@@ -60,18 +60,20 @@ export function mermaidTargets(tree: CommitTree): Target[] {
 }
 
 /**
+ * The commit to name in every blob URL, as a commit SHA and never anything else. github.com
+ * resolves a symbolic ref in a blob path against the *default branch*, so `HEAD` passed through
+ * renders master while the block counts come from the head commit — green, about the wrong tree.
+ * `^{commit}` is what makes it a commit: a tree or tag SHA is 40 hex characters that 404 as a
+ * blob, and a 404 renders nothing, which the settle loop cannot tell from a parse failure.
+ */
+export function resolveRef(ref: string | undefined): string {
+  return git('rev-parse', `${ref ?? 'HEAD'}^{commit}`).trim();
+}
+
+/**
  * A commit in this clone. Absent objects make `git` throw, which ends the run loudly rather than
  * finding nothing to check and calling that a pass.
  */
-/**
- * The commit to name in every blob URL, always as a SHA. github.com resolves a symbolic ref in a
- * blob path against the *default branch*, so passing `HEAD` through renders master while the
- * expected block counts are read from the head commit — a green run about the wrong tree.
- */
-export function resolveRef(ref: string | undefined): string {
-  return git('rev-parse', ref ?? 'HEAD').trim();
-}
-
 export function gitCommitTree(ref: string): CommitTree {
   return {
     // `-z`, because `ls-tree` otherwise quotes and backslash-escapes any path outside ASCII.

@@ -107,6 +107,15 @@ describe('naming the commit a blob URL asks for', () => {
   it('fails loudly on a ref this clone does not have', () => {
     expect(() => resolveRef('no-such-ref-9f3a2b')).toThrow();
   });
+
+  it('refuses a ref that names a tree rather than a commit', () => {
+    /*
+     * `HEAD^{tree}` is forty hex characters and a valid object, so a length check admits it — and
+     * a tree 404s as a blob, which renders nothing and reads as a diagram that failed to parse.
+     * The same holds for the tag object an annotated tag names.
+     */
+    expect(() => resolveRef('HEAD^{tree}')).toThrow(/commit/);
+  });
 });
 
 describe('reading a commit out of the clone', () => {
