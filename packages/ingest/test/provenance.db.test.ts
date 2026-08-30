@@ -78,6 +78,20 @@ const STALLED_PARENTS = Array.from({ length: CHILDREN_PER_TILE }, (_, held) => `
  */
 const FULL_SET_PARENT = `${NS}000120`;
 
+/**
+ * A parent holding one child that was itself subdivided: one child, five descendants.
+ *
+ * The only shape that tells a count of children from a count of descendants apart. `splitTile`
+ * enqueues each child as it upserts it, so a stray child an interrupted split left is already on
+ * the queue, and one that runs out of Overpass clock subdivides in its turn — which z10 to z11
+ * permits.
+ */
+const DEEP_SPLIT_PARENT = `${NS}000130`;
+const DEEP_SPLIT_CHILD = childQuadkeys(DEEP_SPLIT_PARENT)[0];
+
+/** One tile, re-seeded once per `TileStatus`, for the status the empty count names. */
+const STATUS_TILE = `${NS}000200`;
+
 const FIXTURE_TILES = [
   FILLED,
   EMPTIED,
@@ -91,6 +105,10 @@ const FIXTURE_TILES = [
   ...STALLED_PARENTS.flatMap((parent) => [parent, ...childQuadkeys(parent)]),
   FULL_SET_PARENT,
   ...childQuadkeys(FULL_SET_PARENT),
+  DEEP_SPLIT_PARENT,
+  ...childQuadkeys(DEEP_SPLIT_PARENT),
+  ...childQuadkeys(DEEP_SPLIT_CHILD),
+  STATUS_TILE,
 ];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
@@ -434,12 +452,14 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
    *
    * The exclusion counts children and reads nothing off them, which is what makes it the roll-up's
    * precondition taken conservatively — a box split into four no longer stands for ground one
-   * answer covers, whether or not the split ever finished. A predicate that instead counted only
-   * children carrying a `sourceKind`, a `fetchedAt` or a settled status would read the same on
-   * every other fixture in this file and still re-admit the derived rows: `sourceKind` is null on
-   * every row a fetch wrote before provenance was recorded, so under any parent whose children
-   * predate that column such a predicate counts zero, and each row `promoteFrom` composed returns
-   * to both totals at every zoom above the answer.
+   * answer covers, whether or not the split ever finished. Counting only the children that carry
+   * a `sourceKind`, or a `fetchedAt`, or a status past `pending` reads the same on every other
+   * fixture in this file, and only the first is dangerous: `rollUp` refuses unless all four
+   * children are settled and stamped, so the other two still exclude every row `promoteFrom`
+   * writes and merely narrow the exclusion's conservatism. `sourceKind` is the one column that
+   * precondition does not constrain — null on every row a fetch wrote before provenance was
+   * recorded, so under a parent whose children predate the column such a predicate counts zero,
+   * and each row `promoteFrom` composed returns to both totals at every zoom above the answer.
    */
   it('leaves out a parent holding a full set of children, whatever those children hold', async () => {
     await seedParentHolding(FULL_SET_PARENT, CHILDREN_PER_TILE);
@@ -456,4 +476,57 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       empty: 0,
     });
   });
+
+  /**
+   * A stray child of a stalled split, subdivided in its turn.
+   *
+   * The exclusion probes the four immediate children by primary key, and only a subtree deeper
+   * than one level tells that apart from a count of descendants. The distinction is one character
+   * wide: `countOrphanedSplits` takes the same count with `LIKE parent.quadkey || '_'`, and the
+   * prefix form of that counts the whole subtree — reintroducing through the depth what
+   * `< CHILDREN_PER_TILE` refuses through the threshold, and dropping this parent's own answer
+   * from both totals for as long as the stray subtree lives.
+   */
+  it('counts a parent holding one child, however deep that child was split', async () => {
+    await seedParentHolding(DEEP_SPLIT_PARENT, 1);
+    for (const grandchild of childQuadkeys(DEEP_SPLIT_CHILD)) {
+      await seedWrite(grandchild, TileStatus.pending, null, null);
+    }
+
+    // The subtree is on the ground, so the reading below is the exclusion counting one level and
+    // not a fixture that never landed.
+    const descendants = await prisma.ingestTile.count({
+      where: { quadkey: { startsWith: DEEP_SPLIT_CHILD } },
+    });
+    expect(descendants).toBe(CHILDREN_PER_TILE + 1);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 1,
+      empty: 1,
+    });
+  });
+
+  /**
+   * Every status the enum holds, against a numerator that names exactly one of them.
+   *
+   * `status = 'empty'` and `status <> 'ready'` differ only on a tile that is neither, and this
+   * estate leaves three such rows inside the window: `processTile` re-enters a tile that answered
+   * before at `running`, its catch writes `failed`, and `splitTile` returns a parent to `pending`
+   * when what it split was not settled. None of the three moves `fetchedAt`, so a tile that
+   * answered once stays in the denominator under a status no other fixture here constructs.
+   * Swept off `TileStatus` rather than a chosen status, so a sixth arrives with its own case.
+   */
+  it.each(Object.values(TileStatus))(
+    'counts a %s tile as a write, and in the empty count only when it is empty',
+    async (status) => {
+      await seedWrite(STATUS_TILE, status, INSIDE_WINDOW);
+
+      expect(await shareFor(TileSource.overpass)).toEqual({
+        source: TileSource.overpass,
+        written: 1,
+        empty: status === TileStatus.empty ? 1 : 0,
+      });
+    },
+  );
 });
