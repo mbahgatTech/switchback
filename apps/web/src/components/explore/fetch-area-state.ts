@@ -65,8 +65,15 @@ export function describeHours(hours: number | null | undefined): string | null {
   if (typeof hours !== 'number' || !Number.isFinite(hours) || hours <= 0) return null;
   if (hours < 1) return 'less than an hour';
 
-  const days = Math.round(hours / 24);
-  if (days >= 1) return days === 1 ? 'about a day' : `about ${days} days`;
+  /*
+   * Days only from a full day up. Rounding into days first put everything from 12 h to 36 h under
+   * "about a day" — one label over a threefold range, in the one sentence whose whole job is
+   * being honest about the wait.
+   */
+  if (hours >= 24) {
+    const days = Math.round(hours / 24);
+    return days === 1 ? 'about a day' : `about ${days} days`;
+  }
 
   const whole = Math.round(hours);
   return whole === 1 ? 'about an hour' : `about ${whole} hours`;
@@ -110,9 +117,15 @@ function messageFor(
   working: number,
 ): FetchAreaMessage | null {
   if (press.failed) {
+    /*
+     * Deliberately says nothing about what the server did. `isError` covers a dropped connection
+     * as well as a rejection, and `queueTiles` commits each tile on its own — so a failed press
+     * may have queued some, none, or all of them, and only the refusal below is entitled to
+     * claim otherwise. What is safe to promise is the retry, which dedupes.
+     */
     return {
       tone: 'failure',
-      text: 'Nothing was queued — that request did not get through. Try again.',
+      text: 'That request failed. Try it again — tiles already queued are not fetched twice.',
     };
   }
 

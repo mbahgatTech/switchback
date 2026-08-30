@@ -99,6 +99,60 @@ describe('fetchAreaView', () => {
     expect(full.message?.text).toContain('about a day');
   });
 
+  it('gives each refusal its own sentence, because none of them share an instruction', () => {
+    const said = (busyReason: 'queue-depth' | 'storage' | 'rate-limit') =>
+      view({
+        press: {
+          pending: false,
+          failed: false,
+          result: {
+            busy: true,
+            busyReason,
+            queueWaitHours: busyReason === 'queue-depth' ? 24 : null,
+          },
+        },
+      }).message?.text ?? '';
+
+    const queue = said('queue-depth');
+    const storage = said('storage');
+    const allowance = said('rate-limit');
+
+    expect(new Set([queue, storage, allowance]).size).toBe(3);
+    // A queue drains on its own; a full database waits on an operator; an allowance is this
+    // reader's alone. Collapsing any two prescribes an action that cannot work.
+    expect(queue).toMatch(/queue/iu);
+    expect(storage).toMatch(/no room/iu);
+    expect(allowance).toMatch(/you have fetched/iu);
+  });
+
+  it('claims nothing was queued only where the server said so', () => {
+    const refused = view({
+      press: {
+        pending: false,
+        failed: false,
+        result: { busy: true, busyReason: 'queue-depth', queueWaitHours: 24 },
+      },
+    });
+    const failed = view({ press: { pending: false, failed: true, result: null } });
+
+    // A refusal is the server's own answer, and it did queue nothing.
+    expect(refused.message?.text).toMatch(/nothing was queued/iu);
+    /*
+     * A failure is not. `isError` fires on transport loss too, and `queueTiles` commits each
+     * tile separately — so some may well have landed, and the client cannot know.
+     */
+    expect(failed.message?.text).not.toMatch(/nothing was queued/iu);
+    expect(failed.message?.text).toMatch(/again/iu);
+  });
+
+  it('fills the bar and announces the count from the tiles actually done', () => {
+    const partway = view({ area: area({ working: 60, fresh: 24, tiles: 96, outstanding: 72 }) });
+
+    expect(partway.label).toBe('24 of 96 tiles');
+    expect(partway.progress).toEqual({ done: 24, total: 96, percent: 25 });
+    expect(partway.liveText).toBe('Fetching this area: 24 of 96 tiles complete.');
+  });
+
   it('gives refused, failed, under way and covered four different answers', () => {
     const answers = [
       view(),
@@ -128,6 +182,14 @@ describe('describeHours', () => {
 
   it('does not round a short wait down to nothing', () => {
     expect(describeHours(0.4)).toBe('less than an hour');
+  });
+
+  it('does not call half a day a day, and does not call a day and a half one either', () => {
+    // One label may not span a 3x range: 12 h and 35 h both read as "about a day" before this.
+    expect(describeHours(12)).toBe('about 12 hours');
+    expect(describeHours(20)).toBe('about 20 hours');
+    expect(describeHours(23.9)).toBe('about 24 hours');
+    expect(describeHours(36)).toBe('about 2 days');
   });
 
   it('has no answer for a wait that was never measured', () => {
