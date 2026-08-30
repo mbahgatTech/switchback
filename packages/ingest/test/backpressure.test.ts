@@ -18,7 +18,7 @@ import {
 } from '../src/backpressure';
 import { MAX_AREA_TILES, ensureCoverage, queueTiles } from '../src/coverage';
 import { REVIVAL_OUTSTANDING_MAX } from '../src/dead-jobs';
-import { REQUEST_DRAIN_TILES_PER_HOUR, hoursToDrain } from '../src/drain-rate';
+import { REQUEST_DRAIN_TILES_PER_HOUR, hoursToDrain, queueDepthForHours } from '../src/drain-rate';
 import { BUCKET_CAPACITY, PRINCIPAL_QUEUE_SHARE } from '../src/rate-limit';
 import { ensureNetworkCoverage, queueNetworkTiles } from '../src/network';
 
@@ -488,6 +488,9 @@ describe('what the reader is told', () => {
   });
 });
 
+/** The other wall on `MAX_QUEUE_WAIT_HOURS`: past this a fetch is for the next visitor. */
+const HOURS_IN_A_DAY = 24;
+
 /** `MAX_AREA_TILES` distinct z9 quadkeys — one press of "fetch this area". */
 function areaFetchKeys(): string[] {
   return Array.from(
@@ -552,7 +555,22 @@ describe('what the ceiling is worth in hours', () => {
     // The floor is `MAX_AREA_TILES`; this is the other wall. Past a day the fetch is certainly for
     // the next visitor rather than the one who asked, and nothing here can tell them it arrived —
     // so admitting it is the lie the ceiling exists to avoid, just slower.
-    expect(MAX_QUEUE_WAIT_HOURS).toBeLessThanOrEqual(24);
-    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH)).toBeLessThanOrEqual(24);
+    expect(MAX_QUEUE_WAIT_HOURS).toBeLessThanOrEqual(HOURS_IN_A_DAY);
+    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH)).toBeLessThanOrEqual(HOURS_IN_A_DAY);
+  });
+
+  it('takes the longest horizon the floor and the day both allow', () => {
+    /*
+     * More than one whole hour clears both walls, so which one this is cannot be derived — but the
+     * *rule* can be, and this is it. Pinning the rule rather than the number keeps it true through
+     * a re-measurement: change the drain rate and the admissible set moves, and the constant has to
+     * move to the top of it. Recomputed here from the same two bounds the code argues from.
+     */
+    const admissible = Array.from({ length: HOURS_IN_A_DAY }, (_, index) => index + 1).filter(
+      (hours) => queueDepthForHours(hours) >= MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE,
+    );
+
+    expect(admissible.length).toBeGreaterThan(1);
+    expect(Math.max(...admissible)).toBe(MAX_QUEUE_WAIT_HOURS);
   });
 });

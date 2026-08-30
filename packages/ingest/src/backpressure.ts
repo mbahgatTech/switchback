@@ -14,11 +14,17 @@ import { hoursToDrain, queueDepthForHours } from './drain-rate';
  * reader can check against the drain, and an hours figure does. Measured in
  * `REQUEST_DRAIN_TILES_PER_HOUR`, which is request kinds only — the unit this depth counts.
  *
- * Twenty-four sits just above a floor rather than being a preference. One press of "fetch this
- * area" is `MAX_AREA_TILES` = 96 tiles = 4.5 hours of serial drain, and below
+ * Bounded on both sides, and the longest value those bounds allow. One press of "fetch this area"
+ * is `MAX_AREA_TILES` = 96 tiles = 4.5 hours of serial drain, and below
  * `MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs, or 22.5 hours, the per-caller allowance in
- * `rate-limit.ts` stops being a share of this ceiling and becomes a clamp above it. A shorter
- * horizon needs a smaller area fetch first: that is the lever, not this constant.
+ * `rate-limit.ts` stops being a share of this ceiling and becomes a clamp above it. Past a day the
+ * fetch is certainly for the next visitor rather than the one who asked, and nothing here can tell
+ * them it arrived.
+ *
+ * More than one whole hour fits between those two, so taking the largest is a **choice**, not a
+ * derivation: refusing earlier caches less ground for everybody, and this ceiling exists to make
+ * the wait honest rather than to make it short. A shorter horizon needs a smaller area fetch
+ * first — that is the lever, not this constant.
  */
 export const MAX_QUEUE_WAIT_HOURS = 24;
 
