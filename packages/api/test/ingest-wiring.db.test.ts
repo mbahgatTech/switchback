@@ -1,8 +1,16 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { JobKind, JobStatus, prisma } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { INGEST_ZOOM, coverBBox } from '@switchback/geo';
-import { BUCKET_CAPACITY, ROUTING_ZOOM, spendIngestBudget } from '@switchback/ingest';
+import {
+  BUCKET_CAPACITY,
+  MAX_QUEUE_WAIT_HOURS,
+  MAX_TILE_QUEUE_DEPTH,
+  ROUTING_ZOOM,
+  hoursToDrain,
+  spendIngestBudget,
+} from '@switchback/ingest';
 import type { BBox } from '@switchback/core';
+import type { PrismaClient } from '@switchback/db';
 import { createContext } from '../src/context';
 import { ingestPrincipalFor } from '../src/ingest-principal';
 import { appRouter } from '../src/root';
@@ -30,6 +38,13 @@ const SECRET = 'test-secret-at-least-thirty-two-characters-long';
 /** A small box over open sea, so no other test's tiles overlap it. */
 const BBOX: BBox = [-30.05, 40.0, -30.0, 40.05];
 
+/**
+ * A wider box, also over open sea and disjoint from `BBOX`, spanning several z9 tiles — the
+ * shape "fetch this area" is offered for. Wide enough that making one tile fresh separates the
+ * tiles covered from the tiles outstanding, which is what tells the two derivations apart.
+ */
+const WIDE_BBOX: BBox = [-25.0, 35.0, -23.0, 36.0];
+
 /** Two anchors inside `BBOX`, neither freehand, so `/plan` has to ask for the network. */
 const ANCHORS = [
   { lng: -30.04, lat: 40.01, freehand: false },
@@ -40,9 +55,9 @@ function headersFor(address: string): Headers {
   return new Headers({ 'x-forwarded-for': address });
 }
 
-function callerFor(headers: Headers) {
+function callerFor(headers: Headers, db: PrismaClient = prisma) {
   return createCallerFactory(appRouter)({
-    db: prisma,
+    db,
     user: null,
     headers,
     authMethod: null,
@@ -69,6 +84,7 @@ function touchedQuadkeys(): string[] {
   return [
     ...coverBBox(BBOX, INGEST_ZOOM, 4096).quadkeys,
     ...coverBBox(BBOX, ROUTING_ZOOM, 4096).quadkeys,
+    ...coverBBox(WIDE_BBOX, INGEST_ZOOM, 4096).quadkeys,
   ];
 }
 
@@ -171,6 +187,88 @@ describe.skipIf(!IS_LOCAL)('the ingest allowance, through the procedures that sp
         },
       }),
     ).toBe(0);
+  });
+
+  /**
+   * The wait the reader is shown is computed on the server so the client never holds the estate's
+   * throughput. That makes these two fields the whole of the claim, and nothing reached them: the
+   * client suite hands itself the hours as a literal, so it proves only that a number it was given
+   * gets formatted. Both expectations below are computed from the same constants the code derives
+   * from — a literal here would agree with a stale figure instead of with the drain rate.
+   */
+  it('serves the wait for the tiles outstanding, not for the tiles it happens to cover', async () => {
+    const covered = coverBBox(WIDE_BBOX, INGEST_ZOOM, 4096).quadkeys;
+    const [alreadyDone] = covered;
+
+    // One tile fresh, so "covered" and "outstanding" are different numbers and the two candidate
+    // derivations cannot both satisfy the assertion.
+    await prisma.ingestTile.create({
+      data: {
+        quadkey: alreadyDone as string,
+        x: 0,
+        y: 0,
+        z: INGEST_ZOOM,
+        status: TileStatus.ready,
+        fetchedAt: new Date(),
+        trailCount: 1,
+        bboxW: -25,
+        bboxS: 35,
+        bboxE: -24,
+        bboxN: 36,
+      },
+    });
+
+    const area = await callerFor(headersFor(ADDRESS)).trails.fetchArea({ bbox: WIDE_BBOX });
+
+    expect(area.outstanding).toBeGreaterThan(0);
+    expect(area.tiles).toBeGreaterThan(area.outstanding);
+    expect(area.outstandingHours).toBeCloseTo(hoursToDrain(area.outstanding), 10);
+    expect(area.outstandingHours).not.toBeCloseTo(hoursToDrain(area.tiles), 10);
+  });
+
+  it('names the queue wait on the refusal that has one, and on no other', async () => {
+    await spendIngestBudget(prisma, ingestPrincipalFor(headersFor(ADDRESS), null), BUCKET_CAPACITY);
+    const spent = await callerFor(headersFor(ADDRESS)).trails.fetchArea({ bbox: WIDE_BBOX });
+
+    expect(spent.busyReason).toBe('rate-limit');
+    // An allowance refusal has no honest figure: answering it needs this caller's token count.
+    expect(spent.queueWaitHours).toBeNull();
+
+    /*
+     * The depth refusal, driven for real and rolled back. `admitIngest` counts queued request
+     * jobs across the whole database, so committing this many would make every concurrently
+     * running database test see a full queue.
+     */
+    class Rollback extends Error {}
+    let refusalChecked = false;
+
+    await prisma
+      .$transaction(async (tx) => {
+        await tx.ingestJob.createMany({
+          data: Array.from({ length: MAX_TILE_QUEUE_DEPTH }, (_unused, index) => ({
+            kind: JobKind.ingest_tile,
+            dedupeKey: `wiring-depth-${index}`,
+            payload: { quadkey: '000000000' },
+            status: JobStatus.queued,
+          })),
+        });
+
+        const refused = await callerFor(headersFor(ADDRESS), tx as PrismaClient).trails.fetchArea({
+          bbox: WIDE_BBOX,
+        });
+
+        expect(refused.busyReason).toBe('queue-depth');
+        expect(refused.queueWaitHours).toBe(MAX_QUEUE_WAIT_HOURS);
+        refusalChecked = true;
+
+        throw new Rollback();
+      })
+      .catch((error: unknown) => {
+        if (!(error instanceof Rollback)) throw error;
+      });
+
+    // Without this the block above would pass by never running.
+    expect(refusalChecked).toBe(true);
   });
 
   it('keeps two callers apart across the procedures, not just inside the bucket', async () => {

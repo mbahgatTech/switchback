@@ -238,6 +238,14 @@ export const areaSummarySchema = z.object({
   requiredTiles: z.number().int().nonnegative(),
   /** True when the box is wider than one fetch covers, so this is the middle of it. */
   capped: z.boolean(),
+  /**
+   * Hours of drain the outstanding tiles represent, from `hoursToDrain` in `drain-rate.ts`.
+   * Sent rather than derived on the client, which must not hold the estate's throughput: a
+   * second copy of that figure is a second thing to re-measure. Defaulted because
+   * `map-bridge.ts` carries this across a `WebView` version boundary, and a missing value has
+   * to drop the duration rather than the whole message.
+   */
+  outstandingHours: z.number().nonnegative().default(0),
 });
 export type AreaSummary = z.infer<typeof areaSummarySchema>;
 

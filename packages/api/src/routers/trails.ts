@@ -27,6 +27,8 @@ import { Prisma, trailIdsNear } from '@switchback/db';
 import { encodeBase64, toFitCourse, toRouteGpx } from '@switchback/geo';
 import {
   ensureCoverage,
+  hoursToDrain,
+  MAX_QUEUE_WAIT_HOURS,
   publishIngestSignals,
   requestArea,
   surveyArea,
@@ -354,6 +356,9 @@ function toArea(area: AreaCoverage): AreaSummary {
     working: area.working.length,
     requiredTiles: area.requiredTiles,
     capped: area.capped,
+    // Derived here rather than on the client, so the wait on screen and the ceilings sized
+    // against the same measurement cannot drift apart. See `drain-rate.ts`.
+    outstandingHours: hoursToDrain(area.outstanding.length),
   };
 }
 
@@ -755,6 +760,12 @@ export const trailsRouter = router({
         queued: area.queued.length,
         busy: area.busy,
         busyReason: area.busyReason,
+        /*
+         * What a `queue-depth` refusal costs the reader, from the constant that defines the
+         * ceiling it tripped. Null for the other two: a full database waits on an operator, and
+         * a spent allowance would need the caller's own token count to answer honestly.
+         */
+        queueWaitHours: area.busyReason === 'queue-depth' ? MAX_QUEUE_WAIT_HOURS : null,
       };
     }),
 });

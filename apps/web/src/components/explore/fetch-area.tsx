@@ -4,6 +4,7 @@ import { useMutation } from '@tanstack/react-query';
 import type { AreaSummary, BBox } from '@switchback/core';
 import { useTRPC } from '@/trpc/react';
 import { BUTTON, HEIGHT, SECONDARY } from '../controls';
+import { fetchAreaView } from './fetch-area-state';
 
 /**
  * Fetch this area — the one control that asks the pipeline for ground it has never seen.
@@ -11,8 +12,8 @@ import { BUTTON, HEIGHT, SECONDARY } from '../controls';
  * Automatic ingest caps at twelve z9 tiles, so this button appears only past that ceiling with
  * ground still outstanding; at every ordinary zoom the map is already filling itself. Progress
  * is in tiles rather than minutes, because an Overpass round trip is two seconds or a
- * timeout-and-retry. The `bg-surface` fill is the only difference from the same button in a
- * panel, and it is there because everything floating over the map is opaque.
+ * timeout-and-retry. What each state *says* is decided in `fetch-area-state.ts`, where it can be
+ * tested without a DOM; this file is the markup for that decision and nothing else.
  */
 
 export interface FetchAreaProps {
@@ -30,47 +31,45 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
     }),
   );
 
-  // No area survey means the viewport is inside the automatic ceiling, and nothing here has
-  // a job to do. Nothing outstanding means the ground is already ours.
-  if (!area || !bbox || area.outstanding === 0) return null;
+  const view = fetchAreaView({
+    area,
+    hasBBox: bbox !== null,
+    press: {
+      pending: fetchArea.isPending,
+      // Without this the whole of `fetchArea`'s failure surface — a 500, a dropped connection,
+      // an offline click — rendered exactly like never having pressed the button at all.
+      failed: fetchArea.isError,
+      result: fetchArea.data ?? null,
+    },
+  });
+  if (!view || !bbox) return null;
 
-  const working = area.working;
-  const done = area.fresh;
-  const busy = fetchArea.data?.busy ?? false;
-  const busyReason = fetchArea.data?.busyReason ?? null;
-
-  /*
-   * Percentage of the *capped* set, which is the set this press can finish. `requiredTiles`
-   * would show a bar stopping at 12% on a continental view and never moving.
-   */
-  const percent = area.tiles > 0 ? Math.round((done / area.tiles) * 100) : 0;
+  // A refusal and a failure are answers to the press; the other two are standing context, and
+  // progress is already announced by the live region below.
+  const announced = view.message?.tone === 'failure' || view.message?.tone === 'refusal';
 
   return (
     <div className="pointer-events-auto flex flex-col items-center gap-xs">
       <button
         type="button"
-        onClick={() => bbox && fetchArea.mutate({ bbox })}
-        disabled={fetchArea.isPending || working > 0}
+        onClick={() => fetchArea.mutate({ bbox })}
+        disabled={view.disabled}
         className={`${BUTTON} ${SECONDARY} ${HEIGHT.touch} bg-surface px-lg`}
       >
-        {working > 0 ? (
+        {view.progress ? (
           <>
             <span
               aria-hidden
               className="h-[6px] w-[6px] shrink-0 rounded-full bg-contour motion-safe:animate-pulse"
             />
-            <span className="font-mono text-micro tabular-nums">
-              {done} of {area.tiles} tiles
-            </span>
+            <span className="font-mono text-micro tabular-nums">{view.label}</span>
           </>
         ) : (
-          <span className="text-caption font-medium">
-            {fetchArea.isPending ? 'Queueing…' : 'Fetch this area'}
-          </span>
+          <span className="text-caption font-medium">{view.label}</span>
         )}
       </button>
 
-      {working > 0 ? (
+      {view.progress ? (
         <>
           {/*
             The bar is redundant by design — the count above already says everything it
@@ -85,36 +84,21 @@ export function FetchArea({ area, bbox, onRequested }: FetchAreaProps) {
           >
             <div
               className="h-full bg-contour transition-[width] duration-slow ease-standard"
-              style={{ width: `${percent}%` }}
+              style={{ width: `${view.progress.percent}%` }}
             />
           </div>
           <p className="sr-only" aria-live="polite">
-            Fetching this area: {done} of {area.tiles} tiles complete.
+            {view.liveText}
           </p>
         </>
       ) : null}
 
-      {busy && working === 0 ? (
-        // Admission refused, said plainly. Which refusal decides the sentence: a queue drains,
-        // storage does not, and a spent allowance is this reader's own — three states that
-        // must not share one instruction.
+      {view.message ? (
         <p
-          role="status"
+          role={announced ? 'status' : undefined}
           className="max-w-[240px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted"
         >
-          {busyReason === 'storage'
-            ? 'There is no room left to store new ground. Trails already mapped still work.'
-            : busyReason === 'rate-limit'
-              ? 'You have fetched a lot of new ground recently. This area can be fetched again later on.'
-              : 'The fetch queue is full right now. Try again in a few minutes.'}
-        </p>
-      ) : null}
-
-      {area.capped && working === 0 && !busy ? (
-        // Honest about the cap rather than silently fetching the middle and letting the edges
-        // look empty. `requiredTiles` is the whole box; `tiles` is what one press takes.
-        <p className="max-w-[260px] rounded-panel border border-bezel bg-surface px-sm py-xs text-center text-micro tracking-normal text-ink-muted">
-          {area.requiredTiles} tiles in view · one fetch covers the nearest {area.tiles}
+          {view.message.text}
         </p>
       ) : null}
     </div>

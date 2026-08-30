@@ -14,6 +14,8 @@ import {
   REVIVAL_OUTSTANDING_MAX,
   hoursToDrain,
 } from '@switchback/ingest';
+import { describeHours, fetchAreaView } from '../apps/web/src/components/explore/fetch-area-state';
+import type { AreaSummary } from '@switchback/core';
 
 /**
  * The ceiling is derived, but prose, SQL and runbooks restate it as literals — and a restatement
@@ -95,5 +97,61 @@ describe('documents that restate the derived ceiling', () => {
     // `coverage.ts` names this in hours to justify being the floor under the horizon; if the drain
     // rate moves, that justification moves with it.
     expect(read('packages/ingest/src/coverage.ts')).toContain(`${areaHours} hours of`);
+  });
+});
+
+/**
+ * The newest restatement is not prose: "fetch this area" now tells the reader a duration, and a
+ * duration on screen is the thing this file exists to keep tied to the measured drain.
+ *
+ * Asserted through the rendered sentence rather than the source text, because what may not drift
+ * is what the reader is told — a `toContain` on the module would pass a literal that happened to
+ * spell the current answer.
+ */
+describe('the wait the reader is shown', () => {
+  const area = (over: Partial<AreaSummary>): AreaSummary => ({
+    tiles: MAX_AREA_TILES,
+    fresh: 0,
+    outstanding: MAX_AREA_TILES,
+    working: 0,
+    requiredTiles: MAX_AREA_TILES,
+    capped: false,
+    outstandingHours: hoursToDrain(MAX_AREA_TILES),
+    ...over,
+  });
+
+  const untried = { pending: false, failed: false, result: null };
+
+  it('states one area fetch as the hours the estate measurably takes to drain it', () => {
+    const phrase = describeHours(hoursToDrain(MAX_AREA_TILES));
+    const shown = fetchAreaView({
+      area: area({ working: MAX_AREA_TILES }),
+      hasBBox: true,
+      press: untried,
+    });
+
+    expect(phrase).not.toBeNull();
+    expect(shown?.message?.tone).toBe('progress');
+    expect(shown?.message?.text).toContain(phrase as string);
+  });
+
+  it('states a depth refusal as the horizon that ceiling is sized from', () => {
+    const phrase = describeHours(MAX_QUEUE_WAIT_HOURS);
+    const shown = fetchAreaView({
+      area: area({}),
+      hasBBox: true,
+      press: {
+        pending: false,
+        failed: false,
+        // Exactly what `trails.ts` sends for this refusal.
+        result: { busy: true, busyReason: 'queue-depth', queueWaitHours: MAX_QUEUE_WAIT_HOURS },
+      },
+    });
+
+    expect(phrase).not.toBeNull();
+    expect(shown?.message?.tone).toBe('refusal');
+    expect(shown?.message?.text).toContain(phrase as string);
+    // The wait it replaced. A ceiling sized in hours may never be described in minutes again.
+    expect(shown?.message?.text).not.toMatch(/minute/iu);
   });
 });
