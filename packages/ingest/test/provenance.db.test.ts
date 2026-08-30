@@ -7,6 +7,7 @@ import type { PipelineDeps } from '../src/pipeline';
 import type { OverpassElement, OverpassQuerier, OverpassResponse } from '../src/overpass';
 import { EMPTY_WRITE_WINDOW_MS, readEmptyWriteRates } from '../src/maintenance';
 import { tileJobKey, trailEnrichJobKey } from '../src/jobs';
+import { CHILDREN_PER_TILE } from '../src/subdivide';
 import { flatTile, pngResponse } from './fixtures/terrarium';
 
 /**
@@ -60,6 +61,15 @@ const ROLLED_UP_CHILDREN = childQuadkeys(ROLLED_UP);
 /** A z9 parent holding one child, which is all an interrupted `splitTile` leaves behind. */
 const INTERRUPTED = `${NS}000030`;
 const STRAY_CHILD = `${INTERRUPTED}0`;
+
+/**
+ * A parent for every child count a stalled `splitTile` can leave, `STALLED_PARENTS[n]` holding `n`.
+ *
+ * Sized off `CHILDREN_PER_TILE` so the sweep below covers the whole range whatever that number
+ * becomes. The count doubles as the last quadkey digit, the two alphabets being the same one.
+ */
+const STALLED_PARENTS = Array.from({ length: CHILDREN_PER_TILE }, (_, held) => `${NS}00011${held}`);
+
 const FIXTURE_TILES = [
   FILLED,
   EMPTIED,
@@ -70,6 +80,7 @@ const FIXTURE_TILES = [
   ...ROLLED_UP_CHILDREN,
   INTERRUPTED,
   STRAY_CHILD,
+  ...STALLED_PARENTS.flatMap((parent) => [parent, ...childQuadkeys(parent)]),
 ];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
@@ -365,4 +376,34 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       empty: 1,
     });
   });
+
+  /**
+   * Every child count short of a full set, each against its own reading.
+   *
+   * A host kill mid-`splitTile` leaves any of these counts, and `rollUp` returns null below
+   * `CHILDREN_PER_TILE`, so none of them can be the derived row this exclusion drops. Asserting
+   * only the ends leaves the comparison free to be `< 2` or `< 3` — an exclusion wider than the
+   * roll-up's precondition, which discards a real answer for as long as the stray children live.
+   * The full set is the boundary's other half, asserted above through a roll-up that really ran.
+   *
+   * One reading per count rather than one total over all of them: the counts either side of the
+   * boundary are equinumerous, so a single total reads the same whichever side the query kept.
+   */
+  it.each(STALLED_PARENTS.map((_, held) => held))(
+    'counts a parent holding %i children, short of the full set a roll-up needs',
+    async (held) => {
+      const parent = STALLED_PARENTS[held]!;
+      for (const child of childQuadkeys(parent).slice(0, held)) {
+        await seedWrite(child, TileStatus.pending, null, null);
+      }
+      await seedWrite(parent, TileStatus.empty, INSIDE_WINDOW, TileSource.overpass);
+
+      // One parent in the window, so the total names which row was kept and not merely how many.
+      expect(await shareFor(TileSource.overpass)).toEqual({
+        source: TileSource.overpass,
+        written: 1,
+        empty: 1,
+      });
+    },
+  );
 });

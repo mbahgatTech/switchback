@@ -264,10 +264,10 @@ export interface EmptyWriteRate {
  * query answered about a z11 would otherwise be counted again at z10 and again at z9, attributed
  * to whichever source last answered about the ancestor itself. The predicate is the roll-up's own
  * precondition read off the child rows rather than a flag a writer has to remember to set:
- * `rollUp` returns null below `CHILDREN_PER_TILE`, so `promoteFrom` writes nothing `childTiles`
- * returned a full set for. A tile subdivided *since* its own last answer goes with them, which is
- * the same fact taken conservatively — a box split into four no longer stands for ground one
- * answer covers.
+ * `rollUp` returns null below `CHILDREN_PER_TILE` and `promoteFrom` stops at the first null, so
+ * every row a roll-up wrote is one `childTiles` returned a full set for. A tile subdivided
+ * *since* its own last answer goes with them, which is the same fact taken conservatively — a box
+ * split into four no longer stands for ground one answer covers.
  *
  * **Fewer than four children is not that fact, and keeps the parent in.** `splitTile` upserts its
  * children one at a time outside a transaction and writes the parent's split marker last, so a
