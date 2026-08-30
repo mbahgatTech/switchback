@@ -11,13 +11,16 @@ import { hoursToDrain, queueDepthForHours } from './drain-rate';
  * How long a tile admitted at the ceiling may still be waiting to be fetched.
  *
  * The primitive, with `MAX_TILE_QUEUE_DEPTH` its consequence: a job count states no promise a
- * reader can check against the drain, and an hours figure does. Eighteen sits just above a floor
- * rather than being a preference. One press of "fetch this area" is `MAX_AREA_TILES` = 96 tiles =
- * 3.4 hours of serial drain, and below `MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs, or
- * 16.8 hours, the per-caller allowance in `rate-limit.ts` stops being a share of this ceiling and
- * becomes a clamp above it. A shorter horizon needs a smaller area fetch first: that is the lever.
+ * reader can check against the drain, and an hours figure does. Measured in
+ * `REQUEST_DRAIN_TILES_PER_HOUR`, which is request kinds only — the unit this depth counts.
+ *
+ * Twenty-four sits just above a floor rather than being a preference. One press of "fetch this
+ * area" is `MAX_AREA_TILES` = 96 tiles = 4.5 hours of serial drain, and below
+ * `MAX_AREA_TILES / PRINCIPAL_QUEUE_SHARE` = 480 jobs, or 22.5 hours, the per-caller allowance in
+ * `rate-limit.ts` stops being a share of this ceiling and becomes a clamp above it. A shorter
+ * horizon needs a smaller area fetch first: that is the lever, not this constant.
  */
-export const MAX_QUEUE_WAIT_HOURS = 18;
+export const MAX_QUEUE_WAIT_HOURS = 24;
 
 /**
  * Refuse new ingest past this many *requested* jobs already waiting, past which queueing buys no

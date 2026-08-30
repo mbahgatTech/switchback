@@ -8,6 +8,7 @@ import { JobKind, JobStatus } from '@switchback/db';
 import { RECLAIM_PRIORITY, VIEWPORT_PRIORITY } from '@switchback/ingest';
 import type { Db } from '@switchback/ingest';
 import type { WorkerLog } from '../src/log';
+import { PUMP_MESSAGES_FOR_DERIVED, PUMP_MESSAGES_PER_REFILL } from '@switchback/ingest';
 import {
   PUMP_DERIVED_SHARE,
   PUMP_LOW_WATER,
@@ -379,5 +380,18 @@ describe('a braked pump', () => {
     // Unbraked the predicate carries no priority term at all, so an ordinary tick still reads the
     // whole runnable head.
     expect(calls[0]?.where.priority).toBeUndefined();
+  });
+});
+
+describe('the refill shape packages/ingest has to assume', () => {
+  it('matches what drain-rate.ts sizes the request-kind rate from', () => {
+    /*
+     * `REQUEST_DRAIN_TILES_PER_HOUR` divides the measured rate by the share of messages carrying a
+     * request kind, and `packages/ingest` cannot import this app to read that share. This test can
+     * see both, so it is where the restatement is held — change the pump and the ceiling follows,
+     * or this reds.
+     */
+    expect(PUMP_MESSAGES_PER_REFILL).toBe(PUMP_QUEUE_DEPTH);
+    expect(PUMP_MESSAGES_FOR_DERIVED).toBe(PUMP_DERIVED_SHARE);
   });
 });

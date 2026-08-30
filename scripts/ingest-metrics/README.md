@@ -79,8 +79,9 @@ named where it is used.
 
 | Value  | Meaning                                       | Source                                |
 | ------ | --------------------------------------------- | ------------------------------------- |
-| 513    | `MAX_TILE_QUEUE_DEPTH`, 18 h of drain at 28.5 | `packages/ingest/src/backpressure.ts` |
-| 28.5   | `ESTATE_DRAIN_TILES_PER_HOUR`                 | `packages/ingest/src/drain-rate.ts`   |
+| 513    | `MAX_TILE_QUEUE_DEPTH`, 24 h at 21.375        | `packages/ingest/src/backpressure.ts` |
+| 21.375 | `REQUEST_DRAIN_TILES_PER_HOUR`, a lower bound | `packages/ingest/src/drain-rate.ts`   |
+| 28.5   | `ESTATE_DRAIN_TILES_PER_HOUR`, all kinds      | `packages/ingest/src/drain-rate.ts`   |
 | 20,000 | `DERIVED_QUEUE_WARN_DEPTH`                    | `packages/ingest/src/backpressure.ts` |
 | 0.85   | `MAX_STORAGE_FRACTION`                        | `packages/ingest/src/backpressure.ts` |
 | 12 min | `LEASE_TIMEOUT_MS`, host timeout plus margin  | `packages/ingest/src/jobs.ts`         |

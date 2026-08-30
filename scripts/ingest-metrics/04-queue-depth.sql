@@ -1,7 +1,7 @@
 -- Ingest metrics 04 (Q4): queue depth now, queue depth historically, and what the backlog is worth
 -- in hours. SELECT only: no write, no DDL.
 --
--- `MAX_TILE_QUEUE_DEPTH` is 513 — `MAX_QUEUE_WAIT_HOURS` (18) of drain at the measured 28.5
+-- `MAX_TILE_QUEUE_DEPTH` is 513 — `MAX_QUEUE_WAIT_HOURS` (24) of drain at 21.375 request-kind
 -- tiles an hour — and `admitIngest` compares it against exactly one number: rows
 -- whose `kind` is one of `ingest_tile`, `refresh_tile`, `ingest_network` and whose `status` is
 -- `queued` or `running`. Q2 reproduces that number and nothing else; every other section is
@@ -102,8 +102,9 @@ select max(depth)                                  as all_time_peak,
 
 \echo ''
 \echo '=== Q6: the backlog in hours, at the rate the last seven days actually achieved ==='
--- `MAX_TILE_QUEUE_DEPTH` is derived as `MAX_QUEUE_WAIT_HOURS` of drain at the rate measured on
--- 2026-08-08. This is that derivation checked against the rate the last seven days actually ran at:
+-- `MAX_TILE_QUEUE_DEPTH` is derived as `MAX_QUEUE_WAIT_HOURS` of drain at a request-kind rate
+-- bounded below from the 2026-08-08 measurement, never observed directly. The `per_active_hour`
+-- below IS that observation: it is what `REQUEST_DRAIN_TILES_PER_HOUR` should be replaced with.
 -- request depth divided by the request-kind completion rate over active hours in the last week.
 with rate as (
   select count(*)::numeric

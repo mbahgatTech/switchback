@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { ESTATE_DRAIN_TILES_PER_HOUR, hoursToDrain, queueDepthForHours } from '../src/drain-rate';
+import { REQUEST_DRAIN_TILES_PER_HOUR, hoursToDrain, queueDepthForHours } from '../src/drain-rate';
 
 describe('a wait horizon expressed as a queue depth', () => {
   it('never admits more jobs than the estate drains in the time promised', () => {
@@ -18,7 +18,7 @@ describe('a wait horizon expressed as a queue depth', () => {
   it('gives up less than one tile of the horizon to rounding', () => {
     // The other side of it: floor must not throw away real capacity, or a horizon somebody raises
     // by an hour buys fewer jobs than the hour is worth.
-    const oneTile = 1 / ESTATE_DRAIN_TILES_PER_HOUR;
+    const oneTile = 1 / REQUEST_DRAIN_TILES_PER_HOUR;
     for (const hours of [1, 6, 12, 18, 24, 48]) {
       expect(hoursToDrain(queueDepthForHours(hours))).toBeGreaterThan(hours - oneTile);
     }

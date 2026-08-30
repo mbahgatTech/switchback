@@ -97,8 +97,8 @@ export const REVIVAL_QUEUE_SHARE = 0.05;
  * **This is the bound that keeps recovery from becoming an outage.** `admitIngest` counts
  * `REQUEST_JOB_KINDS` in `{queued, running}` against `MAX_TILE_QUEUE_DEPTH`; a `dead` row is not
  * counted and a revived one is, so *revival is the act that re-fills the ceiling*. The drain is
- * serial at `ESTATE_DRAIN_TILES_PER_HOUR`, while an unbounded triage at 64 a tick injects 1,920 —
- * sixty-eight times faster than the queue empties.
+ * serial at `REQUEST_DRAIN_TILES_PER_HOUR`, while an unbounded triage at 64 a tick injects 1,920 —
+ * ninety times faster than the queue empties.
  * An Overpass outage burying a few hundred request tiles would then revive all of them inside
  * twenty minutes, return the depth to its ceiling, and have `admitIngest` refuse every new
  * viewport estate-wide for as long as the backlog took to drain.

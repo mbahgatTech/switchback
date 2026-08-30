@@ -18,8 +18,8 @@ import {
 } from '../src/backpressure';
 import { MAX_AREA_TILES, ensureCoverage, queueTiles } from '../src/coverage';
 import { REVIVAL_OUTSTANDING_MAX } from '../src/dead-jobs';
-import { ESTATE_DRAIN_TILES_PER_HOUR, hoursToDrain } from '../src/drain-rate';
-import { PRINCIPAL_QUEUE_SHARE } from '../src/rate-limit';
+import { REQUEST_DRAIN_TILES_PER_HOUR, hoursToDrain } from '../src/drain-rate';
+import { BUCKET_CAPACITY, PRINCIPAL_QUEUE_SHARE } from '../src/rate-limit';
 import { ensureNetworkCoverage, queueNetworkTiles } from '../src/network';
 
 /** A bbox small enough to need exactly one tile at either zoom. */
@@ -469,7 +469,32 @@ describe('what the reader is told', () => {
     // The number it tripped on, not just the fact that it tripped.
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(String(MAX_TILE_QUEUE_DEPTH + 5)));
   });
+
+  it('tells that operator what the depth costs, not only what it is', async () => {
+    /*
+     * This line is the only place the ceiling is visible in production — nothing is persisted on a
+     * refusal and no alert covers it, so `scripts/ingest-metrics/README.md` sends operators here
+     * with a grep. A bare count is the reading that was misjudged for 21 hours in the first place.
+     */
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const depth = MAX_TILE_QUEUE_DEPTH + 5;
+    const { db } = fakeDb({ depth });
+
+    await queueTiles(db, ['0213012']);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(`${hoursToDrain(depth).toFixed(1)} h of drain`),
+    );
+  });
 });
+
+/** `MAX_AREA_TILES` distinct z9 quadkeys — one press of "fetch this area". */
+function areaFetchKeys(): string[] {
+  return Array.from(
+    { length: MAX_AREA_TILES },
+    (_, index) => `02${index.toString(4).padStart(7, '0')}`,
+  );
+}
 
 describe('what the ceiling is worth in hours', () => {
   it('refuses at the depth the wait horizon buys, and not one job sooner', async () => {
@@ -477,7 +502,7 @@ describe('what the ceiling is worth in hours', () => {
     // Recomputed from the two inputs rather than read off the constant: this is the assertion that
     // goes red if the rate is re-measured and the ceiling is left where it was, which is the drift
     // that let a 21-hour backlog be documented as an hour.
-    const atHorizon = Math.floor(ESTATE_DRAIN_TILES_PER_HOUR * MAX_QUEUE_WAIT_HOURS);
+    const atHorizon = Math.floor(REQUEST_DRAIN_TILES_PER_HOUR * MAX_QUEUE_WAIT_HOURS);
 
     expect(await admitIngest(fakeDb({ depth: atHorizon }).db)).toBe('queue-depth');
     expect(await admitIngest(fakeDb({ depth: atHorizon - 1 }).db)).toBeNull();
@@ -504,10 +529,30 @@ describe('what the ceiling is worth in hours', () => {
   });
 
   it('never refuses a viewport on revived work alone, whatever the ceiling is retuned to', async () => {
-    // `REVIVAL_OUTSTANDING_MAX` is a share of the same ceiling; the property is that spending all
-    // of it leaves admission open. Red if either the share or the ceiling moves without the other.
+    // Revival at its whole bound, with a full area fetch arriving on top of it.
     const { db } = fakeDb({ depth: REVIVAL_OUTSTANDING_MAX });
 
-    expect(await admitIngest(db)).toBeNull();
+    const { queued, refused } = await queueTiles(db, areaFetchKeys());
+
+    expect(refused).toBeNull();
+    expect(queued).toHaveLength(MAX_AREA_TILES);
+  });
+
+  it('keeps recovery smaller than a single ordinary caller may hold', () => {
+    /*
+     * The assertion above passes for any share below 1.0 — revival at half the ceiling still
+     * admits one more tile — so it cannot see a share raised tenfold. This can: revival is
+     * recovery, not a tenant, and a burial that may take more of the queue than one ordinary
+     * caller is allowed to hold is an outage wearing another name. See `REVIVAL_QUEUE_SHARE`.
+     */
+    expect(REVIVAL_OUTSTANDING_MAX).toBeLessThanOrEqual(BUCKET_CAPACITY);
+  });
+
+  it('promises no wait longer than a day, whatever the horizon is set to', () => {
+    // The floor is `MAX_AREA_TILES`; this is the other wall. Past a day the fetch is certainly for
+    // the next visitor rather than the one who asked, and nothing here can tell them it arrived —
+    // so admitting it is the lie the ceiling exists to avoid, just slower.
+    expect(MAX_QUEUE_WAIT_HOURS).toBeLessThanOrEqual(24);
+    expect(hoursToDrain(MAX_TILE_QUEUE_DEPTH)).toBeLessThanOrEqual(24);
   });
 });
