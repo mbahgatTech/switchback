@@ -10,13 +10,12 @@
 #
 # Read `VERDICT` at the end of the log. It licenses a reorder only when some endpoint answered
 # *every* round and has the lowest median; a fast median over one lucky sample is not a result.
+#
+# GitHub offers `workflow_dispatch` only for workflows already on the default branch, so this is
+# not dispatchable from a branch — the first measurement has to come from a temporary trigger.
 name: Overpass endpoint probe
 
 on:
-  # TEMPORARY, removed before this branch merges: GitHub only offers `workflow_dispatch` for
-  # workflows present on the default branch, so the first measurement cannot be dispatched.
-  push:
-    branches: [fix/refresh-poll-and-endpoint-probe]
   workflow_dispatch:
     inputs:
       rounds:
