@@ -132,6 +132,16 @@ export interface OverpassOptions {
 export const OVERPASS_STRAIN_MARKER = 'switchback-ingest-overpass-strain';
 
 /**
+ * The literal `switchback-ingest-overpass-skipped` greps for.
+ *
+ * Three of a tile's four Overpass queries fail soft — region, waypoints, parent routes — so a
+ * budget that refuses them costs metadata silently: the tile still reaches `ready`, the request row
+ * still reads success, and no job row records anything. This token is what makes the loss
+ * countable, and it is why `lookupRegion` logs at all.
+ */
+export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
+
+/**
  * Public instances, tried in this order. Two rules govern the list. A mirror must serve the
  * planet: a regional extract answers an out-of-area query `200 OK` with no elements, which is
  * indistinguishable from "no trails here" and caches a tile empty for thirty days
@@ -754,10 +764,10 @@ out tags;`;
 }
 
 /**
- * Waypoints and amenities in an assembled trail's buffer. Separate from the tile query so it
- * runs against a trail's bbox, and only after assembly has decided the trail is worth keeping.
- * Glaciers are areas rather than nodes; `out center` gives one the point every other feature
- * here already has, and the 150 m buffer drops the ones a trail merely skirts.
+ * Waypoints and amenities across one whole tile, against its bbox padded by `PARKING_BUFFER_M` —
+ * a trailhead car park is often up an access road beyond the edge. Glaciers are areas rather than
+ * nodes, so `out center` gives one the point every other feature here already has. Which trail
+ * each feature belongs to is decided locally, at `WAYPOINT_BUFFER_M`, in `attachWaypoints`.
  */
 export function buildFeatureQuery(bbox: BBox, options: { timeoutS?: number } = {}): string {
   const [w, s, e, n] = bbox;

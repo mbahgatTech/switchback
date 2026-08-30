@@ -77,7 +77,7 @@ sequenceDiagram
   W->>SB: queue trigger, one message at a time
   W->>P: drainIngest limit 1, scoped to that dedupeKey
 
-  P->>O: one tile query, plus one tile-wide waypoint query
+  P->>O: tile query, then region and waypoints together in the two slots
   O-->>P: ways and relations
   P->>DB: one transaction per trail, then tile status
   C->>B: re-ask every 2.5 s while anything is pending
@@ -87,12 +87,43 @@ Inside `processTile`, per tile:
 
 ```mermaid
 flowchart LR
-  A["Overpass<br/>tile query"] --> B["assemble<br/>members into ordered lines"]
-  B --> C["elevate<br/>resample 25 m, terrarium z13"]
+  subgraph OSM["donated public Overpass instance — two slots per client IP"]
+    A["tile query"]
+    subgraph W["one window, both slots held"]
+      T1["region is_in"]
+      T2["tile waypoints"]
+    end
+  end
+  A --> B["assemble<br/>members into ordered lines"]
+  B --> X{"any trails<br/>assembled?"}
+  X -- no --> Z["tile empty<br/>no further queries"]
+  X -- yes --> F(( ))
+  F --> T1
+  F --> T2
+  T1 --> J(( ))
+  T2 --> J(( ))
+  J --> C["elevate<br/>resample 25 m, terrarium z13"]
   C --> D["derive<br/>length, gain, grade, route type,<br/>difficulty, Tobler time"]
   D --> E["commit<br/>one transaction per trail"]
-  E --> F["enqueue: enrich_trail for photographs,<br/>ingest_route for any parent superroute"]
+  E --> G["enqueue: enrich_trail for photographs,<br/>ingest_route for any parent superroute"]
 ```
+
+Every edge crossing the outer box is a request to hardware somebody donated. `W` is the only place
+a tile holds both of its slots, and the fork into it is the whole of the concurrency this pipeline
+asks for.
+
+Neither tile-wide lookup reads the tile query's answer, so the two share one window rather than
+taking a slot each in turn. Both block the commit loop, and they are the last Overpass work before
+it — everything after the join is local arithmetic and Postgres. They follow the tile query rather
+than racing it, which is what keeps a tile over ocean at exactly one Overpass request: the empty
+branch above settles the tile before either lookup is sent.
+
+One request is the exception. `withDeadline` refuses a query synchronously, at the moment it is
+handed over rather than when it would return, so a budget that expires while the region lookup is
+out refuses a waypoint lookup that had not yet been sent — and refuses neither of a pair already
+committed in the same tick. On that path this shape sends one request a serial one would not. The
+aggregate direction is UNVERIFIED: a tile that finishes sooner is a tile less likely to reach its
+deadline at all, and no counter records how many land inside that window.
 
 Three properties make this safe to run unattended. Every trail is keyed by `(osmType, osmId)` and
 every write is an upsert, so an at-least-once queue is harmless. Each trail commits in its own

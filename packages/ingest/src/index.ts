@@ -25,6 +25,7 @@ export * from './subdivide';
 export * from './coverage';
 export * from './drain-slot';
 export * from './maintenance';
+export * from './tile-context';
 export * from './pipeline';
 export * from './publish';
 export * from './network';

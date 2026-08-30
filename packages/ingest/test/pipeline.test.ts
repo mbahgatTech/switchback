@@ -7,11 +7,11 @@ import {
   chooseHero,
   fetchWayGeometries,
   isTileFresh,
-  pickRegion,
   processTile,
   uniqueSlug,
 } from '../src/pipeline';
-import type { OverpassClient, OverpassElement } from '../src/overpass';
+import { OverpassClient } from '../src/overpass';
+import type { OverpassElement } from '../src/overpass';
 import { OverpassDeadlineError, OverpassUnavailableError } from '../src/overpass';
 import type { TerrainSource } from '../src/elevate';
 import { SPLIT_MARKER_PREFIX, SUBTREE_STUCK_MARKER, TILE_SPLIT_MARKER } from '../src/subdivide';
@@ -49,63 +49,6 @@ describe('isTileFresh', () => {
   it('treats a never-fetched or absent tile as cold', () => {
     expect(isTileFresh({ status: TileStatus.ready, fetchedAt: null }, NOW)).toBe(false);
     expect(isTileFresh(null, NOW)).toBe(false);
-  });
-});
-
-describe('pickRegion', () => {
-  const area = (level: string, tags: Record<string, string>): OverpassElement => ({
-    type: 'area',
-    id: Number(level),
-    tags: { admin_level: level, ...tags },
-  });
-
-  it('prefers the most local administrative name', () => {
-    // "Highland" tells a reader more about a trail card than "Scotland" or "United Kingdom".
-    const region = pickRegion([
-      area('2', { name: 'United Kingdom', 'ISO3166-1:alpha2': 'gb' }),
-      area('4', { name: 'Scotland' }),
-      area('6', { name: 'Highland' }),
-    ]);
-    expect(region.regionName).toBe('Highland');
-    expect(region.countryCode).toBe('GB');
-  });
-
-  it('falls back up the hierarchy when the local level is missing', () => {
-    const region = pickRegion([
-      area('2', { name: 'France', 'ISO3166-1': 'fr' }),
-      area('4', { name: 'Occitanie' }),
-    ]);
-    expect(region.regionName).toBe('Occitanie');
-    expect(region.countryCode).toBe('FR');
-  });
-
-  it('never uses the country as a region name', () => {
-    const region = pickRegion([area('2', { name: 'Norway', 'ISO3166-1:alpha2': 'NO' })]);
-    expect(region.regionName).toBeNull();
-    expect(region.countryCode).toBe('NO');
-  });
-
-  it('prefers the English name where one is tagged', () => {
-    const region = pickRegion([area('6', { name: 'Sør-Trøndelag', 'name:en': 'South Trondelag' })]);
-    expect(region.regionName).toBe('South Trondelag');
-  });
-
-  it('ignores elements without a usable admin level', () => {
-    const region = pickRegion([
-      { type: 'area', id: 1, tags: { name: 'Somewhere' } },
-      { type: 'area', id: 2 },
-      area('x', { name: 'Nonsense' }),
-    ]);
-    expect(region).toEqual({ regionName: null, countryCode: null });
-  });
-
-  it('rejects a country code that is not two letters', () => {
-    const region = pickRegion([area('2', { name: 'X', 'ISO3166-1:alpha2': 'GBR' })]);
-    expect(region.countryCode).toBeNull();
-  });
-
-  it('returns nulls for an empty response, because a region is optional', () => {
-    expect(pickRegion([])).toEqual({ regionName: null, countryCode: null });
   });
 });
 
@@ -835,6 +778,113 @@ describe('processTile, a trail that would not commit', () => {
 
     expect(result).toMatchObject({ status: TileStatus.ready, skipped: 1, failed: 0 });
     expect(recorded.updates.at(-1)?.data.status).toBe(TileStatus.ready);
+  });
+});
+
+describe('processTile, Overpass etiquette', () => {
+  /** Terrain that covers nothing, so every trail skips and the tile still reaches `ready`. */
+  const noTerrain = {
+    tilesFor: () => Promise.resolve(new Map<string, TerrariumTile>()),
+  } as unknown as TerrainSource;
+
+  /** Which query a recorded request body carries, read off the shape each builder emits. */
+  function kindOf(body: string): string {
+    const ql = decodeURIComponent(body.replace(/^data=/, '').replace(/\+/g, ' '));
+    if (ql.includes('is_in(')) return 'region';
+    if (ql.includes('out center tags;')) return 'features';
+    if (ql.includes('relation(br)')) return 'parents';
+    return 'tile';
+  }
+
+  /** A client that answers everything with no elements, recording concurrency as it goes. */
+  function recordingClient(tileElements: OverpassElement[]): {
+    client: OverpassClient;
+    sent: string[];
+    peak: () => number;
+  } {
+    const sent: string[] = [];
+    let inFlight = 0;
+    let peak = 0;
+    const client = new OverpassClient({
+      url: 'https://overpass.test/api/interpreter',
+      userAgent: 'Switchback/test (+https://switchback-three.vercel.app/attribution)',
+      maxConcurrent: 2,
+      fetchImpl: async (_input, init) => {
+        const kind = kindOf(typeof init?.body === 'string' ? init.body : '');
+        sent.push(kind);
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return new Response(JSON.stringify({ elements: kind === 'tile' ? tileElements : [] }), {
+          status: 200,
+        });
+      },
+    });
+    return { client, sent, peak: () => peak };
+  }
+
+  it('never holds more of Overpass than the two slots an instance allots one IP', async () => {
+    /*
+     * The cost of getting this wrong is not a slow tile but an IP block, which takes the
+     * product down for as long as the operator leaves it in place. Asserted through a real
+     * client so the semaphore is the thing under test: a phase that opened its own client, or
+     * reached fetch directly, is invisible to `OVERPASS_MAX_CONCURRENT` and shows up here.
+     */
+    const { db } = fakeDb();
+    const { client, peak } = recordingClient(oneTrail);
+
+    await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
+
+    expect(peak()).toBeLessThanOrEqual(2);
+    expect(client.inFlight).toBe(0);
+    expect(client.queueDepth).toBe(0);
+  });
+
+  it('asks a tile of Overpass exactly three questions', async () => {
+    /*
+     * The tile query, then the two tile-wide lookups that overlap it — no more. Overlapping is
+     * a scheduling change and must stay one: a shape that speculates, retries or fans out buys
+     * latency with somebody else's donated hardware, and the budget is counted per application.
+     */
+    const { db } = fakeDb();
+    const { client, sent } = recordingClient(oneTrail);
+
+    await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
+
+    expect(sent).toHaveLength(3);
+    expect(sent[0]).toBe('tile');
+    expect([...sent].sort()).toEqual(['features', 'region', 'tile']);
+  });
+
+  it('sends neither tile-wide lookup for a tile that has no trails', async () => {
+    // Ocean and desert cost one query, not three: the lookups follow the tile query rather than
+    // racing it precisely so an empty tile never pays for context nothing will read.
+    const { db } = fakeDb();
+    const { client, sent } = recordingClient([]);
+
+    const result = await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
+
+    expect(result.status).toBe(TileStatus.empty);
+    expect(sent).toEqual(['tile']);
+  });
+
+  it('keeps the trails it committed when the waypoint lookup fails', async () => {
+    /*
+     * Waypoints are decoration and share a window with the region lookup; neither may take a
+     * tile of good geometry down with it.
+     */
+    const { db } = fakeDb();
+    const client = {
+      query: (ql: string) =>
+        ql.includes('out center tags;')
+          ? Promise.reject(new Error('mirror said 429'))
+          : Promise.resolve({ elements: ql.includes('out body geom;') ? oneTrail : [] }),
+    } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
+
+    expect(result).toMatchObject({ status: TileStatus.ready, skipped: 1, failed: 0 });
   });
 });
 

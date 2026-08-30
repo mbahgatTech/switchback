@@ -21,6 +21,17 @@ function limits(): { maxConcurrent: number; maxTotalMs: number } {
 }
 
 describe('getOverpass', () => {
+  it('allots itself two slots, which is not a tuning knob', () => {
+    /*
+     * Overpass grants slots per client IP and two is the documented-safe figure; a client that
+     * helps itself to more is blocked, and the block outlasts the run that earned it. Raising
+     * this is a decision about somebody else's donated hardware, so it fails a test rather than
+     * passing review as a performance tweak.
+     */
+    expect(OVERPASS_MAX_CONCURRENT).toBe(2);
+    expect(limits().maxConcurrent).toBe(2);
+  });
+
   it('takes the two limits from the environment when they are numbers', () => {
     process.env.OVERPASS_MAX_CONCURRENT = '1';
     process.env.OVERPASS_MAX_TOTAL_MS = '90000';

@@ -35,7 +35,6 @@ import type { AssembledTrail } from './assemble';
 import { deriveTrail, slugify } from './derive';
 import {
   attachWaypoints,
-  featureSearchBBox,
   fetchSeedPhotos,
   parkingCapacity,
   synthesiseTrailhead,
@@ -46,16 +45,17 @@ import { buildFeatureIndex, type FeatureIndex } from './feature-index';
 import { TerrainSource, elevateLine } from './elevate';
 import { IngestDeadlineError, assertBefore } from './deadline';
 import {
+  OVERPASS_SKIPPED_MARKER,
   OverpassDeadlineError,
   OverpassUnavailableError,
-  buildFeatureQuery,
   buildParentRouteQuery,
-  buildRegionQuery,
   buildRelationSkeletonQuery,
   buildRouteQuery,
   buildTileQuery,
   buildWayGeometryQuery,
 } from './overpass';
+import { fetchTileContext, lookupRegion } from './tile-context';
+import type { RegionInfo } from './tile-context';
 import type { OverpassElement, OverpassQuerier, OverpassRelation } from './overpass';
 import { enqueue, routeIngestJobKey, trailEnrichJobKey } from './jobs';
 import {
@@ -140,16 +140,6 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
 
 /** Re-exported from their own module so subdivision can ask the same question without a cycle. */
 export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
-
-/**
- * The literal `switchback-ingest-overpass-skipped` greps for.
- *
- * Three of a tile's four Overpass queries fail soft — region, waypoints, parent routes — so a
- * budget that refuses them costs metadata silently: the tile still reaches `ready`, the request row
- * still reads success, and no job row records anything. This token is what makes the loss
- * countable, and it is why `lookupRegion` logs at all.
- */
-export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
 
 /**
  * The literal an operator greps for when a tile could not commit a trail it had fetched.
@@ -361,22 +351,9 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
     };
   }
 
-  const region = await lookupRegion(bbox, deps);
-  /**
-   * Waypoints for the whole tile in one query rather than one per trail: forty trails would
-   * be forty Overpass requests at two concurrent, for overlapping data. The per-trail assignment
-   * is local, through the grid `buildFeatureIndex` puts over the answer.
-   */
-  let features: OverpassElement[] = [];
-  if (deps.enrichWaypoints !== false) {
-    try {
-      const response = await deps.overpass.query(buildFeatureQuery(featureSearchBBox(bbox)));
-      features = response.elements ?? [];
-    } catch (error) {
-      // Waypoints are decoration; a trail without them is still a trail.
-      log(`${OVERPASS_SKIPPED_MARKER} features failed`, { quadkey, error: String(error) });
-    }
-  }
+  // Both block the commit loop and neither reads the tile query's answer, so they share one
+  // window inside the client's two-slot allowance rather than taking it in turn.
+  const { region, features } = await fetchTileContext(quadkey, bbox, deps);
   /*
    * Built once for the tile, not once per trail. Unindexed, the two enrichment passes scan every
    * feature for every trail: on tile 023010230 (30,838 features, 1,518 trails) that is 349.45 ms
@@ -1535,62 +1512,6 @@ export async function uniqueSlug(
     if (!alias) return candidate;
   }
   return `${slugify(name)}-${osmType}-${osmId.toString(36)}`;
-}
-
-export interface RegionInfo {
-  regionName: string | null;
-  countryCode: string | null;
-}
-
-/**
- * Country and region for a tile, from one `is_in` query at its centre. Fails soft to nulls: a
- * trail with no region name is fully usable, and a boundary lookup is not worth failing a
- * tile of otherwise good data over. Soft, not silent — an empty catch here was the one Overpass
- * refusal in the pipeline that left no trace at all.
- */
-async function lookupRegion(bbox: BBox, deps: PipelineDeps): Promise<RegionInfo> {
-  const centre: LngLat = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2];
-  try {
-    const response = await deps.overpass.query(buildRegionQuery(centre));
-    return pickRegion(response.elements ?? []);
-  } catch (error) {
-    (deps.logger ?? (() => {}))(`${OVERPASS_SKIPPED_MARKER} region lookup failed`, {
-      error: String(error),
-    });
-    return { regionName: null, countryCode: null };
-  }
-}
-
-/**
- * Choose the most useful administrative level present. Descending from 6 (county) to 4
- * (state/region), because the more local name is the more informative one on a trail card.
- * Level 2 is only ever read for its ISO country code, never as a display name.
- */
-export function pickRegion(elements: readonly OverpassElement[]): RegionInfo {
-  let regionName: string | null = null;
-  let countryCode: string | null = null;
-  let bestLevel = -1;
-
-  for (const element of elements) {
-    const tags = element.tags;
-    if (!tags) continue;
-    const level = Number(tags.admin_level);
-    if (!Number.isFinite(level)) continue;
-
-    if (level === 2) {
-      const code = tags['ISO3166-1:alpha2'] ?? tags['ISO3166-1'];
-      if (code && code.length === 2) countryCode = code.toUpperCase();
-      continue;
-    }
-
-    const name = tags['name:en'] ?? tags.name;
-    if (name && level > bestLevel) {
-      regionName = name;
-      bestLevel = level;
-    }
-  }
-
-  return { regionName, countryCode };
 }
 
 /**
