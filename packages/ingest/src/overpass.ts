@@ -147,13 +147,23 @@ export const OVERPASS_SKIPPED_MARKER = 'switchback-ingest-overpass-skipped';
  * indistinguishable from "no trails here" and caches a tile empty for thirty days
  * (`overpass.osm.ch` fails this way and is deliberately absent). And a mirror must be a
  * distinct host — `kumi.systems` and `private.coffee` share an address, so rotating between
- * them is the same outage twice. Ordered by measured reachability, not reputation:
- * `overpass-api.de` is the reference instance but publishes an A record that is unreachable
- * from some networks, and the first endpoint decides whether a cold tile feels instant.
+ * them is the same outage twice.
+ *
+ * Ordered by measured reachability, not reputation, and the vantage point is half the
+ * measurement: `overpass-api.de` publishes an A record that is unreachable from some consumer
+ * networks, which is a fact about those networks and not about a data centre, where every
+ * deployment that ingests actually runs. From a GitHub-hosted runner it answered 6 of 6 rounds at
+ * a 2.4 s median across two runs 90 seconds apart, while `maps.mail.ru` answered 3 of 6 and spent
+ * the other three at a 30 s abort — so the reference instance leads. `scripts/overpass-probe.ts`
+ * is the measurement; re-run it before reordering again, from a runner rather than a workstation.
+ *
+ * A wrong leader is bounded rather than fatal — `cursor` is an instance field, so a dead primary
+ * costs one failed attempt per process, not one per tile — which is what makes the order a
+ * latency decision rather than an availability one.
  */
 const DEFAULT_ENDPOINTS = [
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass-api.de/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
 ] as const;
 

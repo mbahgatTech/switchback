@@ -1016,7 +1016,7 @@ five-attempt ladder, and while it is `queued` the next drain leaves it alone.
 returns the revived-from-dead children as `exhausted`; `rollUpSplitTile` writes them to the parent's
 `lastError` and logs `switchback-ingest-subtree-stuck` — but only when that message differs from what
 the row already says. Edge-triggering is load-bearing rather than tidy: a blocked parent is `pending`,
-so `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls _because_ it is
+so `ensureCoverage` re-queues it on every viewport poll and the client polls _because_ it is
 pending, and `switchback-ingest-ground-lost` fires on one event in fifteen minutes. A line per drain
 would page every quarter of an hour for as long as anyone left that map open, on the same rule as the
 genuine failure signal — which trains an operator to ignore the signal the rule exists to carry.

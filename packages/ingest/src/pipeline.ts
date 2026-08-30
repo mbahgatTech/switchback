@@ -632,7 +632,7 @@ async function rollUpSplitTile(
    * and the trails the parent did commit stay on the row. `unsplitTile` is the way back.
    *
    * Written once per transition, not once per drain. A blocked parent is `pending`, so
-   * `ensureCoverage` re-queues it on every viewport poll and `explore.tsx` polls *because* it is
+   * `ensureCoverage` re-queues it on every viewport poll and the client polls *because* it is
    * pending — a line per drain would page every fifteen minutes for as long as anyone left that
    * map open, on the same rule as the genuine failure signal. The parent's stored `lastError` is
    * the edge, and it survives a restart where a module-level flag would not. Clearing it is

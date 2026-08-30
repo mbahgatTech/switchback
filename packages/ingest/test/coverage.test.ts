@@ -159,7 +159,7 @@ describe('ensureCoverage partitioning', () => {
   it('serves a failed tile that holds trails instead of calling it still loading', async () => {
     /*
      * The tile a lost trail produces: 899 of 900 committed, `failed` because of the last one.
-     * `pending` is the set `explore.tsx` refetches on every 2.5 s, so classifying this as
+     * `pending` is one of the sets the client refetches on every 2.5 s, so classifying this as
      * pending both hides trails that are in the table and starts a poll for them.
      */
     const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))

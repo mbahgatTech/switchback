@@ -1,0 +1,66 @@
+# Measures per-endpoint Overpass latency from a GitHub-hosted runner, which is the only vantage
+# point that settles the question `DEFAULT_ENDPOINTS` is ordered on. A workstation measurement is
+# not evidence about the order: production runs in a data centre, and the list is ordered by
+# reachability from one — `overpass-api.de` publishes an A record that is unreachable from some
+# consumer networks, which is a fact about those networks rather than about a runner.
+#
+# Dispatch-only, and it stays that way. The gates in ci.yml never reach Overpass, deliberately (see
+# the note at the top of that file): a probe on every push would make this repository the kind of
+# automated client that gets a project blocked. One run is nine requests at three rounds.
+#
+# Read `VERDICT` at the end of the log. It licenses a reorder only when some endpoint answered
+# *every* round and has the lowest median; a fast median over one lucky sample is not a result.
+#
+# GitHub offers `workflow_dispatch` only for workflows already on the default branch, so this is
+# not dispatchable from a branch — the first measurement has to come from a temporary trigger.
+name: Overpass endpoint probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 'Samples per endpoint. Three is the floor for a claim about the order.'
+        required: false
+        default: '3'
+      endpoints:
+        description: 'Comma-separated override, to measure a candidate mirror. Blank uses DEFAULT_ENDPOINTS.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: overpass-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: per-endpoint latency
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Overpass refuses a client that will not say who it is, and rightly. `assertUsableUserAgent`
+      # rejects a URL that reaches nobody, so this has to be the repository itself.
+      OVERPASS_USER_AGENT: 'switchback-ci/0.1 (+https://github.com/${{ github.repository }})'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Probe each endpoint
+        run: |
+          set -euo pipefail
+          args=(--rounds "$ROUNDS")
+          if [ -n "$ENDPOINTS" ]; then args+=(--endpoints "$ENDPOINTS"); fi
+          npx tsx scripts/overpass-probe.ts "${args[@]}"
+        env:
+          ROUNDS: ${{ inputs.rounds || '3' }}
+          ENDPOINTS: ${{ inputs.endpoints }}
