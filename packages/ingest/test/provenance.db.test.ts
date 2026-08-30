@@ -70,6 +70,14 @@ const STRAY_CHILD = `${INTERRUPTED}0`;
  */
 const STALLED_PARENTS = Array.from({ length: CHILDREN_PER_TILE }, (_, held) => `${NS}00011${held}`);
 
+/**
+ * The count the sweep cannot reach: a parent holding the full set.
+ *
+ * Not a further entry in `STALLED_PARENTS`, which encodes the count it holds in the last quadkey
+ * digit — and a quadkey has no digit `CHILDREN_PER_TILE`.
+ */
+const FULL_SET_PARENT = `${NS}000120`;
+
 const FIXTURE_TILES = [
   FILLED,
   EMPTIED,
@@ -81,6 +89,8 @@ const FIXTURE_TILES = [
   INTERRUPTED,
   STRAY_CHILD,
   ...STALLED_PARENTS.flatMap((parent) => [parent, ...childQuadkeys(parent)]),
+  FULL_SET_PARENT,
+  ...childQuadkeys(FULL_SET_PARENT),
 ];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
@@ -142,6 +152,20 @@ async function seedWrite(
   await prisma.ingestTile.create({
     data: { quadkey, x, y, z, status, bboxW, bboxS, bboxE, bboxN, fetchedAt, sourceKind },
   });
+}
+
+/**
+ * A parent that answered inside the window, under `held` children a subdivision left behind.
+ *
+ * The one seeder for both sides of the child-count boundary, so the count is all that changes
+ * across it: every child is `pending` with no `fetchedAt` and no `sourceKind`, a set `rollUp`
+ * refuses at any size, and the parent's own row is a source's answer at every size.
+ */
+async function seedParentHolding(parent: string, held: number): Promise<void> {
+  for (const child of childQuadkeys(parent).slice(0, held)) {
+    await seedWrite(child, TileStatus.pending, null, null);
+  }
+  await seedWrite(parent, TileStatus.empty, INSIDE_WINDOW, TileSource.overpass);
 }
 
 /** The window's reading for one source, or zeroes when it wrote nothing inside it. */
@@ -384,19 +408,17 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
    * `CHILDREN_PER_TILE`, so none of them can be the derived row this exclusion drops. Asserting
    * only the ends leaves the comparison free to be `< 2` or `< 3` — an exclusion wider than the
    * roll-up's precondition, which discards a real answer for as long as the stray children live.
-   * The full set is the boundary's other half, asserted above through a roll-up that really ran.
+   * The full set is the boundary's other half, seeded below out of the same `seedParentHolding`,
+   * so the count is the only thing that differs across it.
    *
-   * One reading per count rather than one total over all of them: the counts either side of the
-   * boundary are equinumerous, so a single total reads the same whichever side the query kept.
+   * One reading per count rather than one total over all of them, for the diagnosis and not the
+   * detection: `count(*) < N` is unbounded below, so a threshold that moves keeps a prefix and a
+   * single total over the range moves with it. What a total cannot do is name the count that moved.
    */
   it.each(STALLED_PARENTS.map((_, held) => held))(
     'counts a parent holding %i children, short of the full set a roll-up needs',
     async (held) => {
-      const parent = STALLED_PARENTS[held]!;
-      for (const child of childQuadkeys(parent).slice(0, held)) {
-        await seedWrite(child, TileStatus.pending, null, null);
-      }
-      await seedWrite(parent, TileStatus.empty, INSIDE_WINDOW, TileSource.overpass);
+      await seedParentHolding(STALLED_PARENTS[held]!, held);
 
       // One parent in the window, so the total names which row was kept and not merely how many.
       expect(await shareFor(TileSource.overpass)).toEqual({
@@ -406,4 +428,32 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       });
     },
   );
+
+  /**
+   * The boundary's other half: a full set of children, none of them a roll-up could have used.
+   *
+   * The exclusion counts children and reads nothing off them, which is what makes it the roll-up's
+   * precondition taken conservatively — a box split into four no longer stands for ground one
+   * answer covers, whether or not the split ever finished. A predicate that instead counted only
+   * children carrying a `sourceKind`, a `fetchedAt` or a settled status would read the same on
+   * every other fixture in this file and still re-admit the derived rows: `sourceKind` is null on
+   * every row a fetch wrote before provenance was recorded, so under any parent whose children
+   * predate that column such a predicate counts zero, and each row `promoteFrom` composed returns
+   * to both totals at every zoom above the answer.
+   */
+  it('leaves out a parent holding a full set of children, whatever those children hold', async () => {
+    await seedParentHolding(FULL_SET_PARENT, CHILDREN_PER_TILE);
+
+    // The parent is inside the window and attributed, so the zeroes below are the exclusion and
+    // not a fixture that never landed.
+    const parent = await tileRow(FULL_SET_PARENT);
+    expect(parent.fetchedAt).toEqual(INSIDE_WINDOW);
+    expect(parent.sourceKind).toBe(TileSource.overpass);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 0,
+      empty: 0,
+    });
+  });
 });
