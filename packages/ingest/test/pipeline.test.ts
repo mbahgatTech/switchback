@@ -886,6 +886,118 @@ describe('processTile, Overpass etiquette', () => {
 
     expect(result).toMatchObject({ status: TileStatus.ready, skipped: 1, failed: 0 });
   });
+
+  /** One relation trail, which is what makes a tile ask the fourth question. */
+  const oneRelation: OverpassElement[] = [
+    {
+      type: 'relation',
+      id: 77,
+      tags: { route: 'hiking', name: 'Glen Ridge Path' },
+      members: [
+        {
+          type: 'way',
+          ref: 1,
+          role: '',
+          geometry: [
+            { lat: 46.1, lon: 6.5 },
+            { lat: 46.11, lon: 6.5 },
+          ],
+        },
+      ],
+    },
+  ];
+
+  it('asks a tile with a relation one further question, and still holds only two slots', async () => {
+    /*
+     * `relation(br)` is the fourth and last, and it is asked once. Overlapping it with the commit
+     * loop is a scheduling change and must stay one: a shape that speculates, retries or fans out
+     * buys throughput with somebody else's donated hardware. The peak is counted at the transport,
+     * so a lookup that opened its own client would be invisible to `OVERPASS_MAX_CONCURRENT` and
+     * show up here as an under-count.
+     */
+    const { db } = fakeDb();
+    const { client, sent, peak } = recordingClient(oneRelation);
+
+    await processTile(DENSE, { db, overpass: client, terrain: noTerrain });
+
+    expect(sent).toHaveLength(4);
+    expect([...sent].sort()).toEqual(['features', 'parents', 'region', 'tile']);
+    expect(peak()).toBeLessThanOrEqual(2);
+    expect(client.inFlight).toBe(0);
+  });
+
+  it('hands the parent-route lookup over before the commit loop rather than after it', async () => {
+    /*
+     * The whole of the gain: the round trip spends the commit loop's wall clock instead of the
+     * tile's own. Pinned on ordering rather than on elapsed time — a duration this fake could
+     * measure would be the fake's, not Overpass's.
+     */
+    const { db } = fakeDb();
+    const events: string[] = [];
+    const overpass = {
+      query: (ql: string) => {
+        const kind = kindOf(ql);
+        events.push(kind);
+        return Promise.resolve({ elements: kind === 'tile' ? oneRelation : [] });
+      },
+    } as unknown as OverpassClient;
+    const terrain = {
+      tilesFor: () => {
+        events.push('commit');
+        return Promise.resolve(new Map<string, TerrariumTile>());
+      },
+    } as unknown as TerrainSource;
+
+    await processTile(DENSE, { db, overpass, terrain });
+
+    expect(events).toContain('commit');
+    expect(events.indexOf('parents')).toBeLessThan(events.indexOf('commit'));
+  });
+
+  it('keeps the trails it committed when the parent-route lookup fails', async () => {
+    // It runs beside the commits now, so its rejection reaches a tile that has already written
+    // rows. Additive work must never cost ground that is already in the ground.
+    const { db } = fakeDb();
+    const logged: string[] = [];
+    const overpass = {
+      query: (ql: string) =>
+        kindOf(ql) === 'parents'
+          ? Promise.reject(new Error('mirror said 504'))
+          : Promise.resolve({ elements: kindOf(ql) === 'tile' ? oneRelation : [] }),
+    } as unknown as OverpassClient;
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass,
+      terrain: noTerrain,
+      logger: (message) => logged.push(message),
+    });
+
+    expect(result).toMatchObject({ status: TileStatus.ready, skipped: 1, failed: 0 });
+    expect(logged.join()).toContain('switchback-ingest-overpass-skipped');
+  });
+
+  it('sends the parent-route lookup on a tile that goes on to split, where the serial shape sent none', async () => {
+    /*
+     * The volume this change costs, at the only place it costs anything. The lookup is handed over
+     * before the commit loop, so a tile the deadline refuses has already sent it — where a lookup
+     * handed over afterwards is never reached at all. One request, on that path alone, and the
+     * split still lands: the answer is discarded rather than waited for.
+     */
+    const { db } = fakeDb();
+    const { client, sent } = recordingClient(oneRelation);
+
+    const result = await processTile(DENSE, {
+      db,
+      overpass: client,
+      terrain: noTerrain,
+      subdivideMaxZoom: MAX_INGEST_ZOOM,
+      deadlineAt: Date.now() - 1,
+    });
+
+    expect(result.children).toHaveLength(4);
+    expect(sent).toContain('parents');
+  });
 });
 
 describe('chooseHero', () => {

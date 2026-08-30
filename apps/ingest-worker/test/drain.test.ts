@@ -102,7 +102,7 @@ describe('runIngestSignal', () => {
       deps: {
         // Deadline views over the injected client, not the client itself — see `runIngestSignal`.
         overpass: { query: expect.any(Function) as () => void },
-        overpassAfterCommits: { query: expect.any(Function) as () => void },
+        overpassToHandlerDeadline: { query: expect.any(Function) as () => void },
         deadlineAt: expect.any(Number) as number,
         logger: expect.any(Function) as () => void,
       },
