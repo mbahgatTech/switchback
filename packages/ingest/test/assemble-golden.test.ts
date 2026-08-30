@@ -162,7 +162,9 @@ describe('the recording set', () => {
    */
   it('pins an OSM base timestamp on every recording', () => {
     for (const entry of loadRawIndex()) {
-      expect(entry.timestampOsmBase, entry.file).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u);
+      expect(String(entry.timestampOsmBase), entry.file).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u,
+      );
     }
   });
 
