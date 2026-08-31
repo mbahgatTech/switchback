@@ -39,9 +39,11 @@ function lockCommentary(source: string): string {
   if (declaration === -1) throw new Error(`${MAIN} declares no deleteLock module`);
 
   const block: string[] = [];
-  for (let i = declaration - 1; i >= 0 && (block.length === 0 || lines[i]?.startsWith('//')); i--) {
+  for (let i = declaration - 1; i >= 0; i--) {
     const line = lines[i] ?? '';
-    if (line.trim() === '') continue;
+    // The run is broken by blank lines it does not own, so a blank one only ends it once the
+    // comment above has run out.
+    if (line.trim() === '' && block.length === 0) continue;
     if (!line.startsWith('//')) break;
     block.unshift(line);
   }
