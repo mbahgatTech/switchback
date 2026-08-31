@@ -4,7 +4,11 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { overpassShapesIn, overpassShapesInSource } from './support/query-builders';
+import {
+  SOURCE_SCAN_TIMEOUT_MS,
+  overpassShapesIn,
+  overpassShapesInSource,
+} from './support/query-builders';
 
 const FILE = 'packages/ingest/src/overpass.ts';
 
@@ -111,17 +115,21 @@ describe('the repository as it stands', () => {
    * The shapes the walk finds, listed once so an unrecorded builder is visible here as well as
    * through the recording index. Every one has a recording under `fixtures/raw/`.
    */
-  it('asks for nine answer shapes', async () => {
-    await expect(overpassShapesInSource()).resolves.toEqual([
-      'feature',
-      'network',
-      'parent-route',
-      'region',
-      'relation-skeleton',
-      'route',
-      'tags-by-id',
-      'tile',
-      'way-geometry',
-    ]);
-  });
+  it(
+    'asks for nine answer shapes',
+    async () => {
+      await expect(overpassShapesInSource()).resolves.toEqual([
+        'feature',
+        'network',
+        'parent-route',
+        'region',
+        'relation-skeleton',
+        'route',
+        'tags-by-id',
+        'tile',
+        'way-geometry',
+      ]);
+    },
+    SOURCE_SCAN_TIMEOUT_MS,
+  );
 });

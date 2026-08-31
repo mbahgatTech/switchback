@@ -49,19 +49,21 @@ relation declares — route order, which is not sorted and which no sort reprodu
 relation from a member join without `ORDER BY ... WITH ORDINALITY`, draws different lines from the
 same ways.
 
-How far that carries depends on the tile, so no summary figure detects it:
+How far that carries depends on the tile and on the order, so no summary figure detects it:
 
-| fault                          | tile   | trails        | identities | geometry |
-| ------------------------------ | ------ | ------------- | ---------- | -------- |
-| top-level ways out of id order | sparse | 145 → 145     | changed    | changed  |
-| top-level ways out of id order | dense  | 1,517 → 1,521 | changed    | changed  |
-| relation members sorted by ref | sparse | 145 → 145     | all held   | changed  |
-| relation members sorted by ref | dense  | 1,517 → 1,513 | changed    | changed  |
+| fault                                    | tile   | trails        | identities | geometry |
+| ---------------------------------------- | ------ | ------------- | ---------- | -------- |
+| top-level ways reversed                  | sparse | 145 → 145     | changed    | changed  |
+| top-level ways reversed                  | dense  | 1,517 → 1,521 | changed    | changed  |
+| top-level ways in geometry-cluster order | dense  | 1,517 → 1,517 | changed    | changed  |
+| relation members sorted by ref           | sparse | 145 → 145     | all held   | changed  |
+| relation members sorted by ref           | dense  | 1,517 → 1,513 | changed    | changed  |
 
-A trail count that survives is therefore evidence of nothing, and one that moves does not rule
-ordering out; only the geometry moves in every case. `assembleAsRecorded` takes the recording as
-the authority on both lists and refuses either fault, rather than diffing trails that are silently
-not the golden's. `assemble-golden.test.ts` holds this table.
+A trail count that survives is therefore evidence of nothing — the cluster order a Postgres-backed
+source would serve holds it exactly on the tile where reversal moves it — and one that moves does
+not rule ordering out; only the geometry moves in every case. `assembleAsRecorded` takes the
+recording as the authority on both lists and refuses either fault, rather than diffing trails that
+are silently not the golden's. `assemble-golden.test.ts` holds this table.
 
 Re-derive from what is already committed, with no network:
 

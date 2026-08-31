@@ -148,6 +148,13 @@ export function overpassShapesIn(text: string, file: string): string[] {
  */
 const READ_CONCURRENCY = 64;
 
+/**
+ * What a test must allow one scan, because vitest's 5 s default does not: the walk measured 10.8 s
+ * on a loaded machine and reddened runs that had changed nothing near it. Stated here rather than
+ * in each test, so a third caller cannot inherit the default by forgetting.
+ */
+export const SOURCE_SCAN_TIMEOUT_MS = 30_000;
+
 /** Sorted and deduplicated: two builders producing one answer shape need one recording. */
 export async function overpassShapesInSource(): Promise<string[]> {
   const files = sourceFiles(REPO_ROOT);

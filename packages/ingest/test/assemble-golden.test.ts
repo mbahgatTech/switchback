@@ -5,7 +5,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { assembleTrails } from '../src/assemble';
-import type { OverpassElement, OverpassQuerier, OverpassRelation } from '../src/overpass';
+import type {
+  OverpassElement,
+  OverpassQuerier,
+  OverpassRelation,
+  OverpassWay,
+} from '../src/overpass';
 import { fetchRelationInParts } from '../src/pipeline';
 import {
   DENSE_TILE,
@@ -53,7 +58,7 @@ describe('the order elements arrive in', () => {
   const identity = (trail: { osmType: string; osmId: number }) => `${trail.osmType}/${trail.osmId}`;
   const ascending = (ids: readonly number[]) => ids.every((id, i) => i === 0 || ids[i - 1]! <= id);
 
-  /** Top-level ways backwards: osm2pgsql's geometry-cluster order, in the shape it was caught in. */
+  /** Top-level ways backwards: the coarsest way out of id order, and the shape it was caught in. */
   const reversed = [...sparse.elements].reverse();
 
   /** Every relation's members by way id — what a member join without `WITH ORDINALITY` returns. */
@@ -80,6 +85,28 @@ describe('the order elements arrive in', () => {
       );
     }
     return clone;
+  }
+
+  /**
+   * Top-level ways in geometry order between the first and the last, both of which stay where the
+   * recording put them — what a tile query against osm2pgsql returns, which clusters ways by
+   * geohash rather than by id, and the shape a comparison of the two ends cannot see.
+   */
+  function clusteredBetweenEnds(elements: readonly OverpassElement[]): OverpassElement[] {
+    const clone = structuredClone(elements) as OverpassElement[];
+    const ways = clone.filter((element): element is OverpassWay => element.type === 'way');
+    const cell = (way: OverpassWay): [number, number] => {
+      const [first] = way.geometry ?? [];
+      return [Math.round((first?.lat ?? 0) * 100), Math.round((first?.lon ?? 0) * 100)];
+    };
+    const interior = ways.slice(1, -1).sort((a, b) => {
+      const [aLat, aLon] = cell(a);
+      const [bLat, bLon] = cell(b);
+      return aLat - bLat || aLon - bLon || a.id - b.id;
+    });
+    const held = [ways[0]!, ...interior, ways.at(-1)!];
+    let next = 0;
+    return clone.map((element) => (element.type === 'way' ? held[next++]! : element));
   }
 
   /**
@@ -136,6 +163,44 @@ describe('the order elements arrive in', () => {
   });
 
   /**
+   * The top level at the positions an endpoint comparison cannot reach: the smallest way id is
+   * still first and the largest still last, so a guard reduced to either end — or to a scan that
+   * never carries past the first id — accepts this. Assembled, the dense tile keeps the golden's
+   * 1,517 trails exactly while twelve identities are swapped for twelve others and seventy-one
+   * more draw a different line under an identity the golden also carries.
+   */
+  it('holds top-level ways at every position, not at their ends', () => {
+    const candidate = clusteredBetweenEnds(dense.elements);
+    const served = candidate.filter((element) => element.type === 'way').map(({ id }) => id);
+    const recorded = dense.elements.filter((element) => element.type === 'way').map(({ id }) => id);
+    const byId = (ids: readonly number[]) => [...ids].sort((a, b) => a - b);
+
+    // A reordering and nothing else, both ends left alone and the smallest id still first:
+    // otherwise the divergence below would be evidence of ways lost rather than of the order they
+    // arrive in, and the reductions this exists to catch would be refused for the wrong reason.
+    expect(byId(served)).toEqual(byId(recorded));
+    expect([served[0], served.at(-1)]).toEqual([recorded[0], recorded.at(-1)]);
+    expect(served[0]).toBe(Math.min(...served));
+    expect(ascending(served)).toBe(false);
+
+    expect(() => assembleAsRecorded(candidate, dense.elements)).toThrow(
+      /ordered by way id ascending/u,
+    );
+
+    const golden = new Map(dense.golden.trails.map((trail) => [identity(trail), trail]));
+    const accepted = summariseTrails(assembleTrails(candidate));
+
+    expect({
+      trails: accepted.length,
+      gained: accepted.filter((trail) => !golden.has(identity(trail))).length,
+      geometryMoved: accepted.filter((trail) => {
+        const before = golden.get(identity(trail));
+        return before !== undefined && before.coords.sha256 !== trail.coords.sha256;
+      }).length,
+    }).toEqual({ trails: dense.count, gained: 12, geometryMoved: 71 });
+  });
+
+  /**
    * The interior of a member list, which is where an endpoint comparison sees nothing: every
    * relation here keeps the first and last way the recording gave it. Refusing that is not
    * pedantry — assembled, the dense tile comes back 1,513 trails against the golden's 1,517,
@@ -181,22 +246,46 @@ describe('the order elements arrive in', () => {
   });
 
   /**
-   * Which sequence is the candidate's and which the recording's. Named the wrong way round, the
-   * refusal reads as an instruction to sort the side that was already right.
+   * Which sequence is the candidate's and which the recording's, and what each one holds. Named
+   * the wrong way round the refusal reads as an instruction to sort the side that was already
+   * right; printed from a list nothing derived independently it can name any two sequences at all
+   * and still agree with itself. Both are read off the relation's own members here.
    */
   it('names the served sequence and the recorded one the right way round', () => {
     const candidate = structuredClone(sparse.elements);
     const relation = candidate.find(
       (element): element is OverpassRelation => element.type === 'relation',
     )!;
+    const declared = relation.members
+      .filter((member) => member.type === 'way')
+      .map((member) => member.ref);
+    // Reversing the member list reverses its way members with it, whatever else it holds.
     relation.members.reverse();
-    const served = memberWaySequences(candidate).get(relation.id)!;
-    const declared = memberWaySequences(sparse.elements).get(relation.id)!;
 
     expect(() => assembleAsRecorded(candidate, sparse.elements)).toThrow(
-      `serves member ways [${served.join(', ')}] where the recording declares ` +
+      `serves member ways [${[...declared].reverse().join(', ')}] where the recording declares ` +
         `[${declared.join(', ')}]`,
     );
+  });
+
+  /**
+   * A relation's members that are not ways: `assembleTrails` skips them, so a source that
+   * materialises the member ways alone serves the sequence the recording declares and assembles
+   * to the golden. Compared without that distinction the seam refuses a correct source, naming
+   * the dense tile's two node members and one member relation as member ways.
+   */
+  it("compares a relation's way members and not the rest of its members", () => {
+    const candidate = structuredClone(dense.elements);
+    let dropped = 0;
+    for (const element of candidate) {
+      if (element.type !== 'relation') continue;
+      const ways = element.members.filter((member) => member.type === 'way');
+      dropped += element.members.length - ways.length;
+      element.members = ways;
+    }
+
+    expect(dropped).toBeGreaterThan(0);
+    expect(assembleAsRecorded(candidate, dense.elements)).toEqual(dense.golden.trails);
   });
 
   /**

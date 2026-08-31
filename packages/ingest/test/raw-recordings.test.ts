@@ -9,7 +9,7 @@ import { classifyWaypoint, parseEleM } from '../src/enrich';
 import { countNodes, waysToSegments } from '../src/network';
 import type { OverpassElement, OverpassRelation, OverpassWay } from '../src/overpass';
 import { pickRegion } from '../src/tile-context';
-import { overpassShapesInSource } from './support/query-builders';
+import { SOURCE_SCAN_TIMEOUT_MS, overpassShapesInSource } from './support/query-builders';
 import {
   DENSE_TILE,
   RAW_SHAPES,
@@ -62,12 +62,16 @@ describe('the recording index', () => {
    * non-test file — under a `class` or an `export default` as much as a top-level `const` — is
    * one this notices has no recording, including a `RAW_SHAPES` that has stopped keeping up.
    */
-  it('covers every Overpass answer the repository asks for', async () => {
-    const asked = await overpassShapesInSource();
+  it(
+    'covers every Overpass answer the repository asks for',
+    async () => {
+      const asked = await overpassShapesInSource();
 
-    expect([...new Set(loadRawIndex().map((entry) => entry.shape))].sort()).toEqual(asked);
-    expect([...RAW_SHAPES].sort()).toEqual(asked);
-  });
+      expect([...new Set(loadRawIndex().map((entry) => entry.shape))].sort()).toEqual(asked);
+      expect([...RAW_SHAPES].sort()).toEqual(asked);
+    },
+    SOURCE_SCAN_TIMEOUT_MS,
+  );
 });
 
 describe('the region answer', () => {
