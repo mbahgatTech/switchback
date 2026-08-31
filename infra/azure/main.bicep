@@ -17,11 +17,12 @@
 // **"No-op" is a claim someone will check, so here is what checking it shows.** Measured
 // 2026-08-07 with `az deployment sub what-if` against the live deployment, `DEPLOY_DATABASE=false`
 // and `PGADMIN_PASSWORD` unset: 35 changes — 19 `NoChange`, 8 `Ignore`, 5 `Modify`, 2 `Create`,
-// 1 `Unsupported`. Both budgets and the delete lock are among the `NoChange`. The two `Create`
-// entries are one real to-do; everything else is residue, because it is either a value ARM will
-// not read back or a value ARM rewrites on read. The list is written down so nobody spends an
-// afternoon on it a second time, and the to-do is kept above the residue so it does not get
-// read as more of the same.
+// 1 `Unsupported`. Both budgets were among the `NoChange`, and so was the delete lock; `lockNotes`
+// and the live note differ today, and the lock section below carries what converges them. The
+// two `Create` entries are one real to-do; everything else is residue, because it is either a
+// value ARM will not read back or a value ARM rewrites on read. The list is written down so
+// nobody spends an afternoon on it a second time, and the to-do is kept above the residue so
+// it does not get read as more of the same.
 //
 // ---- Not residue. This is the one thing genuinely absent from the estate. ----
 //
@@ -100,7 +101,7 @@
 
 targetScope = 'subscription'
 
-import { entraAdministrator } from './postgres.bicep'
+import { entraAdministrator, firewallRule } from './postgres.bicep'
 
 // ---------------------------------------------------------------------------------------
 // Location
@@ -418,6 +419,28 @@ rewrite on every run.
 ''')
 param passwordAuthEnabled bool = true
 
+@description('''
+Who may reach 5432. One rule spanning the whole of IPv4 today, because the two consumers that
+must connect — Vercel's functions and GitHub-hosted runners — have no static egress address.
+
+**A wrong value here locks the product out of its own database**, and the way back is a
+control-plane write that has to reach Azure from wherever the operator is sitting. Narrowing is
+not a template edit: `infra/azure/README.md`, "Narrowing the firewall", carries the options, what
+each costs, and what each one breaks.
+
+`@minLength(1)` refuses the empty list, which is the one wrong value that looks like a careful
+one — a server with no rule is not a narrower perimeter, it is an outage. The constraint is
+declared here as well as on postgres.bicep's parameter because preflight checks the parameters of
+the template it is given and does not descend into a module's: with it only on the inner
+parameter, `--parameters databaseFirewallRules='[]'` validates clean.
+
+This is the only parameter in the template with no default, so preflight refuses any deployment
+that supplies neither `main.bicepparam` nor an override. Every recipe in this repository passes the
+parameter file, which is why nothing is written to accommodate a bare template deploy.
+''')
+@minLength(1)
+param databaseFirewallRules firewallRule[]
+
 // ---------------------------------------------------------------------------------------
 // Budget and alerting
 // ---------------------------------------------------------------------------------------
@@ -492,11 +515,11 @@ var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 //
 // Everything in this resource group can be rebuilt from this template in about fifteen
 // minutes — except the data, which cannot be rebuilt from anything in this repository. The
-// server holds every user account, every recorded GPS track, and 19,157 trails. Deleting a
-// Flexible Server takes its automated backups with it: there is no recycle bin, no soft
-// delete, and no "restore the server I deleted yesterday". There is no second copy of this
-// data anywhere — no geo-redundancy, no standby, no logical dump. A deleted server is the end
-// of the data.
+// server holds every user account, every recorded GPS track, and the whole trail corpus.
+// Deleting a Flexible Server takes its automated backups with it: there is no recycle bin,
+// no soft delete, and no "restore the server I deleted yesterday". There is no second copy of
+// this data anywhere — no geo-redundancy, no standby, no logical dump. A deleted server is the
+// end of the data.
 //
 // The realistic ways it goes:
 //
@@ -527,12 +550,17 @@ var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 // which is correct, because the point is to make destruction deliberate rather than
 // impossible.
 //
-// **The lock is live**, and its notes match `lockNotes` below character for character, so
-// `az deployment sub what-if` reports it as `NoChange`. Maintaining it needs
-// `Microsoft.Authorization/locks/write`, which Contributor's `notActions` exclude — so a
-// Contributor-only principal cannot deploy this template at all while `deployDeleteLock` is
-// true, existing lock or not, because preflight authorizes the action rather than the diff.
-// See `deployDeleteLock` above for the escape hatch that situation needs.
+// **The lock is live**, and `what-if` compares the note text rather than existence, so this
+// string and the live note have to stay identical: changing `lockNotes` is a deployment, not a
+// documentation edit. The live note is not yet identical — it still names a trail count
+// (`az lock list -g rg-switchback-prod-northcentralus -o json`, measured 2026-08-31) — so the
+// lock reads as a `Modify` on `notes` until the next deployment of this template converges it,
+// or an Owner runs the `az lock create` in infra/azure/README.md carrying the text below.
+//
+// Maintaining it needs `Microsoft.Authorization/locks/write`, which Contributor's `notActions`
+// exclude — so a Contributor-only principal cannot deploy this template at all while
+// `deployDeleteLock` is true, existing lock or not, because preflight authorizes the action
+// rather than the diff. See `deployDeleteLock` above for the escape hatch that situation needs.
 // ---------------------------------------------------------------------------------------
 
 module deleteLock 'lock.bicep' = if (deployDeleteLock) {
@@ -540,7 +568,7 @@ module deleteLock 'lock.bicep' = if (deployDeleteLock) {
   scope: rg
   params: {
     lockName: 'switchback-prod-no-delete'
-    lockNotes: 'Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and 19,157 trails, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it.'
+    lockNotes: 'Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and the whole trail corpus, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it.'
   }
 }
 
@@ -636,6 +664,7 @@ module postgres 'postgres.bicep' = {
     entraAuthEnabled: entraAuthEnabled
     entraAdministrators: entraAdministrators
     passwordAuthEnabled: passwordAuthEnabled
+    databaseFirewallRules: databaseFirewallRules
     // The CI identity is an administrator because `prisma db push` needs DDL over tables
     // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
     // Passed separately rather than appended to the list — see the parameter in postgres.bicep.

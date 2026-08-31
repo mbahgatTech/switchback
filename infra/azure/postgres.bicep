@@ -74,6 +74,24 @@ type entraAdministrator = {
   principalType: 'User' | 'Group' | 'ServicePrincipal'
 }
 
+@export()
+@description('One public-network firewall rule: a name, and the inclusive IPv4 range it admits.')
+type firewallRule = {
+  @description('Rule name. It is the documentation — the portal shows it beside the range.')
+  name: string
+
+  startIpAddress: string
+  endIpAddress: string
+}
+
+@description('''
+Who may reach 5432. Bound in main.bicepparam, which is where the width of the deployed rule is
+argued; the note above `network` explains why it is what it is, and infra/azure/README.md,
+"Narrowing the firewall", holds the options for making it smaller and what each one costs.
+''')
+@minLength(1)
+param databaseFirewallRules firewallRule[]
+
 // ---------------------------------------------------------------------------------------
 
 var serverName = '${serverNamePrefix}-${uniqueString(resourceGroup().id)}'
@@ -227,14 +245,16 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     // other thing that has to connect. A rule narrowed to "known ranges" would be a rule that
     // fails at 3am when a provider rotates a block.
     //
-    // A private endpoint is not the alternative it looks like. It would put the server on an
-    // Azure virtual network, and Vercel's functions execute inside Vercel's own AWS
-    // infrastructure with no route into that network. Reaching it would need a site-to-site
-    // VPN or ExpressRoute terminating somewhere Vercel can reach — infrastructure that does
-    // not exist, costs more than the database, and is out of scope for what is meant to be a
-    // database migration. Azure also refuses to mix the two models and will not let a server
-    // move between them after creation, so choosing private access now would be a one-way
-    // door into a dead end.
+    // A private endpoint does not replace this rule, and the two are not exclusive. Private Link
+    // gives the server a second address inside a virtual network while the public rule keeps
+    // serving, and it is available to this server precisely because the server uses public
+    // access rather than virtual network integration. What it does not do is give any current
+    // consumer a route: Vercel's functions execute inside Vercel's own AWS infrastructure,
+    // GitHub-hosted runners are outside Azure, and the ingest Function App runs on a Consumption
+    // plan, which Azure Functions offers no virtual network integration on. Virtual network
+    // integration is the one-way door — it cannot be turned on for an existing server, and a
+    // server that has it can never take a private endpoint. What each option costs is in
+    // infra/azure/README.md, "Narrowing the firewall".
     //
     // So the perimeter is credential-only, and the compensating controls are the real
     // security posture rather than decoration:
@@ -576,17 +596,22 @@ resource connectionsAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
 // The name is the documentation. Someone opening the portal a year from now should learn
 // *why* this is open without having to find the pull request — see the long note above.
 //
-// Note this is deliberately not the special rule 0.0.0.0–0.0.0.0, which means "Azure services
-// only" and would block Vercel entirely while looking, at a glance, like the same thing.
-resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2025-08-01' = {
-  parent: server
-  name: 'AllowVercelServerlessNoStaticEgress'
-  properties: {
-    startIpAddress: '0.0.0.0'
-    endIpAddress: '255.255.255.255'
+// Note the deployed rule is deliberately not the special rule 0.0.0.0–0.0.0.0, which means
+// "Azure services only" and would block Vercel entirely while looking, at a glance, like the
+// same thing. `@minLength(1)` — here and on main.bicep's parameter, which is the one preflight
+// actually reads — is the other half of that: an empty list is not a narrower firewall, it is
+// an outage, and it would otherwise deploy without complaint.
+resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2025-08-01' = [
+  for rule in databaseFirewallRules: {
+    parent: server
+    name: rule.name
+    properties: {
+      startIpAddress: rule.startIpAddress
+      endIpAddress: rule.endIpAddress
+    }
+    dependsOn: [connectionsAlert]
   }
-  dependsOn: [connectionsAlert]
-}
+]
 
 // The collation is not cosmetic. `C.UTF-8` is byte order; Azure's server default `en_US.utf8`
 // is dictionary order. A restore succeeds under either, which is exactly what makes a mismatch
