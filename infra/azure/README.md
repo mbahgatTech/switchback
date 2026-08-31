@@ -1924,9 +1924,11 @@ Done on 2026-08-03T18:10Z, along with the dead `vercel-send` SAS rule on the que
 That first re-PUT put back a 178-character paraphrase, not `main.bicep`'s body — so for eight hours
 the only text an operator met when the lock blocked them was missing the sentence demanding a pull
 request, and production drifted from the template in the one resource guarding irreversible data
-loss. Re-PUT verbatim at 2026-08-03T20:07Z from `lockNotes` in `main.bicep`, now 445 characters and
-byte-identical; `az rest --method GET .../locks` is how to check. Read `lock.json` out of the
-template rather than typing it, which is what went wrong the first time.
+loss. Re-PUT verbatim at 2026-08-03T20:07Z from `lockNotes` in `main.bicep`, which made the two
+identical at the time. They are not identical now — `lockNotes` has since been corrected and the
+live note still carries the old text; [The delete lock](#the-delete-lock) records the divergence
+and what converges it. Read `lock.json` out of the template rather than typing it, which is what
+went wrong the first time.
 
 **A rebuild from scratch is not affected** — a fresh resource group deployed from `ingest.bicep`
 gets exactly the three assignments the template declares. This step existed only to converge the
