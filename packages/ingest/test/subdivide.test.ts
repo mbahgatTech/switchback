@@ -197,6 +197,34 @@ describe('rollUp', () => {
       TileStatus.ready,
     );
   });
+
+  it('takes the oldest source stamp, from whichever child holds it', () => {
+    /*
+     * Source age and fetch age need not sit on the same child. Here the child with the most
+     * recent fetch is the one holding the oldest data, so a parent that carried up only the
+     * fetch clock would report a month-old quarter as current — the same laundering the column
+     * exists to stop, one level up the tree.
+     */
+    const oldSource = ago(TILE_TTL_MS + 1000);
+    const rows = [
+      { fetchedAt: ago(5000), sourceSnapshotAt: NOW },
+      { fetchedAt: NOW, sourceSnapshotAt: oldSource },
+      { fetchedAt: ago(3000), sourceSnapshotAt: NOW },
+      { fetchedAt: ago(2000), sourceSnapshotAt: NOW },
+    ];
+
+    expect(rollUp(siblings(rows))?.sourceSnapshotAt).toEqual(oldSource);
+  });
+
+  it('leaves the parent unstamped only when no child carried a stamp', () => {
+    // A child predating the column must not drag its siblings' real stamps out of the answer,
+    // and four such children leave nothing to inherit.
+    const none = [0, 1, 2, 3].map(() => ({ sourceSnapshotAt: null }));
+    expect(rollUp(siblings(none))?.sourceSnapshotAt).toBeNull();
+
+    const stamped = [{ sourceSnapshotAt: NOW }, ...none.slice(1)];
+    expect(rollUp(siblings(stamped))?.sourceSnapshotAt).toEqual(NOW);
+  });
 });
 
 describe('splitTile', () => {
