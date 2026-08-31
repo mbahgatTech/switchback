@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import prettier from 'prettier';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -14,6 +15,12 @@ import { describe, expect, it } from 'vitest';
  * matched a number followed by the literal word "trails" and nothing else, so the same figure
  * written as "trail records" restored the defect with the suite green. The nouns below are read
  * from the Prisma schema, and the note itself may carry no digit at all.
+ *
+ * **Both regions are proved by planting a census on every line of them.** Two earlier revisions
+ * read a truncated region and said so nowhere: one stopped the bicep commentary at the first line
+ * that was not a column-0 `//`, the other took a `#` shell comment inside a ```bash fence for the
+ * top of the runbook section. Each region is now bounded by an anchor the region cannot influence
+ * — a bicep statement above the declaration, a heading a real Markdown parser agrees is a heading.
  */
 
 function read(path: string): string {
@@ -45,10 +52,16 @@ function declarationLine(lines: readonly string[]): number {
   return at;
 }
 
+const COMMENT = /^\s*\/\//u;
+
+/** Anything bicep executes: a declaration or the decorator attached to one. */
+const STATEMENT = /^\s*(?:@|(?:var|param|resource|module|output|type|func|targetScope)\s)/u;
+
 /**
- * The lines of the `//` block that explains the lock: everything between the previous line of code
- * and `module deleteLock`. Blank lines belong to the block rather than ending it — an earlier
- * revision stopped at the first one, so a paragraph break silently shortened what was read.
+ * The lines of the `//` block that explains the lock: everything between the previous statement
+ * and `module deleteLock`. Blank lines and indented `//` both belong to the block — an earlier
+ * revision ended it at either, so a paragraph break or two leading spaces silently shortened
+ * what was read.
  */
 function commentaryLines(lines: readonly string[]): number[] {
   const declaration = declarationLine(lines);
@@ -56,13 +69,13 @@ function commentaryLines(lines: readonly string[]): number[] {
   let start = declaration;
   while (start > 0) {
     const line = lines[start - 1] ?? '';
-    if (line.trim() !== '' && !line.startsWith('//')) break;
+    if (line.trim() !== '' && !COMMENT.test(line)) break;
     start--;
   }
 
   const indices: number[] = [];
   for (let at = start; at < declaration; at++) {
-    if ((lines[at] ?? '').startsWith('//')) indices.push(at);
+    if (COMMENT.test(lines[at] ?? '')) indices.push(at);
   }
   if (indices.length === 0)
     throw new Error(`${MAIN} explains the deleteLock module with no comment`);
@@ -76,19 +89,105 @@ function lockCommentary(source: string): string {
     .join('\n');
 }
 
-/** The runbook section carrying the by-hand recipe, located from the recipe rather than by title. */
-function lockSection(source: string): string {
+/**
+ * Everything between `module deleteLock` and the nearest statement above it. The boundary is code
+ * rather than comment syntax, so this window is wider than the comment block by construction and
+ * owes nothing to how `commentaryLines` reads a comment.
+ */
+function windowAboveDeclaration(lines: readonly string[]): number[] {
+  const declaration = declarationLine(lines);
+
+  let statement = declaration - 1;
+  while (statement >= 0 && !STATEMENT.test(lines[statement] ?? '')) statement--;
+  if (statement < 0) throw new Error(`${MAIN} declares nothing above deleteLock`);
+
+  const window: number[] = [];
+  for (let at = statement + 1; at < declaration; at++) window.push(at);
+  return window;
+}
+
+const ATX_HEADING = /^ {0,3}#{1,6}(?: |$)/u;
+const CODE_FENCE = /^ {0,3}(`{3,}|~{3,})/u;
+
+/**
+ * The 0-based lines carrying a Markdown heading. Fences are tracked because `# …then deploy` in a
+ * ```bash block is a shell comment, and reading it as a heading started the guarded section 14
+ * lines below its title. The scan is held to a real Markdown parser over the runbook below.
+ */
+function headingLines(source: string): number[] {
+  const headings: number[] = [];
+  let fence: string | undefined;
+
+  source.split('\n').forEach((line, at) => {
+    const marker = CODE_FENCE.exec(line)?.[1];
+    if (fence === undefined) {
+      if (marker !== undefined) fence = marker;
+      else if (ATX_HEADING.test(line)) headings.push(at);
+      return;
+    }
+    const closes =
+      marker !== undefined &&
+      marker[0] === fence[0] &&
+      marker.length >= fence.length &&
+      line.slice(line.indexOf(marker) + marker.length).trim() === '';
+    if (closes) fence = undefined;
+  });
+
+  return headings;
+}
+
+/** The lines of the section holding the by-hand recipe, bounded by the headings it is given. */
+function sectionLines(source: string, headings: readonly number[]): number[] {
   const lines = source.split('\n');
   const recipe = lines.findIndex((line) => line.includes('--notes "'));
   if (recipe === -1) throw new Error(`${RUNBOOK} carries no az lock create --notes argument`);
 
-  const heading = /^#{1,6} /u;
-  let start = recipe;
-  while (start > 0 && !heading.test(lines[start] ?? '')) start--;
-  let end = recipe + 1;
-  while (end < lines.length && !heading.test(lines[end] ?? '')) end++;
+  const start = headings.filter((at) => at <= recipe).at(-1);
+  if (start === undefined) throw new Error(`${RUNBOOK} carries no heading above the recipe`);
+  const end = headings.find((at) => at > recipe) ?? lines.length;
 
-  return lines.slice(start, end).join('\n');
+  const section: number[] = [];
+  for (let at = start; at < end; at++) section.push(at);
+  return section;
+}
+
+function lockSection(source: string): string {
+  const lines = source.split('\n');
+  return sectionLines(source, headingLines(source))
+    .map((at) => lines[at] ?? '')
+    .join('\n');
+}
+
+interface MarkdownNode {
+  type: string;
+  position?: { start: { line: number } };
+  children?: MarkdownNode[];
+}
+
+/** Prettier's own markdown parse, cast because the debug entry point ships no declaration. */
+interface PrettierParser {
+  __debug: {
+    parse: (text: string, options: { parser: string }) => Promise<{ ast: MarkdownNode }>;
+  };
+}
+
+/**
+ * Headings as remark finds them. The repository already depends on this parser to format its
+ * Markdown, so it is the one independent answer available to the question the scan above answers.
+ */
+async function parsedHeadingLines(source: string): Promise<number[]> {
+  const { ast } = await (prettier as unknown as PrettierParser).__debug.parse(source, {
+    parser: 'markdown',
+  });
+
+  const headings: number[] = [];
+  const walk = (node: MarkdownNode): void => {
+    if (node.type === 'heading' && node.position !== undefined)
+      headings.push(node.position.start.line - 1);
+    for (const child of node.children ?? []) walk(child);
+  };
+  walk(ast);
+  return headings.sort((a, b) => a - b);
 }
 
 /**
@@ -133,6 +232,8 @@ function census(passage: string): string[] {
   );
 }
 
+const PROBE = `${'9'.repeat(5)} ${NOUNS[0] as string}s`;
+
 describe("the delete lock's note", () => {
   it('is character-for-character the same string in the template and the runbook', () => {
     expect(lockNotesFromRunbook(read(RUNBOOK))).toBe(lockNotesFromTemplate(read(MAIN)));
@@ -153,6 +254,8 @@ describe("the delete lock's note", () => {
     expect(() => lockNotesFromRunbook(runbook.replaceAll('--notes', '--n'))).toThrow();
     expect(() => lockCommentary(template.replace('module deleteLock', 'module lock'))).toThrow();
     expect(() => lockSection(runbook.replaceAll('--notes', '--n'))).toThrow();
+    expect(() => sectionLines(runbook, [])).toThrow(/no heading above the recipe/u);
+    expect(() => windowAboveDeclaration(['module deleteLock ='])).toThrow(/declares nothing/u);
     expect(() => corpusNouns('// no models here')).toThrow(/names no models/u);
   });
 
@@ -167,24 +270,43 @@ describe("the delete lock's note", () => {
     expect(census(lockSection(read(RUNBOOK)))).toEqual([]);
   });
 
-  it('is checked over the whole commentary, not the part above the first paragraph break', () => {
+  it('is checked over every comment line above the declaration, indented ones included', () => {
     const lines = read(MAIN).split('\n');
     const commentary = lockCommentary(read(MAIN));
-    const probe = `${'9'.repeat(5)} ${NOUNS[0] as string}s`;
-    const block = commentaryLines(lines);
+    const comments = windowAboveDeclaration(lines).filter((at) => COMMENT.test(lines[at] ?? ''));
 
-    for (const index of block) {
+    expect(comments).not.toEqual([]);
+    expect(commentaryLines(lines)).toEqual(comments);
+
+    for (const at of comments) {
       // A paragraph break anywhere in the block leaves the same commentary behind.
       const broken = [...lines];
-      broken.splice(index, 0, '');
-      expect(lockCommentary(broken.join('\n')), `blank line at ${index}`).toBe(commentary);
+      broken.splice(at, 0, '');
+      expect(lockCommentary(broken.join('\n')), `blank line at ${at}`).toBe(commentary);
 
-      // And a census on any line of it is seen, so the region is the whole region.
+      // And a census on any line of it is seen — written indented, which is the house style in
+      // these templates and was the shape that used to end the block early.
       const planted = [...lines];
-      planted[index] = `// ${probe}`;
-      expect(census(lockCommentary(planted.join('\n'))), `census at ${index}`).not.toEqual([]);
+      planted[at] = `  // ${PROBE}`;
+      expect(census(lockCommentary(planted.join('\n'))), `census at ${at}`).not.toEqual([]);
     }
+  });
 
-    expect(block.length).toBe(commentary.split('\n').length);
+  it('is checked over every line of the runbook section, fenced code included', async () => {
+    const runbook = read(RUNBOOK);
+    const lines = runbook.split('\n');
+
+    // The section is bounded by headings, so the headings are held to a real Markdown parser
+    // rather than to this file's reading of them — that disagreement is the whole defect.
+    expect(headingLines(runbook)).toEqual(await parsedHeadingLines(runbook));
+
+    const section = sectionLines(runbook, await parsedHeadingLines(runbook));
+    expect(section.length).toBeGreaterThan(1);
+
+    for (const at of section) {
+      const planted = [...lines];
+      planted[at] = `${lines[at] ?? ''} ${PROBE}`;
+      expect(census(lockSection(planted.join('\n'))), `census at ${at}`).not.toEqual([]);
+    }
   });
 });
