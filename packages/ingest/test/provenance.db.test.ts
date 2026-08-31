@@ -7,7 +7,7 @@ import type { PipelineDeps } from '../src/pipeline';
 import type { OverpassElement, OverpassQuerier, OverpassResponse } from '../src/overpass';
 import { EMPTY_WRITE_WINDOW_MS, readEmptyWriteRates } from '../src/maintenance';
 import { tileJobKey, trailEnrichJobKey } from '../src/jobs';
-import { CHILDREN_PER_TILE } from '../src/subdivide';
+import { CHILDREN_PER_TILE, splitTile, unsplitTile } from '../src/subdivide';
 import { flatTile, pngResponse } from './fixtures/terrarium';
 
 /**
@@ -39,6 +39,19 @@ const NS = '321';
 const NOW = new Date('2027-01-08T12:00:00Z');
 const INSIDE_WINDOW = new Date(NOW.getTime() - EMPTY_WRITE_WINDOW_MS / 2);
 const BEFORE_WINDOW = new Date(NOW.getTime() - EMPTY_WRITE_WINDOW_MS - 60_000);
+
+/**
+ * A minute either side of a day, written out rather than taken from the constant under test.
+ *
+ * The two fixtures above are `NOW` minus multiples of `EMPTY_WRITE_WINDOW_MS`, so they straddle
+ * whatever it holds and pin the reading's shape rather than its span. The span is itself the
+ * contract: `readEmptyWriteRates` takes the constant as its default and `reportEmptyWriteRates`
+ * calls it with no window, and `infra/azure/ingest.bicep` publishes the result to the operator as
+ * one over "the trailing day".
+ */
+const A_DAY_MS = 24 * 60 * 60 * 1000;
+const JUST_INSIDE_A_DAY = new Date(NOW.getTime() - A_DAY_MS + 60_000);
+const JUST_OVER_A_DAY = new Date(NOW.getTime() - A_DAY_MS - 60_000);
 
 /** What the source says its own copy of OSM was current to — days behind the fetch, deliberately. */
 const SNAPSHOT = new Date('2027-01-05T04:31:07Z');
@@ -92,6 +105,9 @@ const DEEP_SPLIT_CHILD = childQuadkeys(DEEP_SPLIT_PARENT)[0];
 /** One tile, re-seeded once per `TileStatus`, for the status the empty count names. */
 const STATUS_TILE = `${NS}000200`;
 
+/** A parent taken through a split and back out of one, for the `pending` row each leaves. */
+const UNSPLIT_PARENT = `${NS}000210`;
+
 const FIXTURE_TILES = [
   FILLED,
   EMPTIED,
@@ -109,6 +125,8 @@ const FIXTURE_TILES = [
   ...childQuadkeys(DEEP_SPLIT_PARENT),
   ...childQuadkeys(DEEP_SPLIT_CHILD),
   STATUS_TILE,
+  UNSPLIT_PARENT,
+  ...childQuadkeys(UNSPLIT_PARENT),
 ];
 
 /** Every trail this file creates starts here, and the cleanup deletes on the prefix. */
@@ -314,6 +332,25 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
     });
   });
 
+  /**
+   * The window's span, which the case above cannot see.
+   *
+   * Both of its fixtures are `NOW` minus a multiple of `EMPTY_WRITE_WINDOW_MS`, so they follow the
+   * constant wherever it goes and a day that became an hour reads identically. The alert this
+   * feeds gates on a denominator before it will weigh a share at all, and an hour of tiles is a
+   * denominator that never reaches the gate — so the span is the thing to pin, at its own edge.
+   */
+  it('reads a day of writes, the span the published line names', async () => {
+    await seedWrite(SEEDED[0]!, TileStatus.empty, JUST_INSIDE_A_DAY);
+    await seedWrite(SEEDED[1]!, TileStatus.empty, JUST_OVER_A_DAY);
+
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 1,
+      empty: 1,
+    });
+  });
+
   it('counts a fetch that failed in neither total, having written no data either way', async () => {
     const refused = {
       ...deps({ elements: [] }),
@@ -510,11 +547,18 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
   /**
    * Every status the enum holds, against a numerator that names exactly one of them.
    *
-   * `status = 'empty'` and `status <> 'ready'` differ only on a tile that is neither, and this
-   * estate leaves three such rows inside the window: `processTile` re-enters a tile that answered
-   * before at `running`, its catch writes `failed`, and `splitTile` returns a parent to `pending`
-   * when what it split was not settled. None of the three moves `fetchedAt`, so a tile that
-   * answered once stays in the denominator under a status no other fixture here constructs.
+   * `status = 'empty'` and `status <> 'ready'` differ only on a tile that is neither, and the
+   * writers that leave one inside the window are `processTile` re-entering an answered tile at
+   * `running`, its catch writing `failed`, and `reconcileOrphanedSplits` or `unsplitTile` putting
+   * a parent back to `pending`. None of them moves `fetchedAt`, so a tile that answered once is
+   * still in the denominator under a status no other fixture here constructs.
+   *
+   * **Not `splitTile`, which writes the same `pending`.** It upserts all four children before the
+   * parent, so the exclusion above drops every row it touches — which is why the two repair paths
+   * are the ones named: `reconcileOrphanedSplits` passes over a parent holding the full set, and
+   * `unsplitTile` leaves `pending` over no children at all. The case after this one takes one
+   * parent through both halves of that distinction.
+   *
    * Swept off `TileStatus` rather than a chosen status, so a sixth arrives with its own case.
    */
   it.each(Object.values(TileStatus))(
@@ -529,4 +573,39 @@ describe.runIf(IS_LOCAL).sequential('the empty-write share', () => {
       });
     },
   );
+
+  /**
+   * The `pending` row of the sweep above, reached through the estate rather than seeded.
+   *
+   * `splitTile` and `unsplitTile` write the same status over the same untouched `fetchedAt`, and
+   * only one of the two rows is a write this reading counts. Seeding the status directly cannot
+   * tell them apart, which is how the row gets attributed to the call least able to produce one.
+   */
+  it('counts a parent an unsplit returned to pending, and not one a split left holding four', async () => {
+    await seedWrite(UNSPLIT_PARENT, TileStatus.running, INSIDE_WINDOW);
+    await splitTile(prisma, UNSPLIT_PARENT, {
+      previous: { status: TileStatus.running, fetchedAt: INSIDE_WINDOW },
+    });
+
+    const split = await tileRow(UNSPLIT_PARENT);
+    expect(split.status).toBe(TileStatus.pending);
+    // In the window, carrying the earlier answer's stamp, and still excluded — by the children.
+    expect(split.fetchedAt).toEqual(INSIDE_WINDOW);
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 0,
+      empty: 0,
+    });
+
+    await unsplitTile(prisma, UNSPLIT_PARENT);
+
+    const unsplit = await tileRow(UNSPLIT_PARENT);
+    expect(unsplit.status).toBe(TileStatus.pending);
+    expect(unsplit.fetchedAt).toEqual(INSIDE_WINDOW);
+    expect(await shareFor(TileSource.overpass)).toEqual({
+      source: TileSource.overpass,
+      written: 1,
+      empty: 0,
+    });
+  });
 });
