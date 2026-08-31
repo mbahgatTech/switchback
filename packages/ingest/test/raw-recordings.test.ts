@@ -13,6 +13,7 @@ import { SOURCE_SCAN_TIMEOUT_MS, overpassShapesInSource } from './support/query-
 import {
   DENSE_TILE,
   RAW_SHAPES,
+  RECORDING_SET_TIMEOUT_MS,
   SPARSE_TILE,
   buildRawIndex,
   loadRawFixture,
@@ -35,7 +36,14 @@ function countBy<T>(items: readonly T[], of: (item: T) => string | null): Record
   return counted;
 }
 
-describe('the recording index', () => {
+/**
+ * Both kinds of work in the block below run past vitest's 5 s default — the recordings are
+ * gunzipped whole, and every non-test source is walked — so it takes the larger of their budgets.
+ * On the block rather than on each test: a case added beside them inherits it rather than omits it.
+ */
+const RECORDING_INDEX_TIMEOUT_MS = Math.max(RECORDING_SET_TIMEOUT_MS, SOURCE_SCAN_TIMEOUT_MS);
+
+describe('the recording index', { timeout: RECORDING_INDEX_TIMEOUT_MS }, () => {
   /**
    * Rebuilt from the recordings themselves rather than compared to a list, so a recording added,
    * re-recorded or deleted without rebuilding the index is a difference rather than a stale row
@@ -43,6 +51,15 @@ describe('the recording index', () => {
    */
   it('is what rebuilding it from the files on disk produces', () => {
     expect(loadRawIndex()).toEqual(buildRawIndex());
+  });
+
+  /**
+   * What the runner gives a case that states no budget of its own, which is what the block gives
+   * every case in it. Dropped from the `describe`, this block is back on the 5 s default that
+   * timed the rebuild above out on a tree nothing had changed.
+   */
+  it('budgets a case that states none for the work in this block', ({ task }) => {
+    expect(task.timeout).toBe(RECORDING_INDEX_TIMEOUT_MS);
   });
 
   /**
@@ -62,16 +79,12 @@ describe('the recording index', () => {
    * non-test file — under a `class` or an `export default` as much as a top-level `const` — is
    * one this notices has no recording, including a `RAW_SHAPES` that has stopped keeping up.
    */
-  it(
-    'covers every Overpass answer the repository asks for',
-    async () => {
-      const asked = await overpassShapesInSource();
+  it('covers every Overpass answer the repository asks for', async () => {
+    const asked = await overpassShapesInSource();
 
-      expect([...new Set(loadRawIndex().map((entry) => entry.shape))].sort()).toEqual(asked);
-      expect([...RAW_SHAPES].sort()).toEqual(asked);
-    },
-    SOURCE_SCAN_TIMEOUT_MS,
-  );
+    expect([...new Set(loadRawIndex().map((entry) => entry.shape))].sort()).toEqual(asked);
+    expect([...RAW_SHAPES].sort()).toEqual(asked);
+  });
 });
 
 describe('the region answer', () => {

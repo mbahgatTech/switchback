@@ -150,8 +150,9 @@ const READ_CONCURRENCY = 64;
 
 /**
  * What a test must allow one scan, because vitest's 5 s default does not: the walk measured 10.8 s
- * on a loaded machine and reddened runs that had changed nothing near it. Stated here rather than
- * in each test, so a third caller cannot inherit the default by forgetting.
+ * on a loaded machine and reddened runs that had changed nothing near it. Callers state it on the
+ * `describe` rather than on a test — naming it here did not stop a case being written without it,
+ * and that case timed out.
  */
 export const SOURCE_SCAN_TIMEOUT_MS = 30_000;
 

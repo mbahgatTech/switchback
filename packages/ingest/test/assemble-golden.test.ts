@@ -32,6 +32,7 @@ function tileCase(density: string, quadkey: string, count: number) {
   return {
     density,
     count,
+    recording,
     elements: recording.response.elements ?? [],
     trails: summariseRecording(recording),
     golden: loadAssembleGolden('tile', quadkey),
@@ -109,6 +110,9 @@ describe('the order elements arrive in', () => {
     return clone.map((element) => (element.type === 'way' ? held[next++]! : element));
   }
 
+  /** Built once: three cases below read it, and the dense tile is 4,990 elements. */
+  const clustered = clusteredBetweenEnds(dense.elements);
+
   /**
    * Why a trail count is no evidence of parity. `chainWays` seeds greedily in iteration order, so
    * listing the same ways backwards assembles the golden's 145 trails with one of them under a
@@ -170,8 +174,7 @@ describe('the order elements arrive in', () => {
    * more draw a different line under an identity the golden also carries.
    */
   it('holds top-level ways at every position, not at their ends', () => {
-    const candidate = clusteredBetweenEnds(dense.elements);
-    const served = candidate.filter((element) => element.type === 'way').map(({ id }) => id);
+    const served = clustered.filter((element) => element.type === 'way').map(({ id }) => id);
     const recorded = dense.elements.filter((element) => element.type === 'way').map(({ id }) => id);
     const byId = (ids: readonly number[]) => [...ids].sort((a, b) => a - b);
 
@@ -183,12 +186,12 @@ describe('the order elements arrive in', () => {
     expect(served[0]).toBe(Math.min(...served));
     expect(ascending(served)).toBe(false);
 
-    expect(() => assembleAsRecorded(candidate, dense.elements)).toThrow(
+    expect(() => assembleAsRecorded(clustered, dense.elements)).toThrow(
       /ordered by way id ascending/u,
     );
 
     const golden = new Map(dense.golden.trails.map((trail) => [identity(trail), trail]));
-    const accepted = summariseTrails(assembleTrails(candidate));
+    const accepted = summariseTrails(assembleTrails(clustered));
 
     expect({
       trails: accepted.length,
@@ -198,6 +201,48 @@ describe('the order elements arrive in', () => {
         return before !== undefined && before.coords.sha256 !== trail.coords.sha256;
       }).length,
     }).toEqual({ trails: dense.count, gained: 12, geometryMoved: 71 });
+  });
+
+  /**
+   * Which way arrived out of order, and which one it arrived after. Named the wrong way round the
+   * refusal states the relation the contract *wants* — the smaller id printed as following the
+   * larger — so it reads as an instruction to move the way that was already in place; named from
+   * constants it leaves a reader of a 4,932-way tile nothing to look up. Both ids are read off the
+   * candidate's own served sequence here, so the guard cannot agree with itself.
+   */
+  it('names the way that arrived out of order and the one it arrived after', () => {
+    const served = clustered.filter((element) => element.type === 'way').map(({ id }) => id);
+    const at = served.findIndex((id, index) => index > 0 && id < served[index - 1]!);
+
+    // The first descent, which is where a scan carrying its cursor forward stops, and a real one:
+    // named from an ascending pair the refusal could be printed either way round and still agree.
+    expect(at).toBeGreaterThan(0);
+    expect(served[at]!).toBeLessThan(served[at - 1]!);
+
+    expect(() => assembleAsRecorded(clustered, dense.elements)).toThrow(
+      `way ${served[at]} arrives after way ${served[at - 1]}`,
+    );
+  });
+
+  /**
+   * The same precondition on the path a golden is *written* from: `scripts/enrich-fixture.ts`
+   * derives one through `summariseRecording`. Re-recorded from a mirror that clusters ways by
+   * geometry, the tile would otherwise be written straight into `golden/` — at the trail count the
+   * recorder prints and an operator checks, with different trails under it.
+   */
+  it('refuses that order in a recording a golden would be derived from', () => {
+    const rerecorded = {
+      ...dense.recording,
+      response: { ...dense.recording.response, elements: clustered },
+    };
+
+    expect(() => summariseRecording(rerecorded)).toThrow(/ordered by way id ascending/u);
+
+    // Why refusing beats diffing: the one figure the re-record prints does not move.
+    const wouldWrite = summariseTrails(assembleTrails(clustered));
+
+    expect(wouldWrite).toHaveLength(dense.golden.trails.length);
+    expect(wouldWrite.map(identity)).not.toEqual(dense.golden.trails.map(identity));
   });
 
   /**

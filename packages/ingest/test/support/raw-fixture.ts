@@ -90,6 +90,13 @@ export function recordedFiles(): string[] {
 }
 
 /**
+ * What a test reading every recording must be allowed. `buildRawIndex` gunzips 3.8 MB into tens
+ * of megabytes of JSON — 0.7–3.7 s here, and past vitest's 5 s default on a loaded machine, where
+ * it timed out on a tree that had changed nothing.
+ */
+export const RECORDING_SET_TIMEOUT_MS = 30_000;
+
+/**
  * The index as rebuilt from the recordings on disk. `index.json` is committed as exactly this,
  * so a recording added, re-recorded or deleted without rebuilding leaves a difference rather
  * than a stale row that agrees with itself.
@@ -244,9 +251,9 @@ export function assembleAsRecorded(
 }
 
 /**
- * What assembly makes of a recording — the derivation a golden is written from. A recording is
- * the authority on member order, so there is nothing to hold it to; diff a candidate source
- * through `assembleAsRecorded`, which takes that authority as an argument.
+ * What assembly makes of a recording — the derivation `scripts/enrich-fixture.ts` writes a golden
+ * from. A recording is its own authority on member order, so only the top-level rule is held here;
+ * diff a candidate source through `assembleAsRecorded`, which takes that authority as an argument.
  */
 export function summariseRecording(recording: RawRecording): AssembledTrailSummary[] {
   const elements = recording.response.elements ?? [];

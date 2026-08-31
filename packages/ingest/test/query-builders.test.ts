@@ -110,26 +110,22 @@ describe('Overpass QL quoted rather than sent', () => {
   });
 });
 
-describe('the repository as it stands', () => {
+describe('the repository as it stands', { timeout: SOURCE_SCAN_TIMEOUT_MS }, () => {
   /**
    * The shapes the walk finds, listed once so an unrecorded builder is visible here as well as
    * through the recording index. Every one has a recording under `fixtures/raw/`.
    */
-  it(
-    'asks for nine answer shapes',
-    async () => {
-      await expect(overpassShapesInSource()).resolves.toEqual([
-        'feature',
-        'network',
-        'parent-route',
-        'region',
-        'relation-skeleton',
-        'route',
-        'tags-by-id',
-        'tile',
-        'way-geometry',
-      ]);
-    },
-    SOURCE_SCAN_TIMEOUT_MS,
-  );
+  it('asks for nine answer shapes', async () => {
+    await expect(overpassShapesInSource()).resolves.toEqual([
+      'feature',
+      'network',
+      'parent-route',
+      'region',
+      'relation-skeleton',
+      'route',
+      'tags-by-id',
+      'tile',
+      'way-geometry',
+    ]);
+  });
 });
