@@ -106,6 +106,19 @@ function stale(quadkey: string): TileRow {
   };
 }
 
+/**
+ * Fetched a second ago, over data the source cut before the TTL began. The tile an
+ * extract-backed ingest writes, and the only state in which the two clocks disagree.
+ */
+function staleSource(quadkey: string): TileRow {
+  return {
+    quadkey,
+    status: TileStatus.ready,
+    fetchedAt: new Date(NOW.getTime() - 1_000),
+    sourceSnapshotAt: new Date(NOW.getTime() - TILE_TTL_MS - 1_000),
+  };
+}
+
 describe('ensureCoverage partitioning', () => {
   it('treats an unknown tile as pending, with nothing to serve', async () => {
     const { db } = fakeDb();
@@ -143,6 +156,24 @@ describe('ensureCoverage partitioning', () => {
     expect(result.ready).toEqual([quadkey]);
     expect(result.refreshing).toEqual([quadkey]);
     expect(result.pending).toEqual([]);
+    expect(result.queued).toEqual([quadkey]);
+  });
+
+  it('refreshes a tile whose fetch is recent but whose source data is past the TTL', async () => {
+    /*
+     * The state every other fixture in this file leaves at null, and so the only one in which
+     * the partition can tell the two clocks apart. On `fetchedAt` alone this tile is a second
+     * old: served, never re-queued, ageing without bound behind an extract that keeps
+     * answering. It has to come back out of the partition as work.
+     */
+    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
+      .quadkeys[0]!;
+    const { db } = fakeDb([staleSource(quadkey)]);
+
+    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
+
+    expect(result.ready).toEqual([quadkey]);
+    expect(result.refreshing).toEqual([quadkey]);
     expect(result.queued).toEqual([quadkey]);
   });
 

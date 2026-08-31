@@ -1,9 +1,10 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { TileStatus, prisma } from '@switchback/db';
+import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
-import { surveyArea } from '../src/coverage';
+import { ensureCoverage, surveyArea } from '../src/coverage';
 import { TILE_TTL_MS } from '../src/freshness';
+import { tileJobKey } from '../src/jobs';
 import { promoteFrom } from '../src/subdivide';
 
 /**
@@ -41,10 +42,20 @@ const ROLLED_UP_CURRENT = `${NS}000011`;
 const ROLLED_UP_UNSTAMPED = `${NS}000012`;
 const ROLLED_UP = [ROLLED_UP_STALE, ROLLED_UP_CURRENT, ROLLED_UP_UNSTAMPED];
 
+/**
+ * The same three stamps again, for the viewport reader rather than the area survey. Their own
+ * quadkeys because this reader queues, and a survey must not inherit a job it did not ask for.
+ */
+const VIEWED_STALE_SOURCE = `${NS}000020`;
+const VIEWED_CURRENT = `${NS}000021`;
+const VIEWED_UNSTAMPED = `${NS}000022`;
+const VIEWED = [VIEWED_STALE_SOURCE, VIEWED_CURRENT, VIEWED_UNSTAMPED];
+
 const FIXTURES = [
   CURRENT,
   STALE_SOURCE,
   UNSTAMPED,
+  ...VIEWED,
   ...ROLLED_UP.flatMap((parent) => [parent, ...childQuadkeys(parent)]),
 ];
 
@@ -128,7 +139,34 @@ function promotedRow(quadkey: string) {
   });
 }
 
-const cleanup = () => prisma.ingestTile.deleteMany({ where: { quadkey: { in: FIXTURES } } });
+/**
+ * A fetch already on this tile's queue.
+ *
+ * Load-bearing, not scenery: `ensureCoverage` runs admission over *new ground* only, so a tile
+ * already in flight never reaches `admitIngest` — which counts queued jobs database-wide and
+ * would otherwise let another agent's queue decide this test. The re-enqueue then lands on this
+ * row as a priority bump, so the run leaves behind nothing `cleanup` does not take.
+ */
+async function seedQueuedJob(quadkey: string): Promise<void> {
+  await prisma.ingestJob.create({
+    data: {
+      kind: JobKind.ingest_tile,
+      dedupeKey: tileJobKey(quadkey),
+      payload: { quadkey },
+      status: JobStatus.queued,
+    },
+  });
+}
+
+/** What a viewport poll makes of the single tile `quadkey` covers. */
+function viewportOver(quadkey: string) {
+  return ensureCoverage(centreOf(quadkey), { db: prisma, now: NOW, principal: null, maxTiles: 4 });
+}
+
+const cleanup = async (): Promise<void> => {
+  await prisma.ingestJob.deleteMany({ where: { dedupeKey: { in: FIXTURES.map(tileJobKey) } } });
+  await prisma.ingestTile.deleteMany({ where: { quadkey: { in: FIXTURES } } });
+};
 
 describe.runIf(IS_LOCAL).sequential('freshness against a real database', () => {
   beforeEach(async () => {
@@ -219,5 +257,53 @@ describe.runIf(IS_LOCAL).sequential('the freshness a roll-up hands its parent', 
       maxTiles: 4,
     });
     expect(survey.fresh).toContain(ROLLED_UP_UNSTAMPED);
+  });
+});
+
+/**
+ * The same reading, taken through the viewport path.
+ *
+ * `surveyArea` above proves the column survives one caller's round trip. `ensureCoverage` is the
+ * other, it names its own columns in its own `select`, and it is the reader every open map polls
+ * every few seconds. A select that stopped loading the stamp there — or a row rebuilt without it
+ * on the way to the predicate — would put the whole viewport tier back on fetch time alone while
+ * every test above stayed green.
+ */
+describe.runIf(IS_LOCAL).sequential('the freshness a viewport is judged on', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it('re-queues a tile whose fetch is recent but whose source data is past the TTL', async () => {
+    await seedTile(VIEWED_STALE_SOURCE, PAST_TTL);
+    await seedQueuedJob(VIEWED_STALE_SOURCE);
+
+    const view = await viewportOver(VIEWED_STALE_SOURCE);
+
+    // One tile, so `refreshing` and `queued` are about this row and no other.
+    expect(view.quadkeys).toEqual([VIEWED_STALE_SOURCE]);
+    // Both served and refreshed: the trails it holds keep being drawn under the fetch it earned.
+    expect(view.ready).toEqual([VIEWED_STALE_SOURCE]);
+    expect(view.refreshing).toEqual([VIEWED_STALE_SOURCE]);
+    expect(view.queued).toEqual([VIEWED_STALE_SOURCE]);
+  });
+
+  it('serves a tile whose source data is inside the TTL and queues nothing', async () => {
+    await seedTile(VIEWED_CURRENT, INSIDE_TTL);
+
+    const view = await viewportOver(VIEWED_CURRENT);
+
+    expect(view.ready).toEqual([VIEWED_CURRENT]);
+    expect(view.refreshing).toEqual([]);
+    expect(view.queued).toEqual([]);
+  });
+
+  it('serves a row that predates the column on its fetch time alone', async () => {
+    await seedTile(VIEWED_UNSTAMPED, null);
+
+    const view = await viewportOver(VIEWED_UNSTAMPED);
+
+    expect(view.ready).toEqual([VIEWED_UNSTAMPED]);
+    expect(view.refreshing).toEqual([]);
+    expect(view.queued).toEqual([]);
   });
 });
