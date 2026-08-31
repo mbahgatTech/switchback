@@ -367,6 +367,8 @@ export async function promoteFrom(db: PrismaClient, quadkey: string): Promise<st
 
     await db.ingestTile.update({
       where: { quadkey: key },
+      // Spread rather than a column list: every field `Rollup` carries belongs on the parent's
+      // row, and naming them here drops the next one added without failing to compile.
       data: { ...settled, lastError: null },
     });
     promoted.push(key);
