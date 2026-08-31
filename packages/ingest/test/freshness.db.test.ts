@@ -5,6 +5,8 @@ import type { BBox } from '@switchback/core';
 import { ensureCoverage, surveyArea } from '../src/coverage';
 import { TILE_TTL_MS } from '../src/freshness';
 import { tileJobKey } from '../src/jobs';
+import { processTile } from '../src/pipeline';
+import type { PipelineDeps } from '../src/pipeline';
 import { promoteFrom } from '../src/subdivide';
 
 /**
@@ -51,12 +53,21 @@ const VIEWED_CURRENT = `${NS}000021`;
 const VIEWED_UNSTAMPED = `${NS}000022`;
 const VIEWED = [VIEWED_STALE_SOURCE, VIEWED_CURRENT, VIEWED_UNSTAMPED];
 
+/**
+ * Two parents already split into four children, for the reader that judges the split tier. Their
+ * own quadkeys because this reader queues the children it finds stale, and a block above must not
+ * inherit a job it did not ask for.
+ */
+const SPLIT_STALE_SOURCE = `${NS}000030`;
+const SPLIT_CURRENT = `${NS}000031`;
+const SPLIT = [SPLIT_STALE_SOURCE, SPLIT_CURRENT];
+
 const FIXTURES = [
   CURRENT,
   STALE_SOURCE,
   UNSTAMPED,
   ...VIEWED,
-  ...ROLLED_UP.flatMap((parent) => [parent, ...childQuadkeys(parent)]),
+  ...[...ROLLED_UP, ...SPLIT].flatMap((parent) => [parent, ...childQuadkeys(parent)]),
 ];
 
 const NOW = new Date('2026-06-01T12:00:00Z');
@@ -105,6 +116,23 @@ async function seedUnpromoted(quadkey: string): Promise<void> {
 }
 
 /**
+ * A parent as a split leaves it: an unpromoted row over a full set of real children, each
+ * stamped by `stampAt`. Every child's fetch is `NOW`, so whatever these fixtures are judged on,
+ * it is not the fetch clock.
+ */
+async function seedSplit(
+  parent: string,
+  stampAt: (index: number, count: number) => Date | null,
+): Promise<string[]> {
+  await seedUnpromoted(parent);
+  const children = childQuadkeys(parent);
+  for (const [index, child] of children.entries()) {
+    await seedTile(child, stampAt(index, children.length));
+  }
+  return children;
+}
+
+/**
  * Compose `parent` from a full set of real children, each stamped by `stampAt`, through the
  * roll-up the pipeline promotes with. Every child's fetch is `NOW`, so the parent's own fetch
  * clock reports fresh whichever children it was built from — leaving the source stamp the only
@@ -114,11 +142,7 @@ async function promoteParent(
   parent: string,
   stampAt: (index: number, count: number) => Date | null,
 ): Promise<void> {
-  await seedUnpromoted(parent);
-  const children = childQuadkeys(parent);
-  for (const [index, child] of children.entries()) {
-    await seedTile(child, stampAt(index, children.length));
-  }
+  await seedSplit(parent, stampAt);
   await promoteFrom(prisma, parent);
 }
 
@@ -161,6 +185,33 @@ async function seedQueuedJob(quadkey: string): Promise<void> {
 /** What a viewport poll makes of the single tile `quadkey` covers. */
 function viewportOver(quadkey: string) {
   return ensureCoverage(centreOf(quadkey), { db: prisma, now: NOW, principal: null, maxTiles: 4 });
+}
+
+/**
+ * A drain of a split parent through the production path.
+ *
+ * `processTile` hands a tile that already has four children to the roll-up before it reaches a
+ * source, so the querier here refuses rather than answers: a drain that got as far as querying
+ * has taken a path this block is not about, and should fail loudly instead of quietly passing.
+ */
+function drainSplitParent(parent: string) {
+  const deps: PipelineDeps = {
+    db: prisma,
+    now: () => NOW,
+    overpass: { query: () => Promise.reject(new Error('a split parent must not query a source')) },
+  };
+  return processTile(parent, deps);
+}
+
+/** The children of `parent` sitting on the queue, in quadkey order. */
+async function queuedChildren(parent: string): Promise<string[]> {
+  const children = childQuadkeys(parent);
+  const jobs = await prisma.ingestJob.findMany({
+    where: { dedupeKey: { in: children.map(tileJobKey) }, status: JobStatus.queued },
+    select: { dedupeKey: true },
+  });
+  const queued = new Set(jobs.map((job) => job.dedupeKey));
+  return children.filter((child) => queued.has(tileJobKey(child)));
 }
 
 const cleanup = async (): Promise<void> => {
@@ -305,5 +356,42 @@ describe.runIf(IS_LOCAL).sequential('the freshness a viewport is judged on', () 
     expect(view.ready).toEqual([VIEWED_UNSTAMPED]);
     expect(view.refreshing).toEqual([]);
     expect(view.queued).toEqual([]);
+  });
+});
+
+/**
+ * The same reading again, for the tier the two readers above cannot reach.
+ *
+ * `ensureCoverage` and `surveyArea` both cover `INGEST_ZOOM` alone, so once a parent has split,
+ * `queueStaleChildren` is the only path from "this ground is stale" to a re-fetch of it. A reader
+ * blind to the stamp judges every child fresh on its recent `fetchedAt` and queues nothing, the
+ * roll-up re-promotes the parent from the same stale children, and the viewport tier queues the
+ * parent again on the next poll — a drain per poll that never re-fetches the ground underneath,
+ * with an extract's year-old data serving under a tile that reports itself refreshing.
+ *
+ * Driven through `processTile` rather than the filter directly: the select that loads the column,
+ * the reading taken from it and the enqueue that acts on the reading are three separate places it
+ * can be lost, and only the last is observable to a caller.
+ */
+describe.runIf(IS_LOCAL).sequential('the freshness a split parent’s children are judged on', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it('re-queues the child whose fetch is recent but whose source data is past the TTL', async () => {
+    const children = await seedSplit(SPLIT_STALE_SOURCE, oldestInTheMiddle(PAST_TTL));
+
+    const result = await drainSplitParent(SPLIT_STALE_SOURCE);
+
+    // The roll-up path, not a fetch: a drain that queried a source could not have got this far.
+    expect(result.children).toEqual(children);
+    expect(await queuedChildren(SPLIT_STALE_SOURCE)).toEqual([children[2]]);
+  });
+
+  it('queues nothing when every child’s source data is inside the TTL', async () => {
+    await seedSplit(SPLIT_CURRENT, oldestInTheMiddle(INSIDE_TTL));
+
+    await drainSplitParent(SPLIT_CURRENT);
+
+    expect(await queuedChildren(SPLIT_CURRENT)).toEqual([]);
   });
 });

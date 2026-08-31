@@ -435,6 +435,49 @@ describe('queueStaleChildren', () => {
     expect(outcome.abandoned).toEqual([]);
     expect(recorded.jobUpserts).toEqual([]);
   });
+
+  /*
+   * The split tier's own reading of the source stamp.
+   *
+   * `ensureCoverage` covers `INGEST_ZOOM` alone, so once a parent has split this filter is the
+   * only thing that turns "this ground is stale" into a re-fetch of it. Every other test in this
+   * describe leaves `sourceSnapshotAt` null, which is the one state where reading the stamp and
+   * ignoring it give the same answer — so the three below are what hold this reader to the source
+   * clock rather than to the fetch clock.
+   */
+  it('queues a child whose fetch is recent but whose source data is past the TTL', async () => {
+    // Every child ready, every fetch `NOW`. The stamp is the only column left that can decide it.
+    const rows = siblings([{}, {}, { sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
+    const { db, recorded } = fakeDb(rows);
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.queued).toEqual([keys[2]]);
+    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[2])]);
+  });
+
+  it('leaves a child alone whose source data is still inside the TTL', async () => {
+    // The boundary from the other side, so the reading cannot become "any stamp at all is stale".
+    const rows = siblings([{}, {}, { sourceSnapshotAt: ago(TILE_TTL_MS - 1) }, {}]);
+    const { db, recorded } = fakeDb(rows);
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.queued).toEqual([]);
+    expect(recorded.jobUpserts).toEqual([]);
+  });
+
+  it('leaves a child that predates the column on its fetch time alone', async () => {
+    // The fallback, named rather than left to the default in `child()`: adding the column must
+    // not re-queue every child written before it existed.
+    const rows = siblings([{}, {}, { sourceSnapshotAt: null }, {}]);
+    const { db, recorded } = fakeDb(rows);
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.queued).toEqual([]);
+    expect(recorded.jobUpserts).toEqual([]);
+  });
 });
 
 describe('promoteFrom', () => {
