@@ -53,6 +53,20 @@ export const DERIVED_JOB_KINDS = [JobKind.enrich_trail, JobKind.ingest_route] as
 export const INGEST_JOB_KINDS = [...REQUEST_JOB_KINDS, ...DERIVED_JOB_KINDS] as const;
 
 /**
+ * Kinds whose handler issues no Overpass request. Membership is a claim about behaviour, so each
+ * entry is cleared by running its handler against a client that throws — see `drain-slot.db.test.ts`.
+ */
+export const OVERPASS_FREE_JOB_KINDS: readonly JobKind[] = [];
+
+/**
+ * What `drainSlotGate` counts: every kind except those cleared above. A subtraction rather than a
+ * list, because omission then costs a slower queue instead of the IP block an unbounded kind buys.
+ */
+export const OVERPASS_JOB_KINDS: readonly JobKind[] = Object.values(JobKind).filter(
+  (kind) => !OVERPASS_FREE_JOB_KINDS.includes(kind),
+);
+
+/**
  * Say so, once, when the derived backlog is this deep. **This must not become a refusal.**
  * Derived jobs sit at the lowest priority and only the daily cron claims them unscoped, so a
  * backlog past the mark clears in years — the version that gated on it latched ingest off

@@ -13,6 +13,7 @@
 
 import { prisma } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
+import { OVERPASS_JOB_KINDS } from './backpressure';
 import { reclaimExpiredJobs } from './jobs';
 import type { ClaimGate, ClaimedBatch } from './jobs';
 
@@ -84,7 +85,9 @@ export function drainSlotGate(db: PrismaClient = prisma, limit = maxDrainers()):
       await tx.$executeRaw`select pg_advisory_xact_lock(${DRAIN_ADMISSION_KEY})`;
 
       const [counted] = await tx.$queryRaw<Array<{ drainers: number }>>`
-        select count(distinct "lockedBy")::int as drainers from ingest_jobs where status = 'running'
+        select count(distinct "lockedBy")::int as drainers from ingest_jobs
+         where status = 'running'
+           and kind = ANY(${OVERPASS_JOB_KINDS.map(String)}::"JobKind"[])
       `;
       if ((counted?.drainers ?? 0) >= limit) return EMPTY_BATCH;
 
