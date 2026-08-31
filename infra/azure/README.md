@@ -902,13 +902,15 @@ first and `what-if` reports `switchback-prod-no-delete` as a `Create` in perpetu
 ```bash
 az lock create --name switchback-prod-no-delete --lock-type CanNotDelete \
   --resource-group rg-switchback-prod-northcentralus \
-  --notes "Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and 19,157 trails, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it."
+  --notes "Production database for Switchback. This group holds the Postgres server and its only backups, plus the Log Analytics workspace carrying the connection audit log and the alerts that would notice a problem. Deleting the server destroys every user account, every recorded GPS track and the whole trail corpus, and the backups go with it. Declared in infra/azure/main.bicep. Removing this lock is a deliberate act: say why, in the pull request that does it."
 ```
 
 Copy the `--notes` text from `lockNotes` in `main.bicep` rather than writing your own: `what-if`
 compares declared properties, not just existence, so notes that differ read as a permanent `Modify`
-— the same never-converging diff as a wrong name, in a quieter costume. The live notes match
-`lockNotes` character for character, and `what-if` reports the lock as `NoChange`.
+— the same never-converging diff as a wrong name, in a quieter costume. The live notes do not match
+`lockNotes` today: they still name a trail count, measured 2026-08-31 with
+`az lock list -g rg-switchback-prod-northcentralus -o json`. Deploying `main.bicep`, or running the
+command above with the text as it now stands, is what converges them.
 
 ---
 
