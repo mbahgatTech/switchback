@@ -32,6 +32,7 @@ function child(quadkey: string, overrides: Partial<ChildTile> = {}): ChildTile {
     quadkey,
     status: TileStatus.ready,
     fetchedAt: NOW,
+    sourceSnapshotAt: null,
     trailCount: 10,
     fetchMs: 1000,
     attempts: 0,
@@ -155,6 +156,7 @@ describe('rollUp', () => {
     expect(rollUp(siblings())).toEqual({
       status: TileStatus.ready,
       fetchedAt: NOW,
+      sourceSnapshotAt: null,
       trailCount: 40,
       fetchMs: 4000,
     });

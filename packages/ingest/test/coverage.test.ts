@@ -26,6 +26,8 @@ interface TileRow {
   fetchedAt: Date | null;
   /** Trails the tile has committed. Absent means none, as a fresh row would report. */
   trailCount?: number;
+  /** When the source's data was current. Absent means null, as a row predating it holds. */
+  sourceSnapshotAt?: Date | null;
 }
 
 interface Recorded {
@@ -63,7 +65,7 @@ function fakeDb(
         Promise.resolve(
           existing
             .filter((tile) => where.quadkey.in.includes(tile.quadkey))
-            .map((tile) => ({ trailCount: 0, ...tile })),
+            .map((tile) => ({ trailCount: 0, sourceSnapshotAt: null, ...tile })),
         ),
       upsert: (args: { where: { quadkey: string }; create: Record<string, unknown> }) => {
         recorded.tileUpserts.push(args);

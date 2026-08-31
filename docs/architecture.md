@@ -872,6 +872,17 @@ stamps from the ingest clock and which the trail page renders as "Reconciled wit
 &lt;date&gt;". The two are days apart on any real answer, and the sentence on the page is about the
 first while the column behind it holds the second.
 
+**`isTileFresh` takes the older of `sourceSnapshotAt` and `fetchedAt`, and that is what makes the
+TTL a statement about the data.** `fetchedAt` records when we asked, which says nothing about the
+age of what came back. A source serving an extract rather than live OSM answers with data of
+whatever age the extract was cut at, and the fetch clock stamps it `now` regardless — so on the
+predicate's old reading, re-fetching the same year-old extract every thirty days reported the tile
+fresh forever, and the data behind it aged without bound. Taking the minimum means a recent fetch
+cannot launder old data, and a source clock running ahead of ours cannot extend the TTL either. A
+null snapshot leaves `fetchedAt` deciding: every row written before the column existed is null, and
+treating that as stale would expire the whole estate into one Overpass thundering herd. Those rows
+keep the weaker guarantee until their next fetch stamps them.
+
 `switchback-ingest-empty-tile-writes` in `infra/azure/ingest.bicep` reads the published line and is
 declared **disarmed**. Its threshold is a placeholder rather than a measurement: with one source
 there is nothing to compare a share against, so arming it would page on the geography of whatever
@@ -1013,8 +1024,11 @@ would strand a parent with no children and no route to ready.
 the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
 `fetchedAt` is the _oldest_ child's, so the parent leaves the TTL when its stalest quarter does —
 taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
-sweep for another month. `trailCount` sums. A parent whose children are all `empty` is `empty`; one
-child with trails in it makes the parent `ready`, because that is a place worth re-querying.
+sweep for another month. `sourceSnapshotAt` follows the same rule and is taken separately, because
+the child with the oldest fetch need not be the one holding the oldest data; nulls are skipped, so a
+child predating the column cannot drag its siblings' real stamps out of the answer. `trailCount`
+sums. A parent whose children are all `empty` is `empty`; one child with trails in it makes the
+parent `ready`, because that is a place worth re-querying.
 
 **Nothing in `coverage.ts` changed, and that is the design.** `ensureCoverage` still covers a
 viewport with z9 quadkeys and still reads the z9 row, so `readyTiles`, `pendingTiles` and the TTL

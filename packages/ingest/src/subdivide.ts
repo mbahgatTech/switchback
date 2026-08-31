@@ -107,6 +107,8 @@ export interface ChildTile {
   quadkey: string;
   status: TileStatus;
   fetchedAt: Date | null;
+  /** When the source's own data was current. See `TileFreshness`. */
+  sourceSnapshotAt: Date | null;
   trailCount: number;
   fetchMs: number | null;
   /** Runs of this tile, ever. The revival cap counts in these — see `SPLIT_CHILD_ATTEMPT_CAP`. */
@@ -117,6 +119,7 @@ export interface ChildTile {
 export interface Rollup {
   status: TileStatus;
   fetchedAt: Date;
+  sourceSnapshotAt: Date | null;
   trailCount: number;
   fetchMs: number;
 }
@@ -129,6 +132,11 @@ export interface Rollup {
  * corrects that until the TTL. And **the oldest child sets `fetchedAt`**, so the parent leaves
  * the TTL when its stalest quarter does — taking the freshest would let one child refreshed
  * yesterday hold three stale ones out of the refresh sweep indefinitely.
+ *
+ * `sourceSnapshotAt` follows the same stalest-quarter rule, and separately: the child with the
+ * oldest fetch need not be the one holding the oldest data. Dropping it here would leave every
+ * promoted parent with a null source stamp and hand it back the fetch-only freshness this
+ * column exists to end.
  */
 export function rollUp(children: readonly ChildTile[]): Rollup | null {
   if (children.length !== CHILDREN_PER_TILE) return null;
@@ -139,6 +147,14 @@ export function rollUp(children: readonly ChildTile[]): Rollup | null {
   const oldest = children.reduce((a, b) => (a.fetchedAt! < b.fetchedAt! ? a : b));
   const trailCount = children.reduce((sum, child) => sum + child.trailCount, 0);
 
+  /*
+   * Nulls are skipped rather than treated as "unknown, therefore stale": a child written before
+   * the column existed would otherwise drag its three siblings' real stamps out of the answer.
+   * The parent's `fetchedAt` still bounds the result, so skipping can only ever be as weak as
+   * the old behaviour, never weaker.
+   */
+  const stamps = children.map((child) => child.sourceSnapshotAt).filter((at) => at !== null);
+
   return {
     // `empty` only when every child was: it is what lets the refresh sweep skip ocean, and one
     // child with trails in it makes the parent a place worth re-querying.
@@ -146,6 +162,7 @@ export function rollUp(children: readonly ChildTile[]): Rollup | null {
       ? TileStatus.empty
       : TileStatus.ready,
     fetchedAt: oldest.fetchedAt!,
+    sourceSnapshotAt: stamps.length === 0 ? null : stamps.reduce((a, b) => (a < b ? a : b)),
     trailCount,
     fetchMs: children.reduce((sum, child) => sum + (child.fetchMs ?? 0), 0),
   };
@@ -155,6 +172,7 @@ const childSelect = {
   quadkey: true,
   status: true,
   fetchedAt: true,
+  sourceSnapshotAt: true,
   trailCount: true,
   fetchMs: true,
   attempts: true,

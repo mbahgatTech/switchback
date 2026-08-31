@@ -114,7 +114,13 @@ export async function ensureCoverage(
   const [existing, jobs] = await Promise.all([
     db.ingestTile.findMany({
       where: { quadkey: { in: cover.quadkeys } },
-      select: { quadkey: true, status: true, fetchedAt: true, trailCount: true },
+      select: {
+        quadkey: true,
+        status: true,
+        fetchedAt: true,
+        sourceSnapshotAt: true,
+        trailCount: true,
+      },
     }),
     db.ingestJob.findMany({
       where: {
@@ -361,7 +367,13 @@ export async function surveyArea(bbox: BBox, options: SurveyOptions = {}): Promi
   const [tiles, jobs] = await Promise.all([
     db.ingestTile.findMany({
       where: { quadkey: { in: cover.quadkeys } },
-      select: { quadkey: true, status: true, fetchedAt: true, trailCount: true },
+      select: {
+        quadkey: true,
+        status: true,
+        fetchedAt: true,
+        sourceSnapshotAt: true,
+        trailCount: true,
+      },
     }),
     db.ingestJob.findMany({
       where: {
