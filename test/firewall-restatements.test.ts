@@ -14,6 +14,13 @@ import { describe, expect, it } from 'vitest';
  * *new* range in each. Narrowing the parameter and updating those two left five statements of the
  * old perimeter standing across four files — `postgres.bicep` and `env.ts` among them — with the
  * suite green, because a range nobody listed was a range nobody counted.
+ *
+ * **A prose claim is read as a shape, not as a sentence.** The revision after that listed five
+ * whole phrasings, and two `@description` blocks in `main.bicep` — the rationale for the random
+ * server suffix and for the least-privilege role — matched none of them, so a complete narrowing
+ * left both asserting the whole internet with the suite green. A claim is now any totality word
+ * governing one of the two scope nouns that also choose the files, and every failure names a line
+ * rather than a file, because being pointed at `main.bicep` for one of three claims fixes one.
  */
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -22,18 +29,22 @@ const SELF = relative(REPO_ROOT, fileURLToPath(import.meta.url)).replaceAll('\\'
 /** IPv4 is 2^32 addresses. A rule admitting that many admits everything. */
 const ADDRESS_SPACE = 2 ** 32;
 
+/**
+ * The two words the repository uses to name the address space. They choose the files below, and
+ * they anchor every claim about how much of it the rule admits.
+ */
+const SCOPE = ['IPv4', 'internet'] as const;
+
 interface TrackedFile {
   path: string;
   text: string;
 }
 
 /**
- * Every tracked text file containing an address, `IPv4` or `internet`, as `git grep` decides it.
+ * Every tracked text file containing an address or one of the scope nouns, as `git grep` decides.
  *
  * The tokens are loose on purpose: they are a superset of what the patterns below need, so a claim
- * wrapped across lines still leaves one of them on some line and the file is still read. A phrasing
- * built from neither token would escape this, which is what the vocabulary check guards — it fails
- * when a phrasing stops matching anywhere.
+ * wrapped across lines still leaves one of them on some line and the file is still read.
  */
 function candidateFiles(): TrackedFile[] {
   const listed = execFileSync(
@@ -47,10 +58,7 @@ function candidateFiles(): TrackedFile[] {
       '-z',
       '-e',
       String.raw`[0-9]{1,3}(\.[0-9]{1,3}){3}`,
-      '-e',
-      'IPv4',
-      '-e',
-      'internet',
+      ...SCOPE.flatMap((noun) => ['-e', noun]),
       '--',
       '.',
     ],
@@ -73,6 +81,41 @@ function normalize(document: string): string {
     .replace(/\s+/gu, ' ');
 }
 
+interface Sighting {
+  path: string;
+  line: number;
+  text: string;
+  captured: string[];
+}
+
+/**
+ * Every match of `pattern` in a file, at the line it starts on. Each line is read together with
+ * the one after it so a claim broken across a line break is still one string, and a match is
+ * attributed to the later line only when it begins there — otherwise the wrap reports twice.
+ */
+function sightings(file: TrackedFile, pattern: RegExp): Sighting[] {
+  const lines = file.text.split('\n');
+  const found: Sighting[] = [];
+
+  lines.forEach((line, at) => {
+    const own = normalize(line);
+    const window = `${own} ${normalize(lines[at + 1] ?? '')}`;
+    for (const match of window.matchAll(pattern)) {
+      if ((match.index ?? 0) > own.length) continue;
+      found.push({
+        path: file.path,
+        line: at + 1,
+        text: match[0].trim(),
+        captured: match.slice(1).map((group) => group ?? ''),
+      });
+    }
+  });
+
+  return found;
+}
+
+const describeSighting = ({ path, line, text }: Sighting): string => `${path}:${line} ${text}`;
+
 interface FirewallRule {
   name: string;
   start: string;
@@ -80,7 +123,7 @@ interface FirewallRule {
 }
 
 const TRACKED = candidateFiles();
-const BICEP = TRACKED.filter(({ path }) => /\.bicepparam?$/u.test(path));
+const BICEP = TRACKED.filter(({ path }) => /\.bicep(?:param)?$/u.test(path));
 
 /**
  * Every firewall rule the tracked bicep sources declare, wherever they declare it — a literal
@@ -114,8 +157,13 @@ const toAddress = (value: number): string =>
 const spansEverything =
   RULES.length === 1 && toInt(only.end) - toInt(only.start) + 1 === ADDRESS_SPACE;
 
-/** A range as any file may punctuate it, once backticks and line breaks are normalized away. */
-const STATED_RANGE = /(\d{1,3}(?:\.\d{1,3}){3})\s*[-–—]\s*(\d{1,3}(?:\.\d{1,3}){3})/gu;
+const ADDRESS = String.raw`\d{1,3}(?:\.\d{1,3}){3}`;
+
+/** A range as any file may punctuate it: a dash of any width, or the word an operator writes. */
+const STATED_RANGE = new RegExp(
+  String.raw`(${ADDRESS})(?:\s*[-–—]\s*|\s+(?:to|through|until)\s+)(${ADDRESS})`,
+  'giu',
+);
 
 const isDeclared = (range: FirewallRule): boolean =>
   range.start === only.start && range.end === only.end;
@@ -125,40 +173,44 @@ const isDeclared = (range: FirewallRule): boolean =>
  * perimeter — `0.0.0.0`–`0.0.0.0` is Azure's "Azure services only" sentinel, which the templates
  * name in order to say the deployed rule is deliberately not it.
  */
-function statedRanges(text: string): FirewallRule[] {
-  const ranges: FirewallRule[] = [];
-  for (const [, start = '', end = ''] of normalize(text).matchAll(STATED_RANGE)) {
-    if (start !== end) ranges.push({ name: '', start, end });
-  }
-  return ranges;
+function statedRanges(file: TrackedFile): (Sighting & { range: FirewallRule })[] {
+  return sightings(file, STATED_RANGE)
+    .map((sighting) => {
+      const [start = '', end = ''] = sighting.captured;
+      return { ...sighting, range: { name: '', start, end } };
+    })
+    .filter(({ range }) => range.start !== range.end);
 }
 
 const contradicting = (file: TrackedFile): string[] =>
-  statedRanges(file.text)
-    .filter((range) => !isDeclared(range))
-    .map((range) => `${file.path}: ${range.start}–${range.end}`);
+  statedRanges(file)
+    .filter(({ range }) => !isDeclared(range))
+    .map(describeSighting);
 
 /**
- * Phrasings that assert the rule admits the whole address space. Prose has no compiler, so this
- * vocabulary is written out — but it is held to the tree below rather than trusted: a phrasing that
- * matches nothing has been reworded out of the repository and no longer guards anything.
+ * A claim that the rule admits the whole address space: a totality word governing a scope noun.
+ *
+ * Prose has no compiler, so the totality words are written out — but they are a field rather than
+ * a list of sentences, which is what the previous revision got wrong. `open to the internet` and
+ * `spanning the whole internet` are two different sentences and one shape, and enumerating
+ * sentences missed both. The scope nouns are the ones that chose the files, so a claim can only
+ * live in a file this scan is already reading.
  */
-const WHOLE_SPACE: readonly RegExp[] = [
-  /all of IPv4/iu,
-  /the whole of IPv4/iu,
-  /the whole IPv4 (?:internet|range)/iu,
-  /spans the entire internet/iu,
-  /rule spanning the internet/iu,
-];
+const WHOLE_SPACE = new RegExp(
+  String.raw`(?:all of|the whole(?: of)?|the entire|any(?:one|thing)?(?: on| from)|open to|reachable from|spann?(?:ing|s)(?: the)?)\s+(?:the\s+)?(?:public\s+)?(?:${SCOPE.join('|')}|address space)` +
+    String.raw`|(?:${SCOPE.join('|')})-reachable`,
+  'giu',
+);
 
-/**
- * Files carrying a phrasing — this one excluded, because it is where the phrasings are written and
- * a vocabulary that matched only itself would report coverage it does not have.
- */
-const carrying = (claim: RegExp): string[] =>
-  TRACKED.filter(({ path, text }) => path !== SELF && claim.test(normalize(text))).map(
-    ({ path }) => path,
-  );
+/** Whether a file describes the firewall's reach at all, which is what makes a missing claim a hole. */
+const DESCRIBES_FIREWALL = new RegExp(
+  String.raw`(?:firewall|perimeter|${only.name})[\s\S]{0,400}?(?:${SCOPE.join('|')})|(?:${SCOPE.join('|')})[\s\S]{0,400}?(?:firewall|perimeter|${only.name})`,
+  'iu',
+);
+
+const DOCUMENTS = TRACKED.filter(({ path }) => path !== SELF);
+
+const claims = (file: TrackedFile): Sighting[] => sightings(file, WHOLE_SPACE);
 
 describe('the documents that describe the Postgres firewall', () => {
   it('are enumerated by git, this file included', () => {
@@ -167,26 +219,42 @@ describe('the documents that describe the Postgres firewall', () => {
     expect(BICEP).not.toEqual([]);
   });
 
+  it('are read for a declaration wherever bicep spells one, not only in the parameter file', () => {
+    // A break-glass rule added as a literal `firewallRules` resource is a second rule in the
+    // estate. An extension test that excluded every `.bicep` file could not see one.
+    const declaring = DOCUMENTS.filter(({ text }) => /startIpAddress|firewallRules@/u.test(text));
+    expect(declaring).not.toEqual([]);
+    expect(declaring.filter((file) => !BICEP.includes(file)).map(({ path }) => path)).toEqual([]);
+  });
+
   it('state no range but the one the templates declare', () => {
-    expect(TRACKED.flatMap(contradicting)).toEqual([]);
+    expect(DOCUMENTS.flatMap(contradicting)).toEqual([]);
   });
 
   it('state that range somewhere other than the declaration', () => {
-    const restating = TRACKED.filter(
-      (file) => !BICEP.includes(file) && statedRanges(file.text).some(isDeclared),
+    const restating = DOCUMENTS.filter(
+      (file) => !BICEP.includes(file) && statedRanges(file).some(({ range }) => isDeclared(range)),
     );
     expect(restating.map(({ path }) => path)).not.toEqual([]);
   });
 
   it('claim the whole address space only while the rule admits it', () => {
+    const stated = DOCUMENTS.flatMap(claims);
+
     if (!spansEverything) {
-      expect(WHOLE_SPACE.flatMap(carrying)).toEqual([]);
+      expect(stated.map(describeSighting)).toEqual([]);
       return;
     }
 
-    // Each phrasing still matches, so a reword that orphans one fails here rather than silently
-    // narrowing what this test can see.
-    for (const claim of WHOLE_SPACE) expect(carrying(claim), String(claim)).not.toEqual([]);
+    expect(stated).not.toEqual([]);
+
+    // Every file that describes the firewall's reach carries at least one claim this reader can
+    // see. A file that describes it in words the reader does not know is a file narrowing would
+    // leave behind, and this is the moment — while the rule is still wide — to find out.
+    const blind = DOCUMENTS.filter(
+      (file) => DESCRIBES_FIREWALL.test(normalize(file.text)) && claims(file).length === 0,
+    );
+    expect(blind.map(({ path }) => path)).toEqual([]);
   });
 
   it('describe one rule, and not the Azure-services special case that looks like it', () => {
@@ -195,7 +263,11 @@ describe('the documents that describe the Postgres firewall', () => {
     expect(RULES).toHaveLength(1);
     expect(only.end).not.toBe(only.start);
     expect(only.name).toBe('AllowVercelServerlessNoStaticEgress');
-    expect(carrying(/(?:one|a single) firewall rule|a single rule spanning/iu)).not.toEqual([]);
+    expect(
+      DOCUMENTS.flatMap((file) =>
+        sightings(file, /(?:one|a single) firewall rule|a single rule spanning/giu),
+      ),
+    ).not.toEqual([]);
   });
 
   it('are checked against readers that fail loudly rather than matching nothing', () => {
@@ -204,11 +276,34 @@ describe('the documents that describe the Postgres firewall', () => {
     expect(() => declaredFirewallRules(['param x string'])).toThrow(/declare no firewall rule/u);
     expect(() => declaredFirewallRules(BICEP.map(({ text }) => text))).not.toThrow();
 
-    // The range reader sees a range wherever a document may put one, and rejects a wrong one.
+    // A literal resource declares the same rule as a parameter value, in different syntax.
+    const literal = `resource breakGlass 'x' = {\n  name: 'AllowRunners'\n  properties: {\n    startIpAddress: '20.0.0.0'\n    endIpAddress: '20.255.255.255'\n  }\n}`;
+    expect(declaredFirewallRules([literal])).toEqual([
+      { name: 'AllowRunners', start: '20.0.0.0', end: '20.255.255.255' },
+    ]);
+
+    // The range reader sees a range wherever a document may put one, in either punctuation, and
+    // rejects a wrong one. Prose says "to" as readily as it says a dash.
     const wrapped = `// spanning ${only.start}–\n// ${only.end} today`;
     expect(contradicting({ path: 'probe', text: wrapped })).toEqual([]);
 
-    const stale = `the rule is \`${only.start}\`–\`${toAddress(toInt(only.end) - 1)}\``;
-    expect(contradicting({ path: 'probe', text: stale })).toHaveLength(1);
+    const near = toAddress(toInt(only.end) - 1);
+    expect(
+      contradicting({ path: 'probe', text: `the rule is \`${only.start}\`–\`${near}\`` }),
+    ).toEqual([`probe:1 ${only.start}–${near}`]);
+    expect(contradicting({ path: 'probe', text: `spanning ${only.start} to ${near}` })).toEqual([
+      `probe:1 ${only.start} to ${near}`,
+    ]);
+
+    // And the claim reader sees a totality word governing a scope noun, not a memorized sentence.
+    for (const sentence of [
+      'The firewall below is open to the internet',
+      'a firewall spanning the whole internet',
+      'one firewall rule spans all of IPv4',
+      'an internet-reachable endpoint',
+    ])
+      expect(claims({ path: 'probe', text: sentence }), sentence).toHaveLength(1);
+
+    expect(claims({ path: 'probe', text: 'the inclusive IPv4 range it admits' })).toEqual([]);
   });
 });
