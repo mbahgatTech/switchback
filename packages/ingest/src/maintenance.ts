@@ -4,11 +4,17 @@
  */
 
 import { JobKind, JobStatus, PhotoSource, TileStatus, prisma } from '@switchback/db';
-import type { PrismaClient } from '@switchback/db';
+import type { PrismaClient, TileSource } from '@switchback/db';
+import { childQuadkeys } from '@switchback/geo';
 import { reconcileDeadJobs } from './dead-jobs';
 import type { AbandonedJob, TriageOptions } from './dead-jobs';
 import { HOST_FUNCTION_TIMEOUT_MS, LEASE_TIMEOUT_MS, reclaimExpiredJobs } from './jobs';
-import { SUBTREE_STUCK_MARKER, countOrphanedSplits, reconcileOrphanedSplits } from './subdivide';
+import {
+  CHILDREN_PER_TILE,
+  SUBTREE_STUCK_MARKER,
+  countOrphanedSplits,
+  reconcileOrphanedSplits,
+} from './subdivide';
 import type { OrphanedSplitRepair } from './subdivide';
 
 export interface SweepResult {
@@ -200,6 +206,122 @@ export function formatQueueHealth(health: QueueHealth): string {
     `wedgedTiles=${health.wedgedTiles} stalledDrain=${health.stalledDrain} ` +
     `photoSeedBlackout=${health.photoSeedBlackout}`
   );
+}
+
+/**
+ * The literal an operator greps for, and the token `switchback-ingest-empty-tile-writes` alerts on.
+ *
+ * **Deliberately not a `QueueHealth` field, and this is the reason.** `isDistressed` is
+ * `some((count) => count > 0)`; empty tiles exist wherever a viewport reaches ocean, so a count of
+ * them in that interface would report distress on every tick for ever and drown every other gauge
+ * in it. `formatQueueHealth` is also a field list KQL rules parse, so widening it breaks the rules
+ * already reading it. This reading is its own line for both reasons.
+ */
+export const EMPTY_WRITE_MARKER = 'switchback-ingest-empty-tile-writes';
+
+/**
+ * How much history the share is read over.
+ *
+ * A day, not the distress window's hour, because this is a proportion and an hour is not a sample.
+ * Six hours is roughly forty tiles at the nine-minute handler bound, so an hourly denominator is
+ * single digits and its share swings the whole way from 0 to 1 on one ocean tile.
+ */
+export const EMPTY_WRITE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The suffixes that turn a quadkey into its children, from the function that defines them.
+ *
+ * Written out again in SQL this would be a second copy of the subdivision maths, free to drift
+ * from the first and stop recognising a split tile without saying so.
+ */
+const CHILD_SUFFIXES = childQuadkeys('');
+
+/** One source's tile writes inside the window, and how many of them landed empty. */
+export interface EmptyWriteRate {
+  /** Null on rows a fetch wrote before provenance was recorded. */
+  source: TileSource | null;
+  /** Tiles this source answered about. A failed attempt writes no `fetchedAt` and is in neither. */
+  written: number;
+  empty: number;
+}
+
+/**
+ * What share of each source's tile writes said "no trails here".
+ *
+ * The one in-band signal for a source that answers an out-of-area query `200 OK` with zero
+ * elements. That response is indistinguishable from ocean on the tile it lands on, `processTile`
+ * caches it `empty` for a month, and nothing else in the estate records it — the request reads
+ * success and no job row is written. See the note above `DEFAULT_ENDPOINTS`.
+ *
+ * **Split by source and reported as a proportion, because neither an absolute count of empties nor
+ * one source's share means anything alone.** Ocean is real and its tiles are legitimately empty.
+ * What identifies the hazard is one source's share against another's over comparable ground, so
+ * until a second source exists this reading is accruing the baseline that comparison will need.
+ *
+ * **A tile with a full set of children is not one of its own writes, and is excluded.**
+ * `promoteFrom` composes a parent row out of its four children after every tile a fetch finishes,
+ * and it is the only path outside `processTile` that moves `fetchedAt` on this table — so one
+ * query answered about a z11 would otherwise be counted again at z10 and again at z9, attributed
+ * to whichever source last answered about the ancestor itself. The predicate is the roll-up's own
+ * precondition read off the child rows rather than a flag a writer has to remember to set:
+ * `rollUp` returns null below `CHILDREN_PER_TILE` and `promoteFrom` stops at the first null, so
+ * every row a roll-up wrote is one `childTiles` returned a full set for. A tile subdivided
+ * *since* its own last answer goes with them, which is the same fact taken conservatively — a box
+ * split into four no longer stands for ground one answer covers.
+ *
+ * **Fewer than four children is not that fact, and keeps the parent in.** `splitTile` upserts its
+ * children one at a time outside a transaction and writes the parent's split marker last, so a
+ * host kill part-way through leaves 1–3 children and no marker — a state nothing repairs, since
+ * `reconcileOrphanedSplits` keys on the marker and `processTile` promotes only at four. That
+ * parent is re-fetched on the ordinary path, and the row it writes is one source's own answer.
+ * `< CHILDREN_PER_TILE` is therefore the predicate rather than `NOT EXISTS`, which would discard
+ * that answer for as long as the stray children live.
+ *
+ * **Four primary-key probes rather than `LIKE quadkey || '_'`.** A `LIKE` whose pattern is a column
+ * cannot use an index, so that anti-join degrades to the cross product: on this schema at 5,000
+ * rows inside the window it discarded 25,000,000 join-filter rows in 3.2 s, against 47.9 ms for the
+ * probes below. Counting the probes rather than stopping at the first is the same plan over the
+ * same index and costs nothing measurable: 61.3/57.1/50.0 ms against `NOT EXISTS`'s 52.5/57.2/46.0
+ * ms, three runs each at that row count on `postgis/postgis:17-3.5`. It does raise the planner's
+ * estimate about fourfold, which is what can carry the statement over `jit_above_cost` — those
+ * readings are taken with `jit` off so the two forms are compared on the same terms. This runs on
+ * the two-minute pump tick.
+ *
+ * `status` and `fetchedAt` are read together because one statement writes both. A later failed
+ * attempt moves `status` without moving `fetchedAt`, which would drop that tile from the empty
+ * count while leaving it in the total; an `empty` tile is not re-fetched for thirty days, so
+ * inside one window that is a rounding error rather than a bias. A roll-up cannot widen that gap:
+ * the only rows it writes are the ones the exclusion above has already taken out.
+ */
+export async function readEmptyWriteRates(
+  db: PrismaClient = prisma,
+  now: Date = new Date(),
+  windowMs: number = EMPTY_WRITE_WINDOW_MS,
+): Promise<EmptyWriteRate[]> {
+  const since = new Date(now.getTime() - windowMs);
+  return db.$queryRaw<EmptyWriteRate[]>`
+    SELECT tile."sourceKind" AS source,
+           count(*)::int AS written,
+           count(*) FILTER (WHERE tile.status = 'empty')::int AS empty
+      FROM ingest_tiles tile
+     WHERE tile."fetchedAt" >= ${since}
+       AND (SELECT count(*)
+              FROM unnest(${CHILD_SUFFIXES}::text[]) AS suffix
+              JOIN ingest_tiles child ON child.quadkey = tile.quadkey || suffix) < ${CHILDREN_PER_TILE}
+     GROUP BY tile."sourceKind"
+     ORDER BY tile."sourceKind"
+  `;
+}
+
+/**
+ * One source's reading as a field list, one line per source.
+ *
+ * Both counts rather than the quotient they imply: a rule has to weigh the share against the
+ * sample behind it, and `share=1.0` off two tiles is noise no threshold can tell from a mirror
+ * that has stopped serving the planet.
+ */
+export function formatEmptyWriteRate(rate: EmptyWriteRate): string {
+  return `source=${rate.source ?? 'unknown'} written=${rate.written} empty=${rate.empty}`;
 }
 
 /**

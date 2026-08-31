@@ -3,7 +3,11 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { JobKind, JobStatus, TileStatus } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
-import { reconcileOrphanedSplits } from '../src/subdivide';
+import {
+  SUBTREE_STUCK_MARKER,
+  countOrphanedSplits,
+  reconcileOrphanedSplits,
+} from '../src/subdivide';
 import {
   DEFAULT_MAX_ATTEMPTS,
   HOST_FUNCTION_TIMEOUT_MS,
@@ -20,6 +24,8 @@ import {
   isDistressed,
   photoSeedBlackout,
   queueHealth,
+  readEmptyWriteRates,
+  readEnrichWindow,
   repairWedgedTiles,
   sweepQueue,
 } from '../src/maintenance';
@@ -306,6 +312,54 @@ describe('the sweep the timer calls', () => {
   });
 });
 
+/** The raw readings `queueHealth` composes, named by the field each one feeds. */
+type RawReading = 'orphanedSplits' | 'wedgedTiles' | 'enrichWindow';
+
+/**
+ * The statement one reader emits, read off the reader rather than transcribed from it.
+ *
+ * No rows is an answer all three already handle: each destructures one row and falls back to zero.
+ */
+async function statementOf(read: (db: PrismaClient) => Promise<unknown>): Promise<string> {
+  let statement: string | null = null;
+  const recorder = {
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      statement = strings.join('');
+      return [];
+    },
+  } as unknown as PrismaClient;
+
+  await read(recorder);
+  if (statement === null) throw new Error('a reading queueHealth composes ran no raw statement');
+  return statement;
+}
+
+/** Captured once: the statements are static text, and `queueHealth` asks for all three at once. */
+let statements: Promise<Record<RawReading, string>> | null = null;
+
+/**
+ * Which reading a statement is, or a throw naming it as one the fakes below do not model.
+ *
+ * **Matched whole, never on a fragment of the SQL.** `ingest_tiles child` reads as
+ * `countOrphanedSplits` and is equally a fragment of `readEmptyWriteRates`, so a discriminator
+ * short enough to write by hand can name a statement it does not mean — and a fake answering the
+ * wrong statement is answering for the code under test, which is what these fakes exist to make
+ * impossible. Text taken from the emitters cannot drift from them, and a statement no emitter
+ * emits is unmodelled by construction rather than by a judgement call.
+ */
+async function readingOf(sql: string): Promise<RawReading> {
+  statements ??= (async () => ({
+    orphanedSplits: await statementOf((db) => countOrphanedSplits(db)),
+    wedgedTiles: await statementOf((db) => countWedgedTiles(db)),
+    enrichWindow: await statementOf((db) => readEnrichWindow(db, new Date(0))),
+  }))();
+
+  const known = await statements;
+  const reading = (Object.keys(known) as RawReading[]).find((key) => known[key] === sql);
+  if (reading === undefined) throw new Error(`a statement this fake does not model: ${sql}`);
+  return reading;
+}
+
 describe('the queue health report', () => {
   const NOW = new Date('2026-08-07T10:00:00Z');
 
@@ -320,15 +374,16 @@ describe('the queue health report', () => {
         aggregate: async () => ({ _max: { completedAt: new Date(0) } }),
       },
       ingestTile: { count: async () => reading.stuckSubtrees },
-      // Three correlated reads share this seam; each is named by a table only its query mentions.
+      // Three correlated reads share this seam, told apart by the statement each one emits.
       $queryRaw: async (strings: TemplateStringsArray) => {
-        const sql = strings.join('');
-        if (sql.includes('photos photo')) {
-          return [{ completed: MIN_ENRICH_SAMPLE, seeded: reading.photoSeedBlackout ? 0 : 1 }];
+        switch (await readingOf(strings.join(''))) {
+          case 'enrichWindow':
+            return [{ completed: MIN_ENRICH_SAMPLE, seeded: reading.photoSeedBlackout ? 0 : 1 }];
+          case 'orphanedSplits':
+            return [{ count: reading.orphanedSplits }];
+          case 'wedgedTiles':
+            return [{ count: reading.wedgedTiles }];
         }
-        return sql.includes('ingest_tiles child')
-          ? [{ count: reading.orphanedSplits }]
-          : [{ count: reading.wedgedTiles }];
       },
     } as unknown as PrismaClient;
   }
@@ -646,5 +701,135 @@ describe('repairWedgedTiles', () => {
     const repair = source.indexOf('repairWedgedTiles(db, now)');
     expect(reclaim).toBeGreaterThan(-1);
     expect(repair).toBeGreaterThan(reclaim);
+  });
+});
+
+/**
+ * The empty-write signal is not a member of `QueueHealth`, and this is the assertion that keeps it
+ * out.
+ *
+ * `isDistressed` is `some((count) => count > 0)`, and empty tiles exist wherever a viewport reaches
+ * ocean. A ninth count reading them would hold the distress alert on for as long as there is water,
+ * which takes the other eight gauges with it — the failure `DISTRESS_WINDOW_MS` and `stalledDrain`
+ * were both reshaped to avoid, arriving through a new field instead.
+ *
+ * That the same tiles *are* counted, by `readEmptyWriteRates`, is asserted against a real Postgres
+ * in `provenance.db.test.ts`. It cannot be asserted here: the reading is one `count(*) FILTER`
+ * grouped by an enum, and a fake standing in for it would be answering with the number under test.
+ */
+describe('a queue whose tiles are mostly empty', () => {
+  const NOW = new Date('2026-08-07T10:00:00Z');
+
+  /** Every tile row this fake holds, in the columns `queueHealth` filters on. */
+  interface EmptyTileRow {
+    status: TileStatus;
+    lastError: string | null;
+  }
+
+  /** What this fake refuses, named as the statement that would have to change to satisfy it. */
+  function unmodelled(what: string): Error {
+    return new Error(`queueHealth counted ingest_tiles on ${what}, which this fake does not model`);
+  }
+
+  /** The one operator this fake reads on `lastError`, or null for any other shape. */
+  function onlyContains(filter: unknown): string | null {
+    if (typeof filter !== 'object' || filter === null) return null;
+    const { contains } = filter as { contains?: unknown };
+    return Object.keys(filter).length === 1 && typeof contains === 'string' ? contains : null;
+  }
+
+  /**
+   * Whether one tile satisfies `where`, refusing any filter shape this fake does not model.
+   *
+   * **The refusal is the guard.** A ninth arm written `{ status: { in: [...] } }` against a reader
+   * that compared `where.status` as a scalar would match no row, count zero, and leave the verdict
+   * below green while the field it denies had already shipped — the reading is checked here, so a
+   * fake that answers `false` to a question it did not understand is answering for the code under
+   * test. An unknown column, or a known one under an unknown operator, therefore throws for the
+   * same reason an unknown statement throws in `$queryRaw`.
+   */
+  function matches(tile: EmptyTileRow, where: Record<string, unknown>): boolean {
+    for (const [column, filter] of Object.entries(where)) {
+      if (column === 'status') {
+        if (typeof filter !== 'string') throw unmodelled(`status ${JSON.stringify(filter)}`);
+        if (filter !== tile.status) return false;
+      } else if (column === 'lastError') {
+        const contains = onlyContains(filter);
+        if (contains === null) throw unmodelled(`lastError ${JSON.stringify(filter)}`);
+        if (!(tile.lastError ?? '').includes(contains)) return false;
+      } else {
+        throw unmodelled(column);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * A queue holding `tiles` and no jobs, answering by predicate rather than by call order.
+   *
+   * Order-indexed fakes cannot see a *new* reader — a ninth arm would take whichever answer the
+   * eighth left behind — so this one evaluates the `where` it is handed and refuses any statement
+   * it does not already model. Both halves matter: a new Prisma count over `ingest_tiles` shows up
+   * as a changed verdict, and a new raw statement shows up as a thrown error, neither of which a
+   * fixed script of answers would show at all. `readingOf` is what holds the second half: it
+   * matches the whole statement each modelled reader emits, so a reader this fake has never seen
+   * cannot be taken for one it has.
+   */
+  function tableDb(tiles: readonly EmptyTileRow[]): PrismaClient {
+    return {
+      ingestJob: {
+        count: async () => 0,
+        findFirst: async () => null,
+        aggregate: async () => ({ _max: { completedAt: null } }),
+      },
+      ingestTile: {
+        count: async (args?: { where?: Record<string, unknown> }) => {
+          const where = args?.where;
+          if (where === undefined) throw unmodelled('no filter at all');
+          return tiles.filter((tile) => matches(tile, where)).length;
+        },
+      },
+      $queryRaw: async (strings: TemplateStringsArray) => {
+        switch (await readingOf(strings.join(''))) {
+          case 'enrichWindow':
+            return [{ completed: 0, seeded: 0 }];
+          case 'orphanedSplits':
+          case 'wedgedTiles':
+            return [{ count: 0 }];
+        }
+      },
+    } as unknown as PrismaClient;
+  }
+
+  const ocean: EmptyTileRow[] = Array.from({ length: 40 }, () => ({
+    status: TileStatus.empty,
+    lastError: null,
+  }));
+
+  it('reads no distress at all, however many of them there are', async () => {
+    const health = await queueHealth(tableDb(ocean), NOW);
+
+    expect(isDistressed(health)).toBe(false);
+    // Not one field, and not by name: an empty tile is not evidence of anything the queue can do
+    // about it, so no arm of the reading may move on one.
+    expect(Object.values(health).every((count) => count === 0)).toBe(true);
+  });
+
+  it('still reads the distress that is really there, so the verdict above is not a dead fake', async () => {
+    const wedged = [...ocean, { status: TileStatus.pending, lastError: SUBTREE_STUCK_MARKER }];
+
+    expect(isDistressed(await queueHealth(tableDb(wedged), NOW))).toBe(true);
+  });
+
+  /**
+   * The refusal exercised rather than asserted about.
+   *
+   * `readEmptyWriteRates` is the reading a ninth field would most naturally be wired to: it is
+   * exported from the module `queueHealth` lives in, and it joins `ingest_tiles child` exactly as
+   * `countOrphanedSplits` does. Running its real statement through this fake is what shows the two
+   * verdicts above cannot be satisfied by a fake answering a question it never understood.
+   */
+  it('refuses the empty-write reading rather than answering it a zero of its own', async () => {
+    await expect(readEmptyWriteRates(tableDb(ocean), NOW)).rejects.toThrow(/does not model/);
   });
 });

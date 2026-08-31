@@ -11,7 +11,7 @@ import {
   sweepQueue,
 } from '@switchback/ingest';
 import { reconcileDeadLetters } from '../dead-letter';
-import { reportQueueHealth } from '../health';
+import { reportEmptyWriteRates, reportQueueHealth } from '../health';
 import { pumpBounds, runPump } from '../pump';
 import { deadLetterQueue, serviceBusQueue } from '../service-bus';
 
@@ -33,6 +33,7 @@ app.timer('ingestPump', {
   schedule: '0 */2 * * * *',
   handler: async (_timer: Timer, context: InvocationContext): Promise<void> => {
     await reportQueueHealth(backgroundPrisma, context);
+    await reportEmptyWriteRates(backgroundPrisma, context);
     await maintain(context);
 
     if (braked()) {

@@ -27,6 +27,7 @@ const stub = vi.hoisted(() => ({
   })),
   pruneFinishedJobs: vi.fn(async () => 0),
   reportQueueHealth: vi.fn(async () => {}),
+  reportEmptyWriteRates: vi.fn(async () => []),
   reconcileDeadLetters: vi.fn(async () => ({ runnable: [], terminal: [], unreadable: [] })),
 }));
 
@@ -49,7 +50,10 @@ vi.mock('@switchback/ingest', async (importOriginal) => ({
   pruneFinishedJobs: stub.pruneFinishedJobs,
 }));
 
-vi.mock('../src/health', () => ({ reportQueueHealth: stub.reportQueueHealth }));
+vi.mock('../src/health', () => ({
+  reportQueueHealth: stub.reportQueueHealth,
+  reportEmptyWriteRates: stub.reportEmptyWriteRates,
+}));
 
 vi.mock('../src/dead-letter', () => ({ reconcileDeadLetters: stub.reconcileDeadLetters }));
 
@@ -102,6 +106,19 @@ describe('the ingestPump handler', () => {
     // The same call with no band: an unbraked tick reads the whole runnable head, which is what
     // makes the assertion above a statement about the brake rather than about `runPump`'s default.
     expect(await bandPassedToPump('true')).toBeUndefined();
+  });
+
+  /*
+   * The falsely-empty detector's only publisher. Its whole firing condition is a log line, so a
+   * tick that reads the share and does not emit it is indistinguishable from an estate writing no
+   * empty tiles at all — and a brake stops new work reaching the queue, not the watching of it.
+   */
+  it('publishes the empty-write share whichever way the brake is set', async () => {
+    stub.reportEmptyWriteRates.mockClear();
+    await bandPassedToPump('false');
+    await bandPassedToPump('true');
+
+    expect(stub.reportEmptyWriteRates).toHaveBeenCalledTimes(2);
   });
 
   it('reclaims expired leases whichever way the brake is set', async () => {

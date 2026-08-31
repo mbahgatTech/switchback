@@ -3,15 +3,17 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  EMPTY_WRITE_MARKER,
   QUEUE_DISTRESS_MARKER,
   QUEUE_HEALTH_MARKER,
   TILE_SPLIT_MARKER,
   TRAIL_LOST_MARKER,
 } from '@switchback/ingest';
-import type { QueueHealth } from '@switchback/ingest';
+import type { EmptyWriteRate, QueueHealth } from '@switchback/ingest';
+import { TileSource } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
 import { BUILD_COMMIT } from '../src/build';
-import { reportQueueHealth } from '../src/health';
+import { reportEmptyWriteRates, reportQueueHealth } from '../src/health';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 
@@ -424,5 +426,121 @@ describe('what the repairs are reachable from', () => {
     );
 
     expect(new Set(mentions)).toEqual(ALLOWED);
+  });
+});
+
+/**
+ * The empty-write reading, and the rule that would read it.
+ *
+ * The rule lives in Azure and the line lives here, so neither can see the other and only an
+ * assertion holds them together — the failure this exists to prevent is a reworded field name
+ * silently disarming a rule that goes on looking healthy.
+ */
+describe('the empty-write reading', () => {
+  const bicep = readFileSync(resolve(here, '../../../infra/azure/ingest.bicep'), 'utf8');
+  const ruleQuery =
+    bicep
+      .split('\n')
+      .find((line) => line.includes('query:') && line.includes(EMPTY_WRITE_MARKER)) ?? '';
+
+  /** A database that answers the empty-write read with `rates` and nothing else. */
+  function ratesDb(rates: EmptyWriteRate[]): PrismaClient {
+    return { $queryRaw: async () => rates } as unknown as PrismaClient;
+  }
+
+  /** The literals a KQL `parse ... with *` pattern splits on, each with the field it precedes. */
+  function parsePattern(query: string): Array<{ literal: string; field: string }> {
+    const clause = /parse message with \*(.*?)\|/.exec(query)?.[1] ?? '';
+    return [...clause.matchAll(/"([^"]*)"\s+(\w+):\w+/g)].map((match) => ({
+      literal: match[1]!,
+      field: match[2]!,
+    }));
+  }
+
+  /**
+   * What Azure would read out of `message` with that pattern.
+   *
+   * `parse ... with *` walks the literals in order and takes everything between each one and the
+   * next as the field, which is what makes a renamed field a parse that yields nothing rather
+   * than a parse that yields the wrong thing.
+   */
+  function applyParse(
+    pattern: ReadonlyArray<{ literal: string; field: string }>,
+    message: string,
+  ): Record<string, string> | null {
+    const parsed: Record<string, string> = {};
+    let rest = message;
+    for (const [index, { literal, field }] of pattern.entries()) {
+      const at = rest.indexOf(literal);
+      if (at === -1) return null;
+      rest = rest.slice(at + literal.length);
+      const next = pattern[index + 1]?.literal;
+      const end = next === undefined ? rest.length : rest.indexOf(next);
+      if (end === -1) return null;
+      parsed[field] = rest.slice(0, end);
+      rest = rest.slice(end);
+    }
+    return parsed;
+  }
+
+  it('logs one line per source, carrying the share and the sample behind it', async () => {
+    const log = silentLog();
+
+    await reportEmptyWriteRates(
+      ratesDb([
+        { source: TileSource.overpass, written: 412, empty: 307 },
+        { source: null, written: 9, empty: 9 },
+      ]),
+      log,
+    );
+
+    expect(log.info.mock.calls.map((call) => (call as [string])[0])).toEqual([
+      `${EMPTY_WRITE_MARKER} source=overpass written=412 empty=307`,
+      `${EMPTY_WRITE_MARKER} source=unknown written=9 empty=9`,
+    ]);
+  });
+
+  /*
+   * The half no unit test on either side can reach: the rule's own extraction, run over the line
+   * the worker actually emitted. A field renamed on either side leaves the rule matching nothing,
+   * which reads exactly like an estate with no empty writes in it.
+   */
+  it('emits a line the rule’s own parse pattern reads the fields out of', async () => {
+    const log = silentLog();
+
+    await reportEmptyWriteRates(
+      ratesDb([{ source: TileSource.overpass, written: 412, empty: 307 }]),
+      log,
+    );
+
+    const pattern = parsePattern(ruleQuery);
+    expect(pattern.map((part) => part.field)).toEqual(['source', 'written', 'empty']);
+    expect(applyParse(pattern, (log.info.mock.calls[0] as [string])[0])).toEqual({
+      source: 'overpass',
+      written: '412',
+      empty: '307',
+    });
+  });
+
+  it('is declared, pointed at the action group, and disarmed until the share has a baseline', () => {
+    // Armed, it would page on the geography of whatever people panned over: there is one source,
+    // so no share here has anything to be compared against yet.
+    expect(bicep).toContain(`name: '${EMPTY_WRITE_MARKER}'`);
+    expect(bicep).toMatch(new RegExp(`${EMPTY_WRITE_MARKER}'\\n[\\s\\S]{0,600}?enabled: false`));
+  });
+
+  it('reports nothing rather than throwing when the queue cannot be read', async () => {
+    // Hung off the same two-minute tick as the drain. A reading that threw would take the pump
+    // with it, which trades a missing signal for a stopped queue.
+    const log = silentLog();
+    const broken = {
+      $queryRaw: async () => {
+        throw new Error('connection terminated unexpectedly');
+      },
+    } as unknown as PrismaClient;
+
+    await expect(reportEmptyWriteRates(broken, log)).resolves.toBeNull();
+    expect(log.info).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledTimes(1);
   });
 });

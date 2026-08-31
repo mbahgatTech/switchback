@@ -1797,6 +1797,67 @@ resource queueDistressAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-p
 }
 
 @description('''
+**The falsely-empty hazard: a source that answers a question about ground it does not hold.**
+
+A mirror serving a regional extract rather than the planet answers an out-of-area query `200 OK`
+with zero elements. `processTile` cannot tell that from ocean — it writes `empty`, and `isTileFresh`
+sells that answer for thirty days. Nothing else in the estate records it: the request reads success,
+no job row is written, and `switchback-ingest-queue-distress` deliberately does not count empty
+tiles, because they are ordinary wherever a viewport reaches water and a gauge counting them could
+never fall. `overpass.osm.ch` is absent from `DEFAULT_ENDPOINTS` for exactly this reason.
+
+`reportEmptyWriteRates` publishes one line per source on the two-minute pump tick, carrying that
+source's tile writes over the trailing day and how many of them landed empty. `arg_max` takes the
+latest line per source, so the rule reads a share rather than re-counting the same day fifteen
+times; `written` is required to be a real denominator, because `share=1.0` off two ocean tiles is
+noise no threshold can use.
+
+**Authored disarmed, and the threshold below is a placeholder.** What separates a regional extract
+from a run of ocean tiles is one source's share against another's over comparable ground, and there
+is one source today — so nothing here has been sized against a measured baseline, and arming it now
+would page on the geography of whatever people happened to pan over. The signal ships first for
+precisely that reason: it accrues the baseline, and this rule is armed, with a threshold taken from
+that baseline, when a second source starts answering. Authored alongside it rather than afterwards
+so the log line and the query that reads it are reviewed as one thing.
+''')
+resource emptyWriteAlert 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: 'switchback-ingest-empty-tile-writes'
+  location: location
+  tags: tags
+  properties: {
+    displayName: 'switchback-ingest-empty-tile-writes'
+    description: 'A source is writing almost every tile it touches as empty, which is what a regional extract answering out-of-area queries looks like from inside the pipeline. Disarmed until the empty-write share has a measured baseline to size the threshold against.'
+    severity: 2
+    enabled: false
+    scopes: [
+      appInsights.id
+    ]
+    evaluationFrequency: 'PT15M'
+    windowSize: 'PT1H'
+    criteria: {
+      allOf: [
+        {
+          query: 'traces | where message has "switchback-ingest-empty-tile-writes" | parse message with * "source=" source:string " written=" written:long " empty=" empty:long | summarize arg_max(timestamp, written, empty) by source | where written >= 200 | extend share = todouble(empty) / todouble(written) | where share > 0.9 | project source, share'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+    }
+  }
+}
+
+@description('''
 **The rule that catches a worker which has stopped shipping.**
 
 Every other rule in this file is armed by something the Function App emits, so all of them read a
