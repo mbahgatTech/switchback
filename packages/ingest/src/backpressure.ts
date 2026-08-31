@@ -54,9 +54,10 @@ export const INGEST_JOB_KINDS = [...REQUEST_JOB_KINDS, ...DERIVED_JOB_KINDS] as 
 
 /**
  * Kinds whose handler issues no Overpass request. Membership is a claim about behaviour, so each
- * entry is cleared by running its handler against a client that throws — see `drain-slot.db.test.ts`.
+ * entry is cleared by running its handler against a client that records one — see
+ * `drain-slot.db.test.ts`. `enrich_trail` fetches Wikimedia and Mapillary and reaches no mirror.
  */
-export const OVERPASS_FREE_JOB_KINDS: readonly JobKind[] = [];
+export const OVERPASS_FREE_JOB_KINDS: readonly JobKind[] = [JobKind.enrich_trail];
 
 /**
  * What `drainSlotGate` counts: every kind except those cleared above. A subtraction rather than a

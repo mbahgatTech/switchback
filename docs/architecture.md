@@ -587,10 +587,21 @@ Consumption instance replacement two hosts are briefly alive at once, each with 
 
 The first factor is enforced where it has to be — across processes, in the database.
 `drainSlotGate` takes `pg_advisory_xact_lock`, reclaims expired leases, counts
-`count(distinct "lockedBy")` over `running` jobs, and claims, all in one transaction. Check and
-claim cannot be two statements: under `READ COMMITTED` two lambdas both read "nobody is draining"
-before either commits. Each caller's `workerId` is unique to its process, because a fleet sharing
-the string `inline` counts as one drainer however many lambdas are running.
+`count(distinct "lockedBy")` over `running` jobs **of the kinds that reach a mirror**, and claims,
+all in one transaction. Check and claim cannot be two statements: under `READ COMMITTED` two lambdas
+both read "nobody is draining" before either commits. Each caller's `workerId` is unique to its
+process, because a fleet sharing the string `inline` counts as one drainer however many lambdas are
+running.
+
+`OVERPASS_JOB_KINDS` in `packages/ingest/src/backpressure.ts` is that set, and it is a subtraction:
+every kind except those whose handler has been cleared of making a request. `enrich_trail` is the
+only one cleared — `enrichTrailPhotos` fetches Wikimedia and Mapillary — so a photo job cannot hold
+the slot shut against a tile. A kind nobody has cleared is bounded, which costs a slower queue if
+the clearance was merely forgotten and an IP block if the release were the default.
+
+The lock and the lease sweep are unconditional: the gate cannot know what kind it will claim until
+after it has claimed, and `unsplitTile` relies on every claim of a tile job passing through this
+lock.
 
 **`lockedBy` proves the bound only while a job is mid-drain, which is almost never observable.**
 Every exit from `running` used to null it — a released lease must stop matching, or a stale
@@ -602,16 +613,20 @@ which is more than a "which process" column could have given, because concurrenc
 about overlapping intervals rather than about distinct names.
 
 ```sql
--- Peak concurrent drains in the last hour. Must not exceed INGEST_MAX_DRAINERS.
--- A sweep line over lease start and end, not a distinct count of names: two strictly serial cron
--- invocations use two ids and are not two drainers.
+-- Peak concurrent drains of Overpass-making work in the last hour. Must not exceed
+-- INGEST_MAX_DRAINERS. A sweep line over lease start and end, not a distinct count of names: two
+-- strictly serial cron invocations use two ids and are not two drainers. The kind filter mirrors
+-- OVERPASS_FREE_JOB_KINDS in packages/ingest/src/backpressure.ts and must follow it: drop the
+-- filter and the peak legitimately exceeds the bound, because photo jobs are not bounded by it.
 select max(concurrent) as peak from (
   select sum(delta) over (order by at, delta desc) as concurrent
     from (select "lockedAt" as at,  1 as delta from ingest_jobs
            where "completedAt" >= now() - interval '1 hour' and "lockedAt" is not null
+             and kind <> 'enrich_trail'
           union all
           select "completedAt" as at, -1      from ingest_jobs
-           where "completedAt" >= now() - interval '1 hour' and "lockedAt" is not null) edges
+           where "completedAt" >= now() - interval '1 hour' and "lockedAt" is not null
+             and kind <> 'enrich_trail') edges
 ) swept;
 
 -- Which processes, and how much each ran.

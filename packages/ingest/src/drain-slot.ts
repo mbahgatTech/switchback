@@ -67,6 +67,13 @@ export function maxDrainers(source: NodeJS.ProcessEnv = process.env): number {
  * which refuses admission — and leaves `classifyDisposition` a `running` row past its lease to
  * report as `stranded`. That is the reachability `switchback-ingest-signal-stranded` depends on.
  *
+ * **Only drainers holding a kind in `OVERPASS_JOB_KINDS` are counted.** The slot exists to keep the
+ * estate inside one Overpass allowance, so work that reaches no mirror cannot consume it — a photo
+ * job holding the slot stopped tiles being fetched and bought nothing. `backpressure.ts` derives
+ * that set by subtracting the kinds whose handlers have been cleared, so an uncleared kind is
+ * bounded. The lock is taken and the sweep runs whatever the claim turns out to hold: the gate
+ * cannot know the kind before it claims, and `unsplitTile` depends on every claim passing the lock.
+ *
  * Drainers are counted by `count(distinct "lockedBy")`, so **every caller must pass a `workerId`
  * unique to its process.** A fleet sharing one string counts as one drainer however many processes
  * are running, which is the bug this replaces wearing a lock. `runIngestSignal` derives its from

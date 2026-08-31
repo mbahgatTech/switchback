@@ -67,10 +67,11 @@ export const DEFAULT_DERIVED_SHARE = 2;
  * share rather than zero because derived work sits below every requestable kind and a batch that
  * reserves no room for it never runs any. See `drainJobs`.
  *
- * **The Overpass bound is the default, not the call site's to remember.** Every handler above can
- * reach `OverpassClient` and `OVERPASS_MAX_CONCURRENT` bounds only one process, so an omitted
- * `gate` would mean "unbounded against one egress IP" the moment two processes overlap. Opting out
- * is an argument a reader can see and a reviewer can question.
+ * **The Overpass bound is the default, not the call site's to remember.** Every handler above but
+ * `enrich_trail` reaches `OverpassClient` — `enrichTrailPhotos` fetches Wikimedia and Mapillary
+ * instead — and `OVERPASS_MAX_CONCURRENT` bounds only one process, so an omitted `gate` would mean
+ * "unbounded against one egress IP" the moment two processes overlap. Which kinds the gate counts
+ * is `OVERPASS_JOB_KINDS` in `backpressure.ts`. Opting out is an argument a reader can see.
  */
 export async function drainIngest(
   options: {
