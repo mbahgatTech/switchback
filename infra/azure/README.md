@@ -576,6 +576,28 @@ is the blast radius named in [Read this first](#read-this-first) and the reason
 `DIRECT_DATABASE_URL` counts as a recorded copy of the admin password. Short of writing that
 workflow, setting a secret again from a source you trust is the honest way to know what it holds.
 
+### Narrowing the firewall
+
+The rule is bound by `databaseFirewallRules` in `main.bicepparam`, so making it smaller is a
+parameter change and a deployment, not a template edit. Nothing below is deployed. What holds the
+current width is that both consumers of port 5432 have no static egress address, and only one of
+the four options changes that.
+
+| Option                                       | What it costs                                                                       | What it breaks                                                                                                                                                                   |
+| -------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Vercel static egress**, then allow-list it | A Vercel plan that offers dedicated egress — **UNVERIFIED**, no quote obtained      | Nothing, if GitHub-hosted runners keep an allowance. This is the only option that removes the reason for the width                                                               |
+| **Private endpoint / VNet**                  | A new server: Azure will not move an existing one between public and private access | Everything, until the data is migrated. Vercel's functions run in AWS with no route into an Azure VNet, so it also needs a VPN or ExpressRoute that does not exist               |
+| **Entra-only authentication**                | Nothing in money. `activeDirectoryAuth` is already `Enabled`                        | Any consumer still holding a password. It does not narrow the rule — it makes the width a reachability fact rather than an exposure, which is the paragraph above                |
+| **Allow-list published ranges**              | Nothing in money                                                                    | Intermittently, at the worst time. GitHub publishes 5,625 IPv4 Actions ranges (`api.github.com/meta`, measured 2026-08-31) and rotates them; Vercel publishes none for this plan |
+
+The ordering is not a preference. **Entra-only authentication is the one that changes the security
+posture without changing the topology**, and the cutover it needs is already written down under
+[The least-privilege application role](#the-least-privilege-application-role) and the sections that
+follow it. Static egress is the only option that makes a narrower rule honest, and it is a
+purchasing decision rather than an engineering one. The remaining two are worse than the status quo:
+a private endpoint trades a credential perimeter for a migration and a VPN, and an allow-list of
+published ranges trades a documented exposure for an undocumented outage.
+
 ### Preview has no database
 
 Vercel Preview holds no `DATABASE_URL`, no `DIRECT_DATABASE_URL` and no `CRON_SECRET`. A preview

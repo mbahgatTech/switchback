@@ -101,7 +101,7 @@
 
 targetScope = 'subscription'
 
-import { entraAdministrator } from './postgres.bicep'
+import { entraAdministrator, firewallRule } from './postgres.bicep'
 
 // ---------------------------------------------------------------------------------------
 // Location
@@ -419,6 +419,24 @@ rewrite on every run.
 ''')
 param passwordAuthEnabled bool = true
 
+@description('''
+Who may reach 5432. One rule spanning the whole of IPv4 today, because the two consumers that
+must connect — Vercel's functions and GitHub-hosted runners — have no static egress address.
+
+**A wrong value here locks the product out of its own database**, and the way back is a
+control-plane write that has to reach Azure from wherever the operator is sitting. Narrowing is
+not a template edit: `infra/azure/README.md`, "Narrowing the firewall", carries the four options,
+what each costs, and what each one breaks.
+
+`@minLength(1)` refuses the empty list, which is the one wrong value that looks like a careful
+one — a server with no rule is not a narrower perimeter, it is an outage. The constraint is
+declared here as well as on postgres.bicep's parameter because preflight checks the parameters of
+the template it is given and does not descend into a module's: with it only on the inner
+parameter, `--parameters databaseFirewallRules='[]'` validates clean.
+''')
+@minLength(1)
+param databaseFirewallRules firewallRule[]
+
 // ---------------------------------------------------------------------------------------
 // Budget and alerting
 // ---------------------------------------------------------------------------------------
@@ -642,6 +660,7 @@ module postgres 'postgres.bicep' = {
     entraAuthEnabled: entraAuthEnabled
     entraAdministrators: entraAdministrators
     passwordAuthEnabled: passwordAuthEnabled
+    databaseFirewallRules: databaseFirewallRules
     // The CI identity is an administrator because `prisma db push` needs DDL over tables
     // `sbadmin` owns, which is exactly the power the stored `sbadmin` password carries today.
     // Passed separately rather than appended to the list — see the parameter in postgres.bicep.

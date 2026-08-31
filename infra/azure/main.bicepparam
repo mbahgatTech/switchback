@@ -279,6 +279,20 @@ param vercelProjectName = 'switchback'
 // password authentication back on, and that comparison is what refuses to.
 param passwordAuthEnabled = true
 
+// One rule, the whole of IPv4, and the name carries the reason so the portal explains itself.
+// Vercel serverless on this plan has no static outbound address and neither do GitHub-hosted
+// runners, so there is no range to allow-list and the perimeter is the credential. Four documents
+// state this range and `test/firewall-restatements.test.ts` holds them to it; narrowing means
+// updating them in the same change. What narrowing would cost is in infra/azure/README.md,
+// "Narrowing the firewall".
+param databaseFirewallRules = [
+  {
+    name: 'AllowVercelServerlessNoStaticEgress'
+    startIpAddress: '0.0.0.0'
+    endIpAddress: '255.255.255.255'
+  }
+]
+
 // The owner is here as break-glass: a human who can reach the database with a token and no
 // password at all, which is what stops "the admin password is not recorded anywhere" from
 // being an outage a second time. The Entra-mapped roles the *applications* use are not

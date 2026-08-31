@@ -74,6 +74,24 @@ type entraAdministrator = {
   principalType: 'User' | 'Group' | 'ServicePrincipal'
 }
 
+@export()
+@description('One public-network firewall rule: a name, and the inclusive IPv4 range it admits.')
+type firewallRule = {
+  @description('Rule name. It is the documentation — the portal shows it beside the range.')
+  name: string
+
+  startIpAddress: string
+  endIpAddress: string
+}
+
+@description('''
+Who may reach 5432. Bound in main.bicepparam, which is where the width of the deployed rule is
+argued; the note above `network` explains why it is what it is, and infra/azure/README.md,
+"Narrowing the firewall", holds the options for making it smaller and what each one costs.
+''')
+@minLength(1)
+param databaseFirewallRules firewallRule[]
+
 // ---------------------------------------------------------------------------------------
 
 var serverName = '${serverNamePrefix}-${uniqueString(resourceGroup().id)}'
@@ -576,17 +594,22 @@ resource connectionsAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
 // The name is the documentation. Someone opening the portal a year from now should learn
 // *why* this is open without having to find the pull request — see the long note above.
 //
-// Note this is deliberately not the special rule 0.0.0.0–0.0.0.0, which means "Azure services
-// only" and would block Vercel entirely while looking, at a glance, like the same thing.
-resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2025-08-01' = {
-  parent: server
-  name: 'AllowVercelServerlessNoStaticEgress'
-  properties: {
-    startIpAddress: '0.0.0.0'
-    endIpAddress: '255.255.255.255'
+// Note the deployed rule is deliberately not the special rule 0.0.0.0–0.0.0.0, which means
+// "Azure services only" and would block Vercel entirely while looking, at a glance, like the
+// same thing. `@minLength(1)` — here and on main.bicep's parameter, which is the one preflight
+// actually reads — is the other half of that: an empty list is not a narrower firewall, it is
+// an outage, and it would otherwise deploy without complaint.
+resource allowInternet 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2025-08-01' = [
+  for rule in databaseFirewallRules: {
+    parent: server
+    name: rule.name
+    properties: {
+      startIpAddress: rule.startIpAddress
+      endIpAddress: rule.endIpAddress
+    }
+    dependsOn: [connectionsAlert]
   }
-  dependsOn: [connectionsAlert]
-}
+]
 
 // The collation is not cosmetic. `C.UTF-8` is byte order; Azure's server default `en_US.utf8`
 // is dictionary order. A restore succeeds under either, which is exactly what makes a mismatch
