@@ -497,10 +497,10 @@ URL parameter all follow from the tier. Watch for sustained `active_connections`
 
 **One firewall rule, `0.0.0.0`–`255.255.255.255`.** Vercel serverless functions on this plan have
 no static outbound IPs — dedicated egress is an Enterprise feature — and neither do GitHub-hosted
-runners. There is no range to allowlist. A private endpoint is not the alternative it looks like:
-it would put the server on an Azure virtual network, and Vercel's functions run in Vercel's own AWS
-infrastructure with no route into it. Azure also refuses to mix public and private access and will
-not let a server move between them, so choosing private now would be a one-way door.
+runners. There is no range to allowlist. A private endpoint would not close this on its own: it
+gives the server a second address inside a virtual network and leaves the public rule serving, and
+none of the three consumers of 5432 sits in a virtual network to use it. What it costs and what it
+is a prerequisite for is under [Narrowing the firewall](#narrowing-the-firewall).
 
 So the perimeter is a credential, and these are the compensating controls:
 
@@ -580,23 +580,56 @@ workflow, setting a secret again from a source you trust is the honest way to kn
 
 The rule is bound by `databaseFirewallRules` in `main.bicepparam`, so making it smaller is a
 parameter change and a deployment, not a template edit. Nothing below is deployed. What holds the
-current width is that both consumers of port 5432 have no static egress address, and only one of
-the four options changes that.
+current width is that the two consumers which cannot be allow-listed have no static egress address,
+and only one of the five options changes that.
 
-| Option                                       | What it costs                                                                       | What it breaks                                                                                                                                                                   |
-| -------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Vercel static egress**, then allow-list it | A Vercel plan that offers dedicated egress — **UNVERIFIED**, no quote obtained      | Nothing, if GitHub-hosted runners keep an allowance. This is the only option that removes the reason for the width                                                               |
-| **Private endpoint / VNet**                  | A new server: Azure will not move an existing one between public and private access | Everything, until the data is migrated. Vercel's functions run in AWS with no route into an Azure VNet, so it also needs a VPN or ExpressRoute that does not exist               |
-| **Entra-only authentication**                | Nothing in money. `activeDirectoryAuth` is already `Enabled`                        | Any consumer still holding a password. It does not narrow the rule — it makes the width a reachability fact rather than an exposure, which is the paragraph above                |
-| **Allow-list published ranges**              | Nothing in money                                                                    | Intermittently, at the worst time. GitHub publishes 5,625 IPv4 Actions ranges (`api.github.com/meta`, measured 2026-08-31) and rotates them; Vercel publishes none for this plan |
+| Option                                       | What it costs                                                                                                                                               | What it breaks                                                                                                                                                                   |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Vercel static egress**, then allow-list it | A Vercel plan that offers dedicated egress — **UNVERIFIED**, no quote obtained                                                                              | Nothing, if GitHub-hosted runners keep an allowance. This is the only option that removes the reason for the width                                                               |
+| **Private endpoint** (Private Link)          | A virtual network, a subnet and the endpoint's hourly charge — **UNVERIFIED**, not priced. Not a new server and not a data migration: this server qualifies | Nothing — it adds a second address and the public rule keeps serving. It also narrows nothing by itself: no consumer is inside a virtual network to reach it                     |
+| **Virtual network integration**              | A new server: Azure will not move an existing one between public and private access                                                                         | Everything, until the data is migrated. It also forecloses the row above — a server built this way can never take a private endpoint                                             |
+| **Entra-only authentication**                | Nothing in money. `activeDirectoryAuth` is already `Enabled`                                                                                                | Any consumer still holding a password. It does not narrow the rule — it makes the width a reachability fact rather than an exposure, which is the paragraph above                |
+| **Allow-list published ranges**              | Nothing in money                                                                                                                                            | Intermittently, at the worst time. GitHub publishes 5,625 IPv4 Actions ranges (`api.github.com/meta`, measured 2026-08-31) and rotates them; Vercel publishes none for this plan |
+
+The two private-networking rows are the single choice Azure makes at server creation, listed apart
+because their constraints are opposite. A private endpoint needs a server created after Private
+Link shipped and configured for public access rather than virtual network integration, and it then
+coexists with firewall rules — the supported-feature matrix lists "Allowing also public/internet
+access with firewall rules" as working as designed
+([Private Link](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-networking-private-link)).
+A virtual-network-integrated server never qualifies, and cannot be moved out of its subnet
+afterwards
+([private access](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-networking-private)).
+
+This server qualifies on both counts. Measured 2026-08-31:
+
+```bash
+az postgres flexible-server show \
+  -g rg-switchback-prod-northcentralus -n psql-switchback-prod-37ywppu5p7fri \
+  --query '{created:systemData.createdAt,public:network.publicNetworkAccess,subnet:network.delegatedSubnetResourceId}' \
+  -o json
+# { "created": "2026-07-30T16:27:16.469822+00:00", "public": "Enabled", "subnet": null }
+```
 
 The ordering is not a preference. **Entra-only authentication is the one that changes the security
 posture without changing the topology**, and the cutover it needs is already written down under
 [The least-privilege application role](#the-least-privilege-application-role) and the sections that
-follow it. Static egress is the only option that makes a narrower rule honest, and it is a
-purchasing decision rather than an engineering one. The remaining two are worse than the status quo:
-a private endpoint trades a credential perimeter for a migration and a VPN, and an allow-list of
-published ranges trades a documented exposure for an undocumented outage.
+follow it. Static egress is the only option that makes a narrower rule honest for Vercel, and it is
+a purchasing decision rather than an engineering one.
+
+A private endpoint is the only option that can be applied to the live server incrementally: it is
+added beside the existing rule and takes nothing away. It also buys nothing on the day it lands,
+because reaching it needs a consumer inside the virtual network and there is none — Vercel's
+functions are in AWS, GitHub-hosted runners are outside Azure, and the ingest Function App runs on
+a Consumption plan, the one hosting plan Azure Functions offers no virtual network integration on
+([Azure Functions networking
+options](https://learn.microsoft.com/en-us/azure/azure-functions/functions-networking-options)). The
+sequence it starts is a Function App plan change, then the endpoint, then the worker off the public
+rule. That shrinks what the wide rule is _for_ without shrinking the rule; closing it altogether
+still needs the Vercel half, which is the first row.
+
+An allow-list of published ranges is the only option that is worse than the status quo: it trades a
+documented exposure for an undocumented outage.
 
 ### Preview has no database
 
