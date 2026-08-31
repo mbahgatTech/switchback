@@ -245,14 +245,16 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2025-08-01' = {
     // other thing that has to connect. A rule narrowed to "known ranges" would be a rule that
     // fails at 3am when a provider rotates a block.
     //
-    // A private endpoint is not the alternative it looks like. It would put the server on an
-    // Azure virtual network, and Vercel's functions execute inside Vercel's own AWS
-    // infrastructure with no route into that network. Reaching it would need a site-to-site
-    // VPN or ExpressRoute terminating somewhere Vercel can reach — infrastructure that does
-    // not exist, costs more than the database, and is out of scope for what is meant to be a
-    // database migration. Azure also refuses to mix the two models and will not let a server
-    // move between them after creation, so choosing private access now would be a one-way
-    // door into a dead end.
+    // A private endpoint does not replace this rule, and the two are not exclusive. Private Link
+    // gives the server a second address inside a virtual network while the public rule keeps
+    // serving, and it is available to this server precisely because the server uses public
+    // access rather than virtual network integration. What it does not do is give any current
+    // consumer a route: Vercel's functions execute inside Vercel's own AWS infrastructure,
+    // GitHub-hosted runners are outside Azure, and the ingest Function App runs on a Consumption
+    // plan, which Azure Functions offers no virtual network integration on. Virtual network
+    // integration is the one-way door — it cannot be turned on for an existing server, and a
+    // server that has it can never take a private endpoint. What each option costs is in
+    // infra/azure/README.md, "Narrowing the firewall".
     //
     // So the perimeter is credential-only, and the compensating controls are the real
     // security posture rather than decoration:

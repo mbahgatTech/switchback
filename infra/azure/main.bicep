@@ -433,6 +433,10 @@ one — a server with no rule is not a narrower perimeter, it is an outage. The 
 declared here as well as on postgres.bicep's parameter because preflight checks the parameters of
 the template it is given and does not descend into a module's: with it only on the inner
 parameter, `--parameters databaseFirewallRules='[]'` validates clean.
+
+This is the only parameter in the template with no default, so preflight refuses any deployment
+that supplies neither `main.bicepparam` nor an override. Every recipe in this repository passes the
+parameter file, which is why nothing is written to accommodate a bare template deploy.
 ''')
 @minLength(1)
 param databaseFirewallRules firewallRule[]
