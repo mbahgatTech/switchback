@@ -25,6 +25,9 @@ rather than argued. Nothing here is imported by the application.
 | `provenance.ts` | Which tree the harness actually loads — a worktree has no `node_modules` of its own |
 | `disk-arithmetic.py` | The first gate's densities against the production disk budget |
 | `disk-widened.py` | The same including the context slice, at region extent, on deduplicated sizes |
+| `tile-completeness.ts` | Does every way member a tile's route relations declare resolve to a way the slice holds? |
+| `untagged-member-probe.osm` | A route relation with one member the loader keeps and one it drops, no boundary in the file |
+| `untagged-member-probe.sh` | Loads that fixture and holds the gap to being either kept or reported |
 
 ## Running it
 
@@ -90,6 +93,41 @@ alongside for the answer.
 index on every geometry table, and the first gate's disk figures carried both copies — 94 MB of
 the 1,056 MB northern California slice. Every size in `disk-widened.py` is measured after dropping
 the duplicates.
+
+## The gap a pre-warmed tile cannot recover from
+
+A tile marked `ready` is never re-fetched, so any way the slice lacks that Overpass would have
+returned is not a cache miss — it is permanent, invisible loss. `tile-completeness.ts` is the
+predicate that makes it visible: it counts the way members a tile's route relations declare
+against the ways the slice actually holds, and names every relation where the two disagree.
+
+```sh
+tsx scripts/osm-slice/tile-completeness.ts --database osm_norcal --quadkey 023010230
+```
+
+The `rel` term is the selection `RELATION_SQL` uses, deliberately. A predicate that selected a
+different set of relations than the adapter reads would score a tile the adapter never fetches.
+
+**The gaps are interior.** `osm2pgsql` never calls the style's way callback for a way carrying no
+tags, so an untagged way that a route relation declares as a member is gone before
+`switchback.lua` can decide anything — no widening of the extract box brings it back.
+`untagged-member-probe.osm` reproduces exactly that in a file whose every element sits well inside
+its own `<bounds>`, which is what separates the mechanism from a clipping artefact:
+
+```sh
+bash scripts/osm-slice/untagged-member-probe.sh
+```
+
+It holds one invariant: **either** way `100` reaches `osm.trail_way`, **or** `tileCompleteness`
+reports relation `900` incomplete. Branch B is what holds against osm2pgsql 1.8.0; a loader that
+later keeps untagged relation members satisfies branch A and the check stays green unedited. What
+it forbids is the third state — the way absent and the predicate blind to it.
+
+`osm.relation_node_member` is built after the fact by `measure-node-members.ts` and never by
+`switchback.lua`. The predicate probes for it and includes the node-member term only when it is
+really there: naming it unconditionally fails outright on a loader-built database, and dropping it
+unconditionally unselects the relations only a member node puts inside the box — which is the same
+silent thinness the predicate exists to catch.
 
 ## What a regional extract cannot answer
 

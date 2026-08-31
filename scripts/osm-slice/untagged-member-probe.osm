@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A route relation declaring one way the trail tag filter keeps and one it does not. Every element
+  sits far inside the file's own extent, so the gap it reproduces cannot be a clipping artefact.
+-->
+<osm version="0.6" generator="switchback-untagged-member-probe">
+  <bounds minlat="37.3990" minlon="-122.1010" maxlat="37.4010" maxlon="-122.0960"/>
+
+  <node id="1" version="1" lat="37.4000" lon="-122.1000"/>
+  <node id="2" version="1" lat="37.4000" lon="-122.0990"/>
+  <node id="3" version="1" lat="37.4000" lon="-122.0980"/>
+  <node id="4" version="1" lat="37.4000" lon="-122.0970"/>
+
+  <!-- Untagged: carries no `highway`, so `w/highway=...` does not match it on its own. -->
+  <way id="100" version="1">
+    <nd ref="1"/>
+    <nd ref="2"/>
+  </way>
+
+  <way id="101" version="1">
+    <nd ref="2"/>
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <tag k="highway" v="path"/>
+    <tag k="name" v="Untagged Member Probe Path"/>
+  </way>
+
+  <relation id="900" version="1">
+    <member type="way" ref="100" role=""/>
+    <member type="way" ref="101" role=""/>
+    <tag k="type" v="route"/>
+    <tag k="route" v="hiking"/>
+    <tag k="name" v="Untagged Member Probe Route"/>
+  </relation>
+</osm>
