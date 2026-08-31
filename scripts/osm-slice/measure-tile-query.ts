@@ -30,6 +30,10 @@ ORDER BY w.way_id`;
 /*
  * One row per member, ordinality carried through: a route relation is an ordered member list in
  * OSM and `assembleTrails` chains by endpoint, so losing the order loses the chain.
+ *
+ * A relation is selected by its member WAYS' geometry or by a member NODE's position, because
+ * `relation(bbox)` returns either. `measure-node-members.ts` builds that second table and reports
+ * how much it adds — two relations in northern California, none in Idaho, for 24 kB.
  */
 const RELATION_SQL = `
 WITH box AS (SELECT ST_MakeEnvelope($1, $2, $3, $4, 4326) AS g),
@@ -37,7 +41,13 @@ rel AS (
   SELECT r.relation_id, r.tags, r.members
   FROM osm.trail_relation r, box
   WHERE r.tags ->> 'route' IN ('hiking', 'foot', 'walking', 'running')
-    AND r.geom && box.g AND ST_Intersects(r.geom, box.g)
+    AND (
+      (r.geom && box.g AND ST_Intersects(r.geom, box.g))
+      OR EXISTS (
+        SELECT 1 FROM osm.relation_node_member n
+        WHERE n.relation_id = r.relation_id AND n.geom && box.g
+      )
+    )
 )
 SELECT rel.relation_id, rel.tags, m.ord,
        m.value ->> 'type' AS mtype,
@@ -103,7 +113,28 @@ export async function fetchTileElements(
   }
   const shapeMs = performance.now() - t1;
 
+  assertAscendingWayIds(elements);
   return { elements, sqlMs, shapeMs };
+}
+
+/**
+ * The ordering `chainWays` depends on, checked rather than commented. osm2pgsql clusters by
+ * geometry, so a query that loses `ORDER BY way_id` still returns the right trail *count* with
+ * silently different trails — the failure this asserts against is invisible in every other number
+ * the harness prints.
+ */
+function assertAscendingWayIds(elements: readonly OverpassElement[]): void {
+  let previous = -Infinity;
+  for (const element of elements) {
+    if (element.type !== 'way') continue;
+    if (element.id < previous) {
+      throw new Error(
+        `ways reached assembleTrails out of order: ${element.id} after ${previous}. ` +
+          'chainWays seeds in iteration order, so this changes which trails are produced.',
+      );
+    }
+    previous = element.id;
+  }
 }
 
 interface Divergence {

@@ -13,9 +13,17 @@ import { processTile } from '../../packages/ingest/src/pipeline';
 import type { OverpassQuerier, OverpassResponse } from '../../packages/ingest/src/overpass';
 import { RAW_FIXTURE_DIR } from '../../packages/ingest/test/support/raw-fixture';
 import { fetchTileElements } from './measure-tile-query';
+import { fetchContext } from './measure-context-query';
 import { getOverpass } from '../../packages/ingest/src/config';
 
 type BBox = [number, number, number, number];
+
+/**
+ * Where each Overpass shape comes from this run. `slice` is the migration as this gate scopes it —
+ * every read the pipeline makes off the local slice; `live` is the unmigrated pipeline; `sql`
+ * keeps the first gate's narrower scope, where only the trail source moved.
+ */
+type Mode = 'slice' | 'sql' | 'fixture' | 'live';
 
 function fixture(shape: string, subject: string): OverpassResponse {
   const packed = readFileSync(join(RAW_FIXTURE_DIR, `${shape}.${subject}.json.gz`));
@@ -24,6 +32,7 @@ function fixture(shape: string, subject: string): OverpassResponse {
 
 /** What each Overpass shape was served from this run, so the report can say so exactly. */
 const served = new Map<string, number>();
+const unmatched: string[] = [];
 function note(kind: string): void {
   served.set(kind, (served.get(kind) ?? 0) + 1);
 }
@@ -33,7 +42,7 @@ class MeasuredSource implements OverpassQuerier {
   contextMs = 0;
 
   constructor(
-    private readonly mode: 'sql' | 'fixture' | 'live',
+    private readonly mode: Mode,
     private readonly quadkey: string,
     private readonly bbox: BBox,
     private readonly sql: Client,
@@ -43,7 +52,7 @@ class MeasuredSource implements OverpassQuerier {
     if (ql.includes('relation["route"')) {
       const startedAt = performance.now();
       let response: OverpassResponse;
-      if (this.mode === 'sql') {
+      if (this.mode === 'sql' || this.mode === 'slice') {
         const { elements } = await fetchTileElements(this.sql, this.bbox);
         response = { elements } as OverpassResponse;
         note('tile:sql-slice');
@@ -58,7 +67,6 @@ class MeasuredSource implements OverpassQuerier {
       return response;
     }
 
-    // Context is whatever this run is configured for; the migration as scoped does not replace it.
     if (ql.includes('is_in(') || ql.includes('node["natural"')) {
       const kind = ql.includes('is_in(') ? 'region' : 'feature';
       const startedAt = performance.now();
@@ -68,6 +76,18 @@ class MeasuredSource implements OverpassQuerier {
           note(`${kind}:live-overpass`);
           return response;
         }
+        if (this.mode === 'slice') {
+          // Both halves come off the slice. `fetchContext` runs them as one pair, so asking it
+          // twice would double the work — the region call takes the cached pair's region half.
+          const centre: [number, number] = [
+            (this.bbox[0] + this.bbox[2]) / 2,
+            (this.bbox[1] + this.bbox[3]) / 2,
+          ];
+          this.context ??= fetchContext(this.sql, this.bbox, centre);
+          const answer = await this.context;
+          note(`${kind}:sql-slice`);
+          return { elements: kind === 'region' ? answer.region : answer.features } as OverpassResponse;
+        }
         note(`${kind}:recorded`);
         return fixture(kind, kind === 'region' ? '021231030' : this.quadkey);
       } finally {
@@ -76,15 +96,21 @@ class MeasuredSource implements OverpassQuerier {
     }
 
     note('other:empty');
+    // An unmatched shape is a fallback the slice did not answer and a live run would have paid
+    // for. Naming it is what keeps the two arms comparable rather than quietly asymmetric.
+    unmatched.push(ql.replace(/\s+/g, ' ').slice(0, 120));
     return { elements: [] } as OverpassResponse;
   }
+
+  /** The one context pair this tile needs, shared by the region and feature callers. */
+  private context?: Promise<Awaited<ReturnType<typeof fetchContext>>>;
 }
 
 async function main(): Promise<void> {
   const quadkey = process.argv[2]!;
   const bbox = process.argv.slice(3, 7).map(Number) as BBox;
   const osmDatabase = process.argv[7]!;
-  const mode = (process.env.MODE ?? 'sql') as 'sql' | 'fixture' | 'live';
+  const mode = (process.env.MODE ?? 'slice') as Mode;
 
   const sql = new Client({
     host: 'localhost',
@@ -130,6 +156,7 @@ async function main(): Promise<void> {
         commitLoopAndRestMs: Math.round(totalMs - source.tileSourceMs),
         ingestTileFetchMs: row[0]?.fetchMs ?? null,
         served: Object.fromEntries(served),
+        unmatched,
       },
       null,
       2,

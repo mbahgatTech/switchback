@@ -1,4 +1,10 @@
-"""Disk arithmetic for the P4 kill gate. Every input is a measured figure; nothing is estimated."""
+"""Disk arithmetic for the P4 kill gate. Every input is a measured figure; nothing is estimated.
+
+Superseded by `disk-widened.py`. The sizes below carry a duplicated GiST index on every geometry
+table — osm2pgsql creates one and `measure-extract.sh` created a second — so each overstates its
+slice, by 94 MB of 1,056 MB on northern California. Kept as the record of what the first gate
+measured; use the widened script for figures.
+"""
 
 GIB = 1024**3
 
