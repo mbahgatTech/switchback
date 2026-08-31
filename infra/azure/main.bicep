@@ -425,8 +425,8 @@ must connect — Vercel's functions and GitHub-hosted runners — have no static
 
 **A wrong value here locks the product out of its own database**, and the way back is a
 control-plane write that has to reach Azure from wherever the operator is sitting. Narrowing is
-not a template edit: `infra/azure/README.md`, "Narrowing the firewall", carries the four options,
-what each costs, and what each one breaks.
+not a template edit: `infra/azure/README.md`, "Narrowing the firewall", carries the options, what
+each costs, and what each one breaks.
 
 `@minLength(1)` refuses the empty list, which is the one wrong value that looks like a careful
 one — a server with no rule is not a narrower perimeter, it is an outage. The constraint is
