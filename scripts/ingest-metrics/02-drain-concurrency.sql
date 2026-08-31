@@ -6,6 +6,11 @@
 -- work. Concurrency is therefore a question about overlapping intervals, and D1 is the sweep line
 -- `docs/architecture.md` carries, verbatim. `INGEST_MAX_DRAINERS` is the bound it must not exceed.
 --
+-- D1-D3 count only kinds that reach an Overpass mirror, because that is all the bound covers:
+-- `enrich_trail` fetches Wikimedia and Mapillary and drains beside a tile by design. The filter
+-- mirrors `OVERPASS_FREE_JOB_KINDS` in `packages/ingest/src/backpressure.ts` and must follow it.
+-- D4 and D6 stay unfiltered — they answer what ran, not what the bound allows.
+--
 -- Two limits are load-bearing. A row revived by `enqueue` has its `completedAt` cleared, so only
 -- the most recent drain of each dedupeKey is visible: read this over hours, not months. And a job
 -- still `running` contributes no end edge, so an open lease is invisible here — D5 counts those.
@@ -24,11 +29,11 @@ select :'win_hours' as window_hours,
     select sum(delta) over (order by at, delta desc) as concurrent
       from (select "lockedAt" as at, 1 as delta from ingest_jobs
              where "completedAt" >= now() - (:'win_hours' || ' hours')::interval
-               and "lockedAt" is not null
+               and "lockedAt" is not null and kind <> 'enrich_trail'
             union all
             select "completedAt" as at, -1 from ingest_jobs
              where "completedAt" >= now() - (:'win_hours' || ' hours')::interval
-               and "lockedAt" is not null) edges
+               and "lockedAt" is not null and kind <> 'enrich_trail') edges
   ) swept;
 
 \echo ''
@@ -39,9 +44,11 @@ select day, max(concurrent) as peak, count(*) as lease_edges
            sum(delta) over (partition by date_trunc('day', at) order by at, delta desc) as concurrent
       from (select "lockedAt" as at, 1 as delta from ingest_jobs
              where "completedAt" >= now() - interval '30 days' and "lockedAt" is not null
+               and kind <> 'enrich_trail'
             union all
             select "completedAt" as at, -1 from ingest_jobs
-             where "completedAt" >= now() - interval '30 days' and "lockedAt" is not null) edges
+             where "completedAt" >= now() - interval '30 days' and "lockedAt" is not null
+               and kind <> 'enrich_trail') edges
   ) swept
  group by day
  order by day;
@@ -53,9 +60,11 @@ select day, max(concurrent) as peak, count(*) as lease_edges
 with edges as (
   select "lockedAt" as at, 1 as delta from ingest_jobs
    where "completedAt" >= now() - (:'win_hours' || ' hours')::interval and "lockedAt" is not null
+     and kind <> 'enrich_trail'
   union all
   select "completedAt" as at, -1 from ingest_jobs
    where "completedAt" >= now() - (:'win_hours' || ' hours')::interval and "lockedAt" is not null
+     and kind <> 'enrich_trail'
 ), swept as (
   select at,
          sum(delta) over (order by at, delta desc)  as concurrent,

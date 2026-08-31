@@ -684,7 +684,7 @@ describe('a burial, counted apart from a retry', () => {
 
 /**
  * `INGEST_MAX_DRAINERS` is enforced by `drainSlotGate` counting `distinct "lockedBy"` over
- * `running` rows — a reading that exists only while something is mid-drain, and eight samples over
+ * `running` rows of the Overpass-making kinds — a reading that exists only while something is mid-drain, and eight samples over
  * seventy seconds of production caught zero. Leaving the lease pair on the row after the outcome
  * is what makes the achieved concurrency recoverable from finished work instead: `lockedAt` and
  * `completedAt` bound one drain, so overlapping intervals answer it.

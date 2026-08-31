@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { JobKind } from '@switchback/db';
 import type { PrismaClient } from '@switchback/db';
+import { OVERPASS_JOB_KINDS } from '../src/backpressure';
 import { drainSlotGate, maxDrainers } from '../src/drain-slot';
-import { drainIngest } from '../src/handlers';
+import { drainIngest, ingestHandlers } from '../src/handlers';
 import { drainJobs } from '../src/jobs';
 import type { ClaimedBatch, ClaimedJob } from '../src/jobs';
 
@@ -193,5 +194,87 @@ describe('a caller that asks for no gate at all', () => {
 
     expect(recorded.raw.some((sql) => sql.includes('pg_advisory_xact_lock'))).toBe(false);
     expect(recorded.raw.some((sql) => sql.includes(CLAIM_SQL))).toBe(true);
+  });
+});
+
+/**
+ * Which kinds reach Overpass is the whole basis of the bound, so it is read off the handlers the
+ * drain registers rather than off a list somebody kept up to date.
+ */
+describe('the kinds the drain slot bounds', () => {
+  /** A z9 tile, a z12 routing tile, a relation and a trail — enough payload to reach a request. */
+  const PAYLOADS: Record<string, Record<string, unknown>> = {
+    [JobKind.ingest_tile]: { quadkey: '120230203' },
+    [JobKind.refresh_tile]: { quadkey: '120230203' },
+    [JobKind.ingest_network]: { quadkey: '120230203123' },
+    [JobKind.ingest_route]: { osmId: 1_234_567 },
+    [JobKind.enrich_trail]: { trailId: 'trail-that-is-not-there' },
+  };
+
+  /**
+   * A client that answers every model call with nothing. These cases drive each handler only as
+   * far as its first Overpass request, so what the database would have said decides nothing —
+   * and a handler that cannot get that far fails the control below rather than passing quietly.
+   */
+  function silentDb(): PrismaClient {
+    const model = new Proxy(
+      {},
+      {
+        get: (_unused, method: string) => async () =>
+          method === 'findMany' ? [] : method.startsWith('find') ? null : {},
+      },
+    );
+    return new Proxy(
+      {},
+      { get: (_unused, key) => (key === 'then' ? undefined : model) },
+    ) as unknown as PrismaClient;
+  }
+
+  /** Runs every registered handler against a client that records the request and refuses it. */
+  async function kindsThatQueryOverpass(): Promise<Set<JobKind>> {
+    const queried = new Set<JobKind>();
+    const refuse = () => Promise.reject(new Error('no request leaves this test'));
+    // The handlers run one at a time below, so the kind in flight names the caller of `query`.
+    let running: JobKind | null = null;
+
+    const handlers = ingestHandlers({
+      db: silentDb(),
+      overpass: {
+        query: () => {
+          if (running) queried.add(running);
+          return refuse();
+        },
+      },
+      fetchImpl: refuse as unknown as typeof fetch,
+    });
+
+    for (const [kind, handler] of Object.entries(handlers)) {
+      running = kind as JobKind;
+      await handler({ ...job, kind: running, payload: PAYLOADS[kind] ?? {} }).catch(
+        () => undefined,
+      );
+    }
+    return queried;
+  }
+
+  it('bounds every kind observed to reach Overpass', async () => {
+    const observed = await kindsThatQueryOverpass();
+
+    // The guard. A handler that starts making requests is caught by this rather than by an IP
+    // block, because the set it is checked against is not a copy of the same list.
+    for (const kind of observed) {
+      expect(OVERPASS_JOB_KINDS, `${kind} reaches Overpass and is not bounded`).toContain(kind);
+    }
+
+    // The control. Without it every handler could have died before its first request and the
+    // loop above would pass over an empty set.
+    expect([...observed].sort()).toEqual(
+      [
+        JobKind.ingest_network,
+        JobKind.ingest_route,
+        JobKind.ingest_tile,
+        JobKind.refresh_tile,
+      ].sort(),
+    );
   });
 });
