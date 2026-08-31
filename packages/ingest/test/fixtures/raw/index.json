@@ -1,0 +1,110 @@
+[
+  {
+    "shape": "feature",
+    "subject": "021231030",
+    "file": "feature.021231030.json.gz",
+    "recordedAt": "2026-08-30T08:18:22.693Z",
+    "timestampOsmBase": "2026-08-30T08:16:48Z",
+    "elements": 558,
+    "gzippedBytes": 13697
+  },
+  {
+    "shape": "feature",
+    "subject": "023010230",
+    "file": "feature.023010230.json.gz",
+    "recordedAt": "2026-08-30T08:20:11.535Z",
+    "timestampOsmBase": "2026-08-30T08:18:49Z",
+    "elements": 30894,
+    "gzippedBytes": 534766
+  },
+  {
+    "shape": "network",
+    "subject": "021231030323",
+    "file": "network.021231030323.json.gz",
+    "recordedAt": "2026-08-30T08:23:38.026Z",
+    "timestampOsmBase": "2026-08-30T08:21:51Z",
+    "elements": 282,
+    "gzippedBytes": 75390
+  },
+  {
+    "shape": "parent-route",
+    "subject": "1247934+1249228",
+    "file": "parent-route.1247934+1249228.json.gz",
+    "recordedAt": "2026-08-30T08:22:17.640Z",
+    "timestampOsmBase": "2026-08-30T08:20:49Z",
+    "elements": 1,
+    "gzippedBytes": 580
+  },
+  {
+    "shape": "region",
+    "subject": "021231030",
+    "file": "region.021231030.json.gz",
+    "recordedAt": "2026-08-30T08:17:54.108Z",
+    "timestampOsmBase": "2026-08-30T08:15:45Z",
+    "elements": 3,
+    "gzippedBytes": 7733
+  },
+  {
+    "shape": "relation-skeleton",
+    "subject": "7470475",
+    "file": "relation-skeleton.7470475.json.gz",
+    "recordedAt": "2026-08-30T08:21:59.877Z",
+    "timestampOsmBase": "2026-08-30T08:19:51Z",
+    "elements": 1,
+    "gzippedBytes": 487
+  },
+  {
+    "shape": "route",
+    "subject": "1225378",
+    "file": "route.1225378.json.gz",
+    "recordedAt": "2026-08-30T08:23:18.658Z",
+    "timestampOsmBase": "2026-08-30T08:21:51Z",
+    "elements": 1,
+    "gzippedBytes": 848
+  },
+  {
+    "shape": "route",
+    "subject": "7470475",
+    "file": "route.7470475.json.gz",
+    "recordedAt": "2026-08-30T08:21:59.486Z",
+    "timestampOsmBase": "2026-08-30T08:19:51Z",
+    "elements": 1,
+    "gzippedBytes": 5331
+  },
+  {
+    "shape": "tags-by-id",
+    "subject": "node.12",
+    "file": "tags-by-id.node.12.json.gz",
+    "recordedAt": "2026-08-30T08:23:57.367Z",
+    "timestampOsmBase": "2026-08-30T08:21:51Z",
+    "elements": 12,
+    "gzippedBytes": 734
+  },
+  {
+    "shape": "tile",
+    "subject": "021231030",
+    "file": "tile.021231030.json.gz",
+    "recordedAt": "2026-08-30T08:18:20.108Z",
+    "timestampOsmBase": "2026-08-30T08:16:48Z",
+    "elements": 281,
+    "gzippedBytes": 266627
+  },
+  {
+    "shape": "tile",
+    "subject": "023010230",
+    "file": "tile.023010230.json.gz",
+    "recordedAt": "2026-08-30T08:19:50.720Z",
+    "timestampOsmBase": "2026-08-30T08:18:49Z",
+    "elements": 4990,
+    "gzippedBytes": 2282021
+  },
+  {
+    "shape": "way-geometry",
+    "subject": "7470475",
+    "file": "way-geometry.7470475.json.gz",
+    "recordedAt": "2026-08-30T08:22:00.147Z",
+    "timestampOsmBase": "2026-08-30T08:19:51Z",
+    "elements": 7,
+    "gzippedBytes": 7443
+  }
+]

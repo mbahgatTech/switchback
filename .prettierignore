@@ -35,3 +35,8 @@ apps/mobile/expo-env.d.ts
 # only guarantee it has — that it is byte-identical to the published tarball whose digest
 # `src/components/map/rtl.ts` records.
 apps/web/public/vendor
+
+# recorded Overpass answers and what assembly makes of them. The goldens are written one line
+# per trail so a single changed trail is a single changed line; indenting a dense tile's 1,517
+# of them turns every re-record into a thirty-thousand-line diff nobody reads.
+packages/ingest/test/fixtures/raw

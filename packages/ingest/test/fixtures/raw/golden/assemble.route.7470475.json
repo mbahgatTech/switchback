@@ -1,0 +1,8 @@
+{
+  "shape": "route",
+  "subject": "7470475",
+  "timestampOsmBase": "2026-08-30T08:19:51Z",
+  "trails": [
+    {"osmType":"relation","osmId":7470475,"name":"Trail A","tags":{"name":"Trail A","note":"hiking trails unification project by outdoor.rocks","route":"hiking","type":"route","website":"https://outdoor.rocks/"},"bbox":[-116.714071,47.7137027,-116.669692,47.731689],"lengthM":9081.932750458918,"bridgedM":0,"memberWayIds":[36925943,35744292,35744293],"coords":{"vertices":423,"sha256":"f0a224808e7b334c7d560af727ed771064bd121d31b02963e0fa5293d83327f4"}}
+  ]
+}
