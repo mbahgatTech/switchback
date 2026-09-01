@@ -4,8 +4,12 @@
  */
 
 import { Client } from 'pg';
-import { assembleSummary, loadAssembleGolden } from '../../packages/ingest/test/support/raw-fixture';
-import type { OverpassElement } from '../../packages/ingest/src/overpass';
+import { assembleSummary, loadAssembleGolden } from './raw-fixtures';
+import type {
+  OverpassElement,
+  OverpassRelation,
+  OverpassRelationMember,
+} from '../../packages/ingest/src/overpass';
 
 type BBox = [number, number, number, number];
 
@@ -61,6 +65,23 @@ ORDER BY rel.relation_id, m.ord`;
 
 type Coord = [number, number];
 
+/** The two row shapes above, named so the rows arrive typed instead of as `any`. */
+interface WayRow {
+  way_id: string;
+  tags: Record<string, string>;
+  coords: Coord[] | null;
+}
+
+interface MemberRow {
+  relation_id: string;
+  tags: Record<string, string>;
+  ord: string;
+  mtype: string;
+  ref: string;
+  role: string | null;
+  coords: Coord[] | null;
+}
+
 function toGeometry(coords: Coord[] | null): Array<{ lat: number; lon: number }> | undefined {
   if (!coords) return undefined;
   return coords.map(([lon, lat]) => ({ lat, lon }));
@@ -73,14 +94,14 @@ export async function fetchTileElements(
   const [w, s, e, n] = bbox;
   const t0 = performance.now();
   const [ways, members] = await Promise.all([
-    client.query(WAY_SQL, [w, s, e, n, TRAIL_HIGHWAY]),
-    client.query(RELATION_SQL, [w, s, e, n]),
+    client.query<WayRow>(WAY_SQL, [w, s, e, n, TRAIL_HIGHWAY]),
+    client.query<MemberRow>(RELATION_SQL, [w, s, e, n]),
   ]);
   const sqlMs = performance.now() - t0;
 
   const t1 = performance.now();
   const elements: OverpassElement[] = [];
-  const byRelation = new Map<number, OverpassElement>();
+  const byRelation = new Map<number, OverpassRelation>();
 
   // Ways first, then relations, each ascending by id — the order Overpass emits.
   for (const row of ways.rows) {
@@ -88,8 +109,8 @@ export async function fetchTileElements(
       type: 'way',
       id: Number(row.way_id),
       tags: row.tags,
-      geometry: toGeometry(row.coords as Coord[] | null),
-    } as OverpassElement);
+      geometry: toGeometry(row.coords),
+    });
   }
 
   for (const row of members.rows) {
@@ -100,15 +121,15 @@ export async function fetchTileElements(
         id: Number(row.relation_id),
         tags: row.tags,
         members: [],
-      } as OverpassElement;
+      };
       byRelation.set(Number(row.relation_id), relation);
       elements.push(relation);
     }
-    (relation as { members: unknown[] }).members.push({
-      type: row.mtype,
+    relation.members.push({
+      type: row.mtype as OverpassRelationMember['type'],
       ref: Number(row.ref),
       role: row.role ?? '',
-      geometry: toGeometry(row.coords as Coord[] | null),
+      geometry: toGeometry(row.coords),
     });
   }
   const shapeMs = performance.now() - t1;
@@ -261,6 +282,12 @@ async function main(): Promise<void> {
   console.log(JSON.stringify(report, null, 2));
 
   const golden = loadAssembleGolden('tile', quadkey!);
+  if (!golden) {
+    // Timings above stand on their own; only the parity half needs a recording to compare against.
+    console.log(JSON.stringify({ parity: 'UNVERIFIED: no golden recorded for this tile' }, null, 2));
+    await client.end();
+    return;
+  }
   const diff = compare(golden.trails, summary);
   console.log(
     JSON.stringify(

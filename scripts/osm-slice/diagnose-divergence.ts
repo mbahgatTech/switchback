@@ -4,8 +4,7 @@
  */
 
 import { Client } from 'pg';
-import { loadAssembleGolden } from '../../packages/ingest/test/support/raw-fixture';
-import { assembleSummary } from '../../packages/ingest/test/support/raw-fixture';
+import { assembleSummary, loadAssembleGolden } from './raw-fixtures';
 import { fetchTileElements } from './measure-tile-query';
 
 const KEYS = (process.env.KEYS ?? '').split(',').filter(Boolean);
@@ -26,6 +25,10 @@ async function main(): Promise<void> {
   const { elements } = await fetchTileElements(client, bbox);
   const actual = assembleSummary(elements);
   const golden = loadAssembleGolden('tile', quadkey!);
+  if (!golden) {
+    await client.end();
+    throw new Error(`no golden recorded for tile ${quadkey}; this diagnostic compares against it`);
+  }
 
   const actualBy = new Map(actual.map((t) => [`${t.osmType}/${t.osmId}`, t]));
 

@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import { assembleTrails, MIN_TRAIL_LENGTH_M } from '../../packages/ingest/src/assemble';
-import { RAW_FIXTURE_DIR } from '../../packages/ingest/test/support/raw-fixture';
+import { RAW_FIXTURE_DIR } from './raw-fixtures';
 
 const require = createRequire(import.meta.url);
 console.log('pg              ->', require.resolve('pg'));

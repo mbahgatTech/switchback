@@ -11,7 +11,7 @@ import { Client } from 'pg';
 import { PrismaClient } from '@prisma/client';
 import { processTile } from '../../packages/ingest/src/pipeline';
 import type { OverpassQuerier, OverpassResponse } from '../../packages/ingest/src/overpass';
-import { RAW_FIXTURE_DIR } from '../../packages/ingest/test/support/raw-fixture';
+import { RAW_FIXTURE_DIR } from './raw-fixtures';
 import { fetchTileElements } from './measure-tile-query';
 import { fetchContext } from './measure-context-query';
 import { getOverpass } from '../../packages/ingest/src/config';
@@ -27,7 +27,8 @@ type Mode = 'slice' | 'sql' | 'fixture' | 'live';
 
 function fixture(shape: string, subject: string): OverpassResponse {
   const packed = readFileSync(join(RAW_FIXTURE_DIR, `${shape}.${subject}.json.gz`));
-  return JSON.parse(gunzipSync(packed).toString('utf8')).response as OverpassResponse;
+  const recorded = JSON.parse(gunzipSync(packed).toString('utf8')) as { response: OverpassResponse };
+  return recorded.response;
 }
 
 /** What each Overpass shape was served from this run, so the report can say so exactly. */
@@ -54,7 +55,7 @@ class MeasuredSource implements OverpassQuerier {
       let response: OverpassResponse;
       if (this.mode === 'sql' || this.mode === 'slice') {
         const { elements } = await fetchTileElements(this.sql, this.bbox);
-        response = { elements } as OverpassResponse;
+        response = { elements };
         note('tile:sql-slice');
       } else if (this.mode === 'live') {
         response = await getOverpass().query(ql);
@@ -86,7 +87,7 @@ class MeasuredSource implements OverpassQuerier {
           this.context ??= fetchContext(this.sql, this.bbox, centre);
           const answer = await this.context;
           note(`${kind}:sql-slice`);
-          return { elements: kind === 'region' ? answer.region : answer.features } as OverpassResponse;
+          return { elements: kind === 'region' ? answer.region : answer.features };
         }
         note(`${kind}:recorded`);
         return fixture(kind, kind === 'region' ? '021231030' : this.quadkey);
@@ -99,7 +100,7 @@ class MeasuredSource implements OverpassQuerier {
     // An unmatched shape is a fallback the slice did not answer and a live run would have paid
     // for. Naming it is what keeps the two arms comparable rather than quietly asymmetric.
     unmatched.push(ql.replace(/\s+/g, ' ').slice(0, 120));
-    return { elements: [] } as OverpassResponse;
+    return { elements: [] };
   }
 
   /** The one context pair this tile needs, shared by the region and feature callers. */
@@ -130,7 +131,7 @@ async function main(): Promise<void> {
   const source = new MeasuredSource(mode, quadkey, bbox, sql);
   const startedAt = performance.now();
   const result = await processTile(quadkey, {
-    db: db as never,
+    db,
     overpass: source,
     enrichWaypoints: true,
     logger: () => {},

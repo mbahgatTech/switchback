@@ -26,6 +26,7 @@ rather than argued. Nothing here is imported by the application.
 | `disk-arithmetic.py` | The first gate's densities against the production disk budget |
 | `disk-widened.py` | The same including the context slice, at region extent, on deduplicated sizes |
 | `tile-completeness.ts` | Does every way member a tile's route relations declare resolve to a way the slice holds? |
+| `raw-fixtures.ts` | Reads the golden Overpass recordings and reduces assembled trails to a comparable summary |
 | `untagged-member-probe.osm` | A route relation with one member the loader keeps and one it drops, no boundary in the file |
 | `untagged-member-probe.sh` | Loads that fixture and holds the gap to being either kept or reported |
 
@@ -56,8 +57,11 @@ scripts/osm-slice/measure-extract.sh /path/to/idaho-latest.osm.pbf osm_idaho
 dropping them yields route relations with nothing to assemble and ways with no coordinates, and
 the slice still looks healthy.
 
-The parity harness reads the golden Overpass recordings in
-`packages/ingest/test/fixtures/raw/`, so it needs no network:
+Every script here runs against a plain `master` checkout. The timing and completeness numbers need
+only the slice; the parity half additionally needs the golden Overpass recordings under
+`packages/ingest/test/fixtures/raw/`, which arrive with the fixture branch. When they are not
+checked out `measure-tile-query.ts` prints its timings and reports parity `UNVERIFIED` rather than
+failing, so a measurement is never lost to a missing recording:
 
 ```sh
 tsx scripts/osm-slice/measure-tile-query.ts osm_idaho 021231030 \
@@ -65,7 +69,8 @@ tsx scripts/osm-slice/measure-tile-query.ts osm_idaho 021231030 \
 ```
 
 `PERTURB=coords|drop|order` damages the SQL answer on purpose. A parity run that has not been seen
-failing proves nothing, so the control runs before the result is believed.
+failing proves nothing, so the control runs before the result is believed — which means the
+recordings have to be present for it to say anything.
 
 ## Two things that are load-bearing and do not look it
 

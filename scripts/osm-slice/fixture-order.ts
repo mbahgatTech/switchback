@@ -1,10 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 
+interface Recorded {
+  response: { elements: Array<{ type: string; id: number }> };
+}
+
 const quadkey = process.argv[2] ?? '021231030';
 const path = `packages/ingest/test/fixtures/raw/tile.${quadkey}.json.gz`;
-const rec = JSON.parse(gunzipSync(readFileSync(path)).toString('utf8'));
-const els = rec.response.elements as Array<{ type: string; id: number }>;
+const rec = JSON.parse(gunzipSync(readFileSync(path)).toString('utf8')) as Recorded;
+const els = rec.response.elements;
 
 const order = els.map((e) => e.type);
 const firstWay = order.indexOf('way');

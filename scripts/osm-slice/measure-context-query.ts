@@ -6,7 +6,7 @@
 import { Client } from 'pg';
 import { classifyWaypoint, featurePosition, featureSearchBBox } from '../../packages/ingest/src/enrich';
 import { pickRegion } from '../../packages/ingest/src/tile-context';
-import { loadRawFixture } from '../../packages/ingest/test/support/raw-fixture';
+import { loadRawFixture } from './raw-fixtures';
 import type { OverpassElement } from '../../packages/ingest/src/overpass';
 
 type BBox = [number, number, number, number];
@@ -51,6 +51,18 @@ export interface ContextAnswer {
   featureMs: number;
 }
 
+/** The row shapes the three statements above return, so the rows arrive typed instead of as `any`. */
+interface RegionQueryRow {
+  tags: Record<string, string>;
+}
+
+interface FeatureQueryRow {
+  id: string;
+  tags: Record<string, string>;
+  lon: number;
+  lat: number;
+}
+
 /** Both context lookups, shaped as the elements `pickRegion` and `buildFeatureIndex` read. */
 export async function fetchContext(
   client: Client,
@@ -60,33 +72,38 @@ export async function fetchContext(
   const search = featureSearchBBox(bbox);
 
   const t0 = performance.now();
-  const region = await client.query(REGION_SQL, [at[0], at[1]]);
+  const region = await client.query<RegionQueryRow>(REGION_SQL, [at[0], at[1]]);
   const regionMs = performance.now() - t0;
 
   const t1 = performance.now();
   const [nodes, ways] = await Promise.all([
-    client.query(FEATURE_NODE_SQL, search),
-    client.query(FEATURE_WAY_SQL, search),
+    client.query<FeatureQueryRow>(FEATURE_NODE_SQL, search),
+    client.query<FeatureQueryRow>(FEATURE_WAY_SQL, search),
   ]);
   const featureMs = performance.now() - t1;
 
   const features: OverpassElement[] = [
     ...nodes.rows.map(
-      (r) => ({ type: 'node', id: Number(r.id), lat: r.lat, lon: r.lon, tags: r.tags }) as OverpassElement,
+      (r): OverpassElement => ({
+        type: 'node',
+        id: Number(r.id),
+        lat: r.lat,
+        lon: r.lon,
+        tags: r.tags,
+      }),
     ),
     ...ways.rows.map(
-      (r) =>
-        ({
-          type: 'way',
-          id: Number(r.id),
-          center: { lat: r.lat, lon: r.lon },
-          tags: r.tags,
-        }) as OverpassElement,
+      (r): OverpassElement => ({
+        type: 'way',
+        id: Number(r.id),
+        center: { lat: r.lat, lon: r.lon },
+        tags: r.tags,
+      }),
     ),
   ];
 
   return {
-    region: region.rows.map((r) => ({ type: 'area', id: 0, tags: r.tags }) as OverpassElement),
+    region: region.rows.map((r): OverpassElement => ({ type: 'area', id: 0, tags: r.tags })),
     features,
     regionMs,
     featureMs,
