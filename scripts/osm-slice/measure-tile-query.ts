@@ -5,6 +5,7 @@
 
 import { Client } from 'pg';
 import { assembleSummary, loadAssembleGolden } from './raw-fixtures';
+import { hasNodeMemberTable } from './tile-completeness';
 import type {
   OverpassElement,
   OverpassRelation,
@@ -37,20 +38,27 @@ ORDER BY w.way_id`;
  *
  * A relation is selected by its member WAYS' geometry or by a member NODE's position, because
  * `relation(bbox)` returns either. `measure-node-members.ts` builds that second table and reports
- * how much it adds — two relations in northern California, none in Idaho, for 24 kB.
+ * how much it adds — two relations in northern California, none in Idaho, for 24 kB. It is not
+ * part of the documented build, so the clause naming it is included only where it exists;
+ * unguarded, this query dies on every slice `measure-extract.sh` produces.
  */
-const RELATION_SQL = `
+function relationSql(withNodeMembers: boolean): string {
+  const nodeMemberClause = withNodeMembers
+    ? `
+      OR EXISTS (
+        SELECT 1 FROM osm.relation_node_member n
+        WHERE n.relation_id = r.relation_id AND n.geom && box.g
+      )`
+    : '';
+
+  return `
 WITH box AS (SELECT ST_MakeEnvelope($1, $2, $3, $4, 4326) AS g),
 rel AS (
   SELECT r.relation_id, r.tags, r.members
   FROM osm.trail_relation r, box
   WHERE r.tags ->> 'route' IN ('hiking', 'foot', 'walking', 'running')
     AND (
-      (r.geom && box.g AND ST_Intersects(r.geom, box.g))
-      OR EXISTS (
-        SELECT 1 FROM osm.relation_node_member n
-        WHERE n.relation_id = r.relation_id AND n.geom && box.g
-      )
+      (r.geom && box.g AND ST_Intersects(r.geom, box.g))${nodeMemberClause}
     )
 )
 SELECT rel.relation_id, rel.tags, m.ord,
@@ -62,6 +70,7 @@ FROM rel
 CROSS JOIN LATERAL jsonb_array_elements(rel.members) WITH ORDINALITY AS m(value, ord)
 LEFT JOIN osm.trail_way w ON m.value ->> 'type' = 'way' AND w.way_id = (m.value ->> 'ref')::bigint
 ORDER BY rel.relation_id, m.ord`;
+}
 
 type Coord = [number, number];
 
@@ -92,10 +101,13 @@ export async function fetchTileElements(
   bbox: BBox,
 ): Promise<{ elements: OverpassElement[]; sqlMs: number; shapeMs: number }> {
   const [w, s, e, n] = bbox;
+  // Probed outside the timed section: which tables the slice has is a fact about the harness's
+  // input, not part of the query whose cost is being compared against Overpass.
+  const relationSqlForSlice = relationSql(await hasNodeMemberTable(client));
   const t0 = performance.now();
   const [ways, members] = await Promise.all([
     client.query<WayRow>(WAY_SQL, [w, s, e, n, TRAIL_HIGHWAY]),
-    client.query<MemberRow>(RELATION_SQL, [w, s, e, n]),
+    client.query<MemberRow>(relationSqlForSlice, [w, s, e, n]),
   ]);
   const sqlMs = performance.now() - t0;
 

@@ -16,7 +16,15 @@ const INSIDE = 'LINESTRING(10.1 45.1, 10.3 45.3)';
 /** Starts in the box and runs off it: the normal shape of a route relation on a z9 tile. */
 const CROSSING = 'LINESTRING(10.9 45.9, 11.5 46.5)';
 const OUTSIDE = 'LINESTRING(20 55, 20.1 55.1)';
-const SCRATCH_DB = 'switchback_osm_completeness_test';
+/** Passes north of the box and then east of it: bounding box over the tile, line never in it. */
+const WRAPPING = 'LINESTRING(9.5 46.5, 12 46.5, 12 44.5)';
+
+/*
+ * Unique per run. The container is shared by every agent, CI shard and second terminal on this
+ * machine, and a fixed name means two runs create and truncate one physical database: the later
+ * one dies in setup, the earlier one has its fixtures deleted out from under its assertions.
+ */
+const SCRATCH_DB = `switchback_osm_completeness_${process.pid}_${Date.now().toString(36)}`;
 
 function connection(database: string): ConstructorParameters<typeof Client>[0] {
   const url = process.env.DATABASE_URL;
@@ -44,7 +52,9 @@ function connection(database: string): ConstructorParameters<typeof Client>[0] {
 }
 
 let client: Client;
-let reachable = true;
+/** Whether teardown has anything to close or drop. `beforeAll` can fail before either exists. */
+let connected = false;
+let scratchCreated = false;
 
 /** The two tables `switchback.lua` defines for the trail slice, and nothing else it does not. */
 const SCHEMA_SQL = `
@@ -120,26 +130,30 @@ async function withNodeMemberTable(
   }
 }
 
+/*
+ * Deliberately unguarded against an unreachable database. Swallowing the connection error and
+ * skipping would report a passing file for a predicate that never ran, and `mutate-completeness.sh`
+ * reads this suite's result as a mutation verdict — so every mutation would score as caught.
+ */
 beforeAll(async () => {
   const admin = new Client(connection('postgres'));
+  await admin.connect();
   try {
-    await admin.connect();
-  } catch {
-    reachable = false;
-    return;
+    await admin.query(`CREATE DATABASE ${SCRATCH_DB}`);
+    scratchCreated = true;
+  } finally {
+    await admin.end();
   }
-  await admin.query(`DROP DATABASE IF EXISTS ${SCRATCH_DB}`);
-  await admin.query(`CREATE DATABASE ${SCRATCH_DB}`);
-  await admin.end();
 
   client = new Client(connection(SCRATCH_DB));
   await client.connect();
+  connected = true;
   await client.query(SCHEMA_SQL);
 }, 120_000);
 
 afterAll(async () => {
-  if (!reachable) return;
-  await client.end();
+  if (connected) await client.end();
+  if (!scratchCreated) return;
   const admin = new Client(connection('postgres'));
   await admin.connect();
   await admin.query(`DROP DATABASE IF EXISTS ${SCRATCH_DB}`);
@@ -147,13 +161,11 @@ afterAll(async () => {
 }, 60_000);
 
 beforeEach(async () => {
-  if (!reachable) return;
   await client.query('TRUNCATE osm.trail_way, osm.trail_relation');
 });
 
 describe.sequential('tileCompleteness', () => {
-  it('resolves every member of a relation whose ways are all in the slice', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('resolves every member of a relation whose ways are all in the slice', async () => {
     await insertWay(11, 'LINESTRING(10.1 45.1, 10.2 45.2)');
     await insertWay(12, 'LINESTRING(10.2 45.2, 10.3 45.3)');
     await insertRelation(1, wayMembers(11, 12), INSIDE);
@@ -166,8 +178,7 @@ describe.sequential('tileCompleteness', () => {
     expect(report.incomplete).toEqual([]);
   });
 
-  it('reports the relation and the ref when a declared way is not in the slice', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('reports the relation and the ref when a declared way is not in the slice', async () => {
     await insertWay(21, 'LINESTRING(10.1 45.1, 10.2 45.2)');
     await insertRelation(2, wayMembers(21, 22), INSIDE);
 
@@ -180,8 +191,7 @@ describe.sequential('tileCompleteness', () => {
     ]);
   });
 
-  it('still scores the tile when osm.relation_node_member does not exist', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('still scores the tile when osm.relation_node_member does not exist', async () => {
     await insertWay(31, 'LINESTRING(10.1 45.1, 10.2 45.2)');
     await insertRelation(3, wayMembers(31, 32), INSIDE);
 
@@ -199,8 +209,7 @@ describe.sequential('tileCompleteness', () => {
    * ordinary case, not the exotic one. Both fixtures declare an absent member, so `incomplete`
    * names exactly which relations the predicate selected.
    */
-  it('selects a relation crossing the tile edge and not one wholly outside it', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('selects a relation crossing the tile edge and not one wholly outside it', async () => {
     await insertWay(41, CROSSING);
     await insertRelation(4, wayMembers(41, 49), CROSSING);
     await insertRelation(5, wayMembers(51, 59), OUTSIDE);
@@ -213,12 +222,27 @@ describe.sequential('tileCompleteness', () => {
   });
 
   /*
+   * `&&` is the index filter and `ST_Intersects` the exact answer, and on every fixture above the
+   * two agree — so dropping the exact test costs nothing there. A long route that passes around a
+   * tile has a bounding box over it and a line that never enters it, which is the only shape that
+   * separates them, and the ordinary shape of a route relation rather than an exotic one.
+   */
+  it('does not select a relation whose bounding box covers the tile but whose line stays outside', async () => {
+    await insertRelation(12, wayMembers(1201, 1202), INSIDE);
+    await insertRelation(13, wayMembers(1301, 1302), WRAPPING);
+
+    const report = await tileCompleteness(client, BOX);
+
+    expect(report.relations).toBe(1);
+    expect(report.incomplete.map((r) => r.relationId)).toEqual([12]);
+  });
+
+  /*
    * A route relation carries guideposts and sub-routes alongside its ways. Counting those as
    * declared members invents missing ways out of nodes, and a gate that refuses tiles over
    * members that were never ways is a gate an operator turns off.
    */
-  it('counts only way members, and never reports a node or relation member missing', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('counts only way members, and never reports a node or relation member missing', async () => {
     await insertWay(61, 'LINESTRING(10.1 45.1, 10.2 45.2)');
     await insertWay(62, 'LINESTRING(10.2 45.2, 10.3 45.3)');
     await insertRelation(
@@ -239,10 +263,35 @@ describe.sequential('tileCompleteness', () => {
     expect(report.incomplete).toEqual([]);
   });
 
+  /*
+   * The counts above stay right whether or not the reported refs discriminate on member type,
+   * because that fixture resolves completely and `missingRefs` is never populated. `missingRefs`
+   * is the gate's only actionable output — an operator asks Overpass for exactly those ids — so
+   * an incomplete relation carrying a node and a sub-route is what pins the filter inside it.
+   */
+  it('names only way refs when an incomplete relation also declares node and relation members', async () => {
+    await insertWay(141, 'LINESTRING(10.1 45.1, 10.2 45.2)');
+    await insertRelation(
+      14,
+      members(
+        { type: 'way', ref: 141 },
+        { type: 'node', ref: 1491, role: 'guidepost' },
+        { type: 'way', ref: 142 },
+        { type: 'relation', ref: 1481 },
+      ),
+      INSIDE,
+    );
+
+    const report = await tileCompleteness(client, BOX);
+
+    expect(report.incomplete).toEqual([
+      { relationId: 14, name: 'probe route', declared: 2, resolved: 1, missingRefs: [142] },
+    ]);
+  });
+
   // OSM ids are unique per element type, so a node and a way can share a number. The join has to
   // discriminate on type or that collision resolves a member the slice does not actually hold.
-  it('does not resolve a node member whose ref collides with a way in the slice', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('does not resolve a node member whose ref collides with a way in the slice', async () => {
     await insertWay(71, 'LINESTRING(10.1 45.1, 10.2 45.2)');
     await insertWay(72, 'LINESTRING(10.2 45.2, 10.3 45.3)');
     await insertRelation(7, members({ type: 'way', ref: 71 }, { type: 'node', ref: 72 }), INSIDE);
@@ -259,8 +308,7 @@ describe.sequential('tileCompleteness', () => {
    * select is one whose missing members it can never report, so the tile scores complete on a
    * thinner set than the adapter will fetch — the silent thinness this exists to catch.
    */
-  it('scores every route value the adapter selects, and no others', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('scores every route value the adapter selects, and no others', async () => {
     await insertRelation(81, wayMembers(8101), INSIDE, 'hiking');
     await insertRelation(82, wayMembers(8201), INSIDE, 'foot');
     await insertRelation(83, wayMembers(8301), INSIDE, 'walking');
@@ -274,8 +322,7 @@ describe.sequential('tileCompleteness', () => {
     expect(report.incomplete.map((r) => r.relationId)).toEqual([81, 82, 83, 84]);
   });
 
-  it('selects a relation held in the box only by a member node when that table exists', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('selects a relation held in the box only by a member node when that table exists', async () => {
     await insertWay(91, OUTSIDE);
     await insertRelation(9, wayMembers(91, 92), OUTSIDE);
 
@@ -296,8 +343,7 @@ describe.sequential('tileCompleteness', () => {
    * true either way. Three relations separate the two terms — 101 is held by a node in the box,
    * 102 by a node outside it, 103 by no node at all — so dropping either term changes the answer.
    */
-  it('selects by member node only for that relation and only inside the tile', async (ctx) => {
-    if (!reachable) ctx.skip();
+  it('selects by member node only for that relation and only inside the tile', async () => {
     await insertRelation(101, wayMembers(10101), OUTSIDE);
     await insertRelation(102, wayMembers(10201), OUTSIDE);
     await insertRelation(103, wayMembers(10301), OUTSIDE);

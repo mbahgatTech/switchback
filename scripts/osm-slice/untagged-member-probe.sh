@@ -10,7 +10,9 @@ set -euo pipefail
 # stays green without being edited. What it forbids is the third state — the way silently absent
 # AND the predicate blind to it — which is the permanent data loss the gate exists to prevent.
 
-DB=${PROBE_DB:-osm_untagged_member_probe}
+# Unique per run: the container is shared, and a fixed name means a second probe drops the
+# database this one is loading into. `$$` is this shell's pid; the trap below drops it either way.
+DB=${PROBE_DB:-osm_untagged_member_probe_$$}
 STYLE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$STYLE_DIR/../.." && pwd)
 
@@ -44,7 +46,6 @@ echo "== osm2pgsql version =="
 docker run --rm "$OSM2PGSQL_IMAGE" osm2pgsql --version 2>&1 | sed -n '1p'
 
 echo "== creating $DB =="
-psql_db postgres "DROP DATABASE IF EXISTS $DB" >/dev/null
 psql_db postgres "CREATE DATABASE $DB" >/dev/null
 psql_db "$DB" "CREATE EXTENSION IF NOT EXISTS postgis" >/dev/null
 psql_db "$DB" "CREATE SCHEMA IF NOT EXISTS osm" >/dev/null

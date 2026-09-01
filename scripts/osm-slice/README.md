@@ -58,20 +58,28 @@ scripts/osm-slice/measure-extract.sh /path/to/idaho-latest.osm.pbf osm_idaho
 dropping them yields route relations with nothing to assemble and ways with no coordinates, and
 the slice still looks healthy.
 
-Every script here runs against a plain `master` checkout. The timing and completeness numbers need
-only the slice; the parity half additionally needs the golden Overpass recordings under
-`packages/ingest/test/fixtures/raw/`, which arrive with the fixture branch. When they are not
-checked out `measure-tile-query.ts` prints its timings and reports parity `UNVERIFIED` rather than
-failing, so a measurement is never lost to a missing recording:
+Every script here runs against a plain `master` checkout, including a slice built only by the
+command above — no script names a table `measure-extract.sh` does not create. The timing and
+completeness numbers need nothing else. The parity half additionally needs one golden summary per
+tile, which lives on the fixture branch and is a plain JSON file of tens to hundreds of kilobytes,
+not one of the gzipped recordings beside it:
 
 ```sh
+mkdir -p packages/ingest/test/fixtures/raw/golden
+git fetch origin test/golden-overpass-fixtures
+git cat-file -p origin/test/golden-overpass-fixtures:packages/ingest/test/fixtures/raw/golden/assemble.tile.021231030.json \
+  > packages/ingest/test/fixtures/raw/golden/assemble.tile.021231030.json
+
 tsx scripts/osm-slice/measure-tile-query.ts osm_idaho 021231030 \
   -116.71875 47.5172006978394 -116.015625 47.98992166741418
 ```
 
+Without that file the run prints its timings and reports parity `UNVERIFIED` rather than failing,
+so a measurement is never lost to a missing recording.
+
 `PERTURB=coords|drop|order` damages the SQL answer on purpose. A parity run that has not been seen
-failing proves nothing, so the control runs before the result is believed — which means the
-recordings have to be present for it to say anything.
+failing proves nothing, so the control runs before the result is believed — which means the golden
+has to be present for it to say anything.
 
 ## Two things that are load-bearing and do not look it
 
@@ -116,16 +124,26 @@ different set of relations than the adapter reads would score a tile the adapter
 
 Every term in that selection is one an edit could quietly weaken while the tool still prints a
 plausible number, so each has a fixture that separates it from its neighbours: a relation crossing
-the tile edge (the only geometry that tells `ST_Intersects` from `ST_Within`), a relation carrying
-node and sub-relation members alongside its ways, a node member whose ref collides with a real way
-id, one relation per selected route value plus two excluded ones, and three relations sharing a
-node-member table so the clause's positional and correlation terms move independently.
+the tile edge (the only geometry that tells `ST_Intersects` from `ST_Within`), a relation whose
+bounding box covers the tile while its line passes around it (the only geometry that tells the
+exact test from the `&&` index filter), a relation carrying node and sub-relation members
+alongside its ways, an incomplete relation carrying them (the counts are right either way; only
+the reported refs move), a node member whose ref collides with a real way id, one relation per
+selected route value plus two excluded ones, and three relations sharing a node-member table so
+the clause's positional and correlation terms move independently.
+
 `mutate-completeness.sh` applies each weakening in turn and reruns
 `test/osm-slice-completeness.db.test.ts`, which is what makes the coverage a differential:
 
 ```sh
 bash scripts/osm-slice/mutate-completeness.sh within
 ```
+
+Its verdict is a **named assertion failure**, not an exit code. A suite that cannot reach its
+database exits 1 with every test skipped, which is indistinguishable from a caught mutation if the
+exit code is all you read — so each run first reverts the mutation and requires that control run
+green, then requires the mutated run to execute the same number of tests and fail at least one,
+and prints which. `NOT EVALUATED` (exit 5) is the third outcome.
 
 **The gaps are interior.** `osm2pgsql` never calls the style's way callback for a way carrying no
 tags, so an untagged way that a route relation declares as a member is gone before
@@ -143,10 +161,15 @@ later keeps untagged relation members satisfies branch A and the check stays gre
 it forbids is the third state — the way absent and the predicate blind to it.
 
 `osm.relation_node_member` is built after the fact by `measure-node-members.ts` and never by
-`switchback.lua`. The predicate probes for it and includes the node-member term only when it is
-really there: naming it unconditionally fails outright on a loader-built database, and dropping it
-unconditionally unselects the relations only a member node puts inside the box — which is the same
-silent thinness the predicate exists to catch.
+`switchback.lua`. Both `tile-completeness.ts` and `measure-tile-query.ts` probe for it and include
+the node-member term only when it is really there: naming it unconditionally fails outright on a
+loader-built database, and dropping it unconditionally unselects the relations only a member node
+puts inside the box — which is the same silent thinness the predicate exists to catch.
+
+The completeness suite needs a database. It creates a scratch one per run, named with the process
+id, because the container is shared: two runs against one fixed name give the second a setup
+failure and the first a truncated fixture mid-assertion. A run that cannot reach Postgres fails
+rather than skipping, so a green suite always means the predicate executed.
 
 ## What a regional extract cannot answer
 
