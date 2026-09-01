@@ -14,7 +14,7 @@ import {
   quadkeyToTile,
 } from '@switchback/geo';
 import { DRAIN_ADMISSION_KEY } from './drain-slot';
-import { isTileFresh, isTileSettled } from './freshness';
+import { isRefetchDue, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
 import { DEFAULT_MAX_ATTEMPTS, LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
 
@@ -107,6 +107,8 @@ export interface ChildTile {
   quadkey: string;
   status: TileStatus;
   fetchedAt: Date | null;
+  /** When the source's own data was current. See `TileFreshness`. */
+  sourceSnapshotAt: Date | null;
   trailCount: number;
   fetchMs: number | null;
   /** Runs of this tile, ever. The revival cap counts in these — see `SPLIT_CHILD_ATTEMPT_CAP`. */
@@ -117,6 +119,7 @@ export interface ChildTile {
 export interface Rollup {
   status: TileStatus;
   fetchedAt: Date;
+  sourceSnapshotAt: Date | null;
   trailCount: number;
   fetchMs: number;
 }
@@ -129,6 +132,16 @@ export interface Rollup {
  * corrects that until the TTL. And **the oldest child sets `fetchedAt`**, so the parent leaves
  * the TTL when its stalest quarter does — taking the freshest would let one child refreshed
  * yesterday hold three stale ones out of the refresh sweep indefinitely.
+ *
+ * `sourceSnapshotAt` follows the same stalest-quarter rule, and separately: the child with the
+ * oldest fetch need not be the one holding the oldest data. Dropping it here would leave every
+ * promoted parent with a null source stamp and hand it back the fetch-only freshness this
+ * column exists to end.
+ *
+ * Every settled quarter is asked for that stamp, `empty` included. An extract answering
+ * out-of-area ground `200 OK` with zero elements lands as `empty` carrying the extract's own
+ * date, so discounting those quarters — by status or by trail count — is how a parent gets
+ * stamped from its live siblings and reports fresh over ground nothing will re-query.
  */
 export function rollUp(children: readonly ChildTile[]): Rollup | null {
   if (children.length !== CHILDREN_PER_TILE) return null;
@@ -139,6 +152,14 @@ export function rollUp(children: readonly ChildTile[]): Rollup | null {
   const oldest = children.reduce((a, b) => (a.fetchedAt! < b.fetchedAt! ? a : b));
   const trailCount = children.reduce((sum, child) => sum + child.trailCount, 0);
 
+  /*
+   * Nulls are skipped rather than treated as "unknown, therefore stale": a child written before
+   * the column existed would otherwise drag its three siblings' real stamps out of the answer.
+   * The parent's `fetchedAt` still bounds the result, so skipping can only ever be as weak as
+   * the old behaviour, never weaker.
+   */
+  const stamps = children.map((child) => child.sourceSnapshotAt).filter((at) => at !== null);
+
   return {
     // `empty` only when every child was: it is what lets the refresh sweep skip ocean, and one
     // child with trails in it makes the parent a place worth re-querying.
@@ -146,6 +167,7 @@ export function rollUp(children: readonly ChildTile[]): Rollup | null {
       ? TileStatus.empty
       : TileStatus.ready,
     fetchedAt: oldest.fetchedAt!,
+    sourceSnapshotAt: stamps.length === 0 ? null : stamps.reduce((a, b) => (a < b ? a : b)),
     trailCount,
     fetchMs: children.reduce((sum, child) => sum + (child.fetchMs ?? 0), 0),
   };
@@ -155,6 +177,7 @@ const childSelect = {
   quadkey: true,
   status: true,
   fetchedAt: true,
+  sourceSnapshotAt: true,
   trailCount: true,
   fetchMs: true,
   attempts: true,
@@ -185,9 +208,9 @@ export type TileSnapshot = { status: TileStatus; fetchedAt: Date | null } | null
  *
  * A parent that has served trails before keeps its `ready`/`empty` status and its old
  * `fetchedAt` rather than dropping to `pending`. `ensureCoverage` classifies a settled-but-stale
- * tile as ready-and-refreshing and anything else as pending, so demoting it would flip a reader
- * from "here are your trails, refreshing" to "still loading" for as long as the four children
- * take.
+ * tile as ready — refreshing too, once a re-fetch is due — and anything else as pending, so
+ * demoting it would flip a reader from "here are your trails, refreshing" to "still loading" for
+ * as long as the four children take.
  *
  * **`previous` is a parameter and not a read, because by the time this runs the row no longer
  * says what the tile was.** `processTile` writes `running` before it fetches, so a re-read here
@@ -285,6 +308,10 @@ export interface ChildQueueOutcome {
  * the ladder restarts for as long as anyone leaves a map open over the parent. `attempts` on the
  * *tile* survives the revival where the job's does not.
  *
+ * A child that keeps *succeeding* with data past the TTL runs away the same way and the cap cannot
+ * see it — the job settles `done`, never `dead` — so `isRefetchDue` rather than `!isTileFresh`
+ * decides what is outstanding. Both readings agree on every child whose stamp can still move.
+ *
  * Past the cap the parent is **held, not promoted**: `rollUp` needs all four children settled, so
  * an abandoned child leaves the parent short rather than letting it report an area complete with a
  * quarter of it missing. `rollUpSplitTile` names the abandoned children on the parent's row and in
@@ -296,7 +323,7 @@ export async function queueStaleChildren(
   now: Date,
   priority = SPLIT_PRIORITY,
 ): Promise<ChildQueueOutcome> {
-  const outstanding = children.filter((child) => !isTileFresh(child, now));
+  const outstanding = children.filter((child) => isRefetchDue(child, now));
   if (outstanding.length === 0) return { queued: [], waiting: [], exhausted: [], abandoned: [] };
 
   const jobs = await db.ingestJob.findMany({
@@ -349,6 +376,8 @@ export async function promoteFrom(db: PrismaClient, quadkey: string): Promise<st
 
     await db.ingestTile.update({
       where: { quadkey: key },
+      // Spread rather than a column list: every field `Rollup` carries belongs on the parent's
+      // row, and naming them here drops the next one added without failing to compile.
       data: { ...settled, lastError: null },
     });
     promoted.push(key);

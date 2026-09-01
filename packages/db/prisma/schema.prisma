@@ -638,8 +638,8 @@ model IngestTile {
   bboxE Float
   bboxN Float
 
-  /// When Overpass was last queried for this tile. Freshness is judged from this, not
-  /// from `updatedAt`, which a failed attempt would also bump.
+  /// When Overpass was last queried for this tile. Freshness takes the older of this and
+  /// `sourceSnapshotAt`, never `updatedAt`, which a failed attempt would also bump.
   fetchedAt  DateTime?
   trailCount Int       @default(0)
   attempts   Int       @default(0)
@@ -650,7 +650,8 @@ model IngestTile {
 
   /// How current the source's own copy of OSM was when it answered — `timestamp_osm_base`,
   /// not the moment we asked. Null on a row written before a fetch recorded it, and on any
-  /// answer that carried no such stamp.
+  /// answer that carried no such stamp. `isTileFresh` takes the older of this and `fetchedAt`,
+  /// so backfilling it with a clock rather than a real stamp would re-open the gap it closes.
   sourceSnapshotAt DateTime?
   /// Which upstream filled this tile. Null for the same two reasons as `sourceSnapshotAt`.
   sourceKind       TileSource?

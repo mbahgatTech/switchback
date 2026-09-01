@@ -6,7 +6,6 @@ import {
   TRAIL_LOST_MARKER,
   chooseHero,
   fetchWayGeometries,
-  isTileFresh,
   processTile,
   uniqueSlug,
 } from '../src/pipeline';
@@ -20,37 +19,6 @@ import type { TerrariumTile } from '@switchback/geo';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
 const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
-
-describe('isTileFresh', () => {
-  it('serves cached data inside the TTL', () => {
-    expect(isTileFresh({ status: TileStatus.ready, fetchedAt: ago(29 * 24 * 3600_000) }, NOW)).toBe(
-      true,
-    );
-  });
-
-  it('counts an empty tile as fresh, so ocean is not re-queried every request', () => {
-    expect(isTileFresh({ status: TileStatus.empty, fetchedAt: ago(1000) }, NOW)).toBe(true);
-  });
-
-  it('expires past the TTL', () => {
-    expect(isTileFresh({ status: TileStatus.ready, fetchedAt: ago(TILE_TTL_MS + 1) }, NOW)).toBe(
-      false,
-    );
-  });
-
-  it('never serves a tile that failed or is still running', () => {
-    // A failed tile with a stale fetchedAt would otherwise render an empty map as though
-    // the area genuinely had no trails.
-    expect(isTileFresh({ status: TileStatus.failed, fetchedAt: ago(1000) }, NOW)).toBe(false);
-    expect(isTileFresh({ status: TileStatus.running, fetchedAt: ago(1000) }, NOW)).toBe(false);
-    expect(isTileFresh({ status: TileStatus.pending, fetchedAt: ago(1000) }, NOW)).toBe(false);
-  });
-
-  it('treats a never-fetched or absent tile as cold', () => {
-    expect(isTileFresh({ status: TileStatus.ready, fetchedAt: null }, NOW)).toBe(false);
-    expect(isTileFresh(null, NOW)).toBe(false);
-  });
-});
 
 describe('processTile', () => {
   it('refuses a quadkey below the ingest zoom before touching the database', async () => {
@@ -596,9 +564,9 @@ describe('processTile, a trail that would not commit', () => {
   it('refuses to report ready with a trail it could not commit', async () => {
     /*
      * Tile 1202212023 in production: `status=ready, trailCount=900`, and four of the six trails
-     * its log named have no row in `trails` at all. `ready` plus `fetchedAt` is what
-     * `isTileFresh` sells to `ensureCoverage`, so that write bought `TILE_TTL_MS` of silence
-     * over ground with holes in it.
+     * its log named have no row in `trails` at all. `ready`, `fetchedAt` and `sourceSnapshotAt`
+     * are what `isTileFresh` sells to `ensureCoverage`, so that write bought `TILE_TTL_MS` of
+     * silence over ground with holes in it.
      */
     const db = timingOutTransaction();
     const { recorded } = db as unknown as { recorded: Recorded };

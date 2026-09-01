@@ -21,7 +21,14 @@ import {
   unsplitTile,
 } from '../src/subdivide';
 import type { ChildTile } from '../src/subdivide';
-import { TILE_TTL_MS } from '../src/freshness';
+import { REFETCH_INTERVAL_MS, TILE_TTL_MS, isTileSettled } from '../src/freshness';
+
+/**
+ * Every status `queueStaleChildren` treats as settled data, from the helper rather than named
+ * here. One predicate judges all of them, so the stamp has to be asked of each: a split parent
+ * whose stale `empty` child is exempt re-promotes from ground nothing ever re-fetches.
+ */
+const SETTLED = Object.values(TileStatus).filter(isTileSettled);
 
 const PARENT = '120221203';
 const NOW = new Date('2026-08-05T12:00:00Z');
@@ -32,6 +39,7 @@ function child(quadkey: string, overrides: Partial<ChildTile> = {}): ChildTile {
     quadkey,
     status: TileStatus.ready,
     fetchedAt: NOW,
+    sourceSnapshotAt: null,
     trailCount: 10,
     fetchMs: 1000,
     attempts: 0,
@@ -42,6 +50,16 @@ function child(quadkey: string, overrides: Partial<ChildTile> = {}): ChildTile {
 /** All four children of `PARENT`, each ready unless the caller says otherwise. */
 function siblings(overrides: Partial<ChildTile>[] = []): ChildTile[] {
   return childQuadkeys(PARENT).map((key, index) => child(key, overrides[index] ?? {}));
+}
+
+/**
+ * A child of `status` carrying what the writer would have left on it. `trailCount` follows the
+ * status rather than being a knob — `processTile` writes `empty` exactly when it assembled no
+ * trails — so a roll-up discounting a quarter by its trail count is caught by the same fixture as
+ * one discounting it by its status word.
+ */
+function settled(status: TileStatus, overrides: Partial<ChildTile> = {}): Partial<ChildTile> {
+  return { status, trailCount: status === TileStatus.empty ? 0 : 10, ...overrides };
 }
 
 interface Recorded {
@@ -155,6 +173,7 @@ describe('rollUp', () => {
     expect(rollUp(siblings())).toEqual({
       status: TileStatus.ready,
       fetchedAt: NOW,
+      sourceSnapshotAt: null,
       trailCount: 40,
       fetchMs: 4000,
     });
@@ -197,6 +216,53 @@ describe('rollUp', () => {
       TileStatus.ready,
     );
   });
+
+  it.each(SETTLED)('takes the oldest source stamp off a %s child like any other', (status) => {
+    /*
+     * Source age and fetch age need not sit on the same child, and neither does status. Here the
+     * child with the most recent fetch is the one holding the oldest data, so a parent that
+     * carried up only the fetch clock would report a month-old quarter as current — the same
+     * laundering the column exists to stop, one level up the tree. Asked of every settled status
+     * because an `empty` quarter reads as having answered about nothing, while a partial extract
+     * answering out-of-area ground `200 OK` with zero elements is an old answer about real ground.
+     */
+    const oldSource = ago(TILE_TTL_MS + 1000);
+    const rows = [
+      { fetchedAt: ago(5000), sourceSnapshotAt: NOW },
+      settled(status, { fetchedAt: NOW, sourceSnapshotAt: oldSource }),
+      { fetchedAt: ago(3000), sourceSnapshotAt: NOW },
+      { fetchedAt: ago(2000), sourceSnapshotAt: NOW },
+    ];
+
+    expect(rollUp(siblings(rows))?.sourceSnapshotAt).toEqual(oldSource);
+  });
+
+  it('carries the source stamp up from a parent whose every child is empty', () => {
+    /*
+     * What a partial extract produces first: four out-of-area answers of `200 OK` with zero
+     * elements, each stamped with the extract's own date. An `empty` parent left unstamped is
+     * judged on its fetch clock alone, which the next pass over the same extract resets, and it
+     * has no other route back — `queueStaleChildren` runs only inside a drain the two z9 readers
+     * enqueue, and both of them would be calling this parent fresh.
+     */
+    const oldSource = ago(TILE_TTL_MS + 1000);
+    const rows = [0, 1, 2, 3].map(() => settled(TileStatus.empty, { sourceSnapshotAt: oldSource }));
+
+    const parent = rollUp(siblings(rows));
+
+    expect(parent?.status).toBe(TileStatus.empty);
+    expect(parent?.sourceSnapshotAt).toEqual(oldSource);
+  });
+
+  it('leaves the parent unstamped only when no child carried a stamp', () => {
+    // A child predating the column must not drag its siblings' real stamps out of the answer,
+    // and four such children leave nothing to inherit.
+    const none = [0, 1, 2, 3].map(() => ({ sourceSnapshotAt: null }));
+    expect(rollUp(siblings(none))?.sourceSnapshotAt).toBeNull();
+
+    const stamped = [{ sourceSnapshotAt: NOW }, ...none.slice(1)];
+    expect(rollUp(siblings(stamped))?.sourceSnapshotAt).toEqual(NOW);
+  });
 });
 
 describe('splitTile', () => {
@@ -229,9 +295,9 @@ describe('splitTile', () => {
   });
 
   it('keeps a parent that was already serving trails in readyTiles while children run', async () => {
-    // `ensureCoverage` calls a settled-but-stale tile ready-and-refreshing and anything else
-    // pending, so demoting this one would flip a reader from "here are your trails" back to
-    // "still loading" for as long as four children take.
+    // `ensureCoverage` calls a settled-but-stale tile ready — refreshing too, once a re-fetch is
+    // due — and anything else pending, so demoting this one would flip a reader from "here are
+    // your trails" back to "still loading" for as long as four children take.
     const fetchedAt = ago(TILE_TTL_MS + 1);
     const { db, recorded } = fakeDb();
 
@@ -403,6 +469,83 @@ describe('queueStaleChildren', () => {
 
     expect(outcome.waiting).toEqual([keys[3]]);
     expect(outcome.abandoned).toEqual([]);
+    expect(recorded.jobUpserts).toEqual([]);
+  });
+
+  /*
+   * The split tier's own reading of the source stamp.
+   *
+   * `ensureCoverage` covers `INGEST_ZOOM` alone, so once a parent has split this filter is the
+   * only thing that turns "this ground is stale" into a re-fetch of it. Every other test in this
+   * describe leaves `sourceSnapshotAt` null, which is the one state where reading the stamp and
+   * ignoring it give the same answer — so the three below are what hold this reader to the source
+   * clock rather than to the fetch clock.
+   */
+  it.each(SETTLED)(
+    'queues a %s child whose fetch is recent but whose source data is past the TTL',
+    async (status) => {
+      /*
+       * The fetch is recent enough that the TTL alone would still call this child fresh, so the
+       * stamp is the only column left that can queue it — and old enough to clear the interval
+       * that keeps a stamp which cannot advance off the queue on every drain.
+       */
+      const rows = siblings([
+        {},
+        {},
+        { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1), fetchedAt: ago(REFETCH_INTERVAL_MS * 2) },
+        {},
+      ]);
+      const { db, recorded } = fakeDb(rows);
+
+      const outcome = await queueStaleChildren(db, rows, NOW);
+
+      expect(outcome.queued).toEqual([keys[2]]);
+      expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[2])]);
+    },
+  );
+
+  it.each(SETTLED)(
+    'leaves a %s child alone whose stale source was asked only moments ago',
+    async (status) => {
+      /*
+       * `SPLIT_CHILD_ATTEMPT_CAP` cannot bound this one: it counts a child whose job reaches
+       * `dead`, and a child whose fetch succeeds every time with data past the TTL settles
+       * `done`. `enqueue` then revives it, and the parent is drained on every viewport poll for
+       * as long as it is unpromoted — a query per poll that cannot move the stamp.
+       */
+      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
+      const { db, recorded } = fakeDb(rows);
+
+      const outcome = await queueStaleChildren(db, rows, NOW);
+
+      expect(outcome.queued).toEqual([]);
+      expect(recorded.jobUpserts).toEqual([]);
+    },
+  );
+
+  it.each(SETTLED)(
+    'leaves a %s child alone whose source data is still inside the TTL',
+    async (status) => {
+      // The boundary from the other side, so the reading cannot become "any stamp is stale".
+      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS - 1) }, {}]);
+      const { db, recorded } = fakeDb(rows);
+
+      const outcome = await queueStaleChildren(db, rows, NOW);
+
+      expect(outcome.queued).toEqual([]);
+      expect(recorded.jobUpserts).toEqual([]);
+    },
+  );
+
+  it('leaves a child that predates the column on its fetch time alone', async () => {
+    // The fallback, named rather than left to the default in `child()`: adding the column must
+    // not re-queue every child written before it existed.
+    const rows = siblings([{}, {}, { sourceSnapshotAt: null }, {}]);
+    const { db, recorded } = fakeDb(rows);
+
+    const outcome = await queueStaleChildren(db, rows, NOW);
+
+    expect(outcome.queued).toEqual([]);
     expect(recorded.jobUpserts).toEqual([]);
   });
 });

@@ -140,7 +140,8 @@ function renderGeometry(coords: readonly LngLat[]): LngLat[] {
 }
 
 /** Re-exported from their own module so subdivision can ask the same question without a cycle. */
-export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
+import { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
+export { TILE_TTL_MS, isTileFresh, isTileSettled };
 
 /**
  * The literal an operator greps for when a tile could not commit a trail it had fetched.
@@ -151,6 +152,16 @@ export { TILE_TTL_MS, isTileFresh, isTileSettled } from './freshness';
  * `failJob` never runs, so this token is the only thing marking the ground that did not commit.
  */
 export const TRAIL_LOST_MARKER = 'switchback-ingest-trail-lost';
+
+/**
+ * The literal an operator greps for when a source answered with data already past `TILE_TTL_MS`.
+ *
+ * The tile cannot become fresh from that answer however often it is re-read, and `isRefetchDue`
+ * deliberately makes the retry quiet — one query a day rather than one per browse request. Without
+ * a line of its own, an estate served entirely from a year-old extract looks identical to a healthy
+ * one: every tile reports `ready`, and only the "Reconciled with OSM on …" date gives it away.
+ */
+export const STALE_SOURCE_MARKER = 'switchback-ingest-stale-source';
 
 /** How many OSM ids the message names before it stops; the count beside them is always exact. */
 const NAMED_TRAIL_LIMIT = 10;
@@ -337,6 +348,16 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
    */
   const provenance = { sourceSnapshotAt, sourceKind: TileSource.overpass };
 
+  // Logged off the answer rather than the row, so it reads the same whichever status the tile
+  // lands on, and once per fetch — which `isRefetchDue` has already bounded to once a day.
+  if (sourceSnapshotAt !== null && now().getTime() - sourceSnapshotAt.getTime() >= TILE_TTL_MS) {
+    log(`${STALE_SOURCE_MARKER} ${quadkey}: source data is already past the TTL`, {
+      quadkey,
+      sourceSnapshotAt: sourceSnapshotAt.toISOString(),
+      ttlMs: TILE_TTL_MS,
+    });
+  }
+
   if (assembled.length === 0) {
     await db.ingestTile.update({
       where: { quadkey },
@@ -513,11 +534,12 @@ export async function processTile(quadkey: string, deps: PipelineDeps): Promise<
 
   /*
    * A trail that threw is ground this tile was responsible for and does not have, so the tile
-   * does not get to say `ready`. That status plus `fetchedAt` is what `isTileFresh` sells to
-   * `ensureCoverage`, and writing it here bought `TILE_TTL_MS` of silence over a hole: tile
-   * 1202212023 reached `ready` with `trailCount=900` and `lastError="6 trail(s) failed to
-   * commit"`, and four of the six had no row in `trails` at all. Nothing read that `lastError` —
-   * the heartbeat's gauges match `'429'` and `SUBTREE_STUCK_MARKER`, neither of which it is.
+   * does not get to say `ready`. That status, `fetchedAt` and `sourceSnapshotAt` are what
+   * `isTileFresh` sells to `ensureCoverage`, and writing it here bought `TILE_TTL_MS` of
+   * silence over a hole: tile 1202212023 reached `ready` with `trailCount=900` and
+   * `lastError="6 trail(s) failed to commit"`, and four of the six had no row in `trails` at
+   * all. Nothing read that `lastError` — the heartbeat's gauges match `'429'` and
+   * `SUBTREE_STUCK_MARKER`, neither of which it is.
    *
    * **Rethrowing is the requeue, and the ladder is the bound.** `failJob` puts the row back with
    * a backoff of 30 s, 2 m, 10 m, 30 m and buries it `dead` on the fifth failure, roughly 43

@@ -830,10 +830,13 @@ exhausted its retries, which is what `queueHealth`'s `rateLimited` counts and
 
 **A source that answers about ground it does not hold is invisible to every rule above.** A mirror
 serving a regional extract rather than the planet answers an out-of-area query `200 OK` with zero
-elements. `processTile` cannot tell that from ocean: it writes `empty`, and `isTileFresh` sells that
-answer for `TILE_TTL_MS`. The request reads success, no job row is written, and no field of
-`queueHealth` moves. `overpass.osm.ch` is absent from `DEFAULT_ENDPOINTS` for exactly this reason —
-a list an operator keeps by hand, because nothing in the estate could see the failure it prevents.
+elements. `processTile` cannot tell that from ocean: it writes `empty` with whatever
+`sourceSnapshotAt` the answer carried, and `isTileFresh` sells it until the older of that stamp and
+the fetch leaves the TTL — the full `TILE_TTL_MS` when the answer carried no stamp at all, which is
+why the stamp bounds this hazard rather than closing it. The request reads success, no job row is
+written, and no field of `queueHealth` moves. `overpass.osm.ch` is absent from
+`DEFAULT_ENDPOINTS` for exactly this reason — a list an operator keeps by hand, because nothing in
+the estate could see the failure it prevents.
 
 `readEmptyWriteRates` in `packages/ingest/src/maintenance.ts` is what makes it countable: one day of
 tile writes, grouped by the source that answered, with the share of them that landed empty. A write
@@ -871,6 +874,36 @@ when it was asked. **It is a different fact from `Trail.sourceUpdatedAt`**, whic
 stamps from the ingest clock and which the trail page renders as "Reconciled with OpenStreetMap
 &lt;date&gt;". The two are days apart on any real answer, and the sentence on the page is about the
 first while the column behind it holds the second.
+
+**`isTileFresh` takes the older of `sourceSnapshotAt` and `fetchedAt`, and that is what makes the
+TTL a statement about the data.** `fetchedAt` records when we asked, which says nothing about the
+age of what came back. A source serving an extract rather than live OSM answers with data of
+whatever age the extract was cut at, and the fetch clock stamps it `now` regardless — so on the
+predicate's old reading, re-fetching the same year-old extract every thirty days reported the tile
+fresh forever, and the data behind it aged without bound. Taking the minimum means a recent fetch
+cannot launder old data, and a source clock running ahead of ours cannot extend the TTL either. A
+null snapshot leaves `fetchedAt` deciding: every row written before the column existed is null, and
+treating that as stale would expire the whole estate into one Overpass thundering herd. Those rows
+keep the weaker guarantee until their next fetch stamps them.
+
+**Refusing to call a tile fresh is only half of it, and `isRefetchDue` is the other half.** A source
+stamp past the TTL never advances by being read again, so a queueing caller asking only "is this
+fresh?" puts that tile back on the queue on every viewport poll: `enqueue` revives the settled job
+with `attempts` cleared, the drain re-queries the same source, and the same stamp lands. The fetch
+_succeeds_ every time, so no ladder engages — `failJob` never runs, `SPLIT_CHILD_ATTEMPT_CAP` is
+read only for split children, `reconcileDeadJobs` only for dead jobs — and one tile costs a real
+Overpass query per browse request. `REFETCH_INTERVAL_MS` is the floor that bounds it at one query a
+day: `ensureCoverage` and `queueStaleChildren` both ask `isRefetchDue` rather than `!isTileFresh`,
+and a tile it holds back is still served and is no longer reported as refreshing, because nothing is
+refreshing it. It is a floor and not an attempt cap deliberately — the fetch is succeeding and the
+data is being served, so a source that is behind today may catch up tomorrow, and a cap would keep
+the tile from ever noticing. Only settled rows are held back; `pending`, `running` and `failed`
+belong to the job retry ladder and its own backoff. `fetchArea` runs off `surveyArea`, which does not
+queue, so a deliberate area fetch is still the way back for someone who will not wait out the
+interval. `switchback-ingest-stale-source` is logged by `processTile` whenever an answer arrives
+already past the TTL, because a quiet retry over year-old data is otherwise indistinguishable from a
+healthy estate. **No alert rule reads that token yet** — arming one needs a threshold, and neither
+provenance column exists in production, so there is nothing yet to measure a normal rate against.
 
 `switchback-ingest-empty-tile-writes` in `infra/azure/ingest.bicep` reads the published line and is
 declared **disarmed**. Its threshold is a placeholder rather than a measurement: with one source
@@ -1013,8 +1046,14 @@ would strand a parent with no children and no route to ready.
 the parent's row or null; it returns null unless all four exist and all four are `ready` or `empty`.
 `fetchedAt` is the _oldest_ child's, so the parent leaves the TTL when its stalest quarter does —
 taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
-sweep for another month. `trailCount` sums. A parent whose children are all `empty` is `empty`; one
-child with trails in it makes the parent `ready`, because that is a place worth re-querying.
+sweep for another month. `sourceSnapshotAt` follows the same rule and is taken separately, because
+the child with the oldest fetch need not be the one holding the oldest data; nulls are skipped, so a
+child predating the column cannot drag its siblings' real stamps out of the answer. Every settled
+quarter is asked for a stamp, `empty` included — an extract answering out-of-area ground `200 OK`
+with zero elements lands as `empty` carrying that extract's own date, so discounting those quarters
+is how a parent gets stamped from its live siblings and reports fresh over ground nothing will
+re-query. `trailCount` sums. A parent whose children are all `empty` is `empty`; one child with
+trails in it makes the parent `ready`, because that is a place worth re-querying.
 
 **Nothing in `coverage.ts` changed, and that is the design.** `ensureCoverage` still covers a
 viewport with z9 quadkeys and still reads the z9 row, so `readyTiles`, `pendingTiles` and the TTL
@@ -1026,10 +1065,11 @@ three-quarters of the map.
 
 **A parent that was already serving trails keeps serving them.** `splitTile` preserves a
 `ready`/`empty` status and its `fetchedAt` instead of writing `pending`. `ensureCoverage` classifies
-a settled-but-stale tile as ready-and-refreshing and everything else as pending, so demoting a tile
-that split on a TTL refresh would flip a reader from "here are your trails" back to "still loading"
-for however long four children sit in the drain queue — which is not a length anybody is watching.
-A parent with no `fetchedAt` has nothing to serve and still reads `pending`.
+a settled-but-stale tile as ready — and refreshing too, once a re-fetch is due — and everything else
+as pending, so demoting a tile that split on a TTL refresh would flip a reader from "here are your
+trails" back to "still loading" for however long four children sit in the drain queue — which is not
+a length anybody is watching. A parent with no `fetchedAt` has nothing to serve and still reads
+`pending`.
 
 **That status is passed in, not read back, and the difference was a live bug.** `processTile` writes
 `running` to the parent before it fetches, so a `splitTile` that re-read the row saw `running` for
