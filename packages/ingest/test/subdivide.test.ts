@@ -52,6 +52,16 @@ function siblings(overrides: Partial<ChildTile>[] = []): ChildTile[] {
   return childQuadkeys(PARENT).map((key, index) => child(key, overrides[index] ?? {}));
 }
 
+/**
+ * A child of `status` carrying what the writer would have left on it. `trailCount` follows the
+ * status rather than being a knob — `processTile` writes `empty` exactly when it assembled no
+ * trails — so a roll-up discounting a quarter by its trail count is caught by the same fixture as
+ * one discounting it by its status word.
+ */
+function settled(status: TileStatus, overrides: Partial<ChildTile> = {}): Partial<ChildTile> {
+  return { status, trailCount: status === TileStatus.empty ? 0 : 10, ...overrides };
+}
+
 interface Recorded {
   tileUpserts: string[];
   tileUpdates: Array<{ quadkey: string; data: Record<string, unknown> }>;
@@ -207,22 +217,41 @@ describe('rollUp', () => {
     );
   });
 
-  it('takes the oldest source stamp, from whichever child holds it', () => {
+  it.each(SETTLED)('takes the oldest source stamp off a %s child like any other', (status) => {
     /*
-     * Source age and fetch age need not sit on the same child. Here the child with the most
-     * recent fetch is the one holding the oldest data, so a parent that carried up only the
-     * fetch clock would report a month-old quarter as current — the same laundering the column
-     * exists to stop, one level up the tree.
+     * Source age and fetch age need not sit on the same child, and neither does status. Here the
+     * child with the most recent fetch is the one holding the oldest data, so a parent that
+     * carried up only the fetch clock would report a month-old quarter as current — the same
+     * laundering the column exists to stop, one level up the tree. Asked of every settled status
+     * because an `empty` quarter reads as having answered about nothing, while a partial extract
+     * answering out-of-area ground `200 OK` with zero elements is an old answer about real ground.
      */
     const oldSource = ago(TILE_TTL_MS + 1000);
     const rows = [
       { fetchedAt: ago(5000), sourceSnapshotAt: NOW },
-      { fetchedAt: NOW, sourceSnapshotAt: oldSource },
+      settled(status, { fetchedAt: NOW, sourceSnapshotAt: oldSource }),
       { fetchedAt: ago(3000), sourceSnapshotAt: NOW },
       { fetchedAt: ago(2000), sourceSnapshotAt: NOW },
     ];
 
     expect(rollUp(siblings(rows))?.sourceSnapshotAt).toEqual(oldSource);
+  });
+
+  it('carries the source stamp up from a parent whose every child is empty', () => {
+    /*
+     * What a partial extract produces first: four out-of-area answers of `200 OK` with zero
+     * elements, each stamped with the extract's own date. An `empty` parent left unstamped is
+     * judged on its fetch clock alone, which the next pass over the same extract resets, and it
+     * has no other route back — `queueStaleChildren` runs only inside a drain the two z9 readers
+     * enqueue, and both of them would be calling this parent fresh.
+     */
+    const oldSource = ago(TILE_TTL_MS + 1000);
+    const rows = [0, 1, 2, 3].map(() => settled(TileStatus.empty, { sourceSnapshotAt: oldSource }));
+
+    const parent = rollUp(siblings(rows));
+
+    expect(parent?.status).toBe(TileStatus.empty);
+    expect(parent?.sourceSnapshotAt).toEqual(oldSource);
   });
 
   it('leaves the parent unstamped only when no child carried a stamp', () => {

@@ -1029,9 +1029,12 @@ the parent's row or null; it returns null unless all four exist and all four are
 taking the freshest would let one child refreshed yesterday hold three stale ones out of the refresh
 sweep for another month. `sourceSnapshotAt` follows the same rule and is taken separately, because
 the child with the oldest fetch need not be the one holding the oldest data; nulls are skipped, so a
-child predating the column cannot drag its siblings' real stamps out of the answer. `trailCount`
-sums. A parent whose children are all `empty` is `empty`; one child with trails in it makes the
-parent `ready`, because that is a place worth re-querying.
+child predating the column cannot drag its siblings' real stamps out of the answer. Every settled
+quarter is asked for a stamp, `empty` included — an extract answering out-of-area ground `200 OK`
+with zero elements lands as `empty` carrying that extract's own date, so discounting those quarters
+is how a parent gets stamped from its live siblings and reports fresh over ground nothing will
+re-query. `trailCount` sums. A parent whose children are all `empty` is `empty`; one child with
+trails in it makes the parent `ready`, because that is a place worth re-querying.
 
 **Nothing in `coverage.ts` changed, and that is the design.** `ensureCoverage` still covers a
 viewport with z9 quadkeys and still reads the z9 row, so `readyTiles`, `pendingTiles` and the TTL

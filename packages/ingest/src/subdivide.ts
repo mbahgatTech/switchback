@@ -137,6 +137,11 @@ export interface Rollup {
  * oldest fetch need not be the one holding the oldest data. Dropping it here would leave every
  * promoted parent with a null source stamp and hand it back the fetch-only freshness this
  * column exists to end.
+ *
+ * Every settled quarter is asked for that stamp, `empty` included. An extract answering
+ * out-of-area ground `200 OK` with zero elements lands as `empty` carrying the extract's own
+ * date, so discounting those quarters — by status or by trail count — is how a parent gets
+ * stamped from its live siblings and reports fresh over ground nothing will re-query.
  */
 export function rollUp(children: readonly ChildTile[]): Rollup | null {
   if (children.length !== CHILDREN_PER_TILE) return null;

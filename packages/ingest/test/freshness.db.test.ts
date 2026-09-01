@@ -42,7 +42,9 @@ const UNSTAMPED = `${NS}000002`;
 const ROLLED_UP_STALE = `${NS}000010`;
 const ROLLED_UP_CURRENT = `${NS}000011`;
 const ROLLED_UP_UNSTAMPED = `${NS}000012`;
-const ROLLED_UP = [ROLLED_UP_STALE, ROLLED_UP_CURRENT, ROLLED_UP_UNSTAMPED];
+/** The fourth: a parent an extract answered `empty` on all four quarters. */
+const ROLLED_UP_EMPTY = `${NS}000013`;
+const ROLLED_UP = [ROLLED_UP_STALE, ROLLED_UP_CURRENT, ROLLED_UP_UNSTAMPED, ROLLED_UP_EMPTY];
 
 /**
  * The same three stamps again, for the viewport reader rather than the area survey. Their own
@@ -168,8 +170,9 @@ async function seedSplit(
 async function promoteParent(
   parent: string,
   stampAt: (index: number, count: number) => Date | null,
+  statusAt?: (index: number, count: number) => TileStatus,
 ): Promise<void> {
-  await seedSplit(parent, stampAt);
+  await seedSplit(parent, stampAt, statusAt);
   await promoteFrom(prisma, parent);
 }
 
@@ -287,29 +290,63 @@ describe.runIf(IS_LOCAL).sequential('freshness against a real database', () => {
  * nothing about whether that value reaches `ingest_tiles`. A column list in `promoteFrom` that
  * omitted the stamp would leave every promoted parent unstamped, and the z9 tier that
  * `ensureCoverage` and `surveyArea` actually read would go back to being judged on fetch time.
+ *
+ * Asked of every settled status the deciding child can hold, and of a parent composed entirely of
+ * `empty` quarters. A roll-up that dropped the stamp for those alone leaves a z9 parent judged on
+ * its fetch clock, and the two readers above are the only paths back to a re-fetch at that zoom —
+ * so the ground under it is never re-queried and the map over it stays blank.
  */
 describe.runIf(IS_LOCAL).sequential('the freshness a roll-up hands its parent', () => {
   beforeEach(cleanup);
   afterAll(cleanup);
 
-  it('writes the stalest child’s source stamp, and is judged stale on it', async () => {
-    await promoteParent(ROLLED_UP_STALE, oldestInTheMiddle(PAST_TTL));
+  it.each(SETTLED)(
+    'writes the stalest child’s source stamp when that child is %s, and is judged stale on it',
+    async (status) => {
+      await promoteParent(
+        ROLLED_UP_STALE,
+        oldestInTheMiddle(PAST_TTL),
+        inTheMiddle(status, TileStatus.ready),
+      );
 
-    // The stamp on the row, before the reading taken from it: the parent's own `fetchedAt` is
-    // `NOW`, so a survey calling this tile stale for any other reason is a green for nothing.
-    const row = await freshnessRow(ROLLED_UP_STALE);
-    expect(row.status).toBe(TileStatus.ready);
+      // The stamp on the row, before the reading taken from it: the parent's own `fetchedAt` is
+      // `NOW`, so a survey calling this tile stale for any other reason is a green for nothing.
+      const row = await freshnessRow(ROLLED_UP_STALE);
+      expect(row.status).toBe(TileStatus.ready);
+      expect(row.fetchedAt).toEqual(NOW);
+      expect(row.sourceSnapshotAt).toEqual(PAST_TTL);
+
+      const survey = await surveyArea(centreOf(ROLLED_UP_STALE), {
+        db: prisma,
+        now: NOW,
+        maxTiles: 4,
+      });
+      expect(survey.quadkeys).toContain(ROLLED_UP_STALE);
+      expect(survey.fresh).not.toContain(ROLLED_UP_STALE);
+      expect(survey.outstanding).toContain(ROLLED_UP_STALE);
+    },
+  );
+
+  it('writes the stamp of a parent every one of whose quarters came back empty', async () => {
+    // Four `200 OK`s with zero elements is what a partial extract answers over out-of-area
+    // ground, and the parent it composes still has a data age. Unstamped it is judged on a fetch
+    // clock the next pass over the same extract resets, and no sweep revisits it: `promoteFrom`
+    // has just cleared the split marker `reconcileOrphanedSplits` looks for.
+    await promoteParent(ROLLED_UP_EMPTY, oldestInTheMiddle(PAST_TTL), () => TileStatus.empty);
+
+    const row = await freshnessRow(ROLLED_UP_EMPTY);
+    expect(row.status).toBe(TileStatus.empty);
     expect(row.fetchedAt).toEqual(NOW);
     expect(row.sourceSnapshotAt).toEqual(PAST_TTL);
 
-    const survey = await surveyArea(centreOf(ROLLED_UP_STALE), {
+    const survey = await surveyArea(centreOf(ROLLED_UP_EMPTY), {
       db: prisma,
       now: NOW,
       maxTiles: 4,
     });
-    expect(survey.quadkeys).toContain(ROLLED_UP_STALE);
-    expect(survey.fresh).not.toContain(ROLLED_UP_STALE);
-    expect(survey.outstanding).toContain(ROLLED_UP_STALE);
+    expect(survey.quadkeys).toContain(ROLLED_UP_EMPTY);
+    expect(survey.fresh).not.toContain(ROLLED_UP_EMPTY);
+    expect(survey.outstanding).toContain(ROLLED_UP_EMPTY);
   });
 
   it('leaves a parent fresh when every child’s source data is inside the TTL', async () => {
