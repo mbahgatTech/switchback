@@ -564,9 +564,9 @@ describe('processTile, a trail that would not commit', () => {
   it('refuses to report ready with a trail it could not commit', async () => {
     /*
      * Tile 1202212023 in production: `status=ready, trailCount=900`, and four of the six trails
-     * its log named have no row in `trails` at all. `ready` plus `fetchedAt` is what
-     * `isTileFresh` sells to `ensureCoverage`, so that write bought `TILE_TTL_MS` of silence
-     * over ground with holes in it.
+     * its log named have no row in `trails` at all. `ready`, `fetchedAt` and `sourceSnapshotAt`
+     * are what `isTileFresh` sells to `ensureCoverage`, so that write bought `TILE_TTL_MS` of
+     * silence over ground with holes in it.
      */
     const db = timingOutTransaction();
     const { recorded } = db as unknown as { recorded: Recorded };

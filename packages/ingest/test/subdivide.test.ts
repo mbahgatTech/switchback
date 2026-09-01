@@ -21,7 +21,14 @@ import {
   unsplitTile,
 } from '../src/subdivide';
 import type { ChildTile } from '../src/subdivide';
-import { TILE_TTL_MS } from '../src/freshness';
+import { TILE_TTL_MS, isTileSettled } from '../src/freshness';
+
+/**
+ * Every status `queueStaleChildren` treats as settled data, from the helper rather than named
+ * here. One predicate judges all of them, so the stamp has to be asked of each: a split parent
+ * whose stale `empty` child is exempt re-promotes from ground nothing ever re-fetches.
+ */
+const SETTLED = Object.values(TileStatus).filter(isTileSettled);
 
 const PARENT = '120221203';
 const NOW = new Date('2026-08-05T12:00:00Z');
@@ -445,27 +452,33 @@ describe('queueStaleChildren', () => {
    * ignoring it give the same answer — so the three below are what hold this reader to the source
    * clock rather than to the fetch clock.
    */
-  it('queues a child whose fetch is recent but whose source data is past the TTL', async () => {
-    // Every child ready, every fetch `NOW`. The stamp is the only column left that can decide it.
-    const rows = siblings([{}, {}, { sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
-    const { db, recorded } = fakeDb(rows);
+  it.each(SETTLED)(
+    'queues a %s child whose fetch is recent but whose source data is past the TTL',
+    async (status) => {
+      // Every child settled, every fetch `NOW`. The stamp is the only column left that decides.
+      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
+      const { db, recorded } = fakeDb(rows);
 
-    const outcome = await queueStaleChildren(db, rows, NOW);
+      const outcome = await queueStaleChildren(db, rows, NOW);
 
-    expect(outcome.queued).toEqual([keys[2]]);
-    expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[2])]);
-  });
+      expect(outcome.queued).toEqual([keys[2]]);
+      expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[2])]);
+    },
+  );
 
-  it('leaves a child alone whose source data is still inside the TTL', async () => {
-    // The boundary from the other side, so the reading cannot become "any stamp at all is stale".
-    const rows = siblings([{}, {}, { sourceSnapshotAt: ago(TILE_TTL_MS - 1) }, {}]);
-    const { db, recorded } = fakeDb(rows);
+  it.each(SETTLED)(
+    'leaves a %s child alone whose source data is still inside the TTL',
+    async (status) => {
+      // The boundary from the other side, so the reading cannot become "any stamp is stale".
+      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS - 1) }, {}]);
+      const { db, recorded } = fakeDb(rows);
 
-    const outcome = await queueStaleChildren(db, rows, NOW);
+      const outcome = await queueStaleChildren(db, rows, NOW);
 
-    expect(outcome.queued).toEqual([]);
-    expect(recorded.jobUpserts).toEqual([]);
-  });
+      expect(outcome.queued).toEqual([]);
+      expect(recorded.jobUpserts).toEqual([]);
+    },
+  );
 
   it('leaves a child that predates the column on its fetch time alone', async () => {
     // The fallback, named rather than left to the default in `child()`: adding the column must

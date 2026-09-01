@@ -830,10 +830,13 @@ exhausted its retries, which is what `queueHealth`'s `rateLimited` counts and
 
 **A source that answers about ground it does not hold is invisible to every rule above.** A mirror
 serving a regional extract rather than the planet answers an out-of-area query `200 OK` with zero
-elements. `processTile` cannot tell that from ocean: it writes `empty`, and `isTileFresh` sells that
-answer for `TILE_TTL_MS`. The request reads success, no job row is written, and no field of
-`queueHealth` moves. `overpass.osm.ch` is absent from `DEFAULT_ENDPOINTS` for exactly this reason —
-a list an operator keeps by hand, because nothing in the estate could see the failure it prevents.
+elements. `processTile` cannot tell that from ocean: it writes `empty` with whatever
+`sourceSnapshotAt` the answer carried, and `isTileFresh` sells it until the older of that stamp and
+the fetch leaves the TTL — the full `TILE_TTL_MS` when the answer carried no stamp at all, which is
+why the stamp bounds this hazard rather than closing it. The request reads success, no job row is
+written, and no field of `queueHealth` moves. `overpass.osm.ch` is absent from
+`DEFAULT_ENDPOINTS` for exactly this reason — a list an operator keeps by hand, because nothing in
+the estate could see the failure it prevents.
 
 `readEmptyWriteRates` in `packages/ingest/src/maintenance.ts` is what makes it countable: one day of
 tile writes, grouped by the source that answered, with the share of them that landed empty. A write

@@ -638,8 +638,8 @@ model IngestTile {
   bboxE Float
   bboxN Float
 
-  /// When Overpass was last queried for this tile. Freshness is judged from this, not
-  /// from `updatedAt`, which a failed attempt would also bump.
+  /// When Overpass was last queried for this tile. Freshness takes the older of this and
+  /// `sourceSnapshotAt`, never `updatedAt`, which a failed attempt would also bump.
   fetchedAt  DateTime?
   trailCount Int       @default(0)
   attempts   Int       @default(0)

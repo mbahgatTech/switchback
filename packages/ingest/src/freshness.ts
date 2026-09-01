@@ -49,7 +49,14 @@ export function dataAsOf(fetchedAt: Date, sourceSnapshotAt: Date | null): Date {
   return sourceSnapshotAt !== null && sourceSnapshotAt < fetchedAt ? sourceSnapshotAt : fetchedAt;
 }
 
-/** Whether a tile's cached data is still good enough to serve without re-fetching. */
+/**
+ * Whether a tile's cached data is still good enough to serve without re-fetching.
+ *
+ * The source stamp binds every settled status, `empty` included. A partial extract answers an
+ * out-of-area query `200 OK` with zero elements, which lands as `empty` carrying that extract's
+ * own date over real ground — exempting it would serve an empty map there for as long as
+ * anything kept re-fetching.
+ */
 export function isTileFresh(tile: TileFreshness | null, now: Date, ttlMs = TILE_TTL_MS): boolean {
   if (!tile?.fetchedAt) return false;
   if (!isTileSettled(tile.status)) return false;

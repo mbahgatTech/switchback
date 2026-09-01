@@ -11,7 +11,15 @@ import {
   surveyArea,
 } from '../src/coverage';
 import { MAX_TILE_QUEUE_DEPTH } from '../src/backpressure';
+import { isTileSettled } from '../src/freshness';
 import { TILE_TTL_MS } from '../src/pipeline';
+
+/**
+ * Every status the partition treats as settled data, from the helper rather than named here.
+ * `ensureCoverage` runs one predicate over all of them, so the stale-source case has to be
+ * asked of each — an exemption for one is the fetch-only lie back for that status alone.
+ */
+const SETTLED = Object.values(TileStatus).filter(isTileSettled);
 
 /** A bbox small enough to need exactly one z9 tile. */
 const ONE_TILE: [number, number, number, number] = [-4.08, 53.06, -4.07, 53.07];
@@ -110,10 +118,10 @@ function stale(quadkey: string): TileRow {
  * Fetched a second ago, over data the source cut before the TTL began. The tile an
  * extract-backed ingest writes, and the only state in which the two clocks disagree.
  */
-function staleSource(quadkey: string): TileRow {
+function staleSource(quadkey: string, status: TileStatus): TileRow {
   return {
     quadkey,
-    status: TileStatus.ready,
+    status,
     fetchedAt: new Date(NOW.getTime() - 1_000),
     sourceSnapshotAt: new Date(NOW.getTime() - TILE_TTL_MS - 1_000),
   };
@@ -159,23 +167,31 @@ describe('ensureCoverage partitioning', () => {
     expect(result.queued).toEqual([quadkey]);
   });
 
-  it('refreshes a tile whose fetch is recent but whose source data is past the TTL', async () => {
-    /*
-     * The state every other fixture in this file leaves at null, and so the only one in which
-     * the partition can tell the two clocks apart. On `fetchedAt` alone this tile is a second
-     * old: served, never re-queued, ageing without bound behind an extract that keeps
-     * answering. It has to come back out of the partition as work.
-     */
-    const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))
-      .quadkeys[0]!;
-    const { db } = fakeDb([staleSource(quadkey)]);
+  it.each(SETTLED)(
+    'refreshes a %s tile whose fetch is recent but whose source data is past the TTL',
+    async (status) => {
+      /*
+       * The state every other fixture in this file leaves at null, and so the only one in which
+       * the partition can tell the two clocks apart. On `fetchedAt` alone this tile is a second
+       * old: served, never re-queued, ageing without bound behind an extract that keeps
+       * answering. It has to come back out of the partition as work.
+       *
+       * `empty` is the worse half, not the lesser one: a stale `ready` tile keeps drawing the
+       * trails it fetched last month, while a stale `empty` one draws nothing at all over
+       * ground that has them.
+       */
+      const quadkey = (
+        await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW })
+      ).quadkeys[0]!;
+      const { db } = fakeDb([staleSource(quadkey, status)]);
 
-    const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
+      const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
 
-    expect(result.ready).toEqual([quadkey]);
-    expect(result.refreshing).toEqual([quadkey]);
-    expect(result.queued).toEqual([quadkey]);
-  });
+      expect(result.ready).toEqual([quadkey]);
+      expect(result.refreshing).toEqual([quadkey]);
+      expect(result.queued).toEqual([quadkey]);
+    },
+  );
 
   it('does not offer a failed tile as ready', async () => {
     const quadkey = (await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW }))

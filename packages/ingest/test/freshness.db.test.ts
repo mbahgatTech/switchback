@@ -3,7 +3,7 @@ import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
 import { ensureCoverage, surveyArea } from '../src/coverage';
-import { TILE_TTL_MS } from '../src/freshness';
+import { TILE_TTL_MS, isTileSettled } from '../src/freshness';
 import { tileJobKey } from '../src/jobs';
 import { processTile } from '../src/pipeline';
 import type { PipelineDeps } from '../src/pipeline';
@@ -62,10 +62,30 @@ const SPLIT_STALE_SOURCE = `${NS}000030`;
 const SPLIT_CURRENT = `${NS}000031`;
 const SPLIT = [SPLIT_STALE_SOURCE, SPLIT_CURRENT];
 
+/**
+ * Every status the predicate serves, from the helper rather than named here. The blocks below
+ * are parameterised over it, so a settled status the stamp is never asked about would have to be
+ * added to `isTileSettled` and left out of the tests in the same edit.
+ */
+const SETTLED = Object.values(TileStatus).filter(isTileSettled);
+
+/**
+ * One tile per reading, re-seeded per status by the block that owns them — cheaper than a quadkey
+ * per status, and a quadkey has only four digits to spend at each level.
+ */
+const SETTLED_STALE_SOURCE = `${NS}000100`;
+const SETTLED_CURRENT = `${NS}000101`;
+
+/** The tile a partial extract writes: `200 OK`, zero elements, and the extract's own date. */
+const EXTRACT_EMPTY = `${NS}000102`;
+
 const FIXTURES = [
   CURRENT,
   STALE_SOURCE,
   UNSTAMPED,
+  SETTLED_STALE_SOURCE,
+  SETTLED_CURRENT,
+  EXTRACT_EMPTY,
   ...VIEWED,
   ...[...ROLLED_UP, ...SPLIT].flatMap((parent) => [parent, ...childQuadkeys(parent)]),
 ];
@@ -95,12 +115,18 @@ function tileGeometry(quadkey: string) {
   return { quadkey, x, y, z, bboxW, bboxS, bboxE, bboxN };
 }
 
-async function seedTile(quadkey: string, sourceSnapshotAt: Date | null): Promise<void> {
+async function seedTile(
+  quadkey: string,
+  sourceSnapshotAt: Date | null,
+  status: TileStatus = TileStatus.ready,
+): Promise<void> {
   await prisma.ingestTile.create({
     data: {
       ...tileGeometry(quadkey),
-      status: TileStatus.ready,
-      trailCount: 1,
+      status,
+      // The row invariant the writer keeps, not a knob: `processTile` writes `empty` exactly
+      // when it assembled no trails.
+      trailCount: status === TileStatus.empty ? 0 : 1,
       // The fetch is always recent. Whatever these tiles are judged on, it is not this.
       fetchedAt: NOW,
       sourceSnapshotAt,
@@ -123,11 +149,12 @@ async function seedUnpromoted(quadkey: string): Promise<void> {
 async function seedSplit(
   parent: string,
   stampAt: (index: number, count: number) => Date | null,
+  statusAt: (index: number, count: number) => TileStatus = () => TileStatus.ready,
 ): Promise<string[]> {
   await seedUnpromoted(parent);
   const children = childQuadkeys(parent);
   for (const [index, child] of children.entries()) {
-    await seedTile(child, stampAt(index, children.length));
+    await seedTile(child, stampAt(index, children.length), statusAt(index, children.length));
   }
   return children;
 }
@@ -147,16 +174,19 @@ async function promoteParent(
 }
 
 /**
- * `oldest` on a child that is neither the first of the set nor the last, so a roll-up reaching
- * for one end of it is caught alongside one that ignores the column altogether.
+ * `value` on a child that is neither the first of the set nor the last, so a reader reaching for
+ * one end of the set is caught alongside one that ignores the column altogether.
  */
-const oldestInTheMiddle =
-  (oldest: Date) =>
-  (index: number, count: number): Date =>
-    index === Math.floor(count / 2) ? oldest : NOW;
+const inTheMiddle =
+  <T>(value: T, rest: T) =>
+  (index: number, count: number): T =>
+    index === Math.floor(count / 2) ? value : rest;
 
-/** What a parent row holds once a roll-up has written it. */
-function promotedRow(quadkey: string) {
+/** The stamp form of `inTheMiddle`: one child cut at `oldest`, the rest current. */
+const oldestInTheMiddle = (oldest: Date) => inTheMiddle<Date>(oldest, NOW);
+
+/** The three columns freshness is decided on, off the row as it actually landed. */
+function freshnessRow(quadkey: string) {
   return prisma.ingestTile.findUniqueOrThrow({
     where: { quadkey },
     select: { status: true, fetchedAt: true, sourceSnapshotAt: true },
@@ -267,7 +297,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness a roll-up hands its parent', 
 
     // The stamp on the row, before the reading taken from it: the parent's own `fetchedAt` is
     // `NOW`, so a survey calling this tile stale for any other reason is a green for nothing.
-    const row = await promotedRow(ROLLED_UP_STALE);
+    const row = await freshnessRow(ROLLED_UP_STALE);
     expect(row.status).toBe(TileStatus.ready);
     expect(row.fetchedAt).toEqual(NOW);
     expect(row.sourceSnapshotAt).toEqual(PAST_TTL);
@@ -285,7 +315,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness a roll-up hands its parent', 
   it('leaves a parent fresh when every child’s source data is inside the TTL', async () => {
     await promoteParent(ROLLED_UP_CURRENT, oldestInTheMiddle(INSIDE_TTL));
 
-    expect((await promotedRow(ROLLED_UP_CURRENT)).sourceSnapshotAt).toEqual(INSIDE_TTL);
+    expect((await freshnessRow(ROLLED_UP_CURRENT)).sourceSnapshotAt).toEqual(INSIDE_TTL);
 
     const survey = await surveyArea(centreOf(ROLLED_UP_CURRENT), {
       db: prisma,
@@ -300,7 +330,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness a roll-up hands its parent', 
 
     // Null rather than left alone: a parent holding a stamp no child carried would be claiming
     // an age for data that never reported one.
-    expect((await promotedRow(ROLLED_UP_UNSTAMPED)).sourceSnapshotAt).toBeNull();
+    expect((await freshnessRow(ROLLED_UP_UNSTAMPED)).sourceSnapshotAt).toBeNull();
 
     const survey = await surveyArea(centreOf(ROLLED_UP_UNSTAMPED), {
       db: prisma,
@@ -377,15 +407,22 @@ describe.runIf(IS_LOCAL).sequential('the freshness a split parent’s children a
   beforeEach(cleanup);
   afterAll(cleanup);
 
-  it('re-queues the child whose fetch is recent but whose source data is past the TTL', async () => {
-    const children = await seedSplit(SPLIT_STALE_SOURCE, oldestInTheMiddle(PAST_TTL));
+  it.each(SETTLED)(
+    're-queues the %s child whose fetch is recent but whose source data is past the TTL',
+    async (status) => {
+      const children = await seedSplit(
+        SPLIT_STALE_SOURCE,
+        oldestInTheMiddle(PAST_TTL),
+        inTheMiddle(status, TileStatus.ready),
+      );
 
-    const result = await drainSplitParent(SPLIT_STALE_SOURCE);
+      const result = await drainSplitParent(SPLIT_STALE_SOURCE);
 
-    // The roll-up path, not a fetch: a drain that queried a source could not have got this far.
-    expect(result.children).toEqual(children);
-    expect(await queuedChildren(SPLIT_STALE_SOURCE)).toEqual([children[2]]);
-  });
+      // The roll-up path, not a fetch: a drain that queried a source could not have got this far.
+      expect(result.children).toEqual(children);
+      expect(await queuedChildren(SPLIT_STALE_SOURCE)).toEqual([children[2]]);
+    },
+  );
 
   it('queues nothing when every child’s source data is inside the TTL', async () => {
     await seedSplit(SPLIT_CURRENT, oldestInTheMiddle(INSIDE_TTL));
@@ -393,5 +430,101 @@ describe.runIf(IS_LOCAL).sequential('the freshness a split parent’s children a
     await drainSplitParent(SPLIT_CURRENT);
 
     expect(await queuedChildren(SPLIT_CURRENT)).toEqual([]);
+  });
+});
+
+/**
+ * The same two readers again, asked of every status the predicate serves rather than `ready`.
+ *
+ * `isTileSettled` admits two, and `isTileFresh` applies the source stamp to both — but every
+ * fixture above is `ready`, so a stamp applied to `ready` alone leaves each reader green while
+ * `empty` goes back to being judged on fetch time. That is the worse half rather than the lesser:
+ * a stale `ready` tile keeps drawing the trails it fetched last month, while a stale `empty` one
+ * draws nothing at all over ground that has them.
+ */
+describe.runIf(IS_LOCAL).sequential('the freshness every settled status is judged on', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it.each(SETTLED)(
+    're-queues a %s tile whose fetch is recent but whose source data is past the TTL',
+    async (status) => {
+      await seedTile(SETTLED_STALE_SOURCE, PAST_TTL, status);
+      await seedQueuedJob(SETTLED_STALE_SOURCE);
+
+      const view = await viewportOver(SETTLED_STALE_SOURCE);
+
+      // One tile, so `refreshing` and `queued` are about this row and no other.
+      expect(view.quadkeys).toEqual([SETTLED_STALE_SOURCE]);
+      expect(view.refreshing).toEqual([SETTLED_STALE_SOURCE]);
+      expect(view.queued).toEqual([SETTLED_STALE_SOURCE]);
+
+      const survey = await surveyArea(centreOf(SETTLED_STALE_SOURCE), {
+        db: prisma,
+        now: NOW,
+        maxTiles: 4,
+      });
+      expect(survey.fresh).not.toContain(SETTLED_STALE_SOURCE);
+      expect(survey.outstanding).toContain(SETTLED_STALE_SOURCE);
+    },
+  );
+
+  it.each(SETTLED)(
+    'still serves a %s tile whose source data is inside the TTL, and queues nothing',
+    async (status) => {
+      // The boundary from the other side, so the reading cannot become "any stamp is stale" —
+      // which would re-fetch every ocean tile in the estate once a month for nothing.
+      await seedTile(SETTLED_CURRENT, INSIDE_TTL, status);
+
+      const view = await viewportOver(SETTLED_CURRENT);
+
+      expect(view.ready).toEqual([SETTLED_CURRENT]);
+      expect(view.refreshing).toEqual([]);
+      expect(view.queued).toEqual([]);
+
+      const survey = await surveyArea(centreOf(SETTLED_CURRENT), {
+        db: prisma,
+        now: NOW,
+        maxTiles: 4,
+      });
+      expect(survey.fresh).toContain(SETTLED_CURRENT);
+    },
+  );
+});
+
+/**
+ * The writer that produces the stale `empty` row, rather than a seed standing in for it.
+ *
+ * A partial extract answers an out-of-area query `200 OK` with zero elements, and `processTile`
+ * writes exactly that as `empty` carrying the extract's own `timestamp_osm_base`. Seeded rows
+ * pin the reading; only the pipeline pins that the stamp reaches the row at all, from the one
+ * source that ever writes it.
+ */
+describe.runIf(IS_LOCAL).sequential('the freshness an extract’s empty answer is judged on', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it('re-queues ground an extract answered empty with a stamp past the TTL', async () => {
+    const result = await processTile(EXTRACT_EMPTY, {
+      db: prisma,
+      now: () => NOW,
+      overpass: {
+        query: () =>
+          Promise.resolve({ elements: [], osm3s: { timestamp_osm_base: PAST_TTL.toISOString() } }),
+      },
+    });
+    expect(result.status).toBe(TileStatus.empty);
+
+    // The row the writer left, before the reading taken from it: its `fetchedAt` is `NOW`, so a
+    // survey calling this tile stale for any other reason would be a green for nothing.
+    const row = await freshnessRow(EXTRACT_EMPTY);
+    expect(row.status).toBe(TileStatus.empty);
+    expect(row.fetchedAt).toEqual(NOW);
+    expect(row.sourceSnapshotAt).toEqual(PAST_TTL);
+
+    const survey = await surveyArea(centreOf(EXTRACT_EMPTY), { db: prisma, now: NOW, maxTiles: 4 });
+    expect(survey.quadkeys).toContain(EXTRACT_EMPTY);
+    expect(survey.fresh).not.toContain(EXTRACT_EMPTY);
+    expect(survey.outstanding).toContain(EXTRACT_EMPTY);
   });
 });
