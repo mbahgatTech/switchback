@@ -26,6 +26,7 @@ rather than argued. Nothing here is imported by the application.
 | `disk-arithmetic.py` | The first gate's densities against the production disk budget |
 | `disk-widened.py` | The same including the context slice, at region extent, on deduplicated sizes |
 | `tile-completeness.ts` | Does every way member a tile's route relations declare resolve to a way the slice holds? |
+| `mutate-completeness.sh` | Applies one named mutation to that predicate and reruns its suite, so each SQL term's coverage is a differential rather than a claim |
 | `raw-fixtures.ts` | Reads the golden Overpass recordings and reduces assembled trails to a comparable summary |
 | `untagged-member-probe.osm` | A route relation with one member the loader keeps and one it drops, no boundary in the file |
 | `untagged-member-probe.sh` | Loads that fixture and holds the gap to being either kept or reported |
@@ -112,6 +113,19 @@ tsx scripts/osm-slice/tile-completeness.ts --database osm_norcal --quadkey 02301
 
 The `rel` term is the selection `RELATION_SQL` uses, deliberately. A predicate that selected a
 different set of relations than the adapter reads would score a tile the adapter never fetches.
+
+Every term in that selection is one an edit could quietly weaken while the tool still prints a
+plausible number, so each has a fixture that separates it from its neighbours: a relation crossing
+the tile edge (the only geometry that tells `ST_Intersects` from `ST_Within`), a relation carrying
+node and sub-relation members alongside its ways, a node member whose ref collides with a real way
+id, one relation per selected route value plus two excluded ones, and three relations sharing a
+node-member table so the clause's positional and correlation terms move independently.
+`mutate-completeness.sh` applies each weakening in turn and reruns
+`test/osm-slice-completeness.db.test.ts`, which is what makes the coverage a differential:
+
+```sh
+bash scripts/osm-slice/mutate-completeness.sh within
+```
 
 **The gaps are interior.** `osm2pgsql` never calls the style's way callback for a way carrying no
 tags, so an untagged way that a route relation declares as a member is gone before
