@@ -19,6 +19,11 @@ const types = [...new Set(order)];
 for (const t of types) {
   const ids = els.filter((e) => e.type === t).map((e) => e.id);
   const ascending = ids.every((id, i) => i === 0 || ids[i - 1]! <= id);
-  console.log(`${t}: n=${ids.length} ascendingById=${ascending} first=${ids[0]} last=${ids.at(-1)}`);
+  console.log(
+    `${t}: n=${ids.length} ascendingById=${ascending} first=${ids[0]} last=${ids.at(-1)}`,
+  );
 }
-console.log('type blocks in order:', order.filter((t, i) => i === 0 || order[i - 1] !== t).join(' -> '));
+console.log(
+  'type blocks in order:',
+  order.filter((t, i) => i === 0 || order[i - 1] !== t).join(' -> '),
+);

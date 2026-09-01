@@ -160,7 +160,9 @@ function parseArgs(argv: string[]): Args {
 
   const database = flag('database');
   if (!database) {
-    throw new Error('usage: tile-completeness.ts --database <db> (--quadkey <qk> | --bbox w,s,e,n)');
+    throw new Error(
+      'usage: tile-completeness.ts --database <db> (--quadkey <qk> | --bbox w,s,e,n)',
+    );
   }
   const json = argv.includes('--json');
 

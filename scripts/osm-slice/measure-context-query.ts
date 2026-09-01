@@ -4,7 +4,11 @@
  */
 
 import { Client } from 'pg';
-import { classifyWaypoint, featurePosition, featureSearchBBox } from '../../packages/ingest/src/enrich';
+import {
+  classifyWaypoint,
+  featurePosition,
+  featureSearchBBox,
+} from '../../packages/ingest/src/enrich';
 import { pickRegion } from '../../packages/ingest/src/tile-context';
 import { loadRawFixture } from './raw-fixtures';
 import type { OverpassElement } from '../../packages/ingest/src/overpass';
@@ -83,23 +87,19 @@ export async function fetchContext(
   const featureMs = performance.now() - t1;
 
   const features: OverpassElement[] = [
-    ...nodes.rows.map(
-      (r): OverpassElement => ({
-        type: 'node',
-        id: Number(r.id),
-        lat: r.lat,
-        lon: r.lon,
-        tags: r.tags,
-      }),
-    ),
-    ...ways.rows.map(
-      (r): OverpassElement => ({
-        type: 'way',
-        id: Number(r.id),
-        center: { lat: r.lat, lon: r.lon },
-        tags: r.tags,
-      }),
-    ),
+    ...nodes.rows.map((r): OverpassElement => ({
+      type: 'node',
+      id: Number(r.id),
+      lat: r.lat,
+      lon: r.lon,
+      tags: r.tags,
+    })),
+    ...ways.rows.map((r): OverpassElement => ({
+      type: 'way',
+      id: Number(r.id),
+      center: { lat: r.lat, lon: r.lon },
+      tags: r.tags,
+    })),
   ];
 
   return {
@@ -227,7 +227,8 @@ async function main(): Promise<void> {
     timings.push({ regionMs: fetched.regionMs, featureMs: fetched.featureMs });
   }
 
-  const median = (xs: number[]): number => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
+  const median = (xs: number[]): number =>
+    xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
   const regionMs = median(timings.map((t) => t.regionMs));
   const featureMs = median(timings.map((t) => t.featureMs));
 

@@ -36,7 +36,9 @@ function describe(label: string, runs: Run[]) {
       ` context median=${median(runs.map((r) => r.contextMs))}`,
   );
   const trails = new Set(runs.map((r) => r.trailsCommitted));
-  const softFailed = runs.filter((r) => !r.served['feature:live-overpass'] && r.mode === 'live').length;
+  const softFailed = runs.filter(
+    (r) => !r.served['feature:live-overpass'] && r.mode === 'live',
+  ).length;
   console.log(
     `${''.padEnd(28)} trailsCommitted=${[...trails].join('/')}` +
       ` failed=${runs.reduce((a, r) => a + r.failed, 0)}` +
@@ -56,6 +58,12 @@ const lc = complete.length ? median(complete.map((r) => r.totalMs)) : NaN;
 
 console.log('\n-- speedup, stated every way it can honestly be stated --');
 console.log(`median live / median slice          ${(l.median / s.median).toFixed(2)}x`);
-console.log(`median complete-output live / slice ${(lc / s.median).toFixed(2)}x  (n=${complete.length} live runs whose feature lookup did not soft-fail)`);
-console.log(`FASTEST live / median slice         ${(l.totals[0]! / s.median).toFixed(2)}x  (most conservative)`);
-console.log(`fastest live / slowest slice        ${(l.totals[0]! / s.totals.at(-1)!).toFixed(2)}x  (worst-case pairing, not an estimator)`);
+console.log(
+  `median complete-output live / slice ${(lc / s.median).toFixed(2)}x  (n=${complete.length} live runs whose feature lookup did not soft-fail)`,
+);
+console.log(
+  `FASTEST live / median slice         ${(l.totals[0]! / s.median).toFixed(2)}x  (most conservative)`,
+);
+console.log(
+  `fastest live / slowest slice        ${(l.totals[0]! / s.totals.at(-1)!).toFixed(2)}x  (worst-case pairing, not an estimator)`,
+);

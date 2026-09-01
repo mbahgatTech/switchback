@@ -266,7 +266,8 @@ async function main(): Promise<void> {
     timings.push({ sqlMs: fetched.sqlMs, shapeMs: fetched.shapeMs, assembleMs });
   }
 
-  const median = (xs: number[]): number => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
+  const median = (xs: number[]): number =>
+    xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
   const report = {
     quadkey,
     database,
@@ -284,7 +285,9 @@ async function main(): Promise<void> {
   const golden = loadAssembleGolden('tile', quadkey!);
   if (!golden) {
     // Timings above stand on their own; only the parity half needs a recording to compare against.
-    console.log(JSON.stringify({ parity: 'UNVERIFIED: no golden recorded for this tile' }, null, 2));
+    console.log(
+      JSON.stringify({ parity: 'UNVERIFIED: no golden recorded for this tile' }, null, 2),
+    );
     await client.end();
     return;
   }

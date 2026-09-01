@@ -5,31 +5,31 @@ rather than argued. Nothing here is imported by the application.
 
 ## What each script answers
 
-| script | question |
-| --- | --- |
-| `measure-extract.sh` | What does slicing an extract cost to build, and on disk? |
-| `measure-context-extract.sh` | Same, for the feature and admin classes the tile context queries read |
-| `switchback.lua` | osm2pgsql flex style; `SB_SLICE` picks `trail` (buildTileQuery), `network` (buildNetworkQuery) or `context` (the feature and region pair) |
-| `measure-tile-query.ts` | How fast is the SQL equivalent of `buildTileQuery`, and does it reproduce the committed golden? |
-| `measure-context-query.ts` | The same for `buildRegionQuery` and `buildFeatureQuery` |
-| `measure-node-members.ts` | How much selection area do relation node members add that member-way geometry misses? |
-| `measure-overpass-baseline.ts` | What does the same tile query cost against a live mirror, now? |
-| `measure-context-baseline.ts` | What does the region and feature pair cost live? |
-| `measure-ingest-tile.ts` | What does a whole tile cost end to end, with the source `MODE` names? |
-| `measure-e2e-runs.sh` | The same, N times, because one run of either arm decides nothing |
-| `summarise-e2e.ts` | Both distributions and the speedup, stated every way it can honestly be stated |
-| `measure-env.sh` | The measurement database and a usable Overpass identity; never reads the repository `.env` |
-| `slice-bytes.sql` | Bytes per km², per slice, with index and page overhead carried in |
-| `poly-to-wkt.ts` | Geofabrik `.poly` to WKT, so an extract's area is computed rather than looked up |
-| `diagnose-divergence.ts` | Which member ways a divergent trail lost, and whether the slice ever held them |
-| `provenance.ts` | Which tree the harness actually loads — a worktree has no `node_modules` of its own |
-| `disk-arithmetic.py` | The first gate's densities against the production disk budget |
-| `disk-widened.py` | The same including the context slice, at region extent, on deduplicated sizes |
-| `tile-completeness.ts` | Does every way member a tile's route relations declare resolve to a way the slice holds? |
-| `mutate-completeness.sh` | Applies one named mutation to that predicate and reruns its suite, so each SQL term's coverage is a differential rather than a claim |
-| `raw-fixtures.ts` | Reads the golden Overpass recordings and reduces assembled trails to a comparable summary |
-| `untagged-member-probe.osm` | A route relation with one member the loader keeps and one it drops, no boundary in the file |
-| `untagged-member-probe.sh` | Loads that fixture and holds the gap to being either kept or reported |
+| script                         | question                                                                                                                                  |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `measure-extract.sh`           | What does slicing an extract cost to build, and on disk?                                                                                  |
+| `measure-context-extract.sh`   | Same, for the feature and admin classes the tile context queries read                                                                     |
+| `switchback.lua`               | osm2pgsql flex style; `SB_SLICE` picks `trail` (buildTileQuery), `network` (buildNetworkQuery) or `context` (the feature and region pair) |
+| `measure-tile-query.ts`        | How fast is the SQL equivalent of `buildTileQuery`, and does it reproduce the committed golden?                                           |
+| `measure-context-query.ts`     | The same for `buildRegionQuery` and `buildFeatureQuery`                                                                                   |
+| `measure-node-members.ts`      | How much selection area do relation node members add that member-way geometry misses?                                                     |
+| `measure-overpass-baseline.ts` | What does the same tile query cost against a live mirror, now?                                                                            |
+| `measure-context-baseline.ts`  | What does the region and feature pair cost live?                                                                                          |
+| `measure-ingest-tile.ts`       | What does a whole tile cost end to end, with the source `MODE` names?                                                                     |
+| `measure-e2e-runs.sh`          | The same, N times, because one run of either arm decides nothing                                                                          |
+| `summarise-e2e.ts`             | Both distributions and the speedup, stated every way it can honestly be stated                                                            |
+| `measure-env.sh`               | The measurement database and a usable Overpass identity; never reads the repository `.env`                                                |
+| `slice-bytes.sql`              | Bytes per km², per slice, with index and page overhead carried in                                                                         |
+| `poly-to-wkt.ts`               | Geofabrik `.poly` to WKT, so an extract's area is computed rather than looked up                                                          |
+| `diagnose-divergence.ts`       | Which member ways a divergent trail lost, and whether the slice ever held them                                                            |
+| `provenance.ts`                | Which tree the harness actually loads — a worktree has no `node_modules` of its own                                                       |
+| `disk-arithmetic.py`           | The first gate's densities against the production disk budget                                                                             |
+| `disk-widened.py`              | The same including the context slice, at region extent, on deduplicated sizes                                                             |
+| `tile-completeness.ts`         | Does every way member a tile's route relations declare resolve to a way the slice holds?                                                  |
+| `mutate-completeness.sh`       | Applies one named mutation to that predicate and reruns its suite, so each SQL term's coverage is a differential rather than a claim      |
+| `raw-fixtures.ts`              | Reads the golden Overpass recordings and reduces assembled trails to a comparable summary                                                 |
+| `untagged-member-probe.osm`    | A route relation with one member the loader keeps and one it drops, no boundary in the file                                               |
+| `untagged-member-probe.sh`     | Loads that fixture and holds the gap to being either kept or reported                                                                     |
 
 ## Running it
 
@@ -78,7 +78,7 @@ recordings have to be present for it to say anything.
 **Ways must arrive ordered by `way_id` ascending.** `chainWays` is greedy and seeds in iteration
 order, so arrival order decides which line a branchy name group yields, and therefore the
 `Math.min(wayIds)` that becomes the trail's `osmId`. Overpass emits ascending by id; osm2pgsql
-clusters by geometry. Serving cluster order reproduces the right trail *count* with the wrong
+clusters by geometry. Serving cluster order reproduces the right trail _count_ with the wrong
 trails, which is the failure mode least likely to be noticed — `PERTURB=order` on the sparse tile
 holds the count at 145 and still moves one trail in, one out and eight fields. `fetchTileElements`
 asserts the ordering rather than trusting the `ORDER BY`.

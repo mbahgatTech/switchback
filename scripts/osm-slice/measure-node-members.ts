@@ -107,7 +107,11 @@ async function main(): Promise<void> {
   const { rows: size } = await client.query<{ bytes: string }>(
     `SELECT pg_total_relation_size('osm.relation_node_member')::text AS bytes`,
   );
-  const { rows: totals } = await client.query<{ relations: string; withNode: string; nullGeom: string }>(
+  const { rows: totals } = await client.query<{
+    relations: string;
+    withNode: string;
+    nullGeom: string;
+  }>(
     `SELECT count(*)::text AS relations,
             count(*) FILTER (WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(members) m WHERE m->>'type'='node'))::text AS "withNode",
             count(*) FILTER (WHERE geom IS NULL)::text AS "nullGeom"

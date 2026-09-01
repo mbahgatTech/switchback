@@ -27,7 +27,9 @@ type Mode = 'slice' | 'sql' | 'fixture' | 'live';
 
 function fixture(shape: string, subject: string): OverpassResponse {
   const packed = readFileSync(join(RAW_FIXTURE_DIR, `${shape}.${subject}.json.gz`));
-  const recorded = JSON.parse(gunzipSync(packed).toString('utf8')) as { response: OverpassResponse };
+  const recorded = JSON.parse(gunzipSync(packed).toString('utf8')) as {
+    response: OverpassResponse;
+  };
   return recorded.response;
 }
 
