@@ -14,7 +14,7 @@ import {
   quadkeyToTile,
 } from '@switchback/geo';
 import { DRAIN_ADMISSION_KEY } from './drain-slot';
-import { isTileFresh, isTileSettled } from './freshness';
+import { isRefetchDue, isTileSettled } from './freshness';
 import { trailIdentityMode } from './identity';
 import { DEFAULT_MAX_ATTEMPTS, LEASE_TIMEOUT_MS, enqueue, tileJobKey } from './jobs';
 
@@ -208,9 +208,9 @@ export type TileSnapshot = { status: TileStatus; fetchedAt: Date | null } | null
  *
  * A parent that has served trails before keeps its `ready`/`empty` status and its old
  * `fetchedAt` rather than dropping to `pending`. `ensureCoverage` classifies a settled-but-stale
- * tile as ready-and-refreshing and anything else as pending, so demoting it would flip a reader
- * from "here are your trails, refreshing" to "still loading" for as long as the four children
- * take.
+ * tile as ready — refreshing too, once a re-fetch is due — and anything else as pending, so
+ * demoting it would flip a reader from "here are your trails, refreshing" to "still loading" for
+ * as long as the four children take.
  *
  * **`previous` is a parameter and not a read, because by the time this runs the row no longer
  * says what the tile was.** `processTile` writes `running` before it fetches, so a re-read here
@@ -308,6 +308,10 @@ export interface ChildQueueOutcome {
  * the ladder restarts for as long as anyone leaves a map open over the parent. `attempts` on the
  * *tile* survives the revival where the job's does not.
  *
+ * A child that keeps *succeeding* with data past the TTL runs away the same way and the cap cannot
+ * see it — the job settles `done`, never `dead` — so `isRefetchDue` rather than `!isTileFresh`
+ * decides what is outstanding. Both readings agree on every child whose stamp can still move.
+ *
  * Past the cap the parent is **held, not promoted**: `rollUp` needs all four children settled, so
  * an abandoned child leaves the parent short rather than letting it report an area complete with a
  * quarter of it missing. `rollUpSplitTile` names the abandoned children on the parent's row and in
@@ -319,7 +323,7 @@ export async function queueStaleChildren(
   now: Date,
   priority = SPLIT_PRIORITY,
 ): Promise<ChildQueueOutcome> {
-  const outstanding = children.filter((child) => !isTileFresh(child, now));
+  const outstanding = children.filter((child) => isRefetchDue(child, now));
   if (outstanding.length === 0) return { queued: [], waiting: [], exhausted: [], abandoned: [] };
 
   const jobs = await db.ingestJob.findMany({

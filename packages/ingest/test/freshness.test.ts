@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { TileStatus } from '@switchback/db';
-import { TILE_TTL_MS, isTileFresh, isTileSettled } from '../src/freshness';
+import {
+  REFETCH_INTERVAL_MS,
+  TILE_TTL_MS,
+  isRefetchDue,
+  isTileFresh,
+  isTileSettled,
+} from '../src/freshness';
 
 const NOW = new Date('2026-06-01T12:00:00Z');
 const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
@@ -132,5 +138,66 @@ describe('isTileFresh against the source stamp', () => {
       const stale = { status, fetchedAt: ago(TILE_TTL_MS + 1), sourceSnapshotAt: NOW };
       expect(isTileFresh(stale, NOW)).toBe(false);
     });
+  });
+});
+
+/*
+ * Too old to serve is a different question from worth asking again, and every queueing caller has
+ * the second one. A tile whose source stamp is already past the TTL never becomes fresh, so a
+ * caller reading `isTileFresh` alone re-queues it on every viewport poll for as long as a map
+ * stays open over that ground — a real Overpass query per browse request that cannot move the
+ * stamp it exists to move.
+ */
+describe('isRefetchDue', () => {
+  describe.each(SERVED)('on a %s tile whose source data is past the TTL', (status) => {
+    const stampedStale = (fetchedAt: Date) => ({
+      status,
+      fetchedAt,
+      sourceSnapshotAt: ago(TILE_TTL_MS + 1),
+    });
+
+    it('holds the tile back while it is inside the refetch interval', () => {
+      // Stale on both readings. The point is that asking again cannot change either one.
+      expect(isTileFresh(stampedStale(NOW), NOW)).toBe(false);
+      expect(isRefetchDue(stampedStale(NOW), NOW)).toBe(false);
+      expect(isRefetchDue(stampedStale(ago(REFETCH_INTERVAL_MS - 1)), NOW)).toBe(false);
+    });
+
+    it('lets it through once the interval has passed, so a caught-up source is noticed', () => {
+      expect(isRefetchDue(stampedStale(ago(REFETCH_INTERVAL_MS)), NOW)).toBe(true);
+    });
+  });
+
+  it('never holds back a tile that is stale on its own fetch clock', () => {
+    // The interval is shorter than the TTL, so a tile the TTL has expired has always waited it
+    // out already. Anything else would be a second, longer TTL nobody asked for.
+    expect(REFETCH_INTERVAL_MS).toBeLessThan(TILE_TTL_MS);
+    expect(
+      isRefetchDue(
+        { status: TileStatus.ready, fetchedAt: ago(TILE_TTL_MS + 1), sourceSnapshotAt: null },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  it('leaves an unsettled tile to the job retry ladder, which carries its own backoff', () => {
+    // `pending`, `running` and `failed` are how a tile in flight is represented. Holding one back
+    // here would strand it behind an interval the ladder knows nothing about.
+    const unsettled = Object.values(TileStatus).filter((status) => !isTileSettled(status));
+    expect(unsettled.length).toBeGreaterThan(0);
+    for (const status of unsettled) {
+      expect(isRefetchDue({ status, fetchedAt: NOW, sourceSnapshotAt: NOW }, NOW)).toBe(true);
+    }
+  });
+
+  it('queues a cold tile and an absent row without waiting', () => {
+    expect(
+      isRefetchDue({ status: TileStatus.ready, fetchedAt: null, sourceSnapshotAt: null }, NOW),
+    ).toBe(true);
+    expect(isRefetchDue(null, NOW)).toBe(true);
+  });
+
+  it('asks nothing of a tile that is genuinely fresh', () => {
+    expect(isRefetchDue(justFetched(TileStatus.ready, ago(TILE_TTL_MS - 1000)), NOW)).toBe(false);
   });
 });

@@ -11,6 +11,17 @@ import { TileStatus } from '@switchback/db';
  */
 export const TILE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * The shortest gap between two fetches of one tile.
+ *
+ * `TILE_TTL_MS` says when data stops being worth serving. It does not say a re-fetch can replace
+ * it: a source answering with a `timestamp_osm_base` already past the TTL — a mirror behind on
+ * replication, an extract cut months ago — leaves the row stale however often it is re-read. A day
+ * is the coarsest cadence any source we read republishes on, so it is the shortest wait after which
+ * a different answer is even possible.
+ */
+export const REFETCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 /** A tile row that has contributed everything it is going to — trails, or provably none. */
 export function isTileSettled(status: TileStatus): boolean {
   return status === TileStatus.ready || status === TileStatus.empty;
@@ -61,4 +72,34 @@ export function isTileFresh(tile: TileFreshness | null, now: Date, ttlMs = TILE_
   if (!tile?.fetchedAt) return false;
   if (!isTileSettled(tile.status)) return false;
   return now.getTime() - dataAsOf(tile.fetchedAt, tile.sourceSnapshotAt).getTime() < ttlMs;
+}
+
+/**
+ * Whether queueing a fetch for this tile now could improve it — the question `isTileFresh` does
+ * not answer, and the one every queueing caller actually has.
+ *
+ * Stale means the data is too old to serve. It does not mean asking again will return anything
+ * newer, and reading the two as one is what puts a tile whose source stamp cannot advance back on
+ * the queue on every viewport poll: `enqueue` revives the finished job, the drain re-queries the
+ * same source, the same stamp lands, and the tile is stale again — one Overpass query per browse
+ * request over ground that cannot improve. A settled tile has already been asked, so it is served
+ * from what it holds until `REFETCH_INTERVAL_MS` has passed.
+ *
+ * A floor rather than an attempt cap, because the fetch is *succeeding* and the data is being
+ * served: a source behind today may catch up tomorrow, and a cap would keep the tile from ever
+ * noticing. `SPLIT_CHILD_ATTEMPT_CAP` counts a child that keeps *failing*, which is why it is the
+ * wrong instrument here even though the runaway loop is the same one.
+ *
+ * Only settled rows are held back. `pending`, `running` and `failed` belong to the job retry
+ * ladder, which carries its own backoff, and blocking them here would strand a tile mid-flight.
+ */
+export function isRefetchDue(
+  tile: TileFreshness | null,
+  now: Date,
+  ttlMs = TILE_TTL_MS,
+  intervalMs = REFETCH_INTERVAL_MS,
+): boolean {
+  if (isTileFresh(tile, now, ttlMs)) return false;
+  if (!tile?.fetchedAt || !isTileSettled(tile.status)) return true;
+  return now.getTime() - tile.fetchedAt.getTime() >= intervalMs;
 }

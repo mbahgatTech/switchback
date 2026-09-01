@@ -11,7 +11,7 @@ import {
   surveyArea,
 } from '../src/coverage';
 import { MAX_TILE_QUEUE_DEPTH } from '../src/backpressure';
-import { isTileSettled } from '../src/freshness';
+import { REFETCH_INTERVAL_MS, isTileSettled } from '../src/freshness';
 import { TILE_TTL_MS } from '../src/pipeline';
 
 /**
@@ -115,14 +115,16 @@ function stale(quadkey: string): TileRow {
 }
 
 /**
- * Fetched a second ago, over data the source cut before the TTL began. The tile an
- * extract-backed ingest writes, and the only state in which the two clocks disagree.
+ * Fetched long enough ago to be worth asking again, over data the source cut before the TTL
+ * began. The tile an extract-backed ingest writes, and the only state in which the two clocks
+ * disagree: the fetch alone still says fresh, so the source stamp is the only column that can
+ * put this back on the queue.
  */
 function staleSource(quadkey: string, status: TileStatus): TileRow {
   return {
     quadkey,
     status,
-    fetchedAt: new Date(NOW.getTime() - 1_000),
+    fetchedAt: new Date(NOW.getTime() - REFETCH_INTERVAL_MS * 2),
     sourceSnapshotAt: new Date(NOW.getTime() - TILE_TTL_MS - 1_000),
   };
 }
@@ -172,9 +174,9 @@ describe('ensureCoverage partitioning', () => {
     async (status) => {
       /*
        * The state every other fixture in this file leaves at null, and so the only one in which
-       * the partition can tell the two clocks apart. On `fetchedAt` alone this tile is a second
-       * old: served, never re-queued, ageing without bound behind an extract that keeps
-       * answering. It has to come back out of the partition as work.
+       * the partition can tell the two clocks apart. On `fetchedAt` alone this tile is well
+       * inside the TTL: served, never re-queued, ageing without bound behind an extract that
+       * keeps answering. It has to come back out of the partition as work.
        *
        * `empty` is the worse half, not the lesser one: a stale `ready` tile keeps drawing the
        * trails it fetched last month, while a stale `empty` one draws nothing at all over
@@ -190,6 +192,33 @@ describe('ensureCoverage partitioning', () => {
       expect(result.ready).toEqual([quadkey]);
       expect(result.refreshing).toEqual([quadkey]);
       expect(result.queued).toEqual([quadkey]);
+    },
+  );
+
+  it.each(SETTLED)(
+    'leaves a %s tile alone when its stale source was asked only moments ago',
+    async (status) => {
+      /*
+       * The other half of the same reading. A source stamp past the TTL never advances, so a
+       * partition that only asks "is this fresh?" queues the tile on every poll and buys a real
+       * Overpass query per browse request that cannot change the answer. Held back, the tile
+       * keeps being served — and is not reported as refreshing, because nothing is refreshing it.
+       */
+      const quadkey = (
+        await ensureCoverage(ONE_TILE, { principal: null, db: fakeDb().db, now: NOW })
+      ).quadkeys[0]!;
+      const justAsked = {
+        ...staleSource(quadkey, status),
+        fetchedAt: new Date(NOW.getTime() - 1_000),
+      };
+      const { db, recorded } = fakeDb([justAsked]);
+
+      const result = await ensureCoverage(ONE_TILE, { principal: null, db, now: NOW });
+
+      expect(result.ready).toEqual([quadkey]);
+      expect(result.refreshing).toEqual([]);
+      expect(result.queued).toEqual([]);
+      expect(recorded.jobUpserts).toHaveLength(0);
     },
   );
 

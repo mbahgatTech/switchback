@@ -21,7 +21,7 @@ import {
   unsplitTile,
 } from '../src/subdivide';
 import type { ChildTile } from '../src/subdivide';
-import { TILE_TTL_MS, isTileSettled } from '../src/freshness';
+import { REFETCH_INTERVAL_MS, TILE_TTL_MS, isTileSettled } from '../src/freshness';
 
 /**
  * Every status `queueStaleChildren` treats as settled data, from the helper rather than named
@@ -295,9 +295,9 @@ describe('splitTile', () => {
   });
 
   it('keeps a parent that was already serving trails in readyTiles while children run', async () => {
-    // `ensureCoverage` calls a settled-but-stale tile ready-and-refreshing and anything else
-    // pending, so demoting this one would flip a reader from "here are your trails" back to
-    // "still loading" for as long as four children take.
+    // `ensureCoverage` calls a settled-but-stale tile ready — refreshing too, once a re-fetch is
+    // due — and anything else pending, so demoting this one would flip a reader from "here are
+    // your trails" back to "still loading" for as long as four children take.
     const fetchedAt = ago(TILE_TTL_MS + 1);
     const { db, recorded } = fakeDb();
 
@@ -484,14 +484,42 @@ describe('queueStaleChildren', () => {
   it.each(SETTLED)(
     'queues a %s child whose fetch is recent but whose source data is past the TTL',
     async (status) => {
-      // Every child settled, every fetch `NOW`. The stamp is the only column left that decides.
-      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
+      /*
+       * The fetch is recent enough that the TTL alone would still call this child fresh, so the
+       * stamp is the only column left that can queue it — and old enough to clear the interval
+       * that keeps a stamp which cannot advance off the queue on every drain.
+       */
+      const rows = siblings([
+        {},
+        {},
+        { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1), fetchedAt: ago(REFETCH_INTERVAL_MS * 2) },
+        {},
+      ]);
       const { db, recorded } = fakeDb(rows);
 
       const outcome = await queueStaleChildren(db, rows, NOW);
 
       expect(outcome.queued).toEqual([keys[2]]);
       expect(recorded.jobUpserts.map((job) => job.dedupeKey)).toEqual([jobKey(keys[2])]);
+    },
+  );
+
+  it.each(SETTLED)(
+    'leaves a %s child alone whose stale source was asked only moments ago',
+    async (status) => {
+      /*
+       * `SPLIT_CHILD_ATTEMPT_CAP` cannot bound this one: it counts a child whose job reaches
+       * `dead`, and a child whose fetch succeeds every time with data past the TTL settles
+       * `done`. `enqueue` then revives it, and the parent is drained on every viewport poll for
+       * as long as it is unpromoted — a query per poll that cannot move the stamp.
+       */
+      const rows = siblings([{}, {}, { status, sourceSnapshotAt: ago(TILE_TTL_MS + 1) }, {}]);
+      const { db, recorded } = fakeDb(rows);
+
+      const outcome = await queueStaleChildren(db, rows, NOW);
+
+      expect(outcome.queued).toEqual([]);
+      expect(recorded.jobUpserts).toEqual([]);
     },
   );
 

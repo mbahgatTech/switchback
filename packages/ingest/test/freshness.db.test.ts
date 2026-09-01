@@ -3,9 +3,9 @@ import { JobKind, JobStatus, TileStatus, prisma } from '@switchback/db';
 import { childQuadkeys, quadkeyToBBox, quadkeyToTile } from '@switchback/geo';
 import type { BBox } from '@switchback/core';
 import { ensureCoverage, surveyArea } from '../src/coverage';
-import { TILE_TTL_MS, isTileSettled } from '../src/freshness';
+import { REFETCH_INTERVAL_MS, TILE_TTL_MS, isTileFresh, isTileSettled } from '../src/freshness';
 import { tileJobKey } from '../src/jobs';
-import { processTile } from '../src/pipeline';
+import { STALE_SOURCE_MARKER, processTile } from '../src/pipeline';
 import type { PipelineDeps } from '../src/pipeline';
 import { promoteFrom } from '../src/subdivide';
 
@@ -81,6 +81,9 @@ const SETTLED_CURRENT = `${NS}000101`;
 /** The tile a partial extract writes: `200 OK`, zero elements, and the extract's own date. */
 const EXTRACT_EMPTY = `${NS}000102`;
 
+/** The same answer, given over and over, to count what a source that cannot advance costs. */
+const LOOPING = `${NS}000103`;
+
 const FIXTURES = [
   CURRENT,
   STALE_SOURCE,
@@ -88,6 +91,7 @@ const FIXTURES = [
   SETTLED_STALE_SOURCE,
   SETTLED_CURRENT,
   EXTRACT_EMPTY,
+  LOOPING,
   ...VIEWED,
   ...[...ROLLED_UP, ...SPLIT].flatMap((parent) => [parent, ...childQuadkeys(parent)]),
 ];
@@ -98,6 +102,30 @@ const ago = (ms: number): Date => new Date(NOW.getTime() - ms);
 /** A day either side of the TTL, so moving the TTL moves every fixture judged against it. */
 const INSIDE_TTL = ago(TILE_TTL_MS - 86_400_000);
 const PAST_TTL = ago(TILE_TTL_MS + 86_400_000);
+
+/**
+ * A fetch old enough to clear `REFETCH_INTERVAL_MS` and recent enough to stay well inside
+ * `TILE_TTL_MS`, derived from both so moving either moves the fixture with it. A tile seeded with
+ * it is fresh on its fetch clock alone, which leaves the source stamp the only column that can
+ * put it back on the queue.
+ */
+const ASKED_BEFORE = ago(REFETCH_INTERVAL_MS * 2);
+
+/**
+ * The premise every re-queue below rests on, pinned rather than assumed. Should the two constants
+ * ever cross, `ASKED_BEFORE` would expire on the fetch clock and those tests would go green
+ * without the source stamp deciding anything — which is the reading they exist to take.
+ */
+describe('the fetch clock the re-queue fixtures are seeded with', () => {
+  it('is one the TTL alone would still call fresh', () => {
+    expect(
+      isTileFresh(
+        { status: TileStatus.ready, fetchedAt: ASKED_BEFORE, sourceSnapshotAt: null },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+});
 
 /**
  * A bbox that covers this tile and cannot spill into its neighbours. The tile's own bbox shares
@@ -121,6 +149,7 @@ async function seedTile(
   quadkey: string,
   sourceSnapshotAt: Date | null,
   status: TileStatus = TileStatus.ready,
+  fetchedAt: Date = NOW,
 ): Promise<void> {
   await prisma.ingestTile.create({
     data: {
@@ -129,8 +158,9 @@ async function seedTile(
       // The row invariant the writer keeps, not a knob: `processTile` writes `empty` exactly
       // when it assembled no trails.
       trailCount: status === TileStatus.empty ? 0 : 1,
-      // The fetch is always recent. Whatever these tiles are judged on, it is not this.
-      fetchedAt: NOW,
+      // `NOW` unless a block is about the fetch clock itself, so whatever these tiles are
+      // judged on, it is not this.
+      fetchedAt,
       sourceSnapshotAt,
     },
   });
@@ -152,11 +182,17 @@ async function seedSplit(
   parent: string,
   stampAt: (index: number, count: number) => Date | null,
   statusAt: (index: number, count: number) => TileStatus = () => TileStatus.ready,
+  fetchedAt: Date = NOW,
 ): Promise<string[]> {
   await seedUnpromoted(parent);
   const children = childQuadkeys(parent);
   for (const [index, child] of children.entries()) {
-    await seedTile(child, stampAt(index, children.length), statusAt(index, children.length));
+    await seedTile(
+      child,
+      stampAt(index, children.length),
+      statusAt(index, children.length),
+      fetchedAt,
+    );
   }
   return children;
 }
@@ -218,6 +254,56 @@ async function seedQueuedJob(quadkey: string): Promise<void> {
 /** What a viewport poll makes of the single tile `quadkey` covers. */
 function viewportOver(quadkey: string) {
   return ensureCoverage(centreOf(quadkey), { db: prisma, now: NOW, principal: null, maxTiles: 4 });
+}
+
+/**
+ * A source stuck at `stamp` however often it is asked, and a count of what asking costs.
+ *
+ * Its clock is a variable because the whole reading is about elapsed time, and the query count is
+ * the measurement: a tile this source can never make fresh still has to cost one query per
+ * `REFETCH_INTERVAL_MS` rather than one per poll.
+ */
+function stuckSource(stamp: Date) {
+  const state = { at: NOW, queries: 0 };
+  const deps: PipelineDeps = {
+    db: prisma,
+    now: () => state.at,
+    overpass: {
+      query: () => {
+        state.queries += 1;
+        return Promise.resolve({
+          elements: [],
+          osm3s: { timestamp_osm_base: stamp.toISOString() },
+        });
+      },
+    },
+  };
+  return { state, deps };
+}
+
+/**
+ * One viewport poll and the drain it asks for — the loop an open map actually runs.
+ *
+ * `refreshing` decides rather than `queued` because `queueTiles` puts new ground through
+ * `admitIngest`, which counts queued jobs database-wide and would let another agent's queue
+ * answer this. `refreshing` is written before admission and says the same thing: this poll wants
+ * the tile fetched.
+ */
+async function pollAndDrain(
+  quadkey: string,
+  at: Date,
+  source: ReturnType<typeof stuckSource>,
+): Promise<boolean> {
+  source.state.at = at;
+  const view = await ensureCoverage(centreOf(quadkey), {
+    db: prisma,
+    now: at,
+    principal: null,
+    maxTiles: 4,
+  });
+  const wanted = view.refreshing.includes(quadkey) || view.pending.includes(quadkey);
+  if (wanted) await processTile(quadkey, source.deps);
+  return wanted;
 }
 
 /**
@@ -392,7 +478,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness a viewport is judged on', () 
   afterAll(cleanup);
 
   it('re-queues a tile whose fetch is recent but whose source data is past the TTL', async () => {
-    await seedTile(VIEWED_STALE_SOURCE, PAST_TTL);
+    await seedTile(VIEWED_STALE_SOURCE, PAST_TTL, TileStatus.ready, ASKED_BEFORE);
     await seedQueuedJob(VIEWED_STALE_SOURCE);
 
     const view = await viewportOver(VIEWED_STALE_SOURCE);
@@ -451,6 +537,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness a split parent’s children a
         SPLIT_STALE_SOURCE,
         oldestInTheMiddle(PAST_TTL),
         inTheMiddle(status, TileStatus.ready),
+        ASKED_BEFORE,
       );
 
       const result = await drainSplitParent(SPLIT_STALE_SOURCE);
@@ -467,6 +554,20 @@ describe.runIf(IS_LOCAL).sequential('the freshness a split parent’s children a
     await drainSplitParent(SPLIT_CURRENT);
 
     expect(await queuedChildren(SPLIT_CURRENT)).toEqual([]);
+  });
+
+  it('queues nothing for a child just asked, whose source stamp cannot advance', async () => {
+    /*
+     * The runaway the `SPLIT_CHILD_ATTEMPT_CAP` cannot see. That cap counts a child whose job
+     * reaches `dead`; a child whose fetch *succeeds* every time with data past the TTL settles
+     * `done`, so `enqueue` revives it and this filter queues it again on the next drain — and the
+     * parent is drained on every viewport poll while it is unpromoted.
+     */
+    await seedSplit(SPLIT_STALE_SOURCE, oldestInTheMiddle(PAST_TTL));
+
+    await drainSplitParent(SPLIT_STALE_SOURCE);
+
+    expect(await queuedChildren(SPLIT_STALE_SOURCE)).toEqual([]);
   });
 });
 
@@ -486,7 +587,7 @@ describe.runIf(IS_LOCAL).sequential('the freshness every settled status is judge
   it.each(SETTLED)(
     're-queues a %s tile whose fetch is recent but whose source data is past the TTL',
     async (status) => {
-      await seedTile(SETTLED_STALE_SOURCE, PAST_TTL, status);
+      await seedTile(SETTLED_STALE_SOURCE, PAST_TTL, status, ASKED_BEFORE);
       await seedQueuedJob(SETTLED_STALE_SOURCE);
 
       const view = await viewportOver(SETTLED_STALE_SOURCE);
@@ -563,5 +664,84 @@ describe.runIf(IS_LOCAL).sequential('the freshness an extract’s empty answer i
     expect(survey.quadkeys).toContain(EXTRACT_EMPTY);
     expect(survey.fresh).not.toContain(EXTRACT_EMPTY);
     expect(survey.outstanding).toContain(EXTRACT_EMPTY);
+  });
+});
+
+/**
+ * What a source that cannot advance costs, counted rather than reasoned about.
+ *
+ * Refusing to call such a tile fresh is only half the job. The other half is that nothing else
+ * notices when a re-fetch cannot move the stamp: `ensureCoverage` puts the tile back in
+ * `needsWork` on every poll, `enqueue` revives the settled job with `attempts` cleared, the drain
+ * re-queries the same source, and the same stamp lands. The fetch *succeeds* every time, so no
+ * ladder engages — `failJob` never runs, `SPLIT_CHILD_ATTEMPT_CAP` is only read for split
+ * children, and `reconcileDeadJobs` only for dead jobs. One tile then costs a real Overpass query
+ * per browse request, spending the ingest budget on ground that cannot improve while genuinely
+ * new ground is refused, and `coverage-note.tsx` reports "refreshing cached ground" for as long
+ * as the map stays open.
+ *
+ * Driven end to end and measured in queries: the count is the defect, and any assertion about the
+ * predicate alone would leave the loop free to run through some other caller.
+ */
+describe.runIf(IS_LOCAL).sequential('what a source that cannot advance costs', () => {
+  beforeEach(cleanup);
+  afterAll(cleanup);
+
+  it('is re-queried once per refetch interval, not once per poll', async () => {
+    const source = stuckSource(PAST_TTL);
+
+    // The first fetch is the one worth making — nothing is known about this ground yet.
+    await processTile(LOOPING, source.deps);
+    expect(source.state.queries).toBe(1);
+    const written = await freshnessRow(LOOPING);
+    expect(written.status).toBe(TileStatus.empty);
+    expect(written.fetchedAt).toEqual(NOW);
+    expect(written.sourceSnapshotAt).toEqual(PAST_TTL);
+
+    // Four polls over the day that follows: one map, left open.
+    const polls = [60_000, 3_600_000, REFETCH_INTERVAL_MS / 2, REFETCH_INTERVAL_MS - 60_000];
+    const wanted: boolean[] = [];
+    for (const ms of polls) {
+      wanted.push(await pollAndDrain(LOOPING, new Date(NOW.getTime() + ms), source));
+    }
+    // The count is the measurement — asserted whole so a regression reports how far it ran.
+    expect(wanted).toEqual(polls.map(() => false));
+    expect(source.state.queries).toBe(1);
+
+    // Served throughout, and never claiming a refresh nobody is running.
+    const view = await ensureCoverage(centreOf(LOOPING), {
+      db: prisma,
+      now: new Date(NOW.getTime() + 60_000),
+      principal: null,
+      maxTiles: 4,
+    });
+    expect(view.ready).toEqual([LOOPING]);
+    expect(view.refreshing).toEqual([]);
+    expect(view.queued).toEqual([]);
+
+    // A floor, not a cap: the source may have caught up by now, so it is asked again — once.
+    const due = new Date(NOW.getTime() + REFETCH_INTERVAL_MS);
+    expect(await pollAndDrain(LOOPING, due, source)).toBe(true);
+    expect(source.state.queries).toBe(2);
+    expect((await freshnessRow(LOOPING)).fetchedAt).toEqual(due);
+  });
+
+  it('says so in the log, so an estate on a stale extract is not silent', async () => {
+    // The retry being quiet is the point of the interval, and a quiet retry over year-old data
+    // is indistinguishable from a healthy estate unless the fetch itself reports the age.
+    const lines: string[] = [];
+    const source = stuckSource(PAST_TTL);
+    await processTile(LOOPING, { ...source.deps, logger: (message) => lines.push(message) });
+
+    expect(lines.filter((line) => line.startsWith(STALE_SOURCE_MARKER))).toHaveLength(1);
+    expect(lines.find((line) => line.startsWith(STALE_SOURCE_MARKER))).toContain(LOOPING);
+  });
+
+  it('stays quiet for a source whose data is inside the TTL', async () => {
+    const lines: string[] = [];
+    const source = stuckSource(INSIDE_TTL);
+    await processTile(LOOPING, { ...source.deps, logger: (message) => lines.push(message) });
+
+    expect(lines.filter((line) => line.startsWith(STALE_SOURCE_MARKER))).toEqual([]);
   });
 });

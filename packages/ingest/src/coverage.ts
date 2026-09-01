@@ -19,7 +19,7 @@ import type { IngestRefusal } from './backpressure';
 import { spendIngestBudget } from './rate-limit';
 import type { IngestPrincipal, RateRefusal } from './rate-limit';
 import { enqueue, tileJobKey } from './jobs';
-import { isTileFresh, isTileSettled } from './freshness';
+import { isRefetchDue, isTileFresh, isTileSettled } from './freshness';
 
 /** Priority for a tile someone is looking at, above the 0 a scheduled refresh enqueues with. */
 export const VIEWPORT_PRIORITY = 5;
@@ -164,6 +164,19 @@ export async function ensureCoverage(
      * person who will not wait for it.
      */
     if (givenUp.has(tileJobKey(quadkey))) {
+      if (holdsTrails) ready.push(quadkey);
+      continue;
+    }
+
+    /*
+     * Stale is not the same as worth asking again. A tile whose source stamp cannot advance is
+     * never fresh, so without this it re-enters `needsWork` on every poll and costs an Overpass
+     * query per browse request that cannot change the answer — spending the ingest budget on
+     * ground that can never become fresh while genuinely new ground is refused. Keeping it out of
+     * `refreshing` also stops `coverage-note.tsx` claiming a refresh is under way forever.
+     * `fetchArea` runs off `surveyArea` and stays the way back for someone who will not wait.
+     */
+    if (!isRefetchDue(tile, now)) {
       if (holdsTrails) ready.push(quadkey);
       continue;
     }

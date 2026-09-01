@@ -886,6 +886,25 @@ null snapshot leaves `fetchedAt` deciding: every row written before the column e
 treating that as stale would expire the whole estate into one Overpass thundering herd. Those rows
 keep the weaker guarantee until their next fetch stamps them.
 
+**Refusing to call a tile fresh is only half of it, and `isRefetchDue` is the other half.** A source
+stamp past the TTL never advances by being read again, so a queueing caller asking only "is this
+fresh?" puts that tile back on the queue on every viewport poll: `enqueue` revives the settled job
+with `attempts` cleared, the drain re-queries the same source, and the same stamp lands. The fetch
+_succeeds_ every time, so no ladder engages — `failJob` never runs, `SPLIT_CHILD_ATTEMPT_CAP` is
+read only for split children, `reconcileDeadJobs` only for dead jobs — and one tile costs a real
+Overpass query per browse request. `REFETCH_INTERVAL_MS` is the floor that bounds it at one query a
+day: `ensureCoverage` and `queueStaleChildren` both ask `isRefetchDue` rather than `!isTileFresh`,
+and a tile it holds back is still served and is no longer reported as refreshing, because nothing is
+refreshing it. It is a floor and not an attempt cap deliberately — the fetch is succeeding and the
+data is being served, so a source that is behind today may catch up tomorrow, and a cap would keep
+the tile from ever noticing. Only settled rows are held back; `pending`, `running` and `failed`
+belong to the job retry ladder and its own backoff. `fetchArea` runs off `surveyArea`, which does not
+queue, so a deliberate area fetch is still the way back for someone who will not wait out the
+interval. `switchback-ingest-stale-source` is logged by `processTile` whenever an answer arrives
+already past the TTL, because a quiet retry over year-old data is otherwise indistinguishable from a
+healthy estate. **No alert rule reads that token yet** — arming one needs a threshold, and neither
+provenance column exists in production, so there is nothing yet to measure a normal rate against.
+
 `switchback-ingest-empty-tile-writes` in `infra/azure/ingest.bicep` reads the published line and is
 declared **disarmed**. Its threshold is a placeholder rather than a measurement: with one source
 there is nothing to compare a share against, so arming it would page on the geography of whatever
@@ -1046,10 +1065,11 @@ three-quarters of the map.
 
 **A parent that was already serving trails keeps serving them.** `splitTile` preserves a
 `ready`/`empty` status and its `fetchedAt` instead of writing `pending`. `ensureCoverage` classifies
-a settled-but-stale tile as ready-and-refreshing and everything else as pending, so demoting a tile
-that split on a TTL refresh would flip a reader from "here are your trails" back to "still loading"
-for however long four children sit in the drain queue — which is not a length anybody is watching.
-A parent with no `fetchedAt` has nothing to serve and still reads `pending`.
+a settled-but-stale tile as ready — and refreshing too, once a re-fetch is due — and everything else
+as pending, so demoting a tile that split on a TTL refresh would flip a reader from "here are your
+trails" back to "still loading" for however long four children sit in the drain queue — which is not
+a length anybody is watching. A parent with no `fetchedAt` has nothing to serve and still reads
+`pending`.
 
 **That status is passed in, not read back, and the difference was a live bug.** `processTile` writes
 `running` to the parent before it fetches, so a `splitTile` that re-read the row saw `running` for
