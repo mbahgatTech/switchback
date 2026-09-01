@@ -187,7 +187,13 @@ describe.sequential('tileCompleteness', () => {
     expect(report.declaredWayMembers).toBe(2);
     expect(report.resolvedWayMembers).toBe(1);
     expect(report.incomplete).toEqual([
-      { relationId: 2, name: 'probe route', declared: 2, resolved: 1, missingRefs: [22] },
+      {
+        relationId: 2,
+        name: 'probe route',
+        declared: 2,
+        resolved: 1,
+        missingMembers: [{ ref: 22, ordinal: 2 }],
+      },
     ]);
   });
 
@@ -264,10 +270,12 @@ describe.sequential('tileCompleteness', () => {
   });
 
   /*
-   * The counts above stay right whether or not the reported refs discriminate on member type,
-   * because that fixture resolves completely and `missingRefs` is never populated. `missingRefs`
+   * The counts above stay right whether or not the reported members discriminate on member type,
+   * because that fixture resolves completely and `missingMembers` is never populated. That list
    * is the gate's only actionable output — an operator asks Overpass for exactly those ids — so
    * an incomplete relation carrying a node and a sub-route is what pins the filter inside it.
+   * The ordinal is 3 rather than 2: it is the position in the whole member chain, which is what
+   * an operator counts down, not the index among way members.
    */
   it('names only way refs when an incomplete relation also declares node and relation members', async () => {
     await insertWay(141, 'LINESTRING(10.1 45.1, 10.2 45.2)');
@@ -285,7 +293,91 @@ describe.sequential('tileCompleteness', () => {
     const report = await tileCompleteness(client, BOX);
 
     expect(report.incomplete).toEqual([
-      { relationId: 14, name: 'probe route', declared: 2, resolved: 1, missingRefs: [142] },
+      {
+        relationId: 14,
+        name: 'probe route',
+        declared: 2,
+        resolved: 1,
+        missingMembers: [{ ref: 142, ordinal: 3 }],
+      },
+    ]);
+  });
+
+  /*
+   * Every fixture above is missing exactly one member, which pins neither the list's length nor
+   * its order nor the ordinal any entry carries. Three gaps interleaved with node and sub-route
+   * members, at chain positions whose order is neither ref-ascending nor ref-descending, separate
+   * all three: truncating the list, reordering it, or annotating it from a second array all move
+   * this assertion while every count in the report stays right.
+   */
+  it('names every missing way member in chain order, each at the position it occupies', async () => {
+    await insertWay(1510, 'LINESTRING(10.1 45.1, 10.2 45.2)');
+    await insertRelation(
+      15,
+      members(
+        { type: 'way', ref: 1510 },
+        { type: 'node', ref: 1591, role: 'guidepost' },
+        { type: 'way', ref: 1553 },
+        { type: 'relation', ref: 1581 },
+        { type: 'way', ref: 1551 },
+        { type: 'way', ref: 1552 },
+      ),
+      INSIDE,
+    );
+
+    const report = await tileCompleteness(client, BOX);
+
+    expect(report.incomplete).toEqual([
+      {
+        relationId: 15,
+        name: 'probe route',
+        declared: 4,
+        resolved: 1,
+        missingMembers: [
+          { ref: 1553, ordinal: 3 },
+          { ref: 1551, ordinal: 5 },
+          { ref: 1552, ordinal: 6 },
+        ],
+      },
+    ]);
+  });
+
+  /*
+   * A spur walked out and back declares the same way twice, as 11 route relations in the northern
+   * California slice do. Counting distinct ids rather than occurrences refuses a tile that
+   * resolves every member it declares, and names nothing for an operator to fetch.
+   */
+  it('counts a way declared twice as two members and resolves both', async () => {
+    await insertWay(161, 'LINESTRING(10.1 45.1, 10.2 45.2)');
+    await insertWay(162, 'LINESTRING(10.2 45.2, 10.3 45.3)');
+    await insertRelation(16, wayMembers(161, 162, 161), INSIDE);
+
+    const report = await tileCompleteness(client, BOX);
+
+    expect(report.declaredWayMembers).toBe(3);
+    expect(report.resolvedWayMembers).toBe(3);
+    expect(report.incomplete).toEqual([]);
+  });
+
+  // Both occurrences are unresolved, so both are named: the list's length is always
+  // `declared - resolved`, and a list deduplicated by ref breaks that arithmetic.
+  it('names each unresolved occurrence when a missing way is declared twice', async () => {
+    await insertWay(172, 'LINESTRING(10.1 45.1, 10.2 45.2)');
+    await insertRelation(17, wayMembers(171, 172, 171), INSIDE);
+
+    const report = await tileCompleteness(client, BOX);
+
+    expect(report.incomplete).toEqual([
+      {
+        relationId: 17,
+        name: 'probe route',
+        declared: 3,
+        resolved: 1,
+        missingMembers: [
+          { ref: 171, ordinal: 1 },
+          { ref: 171, ordinal: 3 },
+        ],
+      },
     ]);
   });
 
@@ -334,7 +426,7 @@ describe.sequential('tileCompleteness', () => {
       expect(await hasNodeMemberTable(client)).toBe(true);
       const report = await tileCompleteness(client, BOX);
       expect(report.relations).toBe(1);
-      expect(report.incomplete.map((r) => r.missingRefs)).toEqual([[92]]);
+      expect(report.incomplete.map((r) => r.missingMembers)).toEqual([[{ ref: 92, ordinal: 2 }]]);
     });
   });
 

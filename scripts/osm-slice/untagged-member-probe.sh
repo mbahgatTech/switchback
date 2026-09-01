@@ -81,9 +81,10 @@ report=$(cd "$REPO_ROOT" && npx tsx scripts/osm-slice/tile-completeness.ts \
 verdict=$(printf '%s' "$report" | node -e '
   const report = JSON.parse(require("fs").readFileSync(0, "utf8"));
   const hit = report.incomplete.find((r) => r.relationId === Number(process.argv[1]));
+  const missing = hit ? hit.missingMembers.map((m) => `${m.ref}@${m.ordinal}`).join(" ") : "";
   console.log(
     hit
-      ? `INCOMPLETE ${hit.declared} declared / ${hit.resolved} resolved, missing ${hit.missingRefs.join(" ")}`
+      ? `INCOMPLETE ${hit.declared} declared / ${hit.resolved} resolved, missing ${missing}`
       : "COMPLETE",
   );
 ' "$RELATION") || {

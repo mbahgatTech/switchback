@@ -10,7 +10,7 @@ SUITE=test/osm-slice-completeness.db.test.ts
 # reporter runs on resolves to a `C:\tmp\...` that does not exist.
 REPORT=tmp/mutate-completeness.$$.json
 
-MUTATIONS='within|no-exact-intersects|no-type-filter|no-refs-type-filter|no-join-type|hiking-only|no-node-box|no-node-correlation'
+MUTATIONS='within|no-exact-intersects|no-type-filter|no-refs-type-filter|no-join-type|hiking-only|no-node-box|no-node-correlation|distinct-declared|distinct-resolved|ords-constant|missing-reversed|missing-by-ref|missing-truncated|missing-deduped'
 
 # The predicate is a tracked file and other agents share this checkout, so a run that starts dirty
 # cannot tell its own edit from someone else's, and restoring would discard theirs.
@@ -73,7 +73,7 @@ case "${1:-}" in
   no-type-filter) # member-type discrimination dropped from the counts
     perl -0pi -e "s/count\(\*\) FILTER \(WHERE mtype = 'way'\) AS declared/count(*) AS declared/" "$TARGET"
     perl -0pi -e "s/FILTER \(WHERE mtype = 'way' AND way_id IS NULL\)/FILTER (WHERE way_id IS NULL)/g" "$TARGET" ;;
-  no-refs-type-filter) # counts keep it; only the reported refs stop discriminating
+  no-refs-type-filter) # counts keep it; only the reported members stop discriminating
     perl -0pi -e "s/FILTER \(WHERE mtype = 'way' AND way_id IS NULL\)/FILTER (WHERE way_id IS NULL)/g" "$TARGET" ;;
   no-join-type) # the LEFT JOIN stops discriminating on member type
     perl -0pi -e "s/ON m\.value ->> 'type' = 'way' AND w\.way_id/ON w.way_id/" "$TARGET" ;;
@@ -83,6 +83,20 @@ case "${1:-}" in
     perl -0pi -e 's/n\.relation_id = r\.relation_id AND n\.geom && box\.g/n.relation_id = r.relation_id/' "$TARGET" ;;
   no-node-correlation) # node-member clause loses its correlation term
     perl -0pi -e 's/WHERE n\.relation_id = r\.relation_id AND n\.geom && box\.g/WHERE n.geom && box.g/' "$TARGET" ;;
+  distinct-declared) # declared counts distinct ids rather than declared occurrences
+    perl -0pi -e "s/count\(\*\) FILTER \(WHERE mtype = 'way'\) AS declared/count(DISTINCT ref) FILTER (WHERE mtype = 'way') AS declared/" "$TARGET" ;;
+  distinct-resolved) # resolved counts distinct ids rather than resolved occurrences
+    perl -0pi -e 's/count\(way_id\) AS resolved/count(DISTINCT way_id) AS resolved/' "$TARGET" ;;
+  ords-constant) # member position replaced by a constant
+    perl -0pi -e 's/         m\.ord,/         1 AS ord,/' "$TARGET" ;;
+  missing-reversed) # the reported gaps come back in reverse chain order
+    perl -0pi -e 's/ORDER BY ord\)/ORDER BY ord DESC)/' "$TARGET" ;;
+  missing-by-ref) # the reported gaps are ordered by way id rather than by chain position
+    perl -0pi -e 's/ORDER BY ord\)/ORDER BY ref)/' "$TARGET" ;;
+  missing-truncated) # only the first gap of each relation reaches the report
+    perl -0pi -e 's/missingMembers: row\.missing_members,/missingMembers: row.missing_members.slice(0, 1),/' "$TARGET" ;;
+  missing-deduped) # a way missing at two positions is named once
+    perl -0pi -e 's/missingMembers: row\.missing_members,/missingMembers: row.missing_members.filter((m, i, a) => a.findIndex((x) => x.ref === m.ref) === i),/' "$TARGET" ;;
   *)
     echo "usage: $0 <${MUTATIONS}>" >&2
     exit 2 ;;

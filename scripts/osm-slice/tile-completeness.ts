@@ -8,13 +8,20 @@ import { quadkeyToBBox } from '../../packages/geo/src/tiles';
 
 type BBox = [number, number, number, number];
 
+/** A declared way member the slice does not hold, and where it sits in the relation's chain. */
+export interface MissingMember {
+  ref: number;
+  ordinal: number;
+}
+
 /** A relation declaring more way members than the slice actually holds. */
 export interface IncompleteRelation {
   relationId: number;
   name: string | null;
   declared: number;
   resolved: number;
-  missingRefs: number[];
+  /** One entry per unresolved occurrence, so its length is always `declared - resolved`. */
+  missingMembers: MissingMember[];
 }
 
 export interface TileCompletenessReport {
@@ -43,6 +50,11 @@ export async function hasNodeMemberTable(client: Client): Promise<boolean> {
  * different set of relations than the adapter reads would score a tile the adapter never fetches.
  * `WITH ORDINALITY` carries member position through so a gap can be named by where it sits in the
  * chain, and the LEFT JOIN is what turns an unresolved member into a NULL that `count` skips.
+ * Ref and ordinal are aggregated as one object, never as two arrays paired by index: reordering
+ * one of two arrays annotates every gap with another member's position while every count stays
+ * right. `ORDER BY ord` is a guarantee rather than an observation — aggregate input order is not
+ * promised — and the counts are of occurrences, not distinct ids, because a relation may declare
+ * the same way twice and must still score complete when the slice holds both.
  */
 function completenessSql(withNodeMembers: boolean): string {
   const nodeMemberClause = withNodeMembers
@@ -78,10 +90,11 @@ SELECT relation_id,
        name,
        count(*) FILTER (WHERE mtype = 'way') AS declared,
        count(way_id) AS resolved,
-       coalesce(array_agg(ref ORDER BY ord) FILTER (WHERE mtype = 'way' AND way_id IS NULL), '{}')
-         AS missing_refs,
-       coalesce(array_agg(ord ORDER BY ord) FILTER (WHERE mtype = 'way' AND way_id IS NULL), '{}')
-         AS missing_ords
+       coalesce(
+         jsonb_agg(jsonb_build_object('ref', ref, 'ordinal', ord) ORDER BY ord)
+           FILTER (WHERE mtype = 'way' AND way_id IS NULL),
+         '[]'::jsonb
+       ) AS missing_members
 FROM member
 GROUP BY relation_id, name
 ORDER BY relation_id`;
@@ -92,8 +105,7 @@ interface CompletenessRow {
   name: string | null;
   declared: string;
   resolved: string;
-  missing_refs: string[];
-  missing_ords: string[];
+  missing_members: MissingMember[];
 }
 
 async function queryRows(
@@ -121,20 +133,11 @@ function summarise(rows: readonly CompletenessRow[]): TileCompletenessReport {
       name: row.name,
       declared,
       resolved,
-      missingRefs: row.missing_refs.map(Number),
+      missingMembers: row.missing_members,
     });
   }
 
   return { relations: rows.length, declaredWayMembers, resolvedWayMembers, incomplete };
-}
-
-/** Missing-member ordinals per relation, so a report can say where in the chain a gap sits. */
-function ordinalsOf(rows: readonly CompletenessRow[]): Map<number, number[]> {
-  return new Map(
-    rows
-      .filter((row) => Number(row.declared) !== Number(row.resolved))
-      .map((row) => [Number(row.relation_id), row.missing_ords.map(Number)]),
-  );
 }
 
 /** Counts every way member the tile's route relations declare against the ways the slice holds. */
@@ -192,17 +195,14 @@ async function main(): Promise<void> {
   await client.connect();
 
   try {
-    // One existence probe and one query, reused for both the totals and the ordinals.
     const nodeMembers = await hasNodeMemberTable(client);
-    const rows = await queryRows(client, bbox, nodeMembers);
-    const report = summarise(rows);
+    const report = summarise(await queryRows(client, bbox, nodeMembers));
 
     if (json) {
       console.log(JSON.stringify(report, null, 2));
       return;
     }
 
-    const ordinals = ordinalsOf(rows);
     console.log(
       `tile ${label}  db ${database}  osm.relation_node_member ${nodeMembers ? 'present' : 'absent'}`,
     );
@@ -212,8 +212,7 @@ async function main(): Promise<void> {
     );
     console.log(`incomplete=${report.incomplete.length}`);
     for (const rel of report.incomplete) {
-      const ords = ordinals.get(rel.relationId) ?? [];
-      const missing = rel.missingRefs.map((ref, i) => `${ref}@${ords[i] ?? '?'}`).join(' ');
+      const missing = rel.missingMembers.map((m) => `${m.ref}@${m.ordinal}`).join(' ');
       console.log(
         `  ${rel.relationId}  ${rel.declared} declared / ${rel.resolved} resolved  ` +
           `missing ${missing}  ${rel.name ?? '(unnamed)'}`,

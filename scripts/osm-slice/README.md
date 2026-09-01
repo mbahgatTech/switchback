@@ -122,15 +122,26 @@ tsx scripts/osm-slice/tile-completeness.ts --database osm_norcal --quadkey 02301
 The `rel` term is the selection `RELATION_SQL` uses, deliberately. A predicate that selected a
 different set of relations than the adapter reads would score a tile the adapter never fetches.
 
-Every term in that selection is one an edit could quietly weaken while the tool still prints a
-plausible number, so each has a fixture that separates it from its neighbours: a relation crossing
-the tile edge (the only geometry that tells `ST_Intersects` from `ST_Within`), a relation whose
-bounding box covers the tile while its line passes around it (the only geometry that tells the
-exact test from the `&&` index filter), a relation carrying node and sub-relation members
-alongside its ways, an incomplete relation carrying them (the counts are right either way; only
-the reported refs move), a node member whose ref collides with a real way id, one relation per
-selected route value plus two excluded ones, and three relations sharing a node-member table so
-the clause's positional and correlation terms move independently.
+Each gap is reported as a `{ ref, ordinal }` pair: the way id, and its position in the whole member
+chain with guideposts and sub-routes counted, so an operator can go to the link that breaks rather
+than search a chain hundreds long. Ref and ordinal are aggregated as one object and not as two
+arrays paired by index, because reordering one of two arrays annotates every gap with another
+member's position while every count in the report stays right.
+
+Every term in the query is one an edit could quietly weaken while the tool still prints a plausible
+number, so each has a fixture that separates it from its neighbours:
+
+| term                                                   | the fixture that moves it                                                                                                                                    |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ST_Intersects` rather than `ST_Within`                | a relation crossing the tile edge                                                                                                                            |
+| the exact test beside the `&&` index filter            | a relation whose bounding box covers the tile while its line passes around it                                                                                |
+| `FILTER (WHERE mtype = 'way')` on the counts           | a complete relation carrying a guidepost node and a sub-route                                                                                                |
+| the same filter on the reported members                | an incomplete relation carrying them — the counts are right either way, only the list moves                                                                  |
+| `WITH ORDINALITY`, and `ORDER BY ord` on the aggregate | a relation missing three ways at interleaved chain positions, in an order that is neither ref-ascending nor ref-descending                                   |
+| counts of occurrences rather than of distinct ids      | a relation declaring one way twice and resolving both, and one missing a way it declares twice — 11 relations in `osm_norcal` declare a duplicate way member |
+| `m.value ->> 'type' = 'way'` on the LEFT JOIN          | a node member whose ref collides with a real way id                                                                                                          |
+| the route-value set                                    | one relation per selected value plus two excluded ones                                                                                                       |
+| both terms of the node-member clause                   | three relations sharing a node-member table                                                                                                                  |
 
 `mutate-completeness.sh` applies each weakening in turn and reruns
 `test/osm-slice-completeness.db.test.ts`, which is what makes the coverage a differential:
